@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lsm-tree vs RocksDB</title>
+<style>
+  :root { --bg: #0d1117; --panel: #161b22; --fg: #c9d1d9; --muted: #8b949e; --line: #30363d; --link: #58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, sans-serif; }
+  main { max-width: 1280px; margin: 0 auto; padding: 1.25rem 1rem 3rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  p.lead { color: var(--muted); line-height: 1.5; margin: 0 0 .5rem; max-width: 70rem; }
+  p.meta { color: var(--muted); font-size: .85rem; margin: 0 0 1rem; }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .controls { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: .75rem 1.5rem; align-items: center;
+    background: var(--bg); padding: .75rem 0; border-bottom: 1px solid var(--line); margin-bottom: 1rem; }
+  .controls label { color: var(--muted); font-size: .9rem; display: flex; gap: .5rem; align-items: center; }
+  select { background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: .3rem .5rem; font-size: .9rem; }
+  h2 { font-size: 1.1rem; margin: 1.5rem 0 .75rem; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .75rem .9rem; }
+  .card h3 { font-size: .95rem; margin: 0 0 .2rem; }
+  .card p { color: var(--muted); font-size: .82rem; margin: 0 0 .5rem; line-height: 1.4; }
+  .chart { position: relative; height: 240px; }
+  #empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>lsm-tree vs RocksDB</h1>
+  <p class="lead">
+    Every engine runs the same workload in one process on one host, so a chart compares engines, not hosts.
+    Bars are the mean time per operation (<strong>lower is faster</strong>) at each key count; the tooltip shows the
+    95% confidence interval. Both engines get the same block size, bloom filter, block cache and values, no WAL,
+    and every lsm-tree protection RocksDB has no equivalent for is off.
+    &middot; <a href="../bench/">single-engine trend &rarr;</a>
+  </p>
+  <p class="meta" id="meta"></p>
+  <div class="controls">
+    <label>Codec <select id="codec">
+      <option value="all">All</option>
+      <option value="none">Uncompressed</option>
+      <option value="zstd22">zstd level 22</option>
+    </select></label>
+    <label>Workload <select id="kind">
+      <option value="all">All</option>
+      <option value="write">Writes</option>
+      <option value="read">Reads</option>
+      <option value="compaction">Compaction</option>
+    </select></label>
+  </div>
+  <p id="empty">No head-to-head results have been published yet.</p>
+  <div id="charts"></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script>
+(function () {
+  "use strict";
+  // One colour per engine on every chart.
+  const COLORS = {
+    "ours": "#58a6ff", "rocksdb": "#f78166", "surrealkv": "#3fb950", "blob_tree": "#d2a8ff",
+    "ours-hash-index": "#79c0ff", "rocksdb-hash-index": "#ffa198", "ours-ribbon": "#e3b341", "ours-row-cache": "#56d4dd",
+  };
+  const KIND = {
+    write_throughput: "write", overwrite: "write",
+    point_read: "read", multi_get: "read", range_scan: "read", seek_random: "read",
+    major_compact_zstd3: "compaction", subcompaction_zstd3: "compaction",
+  };
+  const KIND_TITLE = { write: "Writes", read: "Reads", compaction: "Compaction" };
+
+  const fmt = function (ns) {
+    if (ns >= 1e6) { return (ns / 1e6).toFixed(2) + " ms"; }
+    if (ns >= 1e3) { return (ns / 1e3).toFixed(2) + " µs"; }
+    return ns.toFixed(0) + " ns";
+  };
+
+  Promise.all([
+    fetch("summary.json").then(function (r) { return r.ok ? r.json() : null; }),
+    fetch("meta.json").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+  ]).then(function (loaded) {
+    const summary = loaded[0];
+    const meta = loaded[1];
+    if (!summary || !summary.results.length) {
+      document.getElementById("empty").style.display = "block";
+      return;
+    }
+    if (meta) {
+      const m = document.getElementById("meta");
+      m.textContent = "Measured on the " + meta.line + ".x line, " + meta.ref + " at ";
+      const a = document.createElement("a");
+      a.href = "https://github.com/" + meta.repo + "/commit/" + meta.sha;
+      a.textContent = meta.sha.slice(0, 9);
+      m.appendChild(a);
+      m.appendChild(document.createTextNode(", runner " + meta.runner + ", preset " + summary.preset + ", " + summary.matrix + " matrix."));
+    }
+    const notes = {};
+    summary.groups.forEach(function (g) { notes[g.name] = g.note; });
+
+    // group -> engine -> n -> result
+    const groups = {};
+    summary.results.forEach(function (r) {
+      (groups[r.group] = groups[r.group] || {});
+      (groups[r.group][r.engine] = groups[r.group][r.engine] || {})[r.n] = r;
+    });
+    const base = function (group) { return group.replace(/_zstd22$/, ""); };
+    const codecOf = function (group) { return /_zstd22$/.test(group) ? "zstd22" : "none"; };
+    const ordered = Object.keys(groups).sort(function (a, b) {
+      const order = Object.keys(KIND);
+      return order.indexOf(base(a)) - order.indexOf(base(b)) || codecOf(a).localeCompare(codecOf(b));
+    });
+
+    const charts = [];
+    const container = document.getElementById("charts");
+    const codecSel = document.getElementById("codec");
+    const kindSel = document.getElementById("kind");
+
+    const draw = function () {
+      charts.splice(0).forEach(function (c) { c.destroy(); });
+      container.innerHTML = "";
+      const grids = {};
+      ordered.forEach(function (group) {
+        const kind = KIND[base(group)] || "other";
+        if (codecSel.value !== "all" && codecSel.value !== codecOf(group) && kind !== "compaction") { return; }
+        if (kindSel.value !== "all" && kindSel.value !== kind) { return; }
+        if (!(kind in grids)) {
+          const h = document.createElement("h2");
+          h.textContent = KIND_TITLE[kind] || "Other";
+          const grid = document.createElement("div");
+          grid.className = "grid";
+          container.appendChild(h);
+          container.appendChild(grid);
+          grids[kind] = grid;
+        }
+        const engines = groups[group];
+        const sizes = [];
+        Object.keys(engines).forEach(function (e) {
+          Object.keys(engines[e]).forEach(function (n) { if (sizes.indexOf(Number(n)) < 0) { sizes.push(Number(n)); } });
+        });
+        sizes.sort(function (a, b) { return a - b; });
+        const datasets = Object.keys(engines).map(function (engine) {
+          const color = COLORS[engine] || "#8b949e";
+          return {
+            label: engine,
+            backgroundColor: color,
+            borderColor: color,
+            data: sizes.map(function (n) {
+              const r = engines[engine][n];
+              return r ? r.mean_ns / r.n : null;
+            }),
+            ci: sizes.map(function (n) {
+              const r = engines[engine][n];
+              return r ? [r.lower_ns / r.n, r.upper_ns / r.n] : null;
+            }),
+          };
+        });
+
+        const card = document.createElement("div");
+        card.className = "card";
+        const h3 = document.createElement("h3");
+        h3.textContent = base(group) + (codecOf(group) === "zstd22" ? " · zstd-22" : kind === "compaction" ? "" : " · uncompressed");
+        const p = document.createElement("p");
+        p.textContent = notes[base(group)] || "";
+        const wrap = document.createElement("div");
+        wrap.className = "chart";
+        const canvas = document.createElement("canvas");
+        wrap.appendChild(canvas);
+        card.appendChild(h3);
+        card.appendChild(p);
+        card.appendChild(wrap);
+        grids[kind].appendChild(card);
+        charts.push(new Chart(canvas, {
+          type: "bar",
+          data: { labels: sizes.map(function (n) { return n.toLocaleString("en") + " keys"; }), datasets: datasets },
+          options: {
+            responsive: true, maintainAspectRatio: false, animation: false,
+            scales: {
+              x: { ticks: { color: "#8b949e" }, grid: { display: false } },
+              y: { beginAtZero: true, ticks: { color: "#8b949e", callback: function (v) { return fmt(v); } }, grid: { color: "#21262d" },
+                title: { display: true, text: "time per operation", color: "#8b949e" } },
+            },
+            plugins: {
+              legend: { labels: { color: "#c9d1d9", boxWidth: 12 } },
+              tooltip: { callbacks: {
+                label: function (item) {
+                  const ci = item.dataset.ci[item.dataIndex];
+                  return item.dataset.label + ": " + fmt(item.raw) + (ci ? "  (" + fmt(ci[0]) + " – " + fmt(ci[1]) + ")" : "");
+                },
+              } },
+            },
+          },
+        }));
+      });
+    };
+    codecSel.addEventListener("change", draw);
+    kindSel.addEventListener("change", draw);
+    draw();
+  });
+})();
+</script>
+</body>
+</html>

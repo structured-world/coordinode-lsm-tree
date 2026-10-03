@@ -159,8 +159,8 @@ jobs:
     # On a cold cache the librocksdb-sys C++ compile (RocksDB built from
     # source via bindgen) takes 15-25 min by itself, which leaves too little
     # of the budget for the benches, so that run fails at its limit. The
-    # rust-cache step saves the compiled RocksDB on failure too, so the next
-    # run is warm again.
+    # build is saved to the cache as soon as it finishes, before any bench,
+    # so the next run is warm again whatever happens to this one.
     timeout-minutes: ${{ inputs.full-matrix && 60 || 30 }}
     defaults:
       run:
@@ -260,16 +260,21 @@ jobs:
       # `target/` in the workspace, so nothing built survives on the runner
       # from one run to the next. The one build worth carrying over is
       # tools/compare-rocksdb's, which compiles RocksDB from C++ source
-      # (15-25 minutes): it is the only workspace cached here, restored after
-      # the checkout and saved when the job ends. The engine and db_bench build
-      # in minutes and are removed by the last step instead. Saved when the job
-      # fails as well: a cold RocksDB compile does not fit the job's budget,
-      # and a cache saved only on success would keep every later run cold.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      # (15-25 minutes): its target is restored here and saved by the step
+      # right after the build (CARGO_HOME already persists on the self-hosted
+      # runner). The engine and db_bench build in minutes and are removed by
+      # the last step instead. The key moves with the harness manifest and the
+      # toolchain; the prefix restores the nearest older build, whose compiled
+      # RocksDB cargo reuses when its version did not change.
+      - name: Restore the compare-rocksdb build
+        id: compare-cache
+        uses: actions/cache/restore@v6
         with:
-          prefix-key: bench
-          workspaces: tools/compare-rocksdb -> target
-          cache-on-failure: true
+          path: |
+            tools/compare-rocksdb/target
+            !tools/compare-rocksdb/target/criterion
+          key: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-
 
       # librocksdb-sys builds C bindings via bindgen -> clang-sys, which needs
       # libclang on the host. When it is absent the raw failure is a deep,
@@ -337,8 +342,25 @@ jobs:
       # still measures and publishes the db_bench trend, and the head-to-head
       # step fails the job.
       - name: Build the benchmark binaries
+        id: build
         continue-on-error: true
         run: bash .github/scripts/build-benchmarks.sh
+
+      # Saved as soon as it is built, before any bench runs: a cold RocksDB
+      # compile takes most of the job's budget, and a save left to the end of
+      # the job would be lost whenever the benches after it overrun. Only on a
+      # miss of the exact key, since a cache entry cannot be overwritten.
+      - name: Save the compare-rocksdb build
+        if: >
+          !cancelled() &&
+          steps.build.outcome == 'success' &&
+          steps.compare-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            tools/compare-rocksdb/target
+            !tools/compare-rocksdb/target/criterion
+          key: ${{ steps.compare-cache.outputs.cache-primary-key }}
 
       # The db_bench pass measures for ~2.5 min on the bench runner.
       - name: Run benchmarks
@@ -384,11 +406,11 @@ jobs:
           LSM_BENCH_PRESET: rocksdb-parity
           COMPARE_FULL_MATRIX: ${{ inputs.full-matrix && '1' || '0' }}
           LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
-        # The restored cache carries the previous run's reports under
-        # target/criterion, and Criterion never removes a group's directory once
-        # the group is renamed or deleted. The publish step copies every
-        # directory there, so the stale ones go before the run; the compiled
-        # RocksDB beside them stays.
+        # A workspace left by an earlier run on this runner may still hold
+        # Criterion's results under target/criterion, and the summary the
+        # harness writes collects every result there, so they go before the
+        # run. `--noplot`: the published page draws its charts from that
+        # summary, so Criterion spends no time rendering any.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
             echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
@@ -397,7 +419,7 @@ jobs:
           cd tools/compare-rocksdb
           rm -rf target/criterion
           cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
+            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5 --noplot
 
       # Issued after the benches, right before its first use: an installation
       # token lives one hour, so one issued at the start of the job would let
@@ -515,15 +537,14 @@ jobs:
           save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           benchmark-data-dir-path: dev/bench
 
-      # The overlay page draws every host's series of one workload on one
-      # chart (.github/bench/overlay.html reads the data.js beside it), and a
-      # banner on the per-host dashboard links it and the RocksDB overlays.
-      # It depends on the db_bench pass only, so a host that cannot build
-      # RocksDB still publishes it. The store step writes the dashboard's
-      # index.html only when it is missing, so the banner is rewritten in
-      # place: any banner line is dropped and the current one goes after
-      # <body>.
-      - name: Publish the host overlay page to gh-pages
+      # The dashboard page (.github/bench/dashboard.html, which reads the
+      # data.js beside it): branch and runner selectors defaulting to whatever
+      # was measured last, charts grouped by what they measure, two columns.
+      # It replaces the store action's own index.html, which the action only
+      # writes when none exists, and keeps the old overlay.html address
+      # working. It depends on the db_bench pass only, so a host that cannot
+      # build RocksDB still publishes it.
+      - name: Publish the dashboard page to gh-pages
         if: >
           !cancelled() &&
           steps.dbbench.outcome == 'success' &&
@@ -546,47 +567,26 @@ jobs:
           git clone --depth 1 --branch gh-pages \
             "https://github.com/${REPO}.git" "$work"
           mkdir -p "$work/dev/bench"
-          cp .github/bench/overlay.html "$work/dev/bench/overlay.html"
-          bench_index="$work/dev/bench/index.html"
-          if [ -f "$bench_index" ]; then
-            banner='<div id="bench-nav-banner" style="padding:8px 14px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif;border-bottom:1px solid #30363d;font-size:14px">&#128202; <strong>lsm-tree benchmarks</strong> &nbsp;&middot;&nbsp; per-host dashboards &nbsp;&middot;&nbsp; <a href="overlay.html" style="color:#58a6ff;font-weight:600">every host on one chart &rarr;</a> &nbsp;&middot;&nbsp; <a href="../compare/" style="color:#58a6ff;font-weight:600">RocksDB head-to-head &rarr;</a></div>'
-            injected=0
-            # Shell built-ins only: the Git for Windows shell may ship neither
-            # awk nor sed, and the HTML would need escaping for sed anyway.
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in
-                *'id="bench-nav-banner"'* | *'id="compare-overlay-banner"'*)
-                  continue
-                  ;;
-              esac
-              printf '%s\n' "$line"
-              case "$injected$line" in
-                0*"<body"*)
-                  printf '%s\n' "$banner"
-                  injected=1
-                  ;;
-              esac
-            done < "$bench_index" > "$bench_index.tmp"
-            mv "$bench_index.tmp" "$bench_index"
-          fi
+          cp .github/bench/dashboard.html "$work/dev/bench/index.html"
+          cp .github/bench/dashboard.html "$work/dev/bench/overlay.html"
           cd "$work"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dev/bench/overlay.html
-          git add dev/bench/index.html 2>/dev/null || true
+          git add dev/bench/index.html dev/bench/overlay.html
           if git diff --cached --quiet; then
-            echo "::notice::host overlay page unchanged"
+            echo "::notice::dashboard page unchanged"
           else
-            git commit -m "bench: refresh the host overlay page (dev/bench)"
+            git commit -m "bench: refresh the dashboard page (dev/bench)"
             git push origin gh-pages
           fi
 
-      # Publish the criterion HTML report tree (per-group overlay charts)
-      # to gh-pages under dev/compare, alongside the db_bench dashboard at
-      # dev/bench. Manual git push (rather than a third-party publish
-      # action) keeps the workflow's "every `uses:` pinned to a SHA"
-      # hardening policy intact, with the App-scoped token the stores use.
-      - name: Publish compare-rocksdb overlay reports to gh-pages
+      # Publish the head-to-head under dev/compare, alongside the db_bench
+      # dashboard at dev/bench: the page (.github/bench/compare.html), the
+      # harness's summary.json it draws from, and a meta.json naming what was
+      # measured. Manual git push (rather than a third-party publish action)
+      # keeps the workflow's "every `uses:` pinned to a SHA" hardening policy
+      # intact, with the App-scoped token the stores use.
+      - name: Publish the compare-rocksdb page to gh-pages
         # Publish on main pushes AND on manual workflow_dispatch. The overlay is
         # a ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
         # per-commit trend that dev/bench is — so a manual dispatch refreshing it
@@ -611,11 +611,12 @@ jobs:
           LINE_MAJOR: ${{ steps.line.outputs.major }}
           MEASURED_REF: ${{ github.ref_name }}
           MEASURED_SHA: ${{ github.sha }}
+          MEASURED_RUNNER: ${{ runner.name }}
         run: |
           set -euo pipefail
-          src="tools/compare-rocksdb/target/criterion"
-          if [ ! -d "$src/report" ]; then
-            echo "::error::criterion report tree not found at $src/report"
+          summary="tools/compare-rocksdb/target/criterion/summary.json"
+          if [ ! -f "$summary" ]; then
+            echo "::error::the harness wrote no summary at $summary"
             exit 1
           fi
           # Explicit template (not bare `mktemp -d`, which is GNU-only and
@@ -642,88 +643,50 @@ jobs:
           export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
           git clone --depth 1 --branch gh-pages \
             "https://github.com/${REPO}.git" "$work"
-          # Replace the previous report tree wholesale so deleted /
-          # renamed scenarios don't leave stale pages behind; dev/bench
-          # and every other gh-pages path are untouched.
+          # Replace the previous snapshot wholesale, so a group the harness no
+          # longer runs leaves nothing behind (the per-benchmark report trees
+          # earlier runs published go with it); dev/bench and every other
+          # gh-pages path are untouched.
           rm -rf "$work/dev/compare"
           mkdir -p "$work/dev/compare"
-          cp -R "$src/." "$work/dev/compare/"
-          # Landing gallery: Criterion's own dev/compare/report/index.html is a
-          # FLAT LIST of individual benchmarks with no overlay charts on it — a
-          # visitor lands there and sees links, not the head-to-head. The actual
-          # ours-vs-rocksdb overlays are Criterion's per-group `lines.svg`
-          # (X=element count, one line per engine), buried under
-          # <scenario>/report/. Generate a single landing page at
-          # dev/compare/index.html that embeds every scenario's lines.svg inline,
-          # so the head-to-head is the first thing shown.
-          gallery="$work/dev/compare/index.html"
-          {
-            cat <<'HTML_HEAD'
-          <!doctype html><html lang="en"><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>lsm-tree vs RocksDB — head-to-head</title>
-          <style>
-            body{font-family:system-ui,-apple-system,sans-serif;max-width:1080px;margin:2rem auto;padding:0 1rem;background:#0d1117;color:#c9d1d9}
-            h1{font-size:1.5rem} h2{font-size:1.1rem;margin:0 0 .5rem}
-            a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
-            .intro{color:#8b949e;font-size:.95rem;line-height:1.5}
-            .scenario{margin:1.5rem 0;padding-bottom:1rem;border-bottom:1px solid #30363d}
-            .scenario img{max-width:100%;background:#fff;border-radius:6px;padding:6px}
-            .links{font-size:.85rem;color:#8b949e}
-          </style></head><body>
-          <h1>lsm-tree vs RocksDB — head-to-head overlays</h1>
-          <p class="intro">Each chart overlays <strong>ours</strong> against <strong>rocksdb</strong> on the
-          same axes (X = element count, Y = average time; <strong>lower is faster</strong>). Generated by the
-          <code>compare-rocksdb</code> harness — both engines run in the same process per scenario.
-          &nbsp;&middot;&nbsp; <a href="../bench/overlay.html">single-engine db_bench trend, every host &rarr;</a>
-          &nbsp;&middot;&nbsp; <a href="report/">raw criterion index &rarr;</a></p>
-          HTML_HEAD
-            # The overlay is a snapshot replaced on every run, from main or a
-            # manual dispatch, so it says which line and commit it measured.
-            # A branch name may hold `&`, `<`, `>` and `"` (git check-ref-format
-            # allows them), so it is escaped for HTML, with shell built-ins
-            # only: the Git for Windows shell may ship no sed.
-            ref_html=""
-            rest="$MEASURED_REF"
-            while [ -n "$rest" ]; do
-              c="${rest%"${rest#?}"}"
-              rest="${rest#?}"
-              case "$c" in
-                '&') ref_html="$ref_html&amp;" ;;
-                '<') ref_html="$ref_html&lt;" ;;
-                '>') ref_html="$ref_html&gt;" ;;
-                '"') ref_html="$ref_html&quot;" ;;
-                *) ref_html="$ref_html$c" ;;
-              esac
-            done
-            printf '<p class="intro">Measured on the <strong>%s.x</strong> line: <code>%s</code> at <a href="https://github.com/%s/commit/%s">%s</a>.</p>\n' \
-              "$LINE_MAJOR" "$ref_html" "$REPO" "$MEASURED_SHA" "${MEASURED_SHA:0:9}"
-            for d in "$work"/dev/compare/*/; do
-              name="$(basename "$d")"
-              [ -f "$d/report/lines.svg" ] || continue
-              printf '<div class="scenario"><h2>%s</h2><a href="%s/report/"><img src="%s/report/lines.svg" alt="%s overlay" loading="lazy"></a><div class="links"><a href="%s/report/">full report (violin, regression, per-size) &rarr;</a></div></div>\n' \
-                "$name" "$name" "$name" "$name" "$name"
-            done
-            echo '</body></html>'
-          } > "$gallery"
+          cp .github/bench/compare.html "$work/dev/compare/index.html"
+          cp "$summary" "$work/dev/compare/summary.json"
+          # The page is a snapshot replaced on every run, so it names the line,
+          # branch, commit and runner it measured. A branch name may hold `"`
+          # and `\` (git check-ref-format allows them), so it is escaped for
+          # JSON with shell built-ins only: the Git for Windows shell may ship
+          # no sed.
+          ref_json=""
+          rest="$MEASURED_REF"
+          while [ -n "$rest" ]; do
+            c="${rest%"${rest#?}"}"
+            rest="${rest#?}"
+            case "$c" in
+              \\) ref_json="$ref_json\\\\" ;;
+              '"') ref_json="$ref_json\\\"" ;;
+              *) ref_json="$ref_json$c" ;;
+            esac
+          done
+          printf '{"line":"%s","ref":"%s","sha":"%s","repo":"%s","runner":"%s"}\n' \
+            "$LINE_MAJOR" "$ref_json" "$MEASURED_SHA" "$REPO" "$MEASURED_RUNNER" \
+            > "$work/dev/compare/meta.json"
           cd "$work"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dev/compare
+          git add -A dev/compare
           if git diff --cached --quiet; then
-            echo "::notice::compare-rocksdb reports unchanged — nothing to publish"
+            echo "::notice::compare-rocksdb page unchanged, nothing to publish"
           else
-            git commit -m "bench: refresh compare-rocksdb overlay reports (dev/compare)"
+            git commit -m "bench: refresh the compare-rocksdb page (dev/compare)"
             git push origin gh-pages
-            echo "::notice::published compare-rocksdb overlays to dev/compare/report/index.html"
+            echo "::notice::published the compare-rocksdb page to dev/compare/"
           fi
 
       # The workspace of a self-hosted runner survives the job, and the next
       # checkout only clears it when the next run starts, so the engine's and
       # db_bench's build would sit on the host's disk in between. Removed
-      # whatever the job's outcome. tools/compare-rocksdb/target is left for
-      # the rust-cache step, which saves it when the job ends; emptying it
-      # here would save an empty cache.
+      # whatever the job's outcome. tools/compare-rocksdb/target stays: the
+      # next checkout's clean removes it, and the cache already holds it.
       - name: Remove this run's build output
         if: always()
         run: |

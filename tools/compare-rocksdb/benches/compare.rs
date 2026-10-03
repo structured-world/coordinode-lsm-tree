@@ -114,16 +114,23 @@
 //!   timed window). Overwrite cost (memtable churn over existing keys +
 //!   a superseding flush), distinct from cold first-insert.
 //!
-//! Each of the above also has a `_zstd22` sibling, at the same sizes except
-//! `write_throughput_zstd22` and `overwrite_zstd22`, which run 70k only in
-//! the full matrix (see [`cold_write_sizes`]). Not yet portable
+//! Each of the above also has a `_zstd22` sibling. The read siblings run 70k
+//! only, the one size whose working set overflows the block cache so a read
+//! decodes a block at all (see [`read_sizes`]); `write_throughput_zstd22`
+//! and `overwrite_zstd22` run 1k and 10k, and 70k in the full matrix (see
+//! [`cold_write_sizes`]).
+//!
+//! Values carry the compressibility RocksDB's own `db_bench` gives its values
+//! by default (see [`ValuePool`]), and every RocksDB read borrows the value
+//! out of the block as ours does (`get_pinned`, the raw iterator), so neither
+//! engine pays for a copy or a codec shortcut the other does not. Not yet portable
 //! head-to-head: `readwhilewriting` (concurrency) and `mergerandom`
 //! (merge-operator semantics differ across engines) from [#244]'s list.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 // `Guard` is a trait, used (not dead) for its `.value()` method on the
 // `IterGuardImpl` items yielded by `tree.iter()` / `tree.range()` in the
 // range_scan and seek_random scenarios — there is no direct path
@@ -133,7 +140,7 @@ use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::{
         CompressionPolicy, HashRatioPolicy, KvSeparationOptions, LocatorPolicy, LocatorPolicyEntry,
-        LocatorPrecision,
+        LocatorPrecision, PinningPolicy,
     },
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
@@ -275,7 +282,7 @@ impl Engine {
 
 /// KV-separation threshold for the `blob_tree` arm: values at or above this many
 /// bytes are stored out-of-line. The benchmark value is 256 bytes (see
-/// [`value_for`]), so 128 separates every value out-of-line, mirroring
+/// [`VALUE_SIZE`]), so 128 separates every value out-of-line, mirroring
 /// surrealkv's vlog and isolating the "smaller key-LSM" read effect the
 /// `blob_tree` arm exists to measure. Below the default 1 KiB threshold, which
 /// would leave the 256-byte values inlined (no separation, no measurement).
@@ -300,25 +307,20 @@ fn engines_for(compression: Compression) -> &'static [Engine] {
     }
 }
 
-/// The engine series for a scan-shaped scenario, as `(label, engine, row cache)`.
+/// Element counts of a warm-read group (`point_read`, `multi_get`,
+/// `range_scan`, `seek_random`).
 ///
-/// Our tree appears twice: once with the row cache, which is the default a
-/// deployment gets, and once without. A scan does not reuse keys, so it is the
-/// shape where paying for rows is most likely to cost something and least
-/// likely to repay — exactly the case that has to be measured rather than
-/// assumed. Reporting only one side would leave the default unevidenced.
-fn scan_series(compression: Compression) -> Vec<(&'static str, Engine, bool)> {
-    let mut series = vec![
-        ("ours", Engine::Ours, false),
-        ("ours-row-cache", Engine::Ours, true),
-    ];
-    series.extend(
-        engines_for(compression)
-            .iter()
-            .filter(|e| !matches!(e, Engine::Ours))
-            .map(|&e| (e.label(), e, false)),
-    );
-    series
+/// The block cache is 16 MiB on both engines and every value is 256 bytes, so
+/// at 1k and 10k the whole key set stays in the cache after the warm-up: no
+/// timed read decodes a block, and a zstd-22 group at those sizes measures
+/// exactly what the uncompressed group at the same size does (it did, within
+/// noise, on every engine and size). Only 70k overflows the cache, so the
+/// zstd-22 read groups run that size alone.
+fn read_sizes(compression: Compression) -> &'static [u64] {
+    match compression {
+        Compression::None => &[1_000, 10_000, 70_000],
+        Compression::Zstd22 => &[70_000],
+    }
 }
 
 /// Compression axis of the engine matrix. Each workload runs once per
@@ -453,10 +455,22 @@ fn apply_preset(config: Config, preset: Preset) -> Config {
             // ECC (the runtime `page_ecc` above covers manifest blocks).
             // The retrieval-ribbon locator is on by default (block precision);
             // RocksDB has no equivalent, so parity disables it.
+            //
+            // Index and filter layout as RocksDB's defaults have them: one
+            // index and one filter block per table (`kBinarySearch`, a full
+            // filter), held by the table reader rather than the block cache
+            // (`cache_index_and_filter_blocks = false`), at every level. Ours
+            // partitions the index at every level by default so a corrupt
+            // block costs one partition, not the whole table; RocksDB pays no
+            // such second index lookup, so parity turns it off.
             config
                 .with_runtime_config(rc)
                 .page_ecc(false)
                 .locator_policy(LocatorPolicy::disabled())
+                .index_block_partitioning_policy(PinningPolicy::disabled())
+                .filter_block_partitioning_policy(PinningPolicy::disabled())
+                .index_block_pinning_policy(PinningPolicy::all(true))
+                .filter_block_pinning_policy(PinningPolicy::all(true))
         }
         // Production defaults are exactly `RuntimeConfig::default()` + the
         // `Config` defaults, so leave the config untouched.
@@ -488,20 +502,60 @@ fn key_for(i: u64) -> [u8; 16] {
     out
 }
 
-/// Fixed 256-byte value. The first 8 bytes vary with the key so
-/// the engines can't dedupe / compress the entire payload to a
-/// single block.
-fn value_for(i: u64) -> Vec<u8> {
-    let mut v = vec![0xAA_u8; 256];
-    v[..8].copy_from_slice(&i.to_be_bytes());
-    v
+/// Bytes per value in every workload but the sub-compaction one.
+const VALUE_SIZE: usize = 256;
+
+/// Value bytes with the compressibility RocksDB's own `db_bench` writes by
+/// default (`--compression_ratio=0.5`): a 1 MiB pool of 100-byte pieces, each
+/// 50 random printable bytes written twice, out of which consecutive values
+/// are cut in turn. A codec does real work on them and roughly halves them, on
+/// both engines alike. A constant fill would let any codec collapse every
+/// block, and the compressed groups would measure little beyond the codec's
+/// per-block setup.
+struct ValuePool {
+    bytes: Vec<u8>,
+}
+
+impl ValuePool {
+    const SIZE: usize = 1 << 20;
+    const PIECE: usize = 100;
+
+    fn new() -> Self {
+        // xorshift64 from a fixed seed: the same bytes on every run and host.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut bytes = Vec::with_capacity(Self::SIZE + Self::PIECE);
+        while bytes.len() < Self::SIZE {
+            let mut half = [0_u8; Self::PIECE / 2];
+            for byte in &mut half {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Printable ASCII, the alphabet RocksDB draws its pieces from;
+                // `state % 95` is below 95, so the cast cannot truncate.
+                *byte = b' ' + (state % 95) as u8;
+            }
+            bytes.extend_from_slice(&half);
+            bytes.extend_from_slice(&half);
+        }
+        bytes.truncate(Self::SIZE);
+        Self { bytes }
+    }
+
+    /// The `i`-th value: the pool's `i`-th `VALUE_SIZE` slice, wrapping at its
+    /// end as RocksDB's generator does. Each block holds distinct values, and a
+    /// block is compressed on its own, so the wrap gives a codec nothing to
+    /// match across blocks.
+    fn value(&self, i: u64) -> &[u8] {
+        let slots = (Self::SIZE / VALUE_SIZE) as u64;
+        let start = (i % slots) as usize * VALUE_SIZE;
+        &self.bytes[start..start + VALUE_SIZE]
+    }
 }
 
 /// Precomputed (key, value) workload for a given `n_keys`. Built
 /// ONCE outside the timing loop so the bench measures engine
-/// write throughput, not the per-key
-/// `key_for(i)` / `value_for(i)` allocation + fill cost (which
-/// otherwise dominates at the 1k / 10k scale).
+/// write throughput, not the per-key key derivation and value
+/// allocation cost (which otherwise dominates at the 1k / 10k scale).
 struct WorkloadInputs {
     keys: Vec<[u8; 16]>,
     values: Vec<Vec<u8>>,
@@ -510,11 +564,12 @@ struct WorkloadInputs {
 impl WorkloadInputs {
     fn build(n_keys: u64) -> Self {
         let n = usize::try_from(n_keys).expect("n_keys fits in usize");
+        let pool = ValuePool::new();
         let mut keys = Vec::with_capacity(n);
         let mut values = Vec::with_capacity(n);
         for i in 0..n_keys {
             keys.push(key_for(i));
-            values.push(value_for(i));
+            values.push(pool.value(i).to_vec());
         }
         Self { keys, values }
     }
@@ -914,7 +969,7 @@ fn point_read_variant(
     }
 
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in read_sizes(compression) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &(label, engine, strategy, row_cache) in &series {
@@ -944,7 +999,7 @@ fn point_read_variant(
                         WarmEngine::RocksDb { db, .. } => {
                             for key in &inputs.keys {
                                 assert!(
-                                    db.get(key).expect("rocksdb: verify").is_some(),
+                                    db.get_pinned(key).expect("rocksdb: verify").is_some(),
                                     "rocksdb: key unexpectedly missing"
                                 );
                             }
@@ -977,11 +1032,15 @@ fn point_read_variant(
                         });
                     }
                     WarmEngine::RocksDb { db, .. } => {
+                        // `get_pinned` hands back a view of the block, as our
+                        // `get` does; plain `get` would copy every value into a
+                        // fresh `Vec` and charge RocksDB an allocation ours
+                        // never pays.
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
                                 for key in &inputs.keys {
-                                    let got = db.get(key).expect("rocksdb: get");
+                                    let got = db.get_pinned(key).expect("rocksdb: get");
                                     std::hint::black_box(got);
                                 }
                             }
@@ -1285,7 +1344,7 @@ fn multi_get_variant(
         .collect();
 
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in read_sizes(compression) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
         for &(label, engine) in &series {
@@ -1404,19 +1463,19 @@ fn range_scan_variant(
     seeds: &mut SeedStates,
 ) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in read_sizes(compression) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for (label, engine, row_cache) in scan_series(compression) {
+        for &engine in engines_for(compression) {
             // Built once per arm on the first closure entry (see `WarmEngine`).
             let mut warm: Option<WarmEngine> = None;
-            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let warm = warm.get_or_insert_with(|| {
                     WarmEngine::build(
                         engine,
                         compression,
                         IndexStrategy::Binary,
-                        row_cache,
+                        false,
                         &inputs,
                         seeds,
                     )
@@ -1435,13 +1494,19 @@ fn range_scan_variant(
                         });
                     }
                     WarmEngine::RocksDb { db, .. } => {
+                        // The raw iterator lends each value out of the block, as
+                        // ours does; the boxed iterator would copy every key and
+                        // value into fresh allocations on RocksDB's side only.
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
-                                for kv in db.iterator(rocksdb::IteratorMode::Start) {
-                                    let (_k, v) = kv.expect("rocksdb: scan");
-                                    std::hint::black_box(v);
+                                let mut it = db.raw_iterator();
+                                it.seek_to_first();
+                                while it.valid() {
+                                    std::hint::black_box(it.value());
+                                    it.next();
                                 }
+                                it.status().expect("rocksdb: scan");
                             }
                             start.elapsed()
                         });
@@ -1484,19 +1549,19 @@ fn seek_random_variant(
     seeds: &mut SeedStates,
 ) {
     let mut group = c.benchmark_group(group_name);
-    for &n in &[1_000_u64, 10_000_u64, 70_000_u64] {
+    for &n in read_sizes(compression) {
         let inputs = WorkloadInputs::build(n);
         group.throughput(Throughput::Elements(n));
-        for (label, engine, row_cache) in scan_series(compression) {
+        for &engine in engines_for(compression) {
             // Built once per arm on the first closure entry (see `WarmEngine`).
             let mut warm: Option<WarmEngine> = None;
-            group.bench_with_input(BenchmarkId::new(label, n), &n, |b, _| {
+            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 let warm = warm.get_or_insert_with(|| {
                     WarmEngine::build(
                         engine,
                         compression,
                         IndexStrategy::Binary,
-                        row_cache,
+                        false,
                         &inputs,
                         seeds,
                     )
@@ -1519,16 +1584,16 @@ fn seek_random_variant(
                         });
                     }
                     WarmEngine::RocksDb { db, .. } => {
+                        // A fresh iterator per seek, as ours opens a fresh range;
+                        // the raw iterator lends the value instead of copying it.
                         b.iter_custom(|iters| {
                             let start = std::time::Instant::now();
                             for _ in 0..iters {
                                 for key in &inputs.keys {
-                                    let mut it = db.iterator(rocksdb::IteratorMode::From(
-                                        key,
-                                        rocksdb::Direction::Forward,
-                                    ));
-                                    let got = it.next().map(|kv| kv.expect("rocksdb: seek").1);
-                                    std::hint::black_box(got);
+                                    let mut it = db.raw_iterator();
+                                    it.seek(key);
+                                    std::hint::black_box(it.value());
+                                    it.status().expect("rocksdb: seek");
                                 }
                             }
                             start.elapsed()
@@ -1685,105 +1750,194 @@ const COMPACTION_FLUSHES: u64 = 6;
 /// `compaction_threads`; RocksDB via `compression_options_parallel_threads`).
 const COMPACTION_THREADS: usize = 4;
 
-/// Builds `COMPACTION_FLUSHES` zstd L0 tables from `inputs`, then times one full
-/// compaction. Setup (open + writes + flushes) is excluded from the returned
-/// `Duration` — only the compaction is measured. Both engines run 4-thread
-/// parallel block compression with `max_subcompactions = 1` (RocksDB), so the
-/// head-to-head isolates the same mechanism.
-fn run_compaction(
+/// Bottom-level target file size for the split shape's setup: small enough
+/// that the populated bottom level holds several tables — the boundaries
+/// the timed compaction splits on — on both engines.
+const SUBCOMPACTION_BOTTOM_TARGET: u64 = 1024 * 1024;
+/// Sub-compaction worker threads (ours: range-parallel split; RocksDB:
+/// `max_subcompactions`).
+const SUBCOMPACTION_THREADS: usize = 4;
+
+/// The two compaction head-to-heads.
+#[derive(Clone, Copy)]
+enum CompactionShape {
+    /// `COMPACTION_FLUSHES` overlapping L0 tables merged into one level, with
+    /// parallel block compression and no range split (RocksDB
+    /// `max_subcompactions = 1`), so both engines run the same mechanism.
+    Major,
+    /// A full-keyspace overwrite in `COMPACTION_FLUSHES` L0 tables merged into a
+    /// bottom level of several tables: the range-parallel split (ours
+    /// `subcompaction_min_bytes = 0`, so the bottom's table boundaries drive the
+    /// partition; RocksDB `max_subcompactions = 4`).
+    Split,
+}
+
+impl CompactionShape {
+    fn threads(self) -> usize {
+        match self {
+            Self::Major => COMPACTION_THREADS,
+            Self::Split => SUBCOMPACTION_THREADS,
+        }
+    }
+}
+
+/// Our tree as the compaction benches open it, on a fresh or a copied
+/// directory: zstd at `level` and the shape's threads.
+fn open_ours_for_compaction(
+    dir: &std::path::Path,
+    level: i32,
+    shape: CompactionShape,
+) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
+    let config = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
+    .compaction_threads(shape.threads())
+    .subcompaction_min_bytes(match shape {
+        // No range split, so this shape isolates parallel block compression,
+        // matching RocksDB's `max_subcompactions(1)`.
+        CompactionShape::Major => u64::MAX,
+        CompactionShape::Split => 0,
+    });
+    Ok(apply_preset(config, active_preset()).open()?)
+}
+
+/// RocksDB as the compaction benches open it. The block options are the
+/// matched ones every other group uses (see [`rocksdb_options`]): with a bare
+/// `Options::default()` RocksDB would write its compaction output without the
+/// bloom filter ours builds there, and skip that work.
+fn open_rocksdb_for_compaction(
+    dir: &std::path::Path,
+    level: i32,
+    shape: CompactionShape,
+) -> Result<rocksdb::DB, Box<dyn std::error::Error>> {
+    let mut opts = rocksdb_options(Compression::None, false);
+    // Hold every table where the setup put it until the compaction timed.
+    opts.set_disable_auto_compactions(true);
+    opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+    // (window_bits, level, strategy, max_dict_bytes); -14 = default window.
+    opts.set_compression_options(-14, level, 0, 0);
+    // Our compaction threads drive both the range split and the
+    // block-compression pool, so RocksDB gets both knobs.
+    opts.set_compression_options_parallel_threads(shape.threads() as i32);
+    match shape {
+        CompactionShape::Major => opts.set_max_subcompactions(1),
+        CompactionShape::Split => {
+            opts.set_max_subcompactions(SUBCOMPACTION_THREADS as u32);
+            // Several bottom files, so the split has boundaries to cut on.
+            opts.set_target_file_size_base(SUBCOMPACTION_BOTTOM_TARGET);
+        }
+    }
+    Ok(rocksdb::DB::open(&opts, dir)?)
+}
+
+/// RocksDB's manual compaction defaults to
+/// `bottommost_level_compaction = kIfHaveCompactionFilter`: with no compaction
+/// filter it leaves data above an existing bottom level instead of rewriting
+/// the bottom, a near no-op, whereas ours' `major_compact` merges everything
+/// into the bottom. `Force` makes both engines do the same work.
+fn force_bottommost() -> rocksdb::CompactOptions {
+    let mut compact_opts = rocksdb::CompactOptions::default();
+    compact_opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+    compact_opts
+}
+
+/// Writes the state a `shape` compaction starts from into `dir` and closes the
+/// engine. For [`CompactionShape::Split`] first a bottom level of several
+/// tables, then for both shapes the key set again in `COMPACTION_FLUSHES` L0
+/// tables, flushed at the interior boundaries and once more after the loop, so
+/// floor division leaves no stray remainder table.
+fn write_compaction_state(
     engine: Engine,
     level: i32,
+    shape: CompactionShape,
     inputs: &WorkloadInputs,
-) -> Result<Duration, Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+    dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let total = inputs.keys.len() as u64;
-    // Flush at the COMPACTION_FLUSHES-1 interior boundaries, then once more after
-    // the loop — exactly COMPACTION_FLUSHES L0 tables, with no stray remainder
-    // table from floor division.
-    let boundaries: Vec<u64> = (1..COMPACTION_FLUSHES)
+    let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
         .map(|b| (b * total) / COMPACTION_FLUSHES)
         .collect();
-
-    let elapsed = match engine {
+    let rows = || inputs.keys.iter().zip(inputs.values.iter());
+    match engine {
         Engine::Ours => {
-            let config = Config::new(
-                dir.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
-            .compaction_threads(COMPACTION_THREADS)
-            // Disable range-split sub-compaction so this bench isolates parallel
-            // block compression only, matching RocksDB's max_subcompactions(1).
-            .subcompaction_min_bytes(u64::MAX);
-            let tree = apply_preset(config, active_preset()).open()?;
-
-            let mut written = 0u64;
-            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
+            let tree = open_ours_for_compaction(dir, level, shape)?;
+            let mut base = 0;
+            if matches!(shape, CompactionShape::Split) {
+                for ((key, value), seqno) in rows().zip(0u64..) {
+                    tree.insert(key, value, seqno);
+                }
+                tree.flush_active_memtable(0)?;
+                tree.major_compact(SUBCOMPACTION_BOTTOM_TARGET, 0)?;
+                base = total;
+            }
+            // A newer seqno range, so the L0 copy supersedes the bottom one.
+            for (written, ((key, value), seqno)) in (1u64..).zip(rows().zip(base..)) {
                 tree.insert(key, value, seqno);
-                written += 1;
-                if boundaries.contains(&written) {
+                if flush_points.contains(&written) {
                     tree.flush_active_memtable(0)?;
                 }
             }
-            tree.flush_active_memtable(0)?; // final batch
-
-            let start = std::time::Instant::now();
-            tree.major_compact(u64::MAX, 0)?;
-            start.elapsed()
+            tree.flush_active_memtable(0)?;
         }
         Engine::RocksDb => {
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
-            // Hold L0 until the single explicit compaction we time below.
-            opts.set_disable_auto_compactions(true);
-            opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
-            // (window_bits, level, strategy, max_dict_bytes); -14 = default window.
-            opts.set_compression_options(-14, level, 0, 0);
-            // Same mechanism as ours: parallel block compression, no range split.
-            opts.set_compression_options_parallel_threads(COMPACTION_THREADS as i32);
-            opts.set_max_subcompactions(1);
-
-            // Force the bottommost level to actually compact. RocksDB's manual
-            // compaction defaults to `kIfHaveCompactionFilter` (skip bottommost
-            // without a filter); `Force` makes the timed compaction do the full
-            // merge-into-bottom, matching ours' `major_compact`.
-            let mut compact_opts = rocksdb::CompactOptions::default();
-            compact_opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
-
-            let db = rocksdb::DB::open(&opts, dir.path())?;
+            let db = open_rocksdb_for_compaction(dir, level, shape)?;
             let mut write_opts = rocksdb::WriteOptions::default();
             write_opts.disable_wal(true);
-
-            let mut written = 0u64;
-            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+            if matches!(shape, CompactionShape::Split) {
+                for (key, value) in rows() {
+                    db.put_opt(key, value, &write_opts)?;
+                }
+                db.flush()?;
+                db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &force_bottommost());
+            }
+            for (written, (key, value)) in (1u64..).zip(rows()) {
                 db.put_opt(key, value, &write_opts)?;
-                written += 1;
-                if boundaries.contains(&written) {
+                if flush_points.contains(&written) {
                     db.flush()?;
                 }
             }
-            db.flush()?; // final batch
-
-            let start = std::time::Instant::now();
-            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
-            start.elapsed()
+            db.flush()?;
         }
         // The compaction benches are zstd-level workloads; SurrealKV has no zstd
-        // codec, so `engines_for` never yields it for these groups (its variant
-        // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
-        Engine::SurrealKv => {
-            unreachable!("surrealkv is excluded from zstd-level compaction benches")
+        // codec, and blob_tree overlays only the read/write groups, so the
+        // compaction loop is fixed to ours+rocksdb. The arms exist only for
+        // exhaustiveness.
+        Engine::SurrealKv | Engine::BlobTree => {
+            unreachable!("the compaction benches run ours and rocksdb only")
         }
-        // blob_tree overlays only the read/write groups (where surrealkv runs),
-        // not the zstd-level compaction benches whose loop is fixed to
-        // ours+rocksdb. The arm exists only for exhaustiveness.
-        Engine::BlobTree => {
-            unreachable!("blob_tree is excluded from the zstd-level compaction benches")
+    }
+    Ok(())
+}
+
+/// Times one compaction of the state in `dir`: the open happens before the
+/// clock starts, so only the compaction is measured.
+fn time_compaction(
+    engine: Engine,
+    level: i32,
+    shape: CompactionShape,
+    dir: &std::path::Path,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    match engine {
+        Engine::Ours => {
+            let tree = open_ours_for_compaction(dir, level, shape)?;
+            let start = std::time::Instant::now();
+            tree.major_compact(u64::MAX, 0)?;
+            Ok(start.elapsed())
         }
-    };
-    drop(dir);
-    Ok(elapsed)
+        Engine::RocksDb => {
+            let db = open_rocksdb_for_compaction(dir, level, shape)?;
+            let compact_opts = force_bottommost();
+            let start = std::time::Instant::now();
+            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
+            Ok(start.elapsed())
+        }
+        Engine::SurrealKv | Engine::BlobTree => {
+            unreachable!("the compaction benches run ours and rocksdb only")
+        }
+    }
 }
 
 fn bench_compaction(c: &mut Criterion) {
@@ -1798,7 +1952,7 @@ fn bench_compaction(c: &mut Criterion) {
     // parallel block compression (RocksDB inherits the 4 threads from
     // `compression_opts`; ours via `compaction_threads`). As structured-zstd's
     // level-3 encoder improves, the gain shows directly against RocksDB here.
-    compaction_variant(c, "major_compact_zstd3", 3);
+    compaction_variant(c, "major_compact_zstd3", 3, CompactionShape::Major);
 }
 
 /// Reports compaction tail latency (P50/P95/P99) to stderr from per-iteration
@@ -1822,220 +1976,46 @@ fn report_percentiles(label: &str, mut samples: Vec<Duration>) {
     );
 }
 
-fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
+/// One compaction head-to-head: per size and engine, the starting state is
+/// written once (see [`write_compaction_state`]) and every iteration compacts
+/// a fresh copy of it, so an iteration times its compaction alone.
+fn compaction_variant(c: &mut Criterion, group_name: &str, level: i32, shape: CompactionShape) {
+    let sizes: &[u64] = match shape {
+        CompactionShape::Major => &[10_000, 40_000],
+        CompactionShape::Split => &[40_000, 100_000],
+    };
     let mut group = c.benchmark_group(group_name);
-    for &n in &[10_000_u64, 40_000_u64] {
-        let inputs = WorkloadInputs::build(n);
+    for &n in sizes {
+        let inputs = match shape {
+            CompactionShape::Major => WorkloadInputs::build(n),
+            CompactionShape::Split => WorkloadInputs::incompressible(n),
+        };
         group.throughput(Throughput::Elements(n));
         for engine in [Engine::Ours, Engine::RocksDb] {
+            let mut state: Option<tempfile::TempDir> = None;
             // Collected across every closure entry (Criterion re-enters the
             // routine for warm-up and per sample) and reported ONCE after the
-            // arm. Every iteration is an independent full compaction from a
-            // fresh on-disk state, so the warm-up iterations are the same
+            // arm. Every iteration is an independent full compaction of the
+            // same starting state, so the warm-up iterations are the same
             // population as the measured ones and belong in the distribution.
             let mut samples = Vec::new();
             group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        let elapsed = run_compaction(engine, level, &inputs).unwrap_or_else(|e| {
-                            panic!("run_compaction failed for {}: {e}", engine.label())
+                let state = state.get_or_insert_with(|| {
+                    let dir = tempfile::tempdir().expect("compaction state tempdir");
+                    write_compaction_state(engine, level, shape, &inputs, dir.path())
+                        .unwrap_or_else(|e| {
+                            panic!("compaction setup failed for {}: {e}", engine.label())
                         });
-                        samples.push(elapsed);
-                        total += elapsed;
-                    }
-                    total
+                    dir
                 });
-            });
-            report_percentiles(&format!("{group_name}/{}/{n}", engine.label()), samples);
-        }
-    }
-    group.finish();
-}
-
-/// High-entropy 256-byte value: an xorshift fill so zstd does real,
-/// parallelizable work during sub-compaction. The 0xAA `value_for`
-/// compresses to almost nothing, which would hide any compaction-CPU
-/// parallelism behind near-zero codec time.
-fn value_incompressible(i: u64) -> Vec<u8> {
-    let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    let mut v = vec![0_u8; 256];
-    for chunk in v.chunks_mut(8) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        let bytes = s.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    v
-}
-
-/// Precomputed high-entropy workload for the sub-compaction head-to-head,
-/// built once per `n` outside the timing loop.
-struct SubcompactionInputs {
-    keys: Vec<[u8; 16]>,
-    values: Vec<Vec<u8>>,
-}
-
-impl SubcompactionInputs {
-    fn build(n_keys: u64) -> Self {
-        let n = usize::try_from(n_keys).expect("n_keys fits in usize");
-        let mut keys = Vec::with_capacity(n);
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n_keys {
-            keys.push(key_for(i));
-            values.push(value_incompressible(i));
-        }
-        Self { keys, values }
-    }
-}
-
-/// Bottom-level target file size for the two-phase setup: small enough
-/// that the populated bottom level holds several tables — the boundaries
-/// the timed compaction splits on — on both engines.
-const SUBCOMPACTION_BOTTOM_TARGET: u64 = 1024 * 1024;
-/// Sub-compaction worker threads (ours: range-parallel split; RocksDB:
-/// `max_subcompactions`).
-const SUBCOMPACTION_THREADS: usize = 4;
-
-/// Times one range-parallel compaction: a full-keyspace overwrite (gen 1)
-/// merged into a pre-populated bottom level (gen 0). Only the second
-/// compaction is timed — the gen-0 populate and the gen-1 L0 writes are
-/// excluded. Ours forces the split (`subcompaction_min_bytes = 0`, so the
-/// populated bottom's table boundaries drive the range partition); RocksDB
-/// runs with `max_subcompactions = 4`, so the head-to-head isolates the
-/// range-parallel mechanism on both sides.
-fn run_subcompaction_bench(
-    engine: Engine,
-    level: i32,
-    inputs: &SubcompactionInputs,
-) -> Result<Duration, Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
-    let total = inputs.keys.len() as u64;
-    // Flush the gen-1 overwrite into COMPACTION_FLUSHES L0 tables.
-    let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
-        .map(|b| (b * total) / COMPACTION_FLUSHES)
-        .collect();
-
-    let elapsed = match engine {
-        Engine::Ours => {
-            let config = Config::new(
-                dir.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
-            .compaction_threads(SUBCOMPACTION_THREADS)
-            .subcompaction_min_bytes(0);
-            let tree = apply_preset(config, active_preset()).open()?;
-
-            // Step 1: populate the bottom level with several tables.
-            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
-                tree.insert(key, value, seqno);
-            }
-            tree.flush_active_memtable(0)?;
-            tree.major_compact(SUBCOMPACTION_BOTTOM_TARGET, 0)?;
-
-            // Step 2: overwrite the whole keyspace into fresh L0 tables.
-            let mut written = 0u64;
-            for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(total..) {
-                tree.insert(key, value, seqno);
-                written += 1;
-                if flush_points.contains(&written) {
-                    tree.flush_active_memtable(0)?;
-                }
-            }
-            tree.flush_active_memtable(0)?;
-
-            let start = std::time::Instant::now();
-            tree.major_compact(u64::MAX, 0)?;
-            start.elapsed()
-        }
-        Engine::RocksDb => {
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
-            opts.set_disable_auto_compactions(true);
-            opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
-            opts.set_compression_options(-14, level, 0, 0);
-            // Give RocksDB the matching parallelism knobs + a small target file
-            // size so the bottom level also splits into several files. Our
-            // compaction_threads drives BOTH range-split and the block-
-            // compression pool, so match both on the RocksDB side.
-            opts.set_compression_options_parallel_threads(SUBCOMPACTION_THREADS as i32);
-            opts.set_max_subcompactions(SUBCOMPACTION_THREADS as u32);
-            opts.set_target_file_size_base(SUBCOMPACTION_BOTTOM_TARGET);
-
-            let db = rocksdb::DB::open(&opts, dir.path())?;
-            let mut write_opts = rocksdb::WriteOptions::default();
-            write_opts.disable_wal(true);
-
-            // RocksDB's manual compaction defaults to
-            // `bottommost_level_compaction = kIfHaveCompactionFilter`: with no
-            // compaction filter it leaves the gen-1 overwrite at a higher level
-            // (reads still see it, newest-seqno wins) instead of rewriting the
-            // already-bottommost gen-0 data. That makes the timed compaction a
-            // near-no-op (it skips the expensive bottom rewrite), whereas ours'
-            // `major_compact` forces the full merge-into-bottom. Force RocksDB to
-            // rewrite the bottommost level so both engines do equivalent work.
-            let mut compact_opts = rocksdb::CompactOptions::default();
-            compact_opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
-
-            // Step 1: populate the bottom level.
-            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                db.put_opt(key, value, &write_opts)?;
-            }
-            db.flush()?;
-            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
-
-            // Step 2: overwrite the whole keyspace into fresh L0 tables.
-            let mut written = 0u64;
-            for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
-                db.put_opt(key, value, &write_opts)?;
-                written += 1;
-                if flush_points.contains(&written) {
-                    db.flush()?;
-                }
-            }
-            db.flush()?;
-
-            let start = std::time::Instant::now();
-            db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &compact_opts);
-            start.elapsed()
-        }
-        // The compaction benches are zstd-level workloads; SurrealKV has no zstd
-        // codec, so `engines_for` never yields it for these groups (its variant
-        // loop is fixed to ours+rocksdb). The arm exists only for exhaustiveness.
-        Engine::SurrealKv => {
-            unreachable!("surrealkv is excluded from zstd-level compaction benches")
-        }
-        // blob_tree overlays only the read/write groups (where surrealkv runs),
-        // not the zstd-level compaction benches whose loop is fixed to
-        // ours+rocksdb. The arm exists only for exhaustiveness.
-        Engine::BlobTree => {
-            unreachable!("blob_tree is excluded from the zstd-level compaction benches")
-        }
-    };
-    drop(dir);
-    Ok(elapsed)
-}
-
-fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
-    let mut group = c.benchmark_group(group_name);
-    for &n in &[40_000_u64, 100_000_u64] {
-        let inputs = SubcompactionInputs::build(n);
-        group.throughput(Throughput::Elements(n));
-        for engine in [Engine::Ours, Engine::RocksDb] {
-            // Same shape as `compaction_variant`: one buffer per arm, reported
-            // after the arm, warm-up iterations included (each is a full
-            // sub-compaction from a fresh clone of the master state).
-            let mut samples = Vec::new();
-            group.bench_with_input(BenchmarkId::new(engine.label(), n), &n, |b, _| {
                 b.iter_custom(|iters| {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
-                        let elapsed = run_subcompaction_bench(engine, level, &inputs)
+                        let work = tempfile::tempdir().expect("compaction work tempdir");
+                        copy_dir(state.path(), work.path()).expect("copy compaction state");
+                        let elapsed = time_compaction(engine, level, shape, work.path())
                             .unwrap_or_else(|e| {
-                                panic!("run_subcompaction_bench failed for {}: {e}", engine.label())
+                                panic!("compaction failed for {}: {e}", engine.label())
                             });
                         samples.push(elapsed);
                         total += elapsed;
@@ -2049,8 +2029,38 @@ fn subcompaction_variant(c: &mut Criterion, group_name: &str, level: i32) {
     group.finish();
 }
 
-/// Recursively copies `src` into `dst` (created if missing). Used by the
-/// clean-profile subcompaction bench to clone the pre-compact on-disk state.
+/// High-entropy 256-byte value: an xorshift fill so zstd spends the most
+/// time it can per block during sub-compaction, which is the work the
+/// range-parallel split exists to spread across threads.
+fn value_incompressible(i: u64) -> Vec<u8> {
+    let mut s = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut v = vec![0_u8; VALUE_SIZE];
+    for chunk in v.chunks_mut(8) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let bytes = s.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    v
+}
+
+impl WorkloadInputs {
+    /// The sub-compaction workload: the same keys with high-entropy values.
+    fn incompressible(n_keys: u64) -> Self {
+        let n = usize::try_from(n_keys).expect("n_keys fits in usize");
+        let mut keys = Vec::with_capacity(n);
+        let mut values = Vec::with_capacity(n);
+        for i in 0..n_keys {
+            keys.push(key_for(i));
+            values.push(value_incompressible(i));
+        }
+        Self { keys, values }
+    }
+}
+
+/// Recursively copies `src` into `dst` (created if missing): how a seeded or
+/// compaction starting state is handed to an arm or an iteration.
 fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -2065,89 +2075,13 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()>
     Ok(())
 }
 
-/// Builds our pre-compact subcompaction state (gen-0 compacted to the bottom,
-/// gen-1 overwrite flushed into `COMPACTION_FLUSHES` L0 tables) into `dir`, then
-/// drops the tree so the state is resident on disk for cloning.
-fn build_subcompaction_master(dir: &std::path::Path, level: i32, inputs: &SubcompactionInputs) {
-    let config = Config::new(
-        dir,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
-    .compaction_threads(SUBCOMPACTION_THREADS)
-    .subcompaction_min_bytes(0);
-    let tree = apply_preset(config, active_preset())
-        .open()
-        .expect("master: open");
-    let total = inputs.keys.len() as u64;
-    for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(0u64..) {
-        tree.insert(key, value, seqno);
-    }
-    tree.flush_active_memtable(0).expect("master: flush");
-    tree.major_compact(SUBCOMPACTION_BOTTOM_TARGET, 0)
-        .expect("master: bottom compact");
-    let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
-        .map(|b| (b * total) / COMPACTION_FLUSHES)
-        .collect();
-    let mut written = 0u64;
-    for ((key, value), seqno) in inputs.keys.iter().zip(inputs.values.iter()).zip(total..) {
-        tree.insert(key, value, seqno);
-        written += 1;
-        if flush_points.contains(&written) {
-            tree.flush_active_memtable(0).expect("master: flush");
-        }
-    }
-    tree.flush_active_memtable(0).expect("master: flush");
-}
-
-/// Clean timed-only subcompaction profile (ours). The pre-compact state is built
-/// ONCE into a master dir; each iteration clones it to a fresh dir and times
-/// ONLY `major_compact`. perf-recording this isolates the compaction cost (the
-/// clone + open are distinct symbols), unlike `subcompaction_zstd3` whose
-/// per-iteration input rebuild contaminates the flamegraph.
-fn bench_subcompaction_clean(c: &mut Criterion) {
-    let level = 3;
-    let n = 40_000u64;
-    let inputs = SubcompactionInputs::build(n);
-    let master = tempfile::tempdir().expect("master tempdir");
-    build_subcompaction_master(master.path(), level, &inputs);
-
-    let mut group = c.benchmark_group("subcompaction_clean");
-    group.bench_function(BenchmarkId::new("ours", n), |b| {
-        b.iter_custom(|iters| {
-            let mut elapsed = std::time::Duration::ZERO;
-            for _ in 0..iters {
-                let work = tempfile::tempdir().expect("work tempdir");
-                copy_dir(master.path(), work.path()).expect("clone master");
-                let config = Config::new(
-                    work.path(),
-                    SequenceNumberCounter::default(),
-                    SequenceNumberCounter::default(),
-                )
-                .data_block_compression_policy(CompressionPolicy::all(CompressionType::Zstd(level)))
-                .compaction_threads(SUBCOMPACTION_THREADS)
-                .subcompaction_min_bytes(0);
-                let tree = apply_preset(config, active_preset())
-                    .open()
-                    .expect("work: open");
-                let start = std::time::Instant::now();
-                tree.major_compact(u64::MAX, 0).expect("work: compact");
-                elapsed += start.elapsed();
-            }
-            elapsed
-        });
-    });
-    group.finish();
-}
-
 /// Sub-compaction head-to-head: our range-parallel split vs RocksDB
 /// `max_subcompactions`. Pinned to zstd level 3 — the level RocksDB actually
 /// applies to bottommost compaction output (see [`bench_compaction`]) — with
 /// both engines at 4-thread block compression, so the comparison is honest and
 /// tracks structured-zstd's level-3 encoder progress against RocksDB.
 fn bench_subcompaction(c: &mut Criterion) {
-    subcompaction_variant(c, "subcompaction_zstd3", 3);
+    compaction_variant(c, "subcompaction_zstd3", 3, CompactionShape::Split);
 }
 
 criterion_group!(
@@ -2155,7 +2089,118 @@ criterion_group!(
     bench_write_throughput,
     bench_seeded,
     bench_compaction,
-    bench_subcompaction,
-    bench_subcompaction_clean
+    bench_subcompaction
 );
-criterion_main!(benches);
+
+/// What each group measures, as the published page states it next to the
+/// group's chart. Kept here, beside the code that does the measuring.
+const GROUP_NOTES: &[(&str, &str)] = &[
+    (
+        "write_throughput",
+        "Bulk insert of N fresh keys into an empty engine, then one flush. Covers open, memtable inserts and the flush that writes the table.",
+    ),
+    (
+        "overwrite",
+        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush.",
+    ),
+    (
+        "point_read",
+        "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
+    ),
+    (
+        "multi_get",
+        "One batched lookup of the whole key set on a warm engine (RocksDB: batched_multi_get_cf).",
+    ),
+    (
+        "range_scan",
+        "A full forward scan reading every value on a warm engine.",
+    ),
+    (
+        "seek_random",
+        "A seek to each key in scattered order, reading the value under the cursor.",
+    ),
+    (
+        "major_compact_zstd3",
+        "Six overlapping L0 tables merged into one level, 4-thread block compression, no range split. zstd level 3, the level RocksDB applies to bottommost output.",
+    ),
+    (
+        "subcompaction_zstd3",
+        "A full overwrite in six L0 tables merged into a bottom level of several tables, split into 4 parallel ranges. High-entropy values. zstd level 3.",
+    ),
+];
+
+/// Where Criterion keeps its results for this run: `CRITERION_HOME` when set,
+/// otherwise `criterion/` under the cargo target directory.
+fn criterion_home() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("CRITERION_HOME") {
+        return home.into();
+    }
+    let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || std::path::PathBuf::from("target"),
+        std::path::PathBuf::from,
+    );
+    target.join("criterion")
+}
+
+/// Collects every `new/benchmark.json` + `new/estimates.json` pair under `dir`.
+fn collect_estimates(
+    dir: &std::path::Path,
+    out: &mut Vec<serde_json::Value>,
+) -> std::io::Result<()> {
+    let new = dir.join("new");
+    let (bench, estimates) = (new.join("benchmark.json"), new.join("estimates.json"));
+    if bench.is_file() && estimates.is_file() {
+        let bench: serde_json::Value = serde_json::from_slice(&std::fs::read(bench)?)?;
+        let estimates: serde_json::Value = serde_json::from_slice(&std::fs::read(estimates)?)?;
+        let mean = &estimates["mean"];
+        out.push(serde_json::json!({
+            "group": bench["group_id"],
+            "engine": bench["function_id"],
+            "n": bench["throughput"]["Elements"],
+            // Nanoseconds for one call of the routine: the whole key set.
+            "mean_ns": mean["point_estimate"],
+            "lower_ns": mean["confidence_interval"]["lower_bound"],
+            "upper_ns": mean["confidence_interval"]["upper_bound"],
+        }));
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            collect_estimates(&entry.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes `summary.json` beside Criterion's results: the run's preset and
+/// matrix, what each group measures, and the mean time (with its confidence
+/// interval) of every arm that ran. The published page is drawn from it.
+fn write_summary() -> std::io::Result<()> {
+    let home = criterion_home();
+    let mut results = Vec::new();
+    if home.is_dir() {
+        collect_estimates(&home, &mut results)?;
+    }
+    let groups: Vec<serde_json::Value> = GROUP_NOTES
+        .iter()
+        .map(|(name, note)| serde_json::json!({ "name": name, "note": note }))
+        .collect();
+    let summary = serde_json::json!({
+        "preset": active_preset().label(),
+        "matrix": if full_matrix() { "full" } else { "per-push" },
+        "groups": groups,
+        "results": results,
+    });
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(home.join("summary.json"), serde_json::to_vec(&summary)?)
+}
+
+/// `criterion_main!` with the summary written after the run.
+fn main() {
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    if let Err(e) = write_summary() {
+        panic!("compare-rocksdb: writing summary.json failed: {e}");
+    }
+}

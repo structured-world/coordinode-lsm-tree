@@ -1,5 +1,5 @@
 use crate::config::BenchConfig;
-use crate::db::{make_random_key, make_sequential_key, make_value, prefill_sequential, read_seqno};
+use crate::db::{ValuePool, make_random_key, make_sequential_key, prefill_sequential, read_seqno};
 use crate::reporter::Reporter;
 use crate::workloads::Workload;
 use lsm_tree::{AbstractTree, AnyTree};
@@ -34,6 +34,7 @@ impl Workload for ReadWhileWriting {
         let base_ops = config.num / reader_count as u64;
         let remainder = config.num % reader_count as u64;
         let barrier = Barrier::new(threads);
+        let values = ValuePool::new(config.value_size);
 
         // Timer starts before thread spawn — spawn overhead is negligible
         // (<1ms) compared to benchmark duration. Moving start() inside the
@@ -74,11 +75,10 @@ impl Workload for ReadWhileWriting {
                 // Writer inserts a fixed config.num keys — it may finish before
                 // readers, which is intentional (fixed write volume, measured read
                 // throughput). This matches RocksDB db_bench readwhilewriting.
-                for _ in 0..config.num {
+                for i in 0..config.num {
                     let key = make_random_key(config.key_size);
-                    let value = make_value(config.value_size);
                     let seq = seqno.fetch_add(1, Ordering::Relaxed);
-                    tree.insert(key, value, seq);
+                    tree.insert(key, values.value(i), seq);
                 }
             });
 
