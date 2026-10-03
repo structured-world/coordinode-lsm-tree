@@ -308,6 +308,97 @@ fn get_cells_refuses_a_plain_value() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A range read of cells hands out the rows written as cells, in key order,
+/// across the memtable and the tables, and passes over keys stored whole or
+/// deleted; a metadata-only update of every row through it writes no blob
+/// bytes.
+#[test]
+fn range_cells_reads_cell_rows_for_a_metadata_only_update() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 1_000];
+    tree.insert_cells("a", &bytes(&[b"draft", &body]), 0)?;
+    tree.insert("b-plain", "value", 1);
+    tree.insert_cells("c", &bytes(&[b"draft", &body]), 2)?;
+    tree.insert_cells("d-gone", &bytes(&[b"draft", &body]), 3)?;
+    tree.flush_active_memtable(0)?;
+    tree.remove("d-gone", 4);
+    tree.insert_cells("e", &bytes(&[b"draft", &body]), 5)?;
+    tree.flush_active_memtable(0)?;
+    // A row in the memtable is read as well as the flushed ones.
+    tree.insert_cells("f", &bytes(&[b"draft", b"short"]), 6)?;
+    let blob_bytes = tree.current_version().blob_files.on_disk_size();
+
+    let rows: Vec<RowCells> = tree
+        .range_cells::<&str, _>(.., SeqNo::MAX)?
+        .collect::<lsm_tree::Result<_>>()?;
+    let keys: Vec<&[u8]> = rows.iter().map(|row| &**row.key()).collect();
+    assert_eq!(keys, [&b"a"[..], b"c", b"e", b"f"]);
+
+    let in_range: Vec<RowCells> = tree
+        .range_cells("b".."d", SeqNo::MAX)?
+        .collect::<lsm_tree::Result<_>>()?;
+    assert_eq!(in_range.len(), 1, "only c lies in b..d");
+
+    for (seqno, row) in (10..).zip(&rows) {
+        let mut fields = row.fields()?;
+        fields[0].cell = Cell::Value(b"final");
+        tree.insert_cells(row.key().clone(), &fields, seqno)?;
+    }
+    drop(rows);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(
+        tree.current_version().blob_files.on_disk_size(),
+        blob_bytes,
+        "the update wrote no blob bytes"
+    );
+    for key in ["a", "c", "e"] {
+        assert_eq!(
+            tree.get(key, SeqNo::MAX)?.as_deref(),
+            Some(&framed(&[b"final", &body])[..])
+        );
+    }
+    assert_eq!(
+        tree.get("f", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", b"short"])[..])
+    );
+    Ok(())
+}
+
+/// Rows of one range read share the read: a row held after the others are
+/// dropped still resolves its object through a relocation that moved it,
+/// and its reference is then refused as stale.
+#[test]
+fn a_row_of_a_range_read_keeps_its_read() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?;
+    let body = vec![b'b'; 4_096];
+    stale_file_with_a_body(&tree, &body)?;
+
+    let mut rows = tree
+        .range_cells::<&str, _>(.., SeqNo::MAX)?
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
+    assert_eq!(rows.len(), 1);
+    let row = rows.remove(0);
+    drop(rows);
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+    assert_eq!(row.resolve(BODY)?.as_deref(), Some(&body[..]));
+    let stale = tree.insert_cells(
+        "doc",
+        &[Field::bytes(STATUS, b"x"), reference(&row, BODY)?],
+        2,
+    );
+    assert!(
+        matches!(stale, Err(lsm_tree::Error::BlobRef(_))),
+        "{stale:?}"
+    );
+    Ok(())
+}
+
 /// Builds a blob file holding `doc`'s body and a garbage value, so a major
 /// compaction relocates the body.
 fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {

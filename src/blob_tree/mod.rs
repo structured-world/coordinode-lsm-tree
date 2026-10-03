@@ -577,16 +577,9 @@ impl BlobTree {
         key: K,
         seqno: SeqNo,
     ) -> crate::Result<Option<field_row::RowCells>> {
-        // The version and the read's registration are taken together, under
-        // the history's read lock: an install records its releases under the
-        // write lock, so none newer than this version can go unrecorded.
-        let history = self.index.version_history.read();
-        let version = history.latest_version_ref().clone();
-        version.check_serves(seqno)?;
-        let token = history.released().register(version.version.id());
-        drop(history);
+        let read = self.cell_read(seqno)?;
         let Some(item) = crate::Tree::get_internal_entry_from_version(
-            &version,
+            &read.version,
             key.as_ref(),
             seqno,
             self.index.config.comparator.as_ref(),
@@ -600,11 +593,97 @@ impl BlobTree {
         Ok(Some(field_row::RowCells {
             key: item.key.user_key,
             row: item.value,
+            read: Arc::new(read),
+        }))
+    }
+
+    /// The rows written as cells in `range` as of `seqno`, in key order, each
+    /// with its references as references, as [`Self::get_cells`] reads one.
+    ///
+    /// A key whose version at `seqno` is stored whole rather than as cells is
+    /// passed over: read it with a plain range read. Every row comes from one
+    /// read, which keeps its objects readable and its references writable as
+    /// [`RowCells`](field_row::RowCells) describes, for as long as any of its
+    /// rows is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains; the iterator yields an error for a row it
+    /// cannot read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter};
+    /// # use lsm_tree::blob_tree::field_row::{Cell, Field};
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// for key in ["a", "b"] {
+    ///     tree.insert_cells(key, &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
+    /// }
+    /// tree.insert("plain", "value", 0);
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Publish every draft, keeping each body where it is.
+    /// let rows: Vec<_> = tree.range_cells::<&str, _>(.., 1)?.collect::<lsm_tree::Result<_>>()?;
+    /// assert_eq!(rows.len(), 2);
+    /// for row in &rows {
+    ///     let mut fields = row.fields()?;
+    ///     fields[0].cell = Cell::Value(b"final");
+    ///     tree.insert_cells(row.key().clone(), &fields, 1)?;
+    /// }
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn range_cells<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<
+        Box<dyn DoubleEndedIterator<Item = crate::Result<field_row::RowCells>> + Send + 'static>,
+    > {
+        let read = Arc::new(self.cell_read(seqno)?);
+        let rows = crate::Tree::create_internal_range_with_prefix_hash(
+            read.version.clone(),
+            &range,
+            seqno,
+            None,
+            self.index.config.merge_operator.clone(),
+            self.index.config.comparator.clone(),
+            None,
+            Some(self.blob_source()),
+        );
+        Ok(Box::new(rows.filter_map(move |item| match item {
+            Ok(item) if item.key.value_type.is_cell_row() => Some(Ok(field_row::RowCells {
+                key: item.key.user_key,
+                row: item.value,
+                read: Arc::clone(&read),
+            })),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })))
+    }
+
+    /// A reference-aware read as of `seqno`: the latest version and the
+    /// read's registration, taken together under the history's read lock. An
+    /// install records its releases under the write lock, so none newer than
+    /// this version can go unrecorded.
+    fn cell_read(&self, seqno: SeqNo) -> crate::Result<field_row::CellRead> {
+        let history = self.index.version_history.read();
+        let version = history.latest_version_ref().clone();
+        version.check_serves(seqno)?;
+        let token = history.released().register(version.version.id());
+        drop(history);
+        Ok(field_row::CellRead {
             tree: self.id(),
             version,
             source: self.blob_source(),
             token,
-        }))
+        })
     }
 
     /// Runs a projected columnar scan across the tree, as

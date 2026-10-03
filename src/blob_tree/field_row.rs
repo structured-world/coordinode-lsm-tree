@@ -175,15 +175,23 @@ impl<'a> Field<'a> {
 /// or garbage collection does in the meantime, and the references it hands
 /// out stay writable unless a later version let their object go.
 ///
-/// Returned by [`BlobTree::get_cells`](crate::BlobTree::get_cells).
+/// Returned by [`BlobTree::get_cells`](crate::BlobTree::get_cells) and
+/// [`BlobTree::range_cells`](crate::BlobTree::range_cells).
 pub struct RowCells {
     pub(crate) key: UserKey,
     pub(crate) row: crate::Slice,
-    /// The tree the row was read from.
+    /// The read the row came from, shared by every row of one range read.
+    pub(crate) read: alloc::sync::Arc<CellRead>,
+}
+
+/// One reference-aware read: what keeps the rows it hands out readable and
+/// their references writable.
+pub(crate) struct CellRead {
+    /// The tree the rows were read from.
     pub(crate) tree: crate::TreeId,
-    /// The version the read saw, kept for resolving the row's objects.
+    /// The version the read saw, kept for resolving the rows' objects.
     pub(crate) version: crate::version::SuperVersion,
-    /// Where the row's objects are read from.
+    /// Where the rows' objects are read from.
     pub(crate) source: super::BlobSource,
     /// The read's registration, which keeps the releases newer than its
     /// version on record for as long as the references are held.
@@ -194,13 +202,19 @@ impl core::fmt::Debug for RowCells {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RowCells")
             .field("key", &self.key)
-            .field("tree", &self.tree)
-            .field("version", &self.token.version())
+            .field("tree", &self.read.tree)
+            .field("version", &self.read.token.version())
             .finish_non_exhaustive()
     }
 }
 
 impl RowCells {
+    /// The key the row was read under.
+    #[must_use]
+    pub fn key(&self) -> &UserKey {
+        &self.key
+    }
+
     /// The row's fields in order, each holding a [`Cell::Value`] or a
     /// [`Cell::Ref`] bound to the row's key, ready to be written back in a
     /// newer version.
@@ -219,8 +233,8 @@ impl RowCells {
                     RowCell::Ref { indirection, .. } => Cell::Ref(BlobRef {
                         indirection,
                         key: &self.key,
-                        tree: self.tree,
-                        source: self.token.version(),
+                        tree: self.read.tree,
+                        source: self.read.token.version(),
                     }),
                 },
             })
@@ -243,9 +257,10 @@ impl RowCells {
         match &field.cell {
             RowCell::Value(bytes) => Ok(Some(crate::Slice::from(*bytes))),
             RowCell::Ref { indirection, .. } => {
-                let object = self
-                    .source
-                    .object(&self.version.version, &self.key, indirection)?;
+                let object =
+                    self.read
+                        .source
+                        .object(&self.read.version.version, &self.key, indirection)?;
                 if object.len() != indirection.size as usize {
                     return Err(Error::InvalidHeader(
                         "field row: referenced object differs from its recorded size",
