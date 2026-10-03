@@ -11,6 +11,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.1...v6.0.0) - 2026-10-03
+
+### Added
+
+- *(multi_get)* a multi-get its caller drives ([#781](https://github.com/structured-world/coordinode-lsm-tree/pull/781))
+- *(durability)* publish the flush barrier and cheapen its syncs ([#771](https://github.com/structured-world/coordinode-lsm-tree/pull/771))
+- *(columnar)* project across memtables, row tables and columnar tables ([#756](https://github.com/structured-world/coordinode-lsm-tree/pull/756))
+- *(compaction)* share one rate limiter across trees and retune it live ([#755](https://github.com/structured-world/coordinode-lsm-tree/pull/755))
+- *(compaction)* measure blob locality and relocate deeply interleaved files ([#742](https://github.com/structured-world/coordinode-lsm-tree/pull/742))
+- *(columnar)* encode column pages as light codecs, chosen per level ([#723](https://github.com/structured-world/coordinode-lsm-tree/pull/723))
+- *(columnar)* default to 16 KiB row groups of 4 KiB row pages ([#720](https://github.com/structured-world/coordinode-lsm-tree/pull/720))
+- *(columnar)* read column pages independently ([#709](https://github.com/structured-world/coordinode-lsm-tree/pull/709))
+- *(metrics)* measure bytes read, decoded and copied per emitted row ([#706](https://github.com/structured-world/coordinode-lsm-tree/pull/706))
+- *(filter)* [**breaking**] pack the BuRR solution matrix to r bits per row ([#690](https://github.com/structured-world/coordinode-lsm-tree/pull/690))
+
+### Fixed
+
+- *(compaction)* remove every output of a run that fails before install ([#803](https://github.com/structured-world/coordinode-lsm-tree/pull/803))
+- *(compaction)* advance the tight-space blob frontier past dropped pointers ([#800](https://github.com/structured-world/coordinode-lsm-tree/pull/800))
+- *(mvcc)* skip a key whose resolution fails, from either end ([#798](https://github.com/structured-world/coordinode-lsm-tree/pull/798))
+- *(blob_tree)* merge operands onto a base kept in the value log ([#789](https://github.com/structured-world/coordinode-lsm-tree/pull/789))
+- *(repair)* release cached blob descriptors before removing replacements ([#792](https://github.com/structured-world/coordinode-lsm-tree/pull/792))
+- *(repair)* stop on descriptor exhaustion and scan within the fd cache ([#776](https://github.com/structured-world/coordinode-lsm-tree/pull/776))
+- *(durability)* sync the directory of new blob files and edit logs ([#769](https://github.com/structured-world/coordinode-lsm-tree/pull/769))
+- *(config)* wire the partition size policies to the table writers ([#738](https://github.com/structured-world/coordinode-lsm-tree/pull/738))
+- *(writer)* rotate tables on per-key state, not only data bytes ([#728](https://github.com/structured-world/coordinode-lsm-tree/pull/728))
+- *(memtable)* return the successor a skiplist seek compared ([#731](https://github.com/structured-world/coordinode-lsm-tree/pull/731))
+- *(memtable)* stop committing 64 MiB per memtable ([#725](https://github.com/structured-world/coordinode-lsm-tree/pull/725))
+- rank merges by promoted cost, order number columns, bind block checksums ([#714](https://github.com/structured-world/coordinode-lsm-tree/pull/714))
+- *(manifest)* rotate when an edit outgrows one log record ([#703](https://github.com/structured-world/coordinode-lsm-tree/pull/703))
+- *(manifest)* name each table's place and refuse damage ([#698](https://github.com/structured-world/coordinode-lsm-tree/pull/698))
+
+### Performance
+
+- *(columnar_scan)* gather each scanned row once ([#806](https://github.com/structured-world/coordinode-lsm-tree/pull/806))
+- *(rate_limiter)* wait for the deadline or an event, not a 100 ms tick ([#805](https://github.com/structured-world/coordinode-lsm-tree/pull/805))
+- *(multi_get)* read a level stage by stage across its tables ([#772](https://github.com/structured-world/coordinode-lsm-tree/pull/772))
+- *(filter)* size filters by measured negative-probe load ([#748](https://github.com/structured-world/coordinode-lsm-tree/pull/748))
+- *(writer)* build filter partitions on the block pipeline's workers ([#747](https://github.com/structured-world/coordinode-lsm-tree/pull/747))
+- *(io_uring)* submit a batch in one message and hand reads over as they complete ([#744](https://github.com/structured-world/coordinode-lsm-tree/pull/744))
+- *(writer)* cut per-block coordination in parallel block prep ([#741](https://github.com/structured-world/coordinode-lsm-tree/pull/741))
+- *(columnar)* stream the projected scan within a payload budget ([#740](https://github.com/structured-world/coordinode-lsm-tree/pull/740))
+- *(columnar)* make a sparse scan follow the row page, not the group ([#717](https://github.com/structured-world/coordinode-lsm-tree/pull/717))
+
 ## [5.11.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.0...v5.11.1) - 2026-09-21
 
 ### Fixed
