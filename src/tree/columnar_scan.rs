@@ -1540,6 +1540,11 @@ impl ColumnarScan {
             return Ok(batch);
         }
         let mask = pred.matching_rows(&batch);
+        // Rows judged on their stored column before the gather all pass
+        // again: the batch goes on as gathered, not copied once more.
+        if mask.iter().all(|&keep| keep) {
+            return Ok(batch);
+        }
         let filtered = filter_batch(&batch, &mask)?;
         self.record_gather(&filtered);
         Ok(filtered)
@@ -1647,7 +1652,8 @@ impl ColumnarScan {
 
     /// The rows of `batch` that `mask` keeps, as the batch a singleton group
     /// yields, or `None` when it keeps none: every column but the `dropped`
-    /// ones the scan decoded for itself, gathered once, with the seqno column
+    /// ones the scan decoded for itself, gathered once (shared as decoded when
+    /// it keeps every row), with the seqno column
     /// written in the tree's global space as it is gathered (see
     /// [`Self::globalize_seqnos`]). The gather is charged.
     fn gather_kept(
@@ -1667,13 +1673,17 @@ impl ColumnarScan {
             return Ok(None);
         }
         let rows = batch.row_count as usize;
+        // Every row kept: a column goes on as decoded, shared rather than
+        // gathered, and only the seqno column is written anew.
+        let all = kept.len() == rows;
+        let mut copied = 0usize;
         let mut columns = Vec::with_capacity(batch.columns.len());
         for col in batch
             .columns
             .iter()
             .filter(|c| !dropped.contains(&c.column_id))
         {
-            columns.push(if col.column_id == COL_SEQNO && global != 0 {
+            let written = if col.column_id == COL_SEQNO && global != 0 {
                 let mut data = Vec::with_capacity(kept.len() * 8);
                 for &row in &kept {
                     let effective = fixed_u64_row(&col.data, row)?.checked_add(global).ok_or(
@@ -1690,14 +1700,22 @@ impl ColumnarScan {
                         .map(|bits| take_validity(bits, &kept)),
                     data: crate::Slice::from(data),
                 }
+            } else if all {
+                columns.push(col.clone());
+                continue;
             } else {
                 take_column(col, rows, &kept)?
-            });
+            };
+            copied += written.data.len() + written.validity.as_ref().map_or(0, Vec::len);
+            columns.push(written);
         }
         // A subset of the batch's rows, whose count is a u32.
         let row_count = u32::try_from(kept.len()).unwrap_or(batch.row_count);
         let out = ColumnBatch { row_count, columns };
-        self.record_gather(&out);
+        #[cfg(feature = "metrics")]
+        self.metrics.record_gather(copied);
+        #[cfg(not(feature = "metrics"))]
+        let _ = copied;
         Ok(Some(out))
     }
 

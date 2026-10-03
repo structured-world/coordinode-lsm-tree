@@ -540,6 +540,51 @@ fn a_dense_choice_reads_the_payload_with_the_rest() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A predicate that keeps every row costs the scan no copy of its output
+/// beyond the one a scan without a predicate makes: rows already judged on
+/// their stored column are not gathered again to apply it once more.
+#[test]
+fn a_predicate_keeping_every_row_copies_no_more_than_none() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    let rows = 2_000u32;
+    for i in 0..rows {
+        insert(
+            &tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &[b'n'; 200],
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let m = any.metrics();
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let every_price = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(rows.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+
+    let before = m.bytes_copied();
+    let all = rows_of_scan(&any, notes.clone(), None)?;
+    let unfiltered = m.bytes_copied() - before;
+    let before = m.bytes_copied();
+    let kept = rows_of_scan(&any, notes, Some(&every_price))?;
+    let filtered = m.bytes_copied() - before;
+    assert_eq!(kept, all);
+    assert!(
+        filtered <= unfiltered,
+        "copied {filtered} bytes with a predicate keeping every row, {unfiltered} without one"
+    );
+    Ok(())
+}
+
 /// A scan reads the objects of the version it was created on: a compaction
 /// that relocates the bodies, and drops the blob file they were in, between
 /// the scan's creation and its reads, changes nothing it returns.
