@@ -49,12 +49,38 @@ baseline. Select a preset with the `LSM_BENCH_PRESET` environment variable
 | `page_ecc` | off | RocksDB has no Page ECC |
 | `disable_cow_on_sst_files` | off | RocksDB has no FS-aware CoW control |
 | `use_reflink_for_checkpoint` | off | RocksDB has no reflink path |
+| `locator_policy` | disabled | RocksDB has no retrieval-ribbon locator |
+| index / filter partitioning | off at every level | matches RocksDB's default single index (`kBinarySearch`) and full filter per table |
+| index / filter pinning | pinned at every level | matches RocksDB's `cache_index_and_filter_blocks = false`: the table reader holds them, not the block cache |
 | `manifest_kv_checksums` | **on** | parity: matches RocksDB's per-record MANIFEST CRC32 |
 | block-level XXH3 checksum | **on** | parity: matches RocksDB's per-block checksum |
 
 The preset disables each opt-in explicitly even when it is already off by
 default, so the comparison stays honest if a default ever flips and so the full
 parity surface is documented in one place.
+
+## Same workload for every engine
+
+Beyond the preset, the harness gives every engine the same work:
+
+- **Values.** 256-byte values cut from one pool of half-compressible bytes,
+  the shape of RocksDB `db_bench`'s default value generator
+  (`--compression_ratio=0.5`), so a codec does the work it does on real data
+  rather than collapsing a constant run. The compaction scenario that splits
+  the output across threads uses incompressible values instead, so its output
+  spans enough tables to split.
+- **Reads without copies.** Point reads use RocksDB's `get_pinned` and scans
+  and seeks its `raw_iterator`, both zero-copy, the way our engine hands out
+  values.
+- **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB
+  LRU block cache on both sides, compaction scenarios included; no WAL.
+- **One untimed setup.** A read or overwrite scenario writes its starting
+  state once per engine, codec and size, and every timed iteration opens a
+  copy of it, so only the measured operation is timed.
+
+The run writes `target/criterion/summary.json` (every group and engine, the
+mean time and its 95% confidence interval per key count), which the published
+head-to-head page draws from.
 
 ## Running
 
