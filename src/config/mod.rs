@@ -278,6 +278,12 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub separation_threshold: u32,
 
+    /// Separation thresholds of the fields of rows written as cells, as
+    /// `(column, bytes)` pairs; a column without one uses
+    /// `separation_threshold`. See [`Self::cell_separation_threshold`].
+    #[doc(hidden)]
+    pub cell_separation_thresholds: alloc::vec::Vec<(u16, u32)>,
+
     #[doc(hidden)]
     pub staleness_threshold: f32,
 
@@ -316,11 +322,20 @@ pub struct BlobLocalityRelocation {
     pub budget: f32,
 }
 
+/// The threshold `thresholds` gives `column`, else `default`.
+pub(crate) fn cell_threshold(thresholds: &[(u16, u32)], default: u32, column: u16) -> u32 {
+    thresholds
+        .iter()
+        .find(|(set, _)| *set == column)
+        .map_or(default, |(_, bytes)| *bytes)
+}
+
 impl Default for KvSeparationOptions {
     fn default() -> Self {
         Self {
             file_target_size: /* 64 MiB */ 64 * 1_024 * 1_024,
             separation_threshold: /* 1 KiB */ 1_024,
+            cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
             age_cutoff: 0.25,
@@ -361,6 +376,49 @@ impl KvSeparationOptions {
     pub fn separation_threshold(mut self, bytes: u32) -> Self {
         self.separation_threshold = bytes;
         self
+    }
+
+    /// Sets the separation threshold of `column` in rows written as cells
+    /// (see [`BlobTree::insert_cells`](crate::BlobTree::insert_cells)): a
+    /// value field of that column goes to a blob file when it is at least
+    /// `bytes` long. Setting a column again replaces its threshold; a column
+    /// never set uses [`Self::separation_threshold`].
+    ///
+    /// A field that is always read with the row's compact attributes can stay
+    /// inline whatever its size (`u32::MAX`), and a field that is rarely read
+    /// can go to a blob file however small (`0`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::KvSeparationOptions;
+    ///
+    /// // Column 3 (status) never separates; column 4 (body) separates from 256 bytes.
+    /// let opts = KvSeparationOptions::default()
+    ///     .cell_separation_threshold(3, u32::MAX)
+    ///     .cell_separation_threshold(4, 256);
+    /// ```
+    #[must_use]
+    pub fn cell_separation_threshold(mut self, column: u16, bytes: u32) -> Self {
+        match self
+            .cell_separation_thresholds
+            .iter_mut()
+            .find(|(set, _)| *set == column)
+        {
+            Some(entry) => entry.1 = bytes,
+            None => self.cell_separation_thresholds.push((column, bytes)),
+        }
+        self
+    }
+
+    /// The separation threshold of the fields of `column`.
+    #[must_use]
+    pub(crate) fn cell_threshold(&self, column: u16) -> u32 {
+        cell_threshold(
+            &self.cell_separation_thresholds,
+            self.separation_threshold,
+            column,
+        )
     }
 
     /// Sets how many upcoming values a scan reads ahead in one batch.

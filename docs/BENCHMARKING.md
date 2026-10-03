@@ -91,6 +91,16 @@ and read through `AbstractTree::metrics()`.
 | `bytes_decoded` | Payload bytes produced after the transform — what decompression, decryption and Page-ECC verification turned the bytes read into, for blocks and for blob records alike. | Anything on a cached path: a cached block or blob is already decoded, so no transform runs for it. |
 | `bytes_copied` | Bytes moved by a **gather**: column-batch accumulation, batch filtering, row gathering by index, row-value reconstruction from sub-columns, a point read's copy of the matching rows out of the columns, the row-major block a columnar row group is re-encoded into, the copy of each uncompressed blob record out of a scan's read-ahead span (so a cached value does not pin the whole span), the partial decode of a large zstd block (the decoded prefix each time it grows, a resumed prefix moved back into the decoder's window, and the row block synthesized from the prefix, including one served from the partial cache), the validity bitmaps decoding a columnar page copies out of it (a `Plain` column's data is a view of its own page, which pins nothing else, so a narrow projection copies no data), the effective seqnos written over a bulk-ingested segment's local ones, the key and value a point read detaches into the row cache (so the cached row does not pin its block), and the key each resolved blob is cached under, on every read that performs one (single-segment and merged columnar scans, row iteration and point reads). The figure sums the bytes each of those operations produced, whether or not the read then returns a row: a point read of a missing key still decoded its block, a block refused after a copy still made it, and an intermediate gather that is copied again counts both times. A row read whose value is a single bytes column hands out views into the decoded column and charges nothing. A view is a view whatever its representation: a short key or value stored inline in its handle is not charged, because that inline copy costs no more than building the handle. | Transform output (that is `bytes_decoded`), write-path serialisation, the input decoding of compaction, repair and salvage (maintenance, not reads), the storage statistics report (monitoring), and moves that transfer ownership without duplicating bytes. |
 
+Four more figures describe what a projected scan's late reads spare. They are
+reported beside the three above, never in place of them.
+
+| Counter | Counts | Does not count |
+|---|---|---|
+| `bytes_materialized` | The bytes of the batches a projected columnar scan hands to its caller: what it assembled for the rows it returned, and nothing for a row it dropped. | Anything a scan did not return, and every read but a projected scan's. |
+| `payload_bytes_useful` | Of the payload pages a projected scan read for its chosen rows only (the pages of a field read after the rows were decided), the decoded bytes of those rows' cells. | Pages read with the rest, eagerly; blob objects. |
+| `payload_bytes_incidental` | Of the same pages, the decoded bytes of the rows not chosen: what a page holding one chosen row brings along. It shows where the chosen rows sit, together or one per page, apart from how many there are. | As `payload_bytes_useful`. |
+| `blob_bytes_prefetched` | The share of `blob_bytes_read` read ahead: the coalesced spans a scan reads before asking for each value in them, the gaps it reads to merge two records into one request included. | Values read on their own. |
+
 **Why the definitions are written down rather than inferred.** "Bytes read"
 can plausibly mean either bytes asked of the filesystem or bytes the device
 actually moved, and the two differ by the whole page cache. "Bytes copied"
@@ -166,7 +176,14 @@ measured on.
 | `columnar-scan-overlap-8` | The same rows written round-robin into eight flushed segments, so all eight form one overlapping group the scan merges. Same extra figures: the first batch comes after a bounded prefix of each segment, and the eight share one budget. |
 | `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. Read by a full scan, the pass where adjacent blobs are fetched ahead and merged into one read. |
 | `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. Read by the same full scan, so the gap to the well-placed figure is what placement costs. Both placement scenarios report **unsupported** under `--cache-mb 0`: the prefetch holds what it fetches in the cache, so without one placement cannot show. |
-| `blobs-filtered-before-fetch` | **Unsupported.** Needs materialization deferred past the filter, so discarded rows' blobs are never fetched. |
+| `blobs-filtered-before-fetch` | Rows written as cells into a blob tree with columnar tables, an 8 KiB payload in blob files scattered by rewrite rounds, read by the projected scan with a ~1% predicate on a field of its own: the payload of a row the predicate drops is never fetched. |
+| `wide-cells-projected` | Rows written as cells with a 4 KiB payload in blob files, projected to a header field alone: no blob is read at all. The cell-row counterpart of `wide-records-projected`. |
+| `cells-scan-sparse-clustered` | Rows written as cells with a 64-byte payload kept in its column, a ~1% predicate keeping runs of neighbouring keys: the payload is read only from the few pages holding them (`payload_bytes_incidental` stays small). |
+| `cells-scan-sparse-one-per-page` | The same rows, a predicate keeping about one row in each row page: every payload page holds a kept row, so a late read spares no I/O and must cost no more than an eager one; what it spares is materialising the rows dropped (`bytes_materialized`). |
+| `cells-scan-sparse-one-per-page-eager` | The `cells-scan-sparse-one-per-page` rows read whole, the predicate applied by the caller: the time the late read is held against. |
+| `cells-scan-near-full` | The same rows, a ~90% predicate: the scan reads the payload with the rest once its choices are dense. |
+| `cells-scan-near-full-eager` | The `cells-scan-near-full` rows read whole, the predicate applied by the caller: the sequential pass the density decision must not lose to. |
+| `cells-scan-under-compaction` | The `blobs-filtered-before-fetch` scan repeated forty times while a second thread writes other rows, flushes and compacts, so blob files are relocated and dropped under the scans. Each repetition is verified; it publishes the scans' `scan P50` and `scan P99` in microseconds and no byte series, since the compacting thread reads and copies through the same counters. |
 
 The selective scans hand the predicate to the engine rather than filtering
 returned rows: a harness-side filter would make every selectivity cost the same
@@ -189,7 +206,9 @@ one line rather than a fresh argument about what the expected result is.
 
 **On the dashboard** this workload publishes one series per scenario per
 counter, named `mixed-layout / <scenario> bytes read per row` (and
-`… bytes decoded per row`, `… bytes copied per row`), in place of the ops/sec
+`… bytes decoded per row`, `… bytes copied per row`, and, for a projected
+scan, `… bytes materialized per row` and `… payload bytes useful per row` /
+`… payload bytes incidental per row` where it read a payload late), in place of the ops/sec
 every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in

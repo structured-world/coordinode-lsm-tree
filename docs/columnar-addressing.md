@@ -220,19 +220,35 @@ rewrites a split table through the row path folds its fields back into one
 value, framed by type with no column ids, so after it the fields exist only
 inside the whole value.
 
+A blob tree's table holds a third kind: rows written as cells, each a
+sequence of fields that name their column id and type. Such a table splits
+each cell row into the columns its fields name, under their own types; a
+field whose bytes sit in a blob file is null in its column and listed, with
+its type and whether the row owns its object, in the references column
+`u16::MAX - 1`. Every other row, and a cell row whose fields do not fit the
+group's columns, keeps its value whole in the whole-value column `u16::MAX`,
+null for a split row. A row comes back exactly as it was written: its fields
+are stored in ascending column order, so its fields and references encode to
+the stored row again. The two top ids are the engine's, and an ingested batch
+may not use them, so a group that holds the whole-value column is known to
+hold cell rows.
+
 **So every columnar table records which layout its values use**, in the
-descriptor property `descriptor#value_layout`: `0` whole, `1` split. A table
-without the property stores values whole. A writer fixes the layout with its
-first columnar block and holds one per table; an ingestion that writes rows
-after batches, or batches after rows, starts a new table at the switch. A
-rewrite that re-emits a source's blocks unchanged keeps the source's layout.
+descriptor property `descriptor#value_layout`: `0` whole, `1` split, `2`
+cells. A table without the property stores values whole. A writer fixes the
+layout with its first columnar block and holds one per table; an ingestion
+that writes rows after batches, or batches after rows, starts a new table at
+the switch. A rewrite that re-emits a source's blocks unchanged keeps the
+source's layout.
 
 A reader asks for a field by id only of a split table. Of a whole one it reads
 the value and hands it to the caller's projector, the only party that knows
 how the value encodes its fields; a missing column of a whole table says
 nothing about whether the field exists. The scan does this only for the rows
 it returns, once the newest visible version of each key is chosen, so a
-shadowed, deleted or too-new version is never read through the projector.
+shadowed, deleted or too-new version is never read through the projector. Of
+a cells table it reads a field's own column, and the object of a field held
+by reference only for a row it returns and only when the field is projected.
 
 ## What this means for the conversion
 

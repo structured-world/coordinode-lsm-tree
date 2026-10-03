@@ -122,10 +122,6 @@ impl<'a> Reader<'a> {
     /// Returns the header / checksum / decompression errors of a malformed
     /// record; a caller that prefetched speculatively should treat
     /// them as "leave this one to the read path" rather than as fatal.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "blob validation path is kept in one function so error handling and size checks stay co-located"
-    )]
     pub fn parse_record(
         &self,
         key: &[u8],
@@ -133,6 +129,38 @@ impl<'a> Reader<'a> {
         record: &crate::Slice,
         decoded: &mut usize,
     ) -> crate::Result<UserValue> {
+        let (raw_data, real_val_len) = Self::check_record(key, vhandle, record)?;
+        self.decode(raw_data, real_val_len, decoded)
+    }
+
+    /// Reads one record and returns its value as stored, still in the file's
+    /// codec, with its decoded length: what a verbatim copy into another
+    /// file of the same codec writes.
+    ///
+    /// The record is validated as [`Self::parse_record`] validates it, short
+    /// of decompressing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file's read failures and the header / checksum errors of a
+    /// malformed record.
+    pub fn read_raw(
+        &self,
+        key: &[u8],
+        vhandle: &ValueHandle,
+    ) -> crate::Result<(crate::Slice, usize)> {
+        let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
+        Self::check_record(key, vhandle, &record)
+    }
+
+    /// Validates a record's header, key and checksum against `key` and
+    /// `vhandle`, and returns its stored value with the declared decoded
+    /// length.
+    fn check_record(
+        key: &[u8],
+        vhandle: &ValueHandle,
+        record: &crate::Slice,
+    ) -> crate::Result<(crate::Slice, usize)> {
         let value = record;
         let mut reader = Cursor::new(&value[..]);
 
@@ -230,6 +258,16 @@ impl<'a> Reader<'a> {
             }
         }
 
+        Ok((raw_data, real_val_len))
+    }
+
+    /// Decodes a validated record's stored value under the file's codec.
+    fn decode(
+        &self,
+        raw_data: crate::Slice,
+        real_val_len: usize,
+        decoded: &mut usize,
+    ) -> crate::Result<UserValue> {
         #[warn(clippy::match_single_binding)]
         let value = match &self.blob_file.0.meta.compression {
             CompressionType::None => {

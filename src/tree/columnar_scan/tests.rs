@@ -13,6 +13,7 @@ fn empty_scan(metrics: alloc::sync::Arc<crate::Metrics>) -> ColumnarScan {
         projector: None,
         declared: false,
         resolver: None,
+        cells: None,
         predicate: None,
         support: PredicateSupport::Exact,
         comparator: crate::comparator::default_comparator(),

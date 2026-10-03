@@ -79,6 +79,17 @@ struct ScanPass {
     retained: u64,
 }
 
+/// A pass repeated while something else runs against the tree, reporting
+/// each repetition's latency besides its rows.
+type LatencyFn = fn(&Fixture) -> lsm_tree::Result<LatencyPass>;
+
+/// What a repeated pass measured: the rows of all its repetitions and how
+/// long each took.
+struct LatencyPass {
+    rows: u64,
+    latencies: Vec<Duration>,
+}
+
 /// Whether a scenario's native path exists in this build.
 enum Support {
     /// Runs, through this read pass, and its figures mean what the scenario
@@ -87,6 +98,9 @@ enum Support {
     /// Runs, through this batch scan, which also reports its first batch and
     /// what it held.
     Scan(ScanFn),
+    /// Runs, through this repeated pass, which also reports the P50 and P99
+    /// of its repetitions.
+    Latency(LatencyFn),
     /// The capability it measures has not landed. Carries the reason, which
     /// names the missing piece rather than saying "skipped". There is no read
     /// pass to hold, which is the point of pairing the two in one enum: a
@@ -104,6 +118,13 @@ struct Readings {
     bytes_read: u64,
     bytes_decoded: u64,
     bytes_copied: u64,
+    /// What projected scans handed out, per row returned.
+    bytes_materialized: u64,
+    /// Of the payload read late, the chosen rows' cells and what came along.
+    payload_useful: u64,
+    payload_incidental: u64,
+    /// The blob bytes read ahead in coalesced spans.
+    blob_prefetched: u64,
     elapsed: std::time::Duration,
     /// For a batch scan: its first batch and what it held.
     scan: Option<ScanFigures>,
@@ -130,6 +151,12 @@ impl Readings {
     ) -> lsm_tree::Result<Self> {
         let m = tree.metrics();
         let (r0, d0, c0) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
+        let (mat0, use0, inc0, pre0) = (
+            m.bytes_materialized(),
+            m.payload_bytes_useful(),
+            m.payload_bytes_incidental(),
+            m.blob_bytes_prefetched(),
+        );
         let start = Instant::now();
         let rows = body()?;
         let elapsed = start.elapsed();
@@ -139,6 +166,10 @@ impl Readings {
             bytes_read: m.bytes_read() - r0,
             bytes_decoded: m.bytes_decoded() - d0,
             bytes_copied: m.bytes_copied() - c0,
+            bytes_materialized: m.bytes_materialized() - mat0,
+            payload_useful: m.payload_bytes_useful() - use0,
+            payload_incidental: m.payload_bytes_incidental() - inc0,
+            blob_prefetched: m.blob_bytes_prefetched() - pre0,
             elapsed,
             scan: None,
         })
@@ -194,12 +225,18 @@ impl Readings {
         // `keys` is the working set the scenario built. Each fixture caps it
         // on its own, so it is the size the series describes, not `--num`.
         let annotation = format!(
-            "keys: {} | rows: {} | read: {} B | decoded: {} B | copied: {} B | elapsed: {:?}",
+            "keys: {} | rows: {} | read: {} B | decoded: {} B | copied: {} B | \
+             materialized: {} B | payload useful: {} B | payload incidental: {} B | \
+             blob prefetched: {} B | elapsed: {:?}",
             self.keys,
             self.rows,
             self.bytes_read,
             self.bytes_decoded,
             self.bytes_copied,
+            self.bytes_materialized,
+            self.payload_useful,
+            self.payload_incidental,
+            self.blob_prefetched,
             self.elapsed,
         );
         for (counter, value) in [("read", read), ("decoded", decoded), ("copied", copied)] {
@@ -210,6 +247,36 @@ impl Readings {
                 annotation.clone(),
                 Direction::SmallerIsBetter,
             );
+        }
+        // A projected scan's own figures, published only where one ran: a row
+        // read materialises nothing through a scan and reads no payload late.
+        if let Some(materialized) = self
+            .per_row(self.bytes_materialized)
+            .filter(|_| self.bytes_materialized > 0)
+        {
+            reporter.publish_series(
+                format!("{scenario} bytes materialized per row"),
+                materialized,
+                "B/row",
+                annotation.clone(),
+                Direction::SmallerIsBetter,
+            );
+        }
+        if self.payload_useful + self.payload_incidental > 0 {
+            for (counter, value) in [
+                ("useful", self.payload_useful),
+                ("incidental", self.payload_incidental),
+            ] {
+                if let Some(value) = self.per_row(value) {
+                    reporter.publish_series(
+                        format!("{scenario} payload bytes {counter} per row"),
+                        value,
+                        "B/row",
+                        annotation.clone(),
+                        Direction::SmallerIsBetter,
+                    );
+                }
+            }
         }
         let Some(scan) = &self.scan else {
             return;
@@ -263,6 +330,17 @@ impl Readings {
             fmt_ratio(ratio(self.bytes_copied, self.bytes_decoded), 2),
             self.elapsed,
         );
+        if self.bytes_materialized + self.payload_useful + self.payload_incidental > 0 {
+            eprintln!(
+                "  {:<34} materialized/row={:<9} payload useful={} B incidental={} B \
+                 blob prefetched={} B",
+                "",
+                per_row(self.bytes_materialized),
+                self.payload_useful,
+                self.payload_incidental,
+                self.blob_prefetched,
+            );
+        }
         if let Some(scan) = &self.scan {
             let first = scan.first_batch.map_or_else(
                 || "no batch".to_string(),
@@ -488,6 +566,275 @@ fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
     })
 }
 
+/// Where a cell-row scan's predicate is applied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    /// In the engine, before the payload of a dropped row is read.
+    Engine,
+    /// By the caller, over rows the engine returned with every projected
+    /// field: the sequential pass a late read must not lose to.
+    Caller,
+}
+
+/// Scans a cell-row fixture with a predicate on one of its filter fields,
+/// projecting the key, the sparse field and, when `payload`, the value, and
+/// checks each row against the write history.
+///
+/// With [`Filter::Engine`] the predicate runs over the field's own column and
+/// the payload of a row it drops is never read, from its page or from its
+/// blob file, which is what the late-materialization scenarios measure; with
+/// [`Filter::Caller`] every row comes back whole and the caller drops it.
+#[expect(
+    clippy::expect_used,
+    reason = "a scan missing a projected column or row is a wrong result, and a verify pass panics on one"
+)]
+fn verify_cells_scan(
+    fixture: &Fixture,
+    predicate: Option<&ColumnRangePredicate>,
+    filter: Filter,
+    selects: impl Fn(u64) -> bool,
+    payload: bool,
+) -> lsm_tree::Result<u64> {
+    use lsm_tree::{Absent, ProjectedField, Projection};
+
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a cell-row scan needs a cell-row fixture");
+    };
+    let mut projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(ProjectedField::new(
+            fixtures::CELL_GROUP,
+            fixtures::u64_be(),
+            Absent::Error,
+        )?);
+    if payload {
+        projection = projection.field(ProjectedField::new(
+            fixtures::CELL_PAYLOAD,
+            lsm_tree::table::columnar::TypeTag::Bytes,
+            Absent::Error,
+        )?);
+    }
+    // A blob tree filters on a field it is told the type of: the predicate's
+    // field is declared too, and comes back beside the others.
+    if let Some(predicate) = predicate
+        && predicate.column_id != fixtures::CELL_GROUP
+    {
+        projection = projection.field(ProjectedField::new(
+            predicate.column_id,
+            fixtures::u64_be(),
+            Absent::Error,
+        )?);
+    }
+    let in_engine = predicate.filter(|_| filter == Filter::Engine);
+    let mut check = lockstep(fixture, |v| selects(v.seed));
+    for batch in fixture
+        .tree
+        .columnar_scan(projection, in_engine, SeqNo::MAX, ..)?
+    {
+        let batch = batch?;
+        let column = |id| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .expect("the scan returns every projected column")
+        };
+        let (keys, groups) = (column(COL_USER_KEY), column(fixtures::CELL_GROUP));
+        for row in 0..batch.row_count {
+            if filter == Filter::Caller
+                && let Some(predicate) = predicate
+            {
+                let at = row as usize * 8;
+                let value = column(predicate.column_id)
+                    .data
+                    .get(at..at + 8)
+                    .expect("a filter field per row");
+                // Big-endian u64 bounds order as the values do.
+                let kept = predicate.lower.as_deref().is_none_or(|lo| value >= lo)
+                    && predicate.upper.as_deref().is_none_or(|hi| value <= hi);
+                if !kept {
+                    continue;
+                }
+            }
+            let key = fixtures::bytes_cell(keys, batch.row_count, row)
+                .expect("a returned column holds every row it counts");
+            let at = row as usize * 8;
+            let group = groups.data.get(at..at + 8).expect("a group per row");
+            let mut seen = group.to_vec();
+            if payload {
+                seen.extend_from_slice(
+                    fixtures::bytes_cell(column(fixtures::CELL_PAYLOAD), batch.row_count, row)
+                        .expect("a returned column holds every row it counts"),
+                );
+            }
+            check.check(key, &seen, |v| {
+                let [group, ..] = fixtures::cell_fields(v.seed, spread);
+                let mut want = group.to_vec();
+                if payload {
+                    want.extend_from_slice(&v.bytes());
+                }
+                Ok(want)
+            })?;
+        }
+    }
+    Ok(check.finish())
+}
+
+/// ~1% of a cell-row tree, in a few runs of neighbouring keys: the payload
+/// of the few pages holding them is all a late read takes.
+fn cells_sparse_clustered(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_CLUSTER, 0, 0)),
+        Filter::Engine,
+        |seed| fixtures::cluster_of(seed) == 0,
+        true,
+    )
+}
+
+/// About one row in each row page, filtered by `filter`: every page of the
+/// payload holds a kept row, so the late read can spare no page, and must not
+/// cost more than the eager one; what it spares is materialising the rows
+/// dropped.
+fn cells_one_per_page(fixture: &Fixture, filter: Filter) -> lsm_tree::Result<u64> {
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a cell-row scan needs a cell-row fixture");
+    };
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_SPREAD, 0, 0)),
+        filter,
+        move |seed| seed % spread == 0,
+        true,
+    )
+}
+
+/// One row per page, filtered in the engine.
+fn cells_sparse_one_per_page(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_one_per_page(fixture, Filter::Engine)
+}
+
+/// One row per page, every row read whole and filtered by the caller: the
+/// time the engine's late read is held against.
+fn cells_sparse_one_per_page_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_one_per_page(fixture, Filter::Caller)
+}
+
+/// ~90% of a cell-row tree, filtered by `filter`: nearly every page holds a
+/// kept row.
+fn cells_dense(fixture: &Fixture, filter: Filter) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_BUCKET, 1, 9)),
+        filter,
+        |seed| fixtures::bucket_of(seed) != 0,
+        true,
+    )
+}
+
+/// ~90% of a cell-row tree, filtered in the engine.
+fn cells_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_dense(fixture, Filter::Engine)
+}
+
+/// ~90% of a cell-row tree, every row read whole and filtered by the caller:
+/// the sequential pass the engine's density decision must not lose to.
+fn cells_near_full_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_dense(fixture, Filter::Caller)
+}
+
+/// The header field of every wide cell row, without its payload: no blob is
+/// read at all.
+fn cells_projected(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    let blobs = fixture.tree.metrics().blob_read_count();
+    let rows = verify_cells_scan(fixture, None, Filter::Engine, |_| true, false)?;
+    assert_eq!(
+        fixture.tree.metrics().blob_read_count(),
+        blobs,
+        "a projection of the header fields read a payload"
+    );
+    Ok(rows)
+}
+
+/// ~1% of the scattered blobs: the payload of the rows the predicate drops is
+/// never fetched.
+fn cells_blobs_filtered(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_GROUP, 0, 0)),
+        Filter::Engine,
+        |seed| fixtures::group_of(seed) == 0,
+        true,
+    )
+}
+
+/// The sparse projected scan of the scattered cell rows, repeated while a
+/// second thread rewrites other rows, flushes and compacts, so blob files are
+/// relocated and dropped under the scans: each repetition is verified
+/// against the write history and timed.
+///
+/// The rows the other thread writes hold a sparse field the predicate drops,
+/// so the write history of the scanned rows stays what the fixture recorded.
+fn cells_scan_under_compaction(fixture: &Fixture) -> lsm_tree::Result<LatencyPass> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Repetitions of the scan.
+    const SCANS: usize = 40;
+    let stop = Arc::new(AtomicBool::new(false));
+    let tree = fixture.tree.clone();
+    let churning = Arc::clone(&stop);
+    let churn = std::thread::spawn(move || -> lsm_tree::Result<u64> {
+        let AnyTree::Blob(blob) = &tree else {
+            return Ok(0);
+        };
+        let mut seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+        let mut rounds = 0;
+        // A row the predicate drops: its sparse field is never zero.
+        let group = 1u64.to_be_bytes();
+        let payload = vec![b'c'; 8_192];
+        while !churning.load(Ordering::Relaxed) {
+            for j in 0..64u64 {
+                let fields = [
+                    lsm_tree::blob_tree::field_row::Field {
+                        column: fixtures::CELL_GROUP,
+                        tag: fixtures::u64_be(),
+                        cell: lsm_tree::blob_tree::field_row::Cell::Value(&group),
+                    },
+                    lsm_tree::blob_tree::field_row::Field::bytes(fixtures::CELL_PAYLOAD, &payload),
+                ];
+                blob.insert_cells(format!("zz{j:04}"), &fields, seqno)?;
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(64 * 1_024 * 1_024, SeqNo::MAX)?;
+            rounds += 1;
+        }
+        Ok(rounds)
+    });
+
+    let mut latencies = Vec::with_capacity(SCANS);
+    let mut rows = 0;
+    let scanned = (|| -> lsm_tree::Result<()> {
+        for _ in 0..SCANS {
+            let start = Instant::now();
+            rows += cells_blobs_filtered(fixture)?;
+            latencies.push(start.elapsed());
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let rounds = churn
+        .join()
+        .map_err(|_| lsm_tree::Error::FeatureUnsupported("the compacting thread panicked"))??;
+    scanned?;
+    eprintln!(
+        "  {:<34} {rounds} rewrite and compaction rounds ran under the scans",
+        ""
+    );
+    Ok(LatencyPass { rows, latencies })
+}
+
 /// Every visible row, resolved in key order.
 ///
 /// The blob scenarios read through this rather than through point reads: a
@@ -650,13 +997,68 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
         },
         Scenario {
             name: "blobs-filtered-before-fetch",
-            fixture: fixtures::blobs_scattered,
-            support: Support::Missing(
-                "needs materialization deferred past the filter, so the blob \
-                 reads of discarded rows are never issued",
-            ),
+            fixture: fixtures::cells_scattered,
+            support: Support::Native(cells_blobs_filtered),
+        },
+        Scenario {
+            name: "wide-cells-projected",
+            fixture: fixtures::cells_wide,
+            support: Support::Native(cells_projected),
+        },
+        Scenario {
+            name: "cells-scan-sparse-clustered",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_clustered),
+        },
+        Scenario {
+            name: "cells-scan-sparse-one-per-page",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_one_per_page),
+        },
+        Scenario {
+            name: "cells-scan-sparse-one-per-page-eager",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_one_per_page_eager),
+        },
+        Scenario {
+            name: "cells-scan-near-full",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_near_full),
+        },
+        Scenario {
+            name: "cells-scan-near-full-eager",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_near_full_eager),
+        },
+        Scenario {
+            name: "cells-scan-under-compaction",
+            fixture: fixtures::cells_scattered,
+            support: Support::Latency(cells_scan_under_compaction),
         },
     ]
+}
+
+/// The latency at percentile `p` of `latencies`, in microseconds.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a percentile of a few dozen durations, far below f64's exact range"
+)]
+fn percentile_us(latencies: &[Duration], p: f64) -> f64 {
+    let mut sorted: Vec<Duration> = latencies.to_vec();
+    sorted.sort_unstable();
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0.0;
+    };
+    // Nearest rank, the definition a short series is read by.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a rank within the series, between 0 and its length"
+    )]
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted
+        .get(rank.saturating_sub(1).min(last))
+        .map_or(0.0, |d| d.as_secs_f64() * 1e6)
 }
 
 /// Builds one scenario's fixture beneath `dir` and measures `read` over it,
@@ -745,6 +1147,36 @@ impl Workload for MixedLayout {
                     reporter.record_duration(t.elapsed());
                     readings.report(name);
                     readings.publish(name, reporter);
+                }
+                Support::Latency(pass) => {
+                    let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
+                    let t = Instant::now();
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let mut latencies = Vec::new();
+                    let readings = Readings::measure(&fixture.tree, keys, || {
+                        let measured = pass(&fixture)?;
+                        latencies = measured.latencies;
+                        Ok(measured.rows)
+                    })?;
+                    reporter.record_duration(t.elapsed());
+                    // The counters are the tree's, and the compacting thread
+                    // reads and copies through them during the pass: printed
+                    // for reference, not published as the scan's per-row cost.
+                    readings.report(name);
+                    let (p50, p99) = (
+                        percentile_us(&latencies, 50.0),
+                        percentile_us(&latencies, 99.0),
+                    );
+                    eprintln!("  {:<34} scan P50={p50:.1}us P99={p99:.1}us", "");
+                    for (figure, value) in [("scan P50", p50), ("scan P99", p99)] {
+                        reporter.publish_series(
+                            format!("{name} {figure}"),
+                            value,
+                            "us",
+                            format!("keys: {keys} | scans: {}", latencies.len()),
+                            Direction::SmallerIsBetter,
+                        );
+                    }
                 }
                 Support::Missing(reason) => {
                     // The fixture is NOT built here. It exists, and the tests

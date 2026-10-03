@@ -126,7 +126,11 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 }
                 continue;
             }
-            if matches!(ctx.values, Values::Blob(_)) && entry.key.value_type.is_indirection() {
+            // A cell row resolves its references from the value log as an
+            // indirection does.
+            if matches!(ctx.values, Values::Blob(_))
+                && (entry.key.value_type.is_indirection() || entry.key.value_type.is_cell_row())
+            {
                 out.job(Job::Blob { idx, item: entry });
                 self.jobs += 1;
             } else {

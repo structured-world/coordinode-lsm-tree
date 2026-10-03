@@ -9971,6 +9971,162 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
     Ok(())
 }
 
+/// A cell row's references take a blob-file rewrite the way an indirection
+/// does: a reference into a remapped file names the re-emitted record, one
+/// into an untouched file and a value cell stay as written, and a row whose
+/// referenced record is gone loses its key's head, taking the older versions
+/// behind it.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let reference = |blob_file_id: u64, offset: u64, owner: bool| RowCell::Ref {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id,
+                offset,
+                on_disk_size: 64,
+            },
+            size: 100,
+        },
+        owner,
+    };
+    let row = |cells: Vec<RowCell<'_>>| -> crate::Result<Vec<u8>> {
+        let fields: Vec<RowField<'_>> = cells
+            .into_iter()
+            .zip(3u16..)
+            .map(|(cell, column)| RowField::bytes(column, cell))
+            .collect();
+        encode_row(&fields)
+    };
+    let cell_row = |key: &[u8], seqno, value: Vec<u8>| {
+        InternalValue::from_components(key.to_vec(), value, seqno, ValueType::CellRow)
+    };
+
+    let mut offsets = crate::HashMap::default();
+    offsets.insert(
+        400u64,
+        super::BlobRecordRelocation {
+            offset: 16,
+            on_disk_size: 61,
+        },
+    );
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    rewrite.insert(8u64, super::BlobFileRewrite::DropBelow(500));
+
+    let entries = vec![
+        // Remapped, beside an untouched file and a value cell.
+        cell_row(
+            b"a",
+            3,
+            row(vec![
+                reference(7, 400, true),
+                reference(5, 10, false),
+                RowCell::Value(b"inline"),
+            ])?,
+        ),
+        // Untouched entirely.
+        cell_row(b"b", 3, row(vec![reference(5, 20, true)])?),
+        // Its record is gone from the remapped file: the key's head is lost,
+        // and its older version goes with it.
+        cell_row(b"c", 4, row(vec![reference(7, 999, true)])?),
+        InternalValue::from_components(b"c".to_vec(), b"old".to_vec(), 2, ValueType::Value),
+        // Below the punched frontier: lost the same way.
+        cell_row(b"d", 3, row(vec![reference(8, 100, false)])?),
+        // At or past the frontier: kept.
+        cell_row(b"e", 3, row(vec![reference(8, 600, false)])?),
+    ];
+    let untouched = entries.get(1).expect("row b").value.clone();
+    let mut dropped = 0u64;
+    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
+    assert_eq!(keys, [b"a".to_vec(), b"b".to_vec(), b"e".to_vec()]);
+    assert_eq!(dropped, 3, "the two lost heads and the version behind one");
+    assert!(carry.is_none(), "the last entry is a kept key");
+
+    let a = decode_row(&out.first().expect("row a").value)?;
+    let field = |i: usize| a.get(i).expect("a field of row a");
+    let RowCell::Ref { indirection, owner } = field(0).cell else {
+        panic!("the first field stays a reference");
+    };
+    assert_eq!(
+        (
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+            indirection.vhandle.on_disk_size,
+            owner
+        ),
+        (9, 16, 61, true),
+        "remapped to the re-emitted record, ownership kept"
+    );
+    assert!(
+        matches!(field(1).cell, RowCell::Ref { indirection, .. } if indirection.vhandle.blob_file_id == 5)
+    );
+    assert!(matches!(field(2).cell, RowCell::Value(b"inline")));
+    let b = out.get(1).expect("row b");
+    assert_eq!(b.value, untouched, "an untouched row is copied as is");
+    assert_eq!(b.key.value_type, ValueType::CellRow);
+    Ok(())
+}
+
+/// A recovered block's references include a cell row's, each with its owner
+/// bit: an owned reference adds its object to the file's link, a borrowed one
+/// only links the file.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn recovered_cell_row_references_link_their_files_by_ownership() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let reference = |blob_file_id: u64, owner: bool| RowCell::Ref {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id,
+                offset: 0,
+                on_disk_size: 64,
+            },
+            size: 100,
+        },
+        owner,
+    };
+    let value = encode_row(&[
+        RowField::bytes(3, reference(7, true)),
+        RowField::bytes(4, reference(8, false)),
+    ])?;
+    let entries = vec![InternalValue::from_components(
+        b"k".to_vec(),
+        value,
+        1,
+        ValueType::CellRow,
+    )];
+    let refs = super::collect_indirections(&entries)?;
+    assert_eq!(
+        refs.iter()
+            .map(|(_, ind, owned)| (ind.vhandle.blob_file_id, *owned))
+            .collect::<Vec<_>>(),
+        [(7, true), (8, false)]
+    );
+
+    let mut derived = crate::HashMap::default();
+    super::fold_blob_links(&mut derived, &refs);
+    let owned = derived.get(&7).expect("the owned file is linked");
+    assert_eq!((owned.len, owned.bytes, owned.on_disk_bytes), (1, 100, 64));
+    let borrowed = derived.get(&8).expect("the borrowed file is linked");
+    assert_eq!(
+        (borrowed.len, borrowed.bytes, borrowed.on_disk_bytes),
+        (0, 0, 0),
+        "a borrowed reference charges nothing to its file"
+    );
+    Ok(())
+}
+
 /// A columnar source carrying a per-field value sub-column salvages into a copy
 /// that KEEPS the sub-column (verbatim `ColumnBatch` re-emit), instead of
 /// collapsing it into a single value column via a row round-trip.
@@ -10363,6 +10519,107 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
         carry.is_none(),
         "a surviving different key ended the run inside this block",
     );
+    Ok(())
+}
+
+/// A columnar table of a blob tree's cell rows takes a blob-file rewrite as
+/// it lays its rows out: a reference into the remapped file names the
+/// re-emitted record in the copy, which keeps the cells layout, and a row whose
+/// record is gone is dropped.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+        encode_row(&[
+            RowField::bytes(3, RowCell::Value(b"status")),
+            RowField::bytes(
+                4,
+                RowCell::Ref {
+                    indirection: BlobIndirection {
+                        vhandle: ValueHandle {
+                            blob_file_id: 7,
+                            offset,
+                            on_disk_size: 64,
+                        },
+                        size: 100,
+                    },
+                    owner: true,
+                },
+            ),
+        ])
+    };
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_cell_rows(true)
+        .use_row_group_size(1);
+    for (key, offset) in [(b"a", 400u64), (b"b", 999), (b"c", 500)] {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            row(offset)?,
+            1,
+            ValueType::CellRow,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let mut offsets = crate::HashMap::default();
+    for (from, to) in [(400u64, 16u64), (500, 80)] {
+        offsets.insert(
+            from,
+            super::BlobRecordRelocation {
+                offset: to,
+                on_disk_size: 61,
+            },
+        );
+    }
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    let options = SalvageOptions {
+        encryption: None,
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
+        table_id: 0,
+        expected_stored_id: None,
+        output_id: None,
+        allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
+        blob_rewrite: Some(Arc::new(rewrite)),
+        progress: None,
+    };
+    salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+
+    let recovered = open(dest, &fs)?;
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+        let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
+            return Ok(None);
+        };
+        assert_eq!(entry.key.value_type, ValueType::CellRow);
+        let fields = decode_row(&entry.value)?;
+        let RowCell::Ref { indirection, .. } = fields.get(1).expect("the body field").cell else {
+            panic!("the body stays a reference");
+        };
+        Ok(Some((
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+        )))
+    };
+    assert_eq!(field_ref(b"a")?, Some((9, 16)));
+    assert_eq!(field_ref(b"b")?, None, "its record is gone, so is the row");
+    assert_eq!(field_ref(b"c")?, Some((9, 80)));
     Ok(())
 }
 

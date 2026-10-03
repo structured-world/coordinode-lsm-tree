@@ -397,6 +397,32 @@ fn intrinsic_transpose_round_trips_entries() {
     assert_entries_eq(&entries, &back2);
 }
 
+/// A batch of the intrinsic columns and one caller sub-column has as many
+/// columns as a whole-value batch, yet its rows cannot be laid out again as
+/// it lays them out: rebuilt as whole values, the sub-column's id, type and
+/// validity would be lost.
+#[test]
+fn a_batch_of_one_caller_sub_column_does_not_round_trip() {
+    let entries = vec![entry(b"alpha", 10, ValueType::Value, b"v1")];
+    let mut batch = entries_to_column_batch(&entries).expect("transpose");
+    batch.columns[3] = Column {
+        column_id: 3,
+        type_tag: TypeTag::Number(crate::table::column_type::Number::U64_LE),
+        validity: None,
+        data: Slice::from(7u64.to_le_bytes().to_vec()),
+    };
+    let rows = column_batch_to_entries(&batch).expect("untranspose");
+    assert!(!super::rows_round_trip(&batch));
+    assert!(
+        super::transpose_like(&batch, &rows)
+            .expect("transpose")
+            .is_none()
+    );
+    // The whole-value layout itself still round-trips.
+    let whole = entries_to_column_batch(&entries).expect("transpose");
+    assert!(super::rows_round_trip(&whole));
+}
+
 #[test]
 fn intrinsic_untranspose_rejects_wrong_layout() {
     // A batch whose columns are not the four intrinsic columns is refused.

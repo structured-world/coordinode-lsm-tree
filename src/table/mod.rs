@@ -7,6 +7,7 @@ pub(crate) mod block_index;
 pub(crate) mod block_layout;
 #[cfg(feature = "columnar")]
 pub(crate) mod column_page;
+pub mod column_type;
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
@@ -3922,18 +3923,30 @@ impl Table {
         let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64, UserKey, UserKey)> =
             BTreeMap::new();
         {
+            // An owned reference adds to its file's counts, a borrowed one
+            // (a cell-row reference whose owner is another version) only
+            // links the file, as the writer registers them.
+            let mut add =
+                |ind: &crate::blob_tree::handle::BlobIndirection, owned: bool, key: &UserKey| {
+                    let slot = derived
+                        .entry(ind.vhandle.blob_file_id)
+                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
+                    if owned {
+                        slot.0 += 1;
+                        slot.1 += u64::from(ind.size);
+                        slot.2 += u64::from(ind.vhandle.on_disk_size);
+                    }
+                    slot.4.clone_from(key);
+                };
             let mut accumulate = |kv: InternalValue| -> crate::Result<()> {
                 if kv.key.value_type == crate::ValueType::Indirection {
                     let mut cursor = &kv.value[..];
                     let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-                    let key = &kv.key.user_key;
-                    let slot = derived
-                        .entry(ind.vhandle.blob_file_id)
-                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
-                    slot.0 += 1;
-                    slot.1 += u64::from(ind.size);
-                    slot.2 += u64::from(ind.vhandle.on_disk_size);
-                    slot.4.clone_from(key);
+                    add(&ind, true, &kv.key.user_key);
+                } else if kv.key.value_type == crate::ValueType::CellRow {
+                    for (ind, owned) in crate::blob_tree::field_row::row_refs(&kv.value)? {
+                        add(&ind, owned, &kv.key.user_key);
+                    }
                 }
                 Ok(())
             };

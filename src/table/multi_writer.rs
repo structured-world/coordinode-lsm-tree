@@ -161,6 +161,11 @@ pub struct MultiWriter {
     /// table records one layout, so a write of the other one rotates first.
     value_layout: Option<crate::table::meta::ValueLayout>,
 
+    /// Preserved across writer rotation: every table of a tree whose rows may
+    /// be written as cells splits them into their fields (see
+    /// [`Writer::use_cell_rows`]).
+    cell_rows: bool,
+
     /// Preserved across writer rotation so every successor [`Writer`] of one
     /// bulk ingest is uniformly flagged bulk-ingested (see
     /// [`Writer::use_bulk_ingested`]).
@@ -323,6 +328,7 @@ impl MultiWriter {
             use_zstd_two_pass_seed: true,
             use_columnar: false,
             value_layout: None,
+            cell_rows: false,
             bulk_ingested: false,
             recency: None,
             lineage: None,
@@ -627,7 +633,35 @@ impl MultiWriter {
             u64::from(indirection.size),
             u64::from(indirection.vhandle.on_disk_size),
             key,
+            true,
         );
+    }
+
+    /// Records the blob files the cell row just written references, as
+    /// [`Self::register_blob`] does for an indirection: each owned reference
+    /// adds to its file's counts, each borrowed one only links the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `row` is not a well-formed cell row.
+    pub fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
+        debug_assert!(
+            self.current_key.is_some(),
+            "a cell row is registered after it is written"
+        );
+        let Some(key) = self.current_key.as_ref() else {
+            return Ok(());
+        };
+        for (indirection, owned) in crate::blob_tree::field_row::row_refs(row)? {
+            self.linked_blobs.register(
+                indirection.vhandle.blob_file_id,
+                u64::from(indirection.size),
+                u64::from(indirection.vhandle.on_disk_size),
+                key,
+                owned,
+            );
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -868,6 +902,15 @@ impl MultiWriter {
         self
     }
 
+    /// Splits the cell rows of every table of this run into their fields
+    /// (see [`Writer::use_cell_rows`]), re-applied to each rotated successor.
+    #[must_use]
+    pub(crate) fn use_cell_rows(mut self, cell_rows: bool) -> Self {
+        self.cell_rows = cell_rows;
+        self.writer = self.writer.use_cell_rows(cell_rows);
+        self
+    }
+
     /// Marks every table in this run as bulk-ingested (re-applied to each rotated
     /// successor), so manifest repair can recognize their manifest-only
     /// `global_seqno` dependence. See [`Writer::use_bulk_ingested`].
@@ -1020,6 +1063,7 @@ impl MultiWriter {
         }
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
+        new_writer = new_writer.use_cell_rows(self.cell_rows);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
@@ -1283,7 +1327,11 @@ impl MultiWriter {
 
         self.writer.write(item)?;
         if self.use_columnar {
-            self.value_layout = Some(crate::table::meta::ValueLayout::Whole);
+            self.value_layout = Some(if self.cell_rows {
+                crate::table::meta::ValueLayout::Cells
+            } else {
+                crate::table::meta::ValueLayout::Whole
+            });
         }
         self.note_output_base();
 
@@ -1308,7 +1356,14 @@ impl MultiWriter {
     ) -> crate::Result<Option<crate::UserKey>> {
         // A table records one value layout, so a batch after rows starts the
         // next table.
-        if self.table_full() || self.value_layout == Some(crate::table::meta::ValueLayout::Whole) {
+        if self.table_full()
+            || matches!(
+                self.value_layout,
+                Some(
+                    crate::table::meta::ValueLayout::Whole | crate::table::meta::ValueLayout::Cells
+                )
+            )
+        {
             self.rotate()?;
         }
         // A batch lands whole, so the output's base is what it held before

@@ -105,7 +105,7 @@ fn the_linked_blob_files_count_toward_a_full_table() -> crate::Result<()> {
     assert!(!mw.table_full());
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..10 {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
     }
     assert!(mw.table_full(), "ten linked files take 384 bytes");
     Ok(())
@@ -139,7 +139,7 @@ fn the_linked_blob_files_count_toward_the_held_state() -> crate::Result<()> {
     mw.writer.spill_block()?;
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..FILES {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
     }
     // Their bytes on disk fit; their entries in memory do not.
     let linked = mw.linked_blobs.section_len();
@@ -211,7 +211,7 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
     ))?;
     let key = UserKey::from(b"a" as &[u8]);
     for blob_file_id in 0..1_000 {
-        mw.linked_blobs.register(blob_file_id, 1, 1, &key);
+        mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
     }
     mw.current_key = Some(UserKey::from(b"b" as &[u8]));
     mw.rotate()?;

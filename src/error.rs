@@ -557,6 +557,26 @@ pub enum Error {
     /// A caller-side mismatch between the projection and the data, not damage.
     /// The payload names which of these it is.
     Projection(&'static str),
+
+    /// A blob reference of a row written as cells cannot be used: a
+    /// [`BlobRef`](crate::blob_tree::field_row::BlobRef) read from another
+    /// key or another tree, one object in two cells of the row, a reference in
+    /// an ingested row, or a stale reference, whose object was moved or
+    /// released since it was read; or a reference-aware read finds the key's
+    /// version is not written as cells.
+    ///
+    /// A caller-side error, refused before anything is written. The payload
+    /// names which of these it is; only a stale reference is cured by reading
+    /// the key again.
+    BlobRef(&'static str),
+
+    /// A row written as cells is not one the caller could have meant: two
+    /// fields in one column, or a fixed-width field that is not its type's
+    /// width.
+    ///
+    /// A caller-side error, refused before anything is written. The payload
+    /// names which of these it is.
+    CellRow(&'static str),
 }
 
 impl core::fmt::Display for Error {

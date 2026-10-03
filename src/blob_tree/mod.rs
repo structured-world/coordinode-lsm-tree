@@ -2,9 +2,11 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+pub mod field_row;
 mod gc;
 pub mod handle;
 pub mod ingest;
+pub(crate) mod released;
 
 #[doc(hidden)]
 pub use gc::{FragmentationEntry, FragmentationMap};
@@ -78,6 +80,8 @@ impl IterGuard for Guard {
         if kv.key.value_type.is_indirection() {
             let mut cursor = crate::io::Cursor::new(kv.value);
             Ok(BlobIndirection::decode_from(&mut cursor)?.size)
+        } else if kv.key.value_type.is_cell_row() {
+            field_row::logical_len(&kv.value)
         } else {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 max length")]
             Ok(kv.value.len() as u32)
@@ -106,6 +110,23 @@ pub(crate) fn resolve_value_handle(
     #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
 ) -> RangeItem {
+    if item.key.value_type.is_cell_row() {
+        let accessor = Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(metrics),
+        );
+        let value = field_row::resolve_row(&item.value, |vptr| {
+            // A reference to an object the version no longer holds is damage,
+            // reported as such rather than read as an empty field.
+            accessor
+                .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+                .ok_or(crate::Error::InvalidHeader(
+                    "field row: a reference names a blob file the version does not hold",
+                ))
+        })?;
+        return Ok((item.key.user_key, UserValue::from(value)));
+    }
     if item.key.value_type.is_indirection() {
         let mut cursor = crate::io::Cursor::new(item.value);
         let vptr = BlobIndirection::decode_from(&mut cursor)?;
@@ -119,21 +140,14 @@ pub(crate) fn resolve_value_handle(
             Some(metrics),
         );
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
-            Ok(Some(v)) => {
-                let k = item.key.user_key;
-                Ok((k, v))
-            }
-            Ok(None) => {
-                panic!(
-                    "value handle ({:?} => {:?}) did not match any blob - this is a bug; version={}",
-                    item.key.user_key,
-                    vptr.vhandle,
-                    version.id(),
-                );
-            }
-            Err(e) => Err(e),
-        }
+        // An indirection naming a blob file the version does not hold is
+        // damage, reported as such, the way a cell row's dangling reference is.
+        let value = accessor
+            .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+            .ok_or(crate::Error::InvalidHeader(
+                "blob tree: an indirection names a blob file the version does not hold",
+            ))?;
+        Ok((item.key.user_key, value))
     } else {
         let k = item.key.user_key;
         let v = item.value;
@@ -164,6 +178,56 @@ impl BlobSource {
             item,
         )
         .map(|(_, value)| value)
+    }
+
+    /// The object `indirection` names under `key`, read from `version`'s blob
+    /// files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object cannot be read, or `version` holds no
+    /// blob file of that id: a reference that names nothing is damage, never
+    /// an empty value.
+    pub(crate) fn object(
+        &self,
+        version: &Version,
+        key: &[u8],
+        indirection: &BlobIndirection,
+    ) -> crate::Result<UserValue> {
+        Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        )
+        .get(self.tree_id, key, &indirection.vhandle, &self.cache)?
+        .ok_or(crate::Error::InvalidHeader(
+            "field row: a reference names a blob file the version does not hold",
+        ))
+    }
+
+    /// Reads the objects `items` name (each its key, handle and a slot the
+    /// read fills) into the cache in as few requests as their places in the
+    /// blob files allow, for [`Self::object`] to find them there: a run of
+    /// objects close together in one file is one read. Best effort: an
+    /// object it does not read is read on its own when asked for.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn prefetch(
+        &self,
+        version: &Version,
+        items: &mut Vec<(&[u8], crate::vlog::ValueHandle, usize)>,
+    ) {
+        Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        )
+        .prefetch(
+            self.tree_id,
+            items,
+            &self.cache,
+            PREFETCH_MAX_GAP,
+            PREFETCH_MAX_READ,
+        );
     }
 }
 
@@ -390,6 +454,325 @@ impl BlobTree {
         )
     }
 
+    /// Writes `key` as a row of `fields` at `seqno`.
+    ///
+    /// Each [`Field`](field_row::Field) names its column and physical type,
+    /// and both are stored with the row, so a stored row always reads with
+    /// the layout it was written with. A column id is a field id of the
+    /// columnar format (from [`FIRST_FIELD_COLUMN`](field_row::FIRST_FIELD_COLUMN)
+    /// up to, not including, [`RESERVED_COLUMNS`](field_row::RESERVED_COLUMNS)),
+    /// so a columnar table can store the
+    /// field as that column. The row keeps its fields in ascending column
+    /// order, whatever order they are given in. Plain reads of the key return
+    /// the fields in that order, framed as the columnar format frames a row's value
+    /// sub-columns (a variable-width field as a little-endian `u32` length and
+    /// its bytes, a fixed-width one as its bytes), with every
+    /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object. A
+    /// [`Cell::Value`](field_row::Cell::Value) at or above its column's
+    /// threshold
+    /// ([`KvSeparationOptions::cell_separation_threshold`](crate::KvSeparationOptions::cell_separation_threshold),
+    /// else the tree's separation threshold) is stored in a blob file when the
+    /// row is flushed.
+    ///
+    /// A [`Cell::Ref`](field_row::Cell::Ref) keeps an object the key already
+    /// holds without rewriting it, which is how a metadata-only update leaves
+    /// a large field in place. Take the references from the key's latest
+    /// version and write this row above it.
+    ///
+    /// Returns the added item's size and the new memtable size, as
+    /// [`AbstractTree::insert`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::BlobRef`] if a reference was read from another
+    /// key or tree, two fields name one object, or a reference is stale (its
+    /// object was moved or let go of since the read: read the key again);
+    /// [`crate::Error::CellRow`] if a column is not a field id, two fields
+    /// share a column or a fixed-width field is not its type's width; and an
+    /// error if the row has
+    /// more than `u16::MAX` fields or a cell exceeds `u32::MAX` bytes. Nothing
+    /// is written then.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    /// # use lsm_tree::blob_tree::field_row::Field;
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    ///     .with_kv_separation(Some(KvSeparationOptions::default()))
+    ///     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// // Given out of order, stored and read in column order.
+    /// tree.insert_cells("doc", &[Field::bytes(4, b"body"), Field::bytes(3, b"draft")], 0)?;
+    /// let value = tree.get("doc", 1)?.expect("written");
+    /// assert_eq!(&*value, b"\x05\0\0\0draft\x04\0\0\0body");
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn insert_cells<K: Into<UserKey>>(
+        &self,
+        key: K,
+        fields: &[field_row::Field<'_>],
+        seqno: SeqNo,
+    ) -> crate::Result<(u64, u64)> {
+        let key = key.into();
+        let mut row = Vec::with_capacity(fields.len());
+        for field in fields {
+            let cell = match &field.cell {
+                field_row::Cell::Value(bytes) => field_row::RowCell::Value(bytes),
+                field_row::Cell::Ref(reference) => {
+                    if reference.tree != self.id() {
+                        return Err(crate::Error::BlobRef("reference read from another tree"));
+                    }
+                    if !crate::comparator::same_user_key(reference.key, &key) {
+                        return Err(crate::Error::BlobRef("reference read from another key"));
+                    }
+                    // Written back by a caller, a reference never owns its
+                    // object: the version that wrote the object, or the one a
+                    // compaction moved ownership to, still does.
+                    field_row::RowCell::Ref {
+                        indirection: reference.indirection,
+                        owner: false,
+                    }
+                }
+            };
+            row.push(field_row::RowField {
+                column: field.column,
+                tag: field.tag,
+                cell,
+            });
+        }
+        field_row::order_fields(&mut row)?;
+        let refs = fields.iter().filter_map(|field| match &field.cell {
+            field_row::Cell::Ref(reference) => Some(reference),
+            field_row::Cell::Value(_) => None,
+        });
+        for (i, a) in refs.clone().enumerate() {
+            if refs.clone().skip(i + 1).any(|b| a == b) {
+                return Err(crate::Error::BlobRef("one object in two fields"));
+            }
+        }
+        let value = field_row::encode_row(&row)?;
+        let sourced: Vec<(BlobIndirection, u64)> = refs
+            .map(|reference| (reference.indirection, reference.source))
+            .collect();
+        self.index.append_cell_row(
+            InternalValue::from_components(key, value, seqno, crate::ValueType::CellRow),
+            &sourced,
+        )
+    }
+
+    /// The fields of `key` as of `seqno`, references included as references:
+    /// the read a metadata-only update starts from. No blob object is read.
+    ///
+    /// Returns `None` when the key is absent at `seqno`. References to write
+    /// back must come from the key's latest version; a reference read at an
+    /// older `seqno` may name an object a newer version already let go of.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains, and [`crate::Error::BlobRef`] when the key's
+    /// version at `seqno` was not written as cells.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    /// # use lsm_tree::blob_tree::field_row::{Cell, Field};
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// tree.insert_cells("doc", &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Change the status, keep the body where it is.
+    /// let row = tree.get_cells("doc", 1)?.expect("written");
+    /// let mut fields = row.fields()?;
+    /// assert!(matches!(fields[1].cell, Cell::Ref(_)));
+    /// fields[0].cell = Cell::Value(b"final");
+    /// tree.insert_cells("doc", &fields, 1)?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn get_cells<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        seqno: SeqNo,
+    ) -> crate::Result<Option<field_row::RowCells>> {
+        let read = self.cell_read(seqno)?;
+        let Some(item) = crate::Tree::get_internal_entry_from_version(
+            &read.version,
+            key.as_ref(),
+            seqno,
+            self.index.config.comparator.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        if !item.key.value_type.is_cell_row() {
+            return Err(crate::Error::BlobRef("the key's version is not a cell row"));
+        }
+        Ok(Some(field_row::RowCells {
+            key: item.key.user_key,
+            row: item.value,
+            read: Arc::new(read),
+        }))
+    }
+
+    /// The rows written as cells in `range` as of `seqno`, in key order, each
+    /// with its references as references, as [`Self::get_cells`] reads one.
+    ///
+    /// A key whose version at `seqno` is stored whole rather than as cells is
+    /// passed over: read it with a plain range read. Every row comes from one
+    /// read, which keeps its objects readable and its references writable as
+    /// [`RowCells`](field_row::RowCells) describes, for as long as any of its
+    /// rows is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::SnapshotBelowRetention`] when `seqno` is below
+    /// what the tree retains; the iterator yields an error for a row it
+    /// cannot read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter};
+    /// # use lsm_tree::blob_tree::field_row::{Cell, Field};
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// for key in ["a", "b"] {
+    ///     tree.insert_cells(key, &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
+    /// }
+    /// tree.insert("plain", "value", 0);
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // Publish every draft, keeping each body where it is.
+    /// let rows: Vec<_> = tree.range_cells::<&str, _>(.., 1)?.collect::<lsm_tree::Result<_>>()?;
+    /// assert_eq!(rows.len(), 2);
+    /// for row in &rows {
+    ///     let mut fields = row.fields()?;
+    ///     fields[0].cell = Cell::Value(b"final");
+    ///     tree.insert_cells(row.key().clone(), &fields, 1)?;
+    /// }
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn range_cells<K: AsRef<[u8]>, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        seqno: SeqNo,
+    ) -> crate::Result<
+        Box<dyn DoubleEndedIterator<Item = crate::Result<field_row::RowCells>> + Send + 'static>,
+    > {
+        let read = Arc::new(self.cell_read(seqno)?);
+        let rows = crate::Tree::create_internal_range_with_prefix_hash(
+            read.version.clone(),
+            &range,
+            seqno,
+            None,
+            self.index.config.merge_operator.clone(),
+            self.index.config.comparator.clone(),
+            None,
+            Some(self.blob_source()),
+        );
+        Ok(Box::new(rows.filter_map(move |item| match item {
+            Ok(item) if item.key.value_type.is_cell_row() => Some(Ok(field_row::RowCells {
+                key: item.key.user_key,
+                row: item.value,
+                read: Arc::clone(&read),
+            })),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        })))
+    }
+
+    /// A reference-aware read as of `seqno`: the latest version and the
+    /// read's registration, taken together under the history's read lock. An
+    /// install records its releases under the write lock, so none newer than
+    /// this version can go unrecorded.
+    fn cell_read(&self, seqno: SeqNo) -> crate::Result<field_row::CellRead> {
+        let history = self.index.version_history.read();
+        let version = history.latest_version_ref().clone();
+        version.check_serves(seqno)?;
+        let token = history.released().register(version.version.id());
+        drop(history);
+        Ok(field_row::CellRead {
+            tree: self.id(),
+            version,
+            source: self.blob_source(),
+            token,
+        })
+    }
+
+    /// Runs a projected columnar scan across the tree, as
+    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) does, reading each
+    /// row's declared fields as late as it can.
+    ///
+    /// The rows are decided first on their keys, seqnos and value types; only
+    /// the rows the scan returns have their fields read. A field of a row
+    /// written as cells is read out of the row (or, in a columnar table, out
+    /// of the field's own column), and its object is read from its blob file
+    /// only when the field is projected: a projection of compact fields reads
+    /// no blob at all. A row stored whole has its fields read through the
+    /// projection's [`ValueProjector`](crate::ValueProjector), its value read
+    /// from the value log first when it is kept there. When the predicate
+    /// runs on a projected field, that field is read first and the objects of
+    /// the other fields are read only for the rows it keeps.
+    ///
+    /// A field is projected as a declared field, with its type and what its
+    /// absence means; the intrinsic key, seqno and value-type columns may be
+    /// projected by id. A field holds its value, not how the tree stores it,
+    /// so a row's value type reads as a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Projection`] when a value column is projected
+    /// by id alone or the predicate runs on one no field declares, and
+    /// otherwise as [`Tree::columnar_scan`](crate::Tree::columnar_scan), and,
+    /// lazily, when a field is stored under another type than declared or an
+    /// object cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter};
+    /// use lsm_tree::blob_tree::field_row::{Field, TypeTag};
+    /// use lsm_tree::{Absent, ProjectedField, Projection};
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// tree.insert_cells("doc", &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // The status alone: the body stays in its blob file, unread.
+    /// let status = Projection::new().field(ProjectedField::new(3, TypeTag::Bytes, Absent::Null)?);
+    /// let mut batches = tree.columnar_scan(status, None, SeqNo::MAX, ..)?;
+    /// let batch = batches.next().expect("one batch")?;
+    /// assert_eq!(batch.row_count, 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan<R: core::ops::RangeBounds<UserKey>>(
+        &self,
+        projection: impl Into<crate::Projection>,
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+        seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<crate::tree::columnar_scan::ColumnarScan> {
+        self.index
+            .columnar_scan(projection, predicate, seqno, range)
+    }
+
     /// Updates the live [`RuntimeConfig`](crate::runtime_config::RuntimeConfig),
     /// as [`Tree::update_runtime_config`](crate::Tree::update_runtime_config)
     /// does for the index tree.
@@ -567,6 +950,16 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             Vec::with_capacity(self.buf.len());
         for item in &self.buf {
             let Ok(kv) = item else { continue };
+            if kv.key.value_type.is_cell_row() {
+                // A cell row's references are read when the row resolves, as
+                // an indirection is; warming them is the same read-ahead.
+                if let Ok(refs) = field_row::row_refs(&kv.value) {
+                    for (vptr, _) in refs {
+                        handles.push((&kv.key.user_key, vptr.vhandle, 0));
+                    }
+                }
+                continue;
+            }
             if !kv.key.value_type.is_indirection() {
                 continue;
             }
@@ -1126,6 +1519,8 @@ impl AbstractTree for BlobTree {
             let mut cursor = crate::io::Cursor::new(item.value);
             let vptr = BlobIndirection::decode_from(&mut cursor)?;
             vptr.size
+        } else if item.key.value_type.is_cell_row() {
+            field_row::logical_len(&item.value)?
         } else {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
             {
@@ -1268,7 +1663,9 @@ impl AbstractTree for BlobTree {
             .use_writeback_bytes(self.index.config.writeback_bytes);
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         table_writer = table_writer.use_zone_map(rc.zone_map);
-        table_writer = table_writer.use_columnar(rc.columnar);
+        table_writer = table_writer
+            .use_columnar(rc.columnar)
+            .use_cell_rows(rc.columnar);
         table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));
@@ -1350,6 +1747,20 @@ impl AbstractTree for BlobTree {
             }
 
             let value = item.value;
+
+            if item.key.value_type.is_cell_row() {
+                // Each cell is weighed on its own: the large ones go to the
+                // blob file and the row keeps owning references to them.
+                let row = field_row::separate_row(
+                    &value,
+                    |column| kv_opts.cell_threshold(column),
+                    |bytes| blob_writer.write(&item.key.user_key, item.key.seqno, bytes),
+                )?
+                .map_or(value, UserValue::from);
+                table_writer.write(InternalValue::new(item.key, row.clone()))?;
+                table_writer.register_cell_row(&row)?;
+                continue;
+            }
 
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
             let value_size = value.len() as u32;
@@ -1650,3 +2061,6 @@ impl AbstractTree for BlobTree {
         self.index.remove_range(start, end, seqno)
     }
 }
+
+#[cfg(test)]
+mod tests;

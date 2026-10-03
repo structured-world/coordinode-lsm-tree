@@ -2498,19 +2498,29 @@ fn handle_below_blob_frontier(
 
     for entry in table.scan()? {
         let entry = entry?;
-        if entry.key.value_type != crate::ValueType::Indirection {
+        let handles = if entry.key.value_type == crate::ValueType::Indirection {
+            let mut cursor = &entry.value[..];
+            vec![crate::blob_tree::handle::BlobIndirection::decode_from(
+                &mut cursor,
+            )?]
+        } else if entry.key.value_type == crate::ValueType::CellRow {
+            crate::blob_tree::field_row::row_refs(&entry.value)?
+                .into_iter()
+                .map(|(ind, _)| ind)
+                .collect()
+        } else {
             continue;
-        }
-        let mut cursor = &entry.value[..];
-        let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-        if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
-            && ind.vhandle.offset < frontier
-        {
-            return Ok(Some(format!(
-                "blob handle into file {} at offset {} lies below its recovered \
-                 live-data frontier {frontier}",
-                ind.vhandle.blob_file_id, ind.vhandle.offset,
-            )));
+        };
+        for ind in handles {
+            if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
+                && ind.vhandle.offset < frontier
+            {
+                return Ok(Some(format!(
+                    "blob handle into file {} at offset {} lies below its recovered \
+                     live-data frontier {frontier}",
+                    ind.vhandle.blob_file_id, ind.vhandle.offset,
+                )));
+            }
         }
     }
     Ok(None)
