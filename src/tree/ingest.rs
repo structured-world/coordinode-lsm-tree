@@ -536,7 +536,7 @@ impl<'a> Ingestion<'a> {
                 deletion_pause: &self.tree.deletion_pause,
                 heal_hints: &self.tree.heal_hints,
                 #[cfg(feature = "std")]
-                background_deleter: Some(&self.tree.background_deleter),
+                background_deleter: &self.tree.background_deleter,
             });
         }
 

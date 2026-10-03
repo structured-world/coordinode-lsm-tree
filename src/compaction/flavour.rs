@@ -172,6 +172,7 @@ pub(super) fn prepare_table_writer(
         payload.dest_level,
         level_fs,
     )?
+    .use_output_ledger(opts.outputs.clone())
     .set_comparator(opts.config.comparator.clone())
     .use_recency(recency)
     // The outputs' compaction lineage: the input ids this run merges. Lets a
@@ -396,22 +397,6 @@ impl ProducedOutput {
         self.collected_below_watermark = true;
     }
 
-    /// Marks this produced-but-not-installed output's freshly written files as
-    /// deleted. Used when a sibling sub-compaction fails and the shared
-    /// [`install_merge`] is skipped: each already-finished sub-compaction has
-    /// finalized its SSTs and blob files on disk, so without this they would be
-    /// orphaned. Only the newly created files are dropped — input tables stay
-    /// intact (the caller un-hides them) and rewritten-blob-file drops are left
-    /// for a later successful compaction.
-    pub(super) fn rollback_uninstalled(&self) {
-        for table in &self.created_tables {
-            table.mark_as_deleted();
-        }
-        for blob_file in &self.created_blob_files {
-            blob_file.mark_as_deleted();
-        }
-    }
-
     /// Builds the output for a merge-on-read relocation: the `created` segment
     /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
     /// `deleted` source segment, with no blob files and no fragmentation. Lets
@@ -507,17 +492,11 @@ pub(super) fn install_merge(
     // checkpoint hard-link; without the heal-hint sink a confirmed-persistent
     // ECC correction on a read could never queue the SST for a healing
     // rewrite, leaving the bitrot on disk.
-    //
-    // The background deleter is deliberately NOT installed here. A compaction
-    // output can be rolled back — and the tight-space slice loop rolls back
-    // precisely when space is scarce — where deferring the unlink defeats the
-    // point: the space must come back now, not when a background pass gets to
-    // it. Flush outputs, which have no such rollback, keep it.
     let sinks = crate::table::TableSinks {
         deletion_pause: &opts.deletion_pause,
         heal_hints: &opts.heal_hints,
         #[cfg(feature = "std")]
-        background_deleter: None,
+        background_deleter: &opts.background_deleter,
     };
     for table in &created_tables {
         table.bind_to_tree(&sinks);
@@ -537,52 +516,40 @@ pub(super) fn install_merge(
         }
     }
 
-    // Handles kept for rollback: the output SSTs and blob files are already
-    // finalized on disk, so if the version edit fails they must be marked
-    // deleted here or they leak (the caller only un-hides the input tables).
-    // `created_blob_files` is moved into the closure, so clone for cleanup.
-    let rollback_blob_files = created_blob_files.clone();
-    super_version
-        .upgrade_version(
-            &opts.config.path,
-            |current| {
-                let mut copy = current.clone();
+    super_version.upgrade_version(
+        &opts.config.path,
+        |current| {
+            let mut copy = current.clone();
 
-                let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-                copy.version = copy.version.with_merge(
-                    &payload.table_ids.iter().copied().collect::<Vec<_>>(),
-                    &created_tables,
-                    payload.dest_level as usize,
-                    if blob_frag_map.is_empty() {
-                        None
-                    } else {
-                        Some(blob_frag_map)
-                    },
-                    created_blob_files,
-                    &blob_files_to_drop
-                        .iter()
-                        .map(BlobFile::id)
-                        .collect::<HashSet<_>>(),
-                    &ctx,
-                );
+            let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
+            copy.version = copy.version.with_merge(
+                &payload.table_ids.iter().copied().collect::<Vec<_>>(),
+                &created_tables,
+                payload.dest_level as usize,
+                if blob_frag_map.is_empty() {
+                    None
+                } else {
+                    Some(blob_frag_map)
+                },
+                created_blob_files,
+                &blob_files_to_drop
+                    .iter()
+                    .map(BlobFile::id)
+                    .collect::<HashSet<_>>(),
+                &ctx,
+            );
 
-                Ok(copy)
-            },
-            &opts.global_seqno,
-            &opts.visible_seqno,
-            &*opts.config.fs,
-            opts.runtime_config.load_full(),
-            opts.encryption.clone(),
-            retention,
-        )
-        .inspect_err(|_| {
-            for table in &created_tables {
-                table.mark_as_deleted();
-            }
-            for blob_file in &rollback_blob_files {
-                blob_file.mark_as_deleted();
-            }
-        })?;
+            Ok(copy)
+        },
+        &opts.global_seqno,
+        &opts.visible_seqno,
+        &*opts.config.fs,
+        opts.runtime_config.load_full(),
+        opts.encryption.clone(),
+        retention,
+    )?;
+    // The version names the outputs now, so the run must not remove them.
+    opts.outputs.installed();
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -889,13 +856,7 @@ impl CompactionFlavour for RelocatingCompaction {
         let tables_to_delete = core::mem::take(&mut self.inner.tables_to_rewrite);
 
         let created_tables = self.inner.consume_writer(opts, dst_lvl)?;
-        // The output SSTs are already finalized; if blob finalization fails the
-        // compaction aborts, so delete them here or they orphan on disk.
-        let mut created_blob_files = self.blob_writer.finish().inspect_err(|_| {
-            for table in &created_tables {
-                table.mark_as_deleted();
-            }
-        })?;
+        let mut created_blob_files = self.blob_writer.finish()?;
         created_blob_files.extend(extra_blob_files);
 
         Ok(ProducedOutput {

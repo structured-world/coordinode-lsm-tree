@@ -223,6 +223,10 @@ pub struct MultiWriter {
     spawner: Option<Arc<dyn crate::table::writer::CompactionSpawner>>,
     #[cfg(feature = "std")]
     parallel_threads: usize,
+
+    /// Where a compaction learns of every table file this writer creates, so
+    /// it can remove the ones it never installs. `None` outside compaction.
+    outputs: Option<crate::compaction::output_ledger::OutputLedger>,
 }
 
 impl MultiWriter {
@@ -315,7 +319,25 @@ impl MultiWriter {
             spawner: None,
             #[cfg(feature = "std")]
             parallel_threads: 0,
+
+            outputs: None,
         })
+    }
+
+    /// Records the table file already open and every one a rotation creates
+    /// in `outputs`.
+    #[must_use]
+    pub(crate) fn use_output_ledger(
+        mut self,
+        outputs: crate::compaction::output_ledger::OutputLedger,
+    ) -> Self {
+        outputs.record_table(
+            self.current_writer_id,
+            self.writer.path.clone(),
+            self.fs.clone(),
+        );
+        self.outputs = Some(outputs);
+        self
     }
 
     /// Enables parallel block compression for this run, sharing `spawner` across
@@ -874,7 +896,12 @@ impl MultiWriter {
         let new_table_id = self.table_id_generator.next();
         let path = self.base_path.join(new_table_id.to_string());
 
-        let mut new_writer = Writer::new(path, new_table_id, self.initial_level, self.fs.clone())?
+        let new_writer = Writer::new(path, new_table_id, self.initial_level, self.fs.clone())?;
+        // Recorded once it exists: a failed constructor created nothing ours.
+        if let Some(outputs) = &self.outputs {
+            outputs.record_table(new_table_id, new_writer.path.clone(), self.fs.clone());
+        }
+        let mut new_writer = new_writer
             .use_data_block_compression(self.data_block_compression)
             .use_index_block_compression(self.index_block_compression)
             .use_data_block_size(self.data_block_size)

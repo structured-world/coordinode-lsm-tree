@@ -281,7 +281,7 @@ impl<'a> BlobIngestion<'a> {
                 deletion_pause: &index.deletion_pause,
                 heal_hints: &index.heal_hints,
                 #[cfg(feature = "std")]
-                background_deleter: Some(&index.background_deleter),
+                background_deleter: &index.background_deleter,
             });
         }
         // The blob files this ingestion wrote become reachable through the same
@@ -294,7 +294,7 @@ impl<'a> BlobIngestion<'a> {
                 deletion_pause: &index.deletion_pause,
                 heal_hints: &index.heal_hints,
                 #[cfg(feature = "std")]
-                background_deleter: Some(&index.background_deleter),
+                background_deleter: &index.background_deleter,
             });
         }
 

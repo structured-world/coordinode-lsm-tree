@@ -484,9 +484,7 @@ impl BlobFile {
     pub(crate) fn bind_to_tree(&self, sinks: &crate::table::TableSinks<'_>) {
         self.install_deletion_pause(Arc::clone(sinks.deletion_pause));
         #[cfg(feature = "std")]
-        if let Some(deleter) = sinks.background_deleter {
-            self.install_background_deleter(Arc::clone(deleter));
-        }
+        self.install_background_deleter(Arc::clone(sinks.background_deleter));
     }
 
     /// The installed deletion pause, so tests can assert that every path

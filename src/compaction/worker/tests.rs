@@ -3203,7 +3203,7 @@ fn a_reopened_blob_view_needs_binding_to_carry_the_deletion_pause() -> crate::Re
         deletion_pause: &tree.index.deletion_pause,
         heal_hints: &tree.index.heal_hints,
         #[cfg(feature = "std")]
-        background_deleter: None,
+        background_deleter: &tree.index.background_deleter,
     });
     assert!(
         reopened.deletion_pause_for_test().is_some(),
