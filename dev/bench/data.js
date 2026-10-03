@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791006625192,
+  "lastUpdate": 1791012888442,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -29408,6 +29408,90 @@ window.BENCHMARK_DATA = {
             "value": 359681.1579039992,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.2us | P99.9: 84.6us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8b805b59b04a4d164080b7a054bbcda2c95b91b",
+          "message": "perf(columnar_scan): gather each scanned row once (#806)\n\n## Summary\n- The tree-level columnar scan gathers each row it returns once. Every\nfilter narrows a selection over the rows it was handed and the survivors\nare materialised in one gather, instead of rebuilding the batch at each\nstep.\n- A selective predicate over overlapping segments copies on the order of\nthe output, not the input.\n\n## Changes\n- Merged groups: the predicate judges each decided row in the batch it\nwas taken from, before the output is built, so the rows it drops are\nnever copied. The column layout is still checked against every chosen\nrow. A predicate on the seqno column judges each row's effective seqno.\n- Merged groups: the merge's own key, seqno and value-type columns are\nleft out of an output that nothing reads again.\n- Deduplicated segments: the predicate runs in the dedup pass, into the\nsame selection.\n- Masked and deduplicated segments: only the returned columns are\ngathered, and the seqno column is written in the tree's global space\nwhile it is gathered.\n- Operand resolution: the rewritten value columns are written for the\nreturned rows only, and the other columns are gathered once, instead of\nrewriting every row and copying the batch again to drop an absent key.\n- The returned `ColumnBatch` is unchanged; the selections stay inside\nthe scan.\n\n## Testing\n- New byte-counter tests assert that a selective predicate over a merge\n(on the key and on the seqno), a deduplicated segment with a predicate,\nand a snapshot straddling one segment each copy exactly the bytes they\nreturn.\n- Formatting, clippy in both feature configurations, nextest with all\nand default features, doc tests, the doc build, the no-std check and the\nsst-dump tests pass on Linux.\n\nCloses #686\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Scans now exclude rows outside predicate bounds, with invalid numeric\nvalues, or not visible in the requested snapshot.\n* Deduplicated and merged scans apply predicates and deletion masking\nconsistently, improving result accuracy.\n\n* **Performance**\n* Scans avoid gathering unneeded columns and cells when filters or\nprojections limit results, reducing unnecessary data copying.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-03T07:25:11Z",
+          "tree_id": "48ed40e96910b8c51c121d1592e3a119c1ed4a7e",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f8b805b59b04a4d164080b7a054bbcda2c95b91b"
+        },
+        "date": 1791012886236,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 24286.703628831303,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 14.3us | P99.9: 37.8us\nthreads: 1 | elapsed: 22.04s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1814612.6071553696,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.8us | P99.9: 3.6us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 481806.5127053473,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.3us | P99.9: 17.3us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 358211.8707477217,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 13.6us | P99.9: 40.8us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2333612.3594738017,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 229648.4411796229,
+            "unit": "ops/sec",
+            "extra": "P50: 3.6us | P99: 11.4us | P99.9: 34.1us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 123348.77809081473,
+            "unit": "ops/sec",
+            "extra": "P50: 6.7us | P99: 18.4us | P99.9: 36.4us\nthreads: 1 | elapsed: 1.62s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 658934.9914439598,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 746366.65911468,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 7.6us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 267524.7068630796,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 23.9us | P99.9: 105.3us\nthreads: 1 | elapsed: 0.75s | num: 200000 | iterations: 3"
           }
         ]
       }
