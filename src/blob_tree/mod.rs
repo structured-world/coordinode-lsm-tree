@@ -204,6 +204,31 @@ impl BlobSource {
             "field row: a referenced object is missing from its blob file",
         ))
     }
+
+    /// Reads the objects `items` name (each its key, handle and a slot the
+    /// read fills) into the cache in as few requests as their places in the
+    /// blob files allow, for [`Self::object`] to find them there: a run of
+    /// objects close together in one file is one read. Best effort: an
+    /// object it does not read is read on its own when asked for.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn prefetch(
+        &self,
+        version: &Version,
+        items: &mut Vec<(&[u8], crate::vlog::ValueHandle, usize)>,
+    ) {
+        Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        )
+        .prefetch(
+            self.tree_id,
+            items,
+            &self.cache,
+            PREFETCH_MAX_GAP,
+            PREFETCH_MAX_READ,
+        );
+    }
 }
 
 /// A key-value-separated log-structured merge tree

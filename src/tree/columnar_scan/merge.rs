@@ -431,7 +431,6 @@ impl MergeStream {
             source.row += 1;
             if keep {
                 source.referenced = true;
-                source.late.batch_picks += 1;
                 self.pending.push(Pick {
                     source: winner,
                     row,
@@ -940,6 +939,14 @@ impl MergeStream {
         if pending.is_empty() {
             return Ok(None);
         }
+        // A row page holding a row the predicate kept, where it could judge
+        // it yet, is one whose payload is read: what the density is counted
+        // on.
+        for pick in &pending {
+            if let Some(source) = self.sources.get_mut(pick.source) {
+                source.late.batch_picks += 1;
+            }
+        }
         // The rows are chosen, and judged where the predicate could judge
         // them yet: only now is their payload read, from their row pages.
         self.fill_late(scan, &pending)?;
@@ -1060,6 +1067,21 @@ impl MergeStream {
                         }
                         continue;
                     }
+                    // What of the page the chosen rows hold, and what came
+                    // along with them.
+                    let mut useful = 0u64;
+                    for pick in pending.iter().filter(|pick| pick.source == index) {
+                        if !column.is_valid(pick.row) {
+                            continue;
+                        }
+                        useful +=
+                            match column.type_tag.fixed_width() {
+                                Some(width) => u64::from(width),
+                                None => bytes_column_row(&column.data, batch.row_count, pick.row)?
+                                    .len() as u64,
+                            };
+                    }
+                    scan.record_payload(useful, column.data.len() as u64);
                     *slot = Column {
                         column_id: carried,
                         ..column

@@ -205,7 +205,8 @@ fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Res
             .column(COL_USER_KEY)
             .field(field(PRICE, u32_le()))
             .field(field(BODY, TypeTag::Bytes));
-        let before = any.metrics().blob_read_count();
+        let m = any.metrics();
+        let (requests, bytes) = (m.blob_read_count(), m.blob_bytes_read());
         let got = rows(any.columnar_scan(projection, Some(&cheap), SeqNo::MAX, ..)?)?;
         let keys: Vec<&[u8]> = got.iter().map(|(key, _)| key.as_slice()).collect();
         assert_eq!(
@@ -213,10 +214,17 @@ fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Res
             [&b"k01"[..], b"k02", b"k03", b"k04"],
             "columnar={columnar}: k00's newest version is not cheap"
         );
+        // The four bodies sit next to each other in one blob file: read in
+        // one request, and nothing of the sixteen bodies the predicate drops.
         assert_eq!(
-            any.metrics().blob_read_count() - before,
-            4,
-            "columnar={columnar}: one body read per row kept"
+            m.blob_read_count() - requests,
+            1,
+            "columnar={columnar}: the kept bodies are read together"
+        );
+        let read = m.blob_bytes_read() - bytes;
+        assert!(
+            read < 6 * 300,
+            "columnar={columnar}: {read} body bytes read for four bodies of 300"
         );
     }
     Ok(())
@@ -378,9 +386,16 @@ fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()>
     rows_of_scan(&any, metadata, None)?;
 
     let before = m.bytes_read();
+    let (useful, materialized) = (m.payload_bytes_useful(), m.bytes_materialized());
     let sparse = rows_of_scan(&any, notes.clone(), Some(&cheap))?;
     let sparse_read = m.bytes_read() - before;
+    let sparse_materialized = m.bytes_materialized() - materialized;
     assert_eq!(sparse.len(), 20);
+    assert_eq!(
+        m.payload_bytes_useful() - useful,
+        20 * 200,
+        "the useful payload read is the twenty notes kept"
+    );
     for (key, cells) in &sparse {
         let i: u32 = std::str::from_utf8(&key[1..])
             .expect("utf8")
@@ -391,12 +406,19 @@ fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()>
     }
 
     let before = m.bytes_read();
+    let materialized = m.bytes_materialized();
     let dense = rows_of_scan(&any, notes, None)?;
     let dense_read = m.bytes_read() - before;
+    let dense_materialized = m.bytes_materialized() - materialized;
     assert_eq!(dense.len(), rows as usize);
     assert!(
         sparse_read * 10 < dense_read,
         "the sparse scan read {sparse_read} bytes of notes, the rest of them took {dense_read}"
+    );
+    // What is materialised follows the rows returned, a hundredth of them.
+    assert!(
+        sparse_materialized * 50 < dense_materialized,
+        "materialised {sparse_materialized} for twenty rows, {dense_materialized} for all"
     );
     Ok(())
 }

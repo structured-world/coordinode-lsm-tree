@@ -977,6 +977,23 @@ impl ColumnarScan {
         let _ = batch;
     }
 
+    /// Records a payload page read for chosen rows: `useful` bytes of their
+    /// cells out of the `decoded` bytes of the page's column.
+    #[inline]
+    #[cfg_attr(
+        not(feature = "metrics"),
+        expect(
+            clippy::unused_self,
+            reason = "the scan's metrics exist only with the feature"
+        )
+    )]
+    fn record_payload(&self, useful: u64, decoded: u64) {
+        #[cfg(feature = "metrics")]
+        self.metrics.record_payload(useful, decoded);
+        #[cfg(not(feature = "metrics"))]
+        let _ = (useful, decoded);
+    }
+
     /// Records `bytes` a read copied out of the pages it decoded.
     #[inline]
     #[cfg_attr(
@@ -2109,6 +2126,8 @@ impl Iterator for ColumnarScan {
                 match next {
                     Some(Ok(batch)) => {
                         self.current = Some(stream);
+                        #[cfg(feature = "metrics")]
+                        self.metrics.record_materialized(batch.data_size());
                         return Some(Ok(batch));
                     }
                     // A failed group yields its error and is dropped; the next

@@ -274,6 +274,16 @@ fn read_objects(cells: &CellSource, rows: &mut Rows, mut fetches: Vec<Fetch>) ->
             fetch.indirection.vhandle.offset,
         )
     });
+    // Objects close together in one file are read in one request first;
+    // each is then taken from the cache.
+    if fetches.len() > 1 {
+        let mut items = Vec::with_capacity(fetches.len());
+        for fetch in &fetches {
+            let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
+            items.push((&**key, fetch.indirection.vhandle, 0));
+        }
+        cells.source.prefetch(&cells.version.version, &mut items);
+    }
     for fetch in fetches {
         let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
         let object = cells
