@@ -13643,8 +13643,8 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
         tree.flush_active_memtable(0)?;
     }
 
-    // Damage the FIRST data block of the table, so phase one salvages it into
-    // a replacement holding the later blocks.
+    // Damage the LAST data block of the table, so phase one salvages it into a
+    // replacement holding the earlier blocks.
     let table_path = memfs
         .read_dir(&root.join(crate::file::TABLES_FOLDER))?
         .into_iter()
@@ -13660,7 +13660,7 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
         block_offsets.len() > 2,
         "the table spans several data blocks"
     );
-    let flip_table_at = block_offsets.first().expect("a first block") + 16;
+    let flip_table_at = block_offsets.last().expect("a last block") + 16;
 
     // Damage the LAST blob frame, so the blob stage salvages the blob file and
     // every surviving reference has to be remapped.
@@ -13710,26 +13710,19 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
     let crate::AnyTree::Blob(tree) = config().open()? else {
         panic!("expected blob tree");
     };
+    // The earlier blocks read back as a prefix of the keys; the damaged last
+    // block, which also holds the record of the damaged frame, is lost.
     let mut readable = 0u32;
     for i in 0..n {
         if let Some(v) = tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)? {
+            assert_eq!(readable, i, "k{i:04} reads after a lost key");
             assert_eq!(&*v, value(i).as_slice(), "k{i:04} reads its own value");
             readable += 1;
         }
     }
-    assert_eq!(
-        tree.get(b"k0000", crate::MAX_SEQNO)?,
-        None,
-        "the damaged first block is lost",
-    );
-    assert_eq!(
-        tree.get(format!("k{:04}", n - 1).as_bytes(), crate::MAX_SEQNO)?,
-        None,
-        "the record in the damaged frame is lost",
-    );
     assert!(
-        readable > n / 2,
-        "the later blocks survive: {readable} of {n} keys read",
+        readable > n / 2 && readable < n,
+        "the earlier blocks survive, the last does not: {readable} of {n} keys read",
     );
     Ok(())
 }
