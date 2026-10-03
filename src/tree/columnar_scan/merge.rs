@@ -112,8 +112,8 @@ struct LatePayload {
     filled: Vec<u16>,
     /// The row page the current batch was read from.
     batch_at: Option<crate::table::columnar_cursor::PageAt>,
-    /// Rows chosen from the current batch.
-    batch_picks: u32,
+    /// Whether a row chosen from the current batch was kept.
+    batch_hit: bool,
     /// The decoded bytes of the current batch's payload read late, and of
     /// them the chosen rows' cells taken so far.
     page_bytes: u64,
@@ -158,8 +158,8 @@ impl LatePayload {
         if self.columns.is_empty() {
             return None;
         }
-        self.recent_hits = (self.recent_hits << 1 | u8::from(self.batch_picks > 0)) & DENSITY_MASK;
-        self.batch_picks = 0;
+        self.recent_hits = (self.recent_hits << 1 | u8::from(self.batch_hit)) & DENSITY_MASK;
+        self.batch_hit = false;
         if self.pages < DENSITY_WINDOW {
             self.pages += 1;
             if self.pages < DENSITY_WINDOW {
@@ -810,14 +810,38 @@ impl MergeStream {
             *support = (*support).min(PredicateSupport::Unsupported);
             merged
         };
-        if deferred.contains(&true) {
-            for index in self.returned_indices(&merged, &pending)? {
+        // The density takes whether a page held a kept row, not how many: only
+        // a source still without one on its page has its rows matched, and
+        // only until it has one.
+        let mut waiting: Vec<usize> = pending
+            .iter()
+            .zip(&deferred)
+            .filter(|&(pick, &defer)| {
+                defer
+                    && self
+                        .sources
+                        .get(pick.source)
+                        .is_some_and(|s| !s.late.batch_hit)
+            })
+            .map(|(pick, _)| pick.source)
+            .collect();
+        if !waiting.is_empty() {
+            waiting.sort_unstable();
+            waiting.dedup();
+            let mut hit = Vec::with_capacity(waiting.len());
+            self.walk_returned(&merged, &pending, |index| {
                 if deferred.get(index).copied().unwrap_or(false)
-                    && let Some(source) = pending
-                        .get(index)
-                        .and_then(|pick| self.sources.get_mut(pick.source))
+                    && let Some(pick) = pending.get(index)
+                    && let Ok(at) = waiting.binary_search(&pick.source)
                 {
-                    source.late.batch_picks += 1;
+                    waiting.remove(at);
+                    hit.push(pick.source);
+                }
+                !waiting.is_empty()
+            })?;
+            for source in hit {
+                if let Some(source) = self.sources.get_mut(source) {
+                    source.late.batch_hit = true;
                 }
             }
         }
@@ -865,22 +889,22 @@ impl MergeStream {
         merged: &ColumnBatch,
         pending: &'p [Pick],
     ) -> crate::Result<Vec<&'p Pick>> {
-        self.returned_indices(merged, pending)?
-            .into_iter()
-            .map(|index| {
-                pending.get(index).ok_or(Error::InvalidHeader(
-                    "columnar_scan: a returned row is not among the rows chosen",
-                ))
-            })
-            .collect()
+        let mut returned = Vec::with_capacity(merged.row_count as usize);
+        self.walk_returned(merged, pending, |index| {
+            returned.extend(pending.get(index));
+            true
+        })?;
+        Ok(returned)
     }
 
-    /// [`Self::returned_picks`], as each pick's place in `pending`.
-    fn returned_indices(
+    /// Hands `visit` the place in `pending` of the chosen row each row of
+    /// `merged` was taken from, in row order, while it returns `true`.
+    fn walk_returned(
         &self,
         merged: &ColumnBatch,
         pending: &[Pick],
-    ) -> crate::Result<Vec<usize>> {
+        mut visit: impl FnMut(usize) -> bool,
+    ) -> crate::Result<()> {
         let keys = merged
             .columns
             .iter()
@@ -888,7 +912,6 @@ impl MergeStream {
             .ok_or(MISSING_COLUMN)?;
         // The returned rows keep the order they were chosen in and their keys
         // are distinct, so each is the next chosen row with its key.
-        let mut returned = Vec::with_capacity(merged.row_count as usize);
         let mut picks = pending.iter().enumerate();
         for row in 0..merged.row_count {
             let key = bytes_column_row(&keys.data, merged.row_count, row)?;
@@ -906,9 +929,11 @@ impl MergeStream {
                 .ok_or(Error::InvalidHeader(
                     "columnar_scan: a returned row is not among the rows chosen",
                 ))?;
-            returned.push(index);
+            if !visit(index) {
+                break;
+            }
         }
-        Ok(returned)
+        Ok(())
     }
 
     /// Whether `pick` was taken from a batch that stores a projected field
@@ -1098,7 +1123,7 @@ impl MergeStream {
             let defer =
                 open && filters_after && !source.late.columns.is_empty() && !source.late.batch_late;
             if !defer {
-                source.late.batch_picks += 1;
+                source.late.batch_hit = true;
             }
             deferred.push(defer);
         }
