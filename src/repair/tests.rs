@@ -17460,8 +17460,36 @@ fn repair_propagates_a_transport_failure() -> crate::Result<()> {
 /// own checksum: a verbatim copy carries a checksum bound to its offset, and it
 /// has to be bound to where it lands, after the re-emitted block.
 #[test]
-#[expect(clippy::expect_used, reason = "test code")]
 fn repair_with_salvage_keeps_every_block_after_a_lost_first_block_readable() -> crate::Result<()> {
+    // Two keys a block: the lost one holds k0000 and k0001, and k0002, the
+    // first key after the lost range, goes with it as its possible boundary.
+    let first_read = salvage_after_a_lost_first_unit(false)?;
+    assert_eq!(
+        first_read, 3,
+        "only the first block and its boundary key are lost"
+    );
+    Ok(())
+}
+
+/// The same through a columnar table, whose re-encoded row group is written at
+/// once, so the copies after it land where they are stamped for.
+#[cfg(feature = "columnar")]
+#[test]
+fn repair_with_salvage_keeps_every_row_group_after_a_lost_first_group_readable() -> crate::Result<()>
+{
+    let first_read = salvage_after_a_lost_first_unit(true)?;
+    assert!(
+        (1..20).contains(&first_read),
+        "only the first row group is lost: k{first_read:04}"
+    );
+    Ok(())
+}
+
+/// Damages the first data unit of a 40-key table, repairs it with salvage and
+/// reads every key back: none fails, the survivors are a suffix of the keys
+/// that read their own values. Returns the first key read.
+#[expect(clippy::expect_used, reason = "test code")]
+fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
     use crate::config::BlockSizePolicy;
     use crate::fs::{Fs, MemFs};
     use crate::{AbstractTree, Config, SequenceNumberCounter};
@@ -17480,10 +17508,17 @@ fn repair_with_salvage_keeps_every_block_after_a_lost_first_block_readable() -> 
         )
         .with_shared_fs(memfs.clone())
         .data_block_size_policy(BlockSizePolicy::all(128))
+        .columnar_row_group_size_policy(BlockSizePolicy::all(128))
     };
     let n = 40u32;
     {
         let tree = config().open()?;
+        if columnar {
+            let crate::AnyTree::Standard(standard) = &tree else {
+                panic!("expected a standard tree");
+            };
+            standard.update_runtime_config(|c| c.columnar = true)?;
+        }
         for i in 0..n {
             tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
         }
@@ -17502,7 +17537,7 @@ fn repair_with_salvage_keeps_every_block_after_a_lost_first_block_readable() -> 
         .collect::<Vec<_>>();
     assert!(
         block_offsets.len() > 2,
-        "the table spans several data blocks"
+        "the table spans several data units"
     );
     let at = block_offsets.first().expect("a first block") + 16;
     {
@@ -17543,10 +17578,5 @@ fn repair_with_salvage_keeps_every_block_after_a_lost_first_block_readable() -> 
             None => assert!(first_read.is_none(), "k{i:04} is lost after a key read"),
         }
     }
-    let first_read = first_read.expect("the blocks after the lost one survive");
-    assert!(
-        first_read < n / 2,
-        "only the first block is lost: k{first_read:04}"
-    );
-    Ok(())
+    Ok(first_read.expect("the units after the lost one survive"))
 }
