@@ -2228,6 +2228,13 @@ trait ScanRead: io::Read + io::Seek {}
 #[cfg(not(feature = "std"))]
 impl<T: io::Read + io::Seek> ScanRead for T {}
 
+/// What a read of the file returns: the byte count, or the backend's error.
+#[cfg(feature = "std")]
+type FileRead = std::io::Result<usize>;
+/// What a read of the file returns: the byte count, or the backend's error.
+#[cfg(not(feature = "std"))]
+type FileRead = io::Result<usize>;
+
 /// An SST opened for a scan whose every read of the file is charged to the
 /// limiter, when there is one, before it is made: the bytes the buffered
 /// walk pulls in, trailer and TOC included, never a length a header or the
@@ -2264,20 +2271,16 @@ impl<'a> PacedFile<'a> {
 #[cfg(feature = "std")]
 impl std::io::Read for PacedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.pace(buf.len());
-        let read = self.inner.read(buf)?;
-        self.pos += read as u64;
-        Ok(read)
+        let charged = self.pace(buf.len());
+        self.fill(buf, charged)
     }
 }
 
 #[cfg(not(feature = "std"))]
 impl io::Read for PacedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.pace(buf.len());
-        let read = self.inner.read(buf)?;
-        self.pos += read as u64;
-        Ok(read)
+        let charged = self.pace(buf.len());
+        self.fill(buf, charged)
     }
 }
 
@@ -2299,19 +2302,47 @@ impl io::Seek for PacedFile<'_> {
 
 impl PacedFile<'_> {
     /// Waits until the limiter admits a read of up to `want` bytes, counted
-    /// only up to the file's end, which a read never goes past.
-    fn pace(&self, want: usize) {
-        let Some(limiter) = self.limiter else {
-            return;
-        };
+    /// only up to the file's end, which a read never goes past, and returns
+    /// how many it admitted.
+    fn pace(&self, want: usize) -> usize {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
-        if bytes > 0 {
+        if let Some(limiter) = self.limiter
+            && bytes > 0
+        {
             // A scrub has no stop signal, so the wait always ends in a read.
             let stopped = limiter.request_interruptible(bytes, || false);
             debug_assert!(!stopped, "a scrub is never stopped midway");
         }
+        // At most `want`, so it fits a `usize`.
+        usize::try_from(bytes).unwrap_or(want)
+    }
+
+    /// Reads into `buf` until the `charged` bytes are in or the file ends: a
+    /// backend may return fewer bytes per call, and every byte charged is then
+    /// still one read, never charged again by the next call.
+    fn fill(&mut self, buf: &mut [u8], charged: usize) -> FileRead {
+        if charged == 0 {
+            // Nothing admitted: past the end, which reads nothing, or an
+            // empty buffer.
+            let read = self.inner.read(buf)?;
+            self.pos += read as u64;
+            return Ok(read);
+        }
+        let mut read = 0;
+        while read < charged {
+            let Some(rest) = buf.get_mut(read..charged) else {
+                break;
+            };
+            let got = self.inner.read(rest)?;
+            if got == 0 {
+                break;
+            }
+            read += got;
+            self.pos += got as u64;
+        }
+        Ok(read)
     }
 }
 

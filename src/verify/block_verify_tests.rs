@@ -1124,6 +1124,88 @@ fn a_rated_scan_charges_the_bytes_read_not_a_forged_section_length() -> crate::R
     Ok(())
 }
 
+/// A file that hands back at most 512 bytes a read, as a backend may.
+struct ShortReads(Box<dyn crate::fs::FsFile>);
+
+impl std::io::Read for ShortReads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let cap = buf.len().min(512);
+        match buf.get_mut(..cap) {
+            Some(head) => self.0.read(head),
+            None => Ok(0),
+        }
+    }
+}
+
+impl std::io::Write for ShortReads {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl std::io::Seek for ShortReads {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for ShortReads {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.0.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.0.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.0.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.0.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.0.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.0.lock_exclusive()
+    }
+}
+
+/// A backend that returns fewer bytes than asked costs the budget the bytes it
+/// reads: the buffered walk asks again for the rest, and a read already
+/// charged is not charged a second time.
+#[test]
+fn a_paced_file_charges_short_reads_once() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    let bytes: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&bytes)?;
+    }
+    // A second of rate is the whole file: charged once, the read never waits.
+    let limiter = crate::rate_limiter::RateLimiter::new(bytes.len() as u64);
+    let file = ShortReads(fs.open(path, &FsOpenOptions::new().read(true))?);
+    let mut reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        PacedFile::new(Box::new(file), Some(&limiter))?,
+    );
+    let mut read = vec![0u8; bytes.len()];
+    let start = std::time::Instant::now();
+    reader.read_exact(&mut read[..])?;
+    let elapsed = start.elapsed();
+    assert_eq!(read, bytes, "the file reads back whole");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "short reads were charged more than once: the read waited {elapsed:?}"
+    );
+    Ok(())
+}
+
 /// The parity-trailer drain reports a truncated read when an SST whose ECC
 /// descriptor claims per-block parity is missing those trailer bytes. Forges
 /// a `data` section of header + its full payload (so the data read and its
