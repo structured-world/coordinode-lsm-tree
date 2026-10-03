@@ -307,6 +307,8 @@ struct Opening {
     /// Per-block column min / max, which lets a predicate skip a block
     /// without loading it.
     zone_map: bool,
+    /// A cell column whose fields go to a blob file however small.
+    separated_column: Option<u16>,
 }
 
 fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Result<AnyTree> {
@@ -317,7 +319,11 @@ fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Resu
     let mut builder = crate::config::tree_builder(dir.path(), config)?.with_runtime_config(rc);
 
     if opening.kv_separation {
-        builder = builder.with_kv_separation(Some(Default::default()));
+        let mut opts = lsm_tree::KvSeparationOptions::default();
+        if let Some(column) = opening.separated_column {
+            opts = opts.cell_separation_threshold(column, 0);
+        }
+        builder = builder.with_kv_separation(Some(opts));
     }
 
     builder.open()
@@ -770,6 +776,9 @@ struct CellLayout {
     /// Whether the rows are written out of key order and rewritten in rounds,
     /// so neighbouring keys' payloads sit far apart.
     scattered: bool,
+    /// Whether the cluster field goes to a blob file, so a predicate on it
+    /// judges a row only once its object is read.
+    referenced_cluster: bool,
 }
 
 /// Rows written as cells into a blob tree whose tables are columnar.
@@ -792,6 +801,7 @@ fn cell_rows(
             columnar: true,
             kv_separation: true,
             zone_map: true,
+            separated_column: layout.referenced_cluster.then_some(CELL_CLUSTER),
         },
     )?;
     let AnyTree::Blob(blob) = &tree else {
@@ -883,6 +893,27 @@ pub fn cells_inline(
         CellLayout {
             payload: 64,
             scattered: false,
+            referenced_cluster: false,
+        },
+    )
+}
+
+/// [`cells_inline`] with the cluster field in a blob file however small: a
+/// predicate on it reads each candidate's object to judge it, and the inline
+/// payload of the rows it drops is what a late read still spares.
+pub fn cells_ref_filter(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    cell_rows(
+        config,
+        seqno,
+        base,
+        CellLayout {
+            payload: 64,
+            scattered: false,
+            referenced_cluster: true,
         },
     )
 }
@@ -901,6 +932,7 @@ pub fn cells_wide(
         CellLayout {
             payload: 4_096,
             scattered: false,
+            referenced_cluster: false,
         },
     )
 }
@@ -919,6 +951,7 @@ pub fn cells_scattered(
         CellLayout {
             payload: 8_192,
             scattered: true,
+            referenced_cluster: false,
         },
     )
 }

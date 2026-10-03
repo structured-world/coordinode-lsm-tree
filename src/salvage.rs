@@ -115,6 +115,12 @@ pub struct SalvageOptions {
     /// [`SalvageReport::entries_dropped_by_rewrite`]. A set rewrite disables
     /// verbatim block copy-through (raw block bytes would carry stale handles).
     pub blob_rewrite: Option<Arc<crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>>,
+    /// Cell rows to make the owners of objects they reference, or `None`
+    /// (the default) to keep every owner bit as written. [`crate::repair`]
+    /// fills it for objects whose owning row it could not keep. Like
+    /// [`Self::blob_rewrite`], a set promotion disables verbatim block
+    /// copy-through.
+    pub owner_promotions: Option<Arc<OwnerPromotions>>,
     /// Shared live-progress counters the block walk ticks per inspected /
     /// re-emitted / dropped block and per recovered row, or `None` (the
     /// default) to skip publishing. [`crate::repair`] forwards the handle set
@@ -151,6 +157,85 @@ pub enum BlobFileRewrite {
     /// by a crash) points into zeroed bytes — its entry is removed; handles at
     /// or above the frontier are kept untouched.
     DropBelow(u64),
+}
+
+/// The cell rows a salvage makes the owners of objects they reference, each
+/// named by its user key and seqno, with the field columns whose references
+/// it is to own.
+///
+/// An object is owned by exactly one row of its key, and the drop of that row
+/// is what charges the object's bytes as garbage. A row that only borrows it
+/// is never charged, so an object whose owning row is gone while a borrowing
+/// one stays would be live data no compaction ever counts as garbage once
+/// the borrower goes too. Repair names, for each such object, the oldest row
+/// still referencing it.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::salvage::OwnerPromotions;
+///
+/// let mut promotions = OwnerPromotions::default();
+/// promotions.insert(b"doc".to_vec().into(), 7, 4);
+/// assert!(!promotions.is_empty());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct OwnerPromotions(crate::HashMap<UserKey, Vec<(crate::SeqNo, u16)>>);
+
+impl OwnerPromotions {
+    /// Makes the row of `key` at `seqno` the owner of the object its field
+    /// in `column` references.
+    pub fn insert(&mut self, key: UserKey, seqno: crate::SeqNo, column: u16) {
+        let rows = self.0.entry(key).or_default();
+        if !rows.contains(&(seqno, column)) {
+            rows.push((seqno, column));
+        }
+    }
+
+    /// Whether no row is named.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The `(seqno, column)` pairs named for rows of `key`.
+    fn of_key(&self, key: &UserKey) -> &[(crate::SeqNo, u16)] {
+        self.0.get(key).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// What a salvage rewrites in the rows it re-emits: blob handles into the
+/// files repair reshaped, and the owner bits it hands to other rows.
+#[derive(Clone, Copy)]
+struct RowRewrites<'a> {
+    blobs: Option<&'a crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>,
+    owners: Option<&'a OwnerPromotions>,
+}
+
+impl<'a> RowRewrites<'a> {
+    /// The rewrites `options` asks for, `None` when it asks for none.
+    fn of(options: &'a SalvageOptions) -> Option<Self> {
+        let blobs = options.blob_rewrite.as_deref();
+        let owners = options
+            .owner_promotions
+            .as_deref()
+            .filter(|o| !o.is_empty());
+        (blobs.is_some() || owners.is_some()).then_some(Self { blobs, owners })
+    }
+
+    /// How the handles into `file` are rewritten.
+    fn blob(&self, file: crate::vlog::BlobFileId) -> Option<&'a BlobFileRewrite> {
+        self.blobs.and_then(|blobs| blobs.get(&file))
+    }
+
+    /// The handle rewrites `blobs` alone.
+    #[cfg(test)]
+    fn of_blobs(blobs: &'a crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>) -> Self {
+        Self {
+            blobs: Some(blobs),
+            owners: None,
+        }
+    }
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -1144,7 +1229,7 @@ fn salvage_attempt(
         comparator,
         !delete_mask_unpositionable,
         allow_verbatim && !resealed,
-        options.blob_rewrite.as_deref(),
+        RowRewrites::of(options),
         options.progress.as_deref(),
     ) {
         Ok(walk) => walk,
@@ -1350,7 +1435,7 @@ fn classify_drop(
 /// answers when it groups a key's versions.
 fn rewrite_block_indirections(
     entries: Vec<crate::InternalValue>,
-    rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+    rewrite: RowRewrites<'_>,
     dropped_entries: &mut u64,
 ) -> crate::Result<(Vec<crate::InternalValue>, Option<UserKey>)> {
     use crate::coding::{Decode, Encode};
@@ -1371,7 +1456,17 @@ fn rewrite_block_indirections(
         if entry.key.value_type == crate::ValueType::CellRow {
             // A cell row loses its head the same way when any object it
             // references is gone: a row with a missing field is not the row.
-            match rewrite_row_refs(&entry.value, rewrite)? {
+            let seqno = entry.key.seqno;
+            let named = rewrite
+                .owners
+                .map_or(&[][..], |o| o.of_key(&entry.key.user_key));
+            // Empty, and so not allocated, for a row no promotion names.
+            let owns: Vec<u16> = named
+                .iter()
+                .filter(|&&(at, _)| at == seqno)
+                .map(|&(_, column)| column)
+                .collect();
+            match rewrite_row_refs(&entry.value, rewrite, &owns)? {
                 RowRewrite::Unchanged => out.push(entry),
                 RowRewrite::Rewritten(row) => {
                     entry.value = row.into();
@@ -1390,7 +1485,7 @@ fn rewrite_block_indirections(
         }
         let mut cursor = &entry.value[..];
         let mut ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-        match rewrite.get(&ind.vhandle.blob_file_id) {
+        match rewrite.blob(ind.vhandle.blob_file_id) {
             None => out.push(entry),
             Some(BlobFileRewrite::Remap { new_id, offsets }) => {
                 if let Some(&relocation) = offsets.get(&ind.vhandle.offset) {
@@ -1423,35 +1518,43 @@ fn rewrite_block_indirections(
     Ok((out, headless))
 }
 
-/// What a [`BlobFileRewrite`] set does to one cell row.
+/// What a row rewrite does to one cell row.
 enum RowRewrite {
-    /// No reference names a rewritten file.
+    /// No reference names a rewritten file or is handed ownership.
     Unchanged,
-    /// Every reference into a rewritten file was remapped: the new row.
+    /// Every reference into a rewritten file was remapped, and each one the
+    /// row is to own owns its object: the new row.
     Rewritten(Vec<u8>),
     /// A reference names a record that no longer exists.
     Lost,
 }
 
 /// Applies a [`BlobFileRewrite`] set to the references of the cell row `row`,
-/// as [`rewrite_block_indirections`] applies it to an indirection.
+/// as [`rewrite_block_indirections`] applies it to an indirection, and makes
+/// the row own the objects its fields in the columns of `owns` reference.
 ///
 /// # Errors
 ///
 /// Returns an error if the row is malformed.
 fn rewrite_row_refs(
     row: &[u8],
-    rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+    rewrite: RowRewrites<'_>,
+    owns: &[u16],
 ) -> crate::Result<RowRewrite> {
     use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
 
     let mut cells = decode_row(row)?;
     let mut changed = false;
     for field in &mut cells {
-        let RowCell::Ref { indirection, .. } = &mut field.cell else {
+        let column = field.column;
+        let RowCell::Ref { indirection, owner } = &mut field.cell else {
             continue;
         };
-        match rewrite.get(&indirection.vhandle.blob_file_id) {
+        if !*owner && owns.contains(&column) {
+            *owner = true;
+            changed = true;
+        }
+        match rewrite.blob(indirection.vhandle.blob_file_id) {
             None => {}
             Some(BlobFileRewrite::Remap { new_id, offsets }) => {
                 let Some(&relocation) = offsets.get(&indirection.vhandle.offset) else {
@@ -1658,14 +1761,15 @@ fn salvage_blocks(
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
     allow_verbatim: bool,
-    blob_rewrite: Option<&crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>,
+    blob_rewrite: Option<RowRewrites<'_>>,
     progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
 
-    // A handle rewrite invalidates every raw block byte (it carries the old
-    // handles), so the verbatim copy-through is disabled for the whole walk.
+    // A row rewrite invalidates every raw block byte (it carries the old
+    // handles and owner bits), so the verbatim copy-through is disabled for
+    // the whole walk.
     let allow_verbatim = allow_verbatim && blob_rewrite.is_none();
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;

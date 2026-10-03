@@ -45,7 +45,7 @@ fn config() -> BenchConfig {
 /// Every fixture, including those of the unsupported scenarios. The tests that
 /// cover all of them read this one list, so a new fixture cannot be added to
 /// one of them and silently missed by another.
-const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 13] = [
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 14] = [
     ("narrow", fixtures::narrow),
     ("wide", fixtures::wide),
     ("mixed-sizes", fixtures::mixed_sizes),
@@ -65,6 +65,7 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 13] = [
     ("cells-inline", fixtures::cells_inline),
     ("cells-wide", fixtures::cells_wide),
     ("cells-scattered", fixtures::cells_scattered),
+    ("cells-ref-filter", fixtures::cells_ref_filter),
 ];
 
 /// The cell-row scans return exactly the rows their predicate selects, and a

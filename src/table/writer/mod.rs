@@ -2227,7 +2227,7 @@ impl Writer {
             self.meta.weak_tombstone_count += 1;
         }
 
-        if value_type == ValueType::Value
+        if value_type.is_put()
             && let Some(prev_key) = &self.previous_weak_tombstone_key
             && crate::comparator::same_user_key(prev_key, user_key)
         {
@@ -3289,7 +3289,7 @@ impl Writer {
             if e.key.value_type == ValueType::WeakTombstone {
                 self.meta.weak_tombstone_count += 1;
             }
-            if e.key.value_type == ValueType::Value
+            if e.key.value_type.is_put()
                 && let Some(prev_key) = &self.previous_weak_tombstone_key
                 && crate::comparator::same_user_key(prev_key, user_key)
             {

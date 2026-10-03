@@ -183,6 +183,8 @@ measured on.
 | `cells-scan-sparse-one-per-page-eager` | The `cells-scan-sparse-one-per-page` rows read whole, the predicate applied by the caller: the time the late read is held against. |
 | `cells-scan-near-full` | The same rows, a ~90% predicate: the scan reads the payload with the rest once its choices are dense. |
 | `cells-scan-near-full-eager` | The `cells-scan-near-full` rows read whole, the predicate applied by the caller: the sequential pass the density decision must not lose to. |
+| `cells-scan-ref-filtered` | The `cells-scan-sparse-clustered` rows with the cluster field kept in a blob file however small, so the ~1% predicate on it judges a row only once its object is read: the rows it drops cost their objects, and the inline payload of their pages is what the scan still spares. |
+| `cells-scan-ref-filtered-eager` | The `cells-scan-ref-filtered` rows read whole, the predicate applied by the caller. |
 | `cells-scan-under-compaction` | The `blobs-filtered-before-fetch` scan repeated forty times while a second thread writes other rows, flushes and compacts, so blob files are relocated and dropped under the scans. Each repetition is verified; it publishes the scans' `scan P50` and `scan P99` in microseconds and no byte series, since the compacting thread reads and copies through the same counters. |
 
 The selective scans hand the predicate to the engine rather than filtering

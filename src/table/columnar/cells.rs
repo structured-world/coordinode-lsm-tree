@@ -24,7 +24,7 @@
 //! tag and width byte, a byte that is `1` when the row owns the object, and
 //! the encoded blob indirection. A row without a reference is null.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use super::{
@@ -60,9 +60,9 @@ pub fn holds_cells<'a>(mut ids: impl Iterator<Item = &'a u16>) -> bool {
 /// the references column when a split row holds one, and the whole-value
 /// column.
 ///
-/// A cell row is split unless it does not decode or a field of it holds a
-/// value under another type than the group's column of that id already
-/// does; it is then kept whole, as it was written.
+/// A cell row is split unless it does not decode or a field of it, a value
+/// or a reference, has another type than an earlier split row gave that id;
+/// it is then kept whole, as it was written.
 ///
 /// # Errors
 ///
@@ -73,8 +73,12 @@ pub fn entries_to_cells_batch(entries: &[InternalValue]) -> Result<ColumnBatch> 
         .map_err(|_| Error::InvalidHeader("columnar: row count exceeds u32"))?;
     let count = entries.len();
 
-    // Each field id's type, from the first split row that holds a value in it.
+    // Each field id's type, from the first split row that holds it, as a
+    // value or a reference: a column reads every split row of its id under
+    // that type, the references too. Only the ids some split row holds a
+    // value in get a column.
     let mut tags: BTreeMap<u16, TypeTag> = BTreeMap::new();
+    let mut valued: BTreeSet<u16> = BTreeSet::new();
     let mut rows = Vec::with_capacity(count);
     for entry in entries {
         let split = (entry.key.value_type == ValueType::CellRow)
@@ -84,8 +88,9 @@ pub fn entries_to_cells_batch(entries: &[InternalValue]) -> Result<ColumnBatch> 
         rows.push(match split {
             Some(fields) => {
                 for field in &fields {
+                    tags.entry(field.column).or_insert(field.tag);
                     if let RowCell::Value(_) = field.cell {
-                        tags.entry(field.column).or_insert(field.tag);
+                        valued.insert(field.column);
                     }
                 }
                 Stored::Split(fields)
@@ -122,6 +127,9 @@ pub fn entries_to_cells_batch(entries: &[InternalValue]) -> Result<ColumnBatch> 
     ];
 
     for (&column_id, &type_tag) in &tags {
+        if !valued.contains(&column_id) {
+            continue;
+        }
         let cells: Vec<Option<&[u8]>> = rows
             .iter()
             .map(|row| match row {
@@ -156,19 +164,19 @@ pub fn entries_to_cells_batch(entries: &[InternalValue]) -> Result<ColumnBatch> 
     Ok(ColumnBatch { row_count, columns })
 }
 
-/// Whether every value of `fields` has the type the group's column of its id
-/// holds, where the group has one, and that type's width: a fixed-width cell
-/// of another width would not come back as it was.
+/// Whether every field of `fields`, value or reference, has the type the
+/// group gives its id, where the group gives one, and every value that type's
+/// width: a fixed-width cell of another width would not come back as it was.
 fn fits(fields: &[RowField<'_>], tags: &BTreeMap<u16, TypeTag>) -> bool {
-    fields.iter().all(|field| match field.cell {
-        RowCell::Value(bytes) => {
-            tags.get(&field.column).is_none_or(|&tag| tag == field.tag)
-                && field
+    fields.iter().all(|field| {
+        tags.get(&field.column).is_none_or(|&tag| tag == field.tag)
+            && match field.cell {
+                RowCell::Value(bytes) => field
                     .tag
                     .fixed_width()
-                    .is_none_or(|width| bytes.len() == usize::from(width))
-        }
-        RowCell::Ref { .. } => true,
+                    .is_none_or(|width| bytes.len() == usize::from(width)),
+                RowCell::Ref { .. } => true,
+            }
     })
 }
 

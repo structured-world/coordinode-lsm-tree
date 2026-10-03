@@ -107,6 +107,9 @@ struct LatePayload {
     eager: bool,
     /// Whether the current batch was read without its payload.
     batch_late: bool,
+    /// The columns, as the merge carries them, of the current batch's payload
+    /// already read, ahead of the rest.
+    filled: Vec<u16>,
     /// The row page the current batch was read from.
     batch_at: Option<crate::table::columnar_cursor::PageAt>,
     /// Rows chosen from the current batch.
@@ -115,13 +118,27 @@ struct LatePayload {
     /// them the chosen rows' cells taken so far.
     page_bytes: u64,
     page_useful: u64,
-    /// Row pages loaded so far, and how many of them held a chosen row.
+    /// Row pages loaded so far, counted up to the window only.
     pages: u32,
-    pages_hit: u32,
+    /// Whether each of the last [`DENSITY_WINDOW`] row pages held a chosen
+    /// row, the newest in the lowest bit.
+    recent_hits: u8,
 }
 
-/// Row pages a segment is judged dense or sparse over, at the least.
+/// Row pages a segment is judged dense or sparse over: the last ones read,
+/// so a scan whose choices change density midway follows the change within
+/// as many pages, however long the stretch before it.
 const DENSITY_WINDOW: u32 = 4;
+/// The bits of [`LatePayload::recent_hits`] the window spans.
+const DENSITY_MASK: u8 = (1 << DENSITY_WINDOW) - 1;
+
+/// The payload columns a predicate on a field a blob tree's row holds
+/// elsewhere than in its own cell is judged from: the references and the
+/// whole values.
+const JUDGE_COLUMNS: [u16; 2] = [
+    crate::blob_tree::field_row::CELL_REFS_COLUMN,
+    COL_WHOLE_VALUE,
+];
 
 impl LatePayload {
     /// What the current batch's payload read late held besides the chosen
@@ -141,23 +158,23 @@ impl LatePayload {
         if self.columns.is_empty() {
             return None;
         }
-        self.pages += 1;
-        if self.batch_picks > 0 {
-            self.pages_hit += 1;
-        }
+        self.recent_hits = (self.recent_hits << 1 | u8::from(self.batch_picks > 0)) & DENSITY_MASK;
         self.batch_picks = 0;
         if self.pages < DENSITY_WINDOW {
-            return None;
+            self.pages += 1;
+            if self.pages < DENSITY_WINDOW {
+                return None;
+            }
         }
         // Dense from three in four pages holding a chosen row, sparse again
         // from one in four: the gap keeps a segment near either from flipping
         // back and forth.
-        let (hit, all) = (u64::from(self.pages_hit), u64::from(self.pages));
-        if !self.eager && hit * 4 >= all * 3 {
+        let hit = self.recent_hits.count_ones();
+        if !self.eager && hit * 4 >= DENSITY_WINDOW * 3 {
             self.eager = true;
             return Some(&self.eager_ids);
         }
-        if self.eager && hit * 4 <= all {
+        if self.eager && hit * 4 <= DENSITY_WINDOW {
             self.eager = false;
             return Some(&self.lean_ids);
         }
@@ -234,6 +251,7 @@ enum Position {
 }
 
 /// A row chosen for the output.
+#[derive(Clone, Copy)]
 struct Pick {
     source: usize,
     row: u32,
@@ -654,6 +672,7 @@ impl MergeStream {
                             batch.columns.iter().all(|c| c.column_id != stored)
                         });
                     source.late.batch_at = at;
+                    source.late.filled.clear();
                     // A whole value moves aside before the conform, where a
                     // declared field may share the value column's id.
                     let batch = carry_whole_value(batch, source.whole, raw);
@@ -1005,7 +1024,12 @@ impl MergeStream {
                 self.judge(scan, pending, Some(&types), &layout, support)?
             }
             PredicateTiming::AfterValues if layout.judged => {
-                let (pending, settled) = self.prejudge(scan, pending);
+                let (pending, open) = self.prejudge(scan, pending);
+                let (pending, settled) = if open.contains(&true) {
+                    self.judge_on_objects(scan, pending, &open, &layout)?
+                } else {
+                    (pending, true)
+                };
                 if settled && let Some(pred) = scan.predicate.as_ref() {
                     *support = (*support).min(pred.support(layout.type_of(pred.column_id)));
                     early = true;
@@ -1059,23 +1083,26 @@ impl MergeStream {
     /// stores the predicate's field as a column of its declared type, with a
     /// cell for the row, holds there the value its field reads as, so the
     /// predicate's verdict on that cell is final. Every other row is kept,
-    /// for the predicate to judge once its value is read. Also returns
-    /// whether every row got its final verdict here, in which case the
-    /// predicate has nothing left to judge after the values.
-    fn prejudge(&self, scan: &ColumnarScan, pending: Vec<Pick>) -> (Vec<Pick>, bool) {
+    /// for the predicate to judge once its value is read. Also returns, for
+    /// each row kept, whether it is still to be judged: none is when every
+    /// row got its final verdict here, and the predicate then has nothing
+    /// left to judge after the values.
+    fn prejudge(&self, scan: &ColumnarScan, pending: Vec<Pick>) -> (Vec<Pick>, Vec<bool>) {
         let Some(pred) = scan
             .predicate
             .as_ref()
             .filter(|p| p.apply == PredicateApply::Filter)
         else {
-            return (pending, false);
+            let open = alloc::vec![true; pending.len()];
+            return (pending, open);
         };
         // An operand reads as the value it resolves to, not as its own cells.
         // Otherwise the rows are judged here whether or not their payload is
         // read late: what survives is also what the density is counted on,
         // and a row dropped here is not gathered either.
         if scan.resolver.is_some() {
-            return (pending, false);
+            let open = alloc::vec![true; pending.len()];
+            return (pending, open);
         }
         // A row is judged here only on a cell its segment stores for the
         // field: an empty one reads as the declared default once conformed,
@@ -1092,18 +1119,107 @@ impl MergeStream {
                 Some((pred.matcher(batch), &s.stored))
             })
             .collect();
-        let mut pending = pending;
-        let mut settled = true;
-        pending.retain(
-            |pick| match matchers.get(pick.source).and_then(Option::as_ref) {
-                Some((matcher, stored)) if stored.holds(pick.row) => matcher.matches(pick.row),
-                _ => {
-                    settled = false;
-                    true
+        let mut kept = Vec::with_capacity(pending.len());
+        let mut open = Vec::with_capacity(pending.len());
+        for pick in pending {
+            match matchers.get(pick.source).and_then(Option::as_ref) {
+                Some((matcher, stored)) if stored.holds(pick.row) => {
+                    if matcher.matches(pick.row) {
+                        kept.push(pick);
+                        open.push(false);
+                    }
                 }
-            },
-        );
-        (pending, settled)
+                _ => {
+                    kept.push(pick);
+                    open.push(true);
+                }
+            }
+        }
+        (kept, open)
+    }
+
+    /// The rows of `pending` the predicate keeps, judging each one `open`
+    /// marks (still to be judged) that a blob tree's segment holds the
+    /// predicate's field for elsewhere than in a cell of its own: in a
+    /// referenced object or inside its whole value. Only the references and
+    /// whole values of their row pages are read for it, so the page's other
+    /// fields are read later for the rows kept alone. Also returns whether
+    /// every row now has its final verdict.
+    ///
+    /// A row of a segment whose payload is nothing but its references and
+    /// whole values is left to the judgement after the values: reading its
+    /// value first would save nothing.
+    fn judge_on_objects(
+        &mut self,
+        scan: &ColumnarScan,
+        pending: Vec<Pick>,
+        open: &[bool],
+        layout: &Layout,
+    ) -> crate::Result<(Vec<Pick>, bool)> {
+        let Some(cells) = scan.cells.as_ref() else {
+            return Ok((pending, false));
+        };
+        // A batch already read with its payload is judged here too: its rows
+        // the predicate drops must not count toward the density, or a scan
+        // whose choices once turned dense would read every page with the rest
+        // from then on.
+        let judging = |source: &MergeSource| {
+            !source.whole
+                && source.types == FieldTypes::AsDeclared
+                && source
+                    .late
+                    .columns
+                    .iter()
+                    .any(|&(_, carried)| !JUDGE_COLUMNS.contains(&carried))
+        };
+        // Decided before anything is read: reading changes what a source holds.
+        let ask: Vec<bool> = pending
+            .iter()
+            .zip(open)
+            .map(|(pick, &open)| open && self.sources.get(pick.source).is_some_and(judging))
+            .collect();
+        let asked: Vec<Pick> = pending
+            .iter()
+            .zip(&ask)
+            .filter(|&(_, &ask)| ask)
+            .map(|(pick, _)| *pick)
+            .collect();
+        if asked.is_empty() {
+            return Ok((pending, false));
+        }
+        self.fill_late_columns(scan, &asked, Some(&JUDGE_COLUMNS))?;
+        // Only what a row's field is read out of is gathered for the verdict:
+        // its key and value type, its own cell, its references and its value.
+        let predicate = scan.predicate.as_ref().map(|p| p.column_id);
+        let skip: Vec<u16> = layout
+            .heads
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|&id| {
+                id != COL_USER_KEY
+                    && id != COL_VALUE_TYPE
+                    && Some(id) != predicate
+                    && !JUDGE_COLUMNS.contains(&id)
+            })
+            .collect();
+        let verdicts = super::cells::judge(scan, cells, self.build(&asked, layout, &skip)?)?;
+        debug_assert_eq!(verdicts.len(), asked.len());
+
+        let mut verdicts = verdicts.into_iter();
+        let mut settled = true;
+        let mut kept = Vec::with_capacity(pending.len());
+        for ((pick, &open), &ask) in pending.into_iter().zip(open).zip(&ask) {
+            if ask {
+                // One verdict per row asked, in the order asked.
+                if verdicts.next().unwrap_or(true) {
+                    kept.push(pick);
+                }
+            } else {
+                settled &= !open;
+                kept.push(pick);
+            }
+        }
+        Ok((kept, settled))
     }
 
     /// The bytes of the cells the rows of `pending` take from payload read
@@ -1145,6 +1261,18 @@ impl MergeStream {
     /// field declares stays too, and the rows of the batch returned fail the
     /// scan as any row of a mistyped batch does.
     fn fill_late(&mut self, scan: &ColumnarScan, pending: &[Pick]) -> crate::Result<()> {
+        self.fill_late_columns(scan, pending, None)
+    }
+
+    /// [`Self::fill_late`] for the columns of `only`, as the merge carries
+    /// them, when given: the rest of each batch's payload stays to be read.
+    /// A column already read is not read again.
+    fn fill_late_columns(
+        &mut self,
+        scan: &ColumnarScan,
+        pending: &[Pick],
+        only: Option<&[u16]>,
+    ) -> crate::Result<()> {
         let mut copied = 0usize;
         let result = (|| {
             for (index, source) in self.sources.iter_mut().enumerate() {
@@ -1163,7 +1291,28 @@ impl MergeStream {
                 else {
                     continue;
                 };
-                let stored: Vec<u16> = late.columns.iter().map(|&(id, _)| id).collect();
+                let stored: Vec<u16> = late
+                    .columns
+                    .iter()
+                    .filter(|&&(_, carried)| {
+                        !late.filled.contains(&carried)
+                            && only.is_none_or(|only| only.contains(&carried))
+                    })
+                    .map(|&(id, _)| id)
+                    .collect();
+                if only.is_some() {
+                    late.filled.extend(
+                        late.columns
+                            .iter()
+                            .filter_map(|&(id, carried)| stored.contains(&id).then_some(carried)),
+                    );
+                } else {
+                    late.batch_late = false;
+                    late.filled.clear();
+                }
+                if stored.is_empty() {
+                    continue;
+                }
                 for column in table.columns_at(at, &stored, &mut copied)? {
                     let Some(&(_, carried)) =
                         late.columns.iter().find(|&&(id, _)| id == column.column_id)
@@ -1189,7 +1338,6 @@ impl MergeStream {
                         ..column
                     };
                 }
-                late.batch_late = false;
             }
             Ok(())
         })();

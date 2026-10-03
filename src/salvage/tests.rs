@@ -1597,6 +1597,7 @@ fn salvage_propagates_an_environmental_failure_from_the_mirror_probe() -> crate:
             sync_mode: crate::fs::SyncMode::Normal,
             prefix_extractor: None,
             blob_rewrite: None,
+            owner_promotions: None,
             progress: None,
         };
         match super::meta_mirrors_diverge(&source, &fs, &options) {
@@ -7613,6 +7614,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7698,6 +7700,7 @@ fn a_salvaged_copy_under_a_new_id_reads_every_value() -> crate::Result<()> {
                 sync_mode: crate::fs::SyncMode::Normal,
                 prefix_extractor: None,
                 blob_rewrite: None,
+                owner_promotions: None,
                 progress: None,
             };
             let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7786,6 +7789,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7936,6 +7940,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
@@ -7959,6 +7964,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -9870,7 +9876,11 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     );
 
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
     assert!(carry.is_none(), "nothing was beheaded, nothing to suppress");
     let entry = out.first().expect("one rewritten entry");
@@ -9936,7 +9946,11 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"z".to_vec(), b"v".to_vec(), 1, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
         keys,
@@ -9961,7 +9975,11 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     assert!(out.is_empty(), "the whole block was one beheaded key");
     assert_eq!(
         carry.as_deref(),
@@ -10043,7 +10061,11 @@ fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
     ];
     let untouched = entries.get(1).expect("row b").value.clone();
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(keys, [b"a".to_vec(), b"b".to_vec(), b"e".to_vec()]);
     assert_eq!(dropped, 3, "the two lost heads and the version behind one");
@@ -10503,7 +10525,11 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
     rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
 
     let mut dropped = 0u64;
-    let (kept, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (kept, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
 
     let keys: Vec<_> = kept.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
@@ -10598,6 +10624,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: Some(Arc::new(rewrite)),
+        owner_promotions: None,
         progress: None,
     };
     salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;

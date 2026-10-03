@@ -1105,13 +1105,16 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     }
                     continue;
                 } else if head.key.value_type == ValueType::WeakTombstone
-                    && peeked.key.value_type == ValueType::Value
+                    && peeked.key.value_type.is_put()
                     && head.key.seqno < self.gc_watermark
                 {
                     // The weak delete and the put it consumed leave the output
                     // together: an annihilation, a visibility transform rather
                     // than a GC fold, and it needs no bottom level because a
                     // weak delete is contracted to a key written at most once.
+                    // The put may be a value, an indirection or a cell row:
+                    // the drain reports it to the dropped-version callback,
+                    // which charges the blob objects it owned.
                     //
                     // It is bounded by the watermark for the reason above: a
                     // snapshot between the put and the delete resolves to the

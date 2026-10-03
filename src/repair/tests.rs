@@ -14677,6 +14677,113 @@ fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::R
     Ok(())
 }
 
+/// An object whose owning row went with a table the rebuild could not find is
+/// handed to the oldest row left that borrows it: when that row goes too, the
+/// object is charged as garbage and its file dropped, as it would have been
+/// with its owner.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    const STATUS: u16 = FIRST_FIELD_COLUMN;
+    const BODY: u16 = FIRST_FIELD_COLUMN + 1;
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        // The object's charge is its stored size: uncompressed, its length.
+        .blob_compression(crate::CompressionType::None)
+    };
+    let open = || -> crate::Result<crate::BlobTree> {
+        match config().open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+    let body = vec![b'b'; 4_096];
+
+    {
+        let tree = open()?;
+        // The owner, then a metadata-only update borrowing its body, each in
+        // a table of its own.
+        tree.insert_cells(
+            "doc",
+            &[Field::bytes(STATUS, b"draft"), Field::bytes(BODY, &body)],
+            0,
+        )?;
+        tree.flush_active_memtable(0)?;
+        let row = tree.get_cells("doc", crate::MAX_SEQNO)?.expect("the row");
+        let held = row
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        assert!(matches!(held.cell, Cell::Ref(_)), "the body is a reference");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"final"), held], 1)?;
+        drop(row);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The manifest is lost, and with it the owner's table.
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let tables = root.join(crate::file::TABLES_FOLDER);
+    let owner = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| e.file_name.parse::<u64>().ok().map(|id| (id, e.path)))
+        .min_by_key(|(id, _)| *id)
+        .expect("the owner's table")
+        .1;
+    memfs.remove_file(&owner)?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
+    let tree = open()?;
+    let framed = |cells: &[&[u8]]| {
+        let mut out = Vec::new();
+        for cell in cells {
+            out.extend_from_slice(&u32::try_from(cell.len()).expect("small").to_le_bytes());
+            out.extend_from_slice(cell);
+        }
+        out
+    };
+    assert_eq!(
+        tree.get("doc", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    // The borrower now owns the body: overwritten, it is charged once, and
+    // the next install drops the file, which held nothing else.
+    tree.insert("doc", "gone", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged");
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
+    Ok(())
+}
+
 /// A persistently unreadable blob file is left OUT of the rebuilt manifest and
 /// queued for removal: a file both omitted and left in place is an orphan the
 /// next open must sweep, and an open that cannot sweep it fails. The scan does

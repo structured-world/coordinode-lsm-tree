@@ -214,6 +214,52 @@ fn a_shared_object_is_charged_once_when_its_last_holder_goes() -> lsm_tree::Resu
     Ok(())
 }
 
+/// A weak delete consumes the put before it whatever form the put takes in a
+/// blob tree, a cell row or a separated value: the table counts the pair as
+/// reclaimable, and a compaction below the watermark drops both and charges
+/// the objects they owned.
+#[test]
+fn a_weak_delete_consumes_a_cell_row_and_a_separated_value() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let body = vec![b'b'; 4_096];
+
+    // Both pairs in one table: its writer sees each put right after its delete.
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+    tree.remove_weak("doc", 1);
+    tree.insert("plain", body.clone(), 2);
+    tree.remove_weak("plain", 3);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.weak_tombstone_count(), 2);
+    assert_eq!(tree.weak_tombstone_reclaimable_count(), 2);
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.weak_tombstone_count(), 0);
+    for key in ["doc", "plain"] {
+        assert_eq!(tree.get(key, SeqNo::MAX)?, None);
+    }
+
+    // The puts and the deletes in different tables: the compaction meets them.
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+    tree.insert("plain", body.clone(), 1);
+    tree.flush_active_memtable(0)?;
+    tree.remove_weak("doc", 2);
+    tree.remove_weak("plain", 3);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.weak_tombstone_count(),
+        0,
+        "each weak delete leaves with the put it consumed"
+    );
+    assert_eq!(tree.stale_blob_bytes(), 2 * 4_096);
+    for key in ["doc", "plain"] {
+        assert_eq!(tree.get(key, SeqNo::MAX)?, None);
+    }
+    Ok(())
+}
+
 /// A reference read from one key is refused under another, and one object in
 /// two cells is refused: either would let an object outlive its accounting.
 #[test]

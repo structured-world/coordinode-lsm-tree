@@ -158,6 +158,40 @@ fn a_cell_row_that_does_not_fit_the_columns_is_kept_whole() {
     );
 }
 
+/// A reference counts toward its column's type as a value does: a row whose
+/// reference names another type than the group's column of that id is kept
+/// whole, and so is a row whose value disagrees with a reference split
+/// before it. Otherwise the column would read a returned reference as
+/// mistyped for a type its own row never had.
+#[test]
+fn a_reference_of_another_type_than_its_column_is_kept_whole() {
+    let fixed = |column: u16, offset: u64| RowField {
+        column,
+        tag: TypeTag::Fixed(4),
+        cell: RowCell::Ref {
+            indirection: indirection(offset, 4),
+            owner: true,
+        },
+    };
+    let entries = alloc::vec![
+        cell_row("a", 1, &[RowField::bytes(SCORE, RowCell::Value(b"text"))]),
+        cell_row("b", 1, &[fixed(SCORE, 0)]),
+        cell_row("c", 1, &[fixed(STATUS, 64)]),
+        cell_row("d", 1, &[RowField::bytes(STATUS, RowCell::Value(b"text"))]),
+    ];
+    let batch = entries_to_cells_batch(&entries).unwrap();
+    assert_eq!(column_batch_to_entries(&batch).unwrap(), entries);
+    let whole = column(&batch, WHOLE_VALUE_COLUMN).unwrap();
+    assert_eq!(whole.validity.as_deref(), Some(&[0b0000_1010][..]));
+    let refs = column(&batch, CELL_REFS_COLUMN).unwrap();
+    assert_eq!(refs.validity.as_deref(), Some(&[0b0000_0100][..]));
+    assert_eq!(column(&batch, SCORE).unwrap().type_tag, TypeTag::Bytes);
+    assert!(
+        column(&batch, STATUS).is_none(),
+        "the only split row of that id holds it as a reference"
+    );
+}
+
 /// A cell row that does not decode is kept whole, as written, rather than
 /// dropped or refused: the group stores what it was given.
 #[test]
