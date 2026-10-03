@@ -1642,17 +1642,19 @@ fn a_snapshot_straddling_one_segment_copies_only_the_projected_rows_it_sees() ->
 {
     // A snapshot inside a segment's seqnos masks the rows it cannot see. The
     // seqno column is decoded for the mask alone, so the visible rows are
-    // gathered without it.
+    // gathered without it, and a page whose rows are all visible is handed on
+    // as decoded: only the page the snapshot cuts through is copied.
     let (_folder, tree) = columnar_segment(1_000, 32);
     let m = tree.metrics();
     let before = m.bytes_copied();
 
     let (rows, returned, _) = scan_cost(&tree, &[COL_VALUE], None, 500)?;
     assert_eq!(rows, 500, "the rows written below seqno 500 are visible");
-    assert_eq!(
-        m.bytes_copied() - before,
-        returned,
-        "the mask copies the projected cells of the visible rows, and nothing else",
+    let copied = m.bytes_copied() - before;
+    assert!(
+        copied > 0 && copied < returned,
+        "the mask copied {copied} bytes of the {returned} it returned: the cut page's \
+         visible cells alone",
     );
     Ok(())
 }
