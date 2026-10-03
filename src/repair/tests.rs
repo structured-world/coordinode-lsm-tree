@@ -13604,7 +13604,8 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
 /// salvaged blob is rewritten a second time, from the replacement. That
 /// rewrite must take over the replacement's pending swap: queued as a second
 /// swap onto the replacement's own name, it would run after the first and
-/// leave the un-remapped bytes under the name the manifest gives the rewrite.
+/// leave the un-remapped bytes under the name the manifest gives the rewrite,
+/// with the rewrite parked under a temporary name until some later open.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite() -> crate::Result<()>
@@ -13704,6 +13705,14 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
         "the damaged blob is salvaged: {report:?}",
     );
     assert_eq!(report.recovered, 1, "one table is published: {report:?}");
+    // The repair finishes its own swaps: the name the manifest gives the table
+    // holds the rewrite, and no temporary is left for the next open to finish.
+    let names: Vec<String> = memfs
+        .read_dir(&root.join(crate::file::TABLES_FOLDER))?
+        .into_iter()
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(names, ["0"], "only the published table is left");
 
     // Every surviving key reads its own value: the published table is the
     // remapped rewrite, not the replacement it was rewritten from.
