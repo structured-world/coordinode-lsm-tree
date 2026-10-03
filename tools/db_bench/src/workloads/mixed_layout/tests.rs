@@ -80,8 +80,18 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
         Ok((rows, m.bytes_materialized() - before))
     };
     let (clustered, clustered_bytes) = measure(super::cells_sparse_clustered)?;
-    let (spread, _) = measure(super::cells_sparse_one_per_page)?;
+    let (spread, spread_bytes) = measure(super::cells_sparse_one_per_page)?;
     let (near_full, near_full_bytes) = measure(super::cells_near_full)?;
+    // The caller-filtered passes keep the same rows, and the one-per-page
+    // one materialises every row's payload where the engine's takes only
+    // the kept rows'.
+    let (spread_eager, spread_eager_bytes) = measure(super::cells_sparse_one_per_page_eager)?;
+    let (near_full_eager, _) = measure(super::cells_near_full_eager)?;
+    assert_eq!((spread_eager, near_full_eager), (spread, near_full));
+    assert!(
+        spread_bytes * 10 < spread_eager_bytes,
+        "materialised {spread_bytes} B in the engine and {spread_eager_bytes} B for the caller to filter"
+    );
     assert!(
         clustered > 0 && spread > 0,
         "the sparse predicates keep rows"

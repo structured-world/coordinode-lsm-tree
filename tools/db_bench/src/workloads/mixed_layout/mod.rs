@@ -566,13 +566,24 @@ fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
     })
 }
 
+/// Where a cell-row scan's predicate is applied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    /// In the engine, before the payload of a dropped row is read.
+    Engine,
+    /// By the caller, over rows the engine returned with every projected
+    /// field: the sequential pass a late read must not lose to.
+    Caller,
+}
+
 /// Scans a cell-row fixture with a predicate on one of its filter fields,
 /// projecting the key, the sparse field and, when `payload`, the value, and
 /// checks each row against the write history.
 ///
-/// The predicate runs in the engine over the field's own column; the payload
-/// of a row it drops is never read, from its page or from its blob file,
-/// which is what the late-materialization scenarios measure.
+/// With [`Filter::Engine`] the predicate runs over the field's own column and
+/// the payload of a row it drops is never read, from its page or from its
+/// blob file, which is what the late-materialization scenarios measure; with
+/// [`Filter::Caller`] every row comes back whole and the caller drops it.
 #[expect(
     clippy::expect_used,
     reason = "a scan missing a projected column or row is a wrong result, and a verify pass panics on one"
@@ -580,6 +591,7 @@ fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
 fn verify_cells_scan(
     fixture: &Fixture,
     predicate: Option<&ColumnRangePredicate>,
+    filter: Filter,
     selects: impl Fn(u64) -> bool,
     payload: bool,
 ) -> lsm_tree::Result<u64> {
@@ -613,10 +625,11 @@ fn verify_cells_scan(
             Absent::Error,
         )?);
     }
+    let in_engine = predicate.filter(|_| filter == Filter::Engine);
     let mut check = lockstep(fixture, |v| selects(v.seed));
     for batch in fixture
         .tree
-        .columnar_scan(projection, predicate, SeqNo::MAX, ..)?
+        .columnar_scan(projection, in_engine, SeqNo::MAX, ..)?
     {
         let batch = batch?;
         let column = |id| {
@@ -628,6 +641,21 @@ fn verify_cells_scan(
         };
         let (keys, groups) = (column(COL_USER_KEY), column(fixtures::CELL_GROUP));
         for row in 0..batch.row_count {
+            if filter == Filter::Caller
+                && let Some(predicate) = predicate
+            {
+                let at = row as usize * 8;
+                let value = column(predicate.column_id)
+                    .data
+                    .get(at..at + 8)
+                    .expect("a filter field per row");
+                // Big-endian u64 bounds order as the values do.
+                let kept = predicate.lower.as_deref().is_none_or(|lo| value >= lo)
+                    && predicate.upper.as_deref().is_none_or(|hi| value <= hi);
+                if !kept {
+                    continue;
+                }
+            }
             let key = fixtures::bytes_cell(keys, batch.row_count, row)
                 .expect("a returned column holds every row it counts");
             let at = row as usize * 8;
@@ -658,41 +686,68 @@ fn cells_sparse_clustered(fixture: &Fixture) -> lsm_tree::Result<u64> {
     verify_cells_scan(
         fixture,
         Some(&field_range(fixtures::CELL_CLUSTER, 0, 0)),
+        Filter::Engine,
         |seed| fixtures::cluster_of(seed) == 0,
         true,
     )
 }
 
-/// About one row in each row page: every page of the payload holds a kept
-/// row, so the late read can spare no page, and must not cost more than the
-/// eager one; what it spares is materialising the rows dropped.
-fn cells_sparse_one_per_page(fixture: &Fixture) -> lsm_tree::Result<u64> {
+/// About one row in each row page, filtered by `filter`: every page of the
+/// payload holds a kept row, so the late read can spare no page, and must not
+/// cost more than the eager one; what it spares is materialising the rows
+/// dropped.
+fn cells_one_per_page(fixture: &Fixture, filter: Filter) -> lsm_tree::Result<u64> {
     let fixtures::Shape::Cells { spread } = fixture.shape else {
         panic!("a cell-row scan needs a cell-row fixture");
     };
     verify_cells_scan(
         fixture,
         Some(&field_range(fixtures::CELL_SPREAD, 0, 0)),
+        filter,
         move |seed| seed % spread == 0,
         true,
     )
 }
 
-/// ~90% of a cell-row tree: nearly every page holds a kept row.
-fn cells_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
+/// One row per page, filtered in the engine.
+fn cells_sparse_one_per_page(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_one_per_page(fixture, Filter::Engine)
+}
+
+/// One row per page, every row read whole and filtered by the caller: the
+/// time the engine's late read is held against.
+fn cells_sparse_one_per_page_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_one_per_page(fixture, Filter::Caller)
+}
+
+/// ~90% of a cell-row tree, filtered by `filter`: nearly every page holds a
+/// kept row.
+fn cells_dense(fixture: &Fixture, filter: Filter) -> lsm_tree::Result<u64> {
     verify_cells_scan(
         fixture,
         Some(&field_range(fixtures::CELL_BUCKET, 1, 9)),
+        filter,
         |seed| fixtures::bucket_of(seed) != 0,
         true,
     )
+}
+
+/// ~90% of a cell-row tree, filtered in the engine.
+fn cells_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_dense(fixture, Filter::Engine)
+}
+
+/// ~90% of a cell-row tree, every row read whole and filtered by the caller:
+/// the sequential pass the engine's density decision must not lose to.
+fn cells_near_full_eager(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    cells_dense(fixture, Filter::Caller)
 }
 
 /// The header field of every wide cell row, without its payload: no blob is
 /// read at all.
 fn cells_projected(fixture: &Fixture) -> lsm_tree::Result<u64> {
     let blobs = fixture.tree.metrics().blob_read_count();
-    let rows = verify_cells_scan(fixture, None, |_| true, false)?;
+    let rows = verify_cells_scan(fixture, None, Filter::Engine, |_| true, false)?;
     assert_eq!(
         fixture.tree.metrics().blob_read_count(),
         blobs,
@@ -707,6 +762,7 @@ fn cells_blobs_filtered(fixture: &Fixture) -> lsm_tree::Result<u64> {
     verify_cells_scan(
         fixture,
         Some(&field_range(fixtures::CELL_GROUP, 0, 0)),
+        Filter::Engine,
         |seed| fixtures::group_of(seed) == 0,
         true,
     )
@@ -960,9 +1016,19 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             support: Support::Native(cells_sparse_one_per_page),
         },
         Scenario {
+            name: "cells-scan-sparse-one-per-page-eager",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_one_per_page_eager),
+        },
+        Scenario {
             name: "cells-scan-near-full",
             fixture: fixtures::cells_inline,
             support: Support::Native(cells_near_full),
+        },
+        Scenario {
+            name: "cells-scan-near-full-eager",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_near_full_eager),
         },
         Scenario {
             name: "cells-scan-under-compaction",
