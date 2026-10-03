@@ -329,6 +329,11 @@ impl TreeInner {
         let sync_mode = config.sync_mode;
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        // A compaction throttled by the limiter sleeps until its deadline;
+        // dropping the tree has to wake it.
+        let stop_signal = StopSignal::default();
+        #[cfg(feature = "std")]
+        stop_signal.wake_on_stop(&compaction_rate_limiter);
 
         // The first persist above wrote the full snapshot `v{version.id()}` and
         // pointed CURRENT at it, so that id is the initial manifest snapshot.
@@ -356,7 +361,7 @@ impl TreeInner {
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
             latest_super_version,
-            stop_signal: StopSignal::default(),
+            stop_signal,
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
