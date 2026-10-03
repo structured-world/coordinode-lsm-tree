@@ -558,12 +558,16 @@ pub enum Error {
     /// The payload names which of these it is.
     Projection(&'static str),
 
-    /// A row written as cells refers to a blob object it may not hold: a
+    /// A blob reference of a row written as cells cannot be used: a
     /// [`BlobRef`](crate::blob_tree::field_row::BlobRef) read from another
-    /// key, or one object in two cells of the row.
+    /// key or another tree, one object in two cells of the row, a reference in
+    /// an ingested row, or a stale reference, whose object was moved or
+    /// released since it was read; or a reference-aware read finds the key's
+    /// version is not written as cells.
     ///
     /// A caller-side error, refused before anything is written. The payload
-    /// names which of these it is.
+    /// names which of these it is; only a stale reference is cured by reading
+    /// the key again.
     BlobRef(&'static str),
 
     /// A row written as cells is not one the caller could have meant: two

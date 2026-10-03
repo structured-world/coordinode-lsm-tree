@@ -1159,8 +1159,10 @@ impl Workload for MixedLayout {
                         Ok(measured.rows)
                     })?;
                     reporter.record_duration(t.elapsed());
+                    // The counters are the tree's, and the compacting thread
+                    // reads and copies through them during the pass: printed
+                    // for reference, not published as the scan's per-row cost.
                     readings.report(name);
-                    readings.publish(name, reporter);
                     let (p50, p99) = (
                         percentile_us(&latencies, 50.0),
                         percentile_us(&latencies, 99.0),

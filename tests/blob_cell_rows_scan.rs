@@ -338,6 +338,88 @@ fn whole_values_are_read_through_the_projector() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A scan of the keys alone reads no value: neither a value kept in a blob
+/// file, nor a cell row's referenced field, nor the inline values of the
+/// table.
+#[test]
+fn a_key_only_scan_reads_no_value() -> lsm_tree::Result<()> {
+    for columnar in [false, true] {
+        let folder = get_tmp_folder();
+        let (any, tree) = open(folder.path(), columnar)?;
+        tree.insert("a", vec![b'v'; 500], 0);
+        insert(&tree, "b", b"cell", 2, &[b'b'; 500], 1);
+        tree.insert("c", b"small".to_vec(), 2);
+        tree.flush_active_memtable(0)?;
+
+        let m = any.metrics();
+        let blobs = m.blob_read_count();
+        let keys = Projection::new().column(COL_USER_KEY);
+        let got = rows(any.columnar_scan(keys, None, SeqNo::MAX, ..)?)?;
+        assert_eq!(
+            got.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "columnar={columnar}"
+        );
+        assert_eq!(
+            m.blob_read_count(),
+            blobs,
+            "columnar={columnar}: a key-only scan read a blob"
+        );
+    }
+    Ok(())
+}
+
+/// A predicate on a field with a default judges a value written whole by the
+/// field the projector reads out of it, not by the default its empty cell in
+/// the field's column would read as: neither drops a whole value that
+/// matches nor keeps one that does not.
+#[test]
+fn a_whole_value_is_judged_by_its_field_not_the_default() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open(folder.path(), true)?;
+    let plain = |status: &[u8], price: u32| [status, &price.to_le_bytes()].concat();
+    tree.insert("a", plain(b"cheap", 1), 0);
+    tree.insert("b", plain(b"dear", 50), 1);
+    insert(&tree, "c", b"cell", 3, b"short", 2);
+    tree.flush_active_memtable(0)?;
+
+    let cheap = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(5u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let keys = |default: u32| -> lsm_tree::Result<Vec<Vec<u8>>> {
+        let price = ProjectedField::new(
+            PRICE,
+            u32_le(),
+            Absent::Default(default.to_le_bytes().to_vec().into()),
+        )?;
+        let projection = Projection::new()
+            .column(COL_USER_KEY)
+            .field(price)
+            .projector(Arc::new(PlainProjector));
+        Ok(
+            rows(any.columnar_scan(projection, Some(&cheap), SeqNo::MAX, ..)?)?
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect(),
+        )
+    };
+    let want = vec![b"a".to_vec(), b"c".to_vec()];
+    assert_eq!(
+        keys(99)?,
+        want,
+        "a default outside the range drops no whole value"
+    );
+    assert_eq!(
+        keys(2)?,
+        want,
+        "a default inside the range keeps no whole value"
+    );
+    Ok(())
+}
+
 /// A field stored under another type than declared fails the scan; a value
 /// column projected by id alone is refused up front.
 #[test]

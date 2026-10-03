@@ -1066,14 +1066,16 @@ impl ColumnarScan {
         share: u64,
     ) -> crate::Result<SegmentCursor> {
         // A whole value is carried to the rows the scan returns, for its
-        // declared fields and for the merge operands it may hold.
-        let whole = seg.whole && (self.declared || self.resolver.is_some() || self.cells.is_some());
+        // declared fields and for the merge operands it may hold; a scan of
+        // intrinsic columns alone reads no value.
+        let needs_values = self.declared || self.resolver.is_some();
+        let whole = seg.whole && needs_values;
         // The declared fields of a whole value lie inside it: decode the value
         // in their place. A declared field's id may be the value column's own,
         // so no predicate is pushed down; the merge filters after the fields
         // are read.
         let mut ids: Vec<u16> = projection.to_vec();
-        if seg.cells {
+        if seg.cells && needs_values {
             // A blob tree's columnar table keeps each field of a split row in
             // its own column, the row's references beside them, and every
             // other value whole under the id the merge carries whole values
@@ -1157,7 +1159,9 @@ impl ColumnarScan {
             .iter()
             .filter(|f| projection::is_declared(f) && Some(f.column_id()) != predicate)
             .map(|f| (f.column_id(), f.column_id()));
-        if seg.cells {
+        // Without a declared field no value is read at all, a blob tree's
+        // included (a returned row's value type reads as a value regardless).
+        if seg.cells && self.declared {
             fields
                 .chain([
                     (CELL_REFS_COLUMN, CELL_REFS_COLUMN),
@@ -1166,7 +1170,7 @@ impl ColumnarScan {
                 .collect()
         } else if seg.whole {
             // The declared fields lie inside the whole value.
-            if self.declared || self.cells.is_some() {
+            if self.declared {
                 alloc::vec![(COL_VALUE, merge::COL_WHOLE_VALUE)]
             } else {
                 Vec::new()

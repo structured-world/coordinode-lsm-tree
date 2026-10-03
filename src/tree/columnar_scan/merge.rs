@@ -53,6 +53,10 @@ struct MergeSource {
     batch: Option<ColumnBatch>,
     /// How `batch` stores the projected fields.
     types: FieldTypes,
+    /// Which rows of `batch` hold the predicate's field in its own column as
+    /// the segment stores it, before the conform lays out a default for the
+    /// others.
+    stored: StoredCells,
     /// The next row of `batch` to consider.
     row: u32,
     /// Where `batch` keeps the key and seqno columns.
@@ -158,6 +162,41 @@ impl LatePayload {
             return Some(&self.lean_ids);
         }
         None
+    }
+}
+
+/// Which rows of a batch hold the predicate's field as a stored cell of their
+/// own: only those carry the value the field reads as. A row whose cell is
+/// empty holds its field elsewhere (inside a whole value, in a blob file) or
+/// not at all, and is judged once its value is read.
+enum StoredCells {
+    /// No row: the batch has no column for the field.
+    None,
+    /// Every row.
+    All,
+    /// The rows this validity bitmap marks.
+    Some(Vec<u8>),
+}
+
+impl StoredCells {
+    /// What `column`, the predicate's column as stored, holds.
+    fn of(column: Option<&Column>) -> Self {
+        match column.map(|c| &c.validity) {
+            None => Self::None,
+            Some(None) => Self::All,
+            Some(Some(bits)) => Self::Some(bits.clone()),
+        }
+    }
+
+    /// Whether `row` holds a stored cell.
+    fn holds(&self, row: u32) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Some(bits) => bits
+                .get(row as usize / 8)
+                .is_some_and(|byte| byte >> (row % 8) & 1 == 1),
+        }
     }
 }
 
@@ -356,6 +395,7 @@ impl MergeStream {
                     late,
                     batch: None,
                     types: FieldTypes::AsDeclared,
+                    stored: StoredCells::None,
                     row: 0,
                     key_col: 0,
                     seqno_col: 0,
@@ -617,6 +657,10 @@ impl MergeStream {
                     // A whole value moves aside before the conform, where a
                     // declared field may share the value column's id.
                     let batch = carry_whole_value(batch, source.whole, raw);
+                    source.stored = StoredCells::of(
+                        predicate_column
+                            .and_then(|id| batch.columns.iter().find(|c| c.column_id == id)),
+                    );
                     // Its rows are not decided yet: a shadowed or deleted
                     // one must not fail the scan, and the predicate after
                     // the dedup sees the declared defaults.
@@ -1033,7 +1077,11 @@ impl MergeStream {
         if scan.resolver.is_some() {
             return (pending, false);
         }
-        let matchers: Vec<Option<(RowMatcher<'_>, &Column)>> = self
+        // A row is judged here only on a cell its segment stores for the
+        // field: an empty one reads as the declared default once conformed,
+        // though the row may hold its field inside a whole value or in a blob
+        // file.
+        let matchers: Vec<Option<(RowMatcher<'_>, &StoredCells)>> = self
             .sources
             .iter()
             .map(|s| {
@@ -1041,18 +1089,14 @@ impl MergeStream {
                     return None;
                 }
                 let batch = s.batch.as_ref()?;
-                let column = batch
-                    .columns
-                    .iter()
-                    .find(|c| c.column_id == pred.column_id)?;
-                Some((pred.matcher(batch), column))
+                Some((pred.matcher(batch), &s.stored))
             })
             .collect();
         let mut pending = pending;
         let mut settled = true;
         pending.retain(
             |pick| match matchers.get(pick.source).and_then(Option::as_ref) {
-                Some((matcher, column)) if column.is_valid(pick.row) => matcher.matches(pick.row),
+                Some((matcher, stored)) if stored.holds(pick.row) => matcher.matches(pick.row),
                 _ => {
                     settled = false;
                     true

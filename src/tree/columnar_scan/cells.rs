@@ -85,6 +85,9 @@ pub(super) fn materialize(
         .filter(|f| projection::is_declared(f))
         .cloned()
         .collect();
+    if declared.is_empty() {
+        return Ok(without_values(batch));
+    }
     // The predicate's field, when it is a declared one still to be judged:
     // read before the rest.
     let judged = scan
@@ -257,6 +260,37 @@ pub(super) fn materialize(
     project(scan, &declared, &mut rows)?;
 
     build(batch, &declared, &rows, &out_types, kept.as_deref())
+}
+
+/// `batch` for a projection that declares no field: no value or object is
+/// read, the columns any value was carried in leave, and a row written as
+/// cells or kept in a blob file reads as a value, the form every read gives
+/// it.
+fn without_values(batch: ColumnBatch) -> ColumnBatch {
+    let ColumnBatch {
+        row_count,
+        mut columns,
+    } = batch;
+    columns.retain(|c| c.column_id != COL_WHOLE_VALUE && c.column_id != CELL_REFS_COLUMN);
+    if let Some(types) = columns.iter_mut().find(|c| c.column_id == COL_VALUE_TYPE) {
+        let read_as_value = |byte: u8| {
+            if byte == u8::from(ValueType::CellRow) || byte == u8::from(ValueType::Indirection) {
+                u8::from(ValueType::Value)
+            } else {
+                byte
+            }
+        };
+        if types.data.iter().any(|&byte| read_as_value(byte) != byte) {
+            types.data = Slice::from(
+                types
+                    .data
+                    .iter()
+                    .map(|&b| read_as_value(b))
+                    .collect::<Vec<u8>>(),
+            );
+        }
+    }
+    ColumnBatch { row_count, columns }
 }
 
 /// Refuses a field stored under another type than its declaration.

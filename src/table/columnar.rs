@@ -1961,7 +1961,17 @@ pub(crate) fn transpose_like(
 /// batch lays them out ([`transpose_like`]): every layout but a batch of
 /// caller sub-columns.
 pub(crate) fn rows_round_trip(batch: &ColumnBatch) -> bool {
-    batch.columns.len() <= 4 || cells::holds_cells(batch.columns.iter().map(|c| &c.column_id))
+    // A batch of the intrinsic columns and one caller sub-column has as many
+    // columns as a whole-value batch: the value column itself tells them
+    // apart, written whole as a non-null bytes column.
+    cells::holds_cells(batch.columns.iter().map(|c| &c.column_id))
+        || matches!(
+            batch.columns.as_slice(),
+            [_, _, _, value]
+                if value.column_id == COL_VALUE
+                    && value.type_tag == TypeTag::Bytes
+                    && value.validity.is_none()
+        )
 }
 
 /// Refuses a value sub-column of an ingested batch whose id the engine keeps

@@ -807,7 +807,8 @@ fn cell_rows(
     // column (key, seqno, value type, whole value, four fields and the payload
     // or its reference), so the spread field's zero lands once per page.
     let payload_bytes = if len < 1_024 { len + 4 } else { 24 };
-    let row_bytes = (13 + 4 + 8 + 1 + 4 + 4 * 8 + payload_bytes) as u64;
+    let row_bytes = u64::try_from(13 + 4 + 8 + 1 + 4 + 4 * 8 + payload_bytes)
+        .map_err(|_| lsm_tree::Error::FeatureUnsupported("a row's size exceeds u64"))?;
     let spread = (u64::from(config.page_size) / row_bytes).max(1);
 
     let mut rows: Vec<Row> = (0..n)
@@ -832,7 +833,7 @@ fn cell_rows(
             .collect();
         cells.push(Field::bytes(CELL_PAYLOAD, &payload));
         blob.insert_cells(key(i), &cells, seqno.fetch_add(1, Ordering::Relaxed))?;
-        if let Some(row) = rows.get_mut(i as usize) {
+        if let Some(row) = usize::try_from(i).ok().and_then(|i| rows.get_mut(i)) {
             row.expect = Some(value);
         }
         Ok(())

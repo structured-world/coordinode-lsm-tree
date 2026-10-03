@@ -43,6 +43,20 @@ fn only_a_release_after_the_read_makes_its_reference_stale() {
     drop(early);
 }
 
+/// An object or file released twice is judged by its newest release: a read
+/// between the two releases is stale, whichever order they are recorded in.
+#[test]
+fn a_second_release_after_the_read_makes_its_reference_stale() {
+    let registry = Arc::new(ReleasedObjects::default());
+    let _held = registry.register(2);
+    registry.record(3, [handle(1, 0)], [7]);
+    registry.record(6, [handle(1, 0)], [7]);
+    registry.record(5, [handle(1, 0)], [7]);
+    assert!(registry.released_since(4, &handle(1, 0)));
+    assert!(registry.released_since(4, &handle(7, 50)));
+    assert!(!registry.released_since(6, &handle(1, 0)));
+}
+
 /// A whole-table drop releases every reference into its files read before it.
 #[test]
 fn a_file_release_makes_every_reference_into_it_stale() {
@@ -64,7 +78,10 @@ fn records_go_with_the_last_read_older_than_them() {
     registry.record(3, [handle(1, 0)], [9]);
     registry.record(5, [handle(1, 10)], []);
     drop(old);
-    assert_eq!(registry.records.lock().objects, vec![(5, handle(1, 10))]);
+    assert_eq!(
+        registry.records.lock().objects.iter().collect::<Vec<_>>(),
+        [(&handle(1, 10), &5)]
+    );
     assert!(registry.records.lock().files.is_empty());
     drop(newer);
     assert!(registry.records.lock().objects.is_empty());

@@ -427,8 +427,9 @@ fn bit(bitmap: &[u8], i: usize) -> bool {
 /// # Errors
 ///
 /// Returns an error if the row is truncated, carries trailing bytes, names a
-/// type that does not exist, marks a value cell as owning, or holds a
-/// reference cell that is not one indirection.
+/// type that does not exist, marks a value cell as owning, holds a reference
+/// cell that is not one indirection, or holds a fixed-width field of another
+/// width.
 pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
     let count = row
         .first_chunk::<2>()
@@ -476,6 +477,18 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
         } else {
             RowCell::Value(bytes)
         };
+        // A write refuses a fixed-width field of another width, so a stored
+        // one is damage: read on, the row would be framed with the wrong
+        // field boundaries.
+        if let Some(width) = tag.fixed_width() {
+            let len = match &cell {
+                RowCell::Value(bytes) => bytes.len(),
+                RowCell::Ref { indirection, .. } => indirection.size as usize,
+            };
+            if len != usize::from(width) {
+                return Err(CORRUPT);
+            }
+        }
         fields.push(RowField { column, tag, cell });
         pos = end;
     }

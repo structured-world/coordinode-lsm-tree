@@ -3596,13 +3596,17 @@ fn merge_tables(
         Ok(())
     })?;
 
-    // The rows the ledger still holds go out before the outputs are finished.
-    let (blob_frag_map, released_objects) = ledger
-        .into_inner()
-        .finish(&mut |row| compactor.write(row))?;
-    if let Some(e) = ledger_error.into_inner() {
-        return Err(e);
-    }
+    // The rows the ledger still holds go out before the outputs are finished,
+    // guarded like the merge: a failure here shows the inputs again.
+    let (blob_frag_map, released_objects) = hidden_guard(payload, opts, || {
+        let settled = ledger
+            .into_inner()
+            .finish(&mut |row| compactor.write(row))?;
+        if let Some(e) = ledger_error.into_inner() {
+            return Err(e);
+        }
+        Ok(settled)
+    })?;
 
     if let Some(filter) = compaction_filter {
         filter.finish();
@@ -3740,6 +3744,19 @@ fn drop_tables(
 
     let mut dropped_blob_files = vec![];
 
+    // The files the dropped tables charged the objects they owned to, read
+    // before the edit: nothing that can fail may run once the drop is
+    // published, or an error would report a drop that happened and leave its
+    // files unmarked.
+    let mut released_files = Vec::new();
+    for table in &tables {
+        for link in table.blob_links()? {
+            if link.len > 0 && !released_files.contains(&link.blob_file_id) {
+                released_files.push(link.blob_file_id);
+            }
+        }
+    }
+
     // IMPORTANT: Write the manifest with the removed tables first
     // Otherwise the table files are deleted, but are still referenced!
     version_history_lock.upgrade_version(
@@ -3771,14 +3788,6 @@ fn drop_tables(
     // Still under the write lock that published the drop: the dropped tables
     // charged the objects they owned, by file, so a reference into one of
     // those files read before the drop is stale.
-    let mut released_files = Vec::new();
-    for table in &tables {
-        for link in table.blob_links()? {
-            if link.len > 0 && !released_files.contains(&link.blob_file_id) {
-                released_files.push(link.blob_file_id);
-            }
-        }
-    }
     if !released_files.is_empty() {
         let published = version_history_lock.latest_version().version.id();
         version_history_lock

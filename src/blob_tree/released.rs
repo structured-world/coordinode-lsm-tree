@@ -22,8 +22,8 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
+use crate::HashMap;
 use crate::vlog::{BlobFileId, ValueHandle};
 #[cfg(feature = "std")]
 use parking_lot::Mutex;
@@ -37,13 +37,15 @@ type VersionId = u64;
 struct Records {
     /// The versions held reads took, with how many reads hold each.
     readers: BTreeMap<VersionId, usize>,
-    /// Objects released, each with the version that released it.
-    objects: Vec<(VersionId, ValueHandle)>,
-    /// Blob files a whole-table drop charged, each with the version that
-    /// dropped the table: the drop knows the files whose objects it charged,
-    /// not which objects they were, so a reference into such a file read
-    /// before the drop is stale.
-    files: Vec<(VersionId, BlobFileId)>,
+    /// Objects released, each with the newest version that released it: a
+    /// reference is stale when any release is newer than its read, which is
+    /// so exactly when the newest one is, so one lookup answers it.
+    objects: HashMap<ValueHandle, VersionId>,
+    /// Blob files a whole-table drop charged, each with the newest version
+    /// that dropped such a table: the drop knows the files whose objects it
+    /// charged, not which objects they were, so a reference into such a file
+    /// read before the drop is stale.
+    files: HashMap<BlobFileId, VersionId>,
 }
 
 impl Records {
@@ -54,9 +56,15 @@ impl Records {
             self.files.clear();
             return;
         };
-        self.objects.retain(|&(at, _)| at > oldest);
-        self.files.retain(|&(at, _)| at > oldest);
+        self.objects.retain(|_, at| *at > oldest);
+        self.files.retain(|_, at| *at > oldest);
     }
+}
+
+/// Records `version` as `key`'s release, keeping the newest one.
+fn note<K: core::hash::Hash + Eq>(map: &mut HashMap<K, VersionId>, key: K, version: VersionId) {
+    let at = map.entry(key).or_insert(version);
+    *at = (*at).max(version);
 }
 
 /// The releases of one tree, shared by its reads and its installs.
@@ -93,26 +101,23 @@ impl ReleasedObjects {
         {
             return;
         }
-        records
-            .objects
-            .extend(objects.into_iter().map(|handle| (version, handle)));
-        records
-            .files
-            .extend(files.into_iter().map(|file| (version, file)));
+        for handle in objects {
+            note(&mut records.objects, handle, version);
+        }
+        for file in files {
+            note(&mut records.files, file, version);
+        }
     }
 
     /// Whether the object `handle` names was released in a version newer
     /// than `read`, the version a reference to it was read from.
     pub fn released_since(&self, read: VersionId, handle: &ValueHandle) -> bool {
         let records = self.records.lock();
-        records
-            .objects
-            .iter()
-            .any(|&(at, released)| at > read && released == *handle)
+        records.objects.get(handle).is_some_and(|&at| at > read)
             || records
                 .files
-                .iter()
-                .any(|&(at, file)| at > read && file == handle.blob_file_id)
+                .get(&handle.blob_file_id)
+                .is_some_and(|&at| at > read)
     }
 }
 

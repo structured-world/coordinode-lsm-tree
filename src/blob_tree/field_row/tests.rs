@@ -248,6 +248,27 @@ fn a_fixed_width_field_of_another_width_is_refused() {
     assert!(order_fields(&mut [field(reference(indirection(1, 0, 8)))]).is_ok());
 }
 
+/// A stored fixed-width field whose value, or whose referenced object, is not
+/// its type's width is damage, refused on read as the write refuses it: read
+/// on, the row would be framed with the wrong field boundaries.
+#[test]
+fn a_stored_fixed_width_field_of_another_width_is_refused() {
+    for cell in [
+        RowCell::Value(&[0; 7]),
+        RowCell::Value(&[0; 9]),
+        reference(indirection(1, 0, 4)),
+    ] {
+        let row = encode_row(&[RowField {
+            column: C,
+            tag: u64_le(),
+            cell,
+        }])
+        .unwrap();
+        let result = decode_row(&row);
+        assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
+    }
+}
+
 /// A zero-width fixed type has no wire form: a row holding it would not
 /// decode, so the write is refused.
 #[test]
