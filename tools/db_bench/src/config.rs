@@ -14,7 +14,7 @@ pub enum Compression {
     Lz4,
     Zstd,
     /// Maximum zstd level. The codec-bound end of the spectrum, which the
-    /// `mixed` workload pins so its series means the same thing on every run.
+    /// `lifecycle-zstd22` workload pins so its series means the same thing on every run.
     Zstd22,
 }
 
