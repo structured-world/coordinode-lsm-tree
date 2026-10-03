@@ -140,21 +140,14 @@ pub(crate) fn resolve_value_handle(
             Some(metrics),
         );
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
-            Ok(Some(v)) => {
-                let k = item.key.user_key;
-                Ok((k, v))
-            }
-            Ok(None) => {
-                panic!(
-                    "value handle ({:?} => {:?}) did not match any blob - this is a bug; version={}",
-                    item.key.user_key,
-                    vptr.vhandle,
-                    version.id(),
-                );
-            }
-            Err(e) => Err(e),
-        }
+        // An indirection naming an object the version does not hold is damage,
+        // reported as such, the way a cell row's dangling reference is.
+        let value = accessor
+            .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+            .ok_or(crate::Error::InvalidHeader(
+                "blob tree: an indirection names an object missing from its blob file",
+            ))?;
+        Ok((item.key.user_key, value))
     } else {
         let k = item.key.user_key;
         let v = item.value;
@@ -1964,3 +1957,6 @@ impl AbstractTree for BlobTree {
         self.index.remove_range(start, end, seqno)
     }
 }
+
+#[cfg(test)]
+mod tests;
