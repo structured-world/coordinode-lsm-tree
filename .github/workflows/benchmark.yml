@@ -78,6 +78,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/split-ghpages.XXXXXXXX")"
           trap 'rm -rf "$work"' EXIT
           # The token reaches git through a credential helper reading the
@@ -104,7 +105,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/bench/data.js
           git commit -m "bench: split the dashboard suites by version line (dev/bench)"
-          git push origin gh-pages
+          bash "$push_gh_pages"
 
       # A series whose meaning changed gets a new name, and one that moves to
       # another suite leaves the old one; the points recorded under the old
@@ -117,6 +118,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/retire-ghpages.XXXXXXXX")"
           trap 'rm -rf "$work"' EXIT
           export GIT_CONFIG_COUNT=1
@@ -138,7 +140,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/bench/data.js
           git commit -m "bench: drop the points of retired series (dev/bench)"
-          git push origin gh-pages
+          bash "$push_gh_pages"
 
   benchmark:
     # After the split, so the first store of a push lands in a data file that
@@ -605,6 +607,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/overlay-ghpages.XXXXXXXX")"
           trap 'rm -rf "$work"' EXIT
           # The token reaches git through a credential helper reading the
@@ -627,7 +630,7 @@ jobs:
             echo "::notice::dashboard page unchanged"
           else
             git commit -m "bench: refresh the dashboard page (dev/bench)"
-            git push origin gh-pages
+            bash "$push_gh_pages"
           fi
 
       # Publish the head-to-head under dev/compare, alongside the db_bench
@@ -669,6 +672,7 @@ jobs:
           # Explicit template (not bare `mktemp -d`, which is GNU-only and
           # fails on macOS/BSD with "too few X's") so the step survives a
           # future runner-OS change.
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/compare-ghpages.XXXXXXXX")"
           # Remove the temp clone on every exit path (success, error, or
           # cancellation) so it doesn't leak disk on a long-lived
@@ -725,7 +729,7 @@ jobs:
             echo "::notice::compare-rocksdb page unchanged, nothing to publish"
           else
             git commit -m "bench: refresh the compare-rocksdb page (dev/compare)"
-            git push origin gh-pages
+            bash "$push_gh_pages"
             echo "::notice::published the compare-rocksdb page to dev/compare/"
           fi
 
