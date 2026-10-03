@@ -110,21 +110,14 @@ fn resolve_value_handle(
         // this version keeps the file alive.
         let accessor = Accessor::new(&version.blob_files);
 
-        match accessor.get(tree_id, &item.key.user_key, &vptr.vhandle, cache) {
-            Ok(Some(v)) => {
-                let k = item.key.user_key;
-                Ok((k, v))
-            }
-            Ok(None) => {
-                panic!(
-                    "value handle ({:?} => {:?}) did not match any blob - this is a bug; version={}",
-                    item.key.user_key,
-                    vptr.vhandle,
-                    version.id(),
-                );
-            }
-            Err(e) => Err(e),
-        }
+        // An indirection naming a blob file the version does not hold is
+        // damage, reported as such rather than a panic or an empty value.
+        let value = accessor
+            .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
+            .ok_or(crate::Error::InvalidHeader(
+                "blob tree: an indirection names a blob file the version does not hold",
+            ))?;
+        Ok((item.key.user_key, value))
     } else {
         let k = item.key.user_key;
         let v = item.value;
@@ -1639,3 +1632,6 @@ impl AbstractTree for BlobTree {
         self.index.remove_range(start, end, seqno)
     }
 }
+
+#[cfg(test)]
+mod tests;
