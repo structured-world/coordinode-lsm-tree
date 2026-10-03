@@ -36,8 +36,10 @@
     taking turns at going first, so load on the host slows every engine of a round alike and divides out of their ratio.
     <strong>Relative to RocksDB</strong> shows each engine's time over RocksDB's in the same round, the median over all
     rounds (<strong>below 1 is faster than RocksDB</strong>); <strong>time per operation</strong> shows each engine's
-    median. The tooltip gives the 95% confidence interval of either. Both engines get the same block size, bloom filter,
-    block cache and values, no WAL, and every lsm-tree protection RocksDB has no equivalent for is off.
+    median. The tooltip gives the 95% confidence interval of either, which covers the noise within a run; two runs of
+    one commit on one host agreed on the ratio to within 2% on the median arm and 7% on nine arms in ten, so a ratio
+    within a few percent of 1 is parity. Both engines get the same block size, bloom filter, block cache, values and
+    four block-compression threads, no WAL, and every lsm-tree protection RocksDB has no equivalent for is off.
     &middot; <a href="../bench/">single-engine trend &rarr;</a>
   </p>
   <p class="meta" id="meta"></p>
