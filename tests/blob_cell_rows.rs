@@ -3,8 +3,12 @@
 
 use lsm_tree::{
     AbstractTree, AnyTree, BlobTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
-    blob_tree::field_row::Cell, get_tmp_folder,
+    blob_tree::field_row::Cell,
+    fs::{CrashFs, Fault, FaultFs, FaultOp, FaultRule, MemFs},
+    get_tmp_folder,
+    io::ErrorKind,
 };
+use std::sync::Arc;
 use test_log::test;
 
 /// Cells at or above this many bytes go to a blob file at flush.
@@ -343,6 +347,100 @@ fn a_held_snapshot_keeps_the_objects_it_reads() -> lsm_tree::Result<()> {
         tree.get("doc", SeqNo::MAX)?.as_deref(),
         Some(&framed(&[&second])[..])
     );
+    Ok(())
+}
+
+fn open_on(fs: Arc<dyn lsm_tree::fs::Fs>) -> lsm_tree::Result<BlobTree> {
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(THRESHOLD),
+    ))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .with_shared_fs(fs)
+    .open()?;
+    let AnyTree::Blob(tree) = tree else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    Ok(tree)
+}
+
+/// Fails the next manifest commit, as a power loss right after it would.
+fn fail_next_commit(injector: &lsm_tree::fs::FaultInjector) {
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits")
+            .once(),
+    );
+}
+
+/// A crash between publishing a borrowed reference and dropping its owner, at
+/// either end, loses no object and leaks none: reachability is what the
+/// durable tables say, and the accounting rebuilt from them still charges the
+/// object exactly once when its last holder goes.
+#[test]
+fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()> {
+    let crash = CrashFs::new(MemFs::new());
+    let body = vec![b'b'; 4_096];
+
+    // The borrower's flush never becomes durable: the owner alone holds it.
+    {
+        let fault = FaultFs::new(crash.clone());
+        let injector = fault.injector();
+        let tree = open_on(Arc::new(fault))?;
+        tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+        tree.flush_active_memtable(0)?;
+        let body_ref = reference(&tree, "doc", 1)?;
+        tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+        fail_next_commit(&injector);
+        assert!(tree.flush_active_memtable(0).is_err());
+    }
+    crash.crash();
+    {
+        let tree = open_on(crash.inner())?;
+        assert_eq!(
+            tree.get("doc", SeqNo::MAX)?.as_deref(),
+            Some(&framed(&[b"draft", &body])[..]),
+            "the durable owner still reads its object"
+        );
+        assert_eq!(tree.stale_blob_bytes(), 0);
+        assert_eq!(tree.blob_file_count(), 1);
+    }
+
+    // The borrower is durable; the compaction that drops the owner is not.
+    {
+        let fault = FaultFs::new(crash.clone());
+        let injector = fault.injector();
+        let tree = open_on(Arc::new(fault))?;
+        let body_ref = reference(&tree, "doc", 1)?;
+        tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+        tree.flush_active_memtable(0)?;
+        fail_next_commit(&injector);
+        assert!(tree.major_compact(64_000_000, SeqNo::MAX).is_err());
+    }
+    crash.crash();
+    let tree = open_on(crash.inner())?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..]),
+    );
+    assert_eq!(
+        tree.stale_blob_bytes(),
+        0,
+        "nothing was charged by the lost edit"
+    );
+
+    // The compaction runs again, then the object's last holder goes: it is
+    // charged once and its file is reclaimed.
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 0);
+    tree.insert("doc", "gone", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.blob_file_count(), 0, "no object leaked");
     Ok(())
 }
 
