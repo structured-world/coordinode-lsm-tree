@@ -404,6 +404,12 @@ jobs:
           tool: customBiggerIsBetter
           output-file-path: benchmark-results.json
           github-token: ${{ steps.bot-token.outputs.token }}
+          # The commit the point is filed under. A push carries it in the
+          # event; on a dispatch the action otherwise resolves the branch name
+          # through the API, which names the branch's head at the time of the
+          # store, not the commit measured, and has failed outright on a
+          # branch named with `#` ("No commit found for SHA").
+          ref: ${{ github.sha }}
           # The dashboard series is the history of main, so only a push to
           # main extends it. A manual dispatch measures a branch and is
           # compared against that series without joining it.
