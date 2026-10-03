@@ -7,10 +7,10 @@
 #
 #     cd tools/compare-rocksdb && cargo bench
 #
-# Each criterion group runs the same workload through this crate
-# and through RocksDB side-by-side; results land in
-# `tools/compare-rocksdb/target/criterion/`. The gh-pages
-# dashboard pipeline consumes those JSON outputs (per #244).
+# Each group runs the same workload through this crate and through
+# RocksDB in paired rounds; the results land in
+# `tools/compare-rocksdb/target/head-to-head/summary.json`, which the
+# published head-to-head page is drawn from (per #244).
 #
 # An empty `[workspace]` pins this crate as its own workspace root. The main
 # crate already lists it under `workspace.exclude`, but exclusion alone does not
@@ -51,14 +51,10 @@ rocksdb = { version = "0.25", default-features = false, features = ["zstd"] }
 surrealkv = "=0.21.4"
 # SurrealKV needs a tokio runtime: its `build()` spawns background
 # compaction tasks via `tokio::spawn`, and `commit()` is async. The
-# criterion harness is sync, so each surrealkv arm owns a multi-thread
+# harness is sync, so each surrealkv arm owns a multi-thread
 # runtime and drives open / commit through `rt.block_on`.
 tokio = { version = "1", features = ["rt-multi-thread"] }
-# No HTML reports and no plots (the workflow passes `--noplot`): the published
-# page draws its charts from the `summary.json` the harness writes after the
-# run, so Criterion only measures and keeps its JSON estimates.
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "rayon"] }
-# Reads Criterion's per-benchmark estimates for that summary.
+# Writes the summary the published page is drawn from.
 serde_json = "1"
 tempfile = "3"
 

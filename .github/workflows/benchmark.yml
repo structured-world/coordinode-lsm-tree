@@ -47,12 +47,13 @@ permissions:
   contents: read
 
 jobs:
-  # The suites were once named without a version line, so 5.x and 6.0 points
-  # shared one chart and one alert baseline. This moves every point of an
-  # unversioned suite into the suite of its line, once: 6.x from the first
-  # commit of the 6.0 line, 5.x before it. With no unversioned suite left it
-  # changes nothing. It runs before the bench stores anything, on a hosted
-  # runner, since the transform needs jq and the full history of main.
+  # Keeps the dashboard data consistent before the bench stores anything: the
+  # suites were once named without a version line, so 5.x and 6.0 points
+  # shared one chart and one alert baseline, and the first step moves every
+  # point of an unversioned suite into the suite of its line, once: 6.x from
+  # the first commit of the 6.0 line, 5.x before it. The second drops the
+  # points of retired series. Either changes nothing once done. On a hosted
+  # runner, since the transforms need jq and the full history of main.
   split-series:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -103,6 +104,40 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add dev/bench/data.js
           git commit -m "bench: split the dashboard suites by version line (dev/bench)"
+          git push origin gh-pages
+
+      # A series whose meaning changed gets a new name, and one that moves to
+      # another suite leaves the old one; the points recorded under the old
+      # name or in the old suite measure something else, so they go
+      # (.github/bench/retired-series.json says which and why). With none left
+      # it changes nothing.
+      - name: Drop retired series
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "${TMPDIR:-/tmp}/retire-ghpages.XXXXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=credential.helper
+          # shellcheck disable=SC2016
+          export GIT_CONFIG_VALUE_0='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f'
+          git clone --depth 1 --branch gh-pages \
+            "https://github.com/${REPO}.git" "$work"
+          status=0
+          bash .github/scripts/drop-retired-series.sh "$work/dev/bench/data.js" \
+            .github/bench/retired-series.json || status=$?
+          case "$status" in
+            0) ;;
+            3) echo "::notice::no retired series left, nothing to drop"; exit 0 ;;
+            *) exit "$status" ;;
+          esac
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/data.js
+          git commit -m "bench: drop the points of retired series (dev/bench)"
           git push origin gh-pages
 
   benchmark:
@@ -260,7 +295,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-
 
@@ -347,7 +382,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: ${{ steps.compare-cache.outputs.cache-primary-key }}
 
       # The db_bench pass: under a minute on an idle host, ~3 min on a loaded
@@ -359,23 +394,20 @@ jobs:
 
       # Head-to-head RocksDB comparison. Distinct from the db_bench
       # trend above (single-engine, value-over-commits): this runs the
-      # standalone `tools/compare-rocksdb` criterion harness where every
-      # scenario runs BOTH engines in the same process, so each criterion
-      # group is an ours-vs-rocksdb overlay chart. Because the comparison
-      # is a ratio measured on one host in one run, it stays meaningful
-      # even if this runner's CPU changes between runs.
+      # standalone `tools/compare-rocksdb` harness, where every scenario runs
+      # every engine in the same process and the same rounds, one sample each
+      # per round, so a burst of other load on a shared host slows every
+      # engine of the rounds it overlaps and divides out of their ratio.
+      # Because the comparison is a ratio measured on one host in one run, it
+      # stays meaningful even if this runner's CPU changes between runs.
       #
       # It runs straight after the db_bench pass, before any step below
       # switches the checkout to gh-pages and back: that rewrites the
       # engine's sources, and cargo would then rebuild the harness the build
       # step already compiled.
       #
-      # Bounded criterion settings keep the harness fast: this is a
-      # ratio comparison (both engines in one process per scenario), so a
-      # short warm-up + measurement window per scenario still yields a
-      # stable median. An arm whose single iteration outlasts the window runs
-      # at Criterion's floor of ten samples regardless, so what bounds the
-      # matrix is its sizes.
+      # The harness's own defaults set the rounds (a per-group budget, ten at
+      # least), so the published run and a local `cargo bench` measure alike.
       - name: Run compare-rocksdb head-to-head benches
         id: compare
         # Runs whatever the db_bench pass did, so a host that cannot build
@@ -392,20 +424,16 @@ jobs:
         env:
           LSM_BENCH_PRESET: rocksdb-parity
           LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
-        # A workspace left by an earlier run on this runner may still hold
-        # Criterion's results under target/criterion, and the summary the
-        # harness writes collects every result there, so they go before the
-        # run. `--noplot`: the published page draws its charts from that
-        # summary, so Criterion spends no time rendering any.
+        # A summary an earlier run on this runner left behind goes first, so a
+        # run that fails before writing its own cannot publish the old one.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
             echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
             exit 1
           fi
           cd tools/compare-rocksdb
-          rm -rf target/criterion
-          cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5 --noplot
+          rm -rf target/head-to-head
+          cargo bench --bench compare
 
       # Issued after the benches, right before its first use: an installation
       # token lives one hour, so one issued at the start of the job would let
@@ -503,7 +531,7 @@ jobs:
       # The step above leaves a local gh-pages commit on a run that does not
       # auto-push, and the next store step fetches gh-pages:gh-pages; drop it
       # again for the same reason as before the first store.
-      - name: Drop the local gh-pages the yield store left
+      - name: Drop the local gh-pages the rate store left
         if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
@@ -520,6 +548,34 @@ jobs:
           name: "lsm-tree db_bench costs ${{ steps.line.outputs.major }}.x"
           tool: customSmallerIsBetter
           output-file-path: benchmark-costs.json
+          github-token: ${{ steps.bot-token.outputs.token }}
+          # Looked up by SHA, as in the rate store above.
+          ref: ${{ github.sha }}
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          comment-on-alert: true
+          alert-comment-cc-users: "@polaz"
+          alert-threshold: "115%"
+          fail-on-alert: false
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          benchmark-data-dir-path: dev/bench
+
+      # As after the rate store: the cost store leaves a local gh-pages commit
+      # on a run that does not auto-push.
+      - name: Drop the local gh-pages the cost store left
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
+        run: git branch --delete --force gh-pages 2>/dev/null || true
+
+      # Times measured on this host that improve by shrinking, such as a scan's
+      # time to its first batch: smaller is better like the costs, but one
+      # series per host like the rates, since a time measured on one machine
+      # is no baseline for another.
+      - name: Store benchmark timings
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
+        with:
+          name: "lsm-tree db_bench timings ${{ steps.line.outputs.major }}.x · ${{ runner.os }} · ${{ runner.name }}"
+          tool: customSmallerIsBetter
+          output-file-path: benchmark-timings.json
           github-token: ${{ steps.bot-token.outputs.token }}
           # Looked up by SHA, as in the rate store above.
           ref: ${{ github.sha }}
@@ -605,7 +661,7 @@ jobs:
           MEASURED_RUNNER: ${{ runner.name }}
         run: |
           set -euo pipefail
-          summary="tools/compare-rocksdb/target/criterion/summary.json"
+          summary="tools/compare-rocksdb/target/head-to-head/summary.json"
           if [ ! -f "$summary" ]; then
             echo "::error::the harness wrote no summary at $summary"
             exit 1
