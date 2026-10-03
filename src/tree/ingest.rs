@@ -220,6 +220,9 @@ impl<'a> Ingestion<'a> {
         // tables are columnar too (a row ingest is transposed at spill, a
         // columnar batch is stored directly via `write_columnar_batch`).
         writer = writer.use_columnar(rc.columnar);
+        // The index of a blob tree takes rows written as cells, which its
+        // columnar tables split into the columns of their fields.
+        writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
         // Flag every ingested SST: its entries are written at local seqno 0 and
         // rely on the `global_seqno` allocated at commit, so manifest repair must
         // recognize the manifest-only offset (and fail closed when it is lost)

@@ -2005,6 +2005,19 @@ impl Writer {
         self
     }
 
+    /// Sets up a columnar table of a tree whose rows may be written as cells
+    /// ([`ValueLayout::Cells`](crate::table::meta::ValueLayout::Cells)): its
+    /// blocks split each cell row into the columns of its fields. Must be set
+    /// before the first key is written; `false` leaves the writer as it is.
+    #[must_use]
+    pub(crate) fn use_cell_rows(self, cell_rows: bool) -> Self {
+        if cell_rows {
+            self.use_value_layout(crate::table::meta::ValueLayout::Cells)
+        } else {
+            self
+        }
+    }
+
     /// Records that a columnar block storing values as `layout` is written:
     /// the first fixes the table's layout, and one of the other layout is
     /// refused, since the descriptor records one per table.
@@ -2529,9 +2542,15 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
-        // The transpose keeps each row's value whole, as it was written.
-        self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
-        let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        // The transpose keeps each row's value whole, as it was written, or,
+        // in a table set up for cell rows, splits each cell row into its
+        // fields and keeps every other value whole.
+        let batch = if self.value_layout == Some(crate::table::meta::ValueLayout::Cells) {
+            crate::table::columnar::entries_to_cells_batch(&self.chunk)?
+        } else {
+            self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
+            crate::table::columnar::entries_to_column_batch(&self.chunk)?
+        };
         self.encode_columnar_batch_block(
             &batch,
             last_key,
@@ -2915,6 +2934,12 @@ impl Writer {
         // Validate the batch shape and obtain per-row keys / seqnos / value-types.
         // The framed values feed the shape accounting; the block stores the
         // consumer's sub-columns (not a re-transpose).
+        // An ingested batch names only field ids: one the engine keeps would
+        // make the group read as rows written as cells.
+        if require_zero_seqno {
+            let value_cols = batch.columns.get(3..).unwrap_or_default();
+            crate::table::columnar::check_ingested_field_ids(value_cols)?;
+        }
         let entries = crate::table::columnar::column_batch_to_entries(batch)?;
 
         // Ingest contract. Unsorted keys would corrupt the sorted block index /

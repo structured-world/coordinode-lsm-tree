@@ -442,7 +442,8 @@ impl BlobTree {
     /// and both are stored with the row, so a stored row always reads with
     /// the layout it was written with. A column id is a field id of the
     /// columnar format (from [`FIRST_FIELD_COLUMN`](field_row::FIRST_FIELD_COLUMN)
-    /// up to, not including, `u16::MAX`), so a columnar table can store the
+    /// up to, not including, [`RESERVED_COLUMNS`](field_row::RESERVED_COLUMNS)),
+    /// so a columnar table can store the
     /// field as that column. The row keeps its fields in ascending column
     /// order, whatever order they are given in. Plain reads of the key return
     /// the fields in that order, framed as the columnar format frames a row's value
@@ -1503,7 +1504,9 @@ impl AbstractTree for BlobTree {
             .use_writeback_bytes(self.index.config.writeback_bytes);
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         table_writer = table_writer.use_zone_map(rc.zone_map);
-        table_writer = table_writer.use_columnar(rc.columnar);
+        table_writer = table_writer
+            .use_columnar(rc.columnar)
+            .use_cell_rows(rc.columnar);
         table_writer = table_writer.use_disable_cow_on_sst(rc.disable_cow_on_sst_files);
         table_writer = table_writer.use_kv_checksums(rc.kv_checksums, rc.kv_checksum_algo);
         table_writer = table_writer.use_locator(self.index.config.locator_policy.get(0));

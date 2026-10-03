@@ -325,6 +325,9 @@ pub(super) fn prepare_table_writer(
         .use_seqno_in_index(rc.seqno_in_index)
         .use_zone_map(rc.zone_map)
         .use_columnar(rc.columnar)
+        // A blob tree's rows may be written as cells, which its columnar
+        // tables split into the columns of their fields.
+        .use_cell_rows(rc.columnar && opts.config.kv_separation_opts.is_some())
         // Per-level delete strategy: under copy-on-write the output SSTs persist
         // no delete-bitmap (deleted rows are dropped); merge-on-read / adaptive
         // keep a populated bitmap. Read off the live snapshot so a policy change

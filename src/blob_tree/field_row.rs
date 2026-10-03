@@ -299,11 +299,24 @@ pub const FIRST_FIELD_COLUMN: u16 = 3;
 
 /// The column id a columnar table keeps a whole value under, beside the
 /// fields of rows written as cells: no field may take it.
+#[cfg(feature = "columnar")]
 pub(crate) const WHOLE_VALUE_COLUMN: u16 = u16::MAX;
+
+/// The column id a columnar table keeps the references of rows written as
+/// cells under: no field may take it.
+pub(crate) const CELL_REFS_COLUMN: u16 = u16::MAX - 1;
+
+/// The first column id past the field ids, which the engine keeps for itself.
+pub const RESERVED_COLUMNS: u16 = CELL_REFS_COLUMN;
+
+/// Whether `column` is an id a field may take.
+pub(crate) const fn is_field_column(column: u16) -> bool {
+    column >= FIRST_FIELD_COLUMN && column < RESERVED_COLUMNS
+}
 
 /// Puts `fields` in the order a row stores them, ascending by column, and
 /// refuses a row a caller could not have meant: a column outside the field
-/// ids (below [`FIRST_FIELD_COLUMN`], or `u16::MAX`), a type that has no wire
+/// ids (below [`FIRST_FIELD_COLUMN`], or from [`RESERVED_COLUMNS`] on), a type that has no wire
 /// form (a zero-width [`TypeTag::Fixed`]), two fields in one column, or a
 /// fixed-width field whose value or object is not its type's width.
 ///
@@ -317,7 +330,7 @@ pub(crate) fn order_fields(fields: &mut [RowField<'_>]) -> crate::Result<()> {
     fields.sort_by_key(|field| field.column);
     let mut previous = None;
     for field in fields.iter() {
-        if field.column < FIRST_FIELD_COLUMN || field.column == WHOLE_VALUE_COLUMN {
+        if !is_field_column(field.column) {
             return Err(Error::CellRow("a field's column is not a field id"));
         }
         if previous == Some(field.column) {
@@ -422,10 +435,7 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
         let column = u16::from_le_bytes([c0, c1]);
         // A written row holds field ids in ascending order; anything else is
         // damage, not a layout to read.
-        if column < FIRST_FIELD_COLUMN
-            || column == WHOLE_VALUE_COLUMN
-            || previous.is_some_and(|previous| column <= previous)
-        {
+        if !is_field_column(column) || previous.is_some_and(|previous| column <= previous) {
             return Err(CORRUPT);
         }
         previous = Some(column);

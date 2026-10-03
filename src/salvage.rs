@@ -1296,12 +1296,11 @@ fn suppress_columnar_boundary(
     if let Some(key) = carry {
         return Ok(BoundarySuppression::Emptied(key));
     }
-    if batch.columns.len() > 4 {
+    let Some(rebuilt) = crate::table::columnar::transpose_like(batch, &kept)? else {
         return Err(crate::Error::FeatureUnsupported(
             "boundary-key suppression in a columnar block with value sub-columns",
         ));
-    }
-    let rebuilt = crate::table::columnar::entries_to_column_batch(&kept)?;
+    };
     Ok(BoundarySuppression::Rebuilt(rebuilt, kept))
 }
 
@@ -2156,7 +2155,7 @@ fn salvage_blocks(
                         let mut rewrite_carry: Option<UserKey> = None;
                         let batch = match blob_rewrite {
                             Some(rw) => {
-                                if batch.columns.len() > 4 {
+                                if !crate::table::columnar::rows_round_trip(&batch) {
                                     return Err(crate::Error::FeatureUnsupported(
                                         "blob-handle rewrite of a columnar block \
                                          with value sub-columns",
@@ -2182,9 +2181,16 @@ fn salvage_blocks(
                                     }
                                     Ok((entries, carry)) => {
                                         rewrite_carry = carry;
-                                        match crate::table::columnar::entries_to_column_batch(
-                                            &entries,
-                                        ) {
+                                        let rebuilt = crate::table::columnar::transpose_like(
+                                            &batch, &entries,
+                                        )
+                                        .and_then(|rebuilt| {
+                                            rebuilt.ok_or(crate::Error::FeatureUnsupported(
+                                                "blob-handle rewrite of a columnar block \
+                                                         with value sub-columns",
+                                            ))
+                                        });
+                                        match rebuilt {
                                             Ok(batch) => batch,
                                             Err(e) => {
                                                 dropped.push(classify_drop(
@@ -2346,13 +2352,12 @@ fn salvage_blocks(
                             Ok((batch, entries)) => {
                                 // Apply the blob-handle rewrite by round-tripping
                                 // through the row entries, then rebuilding the
-                                // batch, so the emitted block carries the NEW
-                                // handles. A batch with value SUB-COLUMNS cannot
-                                // round-trip (they are not reconstructible from
-                                // entries) — a KV-separated columnar flush never
-                                // writes them (indirections live in the opaque
-                                // value column), so fail closed on the exotic
-                                // combination instead of silently dropping data.
+                                // batch as the source laid it out, so the emitted
+                                // block carries the NEW handles. A batch of caller
+                                // sub-columns cannot round-trip (rows are not
+                                // split back into them); a blob tree never writes
+                                // one, so fail closed on that combination instead
+                                // of silently dropping data.
                                 // A chain the rewrite beheads at this block's tail
                                 // continues into the next block, so its key is
                                 // handed on once this block's own suppression has
@@ -2360,7 +2365,7 @@ fn salvage_blocks(
                                 let mut rewrite_carry: Option<UserKey> = None;
                                 let (batch, entries) = match blob_rewrite {
                                     Some(rw) => {
-                                        if batch.columns.len() > 4 {
+                                        if !crate::table::columnar::rows_round_trip(&batch) {
                                             return Err(crate::Error::FeatureUnsupported(
                                                 "blob-handle rewrite of a columnar block \
                                                  with value sub-columns",
@@ -2395,9 +2400,16 @@ fn salvage_blocks(
                                             prev_end = end_key.or(prev_end);
                                             continue;
                                         }
-                                        match crate::table::columnar::entries_to_column_batch(
-                                            &entries,
-                                        ) {
+                                        let rebuilt = crate::table::columnar::transpose_like(
+                                            &batch, &entries,
+                                        )
+                                        .and_then(|rebuilt| {
+                                            rebuilt.ok_or(crate::Error::FeatureUnsupported(
+                                                "blob-handle rewrite of a columnar block \
+                                                         with value sub-columns",
+                                            ))
+                                        });
+                                        match rebuilt {
                                             Ok(batch) => (batch, entries),
                                             Err(e) => {
                                                 dropped.push(classify_drop(

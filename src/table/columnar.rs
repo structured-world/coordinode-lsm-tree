@@ -65,8 +65,10 @@ use alloc::vec::Vec;
 pub(crate) use super::column_type::comparable_bytes;
 pub use super::column_type::{ByteOrder, Number, NumberKind, TypeTag};
 
+mod cells;
 mod expr;
 
+pub(crate) use cells::entries_to_cells_batch;
 pub(crate) use expr::{Bounds, Cell, Choice, Values};
 pub use expr::{Candidate, Expression, candidates};
 
@@ -1775,7 +1777,26 @@ fn column_cell(col: &Column, row_count: u32, row: u32) -> Result<&[u8]> {
 /// validity bitmap, the row is framed with [`frame_value_cells_nullable`] (a
 /// presence bitmap plus the present cells), which the consumer reverses with
 /// [`unframe_value_cells_nullable`] / [`unframe_value_cells_with_defaults`].
-fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Result<Slice> {
+///
+/// A group that holds rows written as cells gives back each row's whole value
+/// or the cell row its fields encode to (see [`cells`]).
+fn reconstruct_row_value(
+    value_cols: &[Column],
+    row_count: u32,
+    row: u32,
+    value_type: ValueType,
+) -> Result<Slice> {
+    if cells::holds_cells(value_cols.iter().map(|c| &c.column_id)) {
+        let mut row_cells = Vec::with_capacity(value_cols.len());
+        for col in value_cols {
+            row_cells.push((
+                col.column_id,
+                col.type_tag,
+                column_value_cell(col, row_count, row)?,
+            ));
+        }
+        return cells::row_value(value_type, &row_cells);
+    }
     if value_cols.iter().any(|c| c.validity.is_some()) {
         let mut cells = Vec::with_capacity(value_cols.len());
         for col in value_cols {
@@ -1853,6 +1874,13 @@ fn validate_columnar_columns(
         seen_value_column_ids.push(col.column_id);
         col.validate(batch.row_count)?;
     }
+    if cells::holds_cells(seen_value_column_ids.iter()) {
+        let shapes: Vec<(u16, TypeTag)> = value_cols
+            .iter()
+            .map(|c| (c.column_id, c.type_tag))
+            .collect();
+        cells::check_value_columns(&shapes)?;
+    }
     Ok((key_col, seqno_col, vt_col, value_cols))
 }
 
@@ -1875,7 +1903,8 @@ pub fn validate_columnar_ingest_batch(
     batch: &ColumnBatch,
     comparator: &crate::SharedComparator,
 ) -> Result<()> {
-    let (key_col, seqno_col, vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
+    check_ingested_field_ids(value_cols)?;
     // Reject a malformed value-type tag on submit rather than letting it surface
     // only at flush-time decode (`column_batch_to_entries`).
     for &vt_byte in vt_col.data.iter() {
@@ -1908,6 +1937,52 @@ pub fn validate_columnar_ingest_batch(
     Ok(())
 }
 
+/// `entries`, rows decoded from `batch`, laid out again as `batch` lays its
+/// rows out: whole values, or a group of rows written as cells. `None` for a
+/// batch of caller sub-columns, which rows cannot be split back into.
+///
+/// # Errors
+///
+/// As [`entries_to_column_batch`].
+pub(crate) fn transpose_like(
+    batch: &ColumnBatch,
+    entries: &[InternalValue],
+) -> Result<Option<ColumnBatch>> {
+    if cells::holds_cells(batch.columns.iter().map(|c| &c.column_id)) {
+        return entries_to_cells_batch(entries).map(Some);
+    }
+    if !rows_round_trip(batch) {
+        return Ok(None);
+    }
+    entries_to_column_batch(entries).map(Some)
+}
+
+/// Whether the rows of `batch`, once decoded, can be laid out again as the
+/// batch lays them out ([`transpose_like`]): every layout but a batch of
+/// caller sub-columns.
+pub(crate) fn rows_round_trip(batch: &ColumnBatch) -> bool {
+    batch.columns.len() <= 4 || cells::holds_cells(batch.columns.iter().map(|c| &c.column_id))
+}
+
+/// Refuses a value sub-column of an ingested batch whose id the engine keeps
+/// for itself (from [`RESERVED_COLUMNS`](crate::blob_tree::field_row::RESERVED_COLUMNS)
+/// on): a group holding one would read as a group of rows written as cells.
+///
+/// # Errors
+///
+/// [`Error::InvalidHeader`] naming the fault.
+pub(crate) fn check_ingested_field_ids(value_cols: &[Column]) -> Result<()> {
+    if value_cols
+        .iter()
+        .any(|c| c.column_id >= crate::blob_tree::field_row::RESERVED_COLUMNS)
+    {
+        return Err(Error::InvalidHeader(
+            "columnar: a value sub-column id is one the engine keeps for itself",
+        ));
+    }
+    Ok(())
+}
+
 /// Reconstructs the entries from an intrinsic columnar batch produced by
 /// [`entries_to_column_batch`].
 ///
@@ -1931,7 +2006,7 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         }
         let seqno = fixed_u64_row(&seqno_col.data, i)?;
         let value_type = value_type_row(&vt_col.data, i)?;
-        let value = reconstruct_row_value(value_cols, batch.row_count, i)?;
+        let value = reconstruct_row_value(value_cols, batch.row_count, i, value_type)?;
         out.push(InternalValue {
             key: InternalKey {
                 user_key: Slice::from(user_key),
@@ -2005,7 +2080,7 @@ pub fn column_batch_into_entries(
         let value = match &value_source {
             ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
             ValueSource::Reconstruct(cols) => {
-                let value = reconstruct_row_value(cols, row_count, i)?;
+                let value = reconstruct_row_value(cols, row_count, i, value_type)?;
                 *rebuilt += value.len();
                 value
             }
@@ -2203,6 +2278,11 @@ pub(crate) fn page_match_entries(
             "columnar: batch carries no value column",
         ));
     }
+    let holds_cells = cells::holds_cells(values.iter().map(|(id, ..)| id));
+    if holds_cells {
+        let shapes: Vec<(u16, TypeTag)> = values.iter().map(|&(id, tag, ..)| (id, tag)).collect();
+        cells::check_value_columns(&shapes)?;
+    }
     // Copied once and shared by every version the run holds.
     let user_key = Slice::from(needle);
     *copied += user_key.len();
@@ -2232,7 +2312,22 @@ pub(crate) fn page_match_entries(
         };
         let value_type =
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
-        let value = if let (false, [(_, type_tag, _, access)]) = (nullable, values.as_slice()) {
+        let value = if holds_cells {
+            let mut row_cells = Vec::with_capacity(values.len());
+            for (id, type_tag, validity, access) in &values {
+                let cell = if validity.is_none_or(|v| validity_bit(v, row)) {
+                    Some(access.get(*type_tag, rows, row)?)
+                } else {
+                    None
+                };
+                row_cells.push((*id, *type_tag, cell));
+            }
+            let borrowed: Vec<(u16, TypeTag, Option<&[u8]>)> = row_cells
+                .iter()
+                .map(|(id, tag, cell)| (*id, *tag, cell.as_deref()))
+                .collect();
+            cells::row_value(value_type, &borrowed)?
+        } else if let (false, [(_, type_tag, _, access)]) = (nullable, values.as_slice()) {
             // One value column without nulls, the common shape: its cell is
             // the value, with no framing to build.
             Slice::from(&*access.get(*type_tag, rows, row)?)

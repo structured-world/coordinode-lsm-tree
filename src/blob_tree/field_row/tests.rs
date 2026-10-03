@@ -211,18 +211,20 @@ fn two_fields_in_one_column_are_refused() {
     assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
 }
 
-/// A column id that is not a field id (an intrinsic column's, or the one a
-/// columnar table keeps whole values under) is refused.
+/// A column id that is not a field id (an intrinsic column's, or one a
+/// columnar table keeps whole values or references under) is refused.
 #[test]
 fn a_column_that_is_not_a_field_id_is_refused() {
-    for column in [0, 1, 2, u16::MAX] {
+    for column in [0, 1, 2, RESERVED_COLUMNS, u16::MAX] {
         let result = order_fields(&mut [RowField::bytes(column, RowCell::Value(b"a"))]);
         assert!(
             matches!(result, Err(Error::CellRow(_))),
             "{column}: {result:?}"
         );
     }
-    assert!(order_fields(&mut [RowField::bytes(u16::MAX - 1, RowCell::Value(b"a"))]).is_ok());
+    assert!(
+        order_fields(&mut [RowField::bytes(RESERVED_COLUMNS - 1, RowCell::Value(b"a"))]).is_ok()
+    );
 }
 
 /// A fixed-width field whose value, or whose referenced object, is not its

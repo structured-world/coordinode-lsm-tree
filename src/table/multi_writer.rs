@@ -161,6 +161,11 @@ pub struct MultiWriter {
     /// table records one layout, so a write of the other one rotates first.
     value_layout: Option<crate::table::meta::ValueLayout>,
 
+    /// Preserved across writer rotation: every table of a tree whose rows may
+    /// be written as cells splits them into their fields (see
+    /// [`Writer::use_cell_rows`]).
+    cell_rows: bool,
+
     /// Preserved across writer rotation so every successor [`Writer`] of one
     /// bulk ingest is uniformly flagged bulk-ingested (see
     /// [`Writer::use_bulk_ingested`]).
@@ -323,6 +328,7 @@ impl MultiWriter {
             use_zstd_two_pass_seed: true,
             use_columnar: false,
             value_layout: None,
+            cell_rows: false,
             bulk_ingested: false,
             recency: None,
             lineage: None,
@@ -896,6 +902,15 @@ impl MultiWriter {
         self
     }
 
+    /// Splits the cell rows of every table of this run into their fields
+    /// (see [`Writer::use_cell_rows`]), re-applied to each rotated successor.
+    #[must_use]
+    pub(crate) fn use_cell_rows(mut self, cell_rows: bool) -> Self {
+        self.cell_rows = cell_rows;
+        self.writer = self.writer.use_cell_rows(cell_rows);
+        self
+    }
+
     /// Marks every table in this run as bulk-ingested (re-applied to each rotated
     /// successor), so manifest repair can recognize their manifest-only
     /// `global_seqno` dependence. See [`Writer::use_bulk_ingested`].
@@ -1048,6 +1063,7 @@ impl MultiWriter {
         }
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
+        new_writer = new_writer.use_cell_rows(self.cell_rows);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
@@ -1311,7 +1327,11 @@ impl MultiWriter {
 
         self.writer.write(item)?;
         if self.use_columnar {
-            self.value_layout = Some(crate::table::meta::ValueLayout::Whole);
+            self.value_layout = Some(if self.cell_rows {
+                crate::table::meta::ValueLayout::Cells
+            } else {
+                crate::table::meta::ValueLayout::Whole
+            });
         }
         self.note_output_base();
 
@@ -1336,7 +1356,14 @@ impl MultiWriter {
     ) -> crate::Result<Option<crate::UserKey>> {
         // A table records one value layout, so a batch after rows starts the
         // next table.
-        if self.table_full() || self.value_layout == Some(crate::table::meta::ValueLayout::Whole) {
+        if self.table_full()
+            || matches!(
+                self.value_layout,
+                Some(
+                    crate::table::meta::ValueLayout::Whole | crate::table::meta::ValueLayout::Cells
+                )
+            )
+        {
             self.rotate()?;
         }
         // A batch lands whole, so the output's base is what it held before
