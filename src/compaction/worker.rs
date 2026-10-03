@@ -1715,6 +1715,8 @@ fn run_tight_space_compaction(
                     *slot = (*slot).max(*fe);
                 }
             }
+            // Charged once this slice is installed, below.
+            let relocated_bytes = produced.relocated_bytes();
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -1929,6 +1931,12 @@ fn run_tight_space_compaction(
             // The version names this slice's outputs now: a later slice's failure
             // must not remove them.
             opts.outputs.installed();
+            #[cfg(feature = "metrics")]
+            opts.metrics
+                .blob_bytes_relocated
+                .fetch_add(relocated_bytes, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(feature = "metrics"))]
+            let _ = relocated_bytes;
             // The published version counts the outputs' filters now, and the
             // plan's views must not outlive the slice.
             drop(filter_sizing);

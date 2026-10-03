@@ -149,6 +149,12 @@ pub struct Metrics {
     /// [`Metrics::bytes_decoded`] for the same reason.
     pub(crate) blob_bytes_decoded: AtomicU64,
 
+    /// Blob record bytes a relocating compaction copied into a new blob file,
+    /// on disk: the payload garbage collection moves to reclaim the space of
+    /// the files it rewrites. Charged when the rewritten files are installed,
+    /// so a relocation that fails before install moves nothing.
+    pub(crate) blob_bytes_relocated: AtomicU64,
+
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
 
@@ -368,6 +374,15 @@ impl Metrics {
     #[inline]
     pub(crate) fn record_payload_incidental(&self, bytes: u64) {
         self.payload_bytes_incidental.fetch_add(bytes, Relaxed);
+    }
+
+    /// On-disk blob bytes relocating compactions copied into new blob files.
+    ///
+    /// The work garbage collection does to reclaim the space of the files it
+    /// rewrites: divided by the bytes it reclaimed, the cost of each byte
+    /// freed, which placement moves by deciding which values share a file.
+    pub fn blob_bytes_relocated(&self) -> u64 {
+        self.blob_bytes_relocated.load(Relaxed)
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and
