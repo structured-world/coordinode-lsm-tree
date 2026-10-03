@@ -413,13 +413,13 @@ impl BlobTree {
     /// Writes `key` as a row of `cells` at `seqno`.
     ///
     /// Plain reads of the key return the cells in order, each a
-    /// little-endian `u32` length and its bytes, with every [`Cell::Ref`]
-    /// replaced by its object: the framing
-    /// [`frame_value_cells`](crate::table::columnar::frame_value_cells)
-    /// produces for byte cells. A [`Cell::Value`] at or above the separation
+    /// little-endian `u32` length and its bytes, with every
+    /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object: the framing
+    /// the columnar format gives a row of byte cells. A
+    /// [`Cell::Value`](field_row::Cell::Value) at or above the separation
     /// threshold is stored in a blob file when the row is flushed.
     ///
-    /// A [`Cell::Ref`] keeps an object the key already holds without
+    /// A [`Cell::Ref`](field_row::Cell::Ref) keeps an object the key already holds without
     /// rewriting it, which is how a metadata-only update leaves a large field
     /// in place. Take the references from the key's latest version and write
     /// this row above it: a reference read from an older version may name an

@@ -68,9 +68,8 @@
 //!
 //! The logical value a plain read returns is the cells in order, each a
 //! little-endian `u32` length and its bytes, with every reference replaced by
-//! the bytes of its object: the framing
-//! [`frame_value_cells`](crate::table::columnar::frame_value_cells) produces
-//! for cells of [`TypeTag::Bytes`](crate::table::columnar::TypeTag::Bytes).
+//! the bytes of its object: the framing the columnar format gives a row of
+//! byte cells.
 
 use alloc::vec::Vec;
 

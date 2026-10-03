@@ -115,12 +115,7 @@ fn a_row_resolves_to_its_cells_with_objects_in_place() {
     let object = crate::Slice::from(vec![b'p'; 5]);
     let row = encode_row(&[RowCell::Value(b"ab"), reference(indirection(1, 0, 5))]).unwrap();
     let value = resolve_row(&row, |_| Ok(object.clone())).unwrap();
-    let tags = [
-        crate::table::columnar::TypeTag::Bytes,
-        crate::table::columnar::TypeTag::Bytes,
-    ];
-    let cells = crate::table::columnar::unframe_value_cells(&value, &tags).unwrap();
-    assert_eq!(cells, vec![&b"ab"[..], &b"ppppp"[..]]);
+    assert_eq!(value, b"\x02\0\0\0ab\x05\0\0\0ppppp");
 }
 
 /// An object whose length differs from the size its reference records is an
