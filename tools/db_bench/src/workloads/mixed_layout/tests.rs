@@ -15,7 +15,7 @@
 
 use super::fixtures::{self, Fixture};
 use crate::config::{BenchConfig, Compression};
-use crate::reporter::Direction;
+use crate::reporter::Suite;
 use lsm_tree::{AbstractTree, SeqNo};
 use std::sync::atomic::AtomicU64;
 
@@ -419,18 +419,18 @@ fn columnar_scans_verify_every_row_and_report_their_first_batch() -> lsm_tree::R
     Ok(())
 }
 
-fn published(readings: &super::Readings) -> Vec<(String, f64, String, Direction)> {
+fn published(readings: &super::Readings) -> Vec<(String, f64, String, Suite)> {
     let mut reporter = crate::reporter::Reporter::new();
     readings.publish("s", &mut reporter);
     reporter
         .published()
         .iter()
-        .map(|s| (s.name.clone(), s.value, s.unit.clone(), s.direction))
+        .map(|s| (s.name.clone(), s.value, s.unit.clone(), s.suite))
         .collect()
 }
 
 #[test]
-fn published_series_are_bytes_per_emitted_row_and_smaller_is_better() {
+fn published_series_are_bytes_per_emitted_row_and_costs() {
     // Every counter is divided by the rows emitted, the one denominator the
     // three share, and each is a cost. A read served from cache decodes
     // nothing: its figures are zero, the best value, with no stand-in divisor.
@@ -441,11 +441,42 @@ fn published_series_are_bytes_per_emitted_row_and_smaller_is_better() {
         ("s bytes copied per row", 0.0),
     ];
     assert_eq!(got.len(), want.len());
-    for ((name, value, unit, direction), (want_name, want_value)) in got.iter().zip(want) {
+    for ((name, value, unit, suite), (want_name, want_value)) in got.iter().zip(want) {
         assert_eq!((name.as_str(), *value), (want_name, want_value));
         assert_eq!(unit, "B/row");
-        assert_eq!(*direction, Direction::SmallerIsBetter);
+        assert_eq!(*suite, Suite::Costs);
     }
+}
+
+#[test]
+fn published_scan_time_goes_to_the_host_timings_and_bytes_to_the_costs() {
+    // The cost suite is one series across every host, because the engine
+    // counts its bytes the same everywhere. The time to the first batch is
+    // timed on the host that ran it: in the cost suite it would be compared
+    // against another host's time and alert on whichever ran last.
+    let mut scanned = readings(4, 400, 400, 0);
+    scanned.scan = Some(super::ScanFigures {
+        // A whole second: 1e6 us exactly, so the comparison below is exact.
+        first_batch: Some((std::time::Duration::from_secs(1), 100)),
+        retained: 64,
+    });
+    let suites: Vec<(String, f64, Suite)> = published(&scanned)
+        .into_iter()
+        .map(|(name, value, _, suite)| (name, value, suite))
+        .filter(|(name, ..)| !name.contains(" per row"))
+        .collect();
+    assert_eq!(
+        suites,
+        [
+            ("s retained payload".to_owned(), 64.0, Suite::Costs),
+            ("s time to first batch".to_owned(), 1e6, Suite::Timings),
+            (
+                "s bytes read to first batch".to_owned(),
+                100.0,
+                Suite::Costs
+            ),
+        ]
+    );
 }
 
 #[test]
