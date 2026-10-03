@@ -86,18 +86,23 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
         clustered > 0 && spread > 0,
         "the sparse predicates keep rows"
     );
+    // At this size the clustered run is the first hundred keys, about 3%.
     assert!(
-        near_full > clustered * 50,
+        near_full > clustered * 10,
         "the near-full predicate keeps ~90%"
     );
     assert!(
-        clustered_bytes * 20 < near_full_bytes,
+        clustered_bytes * 10 < near_full_bytes,
         "materialised {clustered_bytes} B for {clustered} rows and {near_full_bytes} B for {near_full}"
     );
     let wide = build(fixtures::cells_wide)?;
     assert_eq!(super::cells_projected(&wide)?, N);
     let scattered = build(fixtures::cells_scattered)?;
-    assert!(super::cells_blobs_filtered(&scattered)? > 0);
+    let kept = super::cells_blobs_filtered(&scattered)?;
+    assert!(kept > 0);
+    // Every repetition under the compacting thread returns the same rows.
+    let pass = super::cells_scan_under_compaction(&scattered)?;
+    assert_eq!(pass.rows, kept * pass.latencies.len() as u64);
     Ok(())
 }
 

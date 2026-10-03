@@ -79,6 +79,17 @@ struct ScanPass {
     retained: u64,
 }
 
+/// A pass repeated while something else runs against the tree, reporting
+/// each repetition's latency besides its rows.
+type LatencyFn = fn(&Fixture) -> lsm_tree::Result<LatencyPass>;
+
+/// What a repeated pass measured: the rows of all its repetitions and how
+/// long each took.
+struct LatencyPass {
+    rows: u64,
+    latencies: Vec<Duration>,
+}
+
 /// Whether a scenario's native path exists in this build.
 enum Support {
     /// Runs, through this read pass, and its figures mean what the scenario
@@ -87,6 +98,9 @@ enum Support {
     /// Runs, through this batch scan, which also reports its first batch and
     /// what it held.
     Scan(ScanFn),
+    /// Runs, through this repeated pass, which also reports the P50 and P99
+    /// of its repetitions.
+    Latency(LatencyFn),
     /// The capability it measures has not landed. Carries the reason, which
     /// names the missing piece rather than saying "skipped". There is no read
     /// pass to hold, which is the point of pairing the two in one enum: a
@@ -687,6 +701,73 @@ fn cells_blobs_filtered(fixture: &Fixture) -> lsm_tree::Result<u64> {
     )
 }
 
+/// The sparse projected scan of the scattered cell rows, repeated while a
+/// second thread rewrites other rows, flushes and compacts, so blob files are
+/// relocated and dropped under the scans: each repetition is verified
+/// against the write history and timed.
+///
+/// The rows the other thread writes hold a sparse field the predicate drops,
+/// so the write history of the scanned rows stays what the fixture recorded.
+fn cells_scan_under_compaction(fixture: &Fixture) -> lsm_tree::Result<LatencyPass> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Repetitions of the scan.
+    const SCANS: usize = 40;
+    let stop = Arc::new(AtomicBool::new(false));
+    let tree = fixture.tree.clone();
+    let churning = Arc::clone(&stop);
+    let churn = std::thread::spawn(move || -> lsm_tree::Result<u64> {
+        let AnyTree::Blob(blob) = &tree else {
+            return Ok(0);
+        };
+        let mut seqno = tree.get_highest_seqno().map_or(0, |s| s + 1);
+        let mut rounds = 0;
+        // A row the predicate drops: its sparse field is never zero.
+        let group = 1u64.to_be_bytes();
+        let payload = vec![b'c'; 8_192];
+        while !churning.load(Ordering::Relaxed) {
+            for j in 0..64u64 {
+                let fields = [
+                    lsm_tree::blob_tree::field_row::Field {
+                        column: fixtures::CELL_GROUP,
+                        tag: fixtures::u64_be(),
+                        cell: lsm_tree::blob_tree::field_row::Cell::Value(&group),
+                    },
+                    lsm_tree::blob_tree::field_row::Field::bytes(fixtures::CELL_PAYLOAD, &payload),
+                ];
+                blob.insert_cells(format!("zz{j:04}"), &fields, seqno)?;
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+            tree.major_compact(64 * 1_024 * 1_024, SeqNo::MAX)?;
+            rounds += 1;
+        }
+        Ok(rounds)
+    });
+
+    let mut latencies = Vec::with_capacity(SCANS);
+    let mut rows = 0;
+    let scanned = (|| -> lsm_tree::Result<()> {
+        for _ in 0..SCANS {
+            let start = Instant::now();
+            rows += cells_blobs_filtered(fixture)?;
+            latencies.push(start.elapsed());
+        }
+        Ok(())
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let rounds = churn
+        .join()
+        .map_err(|_| lsm_tree::Error::FeatureUnsupported("the compacting thread panicked"))??;
+    scanned?;
+    eprintln!(
+        "  {:<34} {rounds} rewrite and compaction rounds ran under the scans",
+        ""
+    );
+    Ok(LatencyPass { rows, latencies })
+}
+
 /// Every visible row, resolved in key order.
 ///
 /// The blob scenarios read through this rather than through point reads: a
@@ -872,7 +953,35 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             fixture: fixtures::cells_inline,
             support: Support::Native(cells_near_full),
         },
+        Scenario {
+            name: "cells-scan-under-compaction",
+            fixture: fixtures::cells_scattered,
+            support: Support::Latency(cells_scan_under_compaction),
+        },
     ]
+}
+
+/// The latency at percentile `p` of `latencies`, in microseconds.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a percentile of a few dozen durations, far below f64's exact range"
+)]
+fn percentile_us(latencies: &[Duration], p: f64) -> f64 {
+    let mut sorted: Vec<Duration> = latencies.to_vec();
+    sorted.sort_unstable();
+    let Some(last) = sorted.len().checked_sub(1) else {
+        return 0.0;
+    };
+    // Nearest rank, the definition a short series is read by.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a rank within the series, between 0 and its length"
+    )]
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted
+        .get(rank.saturating_sub(1).min(last))
+        .map_or(0.0, |d| d.as_secs_f64() * 1e6)
 }
 
 /// Builds one scenario's fixture beneath `dir` and measures `read` over it,
@@ -961,6 +1070,34 @@ impl Workload for MixedLayout {
                     reporter.record_duration(t.elapsed());
                     readings.report(name);
                     readings.publish(name, reporter);
+                }
+                Support::Latency(pass) => {
+                    let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
+                    let t = Instant::now();
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let mut latencies = Vec::new();
+                    let readings = Readings::measure(&fixture.tree, keys, || {
+                        let measured = pass(&fixture)?;
+                        latencies = measured.latencies;
+                        Ok(measured.rows)
+                    })?;
+                    reporter.record_duration(t.elapsed());
+                    readings.report(name);
+                    readings.publish(name, reporter);
+                    let (p50, p99) = (
+                        percentile_us(&latencies, 50.0),
+                        percentile_us(&latencies, 99.0),
+                    );
+                    eprintln!("  {:<34} scan P50={p50:.1}us P99={p99:.1}us", "");
+                    for (figure, value) in [("scan P50", p50), ("scan P99", p99)] {
+                        reporter.publish_series(
+                            format!("{name} {figure}"),
+                            value,
+                            "us",
+                            format!("keys: {keys} | scans: {}", latencies.len()),
+                            Direction::SmallerIsBetter,
+                        );
+                    }
                 }
                 Support::Missing(reason) => {
                     // The fixture is NOT built here. It exists, and the tests

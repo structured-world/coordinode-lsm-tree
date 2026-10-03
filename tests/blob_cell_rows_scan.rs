@@ -230,6 +230,52 @@ fn the_predicate_judges_the_newest_version_and_gates_the_body() -> lsm_tree::Res
     Ok(())
 }
 
+/// The same with the newer version in a columnar table of its own, zone maps
+/// on: that table's price zones are disjoint from the predicate, yet its keys
+/// and seqnos are read, since they shadow the older version that matches.
+#[test]
+fn a_newer_segment_disjoint_from_the_predicate_still_shadows() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open(folder.path(), true)?;
+    tree.index.update_runtime_config(|rc| rc.zone_map = true)?;
+    // The old version: price 10, matches.
+    insert(&tree, "item", b"s", 10, b"old", 0);
+    insert(&tree, "other", b"s", 15, b"kept", 1);
+    tree.flush_active_memtable(0)?;
+    // The new version: price 100, in a table whose prices are all 100.
+    insert(&tree, "item", b"s", 100, b"new", 2);
+    tree.flush_active_memtable(0)?;
+
+    let below_20 = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(19u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let got = rows(any.columnar_scan(projection, Some(&below_20), SeqNo::MAX, ..)?)?;
+    assert_eq!(
+        got,
+        vec![(
+            b"other".to_vec(),
+            vec![Some(15u32.to_le_bytes().to_vec()), Some(b"kept".to_vec())]
+        )],
+        "the item's newest version costs 100, so no version of it is returned"
+    );
+    // What a read returns agrees.
+    assert_eq!(
+        tree.get_cells("item", SeqNo::MAX)?
+            .expect("present")
+            .resolve(PRICE)?
+            .as_deref(),
+        Some(&100u32.to_le_bytes()[..])
+    );
+    Ok(())
+}
+
 /// Reads the fields of a plain value: a status byte string and a price.
 struct PlainProjector;
 

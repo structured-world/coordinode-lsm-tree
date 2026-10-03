@@ -181,6 +181,7 @@ measured on.
 | `cells-scan-sparse-clustered` | Rows written as cells with a 64-byte payload kept in its column, a ~1% predicate keeping runs of neighbouring keys: the payload is read only from the few pages holding them (`payload_bytes_incidental` stays small). |
 | `cells-scan-sparse-one-per-page` | The same rows, a predicate keeping about one row in each row page: every payload page holds a kept row, so a late read spares no I/O and must cost no more than an eager one; what it spares is materialising the rows dropped (`bytes_materialized`). |
 | `cells-scan-near-full` | The same rows, a ~90% predicate: the scan reads the payload with the rest once its choices are dense. |
+| `cells-scan-under-compaction` | The `blobs-filtered-before-fetch` scan repeated forty times while a second thread writes other rows, flushes and compacts, so blob files are relocated and dropped under the scans. Each repetition is verified; besides the counters it publishes the scans' `scan P50` and `scan P99` in microseconds. |
 
 The selective scans hand the predicate to the engine rather than filtering
 returned rows: a harness-side filter would make every selectivity cost the same

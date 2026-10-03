@@ -933,3 +933,104 @@ fn typed_fields_read_with_their_columnar_framing() -> lsm_tree::Result<()> {
     assert_eq!(read.resolve(STATUS)?.as_deref(), Some(&id[..]));
     Ok(())
 }
+
+/// Appends each operand to the base.
+struct Concat;
+
+impl lsm_tree::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<lsm_tree::UserValue> {
+        let mut out = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            out.extend_from_slice(operand);
+        }
+        Ok(out.into())
+    }
+}
+
+/// A merge operator over a row written as cells receives the row's logical
+/// value, its body read from its blob file, exactly as a plain read returns
+/// it: in the memtable, flushed, and after a compaction folds the operands.
+#[test]
+fn a_merge_operator_folds_onto_a_cell_rows_logical_value() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(THRESHOLD),
+    ))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    let body = vec![b'b'; 1_000];
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+    let mut expected = framed(&[b"draft", &body]);
+    expected.extend_from_slice(b"+one");
+    tree.merge("doc", "+one", 1);
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
+    tree.merge("doc", "+two", 2);
+    expected.extend_from_slice(b"+two");
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
+    Ok(())
+}
+
+/// A checkpoint of a tree whose rows borrow objects holds every object they
+/// reference: the checkpoint opens on its own, reads the rows, hands out
+/// their references, and a metadata-only update in it writes no blob bytes.
+#[test]
+fn a_checkpoint_holds_the_objects_its_rows_reference() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let checkpoint = get_tmp_folder();
+    let target = checkpoint.path().join("copy");
+    let body = vec![b'b'; 4_096];
+    {
+        let tree = open(folder.path(), KvSeparationOptions::default())?;
+        tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+        tree.flush_active_memtable(0)?;
+        let row = row_of(&tree, "doc")?;
+        tree.insert_cells(
+            "doc",
+            &[Field::bytes(STATUS, b"final"), reference(&row, BODY)?],
+            1,
+        )?;
+        drop(row);
+        tree.create_checkpoint(&target)?;
+        // The original moves on: its owner version collected, the file kept
+        // for the borrower.
+        tree.major_compact(64_000_000, SeqNo::MAX)?;
+    }
+    let copy = open(&target, KvSeparationOptions::default())?;
+    assert_eq!(
+        copy.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    let blob_bytes = copy.current_version().blob_files.on_disk_size();
+    let row = row_of(&copy, "doc")?;
+    copy.insert_cells(
+        "doc",
+        &[Field::bytes(STATUS, b"done"), reference(&row, BODY)?],
+        2,
+    )?;
+    drop(row);
+    copy.flush_active_memtable(0)?;
+    assert_eq!(copy.current_version().blob_files.on_disk_size(), blob_bytes);
+    assert_eq!(
+        copy.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"done", &body])[..])
+    );
+    Ok(())
+}
