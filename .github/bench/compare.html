@@ -32,14 +32,20 @@
 <main>
   <h1>lsm-tree vs RocksDB</h1>
   <p class="lead">
-    Every engine runs the same workload in one process on one host, so a chart compares engines, not hosts.
-    Bars are the mean time per operation (<strong>lower is faster</strong>) at each key count; the tooltip shows the
-    95% confidence interval. Both engines get the same block size, bloom filter, block cache and values, no WAL,
-    and every lsm-tree protection RocksDB has no equivalent for is off.
+    Every engine runs the same workload in one process on one host, in the same rounds: one sample each per round,
+    taking turns at going first, so load on the host slows every engine of a round alike and divides out of their ratio.
+    <strong>Relative to RocksDB</strong> shows each engine's time over RocksDB's in the same round, the median over all
+    rounds (<strong>below 1 is faster than RocksDB</strong>); <strong>time per operation</strong> shows each engine's
+    median. The tooltip gives the 95% confidence interval of either. Both engines get the same block size, bloom filter,
+    block cache and values, no WAL, and every lsm-tree protection RocksDB has no equivalent for is off.
     &middot; <a href="../bench/">single-engine trend &rarr;</a>
   </p>
   <p class="meta" id="meta"></p>
   <div class="controls">
+    <label>Show <select id="view">
+      <option value="ratio">Relative to RocksDB</option>
+      <option value="time">Time per operation</option>
+    </select></label>
     <label>Codec <select id="codec">
       <option value="all">All</option>
       <option value="none">Uncompressed</option>
@@ -71,11 +77,12 @@
   };
   const KIND_TITLE = { write: "Writes", read: "Reads", compaction: "Compaction" };
 
-  const fmt = function (ns) {
+  const fmtTime = function (ns) {
     if (ns >= 1e6) { return (ns / 1e6).toFixed(2) + " ms"; }
     if (ns >= 1e3) { return (ns / 1e3).toFixed(2) + " µs"; }
     return ns.toFixed(0) + " ns";
   };
+  const fmtRatio = function (x) { return "×" + (x >= 10 ? x.toFixed(0) : x >= 1 ? x.toFixed(2) : x.toPrecision(2)); };
 
   Promise.all([
     fetch("summary.json").then(function (r) { return r.ok ? r.json() : null; }),
@@ -83,10 +90,11 @@
   ]).then(function (loaded) {
     const summary = loaded[0];
     const meta = loaded[1];
-    if (!summary || !summary.results.length) {
+    if (!summary || !summary.results || !summary.results.length || !summary.results[0].ns_per_op) {
       document.getElementById("empty").style.display = "block";
       return;
     }
+    const baseline = summary.baseline;
     if (meta) {
       const m = document.getElementById("meta");
       m.textContent = "Measured on the " + meta.line + ".x line, " + meta.ref + " at ";
@@ -114,12 +122,14 @@
 
     const charts = [];
     const container = document.getElementById("charts");
+    const viewSel = document.getElementById("view");
     const codecSel = document.getElementById("codec");
     const kindSel = document.getElementById("kind");
 
     const draw = function () {
       charts.splice(0).forEach(function (c) { c.destroy(); });
       container.innerHTML = "";
+      const ratio = viewSel.value === "ratio";
       const grids = {};
       ordered.forEach(function (group) {
         const kind = KIND[base(group)] || "other";
@@ -140,20 +150,20 @@
           Object.keys(engines[e]).forEach(function (n) { if (sizes.indexOf(Number(n)) < 0) { sizes.push(Number(n)); } });
         });
         sizes.sort(function (a, b) { return a - b; });
-        const datasets = Object.keys(engines).map(function (engine) {
+        // The baseline is the ratio's denominator, so it has no bar of its own there.
+        const shown = Object.keys(engines).filter(function (e) { return !ratio || e !== baseline; });
+        const datasets = shown.map(function (engine) {
           const color = COLORS[engine] || "#8b949e";
+          const pick = function (r) { return ratio ? r.vs_baseline : r.ns_per_op; };
           return {
             label: engine,
             backgroundColor: color,
             borderColor: color,
             data: sizes.map(function (n) {
               const r = engines[engine][n];
-              return r ? r.mean_ns / r.n : null;
+              return r && pick(r) ? pick(r).median : null;
             }),
-            ci: sizes.map(function (n) {
-              const r = engines[engine][n];
-              return r ? [r.lower_ns / r.n, r.upper_ns / r.n] : null;
-            }),
+            results: sizes.map(function (n) { return engines[engine][n] || null; }),
           };
         });
 
@@ -178,15 +188,31 @@
             responsive: true, maintainAspectRatio: false, animation: false,
             scales: {
               x: { ticks: { color: "#8b949e" }, grid: { display: false } },
-              y: { beginAtZero: true, ticks: { color: "#8b949e", callback: function (v) { return fmt(v); } }, grid: { color: "#21262d" },
-                title: { display: true, text: "time per operation", color: "#8b949e" } },
+              y: ratio ? {
+                type: "logarithmic",
+                ticks: { color: "#8b949e", callback: function (v) { return fmtRatio(v); } },
+                // Parity with RocksDB stands out from the other grid lines.
+                grid: { color: function (ctx) { return ctx.tick && ctx.tick.value === 1 ? "#8b949e" : "#21262d"; } },
+                title: { display: true, text: "time relative to RocksDB (below 1 is faster)", color: "#8b949e" },
+              } : {
+                beginAtZero: true,
+                ticks: { color: "#8b949e", callback: function (v) { return fmtTime(v); } },
+                grid: { color: "#21262d" },
+                title: { display: true, text: "time per operation", color: "#8b949e" },
+              },
             },
             plugins: {
               legend: { labels: { color: "#c9d1d9", boxWidth: 12 } },
               tooltip: { callbacks: {
                 label: function (item) {
-                  const ci = item.dataset.ci[item.dataIndex];
-                  return item.dataset.label + ": " + fmt(item.raw) + (ci ? "  (" + fmt(ci[0]) + " – " + fmt(ci[1]) + ")" : "");
+                  const r = item.dataset.results[item.dataIndex];
+                  if (!r) { return item.dataset.label; }
+                  const t = r.ns_per_op;
+                  const time = fmtTime(t.median) + " (" + fmtTime(t.lower) + " – " + fmtTime(t.upper) + ")";
+                  if (!r.vs_baseline) { return item.dataset.label + ": " + time + ", " + r.rounds + " rounds"; }
+                  const v = r.vs_baseline;
+                  return item.dataset.label + ": " + fmtRatio(v.median) + " (" + fmtRatio(v.lower) + " – " + fmtRatio(v.upper) + ")"
+                    + " of " + baseline + ", " + time + ", " + r.rounds + " rounds";
                 },
               } },
             },
@@ -194,6 +220,7 @@
         }));
       });
     };
+    viewSel.addEventListener("change", draw);
     codecSel.addEventListener("change", draw);
     kindSel.addEventListener("change", draw);
     draw();
