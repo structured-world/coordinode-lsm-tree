@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790784510115,
+  "lastUpdate": 1791006620452,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -29030,6 +29030,90 @@ window.BENCHMARK_DATA = {
             "value": 340766.73773419455,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 16.5us | P99.9: 96.8us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1ae364e977393df00822f089b83c1f1728aa223b",
+          "message": "ci(bench): fix the version-line step on the bench runner (#808)\n\n## Summary\n- The benchmark workflow gets past the version-line step on the\nself-hosted bench runner again.\n\n## Changes\n- `release-plz` is installed when the binary that runs is missing or\nanother version, with `--force` over a surviving install record, and the\nstep fails with a clear error if it still does not run.\n- The version is read after the last `#` or `@` of `cargo pkgid`, which\nspells the id `<url>#<version>` when the package is named as its\ndirectory.\n\n## Testing\n- actionlint passes on the workflow. The full check is the benchmark run\non the bench runner after the merge.\n\nCloses #807",
+          "timestamp": "2026-10-03T05:42:22Z",
+          "tree_id": "40f599b18e8f6baa84530abfc9ca913f266f9dd9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1ae364e977393df00822f089b83c1f1728aa223b"
+        },
+        "date": 1791006618914,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "mixed",
+            "value": 31049.013416093356,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 9.5us | P99.9: 15.2us\nthreads: 1 | elapsed: 17.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2837997.120426222,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 710617.1582819207,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 486538.7061598309,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.4us | P99.9: 27.9us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2296921.741280753,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 254147.7190488103,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.5us | P99.9: 22.9us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 143253.9887404256,
+            "unit": "ops/sec",
+            "extra": "P50: 6.2us | P99: 13.8us | P99.9: 36.1us\nthreads: 1 | elapsed: 1.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 762138.1561903302,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.4us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 758311.0234122728,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 359681.1579039992,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.2us | P99.9: 84.6us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
