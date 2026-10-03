@@ -260,7 +260,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-
 
@@ -347,7 +347,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: ${{ steps.compare-cache.outputs.cache-primary-key }}
 
       # The db_bench pass: under a minute on an idle host, ~3 min on a loaded
@@ -359,23 +359,20 @@ jobs:
 
       # Head-to-head RocksDB comparison. Distinct from the db_bench
       # trend above (single-engine, value-over-commits): this runs the
-      # standalone `tools/compare-rocksdb` criterion harness where every
-      # scenario runs BOTH engines in the same process, so each criterion
-      # group is an ours-vs-rocksdb overlay chart. Because the comparison
-      # is a ratio measured on one host in one run, it stays meaningful
-      # even if this runner's CPU changes between runs.
+      # standalone `tools/compare-rocksdb` harness, where every scenario runs
+      # every engine in the same process and the same rounds, one sample each
+      # per round, so a burst of other load on a shared host slows every
+      # engine of the rounds it overlaps and divides out of their ratio.
+      # Because the comparison is a ratio measured on one host in one run, it
+      # stays meaningful even if this runner's CPU changes between runs.
       #
       # It runs straight after the db_bench pass, before any step below
       # switches the checkout to gh-pages and back: that rewrites the
       # engine's sources, and cargo would then rebuild the harness the build
       # step already compiled.
       #
-      # Bounded criterion settings keep the harness fast: this is a
-      # ratio comparison (both engines in one process per scenario), so a
-      # short warm-up + measurement window per scenario still yields a
-      # stable median. An arm whose single iteration outlasts the window runs
-      # at Criterion's floor of ten samples regardless, so what bounds the
-      # matrix is its sizes.
+      # The harness's own defaults set the rounds (a per-group budget, ten at
+      # least), so the published run and a local `cargo bench` measure alike.
       - name: Run compare-rocksdb head-to-head benches
         id: compare
         # Runs whatever the db_bench pass did, so a host that cannot build
@@ -392,20 +389,16 @@ jobs:
         env:
           LSM_BENCH_PRESET: rocksdb-parity
           LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
-        # A workspace left by an earlier run on this runner may still hold
-        # Criterion's results under target/criterion, and the summary the
-        # harness writes collects every result there, so they go before the
-        # run. `--noplot`: the published page draws its charts from that
-        # summary, so Criterion spends no time rendering any.
+        # A summary an earlier run on this runner left behind goes first, so a
+        # run that fails before writing its own cannot publish the old one.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
             echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
             exit 1
           fi
           cd tools/compare-rocksdb
-          rm -rf target/criterion
-          cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5 --noplot
+          rm -rf target/head-to-head
+          cargo bench --bench compare
 
       # Issued after the benches, right before its first use: an installation
       # token lives one hour, so one issued at the start of the job would let
@@ -605,7 +598,7 @@ jobs:
           MEASURED_RUNNER: ${{ runner.name }}
         run: |
           set -euo pipefail
-          summary="tools/compare-rocksdb/target/criterion/summary.json"
+          summary="tools/compare-rocksdb/target/head-to-head/summary.json"
           if [ ! -f "$summary" ]; then
             echo "::error::the harness wrote no summary at $summary"
             exit 1
