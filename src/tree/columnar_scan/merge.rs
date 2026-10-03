@@ -1074,8 +1074,7 @@ impl MergeStream {
         // Otherwise the rows are judged here whether or not their payload is
         // read late: what survives is also what the density is counted on,
         // and a row dropped here is not gathered either.
-        // A blob tree's stored value type is not the type its rows return.
-        if scan.resolver.is_some() || scan.judges_returned_type(pred) {
+        if scan.resolver.is_some() {
             return (pending, false);
         }
         // A row is judged here only on a cell its segment stores for the

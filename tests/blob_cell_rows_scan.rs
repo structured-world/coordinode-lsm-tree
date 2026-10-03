@@ -369,12 +369,15 @@ fn a_key_only_scan_reads_no_value() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A predicate on the value type sees what the scan returns: a value kept in
-/// a blob file and a row written as cells read as values, so selecting values
-/// keeps them and selecting the stored forms keeps none.
+/// The value type a blob tree's rows come back with is a value's, whether the
+/// row is kept in a blob file or written as cells; a predicate on that opaque
+/// fixed-width column is not judged by the scan (it reports it unsupported
+/// and keeps every row), so a stored type never decides a row, and the caller
+/// filters on the type returned.
 #[test]
-fn a_value_type_predicate_judges_the_type_returned() -> lsm_tree::Result<()> {
+fn a_value_type_predicate_leaves_the_returned_type_to_the_caller() -> lsm_tree::Result<()> {
     use lsm_tree::table::columnar::COL_VALUE_TYPE;
+    use lsm_tree::table::columnar_predicate::PredicateSupport;
 
     for columnar in [false, true] {
         let folder = get_tmp_folder();
@@ -384,34 +387,34 @@ fn a_value_type_predicate_judges_the_type_returned() -> lsm_tree::Result<()> {
         tree.insert("c", b"small".to_vec(), 2);
         tree.flush_active_memtable(0)?;
 
-        let of_type = |value_type: lsm_tree::ValueType| -> lsm_tree::Result<Vec<Vec<u8>>> {
-            let tag = vec![u8::from(value_type)];
+        for stored in [
+            lsm_tree::ValueType::Indirection,
+            lsm_tree::ValueType::CellRow,
+        ] {
+            let tag = vec![u8::from(stored)];
             let predicate = ColumnRangePredicate {
                 column_id: COL_VALUE_TYPE,
                 lower: Some(tag.clone()),
                 upper: Some(tag),
                 apply: PredicateApply::Filter,
             };
-            let keys = Projection::new().column(COL_USER_KEY);
-            Ok(
-                rows(any.columnar_scan(keys, Some(&predicate), SeqNo::MAX, ..)?)?
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect(),
-            )
-        };
-        assert_eq!(
-            of_type(lsm_tree::ValueType::Value)?,
-            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
-            "columnar={columnar}"
-        );
-        for stored in [
-            lsm_tree::ValueType::Indirection,
-            lsm_tree::ValueType::CellRow,
-        ] {
-            assert!(
-                of_type(stored)?.is_empty(),
-                "columnar={columnar}: {stored:?} is never a returned type"
+            let projection = Projection::new()
+                .column(COL_USER_KEY)
+                .column(COL_VALUE_TYPE);
+            let mut scan = any.columnar_scan(projection, Some(&predicate), SeqNo::MAX, ..)?;
+            let got = rows(scan.by_ref())?;
+            assert_eq!(
+                scan.predicate_support(),
+                Some(PredicateSupport::Unsupported),
+                "columnar={columnar}"
+            );
+            let value = vec![u8::from(lsm_tree::ValueType::Value)];
+            assert_eq!(
+                got,
+                [b"a", b"b", b"c"]
+                    .map(|key| (key.to_vec(), vec![Some(value.clone())]))
+                    .to_vec(),
+                "columnar={columnar}: every row is kept and reads as a value under {stored:?}"
             );
         }
     }
