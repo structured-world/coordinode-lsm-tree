@@ -193,7 +193,7 @@ fn a_reference_of_another_type_than_its_column_is_kept_whole() {
 }
 
 /// A group whose whole-value or references column is not a byte column, or
-/// that holds a column no field and no reserved id names, is not one a writer
+/// that lists a system column among its value columns, is not one a writer
 /// produced, and is refused.
 #[test]
 fn value_columns_a_writer_never_produces_are_refused() {
@@ -207,7 +207,7 @@ fn value_columns_a_writer_never_produces_are_refused() {
     for column in [
         (WHOLE_VALUE_COLUMN, u32_le()),
         (CELL_REFS_COLUMN, TypeTag::Fixed(8)),
-        (crate::table::columnar::COL_VALUE, TypeTag::Bytes),
+        (crate::table::columnar::COL_SEQNO, TypeTag::Fixed(8)),
     ] {
         assert!(
             matches!(check_value_columns(&[column]), Err(Error::InvalidHeader(_))),
