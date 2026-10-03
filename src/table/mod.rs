@@ -253,12 +253,8 @@ pub(crate) struct TableSinks<'a> {
     /// How the tree's columnar reads fetch their pages.
     pub read_budget: crate::config::ReadBudget,
     /// Moves an obsolete table's `unlink` off the foreground path.
-    ///
-    /// `None` for outputs that can be ROLLED BACK: the tight-space slice loop
-    /// rolls back exactly when free space is scarce, and there the space has
-    /// to come back now rather than when a background pass gets to it.
     #[cfg(feature = "std")]
-    pub background_deleter: Option<&'a Arc<crate::BackgroundDeleter>>,
+    pub background_deleter: &'a Arc<crate::BackgroundDeleter>,
     /// Whether the tree counts the table's filter probes: it does when it
     /// allocates filter memory by probe load.
     pub track_filter_probes: bool,
@@ -9857,9 +9853,7 @@ impl Table {
         // A second bind keeps the first budget, like the other sinks.
         let _ = self.0.read_budget.set(Box::new(sinks.read_budget));
         #[cfg(feature = "std")]
-        if let Some(deleter) = sinks.background_deleter {
-            self.install_background_deleter(Arc::clone(deleter));
-        }
+        self.install_background_deleter(Arc::clone(sinks.background_deleter));
         // A second bind keeps the counts the first one started.
         if sinks.track_filter_probes {
             self.0.probe_stats.get_or_init(Box::default);

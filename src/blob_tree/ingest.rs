@@ -283,7 +283,7 @@ impl<'a> BlobIngestion<'a> {
                 heal_hints: &index.heal_hints,
                 read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
-                background_deleter: Some(&index.background_deleter),
+                background_deleter: &index.background_deleter,
                 track_filter_probes: index.config.filter_advisor.is_some(),
             });
         }
@@ -298,7 +298,7 @@ impl<'a> BlobIngestion<'a> {
                 heal_hints: &index.heal_hints,
                 read_budget: index.config.columnar_read_budget,
                 #[cfg(feature = "std")]
-                background_deleter: Some(&index.background_deleter),
+                background_deleter: &index.background_deleter,
                 // A blob file has no filter.
                 track_filter_probes: false,
             });
