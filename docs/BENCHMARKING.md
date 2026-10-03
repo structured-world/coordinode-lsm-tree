@@ -103,7 +103,9 @@ engine:
 
 An arm runs as many iterations per sample as fill 20 ms, and a group runs as
 many rounds as fit a 4-second budget, between ten and forty (ten is the fewest
-for which a 95% interval of the median exists at ranks 2 and 9). Two runs of
+for which a 95% interval of the median exists at ranks 2 and 9), rounded to a
+multiple of the group's engine count so every engine takes every position
+equally often. Two runs of
 one commit on one quiet host then agreed on the ratio to within 2% on the
 median arm and 7% on nine arms in ten; the interval covers the noise within a
 run, so a ratio within a few percent of 1 is parity. `cargo bench --bench compare

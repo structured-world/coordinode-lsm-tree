@@ -85,6 +85,50 @@ fn run_sizes_rounds_by_budget_within_bounds() {
     assert_eq!(run("g", 1, "a", costly, &settings(10, 40))[0].rounds, 10);
 }
 
+/// Every arm takes every position equally often: the rounds are a multiple of
+/// the arm count. Eight arms at a floor of ten rounds would let two arms go
+/// first twice and the other six once, and any effect of position (caches,
+/// the cleanup of the engine before) would land on them unevenly; the floor
+/// rounds up to sixteen. A ceiling that is not a multiple rounds down when
+/// that stays at or above the floor: three arms under a ceiling of forty run
+/// thirty-nine rounds.
+#[test]
+fn run_rounds_are_a_multiple_of_the_arm_count() {
+    use std::cell::RefCell;
+    let first = RefCell::new(Vec::new());
+    let labels: [&'static str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let arms = labels
+        .iter()
+        .map(|&label| {
+            let first = &first;
+            Arm::new(label, move |iters| {
+                first.borrow_mut().push(label);
+                Duration::from_millis(200) * u32::try_from(iters).expect("iters fit u32")
+            })
+        })
+        .collect();
+    let results = run("g", 1, "a", arms, &settings(10, 40));
+    assert_eq!(results[0].rounds, 16);
+    // After one warm-up call per arm, every eighth call opens a round.
+    let calls = first.into_inner();
+    for label in labels {
+        let firsts = calls[8..]
+            .chunks(8)
+            .filter(|round| round[0] == label)
+            .count();
+        assert_eq!(firsts, 2, "{label} went first {firsts} times");
+    }
+
+    // A second's budget over 3 ms a round is 333 rounds, held at the ceiling
+    // of forty, which three arms cannot share evenly.
+    let cheap = (0..3)
+        .map(|_| Arm::new("x", fixed(Duration::from_micros(10))))
+        .collect();
+    let mut s = settings(10, 40);
+    s.budget = Duration::from_secs(1);
+    assert_eq!(run("g", 1, "x", cheap, &s)[0].rounds, 39);
+}
+
 /// The arms take turns at going first: over as many rounds as arms, each arm
 /// runs first exactly once, so no arm always measures right after another.
 #[test]
