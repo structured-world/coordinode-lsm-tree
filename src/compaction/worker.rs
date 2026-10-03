@@ -9,7 +9,6 @@ use crate::tree::inner::{CompactionGuard, VersionsReadGuard};
 use crate::{
     BlobFile, Config, HashSet, InternalValue, SeqNo, SequenceNumberCounter,
     SharedSequenceNumberGenerator, Table, TableId, UserKey,
-    blob_tree::FragmentationMap,
     compaction::{
         Choice,
         filter::{Context, FilterBlobOutput, StreamFilterAdapter, TransformCounters},
@@ -2134,7 +2133,15 @@ fn run_subcompaction(
         return Err(cancelled_compaction());
     }
 
-    let mut blob_frag_map = FragmentationMap::default();
+    // The blob accounting of the dropped versions, shared by the stream that
+    // reports them and the loop that settles a key's ownership before its
+    // kept rows are written (see `ownership`).
+    let ledger = core::cell::RefCell::new(super::ownership::OwnershipLedger::default());
+    let ledger_error = core::cell::RefCell::new(None);
+    let mut ledger_hook = super::ownership::LedgerHook {
+        ledger: &ledger,
+        error: &ledger_error,
+    };
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(version, &payload.table_ids, &opts.config);
@@ -2220,7 +2227,7 @@ fn run_subcompaction(
     // KV separation (no relocation on this path): track fragmentation from
     // dropped/GC'd entries so the merged install updates blob GC stats.
     if opts.config.kv_separation_opts.is_some() {
-        merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+        merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
     }
 
     // Versions that go in and do not come out: read after `produce` to tell a
@@ -2370,7 +2377,12 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        compactor.write(item)?;
+        ledger
+            .borrow_mut()
+            .admit(item, &mut |row| compactor.write(row))?;
+        if let Some(e) = ledger_error.borrow_mut().take() {
+            return Err(e);
+        }
 
         if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
             return Err(cancelled_compaction());
@@ -2386,6 +2398,12 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
+    let blob_frag_map = ledger
+        .into_inner()
+        .finish(&mut |row| compactor.write(row))?;
+    if let Some(e) = ledger_error.into_inner() {
+        return Err(e);
+    }
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
@@ -3254,7 +3272,15 @@ fn merge_tables(
         }
     }
 
-    let mut blob_frag_map = FragmentationMap::default();
+    // The blob accounting of the dropped versions, shared by the stream that
+    // reports them and the loop that settles a key's ownership before its
+    // kept rows are written (see `ownership`).
+    let ledger = core::cell::RefCell::new(super::ownership::OwnershipLedger::default());
+    let ledger_error = core::cell::RefCell::new(None);
+    let mut ledger_hook = super::ownership::LedgerHook {
+        ledger: &ledger,
+        error: &ledger_error,
+    };
 
     // Declared before the stream that borrows it, so it outlives it.
     let completeness = input_completeness_for(
@@ -3388,7 +3414,7 @@ fn merge_tables(
 
     let mut compactor = match &opts.config.kv_separation_opts {
         Some(blob_opts) => {
-            merge_iter = merge_iter.with_drop_callback(&mut blob_frag_map);
+            merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
 
             if blob_files_to_rewrite.is_empty() {
                 log::debug!("No blob relocation needed");
@@ -3527,7 +3553,12 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            compactor.write(item)?;
+            ledger
+                .borrow_mut()
+                .admit(item, &mut |row| compactor.write(row))?;
+            if let Some(e) = ledger_error.borrow_mut().take() {
+                return Err(e);
+            }
 
             // Test-only failpoint: raise the stop signal after the first written
             // item, so the interrupted-merge path below is reachable without
@@ -3554,6 +3585,14 @@ fn merge_tables(
 
         Ok(())
     })?;
+
+    // The rows the ledger still holds go out before the outputs are finished.
+    let blob_frag_map = ledger
+        .into_inner()
+        .finish(&mut |row| compactor.write(row))?;
+    if let Some(e) = ledger_error.into_inner() {
+        return Err(e);
+    }
 
     if let Some(filter) = compaction_filter {
         filter.finish();

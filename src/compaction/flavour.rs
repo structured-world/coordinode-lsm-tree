@@ -835,8 +835,12 @@ impl RelocatingCompaction {
     /// drains them later like any frame no pointer claimed, after they are
     /// copied.
     ///
-    /// The first kept holder of a copy owns it and later holders borrow it, so
-    /// the copy has exactly one owner whichever holder owned the original.
+    /// Each reference keeps its owner bit: the rows that reach a relocation
+    /// already carry exactly one owner among the kept holders of an object
+    /// (the compaction moved ownership off a dropped owner before writing
+    /// them), and every holder is in the pass, since a file is relocated only
+    /// when every table that links it is an input. So the copy has the one
+    /// owner the original had.
     fn write_cell_row(&mut self, item: InternalValue) -> crate::Result<()> {
         use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
 
@@ -852,7 +856,7 @@ impl RelocatingCompaction {
         let mut cells = decode_row(&item.value)?;
         let mut rewritten = false;
         for cell in &mut cells {
-            let RowCell::Ref { indirection, owner } = cell else {
+            let RowCell::Ref { indirection, .. } = cell else {
                 continue;
             };
             if !self
@@ -864,13 +868,11 @@ impl RelocatingCompaction {
             rewritten = true;
             if let Some(copy) = self.cell_copies.get(&indirection.vhandle) {
                 *indirection = *copy;
-                *owner = false;
                 continue;
             }
             let copy = self.copy_frame(&item.key.user_key, item.key.seqno, indirection)?;
             self.cell_copies.insert(indirection.vhandle, copy);
             *indirection = copy;
-            *owner = true;
         }
 
         let row = if rewritten {

@@ -21,16 +21,21 @@
 //! another key is refused.
 //!
 //! **Ownership.** Exactly one live reference to an object owns it, marked in
-//! the row. The cell a flush separates owns the object it writes; a reference
-//! written back by a caller never owns. A relocation that copies an object
-//! makes the first holder it keeps the owner of the copy, and no other.
+//! the row: the oldest holder. The cell a flush separates owns the object it
+//! writes, and a reference written back by a caller, being newer, never owns.
+//! A compaction meets a key's versions newest first, so it holds a key's kept
+//! rows until the key ends; when it drops the owner of an object a kept row
+//! also holds, ownership passes to the oldest such row, rewritten before it
+//! is written. A relocation keeps each reference's owner bit on the copy.
 //!
 //! **Charging.** An object's bytes are charged to its blob file once: when its
-//! owning reference leaves the tree (a compaction drops or transforms the
-//! version, a merge folds onto it, or its table is dropped whole). A borrowed
-//! reference leaving charges nothing. So the charged bytes of a file never
-//! exceed its size, though they can reach it while a borrowed reference is
-//! still live: the owner may go first.
+//! owning reference leaves the tree and no kept row takes it over (a
+//! compaction drops or transforms the version, a merge folds onto it, or its
+//! table is dropped whole). A borrowed reference leaving charges nothing. The
+//! owner being the oldest holder, no holder outside a compaction can still
+//! hold an object it charges, except where a whole table is dropped without
+//! the rows that borrow from it: the charged bytes then reach the file's size
+//! early, and the removal rule below keeps the file.
 //!
 //! **Removal.** A blob file is removed, or its consumed prefix punched, only
 //! when its charged bytes reach its size, or a relocation copied it, AND no

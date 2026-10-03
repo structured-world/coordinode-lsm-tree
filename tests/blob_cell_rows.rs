@@ -202,6 +202,10 @@ fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> 
     tree.flush_active_memtable(0)?;
     tree.insert("filler", "small", 1);
     tree.flush_active_memtable(0)?;
+    // The compaction that drops the old filler charges it; files are picked
+    // for relocation by what is charged before a compaction starts.
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 8_192, "the filler is garbage");
     Ok(())
 }
 

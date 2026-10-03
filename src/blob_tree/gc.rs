@@ -134,7 +134,7 @@ impl crate::coding::Decode for FragmentationMap {
 
 impl FragmentationMap {
     /// Charges the object `vptr` names as garbage in its blob file.
-    fn charge(&mut self, vptr: &BlobIndirection) {
+    pub(crate) fn charge(&mut self, vptr: &BlobIndirection) {
         let size = u64::from(vptr.size);
         let on_disk_size = u64::from(vptr.vhandle.on_disk_size);
 
