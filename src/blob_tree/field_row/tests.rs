@@ -149,6 +149,32 @@ fn a_malformed_row_is_refused() {
     assert!(decode_row(&padded).is_err(), "trailing bytes decoded");
 }
 
+/// A row of more fields than its `u16` count can name is refused rather than
+/// written with a count that wraps.
+#[test]
+fn a_row_of_more_than_u16_max_fields_is_refused() {
+    let fields: Vec<RowField<'_>> = (0..=usize::from(u16::MAX))
+        .map(|_| RowField::bytes(C, RowCell::Value(b"")))
+        .collect();
+    assert!(matches!(encode_row(&fields), Err(Error::InvalidHeader(_))));
+}
+
+/// A reference cell holds exactly one indirection: bytes after it are damage,
+/// refused rather than read past.
+#[test]
+fn a_reference_cell_with_trailing_bytes_is_refused() {
+    let row = encode_row(&[RowField::bytes(C, reference(indirection(1, 0, 5)))]).unwrap();
+    // Count, two one-byte bitmaps, one four-byte descriptor, then the cell's
+    // length and the indirection; grow the cell by one byte.
+    let len_at = 2 + 2 + DESCRIPTOR_LEN;
+    let len = u32::from_le_bytes(row[len_at..len_at + 4].try_into().unwrap());
+    let mut padded = row[..len_at].to_vec();
+    padded.extend_from_slice(&(len + 1).to_le_bytes());
+    padded.extend_from_slice(&row[len_at + 4..]);
+    padded.push(0);
+    assert!(matches!(decode_row(&padded), Err(Error::InvalidHeader(_))));
+}
+
 /// An owner bit on a value field names no object: the row is damaged, and is
 /// refused rather than read with the bit ignored.
 #[test]
@@ -331,6 +357,19 @@ fn separation_follows_the_column_threshold() {
     assert!(matches!(fields[0].cell, RowCell::Ref { owner: true, .. }));
     assert_eq!(fields[0].column, C);
     assert!(matches!(fields[1].cell, RowCell::Value(b"large-but-kept")));
+}
+
+/// Setting a column's threshold again replaces it, and a column never set
+/// follows the tree's threshold.
+#[test]
+fn a_column_threshold_set_again_replaces_the_first() {
+    let opts = crate::KvSeparationOptions::default()
+        .separation_threshold(100)
+        .cell_separation_threshold(C, 10)
+        .cell_separation_threshold(C, 20);
+    assert_eq!(opts.cell_separation_thresholds, [(C, 20)]);
+    assert_eq!(opts.cell_threshold(C), 20);
+    assert_eq!(opts.cell_threshold(C + 1), 100);
 }
 
 /// An object whose length differs from the size its reference records is an

@@ -10650,6 +10650,101 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
     Ok(())
 }
 
+/// The same rewrite over a cells table whose delete bitmap masks a row: the
+/// masked row stays gone, the live ones are remapped, and a row whose record
+/// is gone is dropped, all through the masked columnar arm.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::config::DeleteStrategy;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+        encode_row(&[
+            RowField::bytes(3, RowCell::Value(b"status")),
+            RowField::bytes(
+                4,
+                RowCell::Ref {
+                    indirection: BlobIndirection {
+                        vhandle: ValueHandle {
+                            blob_file_id: 7,
+                            offset,
+                            on_disk_size: 64,
+                        },
+                        size: 100,
+                    },
+                    owner: true,
+                },
+            ),
+        ])
+    };
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_cell_rows(true)
+        .use_zone_map(true)
+        .use_row_group_size(4_096)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for (key, offset) in [(b"a", 400u64), (b"b", 450), (b"c", 500), (b"d", 999)] {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            row(offset)?,
+            1,
+            ValueType::CellRow,
+        ))?;
+    }
+    // Row position 1 is "b".
+    writer.delete_bitmap_mut().insert(1);
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let mut offsets = crate::HashMap::default();
+    for (from, to) in [(400u64, 16u64), (450, 48), (500, 80)] {
+        offsets.insert(
+            from,
+            super::BlobRecordRelocation {
+                offset: to,
+                on_disk_size: 61,
+            },
+        );
+    }
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    let options = SalvageOptions {
+        blob_rewrite: Some(Arc::new(rewrite)),
+        ..SalvageOptions::default()
+    };
+    salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+
+    let recovered = open(dest, &fs)?;
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+        let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
+            return Ok(None);
+        };
+        assert_eq!(entry.key.value_type, ValueType::CellRow);
+        let fields = decode_row(&entry.value)?;
+        let RowCell::Ref { indirection, .. } = fields.get(1).expect("the body field").cell else {
+            panic!("the body stays a reference");
+        };
+        Ok(Some((
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+        )))
+    };
+    assert_eq!(field_ref(b"a")?, Some((9, 16)));
+    assert_eq!(field_ref(b"b")?, None, "the masked row stays deleted");
+    assert_eq!(field_ref(b"c")?, Some((9, 80)));
+    assert_eq!(field_ref(b"d")?, None, "its record is gone, so is the row");
+    Ok(())
+}
+
 #[test]
 fn salvage_keeps_tied_seqno_merge_operands() -> crate::Result<()> {
     use crate::table::Writer;
