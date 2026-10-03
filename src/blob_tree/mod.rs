@@ -122,7 +122,7 @@ pub(crate) fn resolve_value_handle(
             accessor
                 .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
                 .ok_or(crate::Error::InvalidHeader(
-                    "field row: a referenced object is missing from its blob file",
+                    "field row: a reference names a blob file the version does not hold",
                 ))
         })?;
         return Ok((item.key.user_key, UserValue::from(value)));
@@ -140,12 +140,12 @@ pub(crate) fn resolve_value_handle(
             Some(metrics),
         );
 
-        // An indirection naming an object the version does not hold is damage,
-        // reported as such, the way a cell row's dangling reference is.
+        // An indirection naming a blob file the version does not hold is
+        // damage, reported as such, the way a cell row's dangling reference is.
         let value = accessor
             .get(tree_id, &item.key.user_key, &vptr.vhandle, cache)?
             .ok_or(crate::Error::InvalidHeader(
-                "blob tree: an indirection names an object missing from its blob file",
+                "blob tree: an indirection names a blob file the version does not hold",
             ))?;
         Ok((item.key.user_key, value))
     } else {
@@ -186,8 +186,8 @@ impl BlobSource {
     /// # Errors
     ///
     /// Returns an error if the object cannot be read, or `version` holds no
-    /// such object: a reference that names nothing is damage, never an empty
-    /// value.
+    /// blob file of that id: a reference that names nothing is damage, never
+    /// an empty value.
     pub(crate) fn object(
         &self,
         version: &Version,
@@ -201,7 +201,7 @@ impl BlobSource {
         )
         .get(self.tree_id, key, &indirection.vhandle, &self.cache)?
         .ok_or(crate::Error::InvalidHeader(
-            "field row: a referenced object is missing from its blob file",
+            "field row: a reference names a blob file the version does not hold",
         ))
     }
 
