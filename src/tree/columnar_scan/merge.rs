@@ -117,6 +117,19 @@ struct Pick {
     eff: SeqNo,
 }
 
+/// Whether a merge's returned rows have their values read, and what its
+/// batches carry for that.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Late {
+    /// The rows are returned as read.
+    No,
+    /// Every batch carries each row's whole value.
+    Values,
+    /// The group belongs to a blob tree: every batch carries each row's
+    /// whole value and the references of rows written as cells.
+    Cells,
+}
+
 /// The streaming merge of one overlapping group.
 pub(super) struct MergeStream {
     sources: Vec<MergeSource>,
@@ -136,9 +149,8 @@ pub(super) struct MergeStream {
     /// that do not all carry it cannot be judged.
     loose_predicate: Option<u16>,
     /// Whether the rows returned have their values read (see
-    /// [`ColumnarScan::read_late`]), so every batch carries the whole-value
-    /// column.
-    late: bool,
+    /// [`ColumnarScan::read_late`]), and what every batch carries for that.
+    late: Late,
     /// Whether the raw value stays beside the whole value a source carries.
     raw: RawValue,
     /// The column the scan's predicate runs on, if it has one.
@@ -173,7 +185,11 @@ impl MergeStream {
         // version of a key can BE a deletion and then the key yields nothing.
         // An operand can resolve to a deletion, so a tree that merges decodes
         // the value type of every source.
-        let deletes = scan.resolver.is_some() || segments.iter().any(Segment::records_deletions);
+        // A blob tree's rows are read by their value type too: a cell row and
+        // an indirection read differently from a value.
+        let deletes = scan.resolver.is_some()
+            || scan.cells.is_some()
+            || segments.iter().any(Segment::records_deletions);
         let mut needed = alloc::vec![COL_USER_KEY, COL_SEQNO];
         if let Some(pred) = &scan.predicate {
             needed.push(pred.column_id);
@@ -246,7 +262,13 @@ impl MergeStream {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let late = segments.iter().any(|seg| scan.reads_late(seg));
+        let late = if scan.cells.is_some() {
+            Late::Cells
+        } else if segments.iter().any(|seg| scan.reads_late(seg)) {
+            Late::Values
+        } else {
+            Late::No
+        };
         Ok(Self {
             sources,
             dropped,
@@ -470,10 +492,10 @@ impl MergeStream {
                     let (batch, mistyped) = conform_lenient(batch, fields, predicate_column)?;
                     // Every source then carries the whole value last, null
                     // where it splits its values, so the sources agree.
-                    let batch = if late {
-                        last_whole_value(batch)?
-                    } else {
+                    let batch = if late == Late::No {
                         batch
+                    } else {
+                        last_whole_value(batch, late == Late::Cells)?
                     };
                     // Keys are read row by row from their framing, which only
                     // a bytes column carries.
@@ -547,7 +569,9 @@ impl MergeStream {
         // The rows are decided: their operands are resolved and their fields
         // read out of their values now, and read as declared before the
         // predicate sees them.
-        let (merged, resolved) = if self.late {
+        let (merged, resolved) = if self.late == Late::No {
+            (merged, Resolved::default())
+        } else {
             let (merged, resolved) = scan.read_late(merged)?;
             // Every declared column now holds its declared type: read out of
             // a value, or conformed when its source was loaded.
@@ -556,8 +580,6 @@ impl MergeStream {
                 return Err(MISTYPED);
             }
             (merged, resolved)
-        } else {
-            (merged, Resolved::default())
         };
         // A row whose predicate column its batch stores under another type
         // cannot be judged, unless its operand was resolved and the column
@@ -817,7 +839,7 @@ impl MergeStream {
         // values; otherwise they are not gathered at all.
         // A source holding chosen rows stands for its rows here: one check per
         // source, not per row.
-        let reread = self.late
+        let reread = self.late != Late::No
             || !layout.left_out.is_empty()
             || (!early && scan.predicate.is_some())
             || self
@@ -1153,24 +1175,33 @@ fn carry_whole_value(mut batch: ColumnBatch, whole: bool, raw: RawValue) -> Colu
 }
 
 /// `batch` with its whole-value column last, or with a null one appended when
-/// its source splits its values.
-fn last_whole_value(mut batch: ColumnBatch) -> crate::Result<ColumnBatch> {
-    let at = batch
-        .columns
-        .iter()
-        .position(|c| c.column_id == COL_WHOLE_VALUE);
-    let column = if let Some(at) = at {
-        batch.columns.remove(at)
+/// its source splits its values; in a scan of a blob tree (`cells`), the
+/// references column of split cell rows just before it, null where the
+/// source has none, so every source carries the same columns.
+fn last_whole_value(mut batch: ColumnBatch, cells: bool) -> crate::Result<ColumnBatch> {
+    let carried: &[u16] = if cells {
+        &[
+            crate::blob_tree::field_row::CELL_REFS_COLUMN,
+            COL_WHOLE_VALUE,
+        ]
     } else {
-        let rows = batch.row_count as usize;
-        Column {
-            column_id: COL_WHOLE_VALUE,
-            type_tag: TypeTag::Bytes,
-            validity: Some(alloc::vec![0u8; rows.div_ceil(8)]),
-            data: frame_bytes_column(rows, || core::iter::repeat_n(&[][..], rows))?,
-        }
+        &[COL_WHOLE_VALUE]
     };
-    batch.columns.push(column);
+    for &id in carried {
+        let at = batch.columns.iter().position(|c| c.column_id == id);
+        let column = if let Some(at) = at {
+            batch.columns.remove(at)
+        } else {
+            let rows = batch.row_count as usize;
+            Column {
+                column_id: id,
+                type_tag: TypeTag::Bytes,
+                validity: Some(alloc::vec![0u8; rows.div_ceil(8)]),
+                data: frame_bytes_column(rows, || core::iter::repeat_n(&[][..], rows))?,
+            }
+        };
+        batch.columns.push(column);
+    }
     Ok(batch)
 }
 

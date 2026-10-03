@@ -76,6 +76,14 @@
 //! [`ValueProjector`](projection::ValueProjector); a table that stores the
 //! value split into fields yields them as its columns, and a field it lacks is
 //! absent. See [`projection`] for the absence rule every source follows.
+//!
+//! # Blob trees
+//!
+//! The index of a blob tree holds rows written as cells, whose fields sit
+//! inline or in blob files, and whole values, inline or in a blob file. Every
+//! source of it is merged and its rows decided on their keys, seqnos and value
+//! types; only the rows the scan returns have their fields read, and a blob
+//! object only when a projected field needs it. See [`cells`].
 
 use core::ops::{Bound, RangeBounds};
 
@@ -95,6 +103,7 @@ use crate::table::columnar_predicate::{
 };
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
+mod cells;
 mod merge;
 pub mod projection;
 mod rows;
@@ -138,6 +147,10 @@ struct Segment {
     /// Whether the segment stores each value whole, so its declared fields
     /// are read out of the value through the projector.
     whole: bool,
+    /// Whether the segment is a blob tree's columnar table, which splits rows
+    /// written as cells into the columns of their fields and keeps every
+    /// other value whole beside them.
+    cells: bool,
 }
 
 impl Segment {
@@ -335,6 +348,33 @@ impl Tree {
             operator,
             blob_source: self.blob_source(),
         });
+        // The index of a blob tree: its rows' fields are read by the engine,
+        // out of rows written as cells and the objects they reference, and
+        // out of whole values through the projector, a whole value kept in a
+        // blob file read first. Every value column is a field: one projected
+        // by id alone, or a predicate on one no field declares, would read a
+        // stored representation (a cell row, an indirection) rather than a
+        // value, so a field is declared with its type.
+        let cells = self.blob_source().map(|source| cells::CellSource {
+            version: super_version.clone(),
+            source,
+        });
+        if cells.is_some() {
+            let intrinsic = |id: u16| matches!(id, COL_USER_KEY | COL_SEQNO | COL_VALUE_TYPE);
+            let loose = |id: u16| {
+                !intrinsic(id)
+                    && fields
+                        .iter()
+                        .all(|f| f.column_id() != id || !projection::is_declared(f))
+            };
+            if fields.iter().any(|f| loose(f.column_id()))
+                || predicate.is_some_and(|p| loose(p.column_id))
+            {
+                return Err(Error::Projection(
+                    "projection: a blob tree's fields are projected as declared fields",
+                ));
+            }
+        }
 
         // A declared field of a segment that stores each value whole lies
         // inside the value, which only the caller's projector reads, and only
@@ -359,6 +399,7 @@ impl Tree {
                     may_dup: true,
                     recency_rank,
                     whole: true,
+                    cells: false,
                     source: Source::Memtable(memtable),
                 });
             }
@@ -390,6 +431,7 @@ impl Tree {
                     may_dup: true,
                     recency_rank,
                     whole: true,
+                    cells: false,
                     source: Source::RowTable(table.clone()),
                 });
                 continue;
@@ -413,6 +455,7 @@ impl Tree {
                 may_dup,
                 recency_rank,
                 whole: table.metadata.value_layout == crate::table::meta::ValueLayout::Whole,
+                cells: table.metadata.value_layout == crate::table::meta::ValueLayout::Cells,
                 source: Source::Columnar(table.clone()),
             });
         }
@@ -429,6 +472,7 @@ impl Tree {
                 .flatten(),
             declared,
             resolver,
+            cells,
             predicate: predicate.cloned(),
             support: PredicateSupport::Exact,
             comparator,
@@ -831,6 +875,10 @@ pub struct ColumnarScan {
     /// What resolves a merge operand row, when the tree merges; `None` when
     /// it has no merge operator.
     resolver: Option<Resolver>,
+    /// Where the objects of a blob tree's rows are read, when the tree is a
+    /// blob tree's index: every row returned has its fields read late (see
+    /// [`cells`]).
+    cells: Option<cells::CellSource>,
     predicate: Option<ColumnRangePredicate>,
     /// The weakest [`PredicateSupport`] over the segments read so far.
     support: PredicateSupport,
@@ -962,6 +1010,10 @@ impl ColumnarScan {
     /// operands a returned row resolves, and a whole-value table whose
     /// declared fields a returned row reads out of its value.
     fn reads_late(&self, seg: &Segment) -> bool {
+        // A blob tree reads every returned row's fields late.
+        if self.cells.is_some() {
+            return true;
+        }
         self.resolver.is_some() || (seg.whole && self.declared)
     }
 
@@ -977,13 +1029,24 @@ impl ColumnarScan {
     ) -> crate::Result<SegmentCursor> {
         // A whole value is carried to the rows the scan returns, for its
         // declared fields and for the merge operands it may hold.
-        let whole = seg.whole && (self.declared || self.resolver.is_some());
+        let whole = seg.whole && (self.declared || self.resolver.is_some() || self.cells.is_some());
         // The declared fields of a whole value lie inside it: decode the value
         // in their place. A declared field's id may be the value column's own,
         // so no predicate is pushed down; the merge filters after the fields
         // are read.
         let mut ids: Vec<u16> = projection.to_vec();
-        if whole {
+        if seg.cells {
+            // A blob tree's columnar table keeps each field of a split row in
+            // its own column, the row's references beside them, and every
+            // other value whole under the id the merge carries whole values
+            // in: no column moves.
+            use crate::blob_tree::field_row::CELL_REFS_COLUMN;
+            for id in [CELL_REFS_COLUMN, merge::COL_WHOLE_VALUE] {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        } else if whole {
             let declared: Vec<u16> = self
                 .fields
                 .iter()
@@ -1046,6 +1109,9 @@ impl ColumnarScan {
     /// of its own for a column no field declares.
     pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
         let (batch, resolved) = self.resolve_operands(batch)?;
+        if let Some(cells) = &self.cells {
+            return Ok((cells::materialize(self, cells, batch)?, resolved));
+        }
         let mut batch = if self.declared {
             projection::project_decided(
                 batch,
@@ -1729,7 +1795,8 @@ impl ColumnarScan {
     /// invisible too-new versions come first and the first visible row is the
     /// newest visible version; a run can span batch boundaries, so the last
     /// kept key carries across batches. The predicate runs AFTER dedup
-    /// (mirroring [`Self::merge_group`]): a key whose newest version fails the
+    /// (mirroring the merge of an overlapping group, [`merge::MergeStream`]): a
+    /// key whose newest version fails the
     /// predicate is dropped, never served from an older matching version —
     /// which also rules out predicate-driven zone-map block-skip here.
     ///

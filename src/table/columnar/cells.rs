@@ -227,6 +227,18 @@ fn encode_refs(fields: &[RowField<'_>]) -> Result<Option<Vec<u8>>> {
     Ok((!out.is_empty()).then_some(out))
 }
 
+/// The references a references cell lists, in column order.
+///
+/// # Errors
+///
+/// Returns an error for a cell that does not decode as a list of
+/// references (see the module documentation).
+pub fn cell_refs(cell: &[u8]) -> Result<Vec<RowField<'static>>> {
+    let mut fields = Vec::new();
+    decode_refs(cell, &mut fields)?;
+    Ok(fields)
+}
+
 /// Appends the references a references cell lists to `fields`.
 fn decode_refs(mut cell: &[u8], fields: &mut Vec<RowField<'_>>) -> Result<()> {
     while !cell.is_empty() {

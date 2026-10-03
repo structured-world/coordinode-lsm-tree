@@ -68,7 +68,7 @@ pub use super::column_type::{ByteOrder, Number, NumberKind, TypeTag};
 mod cells;
 mod expr;
 
-pub(crate) use cells::entries_to_cells_batch;
+pub(crate) use cells::{cell_refs, entries_to_cells_batch};
 pub(crate) use expr::{Bounds, Cell, Choice, Values};
 pub use expr::{Candidate, Expression, candidates};
 

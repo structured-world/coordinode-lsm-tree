@@ -614,6 +614,68 @@ impl BlobTree {
         }))
     }
 
+    /// Runs a projected columnar scan across the tree, as
+    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) does, reading each
+    /// row's declared fields as late as it can.
+    ///
+    /// The rows are decided first on their keys, seqnos and value types; only
+    /// the rows the scan returns have their fields read. A field of a row
+    /// written as cells is read out of the row (or, in a columnar table, out
+    /// of the field's own column), and its object is read from its blob file
+    /// only when the field is projected: a projection of compact fields reads
+    /// no blob at all. A row stored whole has its fields read through the
+    /// projection's [`ValueProjector`](crate::ValueProjector), its value read
+    /// from the value log first when it is kept there. When the predicate
+    /// runs on a projected field, that field is read first and the objects of
+    /// the other fields are read only for the rows it keeps.
+    ///
+    /// A field is projected as a declared field, with its type and what its
+    /// absence means; the intrinsic key, seqno and value-type columns may be
+    /// projected by id. A field holds its value, not how the tree stores it,
+    /// so a row's value type reads as a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Projection`] when a value column is projected
+    /// by id alone or the predicate runs on one no field declares, and
+    /// otherwise as [`Tree::columnar_scan`](crate::Tree::columnar_scan), and,
+    /// lazily, when a field is stored under another type than declared or an
+    /// object cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter};
+    /// use lsm_tree::blob_tree::field_row::{Field, TypeTag};
+    /// use lsm_tree::{Absent, ProjectedField, Projection};
+    /// # let folder = lsm_tree::get_tmp_folder();
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
+    /// #     .open()?;
+    /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
+    /// let body = vec![b'x'; 1_000];
+    /// tree.insert_cells("doc", &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
+    /// tree.flush_active_memtable(0)?;
+    ///
+    /// // The status alone: the body stays in its blob file, unread.
+    /// let status = Projection::new().field(ProjectedField::new(3, TypeTag::Bytes, Absent::Null)?);
+    /// let mut batches = tree.columnar_scan(status, None, SeqNo::MAX, ..)?;
+    /// let batch = batches.next().expect("one batch")?;
+    /// assert_eq!(batch.row_count, 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "columnar")]
+    pub fn columnar_scan<R: core::ops::RangeBounds<UserKey>>(
+        &self,
+        projection: impl Into<crate::Projection>,
+        predicate: Option<&crate::table::columnar_predicate::ColumnRangePredicate>,
+        seqno: SeqNo,
+        range: R,
+    ) -> crate::Result<crate::tree::columnar_scan::ColumnarScan> {
+        self.index
+            .columnar_scan(projection, predicate, seqno, range)
+    }
+
     /// Updates the live [`RuntimeConfig`](crate::runtime_config::RuntimeConfig),
     /// as [`Tree::update_runtime_config`](crate::Tree::update_runtime_config)
     /// does for the index tree.
