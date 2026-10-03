@@ -463,6 +463,7 @@ jobs:
           # Explicit template (not bare `mktemp -d`, which is GNU-only and
           # fails on macOS/BSD with "too few X's") so the step survives a
           # future runner-OS change.
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/compare-ghpages.XXXXXXXX")"
           # Remove the temp clone on every exit path (success, error, or
           # cancellation) so it doesn't leak disk on a long-lived
@@ -519,7 +520,7 @@ jobs:
             echo "::notice::compare-rocksdb page unchanged, nothing to publish"
           else
             git commit -m "bench: refresh the compare-rocksdb page (dev/compare)"
-            git push origin gh-pages
+            bash "$push_gh_pages"
             echo "::notice::published the compare-rocksdb page to dev/compare/"
           fi
 
