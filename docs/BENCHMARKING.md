@@ -49,12 +49,67 @@ baseline. Select a preset with the `LSM_BENCH_PRESET` environment variable
 | `page_ecc` | off | RocksDB has no Page ECC |
 | `disable_cow_on_sst_files` | off | RocksDB has no FS-aware CoW control |
 | `use_reflink_for_checkpoint` | off | RocksDB has no reflink path |
+| `locator_policy` | disabled | RocksDB has no retrieval-ribbon locator |
+| index / filter partitioning | off at every level | matches RocksDB's default single index (`kBinarySearch`) and full filter per table |
+| index / filter pinning | pinned at every level | matches RocksDB's `cache_index_and_filter_blocks = false`: the table reader holds them, not the block cache |
 | `manifest_kv_checksums` | **on** | parity: matches RocksDB's per-record MANIFEST CRC32 |
 | block-level XXH3 checksum | **on** | parity: matches RocksDB's per-block checksum |
 
 The preset disables each opt-in explicitly even when it is already off by
 default, so the comparison stays honest if a default ever flips and so the full
 parity surface is documented in one place.
+
+## Same work for every engine
+
+Beyond the preset, every engine gets the same work:
+
+- **Values.** 256-byte values cut from one pool of half-compressible bytes,
+  the shape of RocksDB `db_bench`'s default value generator
+  (`--compression_ratio=0.5`), so a codec does the work it does on real data
+  rather than collapsing a constant run. The compaction scenario that splits
+  its output across threads uses incompressible values instead, so its output
+  spans enough tables to split.
+- **Reads without copies.** Point reads use RocksDB's `get_pinned`, scans and
+  seeks its `raw_iterator`, both zero-copy, the way our engine hands out values.
+- **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB LRU
+  block cache on both sides, compaction scenarios included; no WAL.
+- **The same cores.** Both engines compress a table's blocks on four threads
+  wherever they compress (ours through `compaction_threads`, RocksDB through
+  `compression_options_parallel_threads`). At their defaults ours would use
+  half the host's cores and RocksDB one, and a write group would compare
+  unequal parallelism.
+- **One untimed setup.** A read or overwrite group writes its starting state
+  once per engine, codec and size, and every timed iteration opens a copy of
+  it, so only the measured operation is timed.
+
+## Paired measurement
+
+The bench hosts are shared machines, and a burst of other work on them lasts
+seconds. Measured one engine after another, such a burst fell on whichever
+engine was running, and two runs of one commit on one host disagreed on the
+ratio of our engine to RocksDB by a median 15-20%, up to 3x on single arms,
+with some arms trading the verdict of which engine is faster.
+
+So the engines of a group are measured in the same **rounds**: one sample each
+per round, taking turns at going first. A burst slows every engine of the
+rounds it overlaps and divides out of their ratio. Each group reports, per
+engine:
+
+- **the ratio to RocksDB**: the median over the rounds of this engine's time
+  over RocksDB's in the same round, with a distribution-free 95% confidence
+  interval (the order statistics a Binomial(rounds, 1/2) count bounds);
+- **the time per operation**: the median over the rounds, with the same kind
+  of interval.
+
+An arm runs as many iterations per sample as fill 20 ms, and a group runs as
+many rounds as fit a 4-second budget, between ten and forty (ten is the fewest
+for which a 95% interval of the median exists at ranks 2 and 9). Two runs of
+one commit on one quiet host then agreed on the ratio to within 2% on the
+median arm and 7% on nine arms in ten; the interval covers the noise within a
+run, so a ratio within a few percent of 1 is parity. `cargo bench --bench compare
+-- --help` lists the flags that change these settings, and a positional filter
+selects groups. The run writes `target/head-to-head/summary.json`, which the
+published page is drawn from.
 
 ## Running
 
@@ -162,7 +217,7 @@ measured on.
 | `versions-deletes-tombstones` | Several versions per key, a fifth point-deleted, a contiguous slice covered by a range tombstone, read at `SeqNo::MAX`. |
 | `selective-scan-sparse` | A predicate matching ~1% of rows, handed to the columnar scan over a field stored in a sub-column of its own, with zone maps on. Where materializing before the predicate runs wastes nearly all the work. |
 | `selective-scan-near-full` | A predicate matching ~90%, over the same fixture. Deferring materialization buys almost nothing here and its bookkeeping can cost more than it saves, so the two are read together. |
-| `columnar-scan-one-segment` | 256-byte values in one flushed columnar segment, read whole by the projected columnar scan of key and value. Also reports the time and bytes read from the scan's creation to its first batch, and the most page bytes the scan held at once (`retained payload`), which stays within `columnar_scan_budget` except for reads its counter reports as past a share. |
+| `columnar-scan-one-segment` | 256-byte values in one flushed columnar segment, read whole by the projected columnar scan of key and value. Also reports the time and bytes read from the scan's creation to its first batch, and the most page bytes the scan held at once (`retained payload`), which stays within `columnar_scan_budget` except for reads its counter reports as past a share. The time goes to the host's timings suite, the bytes to the costs. |
 | `columnar-scan-overlap-8` | The same rows written round-robin into eight flushed segments, so all eight form one overlapping group the scan merges. Same extra figures: the first batch comes after a bounded prefix of each segment, and the eight share one budget. |
 | `blobs-well-placed` | Values far above the separation threshold, written once in key order, so neighbours' blobs are adjacent. Read by a full scan, the pass where adjacent blobs are fetched ahead and merged into one read. |
 | `blobs-scattered` | The same blobs written in a strided order and rewritten in several flushed rounds, so a key's live blob sits in whichever file its last round landed in. Read by the same full scan, so the gap to the well-placed figure is what placement costs. Both placement scenarios report **unsupported** under `--cache-mb 0`: the prefetch holds what it fetches in the cache, so without one placement cannot show. |
@@ -207,9 +262,9 @@ a scenario whose copies go from zero to anything alerts. A scenario that
 emitted no row publishes nothing, since its cost per row does not exist. The
 plain summary also prints decoded over read and copied over decoded as
 diagnostics, `n/a` where the denominator is zero; they are not series.
-`db_bench --github-json` writes the bigger-is-better series to stdout, or
-appends them to the array in a file with `--github-json-append <PATH>`, and
-`--github-json-costs <PATH>` writes the costs.
+`db_bench --github-json` writes the rates to stdout, or appends them to the
+array in a file with `--github-json-append <PATH>`; `--github-json-costs <PATH>`
+writes the costs and `--github-json-timings <PATH>` the timings.
 
 ## Dashboard series
 
@@ -222,6 +277,19 @@ against a 5.x baseline:
 |---|---|
 | `lsm-tree db_bench <N>.x · <os> · <runner>` | The rates of one line measured on one bench host. A rate measured on one machine is no baseline for another, so each host has its own suite. |
 | `lsm-tree db_bench costs <N>.x` | The bytes-per-row costs of one line. They are counted, not timed, so one suite serves every host. |
+| `lsm-tree db_bench timings <N>.x · <os> · <runner>` | Times of one line measured on one host that improve by shrinking, such as a scan's time to its first batch: smaller is better like the costs, one suite per host like the rates. |
+
+**Which suite a series goes to** follows from two facts. The store action fixes
+one direction per suite, so a cost cannot share a suite with a rate. And a
+figure the engine counts is the same on every host, while a figure timed on one
+host means nothing as a baseline for another and, in a suite shared across
+hosts, would alert on whichever host ran last.
+
+**A series that changes meaning gets a new name.** The old points measured
+something else, so they are not the start of the new series: they are dropped
+from the data file on the next push to `main`, by a rule in
+`.github/bench/retired-series.json` that names the suite, the series and the
+reason. A series that moves to another suite leaves the old one the same way.
 
 **Where the line comes from.** `<N>` is the major of the next version
 release-plz computes for the measured commit, the version it will ship as: the
@@ -238,11 +306,13 @@ same way.
 manual dispatch from any branch is compared against the suites of the line it
 measures and writes nothing.
 
-**Where to look.** The per-host dashboard (`dev/bench/`) has one chart per
-suite. The overlay page (`dev/bench/overlay.html`) draws every host of one line
-on one chart per workload, newest line first. The RocksDB head-to-head page
-(`dev/compare/`) is a snapshot replaced on every run; it names the line, branch
-and commit it measured.
+**Where to look.** The dashboard (`dev/bench/`) picks a version line and a
+runner, defaulting to whatever was measured last, and shows the rates, the
+costs or the timings, grouped by what they measure; for the rates and timings
+it can also draw every runner of the line on one chart. The RocksDB
+head-to-head page (`dev/compare/`) is a snapshot replaced on every run; it
+names the line, branch, commit and runner it measured, and shows each engine's
+time relative to RocksDB or its time per operation.
 
 ## Checklist for format-changing PRs
 
