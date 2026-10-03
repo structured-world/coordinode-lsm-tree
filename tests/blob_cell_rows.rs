@@ -144,10 +144,13 @@ fn a_shared_object_is_charged_once_when_its_last_holder_goes() -> lsm_tree::Resu
         Some(&framed(&[b"final", &body])[..])
     );
 
-    // A plain overwrite lets go of the object: it is charged once and the
-    // file, holding nothing else, goes.
+    // A plain overwrite lets go of the object: it is charged once, not once
+    // per version that held it, and the next install drops the file, which
+    // holds nothing else.
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
     tree.major_compact(64_000_000, SeqNo::MAX)?;
     assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
     assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&b"gone"[..]));
@@ -443,6 +446,8 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
     assert_eq!(tree.stale_blob_bytes(), 0);
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
     tree.major_compact(64_000_000, SeqNo::MAX)?;
     assert_eq!(tree.blob_file_count(), 0, "no object leaked");
     Ok(())
