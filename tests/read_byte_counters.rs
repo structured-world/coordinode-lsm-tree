@@ -1453,6 +1453,166 @@ fn a_predicate_scan_of_one_segment_counts_its_filter_gather() {
     );
 }
 
+/// A columnar tree whose two flushed segments overlap on keys 500..1000, so a
+/// scan over them takes the merge. Each segment is one block of one row page,
+/// so every gather of the merge is known.
+fn overlapping_segments() -> lsm_tree::Result<(TempDir, Tree)> {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .columnar_page_size_policy(lsm_tree::config::BlockSizePolicy::all(1 << 20))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    for i in 0..1_000 {
+        tree.insert(key(i), vec![b'v'; 32], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 500..1_500 {
+        tree.insert(key(i), vec![b'w'; 32], 2_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    Ok((folder, tree))
+}
+
+/// Scans `tree` with `projection` and `pred` at `seqno`, returning the rows
+/// and the bytes of the batches it yields.
+fn scan_cost(
+    tree: &Tree,
+    projection: &[u16],
+    pred: Option<&ColumnRangePredicate>,
+    seqno: SeqNo,
+) -> lsm_tree::Result<(u64, u64)> {
+    let mut rows = 0_u64;
+    let mut returned = 0;
+    for batch in tree.columnar_scan(projection, pred, seqno, ..)? {
+        let batch = batch?;
+        rows += u64::from(batch.row_count);
+        returned += batch_bytes(&batch);
+    }
+    Ok((rows, returned))
+}
+
+#[test]
+fn a_merged_scan_with_a_selective_predicate_copies_only_the_rows_it_keeps() -> lsm_tree::Result<()>
+{
+    // The merge's predicate judges each decided row in the batch the row was
+    // taken from, so a predicate keeping 1% of the rows gathers that 1% and
+    // nothing else: not every decided row first and the kept ones again.
+    let (_folder, tree) = overlapping_segments()?;
+    let pred = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(700)),
+        upper: Some(key(714)),
+        apply: PredicateApply::Filter,
+    };
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let (rows, returned) = scan_cost(
+        &tree,
+        &[COL_USER_KEY, COL_SEQNO, COL_VALUE],
+        Some(&pred),
+        SeqNo::MAX,
+    )?;
+    assert_eq!(rows, 15, "the predicate keeps keys 700 to 714");
+    assert_eq!(
+        m.bytes_copied() - before,
+        returned,
+        "the merge copies the rows the predicate keeps, and nothing else",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_merged_scan_with_a_seqno_predicate_judges_the_effective_seqnos() -> lsm_tree::Result<()> {
+    // The merge returns each row with its effective seqno, and a predicate on
+    // the seqno column judges that one, here the second segment's rows from
+    // seqno 2_700 on, before anything is gathered.
+    let (_folder, tree) = overlapping_segments()?;
+    let pred = ColumnRangePredicate {
+        column_id: COL_SEQNO,
+        lower: Some(2_700_u64.to_be_bytes().to_vec()),
+        upper: None,
+        apply: PredicateApply::Filter,
+    };
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let (rows, returned) = scan_cost(&tree, &[COL_SEQNO, COL_VALUE], Some(&pred), SeqNo::MAX)?;
+    assert_eq!(
+        rows, 800,
+        "keys 700 to 1499 were written at seqno 2_700 or later"
+    );
+    assert_eq!(
+        m.bytes_copied() - before,
+        returned,
+        "the merge copies the rows the predicate keeps, and nothing else",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_deduped_segment_scan_with_a_selective_predicate_copies_only_the_rows_it_keeps()
+-> lsm_tree::Result<()> {
+    // A segment that records deletions is deduped key by key, and the
+    // predicate judges each key's surviving row in the same pass, so the rows
+    // it keeps are gathered once, without the key and value-type columns the
+    // scan decoded only for the dedup and the predicate.
+    let (_folder, tree) = columnar_segment(0, 0);
+    for i in 0..1_000 {
+        tree.insert(key(i), vec![b'v'; 32], u64::from(i));
+    }
+    for i in 0..10 {
+        tree.remove(key(i), 1_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let pred = ColumnRangePredicate {
+        column_id: COL_USER_KEY,
+        lower: Some(key(500)),
+        upper: Some(key(514)),
+        apply: PredicateApply::Filter,
+    };
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let (rows, returned) = scan_cost(&tree, &[COL_VALUE], Some(&pred), SeqNo::MAX)?;
+    assert_eq!(rows, 15, "the predicate keeps keys 500 to 514");
+    assert_eq!(
+        m.bytes_copied() - before,
+        returned,
+        "the dedup copies the projected cells of the rows the predicate keeps, \
+         and nothing else",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_snapshot_straddling_one_segment_copies_only_the_projected_rows_it_sees() -> lsm_tree::Result<()>
+{
+    // A snapshot inside a segment's seqnos masks the rows it cannot see. The
+    // seqno column is decoded for the mask alone, so the visible rows are
+    // gathered without it.
+    let (_folder, tree) = columnar_segment(1_000, 32);
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+
+    let (rows, returned) = scan_cost(&tree, &[COL_VALUE], None, 500)?;
+    assert_eq!(rows, 500, "the rows written below seqno 500 are visible");
+    assert_eq!(
+        m.bytes_copied() - before,
+        returned,
+        "the mask copies the projected cells of the visible rows, and nothing else",
+    );
+    Ok(())
+}
+
 #[test]
 fn a_columnar_point_read_that_misses_decodes_only_the_key_page() {
     // A point read looks the key up in the key page before it reads anything

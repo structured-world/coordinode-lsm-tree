@@ -196,55 +196,98 @@ impl ColumnRangePredicate {
     /// [`PredicateSupport::Unsupported`] for that batch.
     #[must_use]
     pub fn matching_rows(&self, batch: &ColumnBatch) -> Vec<bool> {
+        let matcher = self.matcher(batch);
+        (0..batch.row_count)
+            .map(|row| matcher.matches(row))
+            .collect()
+    }
+
+    /// This predicate over `batch`'s column, its type resolved once, to judge
+    /// the rows of `batch` one at a time: the rows [`Self::matching_rows`]
+    /// marks, without building the mask for rows a caller already dropped.
+    pub(crate) fn matcher<'a>(&'a self, batch: &'a ColumnBatch) -> RowMatcher<'a> {
         let rows = batch.row_count as usize;
         let Some(col) = batch.columns.iter().find(|c| c.column_id == self.column_id) else {
-            return alloc::vec![true; rows];
+            return RowMatcher::Every;
         };
         match col.type_tag {
-            TypeTag::Bytes => (0..rows)
-                .map(|row| self.row_matches(col, rows, row))
-                .collect(),
-            TypeTag::Number(number) => self.number_rows(col, number, rows),
-            TypeTag::Fixed(_) => alloc::vec![true; rows],
+            TypeTag::Bytes => RowMatcher::Bytes {
+                pred: self,
+                col,
+                rows,
+            },
+            TypeTag::Number(number) => RowMatcher::Number {
+                col,
+                number,
+                span: self.ordinal_span(number),
+            },
+            TypeTag::Fixed(_) => RowMatcher::Every,
         }
     }
+}
 
-    /// [`Self::matching_rows`] over a number column: each non-null row's
-    /// ordinal against the bounds' ordinal span, integer comparisons only.
-    fn number_rows(&self, col: &Column, number: Number, rows: usize) -> Vec<bool> {
-        let mut mask = Vec::with_capacity(rows);
-        if let Some((lo, hi)) = self.ordinal_span(number) {
-            let cells = col.data.chunks_exact(usize::from(number.width()));
-            for (row, cell) in cells.take(rows).enumerate() {
+/// A [`ColumnRangePredicate`] bound to one batch's column (see
+/// [`ColumnRangePredicate::matcher`]).
+pub(crate) enum RowMatcher<'a> {
+    /// The column is absent or has no order: the predicate cannot run, and
+    /// every row is treated as matching.
+    Every,
+    /// A bytes column, compared by its raw value bytes.
+    Bytes {
+        pred: &'a ColumnRangePredicate,
+        col: &'a Column,
+        rows: usize,
+    },
+    /// A number column, compared by ordinal against the bounds' span, or
+    /// matching nowhere when no value is within them.
+    Number {
+        col: &'a Column,
+        number: Number,
+        span: Option<(u128, u128)>,
+    },
+}
+
+impl RowMatcher<'_> {
+    /// Whether row `row` is non-null and within the bounds. A row past the
+    /// column's cells (never one a decode accepted) does not match.
+    pub(crate) fn matches(&self, row: u32) -> bool {
+        let cell = match *self {
+            Self::Every => return true,
+            Self::Bytes { col, rows, .. } => bytes_row(&col.data, rows, row as usize),
+            Self::Number { col, number, .. } => {
+                let width = usize::from(number.width());
+                (row as usize)
+                    .checked_mul(width)
+                    .and_then(|start| col.data.get(start..start.checked_add(width)?))
+            }
+        };
+        cell.is_some_and(|cell| self.matches_cell(row, cell))
+    }
+
+    /// Whether row `row`, non-null per its column, holds a value within the
+    /// bounds when its value is `cell`: for a row whose stored cell is not
+    /// the value the caller judges, as a seqno a merge rewrites to its
+    /// effective one. A number cell of another width does not match.
+    pub(crate) fn matches_cell(&self, row: u32, cell: &[u8]) -> bool {
+        let row = row as usize;
+        match *self {
+            Self::Every => true,
+            Self::Bytes { pred, col, .. } => {
+                row_valid(col, row)
+                    && pred.lower.as_deref().is_none_or(|lo| cell >= lo)
+                    && pred.upper.as_deref().is_none_or(|hi| cell <= hi)
+            }
+            Self::Number { col, number, span } => {
+                let Some((lo, hi)) = span else {
+                    return false;
+                };
+                if cell.len() != usize::from(number.width()) {
+                    return false;
+                }
                 let value = number.ordinal(cell);
-                mask.push(lo <= value && value <= hi && row_valid(col, row));
+                lo <= value && value <= hi && row_valid(col, row)
             }
         }
-        // No value is within an empty span; a column shorter than its rows (never
-        // one a decode accepted) matches nowhere past its end.
-        mask.resize(rows, false);
-        mask
-    }
-
-    /// Whether row `row` of a `Bytes` column is non-null and within the bounds.
-    fn row_matches(&self, col: &Column, rows: usize, row: usize) -> bool {
-        if !row_valid(col, row) {
-            return false;
-        }
-        let Some(value) = bytes_row(&col.data, rows, row) else {
-            return false;
-        };
-        if let Some(lo) = &self.lower
-            && value < lo.as_slice()
-        {
-            return false;
-        }
-        if let Some(hi) = &self.upper
-            && value > hi.as_slice()
-        {
-            return false;
-        }
-        true
     }
 }
 
@@ -442,7 +485,7 @@ pub(crate) fn take_rows(batch: &ColumnBatch, indices: &[u32]) -> crate::Result<C
 /// rebuilding its framing (fixed chunks copied, `Bytes` offset table + payload
 /// repacked) and its validity bitmap. The body is written once, straight into
 /// its final buffer.
-fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
+pub(crate) fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Column> {
     let data = match col.type_tag.fixed_width() {
         // Out-of-range index: zero-fill one cell so the fixed framing stays
         // `row_count * width` bytes long.
@@ -481,7 +524,7 @@ fn take_column(col: &Column, rows: usize, indices: &[u32]) -> crate::Result<Colu
 
 /// Rebuilds a validity bitmap for the rows listed in `indices`, preserving each
 /// gathered row's null bit in output order.
-fn take_validity(bits: &[u8], indices: &[u32]) -> Vec<u8> {
+pub(crate) fn take_validity(bits: &[u8], indices: &[u32]) -> Vec<u8> {
     let mut out = alloc::vec![0u8; indices.len().div_ceil(8)];
     for (o, &i) in indices.iter().enumerate() {
         let i = i as usize;

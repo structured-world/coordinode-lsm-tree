@@ -24,13 +24,13 @@ use alloc::vec::Vec;
 use super::projection::{MISTYPED, ProjectedField, conform, conform_lenient};
 use super::rows::SourceCursor;
 use super::{ColumnarScan, Segment, SegmentCursor, drop_columns, key_in_bounds};
-use super::{PredicateTiming, TombstoneSweep};
+use super::{PredicateTiming, TombstoneSweep, is_operand, value_types};
 use super::{Resolved, UNREADABLE_BY_ID};
 use crate::table::columnar::{
     COL_SEQNO, COL_USER_KEY, COL_VALUE, COL_VALUE_TYPE, Column, ColumnBatch, TypeTag,
     bytes_column_row, bytes_column_span, fixed_u64_row, frame_bytes_column,
 };
-use crate::table::columnar_predicate::PredicateSupport;
+use crate::table::columnar_predicate::{PredicateApply, PredicateSupport, RowMatcher};
 use crate::{Error, SeqNo, UserKey};
 
 /// Rows an output batch of the merge is cut at.
@@ -528,40 +528,22 @@ impl MergeStream {
         let built = if pending.is_empty() {
             None
         } else {
-            Some(self.build(&pending)?)
+            self.judge_and_build(scan, pending, support)?
         };
         for source in &mut self.sources {
             source.referenced = false;
         }
-        let Some((merged, judged, left_out)) = built else {
+        let Some(Built {
+            merged,
+            pending,
+            judged,
+            early,
+            left_out,
+        }) = built
+        else {
             return Ok(None);
         };
         scan.record_gather(&merged);
-        // The row predicate runs AFTER the dedup: each row is the newest
-        // visible version of its key, so a key whose newest version fails the
-        // predicate is dropped instead of falling back to an older matching
-        // version. It runs in the scan's coordinates, on effective seqnos.
-        // Rows that do not all carry its column are returned unjudged.
-        //
-        // Over a column reading the values does not change, it runs before
-        // they are read, so a row it drops is never resolved or handed to the
-        // projector; an operand still to be resolved is judged after.
-        let timing = if judged {
-            scan.predicate_timing(&merged)
-        } else {
-            PredicateTiming::AfterValues
-        };
-        let early = timing == PredicateTiming::BeforeValues;
-        let merged = match timing {
-            PredicateTiming::BeforeValues => {
-                scan.filter_after_dedup(merged, scan.predicate.as_ref(), support)?
-            }
-            PredicateTiming::BeforeValuesExceptOperands => scan.filter_plain_rows(merged)?,
-            PredicateTiming::AfterValues => merged,
-        };
-        if merged.row_count == 0 {
-            return Ok(None);
-        }
         // The rows are decided: their operands are resolved and their fields
         // read out of their values now, and read as declared before the
         // predicate sees them.
@@ -779,20 +761,123 @@ impl MergeStream {
         Ok(())
     }
 
-    /// The chosen rows as one batch, in the order they were chosen, each column
-    /// built straight from the batches its rows sit in: nothing is copied but
-    /// the chosen cells. The seqno column is written with each row's effective
-    /// seqno, since the rows come from segments with different bases.
+    /// The chosen rows of `pending` the scan's predicate keeps, gathered into
+    /// one batch, or `None` when it keeps none of them.
+    ///
+    /// The row predicate runs AFTER the dedup: each row is the newest visible
+    /// version of its key, so a key whose newest version fails the predicate
+    /// is dropped instead of falling back to an older matching version. It
+    /// runs in the scan's coordinates, on effective seqnos. Rows that do not
+    /// all carry its column are returned unjudged.
+    ///
+    /// Over a column reading the values does not change, it judges each
+    /// chosen row in the batch the row was taken from, before anything is
+    /// gathered, so a row it drops is neither copied nor resolved nor handed
+    /// to the projector; an operand still to be resolved is judged after its
+    /// value is read.
+    fn judge_and_build(
+        &self,
+        scan: &ColumnarScan,
+        pending: Vec<Pick>,
+        support: &mut PredicateSupport,
+    ) -> crate::Result<Option<Built>> {
+        // Laid out over every chosen row, so the sources' columns are checked
+        // whether or not the predicate keeps a row of them.
+        let layout = self.layout(&pending)?;
+        let timing = if layout.judged {
+            scan.predicate_timing(|| pending.iter().any(|pick| self.holds_operand(pick)))
+        } else {
+            PredicateTiming::AfterValues
+        };
+        let pending = match timing {
+            PredicateTiming::BeforeValues => self.judge(scan, pending, false, &layout, support)?,
+            PredicateTiming::BeforeValuesExceptOperands => {
+                self.judge(scan, pending, true, &layout, support)?
+            }
+            PredicateTiming::AfterValues => pending,
+        };
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let merged = self.build(&pending, &layout)?;
+        Ok(Some(Built {
+            merged,
+            pending,
+            judged: layout.judged,
+            early: timing == PredicateTiming::BeforeValues,
+            left_out: layout.left_out,
+        }))
+    }
+
+    /// Whether `pick` is a merge operand in the batch it was taken from.
+    fn holds_operand(&self, pick: &Pick) -> bool {
+        self.sources
+            .get(pick.source)
+            .and_then(|s| s.batch.as_ref())
+            .and_then(value_types)
+            .and_then(|types| types.get(pick.row as usize))
+            .is_some_and(|&byte| is_operand(byte))
+    }
+
+    /// The chosen rows of `pending` the scan's filtering predicate keeps,
+    /// judged in the batches they were taken from, and every operand among
+    /// them when `keep_operands` leaves those to the judgement after their
+    /// values are read. How far it ran is counted when it judges every row.
+    fn judge(
+        &self,
+        scan: &ColumnarScan,
+        pending: Vec<Pick>,
+        keep_operands: bool,
+        layout: &Layout,
+        support: &mut PredicateSupport,
+    ) -> crate::Result<Vec<Pick>> {
+        let Some(pred) = scan.predicate.as_ref() else {
+            return Ok(pending);
+        };
+        if !keep_operands {
+            *support = (*support).min(pred.support(layout.type_of(pred.column_id)));
+        }
+        if pred.apply != PredicateApply::Filter {
+            return Ok(pending);
+        }
+        // Each batch a row is taken from, bound to the predicate once.
+        let matchers: Vec<Option<RowMatcher<'_>>> = self
+            .sources
+            .iter()
+            .map(|s| {
+                s.batch
+                    .as_ref()
+                    .filter(|_| s.referenced)
+                    .map(|b| pred.matcher(b))
+            })
+            .collect();
+        let seqno = pred.column_id == COL_SEQNO;
+        let mut kept = Vec::with_capacity(pending.len());
+        for pick in pending {
+            let matcher = matchers
+                .get(pick.source)
+                .and_then(Option::as_ref)
+                .ok_or(NOT_KEPT)?;
+            // A row is returned with its effective seqno, the one judged.
+            let keep = if seqno {
+                matcher.matches_cell(pick.row, &pick.eff.to_le_bytes())
+            } else {
+                matcher.matches(pick.row)
+            };
+            if keep || (keep_operands && self.holds_operand(&pick)) {
+                kept.push(pick);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The columns the chosen rows of `pending` are gathered into, checked
+    /// against every batch they were taken from.
     ///
     /// A loose column the chosen rows do not all carry under one type is left
-    /// out and named in the third result, for [`Self::fill_left_out`] to bring
-    /// back for the rows returned. Also returns whether the predicate can
-    /// judge the rows: `false` when its loose column is left out.
-    fn build(&self, pending: &[Pick]) -> crate::Result<(ColumnBatch, bool, Vec<u16>)> {
-        use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
-
-        const NOT_KEPT: Error =
-            Error::InvalidHeader("columnar_scan: a chosen row's batch was not kept");
+    /// out, for [`Self::fill_left_out`] to bring back for the rows returned;
+    /// the predicate cannot judge the rows when its loose column is left out.
+    fn layout(&self, pending: &[Pick]) -> crate::Result<Layout> {
         let batch_of = |pick: &Pick| self.sources.get(pick.source).and_then(|s| s.batch.as_ref());
         let template = pending.first().and_then(batch_of).ok_or(NOT_KEPT)?;
         let type_of = |batch: &ColumnBatch, id: u16| {
@@ -870,6 +955,24 @@ impl MergeStream {
                 ));
             }
         }
+        Ok(Layout {
+            heads,
+            places,
+            left_out,
+            judged,
+        })
+    }
+
+    /// The chosen rows as one batch laid out as `layout` says, in the order
+    /// they were chosen, each column built straight from the batches its rows
+    /// sit in: nothing is copied but the chosen cells. The seqno column is
+    /// written with each row's effective seqno, since the rows come from
+    /// segments with different bases.
+    fn build(&self, pending: &[Pick], layout: &Layout) -> crate::Result<ColumnBatch> {
+        use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
+
+        let Layout { heads, places, .. } = layout;
+        let batch_of = |pick: &Pick| self.sources.get(pick.source).and_then(|s| s.batch.as_ref());
         let count = pending.len();
         // A pick addresses a row of one of at most `TARGET_ROWS` rows chosen.
         let row_count = u32::try_from(count).map_err(|_| {
@@ -939,8 +1042,51 @@ impl MergeStream {
                 data,
             });
         }
-        Ok((ColumnBatch { row_count, columns }, judged, left_out))
+        Ok(ColumnBatch { row_count, columns })
     }
+}
+
+/// A chosen row's batch is gone before the output taking it was gathered.
+const NOT_KEPT: Error = Error::InvalidHeader("columnar_scan: a chosen row's batch was not kept");
+
+/// The columns an output batch of the merge is gathered into.
+struct Layout {
+    /// Each column's id and type, in the order the output carries them.
+    heads: Vec<(u16, TypeTag)>,
+    /// Where each source keeps the columns of `heads`, when a column left
+    /// out puts them at different places in different sources; `None` when
+    /// every source keeps them at the same places.
+    places: Option<Vec<Vec<usize>>>,
+    /// The loose columns left out (see [`MergeStream::fill_left_out`]).
+    left_out: Vec<u16>,
+    /// Whether the predicate can judge the rows: `false` when its loose
+    /// column is left out.
+    judged: bool,
+}
+
+impl Layout {
+    /// The type the output carries column `id` under, or `None` when it does
+    /// not carry it.
+    fn type_of(&self, id: u16) -> Option<TypeTag> {
+        self.heads
+            .iter()
+            .find(|&&(column_id, _)| column_id == id)
+            .map(|&(_, type_tag)| type_tag)
+    }
+}
+
+/// The output batch the chosen rows were gathered into, with what decided it.
+struct Built {
+    merged: ColumnBatch,
+    /// The chosen rows it holds, in its row order.
+    pending: Vec<Pick>,
+    /// Whether the predicate could judge the rows.
+    judged: bool,
+    /// Whether the predicate already ran on every row, before their values
+    /// were read.
+    early: bool,
+    /// The loose columns left out of it.
+    left_out: Vec<u16>,
 }
 
 /// What becomes of a whole-value source's value column when it moves under

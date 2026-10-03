@@ -90,7 +90,8 @@ use crate::table::columnar::{
     fixed_u64_row,
 };
 use crate::table::columnar_predicate::{
-    ColumnRangePredicate, PredicateApply, PredicateSupport, filter_batch,
+    ColumnRangePredicate, PredicateApply, PredicateSupport, filter_batch, take_column,
+    take_validity,
 };
 use crate::{Error, SeqNo, Table, Tree, UserKey};
 
@@ -693,32 +694,28 @@ const MISSING_BATCH_COLUMN: Error =
 /// Whether a row of `batch` is a merge operand; `false` for a batch without a
 /// value-type column.
 fn holds_operand(batch: &ColumnBatch) -> bool {
-    operand_rows(batch).into_iter().any(|operand| operand)
+    value_types(batch).is_some_and(|types| {
+        types
+            .iter()
+            .take(batch.row_count as usize)
+            .copied()
+            .any(is_operand)
+    })
 }
 
-/// Whether each row of `batch` is a merge operand; none is when the batch
-/// carries no value type.
-fn operand_rows(batch: &ColumnBatch) -> Vec<bool> {
-    let rows = batch.row_count as usize;
+/// The value-type cells of `batch`, one byte per row, or `None` for a batch
+/// without a value-type column.
+pub(super) fn value_types(batch: &ColumnBatch) -> Option<&[u8]> {
     batch
         .columns
         .iter()
         .find(|c| c.column_id == COL_VALUE_TYPE)
-        .map_or_else(
-            || vec![false; rows],
-            |types| {
-                let mut operands: Vec<bool> = types
-                    .data
-                    .iter()
-                    .take(rows)
-                    .map(|&byte| {
-                        crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand)
-                    })
-                    .collect();
-                operands.resize(rows, false);
-                operands
-            },
-        )
+        .map(|c| &*c.data)
+}
+
+/// Whether a value-type cell marks a merge operand.
+pub(super) fn is_operand(byte: u8) -> bool {
+    crate::ValueType::try_from(byte) == Ok(crate::ValueType::MergeOperand)
 }
 
 /// The visible range tombstones of a group, swept in the ascending key order
@@ -1153,20 +1150,28 @@ impl ColumnarScan {
         outcome.keys.sort_unstable();
         outcome.unreadable.sort_unstable();
 
+        // A key the read finds absent is not returned: the rows returned are
+        // the others, and only they are written below, once each.
+        let returned = |row: &u32| !matches!(resolved.get(*row as usize), Some(Some(None)));
+        let kept: Option<Vec<u32>> = resolved
+            .iter()
+            .any(|fix| matches!(fix, Some(None)))
+            .then(|| (0..row_count).filter(returned).collect());
+        let out_rows = kept.as_ref().map_or(rows, Vec::len);
         // The cells of bytes column `at` with the resolved rows' values in
         // place: a resolved row's cell is its value, the others as read.
         let rewrite = |at: usize| -> crate::Result<Column> {
             let old = column(at)?;
-            let mut cells: Vec<Option<&[u8]>> = Vec::with_capacity(rows);
-            for (row, fix) in (0..row_count).zip(&resolved) {
-                cells.push(match fix {
-                    Some(Some(value)) => Some(&**value),
+            let mut cells: Vec<Option<&[u8]>> = Vec::with_capacity(out_rows);
+            for row in (0..row_count).filter(returned) {
+                cells.push(match resolved.get(row as usize) {
+                    Some(Some(Some(value))) => Some(&**value),
                     _ if old.is_valid(row) => Some(bytes_column_row(&old.data, row_count, row)?),
                     _ => None,
                 });
             }
             let validity = cells.iter().any(Option::is_none).then(|| {
-                let mut bits = alloc::vec![0u8; rows.div_ceil(8)];
+                let mut bits = alloc::vec![0u8; out_rows.div_ceil(8)];
                 for (row, cell) in cells.iter().enumerate() {
                     if cell.is_some()
                         && let Some(byte) = bits.get_mut(row / 8)
@@ -1180,22 +1185,37 @@ impl ColumnarScan {
                 column_id: old.column_id,
                 type_tag: TypeTag::Bytes,
                 validity,
-                data: frame_bytes_column(rows, || cells.iter().map(|c| c.unwrap_or(&[])))?,
+                data: frame_bytes_column(out_rows, || cells.iter().map(|c| c.unwrap_or(&[])))?,
             })
         };
         let whole = rewrite(whole_at)?;
         let raw = raw_at.map(rewrite).transpose()?;
-        let types: Vec<u8> = kinds
-            .data
-            .iter()
-            .zip(&resolved)
-            .map(|(&byte, fix)| match fix {
-                Some(_) => u8::from(crate::ValueType::Value),
-                None => byte,
-            })
-            .collect();
+        let mut types: Vec<u8> = Vec::with_capacity(out_rows);
+        for row in (0..row_count).filter(returned) {
+            types.push(match resolved.get(row as usize) {
+                Some(Some(_)) => u8::from(crate::ValueType::Value),
+                _ => *kinds.data.get(row as usize).ok_or(MISSING_BATCH_COLUMN)?,
+            });
+        }
 
         let mut batch = batch;
+        if let Some(kept) = &kept {
+            for (at, slot) in batch.columns.iter_mut().enumerate() {
+                if at == whole_at || raw_at == Some(at) {
+                    continue;
+                }
+                if at == type_at {
+                    // Its cells are written above; only its nulls are gathered.
+                    slot.validity = slot
+                        .validity
+                        .as_deref()
+                        .map(|bits| take_validity(bits, kept));
+                    continue;
+                }
+                // Every other column keeps the rows returned, gathered once.
+                *slot = take_column(slot, rows, kept)?;
+            }
+        }
         if let Some(slot) = batch.columns.get_mut(whole_at) {
             *slot = whole;
         }
@@ -1207,16 +1227,8 @@ impl ColumnarScan {
         if let Some(slot) = batch.columns.get_mut(type_at) {
             slot.data = crate::Slice::from(types);
         }
-        // A key the read finds absent is not returned.
-        let batch = if resolved.iter().any(|fix| matches!(fix, Some(None))) {
-            let keep: Vec<bool> = resolved
-                .iter()
-                .map(|fix| !matches!(fix, Some(None)))
-                .collect();
-            filter_batch(&batch, &keep)?
-        } else {
-            batch
-        };
+        // A subset of the batch's rows, whose count is a u32.
+        batch.row_count = u32::try_from(out_rows).unwrap_or(row_count);
         self.record_gather(&batch);
         Ok((batch, outcome))
     }
@@ -1336,13 +1348,15 @@ impl ColumnarScan {
                     .is_some_and(|p| p.column_id == COL_VALUE))
     }
 
-    /// When the scan's predicate judges the decided rows of `batch`: before
-    /// their values are read where its column is one reading the values does
-    /// not change. The key and the seqno never change; a column no field
-    /// declares is the row's own physical cell, except on an operand still to
-    /// be resolved into a value read whole, which is judged after. A declared
-    /// field is read out of the value, so a predicate over one runs after.
-    pub(super) fn predicate_timing(&self, batch: &ColumnBatch) -> PredicateTiming {
+    /// When the scan's predicate judges the decided rows: before their values
+    /// are read where its column is one reading the values does not change.
+    /// The key and the seqno never change; a column no field declares is the
+    /// row's own physical cell, except on an operand still to be resolved
+    /// into a value read whole, which is judged after. A declared field is
+    /// read out of the value, so a predicate over one runs after.
+    /// `holds_operand` says whether a decided row is a merge operand, asked
+    /// only when the answer matters.
+    pub(super) fn predicate_timing(&self, holds_operand: impl FnOnce() -> bool) -> PredicateTiming {
         use crate::table::columnar::COL_SEQNO;
 
         let Some(pred) = &self.predicate else {
@@ -1360,35 +1374,11 @@ impl ColumnarScan {
             {
                 PredicateTiming::AfterValues
             }
-            _ if self.resolver.is_some() && holds_operand(batch) => {
+            _ if self.resolver.is_some() && holds_operand() => {
                 PredicateTiming::BeforeValuesExceptOperands
             }
             _ => PredicateTiming::BeforeValues,
         }
-    }
-
-    /// `batch` without the rows that are not merge operands and fail the
-    /// scan's filtering predicate: the plain rows it judges before their
-    /// values are read, the operands left to it after. How far it ran is
-    /// counted when it runs on every row.
-    pub(super) fn filter_plain_rows(&self, batch: ColumnBatch) -> crate::Result<ColumnBatch> {
-        let Some(pred) = self
-            .predicate
-            .as_ref()
-            .filter(|p| p.apply == PredicateApply::Filter)
-        else {
-            return Ok(batch);
-        };
-        let operands = operand_rows(&batch);
-        let mask: Vec<bool> = pred
-            .matching_rows(&batch)
-            .into_iter()
-            .zip(operands)
-            .map(|(matches, operand)| matches || operand)
-            .collect();
-        let filtered = filter_batch(&batch, &mask)?;
-        self.record_gather(&filtered);
-        Ok(filtered)
     }
 
     /// Applies the scan's predicate to `batch` after the dedup, when it filters,
@@ -1510,6 +1500,62 @@ impl ColumnarScan {
         #[cfg(feature = "metrics")]
         self.metrics.record_gather(len);
         Ok(())
+    }
+
+    /// The rows of `batch` that `mask` keeps, as the batch a singleton group
+    /// yields, or `None` when it keeps none: every column but the `dropped`
+    /// ones the scan decoded for itself, gathered once, with the seqno column
+    /// written in the tree's global space as it is gathered (see
+    /// [`Self::globalize_seqnos`]). The gather is charged.
+    fn gather_kept(
+        &self,
+        batch: &ColumnBatch,
+        mask: &[bool],
+        dropped: &[u16],
+        global: SeqNo,
+    ) -> crate::Result<Option<ColumnBatch>> {
+        let mut kept = Vec::with_capacity(mask.len());
+        for (row, &keep) in (0..batch.row_count).zip(mask) {
+            if keep {
+                kept.push(row);
+            }
+        }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        let rows = batch.row_count as usize;
+        let mut columns = Vec::with_capacity(batch.columns.len());
+        for col in batch
+            .columns
+            .iter()
+            .filter(|c| !dropped.contains(&c.column_id))
+        {
+            columns.push(if col.column_id == COL_SEQNO && global != 0 {
+                let mut data = Vec::with_capacity(kept.len() * 8);
+                for &row in &kept {
+                    let effective = fixed_u64_row(&col.data, row)?.checked_add(global).ok_or(
+                        Error::InvalidHeader("columnar_scan: effective seqno overflows"),
+                    )?;
+                    data.extend_from_slice(&effective.to_le_bytes());
+                }
+                crate::table::columnar::Column {
+                    column_id: col.column_id,
+                    type_tag: col.type_tag,
+                    validity: col
+                        .validity
+                        .as_deref()
+                        .map(|bits| take_validity(bits, &kept)),
+                    data: crate::Slice::from(data),
+                }
+            } else {
+                take_column(col, rows, &kept)?
+            });
+        }
+        // A subset of the batch's rows, whose count is a u32.
+        let row_count = u32::try_from(kept.len()).unwrap_or(batch.row_count);
+        let out = ColumnBatch { row_count, columns };
+        self.record_gather(&out);
+        Ok(Some(out))
     }
 
     /// Singleton group: no cross-segment merge. When every row is visible and the
@@ -1671,14 +1717,7 @@ impl ColumnarScan {
                 };
                 mask.push(keep);
             }
-            let mut visible = filter_batch(batch, &mask)?;
-            self.record_gather(&visible);
-            drop_columns(&mut visible, dropped);
-            if visible.row_count == 0 {
-                return Ok(None);
-            }
-            self.globalize_seqnos(&mut visible, global)?;
-            Ok(Some(visible))
+            self.gather_kept(batch, &mask, dropped, global)
         }
     }
 
@@ -1797,6 +1836,17 @@ impl ColumnarScan {
                 None
             };
 
+            // The predicate judges the deduped survivors only (see doc): a row
+            // is judged where it survives the dedup, into the same mask, so the
+            // rows are gathered once.
+            if let Some(pred) = &state.predicate {
+                *support = (*support).min(pred.support_in(batch));
+            }
+            let matcher = state
+                .predicate
+                .as_ref()
+                .filter(|p| p.apply == PredicateApply::Filter)
+                .map(|p| p.matcher(batch));
             let mut mask = Vec::with_capacity(batch.row_count as usize);
             for row in 0..batch.row_count {
                 let local = match seqno_col {
@@ -1856,21 +1906,14 @@ impl ColumnarScan {
                         continue;
                     }
                 }
-                mask.push(!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp));
+                mask.push(
+                    (!range_filter || key_in_bounds(key, &self.lo, &self.hi, cmp))
+                        && matcher.as_ref().is_none_or(|m| m.matches(row)),
+                );
             }
 
-            let visible = filter_batch(batch, &mask)?;
-            self.record_gather(&visible);
-            // The predicate runs on the deduped survivors only (see doc).
-            let mut visible =
-                self.filter_after_dedup(visible, state.predicate.as_ref(), support)?;
             // Match the singleton contract: yield exactly the projected columns.
-            drop_columns(&mut visible, &state.dropped);
-            if visible.row_count == 0 {
-                return Ok(None);
-            }
-            self.globalize_seqnos(&mut visible, global)?;
-            Ok(Some(visible))
+            self.gather_kept(batch, &mask, &state.dropped, global)
         }
     }
 }
