@@ -76,13 +76,53 @@ fn linked_blob_files_track_their_section_len_as_entries_register() {
         (3, "elderberry"),
         (5, "fig"),
     ] {
-        linked.register(file, 10, 7, &UserKey::from(key.as_bytes()));
+        linked.register(file, 10, 7, &UserKey::from(key.as_bytes()), true);
         let links: Vec<LinkedFile> = linked.files.values().cloned().collect();
         assert_eq!(linked.section_len(), encode_links(&links).len() as u64);
     }
     assert_eq!(linked.len(), 3);
     assert_eq!(linked.take().count(), 3);
     assert_eq!(linked.section_len(), 0);
+}
+
+/// A borrowed reference links its file without counting toward it: dropping
+/// the table charges a file only for the objects the table owns, while the
+/// link alone keeps the file from being removed or relocated under it.
+#[test]
+fn a_borrowed_reference_links_its_file_without_counts() {
+    let mut linked = LinkedBlobFiles::default();
+    linked.register(4, 100, 60, &UserKey::from("a"), false);
+    linked.register(4, 30, 20, &UserKey::from("b"), true);
+    linked.register(4, 100, 60, &UserKey::from("c"), false);
+    linked.register(8, 50, 40, &UserKey::from("d"), false);
+    let mut links: Vec<LinkedFile> = linked.take().collect();
+    links.sort_by_key(|link| link.blob_file_id);
+    assert_eq!(
+        links,
+        vec![
+            LinkedFile {
+                blob_file_id: 4,
+                bytes: 30,
+                on_disk_bytes: 20,
+                len: 1,
+                first_key: UserKey::from("a"),
+                last_key: UserKey::from("c"),
+            },
+            LinkedFile {
+                blob_file_id: 8,
+                bytes: 0,
+                on_disk_bytes: 0,
+                len: 0,
+                first_key: UserKey::from("d"),
+                last_key: UserKey::from("d"),
+            },
+        ]
+    );
+    // A borrowed-only record survives the section's round trip.
+    assert_eq!(
+        parse_linked_blob_files(&encode_links(&links)).ok(),
+        Some(links)
+    );
 }
 
 /// The records must fill the section: bytes left past the last record mean

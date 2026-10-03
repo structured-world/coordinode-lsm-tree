@@ -627,7 +627,35 @@ impl MultiWriter {
             u64::from(indirection.size),
             u64::from(indirection.vhandle.on_disk_size),
             key,
+            true,
         );
+    }
+
+    /// Records the blob files the cell row just written references, as
+    /// [`Self::register_blob`] does for an indirection: each owned reference
+    /// adds to its file's counts, each borrowed one only links the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `row` is not a well-formed cell row.
+    pub fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
+        debug_assert!(
+            self.current_key.is_some(),
+            "a cell row is registered after it is written"
+        );
+        let Some(key) = self.current_key.as_ref() else {
+            return Ok(());
+        };
+        for (indirection, owned) in crate::blob_tree::field_row::row_refs(row)? {
+            self.linked_blobs.register(
+                indirection.vhandle.blob_file_id,
+                u64::from(indirection.size),
+                u64::from(indirection.vhandle.on_disk_size),
+                key,
+                owned,
+            );
+        }
+        Ok(())
     }
 
     #[must_use]

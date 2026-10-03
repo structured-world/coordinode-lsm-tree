@@ -1369,6 +1369,22 @@ fn rewrite_block_indirections(
         }
         // A different key: the previous key's chain has ended.
         headless = None;
+        if entry.key.value_type == crate::ValueType::CellRow {
+            // A cell row loses its head the same way when any object it
+            // references is gone: a row with a missing field is not the row.
+            match rewrite_row_refs(&entry.value, rewrite)? {
+                RowRewrite::Unchanged => out.push(entry),
+                RowRewrite::Rewritten(row) => {
+                    entry.value = row.into();
+                    out.push(entry);
+                }
+                RowRewrite::Lost => {
+                    *dropped_entries += 1;
+                    headless = Some(entry.key.user_key);
+                }
+            }
+            continue;
+        }
         if entry.key.value_type != crate::ValueType::Indirection {
             out.push(entry);
             continue;
@@ -1408,14 +1424,74 @@ fn rewrite_block_indirections(
     Ok((out, headless))
 }
 
-/// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
-/// indirection entry in `entries`, with the entry's key. An entry TAGGED as an
-/// indirection whose value fails to decode is corrupt content the live read
-/// path could not follow either — the caller drops the block rather than
-/// laundering it into the recovered copy.
-fn collect_indirections(
-    entries: &[crate::InternalValue],
-) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
+/// What a [`BlobFileRewrite`] set does to one cell row.
+enum RowRewrite {
+    /// No reference names a rewritten file.
+    Unchanged,
+    /// Every reference into a rewritten file was remapped: the new row.
+    Rewritten(Vec<u8>),
+    /// A reference names a record that no longer exists.
+    Lost,
+}
+
+/// Applies a [`BlobFileRewrite`] set to the references of the cell row `row`,
+/// as [`rewrite_block_indirections`] applies it to an indirection.
+///
+/// # Errors
+///
+/// Returns an error if the row is malformed.
+fn rewrite_row_refs(
+    row: &[u8],
+    rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+) -> crate::Result<RowRewrite> {
+    use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
+
+    let mut cells = decode_row(row)?;
+    let mut changed = false;
+    for cell in &mut cells {
+        let RowCell::Ref { indirection, .. } = cell else {
+            continue;
+        };
+        match rewrite.get(&indirection.vhandle.blob_file_id) {
+            None => {}
+            Some(BlobFileRewrite::Remap { new_id, offsets }) => {
+                let Some(&relocation) = offsets.get(&indirection.vhandle.offset) else {
+                    return Ok(RowRewrite::Lost);
+                };
+                indirection.vhandle.blob_file_id = *new_id;
+                indirection.vhandle.offset = relocation.offset;
+                indirection.vhandle.on_disk_size = relocation.on_disk_size;
+                changed = true;
+            }
+            Some(BlobFileRewrite::DropBelow(frontier)) => {
+                if indirection.vhandle.offset < *frontier {
+                    return Ok(RowRewrite::Lost);
+                }
+            }
+        }
+    }
+    Ok(if changed {
+        RowRewrite::Rewritten(encode_row(&cells)?)
+    } else {
+        RowRewrite::Unchanged
+    })
+}
+
+/// One blob reference recovered from an entry: the entry's key, the
+/// reference, and whether the entry owns the object.
+type RecoveredRef = (
+    crate::UserKey,
+    crate::blob_tree::handle::BlobIndirection,
+    bool,
+);
+
+/// Decodes every blob reference in `entries`, with the entry's key: the
+/// [`crate::blob_tree::handle::BlobIndirection`] of an indirection entry, which
+/// owns its object, and each reference of a cell row with its owner bit. An
+/// entry TAGGED as either whose value fails to decode is corrupt content the
+/// live read path could not follow either — the caller drops the block rather
+/// than laundering it into the recovered copy.
+fn collect_indirections(entries: &[crate::InternalValue]) -> crate::Result<Vec<RecoveredRef>> {
     use crate::coding::Decode;
 
     let mut out = Vec::new();
@@ -1425,7 +1501,12 @@ fn collect_indirections(
             out.push((
                 entry.key.user_key.clone(),
                 crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?,
+                true,
             ));
+        } else if entry.key.value_type == crate::ValueType::CellRow {
+            for (ind, owned) in crate::blob_tree::field_row::row_refs(&entry.value)? {
+                out.push((entry.key.user_key.clone(), ind, owned));
+            }
         }
     }
     Ok(out)
@@ -1433,44 +1514,56 @@ fn collect_indirections(
 
 /// [`collect_indirections`] for a columnar batch: a cheap value-type-column
 /// scan first, so the per-row materialization is only paid when the batch
-/// actually holds indirections (KV-separated columnar sources are rare).
+/// actually holds blob references (KV-separated columnar sources are rare).
 #[cfg(feature = "columnar")]
 fn collect_columnar_indirections(
     batch: &crate::table::columnar::ColumnBatch,
-) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
-    let tag = u8::from(crate::ValueType::Indirection);
+) -> crate::Result<Vec<RecoveredRef>> {
+    let tags = [
+        u8::from(crate::ValueType::Indirection),
+        u8::from(crate::ValueType::CellRow),
+    ];
     // Columns are key / seqno / value-type / values...; the value-type column
     // holds one tag byte per row.
-    let has_indirections = batch.columns.get(2).is_some_and(|c| c.data.contains(&tag));
-    if !has_indirections {
+    let has_refs = batch
+        .columns
+        .get(2)
+        .is_some_and(|c| c.data.iter().any(|tag| tags.contains(tag)));
+    if !has_refs {
         return Ok(Vec::new());
     }
     let entries = crate::table::columnar::column_batch_to_entries(batch)?;
     collect_indirections(&entries)
 }
 
-/// Folds one block's recovered indirections into the walk's derived blob-link
-/// map, mirroring the accumulation the live write path does per entry. Blocks
-/// are folded in key order, so a blob file's first key is the first seen and
-/// its last key the latest.
+/// Folds one block's recovered references into the walk's derived blob-link
+/// map, mirroring the accumulation the live write path does per entry: an
+/// owned reference adds to its file's counts, a borrowed one only links the
+/// file. Blocks are folded in key order, so a blob file's first key is the
+/// first seen and its last key the latest.
 fn fold_blob_links(
     derived: &mut crate::HashMap<crate::vlog::BlobFileId, crate::table::writer::LinkedFile>,
-    indirections: &[(crate::UserKey, crate::blob_tree::handle::BlobIndirection)],
+    refs: &[RecoveredRef],
 ) {
-    for (key, ind) in indirections {
+    for (key, ind, owned) in refs {
+        let (len, bytes, on_disk_bytes) = if *owned {
+            (1, u64::from(ind.size), u64::from(ind.vhandle.on_disk_size))
+        } else {
+            (0, 0, 0)
+        };
         derived
             .entry(ind.vhandle.blob_file_id)
             .and_modify(|link| {
-                link.bytes += u64::from(ind.size);
-                link.on_disk_bytes += u64::from(ind.vhandle.on_disk_size);
-                link.len += 1;
+                link.bytes += bytes;
+                link.on_disk_bytes += on_disk_bytes;
+                link.len += len;
                 link.last_key.clone_from(key);
             })
             .or_insert_with(|| crate::table::writer::LinkedFile {
                 blob_file_id: ind.vhandle.blob_file_id,
-                bytes: u64::from(ind.size),
-                on_disk_bytes: u64::from(ind.vhandle.on_disk_size),
-                len: 1,
+                bytes,
+                on_disk_bytes,
+                len,
                 first_key: key.clone(),
                 last_key: key.clone(),
             });

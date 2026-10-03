@@ -145,6 +145,11 @@ pub struct Memtable {
     /// `AtBlockCompile` path). The per-node digest carries its own algorithm, so
     /// no memtable-wide algorithm is tracked here.
     has_at_insert_digests: AtomicBool,
+
+    /// Blob files the cell rows written here reference. Until this memtable
+    /// is flushed, no table links them for these rows, so a blob file listed
+    /// here is neither removed nor punched.
+    blob_refs: RwLock<crate::HashSet<crate::vlog::BlobFileId>>,
 }
 
 impl Memtable {
@@ -187,7 +192,36 @@ impl Memtable {
             highest_seqno: AtomicU64::default(),
             requested_rotation: AtomicBool::default(),
             has_at_insert_digests: AtomicBool::default(),
+            blob_refs: RwLock::new(crate::HashSet::default()),
         }
+    }
+
+    /// Records the blob files `item` references when it is a cell row.
+    ///
+    /// Every insert path calls this, so a row replayed from an external log
+    /// registers its files like a row written through
+    /// [`BlobTree::insert_cells`](crate::BlobTree::insert_cells). A row that
+    /// does not decode registers nothing: it fails at flush or read, which
+    /// decode it again.
+    fn note_blob_refs(&self, item: &InternalValue) {
+        if !item.key.value_type.is_cell_row() {
+            return;
+        }
+        let Ok(refs) = crate::blob_tree::field_row::row_refs(&item.value) else {
+            return;
+        };
+        if refs.is_empty() {
+            return;
+        }
+        let mut set = self.blob_refs.write();
+        for (indirection, _) in refs {
+            set.insert(indirection.vhandle.blob_file_id);
+        }
+    }
+
+    /// Whether a cell row in this memtable references `blob_file_id`.
+    pub(crate) fn references_blob_file(&self, blob_file_id: crate::vlog::BlobFileId) -> bool {
+        self.blob_refs.read().contains(&blob_file_id)
     }
 
     /// Creates an iterator over all items.
@@ -328,6 +362,7 @@ impl Memtable {
         }
 
         for item in items {
+            self.note_blob_refs(&item);
             let digest = kv_algo.and_then(|algo| {
                 crate::table::block::kv_checksum::kv_digest(&item, algo).map(|d| {
                     #[expect(
@@ -368,6 +403,8 @@ impl Memtable {
         let size_before = self
             .approximate_size
             .fetch_add(item_size, core::sync::atomic::Ordering::Relaxed);
+
+        self.note_blob_refs(&item);
 
         // `item.key` is borrowed and `item.value` moved: the key bytes are
         // copied into the arena, the value handle is stored as-is.
@@ -418,6 +455,8 @@ impl Memtable {
             self.has_at_insert_digests
                 .store(true, core::sync::atomic::Ordering::Relaxed);
         }
+
+        self.note_blob_refs(&item);
 
         self.items
             .insert_with_kv_digest(&item.key, item.value, kv_digest);

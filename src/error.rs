@@ -557,6 +557,14 @@ pub enum Error {
     /// A caller-side mismatch between the projection and the data, not damage.
     /// The payload names which of these it is.
     Projection(&'static str),
+
+    /// A row written as cells refers to a blob object it may not hold: a
+    /// [`BlobRef`](crate::blob_tree::field_row::BlobRef) read from another
+    /// key, or one object in two cells of the row.
+    ///
+    /// A caller-side error, refused before anything is written. The payload
+    /// names which of these it is.
+    BlobRef(&'static str),
 }
 
 impl core::fmt::Display for Error {

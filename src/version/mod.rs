@@ -709,10 +709,14 @@ impl Version {
     /// Returns a new version with a list of tables removed.
     ///
     /// The table files are not immediately deleted, this is handled by the version system's free list.
+    ///
+    /// `memtable_refs` reports whether a memtable row references a blob file,
+    /// which keeps that file whatever its counts say.
     pub fn with_dropped(
         &self,
         ids: &[TableId],
         dropped_blob_files: &mut Vec<BlobFile>,
+        memtable_refs: &dyn Fn(BlobFileId) -> bool,
         ctx: &TransformContext<'_>,
     ) -> crate::Result<Self> {
         let comparator = ctx.comparator;
@@ -776,8 +780,32 @@ impl Version {
         let value_log = if dropped_tables.is_empty() {
             self.blob_files.clone()
         } else {
+            // A dropped table charges only the objects it owns, so a file can
+            // look dead while a kept table or a memtable row still borrows an
+            // object in it: such a file stays until that reference goes.
+            let candidates: crate::HashSet<BlobFileId> = self
+                .blob_files
+                .iter()
+                .filter(|file| file.is_dead(&gc_stats))
+                .map(BlobFile::id)
+                .collect();
+            let mut linked = crate::HashSet::default();
+            if !candidates.is_empty() {
+                for table in levels
+                    .iter()
+                    .flat_map(|level| level.iter())
+                    .flat_map(|run| run.iter())
+                {
+                    for link in table.blob_links()? {
+                        if candidates.contains(&link.blob_file_id) {
+                            linked.insert(link.blob_file_id);
+                        }
+                    }
+                }
+            }
             let mut copy = self.blob_files.deref().clone();
-            dropped_blob_files.extend(copy.prune_dead(&gc_stats));
+            dropped_blob_files
+                .extend(copy.prune_dead(&gc_stats, |id| linked.contains(&id) || memtable_refs(id)));
             Arc::new(copy)
         };
 

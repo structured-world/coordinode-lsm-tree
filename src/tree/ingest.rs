@@ -290,6 +290,33 @@ impl<'a> Ingestion<'a> {
         Ok(())
     }
 
+    /// Writes an encoded cell row and links the blob files it references.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs or `row` is not a well-formed
+    /// cell row.
+    pub(crate) fn write_cell_row(&mut self, key: UserKey, row: &UserValue) -> crate::Result<()> {
+        if let Some(prev) = &self.last_key {
+            assert!(
+                self.tree.config.comparator.compare(prev, &key) == Ordering::Less,
+                "next key in ingestion must be ordered after last key by configured comparator"
+            );
+        }
+
+        self.write_row(crate::InternalValue::from_components(
+            key.clone(),
+            row.clone(),
+            self.seqno,
+            crate::ValueType::CellRow,
+        ))?;
+        self.writer.register_cell_row(row)?;
+
+        self.last_key = Some(key);
+
+        Ok(())
+    }
+
     /// Writes a key-value pair.
     ///
     /// # Errors

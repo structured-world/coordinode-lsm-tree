@@ -134,19 +134,30 @@ impl LinkedBlobFiles {
     /// Records that the table's entry at `key` points at a value of `bytes`
     /// (`on_disk_bytes` stored) in `blob_file_id`. Keys arrive in order, so
     /// the first key seen for a file is its first and the latest its last.
+    ///
+    /// Only an `owned` reference adds to the counts: the counts are what
+    /// dropping the table charges to the file, and an object is charged
+    /// through its owner alone. A borrowed one still links the file, which is
+    /// what keeps it from being removed or relocated under this table.
     pub(crate) fn register(
         &mut self,
         blob_file_id: BlobFileId,
         bytes: u64,
         on_disk_bytes: u64,
         key: &UserKey,
+        owned: bool,
     ) {
+        let (len, bytes, on_disk_bytes) = if owned {
+            (1, bytes, on_disk_bytes)
+        } else {
+            (0, 0, 0)
+        };
         match self.files.entry(blob_file_id) {
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 let link = entry.get_mut();
                 link.bytes += bytes;
                 link.on_disk_bytes += on_disk_bytes;
-                link.len += 1;
+                link.len += len;
                 // The record grows or shrinks by the change in its last key.
                 self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
                 link.last_key.clone_from(key);
@@ -157,7 +168,7 @@ impl LinkedBlobFiles {
                     blob_file_id,
                     bytes,
                     on_disk_bytes,
-                    len: 1,
+                    len,
                     first_key: key.clone(),
                     last_key: key.clone(),
                 });
@@ -280,13 +291,19 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
-/// One blob file a table references: how many of its values the table points
-/// at, their bytes, and the span of the table's keys that point there.
+/// One blob file a table references: how many of its objects the table owns,
+/// their bytes, and the span of the table's keys that point there.
+///
+/// A table whose rows only borrow objects of the file (cell-row references
+/// whose owner lives in another version) links it with zero counts.
 #[derive(Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
+    /// Bytes of the objects the table owns, before compression.
     pub bytes: u64,
+    /// Bytes of the objects the table owns, as stored.
     pub on_disk_bytes: u64,
+    /// Objects of the file the table owns.
     pub len: usize,
     /// The table's first key whose value lives in this blob file.
     pub first_key: UserKey,

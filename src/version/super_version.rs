@@ -746,6 +746,20 @@ impl SuperVersion {
             Err(below_retention(seqno, floor))
         }
     }
+
+    /// Whether a cell row in the active or a sealed memtable references
+    /// `blob_file_id`: such a row links the file from no table until its
+    /// flush, so the file must stay.
+    pub(crate) fn memtables_reference_blob_file(
+        &self,
+        blob_file_id: crate::vlog::BlobFileId,
+    ) -> bool {
+        self.active_memtable.references_blob_file(blob_file_id)
+            || self
+                .sealed_memtables
+                .iter()
+                .any(|memtable| memtable.references_blob_file(blob_file_id))
+    }
 }
 
 /// Kept out of line so the check inlined into every read stays a load and two

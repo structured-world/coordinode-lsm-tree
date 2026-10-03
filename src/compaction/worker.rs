@@ -1828,6 +1828,12 @@ fn run_tight_space_compaction(
             if let Some(sizing) = &filter_sizing {
                 sizing.release_replaced();
             }
+            // A stale file a memtable row still references keeps its whole
+            // view and is not punched: the row borrows an object the slice
+            // copied, and links the file from no table until it is flushed.
+            // Decided under the install's version lock, which orders the
+            // writes of such rows against this edit.
+            let mut unpunched: crate::HashSet<BlobFileId> = crate::HashSet::default();
             // Install one atomic, durable version edit for the slice.
             // A failed install commits nothing, so no sidecar was written (the
             // mark step below is strictly post-commit) and the punches never arm;
@@ -1835,6 +1841,16 @@ fn run_tight_space_compaction(
             opts.version_history.write().upgrade_version(
                 &opts.config.path,
                 |sv| {
+                    unpunched.extend(
+                        prior_to_punch
+                            .iter()
+                            .map(|(bf, _)| bf.id())
+                            .filter(|id| sv.memtables_reference_blob_file(*id)),
+                    );
+                    let new_blobs: Vec<BlobFile> = new_blobs
+                        .into_iter()
+                        .filter(|bf| !unpunched.contains(&bf.id()))
+                        .collect();
                     let mut copy = sv.clone();
                     let ctx = crate::version::TransformContext::new(comparator.as_ref());
                     copy.version = copy.version.with_tight_slice(
@@ -1945,7 +1961,9 @@ fn run_tight_space_compaction(
             // Arm each re-opened stale blob file's prior view to punch its
             // relocated `[data_start, frontier)` prefix once it drains.
             for (bf, off) in &prior_to_punch {
-                bf.mark_punch_on_drop(*off);
+                if !unpunched.contains(&bf.id()) {
+                    bf.mark_punch_on_drop(*off);
+                }
             }
 
             tables_out += outputs.len();
@@ -2313,6 +2331,7 @@ fn run_subcompaction(
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
                     opts.config.comparator.clone(),
+                    opts.tree_id,
                 )
                 .with_drain_below(drain_below),
             )
@@ -3422,6 +3441,7 @@ fn merge_tables(
                     opts.rate_limiter.clone(),
                     opts.stop_signal.clone(),
                     opts.config.comparator.clone(),
+                    opts.tree_id,
                 ))
             }
         }
@@ -3678,9 +3698,12 @@ fn drop_tables(
             let mut copy = current.clone();
 
             let ctx = crate::version::TransformContext::new(opts.config.comparator.as_ref());
-            copy.version = copy
-                .version
-                .with_dropped(ids_to_drop, &mut dropped_blob_files, &ctx)?;
+            copy.version = copy.version.with_dropped(
+                ids_to_drop,
+                &mut dropped_blob_files,
+                &|id| current.memtables_reference_blob_file(id),
+                &ctx,
+            )?;
 
             Ok(copy)
         },

@@ -129,6 +129,41 @@ impl<'a> BlobIngestion<'a> {
         }
     }
 
+    /// Writes `key` as a row of value cells, as
+    /// [`BlobTree::insert_cells`](crate::BlobTree::insert_cells) writes one
+    /// whose cells are all [`Cell::Value`](crate::blob_tree::field_row::Cell::Value):
+    /// each cell at or above the separation threshold goes to a blob file on
+    /// its own, and the row keeps a reference to it.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs, the row has more than
+    /// `u16::MAX` cells or a cell exceeds `u32::MAX` bytes.
+    pub fn write_cells(&mut self, key: UserKey, cells: &[&[u8]]) -> crate::Result<()> {
+        use crate::blob_tree::field_row::{RowCell, encode_row, separate_row};
+
+        // Check order before any blob I/O to avoid partial writes on failure
+        if let Some(prev) = &self.last_key {
+            assert!(
+                self.tree.index.config.comparator.compare(prev, &key) == Ordering::Less,
+                "next key in ingestion must be ordered after last key by configured comparator"
+            );
+        }
+
+        let row = encode_row(&cells.iter().map(|c| RowCell::Value(c)).collect::<Vec<_>>())?;
+        let row = separate_row(&row, self.separation_threshold, |bytes| {
+            self.blob.write(&key, self.seqno, bytes)
+        })?
+        .unwrap_or(row);
+
+        let cloned_key = key.clone();
+        let res = self.table.write_cell_row(key, &UserValue::from(row));
+        if res.is_ok() {
+            self.last_key = Some(cloned_key);
+        }
+        res
+    }
+
     /// Writes a tombstone for a key.
     ///
     /// # Errors
