@@ -809,12 +809,23 @@ impl MergeStream {
         if pending.is_empty() {
             return Ok(None);
         }
-        let merged = self.build(&pending, &layout)?;
+        let early = timing == PredicateTiming::BeforeValues;
+        // The columns the merge decoded for itself leave the output once its
+        // rows are decided. Read again after the gather only to read the
+        // values, to bring back a column left out, to check a row taken from
+        // a batch of another type, or by a predicate judging after the
+        // values; otherwise they are not gathered at all.
+        let reread = self.late
+            || !layout.left_out.is_empty()
+            || (!early && scan.predicate.is_some())
+            || pending.iter().any(|pick| self.taken_from_mistyped(pick));
+        let skip: &[u16] = if reread { &[] } else { &self.dropped };
+        let merged = self.build(&pending, &layout, skip)?;
         Ok(Some(Built {
             merged,
             pending,
             judged: layout.judged,
-            early: timing == PredicateTiming::BeforeValues,
+            early,
             left_out: layout.left_out,
         }))
     }
@@ -964,12 +975,12 @@ impl MergeStream {
         })
     }
 
-    /// The chosen rows as one batch laid out as `layout` says, in the order
-    /// they were chosen, each column built straight from the batches its rows
-    /// sit in: nothing is copied but the chosen cells. The seqno column is
-    /// written with each row's effective seqno, since the rows come from
-    /// segments with different bases.
-    fn build(&self, pending: &[Pick], layout: &Layout) -> crate::Result<ColumnBatch> {
+    /// The chosen rows as one batch laid out as `layout` says, without the
+    /// `skip` columns, in the order they were chosen, each column built
+    /// straight from the batches its rows sit in: nothing is copied but the
+    /// chosen cells. The seqno column is written with each row's effective
+    /// seqno, since the rows come from segments with different bases.
+    fn build(&self, pending: &[Pick], layout: &Layout, skip: &[u16]) -> crate::Result<ColumnBatch> {
         use crate::table::columnar::{Column, frame_bytes_column, gather_fixed_column};
 
         let Layout { heads, places, .. } = layout;
@@ -990,6 +1001,9 @@ impl MergeStream {
         };
         let mut columns = Vec::with_capacity(heads.len());
         for (index, &(column_id, type_tag)) in heads.iter().enumerate() {
+            if skip.contains(&column_id) {
+                continue;
+            }
             let data = if column_id == COL_SEQNO {
                 let mut out = Vec::with_capacity(count * 8);
                 for pick in pending {
