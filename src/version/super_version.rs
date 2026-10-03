@@ -311,6 +311,11 @@ pub struct SuperVersions {
     /// load: every version this history publishes updates the filter bytes
     /// it holds.
     filter_budget: Option<Arc<crate::filter_budget::FilterBudget>>,
+
+    /// The blob objects installs released, for the references reads handed
+    /// out before them. Reads register under this history's read lock and
+    /// installs record under its write lock.
+    released: Arc<crate::blob_tree::released::ReleasedObjects>,
 }
 
 impl SuperVersions {
@@ -351,7 +356,14 @@ impl SuperVersions {
             log_entry_synced: false,
             edit_scratch: Vec::new(),
             filter_budget: None,
+            released: Arc::default(),
         }
+    }
+
+    /// The blob objects installs released, for the references reads handed
+    /// out before them (see [`crate::blob_tree::released`]).
+    pub(crate) fn released(&self) -> &Arc<crate::blob_tree::released::ReleasedObjects> {
+        &self.released
     }
 
     /// Makes every version this history publishes, the current one first,

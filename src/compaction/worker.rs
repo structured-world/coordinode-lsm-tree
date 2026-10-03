@@ -1659,6 +1659,7 @@ fn run_tight_space_compaction(
             let mut new_blobs: Vec<BlobFile> = produced.created_blob_files().to_vec();
             let frag = produced.blob_frag_map().clone();
             let gc_diff = if frag.is_empty() { None } else { Some(frag) };
+            let released_objects = produced.released_objects().to_vec();
 
             // Advance the cumulative frontier from this slice's relocation, then
             // release `produced` (and its clones of the stale Inners) so the prior
@@ -1837,7 +1838,8 @@ fn run_tight_space_compaction(
             // A failed install commits nothing, so no sidecar was written (the
             // mark step below is strictly post-commit) and the punches never arm;
             // the run removes the slice's outputs as it returns.
-            opts.version_history.write().upgrade_version(
+            let mut history = opts.version_history.write();
+            history.upgrade_version(
                 &opts.config.path,
                 |sv| {
                     unpunched.extend(
@@ -1872,6 +1874,13 @@ fn run_tight_space_compaction(
                 // punched input prefix: older snapshots lose both.
                 crate::version::RetentionEffect::GcBelow(opts.gc_watermark),
             )?;
+            // Still under the write lock that published the slice: a reference
+            // read from an older version names an object the slice let go of.
+            if !released_objects.is_empty() {
+                let published = history.latest_version().version.id();
+                history.released().record(published, released_objects, []);
+            }
+            drop(history);
             // The version names this slice's outputs now: a later slice's failure
             // must not remove them.
             opts.outputs.installed();
@@ -2398,13 +2407,14 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    let blob_frag_map = ledger
+    let (blob_frag_map, released_objects) = ledger
         .into_inner()
         .finish(&mut |row| compactor.write(row))?;
     if let Some(e) = ledger_error.into_inner() {
         return Err(e);
     }
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
+    produced.set_released_objects(released_objects);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }
@@ -3587,7 +3597,7 @@ fn merge_tables(
     })?;
 
     // The rows the ledger still holds go out before the outputs are finished.
-    let blob_frag_map = ledger
+    let (blob_frag_map, released_objects) = ledger
         .into_inner()
         .finish(&mut |row| compactor.write(row))?;
     if let Some(e) = ledger_error.into_inner() {
@@ -3636,6 +3646,7 @@ fn merge_tables(
                 .hidden_set_mut()
                 .show(payload.table_ids.iter().copied());
         })?;
+    produce_output.set_released_objects(released_objects);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
     }
@@ -3756,6 +3767,24 @@ fn drop_tables(
         // install is servable.
         crate::version::RetentionEffect::DropsData,
     )?;
+
+    // Still under the write lock that published the drop: the dropped tables
+    // charged the objects they owned, by file, so a reference into one of
+    // those files read before the drop is stale.
+    let mut released_files = Vec::new();
+    for table in &tables {
+        for link in table.blob_links()? {
+            if link.len > 0 && !released_files.contains(&link.blob_file_id) {
+                released_files.push(link.blob_file_id);
+            }
+        }
+    }
+    if !released_files.is_empty() {
+        let published = version_history_lock.latest_version().version.id();
+        version_history_lock
+            .released()
+            .record(published, [], released_files);
+    }
 
     drop(version_history_lock);
 

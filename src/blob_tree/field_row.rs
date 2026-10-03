@@ -84,16 +84,23 @@ use crate::{Error, UserKey, vlog::BlobFileId};
 
 /// A blob object a key holds, named by where its frame sits.
 ///
-/// Obtained from the reference-aware projection of a row and written back in
-/// a [`Cell::Ref`] to keep the object in a newer version of the same key. It
-/// stays bound to that key: a write under any other key refuses it.
-#[derive(Clone, Debug)]
-pub struct BlobRef {
+/// Borrowed from the [`RowCells`] of a reference-aware read and written back
+/// in a [`Cell::Ref`] to keep the object in a newer version of the same key.
+/// It stays bound to that key, to the tree it was read from and to the
+/// version the read saw: a write under any other key, into any other tree,
+/// or after that version's owner of the object was let go, refuses it. Blob
+/// file numbers are local to a tree, so the tree is part of what the
+/// reference names, and the borrow keeps the read that vouches for it alive.
+#[derive(Clone, Copy, Debug)]
+pub struct BlobRef<'a> {
     pub(crate) indirection: BlobIndirection,
-    pub(crate) key: UserKey,
+    pub(crate) key: &'a [u8],
+    pub(crate) tree: crate::TreeId,
+    /// The version the read that handed the reference out saw.
+    pub(crate) source: u64,
 }
 
-impl BlobRef {
+impl BlobRef<'_> {
     /// The blob file the object is stored in.
     #[must_use]
     pub fn blob_file_id(&self) -> BlobFileId {
@@ -107,32 +114,55 @@ impl BlobRef {
     }
 }
 
-impl PartialEq for BlobRef {
+impl PartialEq for BlobRef<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.indirection.vhandle == other.indirection.vhandle
     }
 }
 
-impl Eq for BlobRef {}
+impl Eq for BlobRef<'_> {}
 
 /// One cell of a row written as cells.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell<'a> {
     /// The cell's bytes. A cell at or above its tree's separation threshold
     /// is stored in a blob file when the row is flushed.
     Value(&'a [u8]),
     /// An object the key already holds, kept without rewriting its bytes.
-    Ref(BlobRef),
+    Ref(BlobRef<'a>),
 }
 
 /// A stored row's cells as written: value cells with their bytes, and every
 /// reference as a [`BlobRef`], without reading any object.
 ///
+/// It holds the version the read saw: while it lives, every object it
+/// references stays readable through [`Self::resolve`], whatever relocation
+/// or garbage collection does in the meantime, and the references it hands
+/// out stay writable unless a later version let their object go.
+///
 /// Returned by [`BlobTree::get_cells`](crate::BlobTree::get_cells).
-#[derive(Clone, Debug)]
 pub struct RowCells {
     pub(crate) key: UserKey,
     pub(crate) row: crate::Slice,
+    /// The tree the row was read from.
+    pub(crate) tree: crate::TreeId,
+    /// The version the read saw, kept for resolving the row's objects.
+    pub(crate) version: crate::version::SuperVersion,
+    /// Where the row's objects are read from.
+    pub(crate) source: super::BlobSource,
+    /// The read's registration, which keeps the releases newer than its
+    /// version on record for as long as the references are held.
+    pub(crate) token: super::released::ReaderToken,
+}
+
+impl core::fmt::Debug for RowCells {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RowCells")
+            .field("key", &self.key)
+            .field("tree", &self.tree)
+            .field("version", &self.token.version())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RowCells {
@@ -149,10 +179,39 @@ impl RowCells {
                 RowCell::Value(bytes) => Cell::Value(bytes),
                 RowCell::Ref { indirection, .. } => Cell::Ref(BlobRef {
                     indirection,
-                    key: self.key.clone(),
+                    key: &self.key,
+                    tree: self.tree,
+                    source: self.token.version(),
                 }),
             })
             .collect())
+    }
+
+    /// The bytes of the cell at `position`: its own for a value cell, its
+    /// object's for a reference, read through the version the read saw. Only
+    /// that object is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored row is malformed, has no cell at
+    /// `position`, or the object cannot be read.
+    pub fn resolve(&self, position: usize) -> crate::Result<crate::Slice> {
+        let cells = decode_row(&self.row)?;
+        match cells.get(position) {
+            None => Err(Error::BlobRef("no cell at that position")),
+            Some(RowCell::Value(bytes)) => Ok(crate::Slice::from(*bytes)),
+            Some(RowCell::Ref { indirection, .. }) => {
+                let object = self
+                    .source
+                    .object(&self.version.version, &self.key, indirection)?;
+                if object.len() != indirection.size as usize {
+                    return Err(Error::InvalidHeader(
+                        "field row: referenced object differs from its recorded size",
+                    ));
+                }
+                Ok(object)
+            }
+        }
     }
 }
 

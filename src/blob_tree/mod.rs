@@ -6,6 +6,7 @@ pub mod field_row;
 mod gc;
 pub mod handle;
 pub mod ingest;
+pub(crate) mod released;
 
 #[doc(hidden)]
 pub use gc::{FragmentationEntry, FragmentationMap};
@@ -184,6 +185,31 @@ impl BlobSource {
             item,
         )
         .map(|(_, value)| value)
+    }
+
+    /// The object `indirection` names under `key`, read from `version`'s blob
+    /// files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object cannot be read, or `version` holds no
+    /// such object: a reference that names nothing is damage, never an empty
+    /// value.
+    pub(crate) fn object(
+        &self,
+        version: &Version,
+        key: &[u8],
+        indirection: &BlobIndirection,
+    ) -> crate::Result<UserValue> {
+        Accessor::new(
+            &version.blob_files,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        )
+        .get(self.tree_id, key, &indirection.vhandle, &self.cache)?
+        .ok_or(crate::Error::InvalidHeader(
+            "field row: a referenced object is missing from its blob file",
+        ))
     }
 }
 
@@ -466,7 +492,10 @@ impl BlobTree {
             row.push(match cell {
                 field_row::Cell::Value(bytes) => field_row::RowCell::Value(bytes),
                 field_row::Cell::Ref(reference) => {
-                    if !crate::comparator::same_user_key(&reference.key, &key) {
+                    if reference.tree != self.id() {
+                        return Err(crate::Error::BlobRef("reference read from another tree"));
+                    }
+                    if !crate::comparator::same_user_key(reference.key, &key) {
                         return Err(crate::Error::BlobRef("reference read from another key"));
                     }
                     // Written back by a caller, a reference never owns its
@@ -489,11 +518,12 @@ impl BlobTree {
             }
         }
         let value = field_row::encode_row(&row)?;
-        let indirections: Vec<BlobIndirection> =
-            refs.map(|reference| reference.indirection).collect();
+        let sourced: Vec<(BlobIndirection, u64)> = refs
+            .map(|reference| (reference.indirection, reference.source))
+            .collect();
         self.index.append_cell_row(
             InternalValue::from_components(key, value, seqno, crate::ValueType::CellRow),
-            &indirections,
+            &sourced,
         )
     }
 
@@ -535,7 +565,21 @@ impl BlobTree {
         key: K,
         seqno: SeqNo,
     ) -> crate::Result<Option<field_row::RowCells>> {
-        let Some(item) = self.index.get_internal_entry(key.as_ref(), seqno)? else {
+        // The version and the read's registration are taken together, under
+        // the history's read lock: an install records its releases under the
+        // write lock, so none newer than this version can go unrecorded.
+        let history = self.index.version_history.read();
+        let version = history.latest_version_ref().clone();
+        version.check_serves(seqno)?;
+        let token = history.released().register(version.version.id());
+        drop(history);
+        let Some(item) = crate::Tree::get_internal_entry_from_version(
+            &version,
+            key.as_ref(),
+            seqno,
+            self.index.config.comparator.as_ref(),
+        )?
+        else {
             return Ok(None);
         };
         if !item.key.value_type.is_cell_row() {
@@ -544,6 +588,10 @@ impl BlobTree {
         Ok(Some(field_row::RowCells {
             key: item.key.user_key,
             row: item.value,
+            tree: self.id(),
+            version,
+            source: self.blob_source(),
+            token,
         }))
     }
 

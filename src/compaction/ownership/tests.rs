@@ -44,7 +44,7 @@ fn run(
             Err(dropped) => ledger.dropped(&dropped).unwrap(),
         }
     }
-    let frag = ledger
+    let (frag, _) = ledger
         .finish(&mut |row| {
             written.push(row);
             Ok(())

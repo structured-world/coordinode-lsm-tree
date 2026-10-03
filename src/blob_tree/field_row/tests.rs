@@ -133,7 +133,9 @@ fn an_object_of_another_size_is_an_error() {
 fn references_to_one_frame_are_equal() {
     let at = |offset| BlobRef {
         indirection: indirection(2, offset, 9),
-        key: crate::UserKey::from("k"),
+        key: b"k",
+        tree: 0,
+        source: 0,
     };
     assert_eq!(at(128), at(128));
     assert_ne!(at(128), at(256));

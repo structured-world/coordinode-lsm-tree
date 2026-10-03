@@ -430,6 +430,10 @@ pub(super) struct ProducedOutput {
     /// installed or dropped: the budget keeps the room its filters take until
     /// then (see [`crate::filter_budget::FilterSizing::release_replaced`]).
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    /// The cell-row objects this output charged as garbage, recorded at the
+    /// install for the references read before it (see
+    /// [`crate::blob_tree::released`]).
+    released_objects: Vec<crate::vlog::ValueHandle>,
 }
 
 #[cfg_attr(
@@ -478,6 +482,17 @@ impl ProducedOutput {
         self.collected_below_watermark = true;
     }
 
+    /// Records the cell-row objects the run charged as garbage (called by the
+    /// producer, which owns the ownership ledger).
+    pub(super) fn set_released_objects(&mut self, objects: Vec<crate::vlog::ValueHandle>) {
+        self.released_objects = objects;
+    }
+
+    /// The cell-row objects the run charged as garbage.
+    pub(super) fn released_objects(&self) -> &[crate::vlog::ValueHandle] {
+        &self.released_objects
+    }
+
     /// Builds the output for a merge-on-read relocation: the `created` segment
     /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
     /// `deleted` source segment, with no blob files and no fragmentation. Lets
@@ -503,6 +518,7 @@ impl ProducedOutput {
             collected_below_watermark: true,
             // The source's filter is reused verbatim, not sized again.
             filter_sizing: None,
+            released_objects: Vec::new(),
         }
     }
 }
@@ -549,7 +565,9 @@ pub(super) fn install_merge(
     // keeps the outputs' room until then.
     let mut filter_sizings = Vec::new();
 
+    let mut released_objects = Vec::new();
     for out in outputs {
+        released_objects.extend(out.released_objects);
         filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
@@ -689,6 +707,14 @@ pub(super) fn install_merge(
     )?;
     // The version names the outputs now, so the run must not remove them.
     opts.outputs.installed();
+    // Still under the write lock that published the version: a reference read
+    // from an older version names an object this run let go of.
+    if !released_objects.is_empty() {
+        let published = super_version.latest_version().version.id();
+        super_version
+            .released()
+            .record(published, released_objects, []);
+    }
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -1186,6 +1212,8 @@ impl CompactionFlavour for RelocatingCompaction {
             filter_transformed: false,
             collected_below_watermark: false,
             filter_sizing,
+            // The producer owns the ownership ledger and sets this after.
+            released_objects: Vec::new(),
         })
     }
 }
@@ -1306,6 +1334,8 @@ impl CompactionFlavour for StandardCompaction {
             filter_transformed: false,
             collected_below_watermark: false,
             filter_sizing,
+            // The producer owns the ownership ledger and sets this after.
+            released_objects: Vec::new(),
         })
     }
 }

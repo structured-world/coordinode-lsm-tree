@@ -34,6 +34,9 @@ pub struct OwnershipLedger {
     orphans: Vec<BlobIndirection>,
     /// Rows of closed groups, settled and waiting to be written, in order.
     ready: Vec<InternalValue>,
+    /// The cell-row objects charged as garbage, which references read before
+    /// this compaction must no longer be written back.
+    released: Vec<crate::vlog::ValueHandle>,
 }
 
 impl OwnershipLedger {
@@ -103,6 +106,7 @@ impl OwnershipLedger {
         for orphan in core::mem::take(&mut self.orphans) {
             if !adopt(&mut kept, &orphan)? {
                 self.frag.charge(&orphan);
+                self.released.push(orphan.vhandle);
             }
         }
         self.ready.append(&mut kept);
@@ -110,7 +114,7 @@ impl OwnershipLedger {
     }
 
     /// Ends the compaction: writes the rows still held and hands back the
-    /// accounting.
+    /// accounting with the cell-row objects it charged.
     ///
     /// # Errors
     ///
@@ -119,12 +123,12 @@ impl OwnershipLedger {
     pub fn finish(
         mut self,
         write: &mut dyn FnMut(InternalValue) -> crate::Result<()>,
-    ) -> crate::Result<FragmentationMap> {
+    ) -> crate::Result<(FragmentationMap, Vec<crate::vlog::ValueHandle>)> {
         self.close()?;
         for row in self.ready.drain(..) {
             write(row)?;
         }
-        Ok(self.frag)
+        Ok((self.frag, self.released))
     }
 }
 

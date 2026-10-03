@@ -5135,15 +5135,17 @@ impl Tree {
     /// [`crate::Error::BlobRef`] when a reference names a blob file the current
     /// version no longer holds, or a frame before that file's live start: a
     /// relocation has moved it, and the key's latest version names the copy.
+    /// Also when its object was released after the version it was read from
+    /// (each reference comes with that version's id).
     pub(crate) fn append_cell_row(
         &self,
         value: InternalValue,
-        refs: &[crate::blob_tree::handle::BlobIndirection],
+        refs: &[(crate::blob_tree::handle::BlobIndirection, u64)],
     ) -> crate::Result<(u64, u64)> {
         let kv_digest = self.insert_digest(&value);
         let history = self.version_history.read();
         let latest = history.latest_version_ref();
-        for reference in refs {
+        for (reference, source) in refs {
             let held = latest
                 .version
                 .blob_files
@@ -5152,6 +5154,16 @@ impl Tree {
             if !held {
                 return Err(crate::Error::BlobRef(
                     "stale reference: the object has moved, read the key again",
+                ));
+            }
+            // An object let go of since the read: writing it back would make
+            // this row hold what the accounting already charged as garbage.
+            if history
+                .released()
+                .released_since(*source, &reference.vhandle)
+            {
+                return Err(crate::Error::BlobRef(
+                    "stale reference: the object was released, read the key again",
                 ));
             }
         }
