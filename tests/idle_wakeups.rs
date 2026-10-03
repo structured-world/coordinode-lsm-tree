@@ -12,7 +12,7 @@ use test_log::test;
 
 /// Voluntary context switches of the whole process so far: each is a sleep
 /// some thread went into.
-fn process_wakeups() -> i64 {
+fn process_wakeups() -> libc::c_long {
     let mut usage = core::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `getrusage` fills the struct it is handed and nothing else.
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };

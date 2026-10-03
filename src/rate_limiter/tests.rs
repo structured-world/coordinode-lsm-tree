@@ -410,7 +410,7 @@ fn a_retune_stamped_before_the_last_refill_grants_no_phantom_credit() {
 /// Voluntary context switches of the calling thread so far: each is a sleep
 /// the thread went into.
 #[cfg(target_os = "linux")]
-fn thread_wakeups() -> i64 {
+fn thread_wakeups() -> libc::c_long {
     let mut usage = core::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: `getrusage` fills the struct it is handed and nothing else;
     // `RUSAGE_THREAD` names the calling thread (Linux).
