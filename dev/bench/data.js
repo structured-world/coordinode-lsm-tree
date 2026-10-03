@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791012894134,
+  "lastUpdate": 1791048200552,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -29786,6 +29786,90 @@ window.BENCHMARK_DATA = {
             "value": 267524.7068630796,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 23.9us | P99.9: 105.3us\nthreads: 1 | elapsed: 0.75s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c4b52df3a10aa92747c7337ef9bafd5b83a30c4d",
+          "message": "ci(bench): fit the Benchmark workflow in 30 minutes (#814)\n\n## Summary\n- The whole `Benchmark` workflow fits in 30 minutes on the bench runner\nwith a warm cache; each bench step has its own limit, so an overrun\nfails at the bench that caused it.\n- The App tokens are issued after the benches, so the workflow's length\nno longer decides whether its results publish.\n\n## Changes\n- `.github/scripts/build-benchmarks.sh`: db_bench, db_bench with\n`counters` (own target dir) and the compare-rocksdb harness build side\nby side before anything measures.\n- `compare-rocksdb`: each warm-read and overwrite starting state\n(written and flushed key set) is written once per engine, codec, index\nstrategy and size, and copied per arm and per overwrite iteration. The\ntimed window is unchanged; SurrealKV keeps its own populate.\n- `compare-rocksdb`: `write_throughput_zstd22` and `overwrite_zstd22`\nstop at 10k per push; their 70k arms (~50 s an iteration for RocksDB,\neleven iterations at Criterion's floor) run with `COMPARE_FULL_MATRIX=1`\nor the dispatch input `full-matrix`.\n- Workflow: job limit 30 min (60 with the full matrix), per-step limits\non both bench steps, one token for the db_bench stores and one for the\ncompare publish, rust-cache saved on failure too.\n- A host that cannot build RocksDB still publishes the db_bench trend:\nthe libclang check and the build step defer their failure to the\nhead-to-head step.\n- The second commit runs this workflow on pushes to this branch and\npublishes its compare snapshot like a dispatch; it is reverted before\nmerge.\n\n## Step times on the bench runner (runner1-sw)\n\n| Step | Before (main @ f8b805b5, run 37106284979) | After |\n|---|---|---|\n| Run benchmarks (db_bench, incl. two builds) | 8m 06s | pending |\n| Run compare-rocksdb head-to-head (incl. build) | 51m 43s | pending |\n| Whole job | 61m 16s (failed at publish) | pending |\n\nBefore, by compare group: `overwrite_zstd22` 24m 53s,\n`write_throughput_zstd22` 12m 45s, the four zstd-22 warm-read groups 1m\n16s to 1m 40s each (~47 s of each the RocksDB 70k populate), all `None`\ngroups 4m 32s, compaction groups 59s, build 2m 50s.\n\n## Dashboard series\n- `dev/bench`: no series renamed or redefined; db_bench runs the same\nworkloads with the same flags.\n- `dev/compare`: same group and arm names;\n`write_throughput_zstd22/*/70000` and `overwrite_zstd22/*/70000` are\nabsent per push. Seeded arms measure the same timed window on the same\non-disk state; checked against the before run below.\n\n## Testing\n- Engine gates on Linux: nextest (default and all features), clippy\n(both), doc tests, `cargo doc`, no-std check, sst-dump.\n- compare-rocksdb: clippy `-D warnings`, the parallel build script, a\nsmoke run of every seeded engine; actionlint and shellcheck clean.\n\nPart of #678\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Benchmark runs can now use a full test matrix when requested,\nincluding additional cold-write and overwrite scenarios.\n* Benchmark reports include RocksDB comparison results for supported\nruns.\n* **Improvements**\n* Benchmark binaries are built before tests run, and independent builds\nrun concurrently to streamline setup.\n* Benchmark runs have adjusted time limits, with more time available for\nfull-matrix runs.\n* Comparison benchmarks reuse consistent starting data for more\ncomparable results.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-03T20:03:24+03:00",
+          "tree_id": "6548609987a56edff4e64c3450ad5d380a053cec",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/c4b52df3a10aa92747c7337ef9bafd5b83a30c4d"
+        },
+        "date": 1791048199086,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 109036.62063821049,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 21.6us | P99.9: 49.1us\nthreads: 1 | elapsed: 4.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1559331.2318382254,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.6us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.13s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 650330.4989350545,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.0us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 398536.87468709995,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.8us | P99.9: 38.2us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2379005.816086364,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 251133.5171849165,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.6us | P99.9: 21.0us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 131901.17612763587,
+            "unit": "ops/sec",
+            "extra": "P50: 6.5us | P99: 16.3us | P99.9: 31.8us\nthreads: 1 | elapsed: 1.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 569852.8160497814,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 4.2us | P99.9: 18.9us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 666636.5502494483,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 2.1us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 326673.9610457668,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 20.4us | P99.9: 86.7us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
