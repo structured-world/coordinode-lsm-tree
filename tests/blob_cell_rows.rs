@@ -598,6 +598,53 @@ fn a_relocation_copies_an_object_its_versions_share_once() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// A relocation rewrites only the references into the files it relocates: a
+/// row holding one reference into a relocated file and one into a file that
+/// stays has only the first moved, and a row holding references only into
+/// files that stay is written as it was.
+#[test]
+fn a_relocation_moves_only_references_into_the_files_it_relocates() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().age_cutoff(1.0),
+    )?;
+    let body = vec![b'b'; 4_096];
+    stale_file_with_a_body(&tree, &body)?;
+
+    // A second blob file, with no garbage: the next pass does not relocate it.
+    let notes = vec![b'n'; 4_096];
+    let other = vec![b'o'; 4_096];
+    let row = row_of(&tree, "doc")?;
+    tree.insert_cells(
+        "doc",
+        &[
+            Field::bytes(STATUS, b"final"),
+            reference(&row, BODY)?,
+            Field::bytes(BODY + 1, &notes),
+        ],
+        2,
+    )?;
+    drop(row);
+    tree.insert_cells("other", &bytes(&[b"draft", &other]), 2)?;
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 2);
+
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.stale_blob_bytes(), 0, "the stale file was relocated");
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body, &notes])[..]),
+        "the moved and the kept reference both read",
+    );
+    assert_eq!(
+        tree.get("other", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"draft", &other])[..]),
+        "a row with no reference into the relocated file reads as written",
+    );
+    Ok(())
+}
+
 /// A row in the memtable that borrows an object keeps its blob file through a
 /// relocation that moves every table's reference out of it: no table links
 /// the file for that row until it is flushed.
@@ -936,6 +983,40 @@ fn each_column_separates_at_its_own_threshold() -> lsm_tree::Result<()> {
         tree.get("doc", SeqNo::MAX)?.as_deref(),
         Some(&framed(&[&large, b"tiny", &large])[..])
     );
+    Ok(())
+}
+
+/// A fixed-width field a column threshold sends to a blob file reads back in
+/// the logical value as its bytes alone, framed as the columnar format frames
+/// that type, without the length a variable-width field carries.
+#[test]
+fn a_separated_fixed_width_field_reads_without_a_length() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().cell_separation_threshold(BODY, 0),
+    )?;
+    let u32_le = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+    let price = 7u32.to_le_bytes();
+    tree.insert_cells(
+        "doc",
+        &[
+            Field::bytes(STATUS, b"draft"),
+            Field {
+                column: BODY,
+                tag: u32_le,
+                cell: Cell::Value(&price),
+            },
+        ],
+        0,
+    )?;
+    tree.flush_active_memtable(0)?;
+
+    let row = row_of(&tree, "doc")?;
+    reference(&row, BODY)?;
+    let mut expected = framed(&[b"draft"]);
+    expected.extend_from_slice(&price);
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
     Ok(())
 }
 
