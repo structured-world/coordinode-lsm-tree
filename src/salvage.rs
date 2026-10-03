@@ -1488,7 +1488,7 @@ type RecoveredRef = (
 /// [`crate::blob_tree::handle::BlobIndirection`] of an indirection entry, which
 /// owns its object, and each reference of a cell row with its owner bit. An
 /// entry TAGGED as either whose value fails to decode is corrupt content the
-/// live read path could not follow either — the caller drops the block rather
+/// live read path could not follow either: the caller drops the block rather
 /// than laundering it into the recovered copy.
 fn collect_indirections(entries: &[crate::InternalValue]) -> crate::Result<Vec<RecoveredRef>> {
     use crate::coding::Decode;
