@@ -1,1 +1,1 @@
-{"line":"5","ref":"perf/#678-bench-budget-5x","sha":"d44bfb4785194956f094be51456c3dffc10a6771","repo":"structured-world/coordinode-lsm-tree","runner":"runner1-sw"}
+{"line":"6","ref":"main","sha":"3ba1fc17d42d63e8727f1afb8bb9d0a6bb0ac99a","repo":"structured-world/coordinode-lsm-tree","runner":"gpu-win11-ro"}
