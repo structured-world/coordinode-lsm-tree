@@ -815,10 +815,15 @@ impl MergeStream {
         // values, to bring back a column left out, to check a row taken from
         // a batch of another type, or by a predicate judging after the
         // values; otherwise they are not gathered at all.
+        // A source holding chosen rows stands for its rows here: one check per
+        // source, not per row.
         let reread = self.late
             || !layout.left_out.is_empty()
             || (!early && scan.predicate.is_some())
-            || pending.iter().any(|pick| self.taken_from_mistyped(pick));
+            || self
+                .sources
+                .iter()
+                .any(|s| s.referenced && s.types != FieldTypes::AsDeclared);
         let skip: &[u16] = if reread { &[] } else { &self.dropped };
         let merged = self.build(&pending, &layout, skip)?;
         Ok(Some(Built {
