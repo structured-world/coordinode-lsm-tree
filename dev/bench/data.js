@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791048205046,
+  "lastUpdate": 1791058267627,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -28734,6 +28734,90 @@ window.BENCHMARK_DATA = {
             "value": 659769.6546204824,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.5us | P99.9: 75.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3ba1fc17d42d63e8727f1afb8bb9d0a6bb0ac99a",
+          "message": "ci(bench): run on main only, store points under the measured commit (#817)\n\n## Summary\n- The Benchmark workflow runs on pushes to `main` only, and every stored\npoint is filed under the commit that was measured.\n\n## Changes\n- Drop the push trigger and compare-publish clause for the former budget\nbranch.\n- Both db_bench stores pass `ref: ${{ github.sha }}`. On a manual\ndispatch the store action otherwise resolves the branch name through the\nAPI, which names the branch head at store time rather than the measured\ncommit, and failed on a branch named with `#` (\"No commit found for\nSHA\").\n\n## Testing\nactionlint passes on the workflow. The same store change runs on the 5.x\nline in #816.\n\nPart of #678\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Chores**\n* Automated benchmark runs now start on pushes to the main branch,\nrather than on pushes to temporary benchmark branches.\n* Published benchmark comparisons remain available after pushes to the\nmain branch or manual runs.\n* Benchmark results are now associated with the commit being measured\nfor clearer tracking.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-03T22:53:11+03:00",
+          "tree_id": "3b98f5fcd7e97dc330a6568f93b6d96bed3ddc97",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3ba1fc17d42d63e8727f1afb8bb9d0a6bb0ac99a"
+        },
+        "date": 1791058265221,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 239943.98497718616,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 12.8us | P99.9: 31.1us\nthreads: 1 | elapsed: 2.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3056949.4395847437,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 4.0us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1078399.073439516,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.6us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.19s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 709110.2226747922,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.7us | P99.9: 71.7us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2484725.1521272976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 5.1us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 311182.04678746546,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 8.3us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 184128.7295504331,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 7.5us | P99.9: 12.6us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1106442.538289827,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 456439.5750456269,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.4us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 650938.2624114399,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.5us | P99.9: 74.3us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
