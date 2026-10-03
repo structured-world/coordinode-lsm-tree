@@ -334,21 +334,79 @@ jobs:
       # A failed build fails the step that runs its binary, not this one: each
       # bench step runs through cargo, which builds again what is missing and
       # stops on the same error there. So a host that cannot build RocksDB
-      # still measures and publishes the db_bench trend before the head-to-head
-      # fails the job.
+      # still measures and publishes the db_bench trend, and the head-to-head
+      # step fails the job.
       - name: Build the benchmark binaries
         continue-on-error: true
         run: bash .github/scripts/build-benchmarks.sh
 
       # The db_bench pass measures for ~2.5 min on the bench runner.
       - name: Run benchmarks
+        id: dbbench
         timeout-minutes: 6
         run: bash .github/scripts/run-benchmarks.sh 200000
 
+      # Head-to-head RocksDB comparison. Distinct from the db_bench
+      # trend above (single-engine, value-over-commits): this runs the
+      # standalone `tools/compare-rocksdb` criterion harness where every
+      # scenario runs BOTH engines in the same process, so each criterion
+      # group is an ours-vs-rocksdb overlay chart. Because the comparison
+      # is a ratio measured on one host in one run, it stays meaningful
+      # even if this runner's CPU changes between runs.
+      #
+      # It runs straight after the db_bench pass, before any step below
+      # switches the checkout to gh-pages and back: that rewrites the
+      # engine's sources, and cargo would then rebuild the harness the build
+      # step already compiled.
+      #
+      # Bounded criterion settings keep the harness fast: this is a
+      # ratio comparison (both engines in one process per scenario), so a
+      # short warm-up + measurement window per scenario still yields a
+      # stable median. An arm whose single iteration outlasts the window runs
+      # at Criterion's floor of ten samples regardless, so what bounds the
+      # matrix is its sizes: the per-push matrix leaves out the arms that
+      # cannot fit (`cold_write_sizes` in the harness), and a dispatch with
+      # `full-matrix` runs them too.
+      - name: Run compare-rocksdb head-to-head benches
+        id: compare
+        # Runs whatever the db_bench pass did, so a host that cannot build
+        # RocksDB still reaches the db_bench publishing below.
+        if: ${{ !cancelled() }}
+        # ~12 min on the bench runner per push; the full matrix adds ~20.
+        timeout-minutes: ${{ inputs.full-matrix && 45 || 20 }}
+        # Pin the published dashboard to the RocksDbParity preset (the apples-to-
+        # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
+        # numbers are not paying for protection RocksDB has no equivalent for.
+        # Set explicitly rather than relying on the in-code default, so a future
+        # default change cannot silently alter the public comparison. See
+        # docs/BENCHMARKING.md.
+        env:
+          LSM_BENCH_PRESET: rocksdb-parity
+          COMPARE_FULL_MATRIX: ${{ inputs.full-matrix && '1' || '0' }}
+          LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
+        # The restored cache carries the previous run's reports under
+        # target/criterion, and Criterion never removes a group's directory once
+        # the group is renamed or deleted. The publish step copies every
+        # directory there, so the stale ones go before the run; the compiled
+        # RocksDB beside them stays.
+        run: |
+          if [ "$LIBCLANG_OUTCOME" != success ]; then
+            echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
+            exit 1
+          fi
+          cd tools/compare-rocksdb
+          rm -rf target/criterion
+          cargo bench --bench compare -- \
+            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
+
       # Issued after the benches, right before its first use: an installation
       # token lives one hour, so one issued at the start of the job would let
-      # the job's length decide whether its results publish. The compare
-      # publish below takes its own for the same reason.
+      # the job's length decide whether its results publish. Every publishing
+      # step below runs within a minute of it.
+      #
+      # The db_bench publishing depends on the db_bench pass only: when the
+      # head-to-head fails (a host that cannot build RocksDB) the db_bench
+      # trend still publishes and the head-to-head step fails the job.
       - name: Generate bot token
         id: bot-token
         # `push` and `workflow_dispatch` are both trusted contexts on
@@ -362,10 +420,13 @@ jobs:
         # `github.event_name == 'pull_request'` to avoid evaluating
         # a missing context.
         if: >
-          github.event_name == 'push' ||
-          github.event_name == 'workflow_dispatch' ||
-          (github.event_name == 'pull_request' &&
-           github.event.pull_request.head.repo.full_name == github.repository)
+          !cancelled() &&
+          (
+            github.event_name == 'push' ||
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'pull_request' &&
+             github.event.pull_request.head.repo.full_name == github.repository)
+          )
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
@@ -386,7 +447,7 @@ jobs:
       # measuring anything. Drop the local branch first: the step recreates it
       # from the remote, so nothing that was actually published is lost.
       - name: Drop a local gh-pages left by an earlier run
-        if: steps.bot-token.outputs.token != ''
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
       # One series per version line and host: the job lands on whichever
@@ -397,7 +458,7 @@ jobs:
       # line it measures. The overlay page published below draws every host's
       # series of one line on one chart.
       - name: Store benchmark results
-        if: steps.bot-token.outputs.token != ''
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
         with:
           name: "lsm-tree db_bench ${{ steps.line.outputs.major }}.x · ${{ runner.os }} · ${{ runner.name }}"
@@ -429,7 +490,7 @@ jobs:
       # auto-push, and the next store step fetches gh-pages:gh-pages; drop it
       # again for the same reason as before the first store.
       - name: Drop the local gh-pages the yield store left
-        if: steps.bot-token.outputs.token != ''
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
       # Costs (bytes read, decoded and copied per emitted row) improve
@@ -439,7 +500,7 @@ jobs:
       # value and treats 0/0 as unchanged. Bytes are counted by the engine,
       # not timed, so the costs stay one series across hosts, one per line.
       - name: Store benchmark costs
-        if: steps.bot-token.outputs.token != ''
+        if: ${{ !cancelled() && steps.dbbench.outcome == 'success' && steps.bot-token.outputs.token != '' }}
         uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc  # v1.22.2
         with:
           name: "lsm-tree db_bench costs ${{ steps.line.outputs.major }}.x"
@@ -457,12 +518,15 @@ jobs:
       # The overlay page draws every host's series of one workload on one
       # chart (.github/bench/overlay.html reads the data.js beside it), and a
       # banner on the per-host dashboard links it and the RocksDB overlays.
-      # It runs before the head-to-head so a host that cannot build RocksDB
-      # still publishes it. The store step writes the dashboard's index.html
-      # only when it is missing, so the banner is rewritten in place: any
-      # banner line is dropped and the current one goes after <body>.
+      # It depends on the db_bench pass only, so a host that cannot build
+      # RocksDB still publishes it. The store step writes the dashboard's
+      # index.html only when it is missing, so the banner is rewritten in
+      # place: any banner line is dropped and the current one goes after
+      # <body>.
       - name: Publish the host overlay page to gh-pages
         if: >
+          !cancelled() &&
+          steps.dbbench.outcome == 'success' &&
           steps.bot-token.outputs.token != '' &&
           github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -517,74 +581,11 @@ jobs:
             git push origin gh-pages
           fi
 
-      # Head-to-head RocksDB comparison. Distinct from the db_bench
-      # trend above (single-engine, value-over-commits): this runs the
-      # standalone `tools/compare-rocksdb` criterion harness where every
-      # scenario runs BOTH engines in the same process, so each criterion
-      # group is an ours-vs-rocksdb overlay chart. Because the comparison
-      # is a ratio measured on one host in one run, it stays meaningful
-      # even if this runner's CPU changes between runs.
-      #
-      # Bounded criterion settings keep the harness fast: this is a
-      # ratio comparison (both engines in one process per scenario), so a
-      # short warm-up + measurement window per scenario still yields a
-      # stable median. An arm whose single iteration outlasts the window runs
-      # at Criterion's floor of ten samples regardless, so what bounds the
-      # matrix is its sizes: the per-push matrix leaves out the arms that
-      # cannot fit (`cold_write_sizes` in the harness), and a dispatch with
-      # `full-matrix` runs them too.
-      - name: Run compare-rocksdb head-to-head benches
-        # ~12 min on the bench runner per push; the full matrix adds ~20.
-        timeout-minutes: ${{ inputs.full-matrix && 45 || 20 }}
-        # Pin the published dashboard to the RocksDbParity preset (the apples-to-
-        # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
-        # numbers are not paying for protection RocksDB has no equivalent for.
-        # Set explicitly rather than relying on the in-code default, so a future
-        # default change cannot silently alter the public comparison. See
-        # docs/BENCHMARKING.md.
-        env:
-          LSM_BENCH_PRESET: rocksdb-parity
-          COMPARE_FULL_MATRIX: ${{ inputs.full-matrix && '1' || '0' }}
-          LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
-        # The restored cache carries the previous run's reports under
-        # target/criterion, and Criterion never removes a group's directory once
-        # the group is renamed or deleted. The publish step copies every
-        # directory there, so the stale ones go before the run; the compiled
-        # RocksDB beside them stays.
-        run: |
-          if [ "$LIBCLANG_OUTCOME" != success ]; then
-            echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
-            exit 1
-          fi
-          cd tools/compare-rocksdb
-          rm -rf target/criterion
-          cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5
-
-      # The compare publish gets its own token, issued once the head-to-head
-      # has finished: the one above was issued before the head-to-head ran.
-      # Same trusted contexts as the publish step below.
-      - name: Generate bot token for the compare publish
-        id: compare-token
-        # TEMPORARY: the branch clause publishes this branch's runs like a
-        # dispatch does. Remove before merge.
-        if: >
-          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-          (github.event_name == 'push' && github.ref == 'refs/heads/perf/#678-bench-budget') ||
-          github.event_name == 'workflow_dispatch'
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-          # Pushes the report tree to gh-pages; nothing else.
-          permission-contents: write
-
       # Publish the criterion HTML report tree (per-group overlay charts)
       # to gh-pages under dev/compare, alongside the db_bench dashboard at
       # dev/bench. Manual git push (rather than a third-party publish
       # action) keeps the workflow's "every `uses:` pinned to a SHA"
-      # hardening policy intact, with the App-scoped token issued right
-      # above.
+      # hardening policy intact, with the App-scoped token the stores use.
       - name: Publish compare-rocksdb overlay reports to gh-pages
         # Publish on main pushes AND on manual workflow_dispatch. The overlay is
         # a ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
@@ -593,15 +594,19 @@ jobs:
         # overlays on demand (e.g. right after a runner fix) without waiting for
         # the next merge to main. The db_bench trend (benchmark-action auto-push /
         # save-data above) stays push+main only.
+        # TEMPORARY: the branch clause publishes this branch's runs like a
+        # dispatch does. Remove before merge.
         if: >
-          steps.compare-token.outputs.token != '' &&
+          !cancelled() &&
+          steps.compare.outcome == 'success' &&
+          steps.bot-token.outputs.token != '' &&
           (
             (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
             (github.event_name == 'push' && github.ref == 'refs/heads/perf/#678-bench-budget') ||
             github.event_name == 'workflow_dispatch'
           )
         env:
-          GH_TOKEN: ${{ steps.compare-token.outputs.token }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}
           LINE_MAJOR: ${{ steps.line.outputs.major }}
           MEASURED_REF: ${{ github.ref_name }}
