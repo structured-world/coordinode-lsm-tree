@@ -752,6 +752,7 @@ impl MergeStream {
         let Some(Built {
             merged,
             pending,
+            deferred,
             judged,
             early,
             left_out,
@@ -809,6 +810,17 @@ impl MergeStream {
             *support = (*support).min(PredicateSupport::Unsupported);
             merged
         };
+        if deferred.contains(&true) {
+            for index in self.returned_indices(&merged, &pending)? {
+                if deferred.get(index).copied().unwrap_or(false)
+                    && let Some(source) = pending
+                        .get(index)
+                        .and_then(|pick| self.sources.get_mut(pick.source))
+                {
+                    source.late.batch_picks += 1;
+                }
+            }
+        }
         if merged.row_count == 0 {
             return Ok(None);
         }
@@ -853,6 +865,22 @@ impl MergeStream {
         merged: &ColumnBatch,
         pending: &'p [Pick],
     ) -> crate::Result<Vec<&'p Pick>> {
+        self.returned_indices(merged, pending)?
+            .into_iter()
+            .map(|index| {
+                pending.get(index).ok_or(Error::InvalidHeader(
+                    "columnar_scan: a returned row is not among the rows chosen",
+                ))
+            })
+            .collect()
+    }
+
+    /// [`Self::returned_picks`], as each pick's place in `pending`.
+    fn returned_indices(
+        &self,
+        merged: &ColumnBatch,
+        pending: &[Pick],
+    ) -> crate::Result<Vec<usize>> {
         let keys = merged
             .columns
             .iter()
@@ -860,12 +888,12 @@ impl MergeStream {
             .ok_or(MISSING_COLUMN)?;
         // The returned rows keep the order they were chosen in and their keys
         // are distinct, so each is the next chosen row with its key.
-        let mut returned: Vec<&Pick> = Vec::with_capacity(merged.row_count as usize);
-        let mut picks = pending.iter();
+        let mut returned = Vec::with_capacity(merged.row_count as usize);
+        let mut picks = pending.iter().enumerate();
         for row in 0..merged.row_count {
             let key = bytes_column_row(&keys.data, merged.row_count, row)?;
-            let pick = picks
-                .find(|pick| {
+            let (index, _) = picks
+                .find(|(_, pick)| {
                     self.sources
                         .get(pick.source)
                         .and_then(|s| {
@@ -878,7 +906,7 @@ impl MergeStream {
                 .ok_or(Error::InvalidHeader(
                     "columnar_scan: a returned row is not among the rows chosen",
                 ))?;
-            returned.push(pick);
+            returned.push(index);
         }
         Ok(returned)
     }
@@ -1018,36 +1046,56 @@ impl MergeStream {
         // Whether every row has its final verdict before the values are read,
         // so the predicate is not run over the returned rows again.
         let mut early = timing == PredicateTiming::BeforeValues;
-        let pending = match timing {
-            PredicateTiming::BeforeValues => self.judge(scan, pending, None, &layout, support)?,
+        // Which rows are still to be judged, after the values.
+        let (pending, open) = match timing {
+            PredicateTiming::BeforeValues => {
+                let pending = self.judge(scan, pending, None, &layout, support)?;
+                let open = alloc::vec![false; pending.len()];
+                (pending, open)
+            }
             PredicateTiming::BeforeValuesExceptOperands => {
-                self.judge(scan, pending, Some(&types), &layout, support)?
+                let pending = self.judge(scan, pending, Some(&types), &layout, support)?;
+                let open = alloc::vec![false; pending.len()];
+                (pending, open)
             }
             PredicateTiming::AfterValues if layout.judged => {
                 let (pending, open) = self.prejudge(scan, pending);
-                let (pending, settled) = if open.contains(&true) {
-                    self.judge_on_objects(scan, pending, &open, &layout)?
+                let (pending, open) = if open.contains(&true) {
+                    self.judge_on_objects(scan, pending, open, &layout)?
                 } else {
-                    (pending, true)
+                    (pending, open)
                 };
-                if settled && let Some(pred) = scan.predicate.as_ref() {
+                if !open.contains(&true)
+                    && let Some(pred) = scan.predicate.as_ref()
+                {
                     *support = (*support).min(pred.support(layout.type_of(pred.column_id)));
                     early = true;
                 }
-                pending
+                (pending, open)
             }
-            PredicateTiming::AfterValues => pending,
+            PredicateTiming::AfterValues => {
+                let open = alloc::vec![false; pending.len()];
+                (pending, open)
+            }
         };
         if pending.is_empty() {
             return Ok(None);
         }
-        // A row page holding a row the predicate kept, where it could judge
-        // it yet, is one whose payload is read: what the density is counted
-        // on.
-        for pick in &pending {
-            if let Some(source) = self.sources.get_mut(pick.source) {
+        // A row page holding a row the predicate kept is one whose payload is
+        // read: what the density is counted on. A row still to be judged
+        // counts now when its payload is read for it, and once the predicate
+        // after the values keeps it when its batch was read with its payload.
+        let mut deferred = Vec::with_capacity(pending.len());
+        for (pick, open) in pending.iter().zip(open) {
+            let Some(source) = self.sources.get_mut(pick.source) else {
+                deferred.push(false);
+                continue;
+            };
+            let defer = open && !source.late.batch_late;
+            if !defer {
                 source.late.batch_picks += 1;
             }
+            deferred.push(defer);
         }
         // The rows are chosen, and judged where the predicate could judge
         // them yet: only now is their payload read, from their row pages.
@@ -1072,6 +1120,7 @@ impl MergeStream {
         Ok(Some(Built {
             merged,
             pending,
+            deferred,
             judged: layout.judged,
             early,
             left_out: layout.left_out,
@@ -1143,28 +1192,26 @@ impl MergeStream {
     /// predicate's field for elsewhere than in a cell of its own: in a
     /// referenced object or inside its whole value. Only the references and
     /// whole values of their row pages are read for it, so the page's other
-    /// fields are read later for the rows kept alone. Also returns whether
-    /// every row now has its final verdict.
+    /// fields are read later for the rows kept alone. Also returns, for each
+    /// row kept, whether it is still to be judged.
     ///
     /// A row of a segment whose payload is nothing but its references and
     /// whole values is left to the judgement after the values: reading its
-    /// value first would save nothing.
+    /// value first would save nothing. So is a row of a batch read with its
+    /// payload, which that judgement reads nothing more for.
     fn judge_on_objects(
         &mut self,
         scan: &ColumnarScan,
         pending: Vec<Pick>,
-        open: &[bool],
+        open: Vec<bool>,
         layout: &Layout,
-    ) -> crate::Result<(Vec<Pick>, bool)> {
+    ) -> crate::Result<(Vec<Pick>, Vec<bool>)> {
         let Some(cells) = scan.cells.as_ref() else {
-            return Ok((pending, false));
+            return Ok((pending, open));
         };
-        // A batch already read with its payload is judged here too: its rows
-        // the predicate drops must not count toward the density, or a scan
-        // whose choices once turned dense would read every page with the rest
-        // from then on.
         let judging = |source: &MergeSource| {
-            !source.whole
+            source.late.batch_late
+                && !source.whole
                 && source.types == FieldTypes::AsDeclared
                 && source
                     .late
@@ -1175,7 +1222,7 @@ impl MergeStream {
         // Decided before anything is read: reading changes what a source holds.
         let ask: Vec<bool> = pending
             .iter()
-            .zip(open)
+            .zip(&open)
             .map(|(pick, &open)| open && self.sources.get(pick.source).is_some_and(judging))
             .collect();
         let asked: Vec<Pick> = pending
@@ -1185,7 +1232,7 @@ impl MergeStream {
             .map(|(pick, _)| *pick)
             .collect();
         if asked.is_empty() {
-            return Ok((pending, false));
+            return Ok((pending, open));
         }
         self.fill_late_columns(scan, &asked, Some(&JUDGE_COLUMNS))?;
         // Only what a row's field is read out of is gathered for the verdict:
@@ -1206,20 +1253,21 @@ impl MergeStream {
         debug_assert_eq!(verdicts.len(), asked.len());
 
         let mut verdicts = verdicts.into_iter();
-        let mut settled = true;
         let mut kept = Vec::with_capacity(pending.len());
-        for ((pick, &open), &ask) in pending.into_iter().zip(open).zip(&ask) {
+        let mut still_open = Vec::with_capacity(pending.len());
+        for ((pick, open), ask) in pending.into_iter().zip(open).zip(ask) {
             if ask {
                 // One verdict per row asked, in the order asked.
                 if verdicts.next().unwrap_or(true) {
                     kept.push(pick);
+                    still_open.push(false);
                 }
             } else {
-                settled &= !open;
                 kept.push(pick);
+                still_open.push(open);
             }
         }
-        Ok((kept, settled))
+        Ok((kept, still_open))
     }
 
     /// The bytes of the cells the rows of `pending` take from payload read
@@ -1621,6 +1669,9 @@ struct Built {
     merged: ColumnBatch,
     /// The chosen rows it holds, in its row order.
     pending: Vec<Pick>,
+    /// For each chosen row, whether it counts toward its source's density
+    /// only once the predicate after the values keeps it.
+    deferred: Vec<bool>,
     /// Whether the predicate could judge the rows.
     judged: bool,
     /// Whether the predicate already ran on every row, before their values
