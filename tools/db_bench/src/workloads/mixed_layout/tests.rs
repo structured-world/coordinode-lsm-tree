@@ -45,7 +45,7 @@ fn config() -> BenchConfig {
 /// Every fixture, including those of the unsupported scenarios. The tests that
 /// cover all of them read this one list, so a new fixture cannot be added to
 /// one of them and silently missed by another.
-const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 10] = [
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 13] = [
     ("narrow", fixtures::narrow),
     ("wide", fixtures::wide),
     ("mixed-sizes", fixtures::mixed_sizes),
@@ -62,7 +62,44 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 10] = [
     ("columnar-overlap", fixtures::columnar_overlap),
     ("blobs-well-placed", fixtures::blobs_well_placed),
     ("blobs-scattered", fixtures::blobs_scattered),
+    ("cells-inline", fixtures::cells_inline),
+    ("cells-wide", fixtures::cells_wide),
+    ("cells-scattered", fixtures::cells_scattered),
 ];
+
+/// The cell-row scans return exactly the rows their predicate selects, and a
+/// sparse one materialises far less than one that keeps nearly every row,
+/// while every scan's payload useful bytes are those of the rows it kept.
+#[test]
+fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
+    let fixture = build(fixtures::cells_inline)?;
+    let m = fixture.tree.metrics();
+    let measure = |scan: fn(&Fixture) -> lsm_tree::Result<u64>| -> lsm_tree::Result<(u64, u64)> {
+        let before = m.bytes_materialized();
+        let rows = scan(&fixture)?;
+        Ok((rows, m.bytes_materialized() - before))
+    };
+    let (clustered, clustered_bytes) = measure(super::cells_sparse_clustered)?;
+    let (spread, _) = measure(super::cells_sparse_one_per_page)?;
+    let (near_full, near_full_bytes) = measure(super::cells_near_full)?;
+    assert!(
+        clustered > 0 && spread > 0,
+        "the sparse predicates keep rows"
+    );
+    assert!(
+        near_full > clustered * 50,
+        "the near-full predicate keeps ~90%"
+    );
+    assert!(
+        clustered_bytes * 20 < near_full_bytes,
+        "materialised {clustered_bytes} B for {clustered} rows and {near_full_bytes} B for {near_full}"
+    );
+    let wide = build(fixtures::cells_wide)?;
+    assert_eq!(super::cells_projected(&wide)?, N);
+    let scattered = build(fixtures::cells_scattered)?;
+    assert!(super::cells_blobs_filtered(&scattered)? > 0);
+    Ok(())
+}
 
 /// Builds `f` in the system temporary directory, which outlives the fixture;
 /// a per-test base would be removed while the fixture's tree is still open.
@@ -385,6 +422,10 @@ fn readings(rows: u64, read: u64, decoded: u64, copied: u64) -> super::Readings 
         bytes_read: read,
         bytes_decoded: decoded,
         bytes_copied: copied,
+        bytes_materialized: 0,
+        payload_useful: 0,
+        payload_incidental: 0,
+        blob_prefetched: 0,
         elapsed: std::time::Duration::ZERO,
         scan: None,
     }

@@ -21,7 +21,9 @@
 //! numbers and [`value_bytes`] reproduces the value on demand.
 
 use crate::config::BenchConfig;
+use lsm_tree::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
 use lsm_tree::runtime_config::RuntimeConfig;
+use lsm_tree::table::column_type::{ByteOrder, Number, NumberKind};
 use lsm_tree::table::columnar::{
     COL_VALUE, Column, TypeTag, entries_to_column_batch, frame_value_cells,
 };
@@ -76,6 +78,13 @@ pub fn group_of(seed: u64) -> u64 {
 /// The near-full field: nine values in ten, so a predicate on it selects ~90%.
 pub fn bucket_of(seed: u64) -> u64 {
     seed % 10
+}
+
+/// The clustered sparse field: runs of a hundred consecutive seeds, one run
+/// in 97 holding zero, so a predicate on it selects ~1% of the rows in a few
+/// places.
+pub fn cluster_of(seed: u64) -> u64 {
+    (seed / 100) % 97
 }
 
 /// Reads the sparse field back out of a value's header.
@@ -153,6 +162,47 @@ pub enum Shape {
     /// [`COL_GROUP`] and [`COL_BUCKET`] so a columnar scan can filter on them.
     /// A row read returns the three cells framed together.
     Split,
+    /// A blob tree's row written as cells: the filter fields as numbers of
+    /// their own ([`CELL_GROUP`], [`CELL_BUCKET`], [`CELL_CLUSTER`],
+    /// [`CELL_SPREAD`]) and the value in [`CELL_PAYLOAD`], kept in a blob file
+    /// when it is large. `spread` is the modulus of the spread field. A row
+    /// read returns the fields framed in column order.
+    Cells { spread: u64 },
+}
+
+/// A cell row's sparse field ([`group_of`]).
+pub const CELL_GROUP: u16 = FIRST_FIELD_COLUMN;
+/// A cell row's near-full field ([`bucket_of`]).
+pub const CELL_BUCKET: u16 = FIRST_FIELD_COLUMN + 1;
+/// A cell row's clustered sparse field ([`cluster_of`]).
+pub const CELL_CLUSTER: u16 = FIRST_FIELD_COLUMN + 2;
+/// A cell row's spread field: the seed modulo about the rows a row page
+/// holds, so zero selects about one row in each page.
+pub const CELL_SPREAD: u16 = FIRST_FIELD_COLUMN + 3;
+/// A cell row's payload, the value itself.
+pub const CELL_PAYLOAD: u16 = FIRST_FIELD_COLUMN + 4;
+
+/// The type of a cell row's filter fields: unsigned, big-endian, so the
+/// bytes a predicate is bounded by are the numbers themselves.
+#[expect(
+    clippy::expect_used,
+    reason = "an eight-byte unsigned number is a valid number type"
+)]
+pub fn u64_be() -> TypeTag {
+    TypeTag::Number(
+        Number::new(NumberKind::Unsigned, 8, ByteOrder::Big).expect("an eight-byte number"),
+    )
+}
+
+/// A cell row's filter fields for `seed`, as the bytes their cells hold:
+/// group, bucket, cluster and spread.
+pub fn cell_fields(seed: u64, spread: u64) -> [[u8; 8]; 4] {
+    [
+        group_of(seed).to_be_bytes(),
+        bucket_of(seed).to_be_bytes(),
+        cluster_of(seed).to_be_bytes(),
+        (seed % spread.max(1)).to_be_bytes(),
+    ]
 }
 
 /// The sub-column holding a split value's whole row.
@@ -175,6 +225,16 @@ impl Fixture {
                     (TypeTag::Bytes, &row),
                     (TypeTag::Bytes, &group),
                     (TypeTag::Bytes, &bucket),
+                ])
+            }
+            Shape::Cells { spread } => {
+                let [group, bucket, cluster, spread] = cell_fields(value.seed, spread);
+                frame_value_cells(&[
+                    (u64_be(), &group),
+                    (u64_be(), &bucket),
+                    (u64_be(), &cluster),
+                    (u64_be(), &spread),
+                    (TypeTag::Bytes, &row),
                 ])
             }
         }
@@ -699,6 +759,167 @@ pub fn blobs_well_placed(
         shape: Shape::Opaque,
         _dir: dir,
     })
+}
+
+/// How a cell-row fixture lays its rows out.
+#[derive(Clone, Copy)]
+struct CellLayout {
+    /// The payload's length beyond the header: below the separation
+    /// threshold it sits in its column, above it in a blob file.
+    payload: usize,
+    /// Whether the rows are written out of key order and rewritten in rounds,
+    /// so neighbouring keys' payloads sit far apart.
+    scattered: bool,
+}
+
+/// Rows written as cells into a blob tree whose tables are columnar.
+///
+/// Each row holds its four filter fields as numbers and its value as the
+/// payload, so a projected scan can filter on a field and read the payload
+/// of the rows it keeps alone: the shape the late materialization of a blob
+/// tree is measured on.
+fn cell_rows(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+    layout: CellLayout,
+) -> lsm_tree::Result<Fixture> {
+    let dir = fixture_dir(base)?;
+    let tree = open(
+        &dir,
+        config,
+        Opening {
+            columnar: true,
+            kv_separation: true,
+            zone_map: true,
+        },
+    )?;
+    let AnyTree::Blob(blob) = &tree else {
+        return Err(lsm_tree::Error::FeatureUnsupported(
+            "a tree with kv separation opens as a blob tree",
+        ));
+    };
+    let n = config
+        .num
+        .min(if layout.scattered { 10_000 } else { 100_000 });
+    let len = HEADER_LEN + layout.payload;
+    // About the rows a row page holds: the bytes a row adds across every
+    // column (key, seqno, value type, whole value, four fields and the payload
+    // or its reference), so the spread field's zero lands once per page.
+    let payload_bytes = if len < 1_024 { len + 4 } else { 24 };
+    let row_bytes = (13 + 4 + 8 + 1 + 4 + 4 * 8 + payload_bytes) as u64;
+    let spread = (u64::from(config.page_size) / row_bytes).max(1);
+
+    let mut rows: Vec<Row> = (0..n)
+        .map(|i| Row {
+            key: key(i),
+            expect: None,
+            selected: group_of(i) == 0,
+        })
+        .collect();
+    let write = |i: u64, seed: u64, rows: &mut Vec<Row>| -> lsm_tree::Result<()> {
+        let value = Value { seed, len };
+        let fields = cell_fields(seed, spread);
+        let payload = value.bytes();
+        let mut cells: Vec<Field<'_>> = [CELL_GROUP, CELL_BUCKET, CELL_CLUSTER, CELL_SPREAD]
+            .into_iter()
+            .zip(&fields)
+            .map(|(column, bytes)| Field {
+                column,
+                tag: u64_be(),
+                cell: Cell::Value(bytes),
+            })
+            .collect();
+        cells.push(Field::bytes(CELL_PAYLOAD, &payload));
+        blob.insert_cells(key(i), &cells, seqno.fetch_add(1, Ordering::Relaxed))?;
+        if let Some(row) = rows.get_mut(i as usize) {
+            row.expect = Some(value);
+        }
+        Ok(())
+    };
+    if layout.scattered {
+        // As in `blobs_scattered`: a stride coprime with n, then rewrite
+        // rounds over residue classes, each flushed on its own.
+        let stride = (7_919..).find(|&s| gcd(s, n.max(1)) == 1).unwrap_or(1);
+        for step in 0..n {
+            let i = step.wrapping_mul(stride) % n.max(1);
+            write(i, i, &mut rows)?;
+        }
+        tree.flush_active_memtable(0)?;
+        for round in 1..=3_u64 {
+            for i in (round..n).step_by(4) {
+                write(i, i + round * 1_000_000, &mut rows)?;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+    } else {
+        for i in 0..n {
+            write(i, i, &mut rows)?;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    Ok(Fixture {
+        tree,
+        oracle: Oracle { rows },
+        shape: Shape::Cells { spread },
+        _dir: dir,
+    })
+}
+
+/// Cell rows with a small payload kept in its column: what the selective
+/// scans of a blob tree are measured on, the page being what a late read of
+/// the payload saves.
+pub fn cells_inline(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    cell_rows(
+        config,
+        seqno,
+        base,
+        CellLayout {
+            payload: 64,
+            scattered: false,
+        },
+    )
+}
+
+/// Cell rows with a 4 KiB payload in a blob file: the wide record whose
+/// header fields a projection reads without its payload.
+pub fn cells_wide(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    cell_rows(
+        config,
+        seqno,
+        base,
+        CellLayout {
+            payload: 4_096,
+            scattered: false,
+        },
+    )
+}
+
+/// Cell rows with an 8 KiB payload in blob files, scattered by rewrites: the
+/// placement where reading a blob before the predicate decides costs most.
+pub fn cells_scattered(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    cell_rows(
+        config,
+        seqno,
+        base,
+        CellLayout {
+            payload: 8_192,
+            scattered: true,
+        },
+    )
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {

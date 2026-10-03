@@ -448,6 +448,69 @@ fn a_dense_choice_reads_the_payload_with_the_rest() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A scan reads the objects of the version it was created on: a compaction
+/// that relocates the bodies, and drops the blob file they were in, between
+/// the scan's creation and its reads, changes nothing it returns.
+#[test]
+fn a_scan_reads_its_objects_through_a_compaction_that_moves_them() -> lsm_tree::Result<()> {
+    for columnar in [false, true] {
+        let folder = get_tmp_folder();
+        let any = Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(THRESHOLD)
+                .age_cutoff(1.0),
+        ))
+        .blob_compression(lsm_tree::CompressionType::None)
+        .open()?;
+        let AnyTree::Blob(tree) = &any else {
+            panic!("a tree with kv separation opens as a blob tree");
+        };
+        tree.index
+            .update_runtime_config(|rc| rc.columnar = columnar)?;
+        let body = |i: u32| vec![b'a' + (i % 26) as u8; 300];
+        for i in 0..50u32 {
+            insert(tree, &format!("k{i:02}"), b"s", i, &body(i), u64::from(i));
+        }
+        // A filler in the same blob file that turns to garbage, so the next
+        // compaction relocates the bodies.
+        tree.insert("zz-filler", vec![b'f'; 16_384], 50);
+        tree.flush_active_memtable(0)?;
+        tree.insert("zz-filler", "small", 51);
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+        let projection = Projection::new()
+            .column(COL_USER_KEY)
+            .field(field(BODY, TypeTag::Bytes));
+        // The documents only: the filler is stored whole, with no projector.
+        let documents = ..lsm_tree::UserKey::from("zz");
+        let scan = any.columnar_scan(projection, None, SeqNo::MAX, documents)?;
+        let files_before = tree.blob_file_count();
+        tree.major_compact(64_000_000, SeqNo::MAX)?;
+        tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+        let got = rows(scan)?;
+        assert_eq!(got.len(), 50, "columnar={columnar}");
+        for (key, cells) in &got {
+            let i: u32 = std::str::from_utf8(&key[1..])
+                .expect("utf8")
+                .parse()
+                .expect("a number");
+            assert_eq!(cells[0], Some(body(i)), "columnar={columnar}");
+        }
+        assert!(
+            tree.blob_file_count() <= files_before,
+            "columnar={columnar}: the compactions ran"
+        );
+    }
+    Ok(())
+}
+
 fn rows_of_scan(
     any: &AnyTree,
     projection: Projection,

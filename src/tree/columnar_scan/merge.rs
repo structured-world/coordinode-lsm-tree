@@ -107,6 +107,10 @@ struct LatePayload {
     batch_at: Option<crate::table::columnar_cursor::PageAt>,
     /// Rows chosen from the current batch.
     batch_picks: u32,
+    /// The decoded bytes of the current batch's payload read late, and of
+    /// them the chosen rows' cells taken so far.
+    page_bytes: u64,
+    page_useful: u64,
     /// Row pages loaded so far, and how many of them held a chosen row.
     pages: u32,
     pages_hit: u32,
@@ -116,6 +120,17 @@ struct LatePayload {
 const DENSITY_WINDOW: u32 = 4;
 
 impl LatePayload {
+    /// What the current batch's payload read late held besides the chosen
+    /// rows' cells, now that the batch is done with.
+    fn incidental(&mut self) -> u64 {
+        // The chosen rows' cells are cells of the pages read.
+        debug_assert!(self.page_useful <= self.page_bytes);
+        let incidental = self.page_bytes - self.page_useful;
+        self.page_bytes = 0;
+        self.page_useful = 0;
+        incidental
+    }
+
     /// Records the batch just spent, and returns the columns the cursor is to
     /// decode from now on when the choices turned dense or sparse.
     fn spent(&mut self) -> Option<&[u16]> {
@@ -514,7 +529,12 @@ impl MergeStream {
         scan: &ColumnarScan,
         cmp: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Position> {
-        let (position, peak) = self.position_source(i, cmp)?;
+        let mut incidental = 0u64;
+        let positioned = self.position_source(i, cmp, &mut incidental);
+        // Recorded whether or not the move then failed: the batch it let go
+        // of was read all the same.
+        scan.record_payload(0, incidental);
+        let (position, peak) = positioned?;
         if let Some(peak) = peak {
             // The other sources did not move while this one loaded, so the
             // most the merge held is theirs plus this source's peak.
@@ -526,11 +546,14 @@ impl MergeStream {
 
     /// [`Self::position`] for source `i` alone, and the most it held after a
     /// load, when it loaded: a batch it read and then passed over whole, all
-    /// its rows invisible or shadowed, was held all the same.
+    /// its rows invisible or shadowed, was held all the same. Adds to
+    /// `incidental` what the payload read late of a batch it let go of held
+    /// besides the chosen rows' cells.
     fn position_source(
         &mut self,
         i: usize,
         cmp: &dyn crate::comparator::UserComparator,
+        incidental: &mut u64,
     ) -> crate::Result<(Position, Option<u64>)> {
         let last_key = self.last_key.as_deref();
         let (fields, late, raw, predicate_column) =
@@ -572,10 +595,11 @@ impl MergeStream {
             // The spent batch goes before the cursor reads on, so the source
             // never holds it and a new run at once. How dense its choices were
             // decides how the next row group's payload is read.
-            if source.batch.take().is_some()
-                && let Some(ids) = source.late.spent()
-            {
-                source.cursor.set_projection(ids);
+            if source.batch.take().is_some() {
+                *incidental += source.late.incidental();
+                if let Some(ids) = source.late.spent() {
+                    source.cursor.set_projection(ids);
+                }
             }
             match source.cursor.next_located() {
                 None => return Ok((Position::Exhausted, loaded)),
@@ -950,6 +974,7 @@ impl MergeStream {
         // The rows are chosen, and judged where the predicate could judge
         // them yet: only now is their payload read, from their row pages.
         self.fill_late(scan, &pending)?;
+        scan.record_payload(self.late_useful(&pending)?, 0);
         let early = timing == PredicateTiming::BeforeValues;
         // The columns the merge decoded for itself leave the output once its
         // rows are decided. Read again after the gather only to read the
@@ -1024,6 +1049,38 @@ impl MergeStream {
             .collect()
     }
 
+    /// The bytes of the cells the rows of `pending` take from payload read
+    /// late for them, each added to its batch's share of what its pages held.
+    fn late_useful(&mut self, pending: &[Pick]) -> crate::Result<u64> {
+        let mut useful = 0u64;
+        for pick in pending {
+            let Some(source) = self.sources.get_mut(pick.source) else {
+                continue;
+            };
+            let MergeSource { batch, late, .. } = source;
+            let Some(batch) = batch.as_ref().filter(|_| late.page_bytes > 0) else {
+                continue;
+            };
+            let mut taken = 0u64;
+            for &(_, carried) in &late.columns {
+                let Some(column) = batch
+                    .columns
+                    .iter()
+                    .find(|c| c.column_id == carried && c.is_valid(pick.row))
+                else {
+                    continue;
+                };
+                taken += match column.type_tag.fixed_width() {
+                    Some(width) => u64::from(width),
+                    None => bytes_column_row(&column.data, batch.row_count, pick.row)?.len() as u64,
+                };
+            }
+            late.page_useful += taken;
+            useful += taken;
+        }
+        Ok(useful)
+    }
+
     /// Reads the payload of each batch a row of `pending` was chosen from and
     /// that was read without it, from that batch's row page alone, into the
     /// columns that stood in for it. A column the row group does not store
@@ -1067,21 +1124,9 @@ impl MergeStream {
                         }
                         continue;
                     }
-                    // What of the page the chosen rows hold, and what came
-                    // along with them.
-                    let mut useful = 0u64;
-                    for pick in pending.iter().filter(|pick| pick.source == index) {
-                        if !column.is_valid(pick.row) {
-                            continue;
-                        }
-                        useful +=
-                            match column.type_tag.fixed_width() {
-                                Some(width) => u64::from(width),
-                                None => bytes_column_row(&column.data, batch.row_count, pick.row)?
-                                    .len() as u64,
-                            };
-                    }
-                    scan.record_payload(useful, column.data.len() as u64);
+                    // What the page holds, its chosen rows' cells counted out
+                    // of it as they are taken.
+                    late.page_bytes += column.data.len() as u64;
                     *slot = Column {
                         column_id: carried,
                         ..column

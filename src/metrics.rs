@@ -357,15 +357,17 @@ impl Metrics {
         self.bytes_materialized.fetch_add(bytes as u64, Relaxed);
     }
 
-    /// Records a payload page read for chosen rows: `useful` bytes of their
-    /// cells out of `decoded`.
+    /// Records the chosen rows' cells taken from payload pages read for them.
     #[inline]
-    pub(crate) fn record_payload(&self, useful: u64, decoded: u64) {
-        // The chosen rows' cells are cells of the page.
-        debug_assert!(useful <= decoded, "useful bytes are part of the page");
-        self.payload_bytes_useful.fetch_add(useful, Relaxed);
-        self.payload_bytes_incidental
-            .fetch_add(decoded - useful, Relaxed);
+    pub(crate) fn record_payload_useful(&self, bytes: u64) {
+        self.payload_bytes_useful.fetch_add(bytes, Relaxed);
+    }
+
+    /// Records what payload pages read for chosen rows held besides their
+    /// cells, once the pages are done with.
+    #[inline]
+    pub(crate) fn record_payload_incidental(&self, bytes: u64) {
+        self.payload_bytes_incidental.fetch_add(bytes, Relaxed);
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

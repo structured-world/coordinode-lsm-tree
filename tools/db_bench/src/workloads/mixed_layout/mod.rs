@@ -104,6 +104,13 @@ struct Readings {
     bytes_read: u64,
     bytes_decoded: u64,
     bytes_copied: u64,
+    /// What projected scans handed out, per row returned.
+    bytes_materialized: u64,
+    /// Of the payload read late, the chosen rows' cells and what came along.
+    payload_useful: u64,
+    payload_incidental: u64,
+    /// The blob bytes read ahead in coalesced spans.
+    blob_prefetched: u64,
     elapsed: std::time::Duration,
     /// For a batch scan: its first batch and what it held.
     scan: Option<ScanFigures>,
@@ -130,6 +137,12 @@ impl Readings {
     ) -> lsm_tree::Result<Self> {
         let m = tree.metrics();
         let (r0, d0, c0) = (m.bytes_read(), m.bytes_decoded(), m.bytes_copied());
+        let (mat0, use0, inc0, pre0) = (
+            m.bytes_materialized(),
+            m.payload_bytes_useful(),
+            m.payload_bytes_incidental(),
+            m.blob_bytes_prefetched(),
+        );
         let start = Instant::now();
         let rows = body()?;
         let elapsed = start.elapsed();
@@ -139,6 +152,10 @@ impl Readings {
             bytes_read: m.bytes_read() - r0,
             bytes_decoded: m.bytes_decoded() - d0,
             bytes_copied: m.bytes_copied() - c0,
+            bytes_materialized: m.bytes_materialized() - mat0,
+            payload_useful: m.payload_bytes_useful() - use0,
+            payload_incidental: m.payload_bytes_incidental() - inc0,
+            blob_prefetched: m.blob_bytes_prefetched() - pre0,
             elapsed,
             scan: None,
         })
@@ -194,12 +211,18 @@ impl Readings {
         // `keys` is the working set the scenario built. Each fixture caps it
         // on its own, so it is the size the series describes, not `--num`.
         let annotation = format!(
-            "keys: {} | rows: {} | read: {} B | decoded: {} B | copied: {} B | elapsed: {:?}",
+            "keys: {} | rows: {} | read: {} B | decoded: {} B | copied: {} B | \
+             materialized: {} B | payload useful: {} B | payload incidental: {} B | \
+             blob prefetched: {} B | elapsed: {:?}",
             self.keys,
             self.rows,
             self.bytes_read,
             self.bytes_decoded,
             self.bytes_copied,
+            self.bytes_materialized,
+            self.payload_useful,
+            self.payload_incidental,
+            self.blob_prefetched,
             self.elapsed,
         );
         for (counter, value) in [("read", read), ("decoded", decoded), ("copied", copied)] {
@@ -210,6 +233,36 @@ impl Readings {
                 annotation.clone(),
                 Direction::SmallerIsBetter,
             );
+        }
+        // A projected scan's own figures, published only where one ran: a row
+        // read materialises nothing through a scan and reads no payload late.
+        if let Some(materialized) = self
+            .per_row(self.bytes_materialized)
+            .filter(|_| self.bytes_materialized > 0)
+        {
+            reporter.publish_series(
+                format!("{scenario} bytes materialized per row"),
+                materialized,
+                "B/row",
+                annotation.clone(),
+                Direction::SmallerIsBetter,
+            );
+        }
+        if self.payload_useful + self.payload_incidental > 0 {
+            for (counter, value) in [
+                ("useful", self.payload_useful),
+                ("incidental", self.payload_incidental),
+            ] {
+                if let Some(value) = self.per_row(value) {
+                    reporter.publish_series(
+                        format!("{scenario} payload bytes {counter} per row"),
+                        value,
+                        "B/row",
+                        annotation.clone(),
+                        Direction::SmallerIsBetter,
+                    );
+                }
+            }
         }
         let Some(scan) = &self.scan else {
             return;
@@ -263,6 +316,17 @@ impl Readings {
             fmt_ratio(ratio(self.bytes_copied, self.bytes_decoded), 2),
             self.elapsed,
         );
+        if self.bytes_materialized + self.payload_useful + self.payload_incidental > 0 {
+            eprintln!(
+                "  {:<34} materialized/row={:<9} payload useful={} B incidental={} B \
+                 blob prefetched={} B",
+                "",
+                per_row(self.bytes_materialized),
+                self.payload_useful,
+                self.payload_incidental,
+                self.blob_prefetched,
+            );
+        }
         if let Some(scan) = &self.scan {
             let first = scan.first_batch.map_or_else(
                 || "no batch".to_string(),
@@ -488,6 +552,141 @@ fn scan_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
     })
 }
 
+/// Scans a cell-row fixture with a predicate on one of its filter fields,
+/// projecting the key, the sparse field and, when `payload`, the value, and
+/// checks each row against the write history.
+///
+/// The predicate runs in the engine over the field's own column; the payload
+/// of a row it drops is never read, from its page or from its blob file,
+/// which is what the late-materialization scenarios measure.
+#[expect(
+    clippy::expect_used,
+    reason = "a scan missing a projected column or row is a wrong result, and a verify pass panics on one"
+)]
+fn verify_cells_scan(
+    fixture: &Fixture,
+    predicate: Option<&ColumnRangePredicate>,
+    selects: impl Fn(u64) -> bool,
+    payload: bool,
+) -> lsm_tree::Result<u64> {
+    use lsm_tree::{Absent, ProjectedField, Projection};
+
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a cell-row scan needs a cell-row fixture");
+    };
+    let mut projection = Projection::new()
+        .column(COL_USER_KEY)
+        .field(ProjectedField::new(
+            fixtures::CELL_GROUP,
+            fixtures::u64_be(),
+            Absent::Error,
+        )?);
+    if payload {
+        projection = projection.field(ProjectedField::new(
+            fixtures::CELL_PAYLOAD,
+            lsm_tree::table::columnar::TypeTag::Bytes,
+            Absent::Error,
+        )?);
+    }
+    let mut check = lockstep(fixture, |v| selects(v.seed));
+    for batch in fixture
+        .tree
+        .columnar_scan(projection, predicate, SeqNo::MAX, ..)?
+    {
+        let batch = batch?;
+        let column = |id| {
+            batch
+                .columns
+                .iter()
+                .find(|c| c.column_id == id)
+                .expect("the scan returns every projected column")
+        };
+        let (keys, groups) = (column(COL_USER_KEY), column(fixtures::CELL_GROUP));
+        for row in 0..batch.row_count {
+            let key = fixtures::bytes_cell(keys, batch.row_count, row)
+                .expect("a returned column holds every row it counts");
+            let at = row as usize * 8;
+            let group = groups.data.get(at..at + 8).expect("a group per row");
+            let mut seen = group.to_vec();
+            if payload {
+                seen.extend_from_slice(
+                    fixtures::bytes_cell(column(fixtures::CELL_PAYLOAD), batch.row_count, row)
+                        .expect("a returned column holds every row it counts"),
+                );
+            }
+            check.check(key, &seen, |v| {
+                let [group, ..] = fixtures::cell_fields(v.seed, spread);
+                let mut want = group.to_vec();
+                if payload {
+                    want.extend_from_slice(&v.bytes());
+                }
+                Ok(want)
+            })?;
+        }
+    }
+    Ok(check.finish())
+}
+
+/// ~1% of a cell-row tree, in a few runs of neighbouring keys: the payload
+/// of the few pages holding them is all a late read takes.
+fn cells_sparse_clustered(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_CLUSTER, 0, 0)),
+        |seed| fixtures::cluster_of(seed) == 0,
+        true,
+    )
+}
+
+/// About one row in each row page: every page of the payload holds a kept
+/// row, so the late read can spare no page, and must not cost more than the
+/// eager one; what it spares is materialising the rows dropped.
+fn cells_sparse_one_per_page(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a cell-row scan needs a cell-row fixture");
+    };
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_SPREAD, 0, 0)),
+        move |seed| seed % spread == 0,
+        true,
+    )
+}
+
+/// ~90% of a cell-row tree: nearly every page holds a kept row.
+fn cells_near_full(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_BUCKET, 1, 9)),
+        |seed| fixtures::bucket_of(seed) != 0,
+        true,
+    )
+}
+
+/// The header field of every wide cell row, without its payload: no blob is
+/// read at all.
+fn cells_projected(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    let blobs = fixture.tree.metrics().blob_read_count();
+    let rows = verify_cells_scan(fixture, None, |_| true, false)?;
+    assert_eq!(
+        fixture.tree.metrics().blob_read_count(),
+        blobs,
+        "a projection of the header fields read a payload"
+    );
+    Ok(rows)
+}
+
+/// ~1% of the scattered blobs: the payload of the rows the predicate drops is
+/// never fetched.
+fn cells_blobs_filtered(fixture: &Fixture) -> lsm_tree::Result<u64> {
+    verify_cells_scan(
+        fixture,
+        Some(&field_range(fixtures::CELL_GROUP, 0, 0)),
+        |seed| fixtures::group_of(seed) == 0,
+        true,
+    )
+}
+
 /// Every visible row, resolved in key order.
 ///
 /// The blob scenarios read through this rather than through point reads: a
@@ -650,11 +849,28 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
         },
         Scenario {
             name: "blobs-filtered-before-fetch",
-            fixture: fixtures::blobs_scattered,
-            support: Support::Missing(
-                "needs materialization deferred past the filter, so the blob \
-                 reads of discarded rows are never issued",
-            ),
+            fixture: fixtures::cells_scattered,
+            support: Support::Native(cells_blobs_filtered),
+        },
+        Scenario {
+            name: "wide-cells-projected",
+            fixture: fixtures::cells_wide,
+            support: Support::Native(cells_projected),
+        },
+        Scenario {
+            name: "cells-scan-sparse-clustered",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_clustered),
+        },
+        Scenario {
+            name: "cells-scan-sparse-one-per-page",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_sparse_one_per_page),
+        },
+        Scenario {
+            name: "cells-scan-near-full",
+            fixture: fixtures::cells_inline,
+            support: Support::Native(cells_near_full),
         },
     ]
 }

@@ -977,8 +977,8 @@ impl ColumnarScan {
         let _ = batch;
     }
 
-    /// Records a payload page read for chosen rows: `useful` bytes of their
-    /// cells out of the `decoded` bytes of the page's column.
+    /// Records `useful` bytes of chosen rows' cells taken from payload pages
+    /// read for them, and `incidental` bytes those pages held besides.
     #[inline]
     #[cfg_attr(
         not(feature = "metrics"),
@@ -987,11 +987,14 @@ impl ColumnarScan {
             reason = "the scan's metrics exist only with the feature"
         )
     )]
-    fn record_payload(&self, useful: u64, decoded: u64) {
+    fn record_payload(&self, useful: u64, incidental: u64) {
         #[cfg(feature = "metrics")]
-        self.metrics.record_payload(useful, decoded);
+        {
+            self.metrics.record_payload_useful(useful);
+            self.metrics.record_payload_incidental(incidental);
+        }
         #[cfg(not(feature = "metrics"))]
-        let _ = (useful, decoded);
+        let _ = (useful, incidental);
     }
 
     /// Records `bytes` a read copied out of the pages it decoded.
