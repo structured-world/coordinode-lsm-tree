@@ -293,25 +293,40 @@ const CORRUPT: Error = Error::InvalidHeader("field row: malformed cell row");
 /// Bytes a field's descriptor takes: its column id, type tag and width.
 const DESCRIPTOR_LEN: usize = 4;
 
-/// Refuses a row a caller could not have meant: a type that has no wire form
-/// (a zero-width [`TypeTag::Fixed`]), two fields in one column, or a
+/// The first column id a field may take: the ids below it name the key, the
+/// seqno and the value type in a columnar table.
+pub const FIRST_FIELD_COLUMN: u16 = 3;
+
+/// The column id a columnar table keeps a whole value under, beside the
+/// fields of rows written as cells: no field may take it.
+pub(crate) const WHOLE_VALUE_COLUMN: u16 = u16::MAX;
+
+/// Puts `fields` in the order a row stores them, ascending by column, and
+/// refuses a row a caller could not have meant: a column outside the field
+/// ids (below [`FIRST_FIELD_COLUMN`], or `u16::MAX`), a type that has no wire
+/// form (a zero-width [`TypeTag::Fixed`]), two fields in one column, or a
 /// fixed-width field whose value or object is not its type's width.
+///
+/// One order for every row is what lets a columnar table store a row's fields
+/// as columns and give back the row as it was written.
 ///
 /// # Errors
 ///
 /// Returns [`Error::CellRow`] naming the fault.
-pub(crate) fn check_fields(fields: &[RowField<'_>]) -> crate::Result<()> {
-    for (i, field) in fields.iter().enumerate() {
+pub(crate) fn order_fields(fields: &mut [RowField<'_>]) -> crate::Result<()> {
+    fields.sort_by_key(|field| field.column);
+    let mut previous = None;
+    for field in fields.iter() {
+        if field.column < FIRST_FIELD_COLUMN || field.column == WHOLE_VALUE_COLUMN {
+            return Err(Error::CellRow("a field's column is not a field id"));
+        }
+        if previous == Some(field.column) {
+            return Err(Error::CellRow("one column in two fields"));
+        }
+        previous = Some(field.column);
         let (tag, width) = field.tag.to_wire();
         if TypeTag::from_wire(tag, width).is_err() {
             return Err(Error::CellRow("a field's type has no wire form"));
-        }
-        if fields
-            .iter()
-            .skip(i + 1)
-            .any(|other| other.column == field.column)
-        {
-            return Err(Error::CellRow("one column in two fields"));
         }
         if let Some(width) = field.tag.fixed_width() {
             let len = match field.cell {
@@ -400,10 +415,20 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
         .ok_or(CORRUPT)?;
     let mut pos = descriptors_at + count * DESCRIPTOR_LEN;
     let mut fields = Vec::with_capacity(count);
+    let mut previous = None;
     for (i, descriptor) in descriptors.chunks_exact(DESCRIPTOR_LEN).enumerate() {
         let [c0, c1, tag, width] =
             <[u8; DESCRIPTOR_LEN]>::try_from(descriptor).map_err(|_| CORRUPT)?;
         let column = u16::from_le_bytes([c0, c1]);
+        // A written row holds field ids in ascending order; anything else is
+        // damage, not a layout to read.
+        if column < FIRST_FIELD_COLUMN
+            || column == WHOLE_VALUE_COLUMN
+            || previous.is_some_and(|previous| column <= previous)
+        {
+            return Err(CORRUPT);
+        }
+        previous = Some(column);
         let tag = TypeTag::from_wire(tag, width).map_err(|_| CORRUPT)?;
         let len = row
             .get(pos..)

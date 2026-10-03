@@ -393,10 +393,10 @@ impl KvSeparationOptions {
     /// ```
     /// use lsm_tree::KvSeparationOptions;
     ///
-    /// // Column 1 (status) never separates; column 2 (body) separates from 256 bytes.
+    /// // Column 3 (status) never separates; column 4 (body) separates from 256 bytes.
     /// let opts = KvSeparationOptions::default()
-    ///     .cell_separation_threshold(1, u32::MAX)
-    ///     .cell_separation_threshold(2, 256);
+    ///     .cell_separation_threshold(3, u32::MAX)
+    ///     .cell_separation_threshold(4, 256);
     /// ```
     #[must_use]
     pub fn cell_separation_threshold(mut self, column: u16, bytes: u32) -> Self {

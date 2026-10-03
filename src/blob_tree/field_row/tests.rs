@@ -25,22 +25,25 @@ fn u64_le() -> TypeTag {
     TypeTag::Number(Number::new(NumberKind::Unsigned, 8, ByteOrder::Little).unwrap())
 }
 
+/// The first field id, under the name the tests use for it.
+const C: u16 = FIRST_FIELD_COLUMN;
+
 /// A row of values and references decodes to the same fields, references
 /// marked as such, so the engine can list them without the caller's schema.
 #[test]
 fn a_row_round_trips_its_values_and_references() {
     let payload = indirection(7, 4_096, 1_000);
     let row = encode_row(&[
-        RowField::bytes(3, RowCell::Value(b"status")),
-        RowField::bytes(9, reference(payload)),
-        RowField::bytes(1, RowCell::Value(b"")),
+        RowField::bytes(C, RowCell::Value(b"status")),
+        RowField::bytes(C + 6, reference(payload)),
+        RowField::bytes(C + 9, RowCell::Value(b"")),
     ])
     .unwrap();
     let fields = decode_row(&row).unwrap();
     assert_eq!(fields.len(), 3);
     assert_eq!(
         fields.iter().map(|f| f.column).collect::<Vec<_>>(),
-        [3, 9, 1]
+        [C, C + 6, C + 9]
     );
     assert!(matches!(fields[0].cell, RowCell::Value(b"status")));
     assert!(matches!(
@@ -69,9 +72,9 @@ fn a_row_round_trips_its_field_types() {
     let fields: Vec<_> = tags
         .iter()
         .zip(values)
-        .enumerate()
-        .map(|(column, (tag, value))| RowField {
-            column: u16::try_from(column).unwrap(),
+        .zip(C..)
+        .map(|((tag, value), column)| RowField {
+            column,
             tag: *tag,
             cell: RowCell::Value(value),
         })
@@ -89,13 +92,13 @@ fn ownership_round_trips_per_reference() {
     let borrowed = indirection(4, 30, 40);
     let row = encode_row(&[
         RowField::bytes(
-            0,
+            C,
             RowCell::Ref {
                 indirection: owned,
                 owner: true,
             },
         ),
-        RowField::bytes(1, reference(borrowed)),
+        RowField::bytes(C + 1, reference(borrowed)),
     ])
     .unwrap();
     let refs = row_refs(&row).unwrap();
@@ -109,11 +112,11 @@ fn ownership_round_trips_per_reference() {
 #[test]
 fn a_reference_past_the_eighth_field_is_found() {
     let far = indirection(3, 64, 10);
-    let mut fields: Vec<RowField<'_>> = (0..9)
+    let mut fields: Vec<RowField<'_>> = (C..C + 9)
         .map(|column| RowField::bytes(column, RowCell::Value(b"x")))
         .collect();
     fields.push(RowField::bytes(
-        9,
+        C + 9,
         RowCell::Ref {
             indirection: far,
             owner: true,
@@ -131,8 +134,8 @@ fn a_reference_past_the_eighth_field_is_found() {
 #[test]
 fn a_malformed_row_is_refused() {
     let row = encode_row(&[
-        RowField::bytes(0, RowCell::Value(b"abc")),
-        RowField::bytes(1, reference(indirection(1, 0, 5))),
+        RowField::bytes(C, RowCell::Value(b"abc")),
+        RowField::bytes(C + 1, reference(indirection(1, 0, 5))),
     ])
     .unwrap();
     for cut in 0..row.len() {
@@ -150,7 +153,7 @@ fn a_malformed_row_is_refused() {
 /// refused rather than read with the bit ignored.
 #[test]
 fn an_owning_value_field_is_refused() {
-    let mut row = encode_row(&[RowField::bytes(0, RowCell::Value(b"abc"))]).unwrap();
+    let mut row = encode_row(&[RowField::bytes(C, RowCell::Value(b"abc"))]).unwrap();
     // Count (2 bytes), reference bitmap (1 byte), then the owner bitmap.
     row[3] |= 1;
     assert!(matches!(decode_row(&row), Err(Error::InvalidHeader(_))));
@@ -160,21 +163,66 @@ fn an_owning_value_field_is_refused() {
 /// than read with some other layout.
 #[test]
 fn an_unknown_field_type_is_refused() {
-    let mut row = encode_row(&[RowField::bytes(0, RowCell::Value(b"abc"))]).unwrap();
+    let mut row = encode_row(&[RowField::bytes(C, RowCell::Value(b"abc"))]).unwrap();
     // Count, two one-byte bitmaps, then the column id; the tag follows it.
     row[6] = 0xFF;
     assert!(matches!(decode_row(&row), Err(Error::InvalidHeader(_))));
+}
+
+/// A stored row whose fields are out of column order, repeat a column or name
+/// an id that is not a field's is damage: every written row is in ascending
+/// field order, which is what lets a columnar table give it back as written.
+#[test]
+fn a_stored_row_out_of_field_order_is_refused() {
+    for columns in [[C + 1, C], [C, C], [0, C], [C, u16::MAX]] {
+        let row = encode_row(&[
+            RowField::bytes(columns[0], RowCell::Value(b"a")),
+            RowField::bytes(columns[1], RowCell::Value(b"b")),
+        ])
+        .unwrap();
+        assert!(
+            matches!(decode_row(&row), Err(Error::InvalidHeader(_))),
+            "{columns:?} decoded"
+        );
+    }
+}
+
+/// Fields given in any order are stored in ascending column order.
+#[test]
+fn fields_are_put_in_column_order() {
+    let mut fields = [
+        RowField::bytes(C + 7, RowCell::Value(b"c")),
+        RowField::bytes(C, RowCell::Value(b"a")),
+        RowField::bytes(C + 2, RowCell::Value(b"b")),
+    ];
+    order_fields(&mut fields).unwrap();
+    assert_eq!(fields.map(|f| f.column), [C, C + 2, C + 7]);
 }
 
 /// Two fields in one column would make the row's layout ambiguous: the
 /// write is refused.
 #[test]
 fn two_fields_in_one_column_are_refused() {
-    let result = check_fields(&[
-        RowField::bytes(4, RowCell::Value(b"a")),
-        RowField::bytes(4, RowCell::Value(b"b")),
+    let result = order_fields(&mut [
+        RowField::bytes(C + 1, RowCell::Value(b"a")),
+        RowField::bytes(C, RowCell::Value(b"x")),
+        RowField::bytes(C + 1, RowCell::Value(b"b")),
     ]);
     assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
+}
+
+/// A column id that is not a field id (an intrinsic column's, or the one a
+/// columnar table keeps whole values under) is refused.
+#[test]
+fn a_column_that_is_not_a_field_id_is_refused() {
+    for column in [0, 1, 2, u16::MAX] {
+        let result = order_fields(&mut [RowField::bytes(column, RowCell::Value(b"a"))]);
+        assert!(
+            matches!(result, Err(Error::CellRow(_))),
+            "{column}: {result:?}"
+        );
+    }
+    assert!(order_fields(&mut [RowField::bytes(u16::MAX - 1, RowCell::Value(b"a"))]).is_ok());
 }
 
 /// A fixed-width field whose value, or whose referenced object, is not its
@@ -182,28 +230,28 @@ fn two_fields_in_one_column_are_refused() {
 #[test]
 fn a_fixed_width_field_of_another_width_is_refused() {
     let field = |cell| RowField {
-        column: 0,
+        column: C,
         tag: u64_le(),
         cell,
     };
-    assert!(check_fields(&[field(RowCell::Value(&[0; 8]))]).is_ok());
+    assert!(order_fields(&mut [field(RowCell::Value(&[0; 8]))]).is_ok());
     for cell in [
         RowCell::Value(&[0; 7]),
         RowCell::Value(&[0; 9]),
         reference(indirection(1, 0, 4)),
     ] {
-        let result = check_fields(&[field(cell)]);
+        let result = order_fields(&mut [field(cell)]);
         assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
     }
-    assert!(check_fields(&[field(reference(indirection(1, 0, 8)))]).is_ok());
+    assert!(order_fields(&mut [field(reference(indirection(1, 0, 8)))]).is_ok());
 }
 
 /// A zero-width fixed type has no wire form: a row holding it would not
 /// decode, so the write is refused.
 #[test]
 fn a_zero_width_fixed_field_is_refused() {
-    let result = check_fields(&[RowField {
-        column: 0,
+    let result = order_fields(&mut [RowField {
+        column: C,
         tag: TypeTag::Fixed(0),
         cell: RowCell::Value(b""),
     }]);
@@ -217,13 +265,13 @@ fn a_zero_width_fixed_field_is_refused() {
 fn a_row_resolves_to_its_fields_with_objects_in_place() {
     let object = crate::Slice::from(vec![b'p'; 5]);
     let row = encode_row(&[
-        RowField::bytes(0, RowCell::Value(b"ab")),
+        RowField::bytes(C, RowCell::Value(b"ab")),
         RowField {
-            column: 1,
+            column: C + 1,
             tag: u64_le(),
             cell: RowCell::Value(&[7, 0, 0, 0, 0, 0, 0, 0]),
         },
-        RowField::bytes(2, reference(indirection(1, 0, 5))),
+        RowField::bytes(C + 2, reference(indirection(1, 0, 5))),
     ])
     .unwrap();
     let value = resolve_row(&row, |_| Ok(object.clone())).unwrap();
@@ -236,14 +284,14 @@ fn a_row_resolves_to_its_fields_with_objects_in_place() {
 #[test]
 fn separation_follows_the_column_threshold() {
     let row = encode_row(&[
-        RowField::bytes(5, RowCell::Value(b"large-but-kept")),
-        RowField::bytes(2, RowCell::Value(b"tiny")),
+        RowField::bytes(C, RowCell::Value(b"tiny")),
+        RowField::bytes(C + 5, RowCell::Value(b"large-but-kept")),
     ])
     .unwrap();
     let mut written = Vec::new();
     let separated = separate_row(
         &row,
-        |column| if column == 2 { 0 } else { u32::MAX },
+        |column| if column == C { 0 } else { u32::MAX },
         |bytes| {
             written.push(bytes.to_vec());
             Ok(ValueHandle {
@@ -257,16 +305,16 @@ fn separation_follows_the_column_threshold() {
     .unwrap();
     assert_eq!(written, [b"tiny".to_vec()]);
     let fields = decode_row(&separated).unwrap();
-    assert!(matches!(fields[0].cell, RowCell::Value(b"large-but-kept")));
-    assert!(matches!(fields[1].cell, RowCell::Ref { owner: true, .. }));
-    assert_eq!(fields[1].column, 2);
+    assert!(matches!(fields[0].cell, RowCell::Ref { owner: true, .. }));
+    assert_eq!(fields[0].column, C);
+    assert!(matches!(fields[1].cell, RowCell::Value(b"large-but-kept")));
 }
 
 /// An object whose length differs from the size its reference records is an
 /// error: a dangling or mis-typed reference never reads as some other value.
 #[test]
 fn an_object_of_another_size_is_an_error() {
-    let row = encode_row(&[RowField::bytes(0, reference(indirection(1, 0, 5)))]).unwrap();
+    let row = encode_row(&[RowField::bytes(C, reference(indirection(1, 0, 5)))]).unwrap();
     let result = resolve_row(&row, |_| Ok(crate::Slice::from(vec![b'p'; 4])));
     assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
 }

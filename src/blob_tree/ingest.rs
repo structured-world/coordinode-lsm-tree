@@ -154,7 +154,7 @@ impl<'a> BlobIngestion<'a> {
         fields: &[crate::blob_tree::field_row::Field<'_>],
     ) -> crate::Result<()> {
         use crate::blob_tree::field_row::{
-            Cell, RowCell, RowField, check_fields, encode_row, separate_row,
+            Cell, RowCell, RowField, encode_row, order_fields, separate_row,
         };
 
         // Check order before any blob I/O to avoid partial writes on failure
@@ -176,7 +176,7 @@ impl<'a> BlobIngestion<'a> {
                 cell: RowCell::Value(bytes),
             });
         }
-        check_fields(&row)?;
+        order_fields(&mut row)?;
         let row = encode_row(&row)?;
         let (thresholds, default) = (&self.cell_thresholds, self.separation_threshold);
         let (blob, seqno) = (&mut self.blob, self.seqno);

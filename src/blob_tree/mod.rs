@@ -440,8 +440,12 @@ impl BlobTree {
     ///
     /// Each [`Field`](field_row::Field) names its column and physical type,
     /// and both are stored with the row, so a stored row always reads with
-    /// the layout it was written with. Plain reads of the key return the
-    /// fields in order, framed as the columnar format frames a row's value
+    /// the layout it was written with. A column id is a field id of the
+    /// columnar format (from [`FIRST_FIELD_COLUMN`](field_row::FIRST_FIELD_COLUMN)
+    /// up to, not including, `u16::MAX`), so a columnar table can store the
+    /// field as that column. The row keeps its fields in ascending column
+    /// order, whatever order they are given in. Plain reads of the key return
+    /// the fields in that order, framed as the columnar format frames a row's value
     /// sub-columns (a variable-width field as a little-endian `u32` length and
     /// its bytes, a fixed-width one as its bytes), with every
     /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object. A
@@ -464,8 +468,9 @@ impl BlobTree {
     /// Returns [`crate::Error::BlobRef`] if a reference was read from another
     /// key or tree, two fields name one object, or a reference is stale (its
     /// object was moved or let go of since the read: read the key again);
-    /// [`crate::Error::CellRow`] if two fields share a column or a
-    /// fixed-width field is not its type's width; and an error if the row has
+    /// [`crate::Error::CellRow`] if a column is not a field id, two fields
+    /// share a column or a fixed-width field is not its type's width; and an
+    /// error if the row has
     /// more than `u16::MAX` fields or a cell exceeds `u32::MAX` bytes. Nothing
     /// is written then.
     ///
@@ -479,7 +484,8 @@ impl BlobTree {
     ///     .with_kv_separation(Some(KvSeparationOptions::default()))
     ///     .open()?;
     /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
-    /// tree.insert_cells("doc", &[Field::bytes(1, b"draft"), Field::bytes(2, b"body")], 0)?;
+    /// // Given out of order, stored and read in column order.
+    /// tree.insert_cells("doc", &[Field::bytes(4, b"body"), Field::bytes(3, b"draft")], 0)?;
     /// let value = tree.get("doc", 1)?.expect("written");
     /// assert_eq!(&*value, b"\x05\0\0\0draft\x04\0\0\0body");
     /// # Ok::<(), lsm_tree::Error>(())
@@ -517,7 +523,7 @@ impl BlobTree {
                 cell,
             });
         }
-        field_row::check_fields(&row)?;
+        field_row::order_fields(&mut row)?;
         let refs = fields.iter().filter_map(|field| match &field.cell {
             field_row::Cell::Ref(reference) => Some(reference),
             field_row::Cell::Value(_) => None,
@@ -561,7 +567,7 @@ impl BlobTree {
     /// #     .open()?;
     /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
     /// let body = vec![b'x'; 1_000];
-    /// tree.insert_cells("doc", &[Field::bytes(1, b"draft"), Field::bytes(2, &body)], 0)?;
+    /// tree.insert_cells("doc", &[Field::bytes(3, b"draft"), Field::bytes(4, &body)], 0)?;
     /// tree.flush_active_memtable(0)?;
     ///
     /// // Change the status, keep the body where it is.

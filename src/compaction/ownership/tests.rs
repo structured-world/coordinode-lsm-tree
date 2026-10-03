@@ -17,7 +17,7 @@ fn object(offset: u64) -> BlobIndirection {
 fn cell_row(key: &str, seqno: u64, refs: &[(BlobIndirection, bool)]) -> InternalValue {
     let cells: Vec<RowField<'_>> = refs
         .iter()
-        .zip(0..)
+        .zip(crate::blob_tree::field_row::FIRST_FIELD_COLUMN..)
         .map(|(&(indirection, owner), column)| {
             RowField::bytes(column, RowCell::Ref { indirection, owner })
         })

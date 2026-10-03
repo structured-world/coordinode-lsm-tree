@@ -154,15 +154,15 @@ fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
     };
     let row = encode_row(&[
         RowField::bytes(
-            0,
+            3,
             RowCell::Ref {
                 indirection: at(0, 100),
                 owner: true,
             },
         ),
-        RowField::bytes(1, RowCell::Value(b"status")),
+        RowField::bytes(4, RowCell::Value(b"status")),
         RowField::bytes(
-            2,
+            5,
             RowCell::Ref {
                 indirection: at(100, 40),
                 owner: false,
