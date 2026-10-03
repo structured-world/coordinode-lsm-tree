@@ -280,6 +280,9 @@ impl Wakeup {
         let mut generation = self.generation.lock();
         if *generation == seen {
             // Woken early or late, the caller re-derives its wait either way.
+            // A timeout past the clock's range does not panic: parking_lot
+            // takes a deadline that `Instant` cannot hold as no deadline, and
+            // a ring still ends that wait.
             let _ = self.rung.wait_for(&mut generation, timeout);
         }
     }

@@ -441,6 +441,29 @@ fn a_stop_signal_wakes_a_request_waiting_on_the_limiter() {
     assert!(took < Duration::from_secs(2), "stopped after {took:?}");
 }
 
+/// A wait longer than the monotonic clock can count to (`u64::MAX` bytes at
+/// 1 B/s) sleeps without a deadline instead of panicking on it, and a stop
+/// still ends it.
+#[cfg(feature = "std")]
+#[test]
+fn a_wait_past_the_clock_range_sleeps_until_stopped() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1));
+    let signal = crate::stop_signal::StopSignal::default();
+    signal.wake_on_stop(&rl);
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        let signal = signal.clone();
+        std::thread::spawn(move || rl.request_abortable(u64::MAX, || signal.is_stopped()))
+    };
+    std::thread::sleep(ms(300));
+    assert!(!waiter.is_finished(), "the wait is still running");
+    signal.send();
+    assert!(
+        waiter.join().expect("the waiter must not panic"),
+        "the stop ends the wait as a stop"
+    );
+}
+
 /// A debit returned ahead of a waiter wakes it at once: its debt is covered,
 /// and it does not sleep out the wait it had before the return.
 #[cfg(feature = "std")]
