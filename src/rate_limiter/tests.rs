@@ -205,6 +205,26 @@ fn switching_off_makes_requests_immediate() {
     assert_eq!(Duration::ZERO, rl.acquire_wait(1_000_000, ms(0)));
 }
 
+/// Runs `work` on its own thread; the returned closure takes its result, and
+/// fails the test once `bound` passes instead of hanging on a wake-up that
+/// never comes.
+#[cfg(feature = "std")]
+fn spawn_bounded<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl FnOnce(Duration) -> T {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        tx.send(work()).expect("the test waits for this result");
+    });
+    move |bound| {
+        let result = rx
+            .recv_timeout(bound)
+            .expect("the waiter must finish within its bound");
+        handle.join().unwrap();
+        result
+    }
+}
+
 /// A caller already sleeping out a debt is released when throttling is
 /// switched off, instead of sleeping the wait computed at the old rate.
 #[cfg(feature = "std")]
@@ -213,7 +233,7 @@ fn switching_off_releases_a_caller_mid_wait() {
     let rl = alloc::sync::Arc::new(RateLimiter::new(1));
     let waiter = {
         let rl = alloc::sync::Arc::clone(&rl);
-        std::thread::spawn(move || {
+        spawn_bounded(move || {
             let start = std::time::Instant::now();
             // 1 B/s: roughly an hour of debt.
             let stopped = rl.request_interruptible(3_600, || false);
@@ -222,7 +242,7 @@ fn switching_off_releases_a_caller_mid_wait() {
     };
     std::thread::sleep(ms(300));
     rl.set_rate(0);
-    let (stopped, took) = waiter.join().unwrap();
+    let (stopped, took) = waiter(Duration::from_secs(5));
     assert!(!stopped, "a released caller proceeds, it is not stopped");
     assert!(took < Duration::from_secs(5), "released after {took:?}");
 }
@@ -427,7 +447,7 @@ fn a_stop_signal_wakes_a_request_waiting_on_the_limiter() {
     let waiter = {
         let rl = alloc::sync::Arc::clone(&rl);
         let signal = signal.clone();
-        std::thread::spawn(move || {
+        spawn_bounded(move || {
             let start = std::time::Instant::now();
             // 1 B/s: roughly an hour of debt.
             let stopped = rl.request_abortable(3_600, || signal.is_stopped());
@@ -436,7 +456,7 @@ fn a_stop_signal_wakes_a_request_waiting_on_the_limiter() {
     };
     std::thread::sleep(ms(300));
     signal.send();
-    let (stopped, took) = waiter.join().unwrap();
+    let (stopped, took) = waiter(Duration::from_secs(5));
     assert!(stopped, "the stop ends the wait as a stop");
     assert!(took < Duration::from_secs(2), "stopped after {took:?}");
 }
@@ -453,13 +473,14 @@ fn a_wait_past_the_clock_range_sleeps_until_stopped() {
     let waiter = {
         let rl = alloc::sync::Arc::clone(&rl);
         let signal = signal.clone();
-        std::thread::spawn(move || rl.request_abortable(u64::MAX, || signal.is_stopped()))
+        spawn_bounded(move || rl.request_abortable(u64::MAX, || signal.is_stopped()))
     };
     std::thread::sleep(ms(300));
-    assert!(!waiter.is_finished(), "the wait is still running");
     signal.send();
+    // A wait that panicked never reports, and one that ended on its own
+    // reports `false`.
     assert!(
-        waiter.join().expect("the waiter must not panic"),
+        waiter(Duration::from_secs(5)),
         "the stop ends the wait as a stop"
     );
 }
@@ -502,8 +523,8 @@ fn a_returned_debit_wakes_the_waiter_behind_it() {
     );
 }
 
-/// A tree rings its limiter when it stops, opened new and reopened alike: a
-/// compaction throttled to an hour-long wait ends at once.
+/// A tree rings its limiter when it is dropped, opened new and reopened alike:
+/// a compaction throttled to an hour-long wait ends at once.
 #[cfg(feature = "std")]
 #[test]
 fn a_tree_stop_wakes_its_throttled_compaction() -> crate::Result<()> {
@@ -528,14 +549,14 @@ fn a_tree_stop_wakes_its_throttled_compaction() -> crate::Result<()> {
         let tree = open()?;
         let rl = alloc::sync::Arc::clone(&tree.compaction_rate_limiter);
         let signal = tree.stop_signal.clone();
-        let waiter = std::thread::spawn(move || {
+        let waiter = spawn_bounded(move || {
             let start = std::time::Instant::now();
             let stopped = rl.request_abortable(3_600, || signal.is_stopped());
             (stopped, start.elapsed())
         });
         std::thread::sleep(ms(300));
-        tree.stop_signal.send();
-        let (stopped, took) = waiter.join().unwrap();
+        drop(tree);
+        let (stopped, took) = waiter(Duration::from_secs(5));
         assert!(stopped);
         assert!(took < Duration::from_secs(2), "stopped after {took:?}");
     }
