@@ -1024,7 +1024,7 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crat
     }
 
     let table_id: TableId = 42;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
+    let scan = scan_sst_blocks(&fs, path, table_id, SstLayout::PLAIN, None)?;
     // The inflated section length ALSO breaks the TOC tiling invariant
     // (the declared section end runs past where the TOC begins), so the
     // walk reports the tiling finding alongside the read error.
@@ -1059,6 +1059,67 @@ fn walk_block_region_reports_data_read_error_on_truncated_data_segment() -> crat
         scan.blocks_scanned, 1,
         "header decoded successfully, so blocks_scanned must count this block \
          even though the data segment read failed",
+    );
+    Ok(())
+}
+
+/// A rated scan is charged the bytes it reads, never a length the TOC
+/// declares: a re-stamped TOC that gives a raw section a terabyte must not
+/// make the scan wait out that terabyte before it reports the TOC corrupt.
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    reason = "synthetic SFA forgery: the offsets are in bounds by construction and the \
+              archive is under 1 KiB"
+)]
+fn a_rated_scan_charges_the_bytes_read_not_a_forged_section_length() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, StdFs};
+
+    const TRAILER_LEN: usize = 4 + 1 + 1 + 16 + 8 + 8;
+    let mut archive_bytes: Vec<u8> = Vec::new();
+    {
+        let mut writer = crate::sfa::Writer::from_writer(std::io::Cursor::new(&mut archive_bytes));
+        writer.start("meta_separator").unwrap();
+        writer.write_all(&[0u8; 16]).unwrap();
+        writer.finish().unwrap();
+    }
+    let trailer_start = archive_bytes.len() - TRAILER_LEN;
+    let field = |at: usize| -> usize {
+        u64::from_le_bytes(archive_bytes[at..at + 8].try_into().unwrap()) as usize
+    };
+    let (toc_pos, toc_len) = (field(trailer_start + 22), field(trailer_start + 30));
+    // The only entry's length, past `TOC!`, the entry count and its position.
+    let len_at = toc_pos + 4 + 4 + 8;
+    archive_bytes[len_at..len_at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let checksum = crate::hash::hash128(&archive_bytes[toc_pos..toc_pos + toc_len]);
+    let checksum_at = trailer_start + 4 + 1 + 1;
+    archive_bytes[checksum_at..checksum_at + 16].copy_from_slice(&checksum.to_le_bytes());
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("forged.sst");
+    {
+        let mut f = StdFs.open(
+            &path,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        f.write_all(&archive_bytes)?;
+    }
+
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 20);
+    let start = std::time::Instant::now();
+    let scan = scan_sst_blocks(&StdFs, &path, 9, SstLayout::PLAIN, Some(&limiter))?;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the scan waited {elapsed:?} on a forged section length"
+    );
+    assert!(
+        scan.errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::TocCorrupted { .. })),
+        "the forged length is still reported: {:?}",
+        scan.errors,
     );
     Ok(())
 }
@@ -1148,7 +1209,11 @@ fn walk_block_region_reports_data_read_error_on_truncated_parity_trailer() -> cr
     // Scan as an RS(4,2) table: a non-zero parity_len is drained after the
     // (clean) payload, hitting EOF in the short SFA tail.
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(EccParams::RS_4_2), false, 0)?;
+    let layout = SstLayout {
+        ecc: Some(EccParams::RS_4_2),
+        ..SstLayout::PLAIN
+    };
+    let scan = scan_sst_blocks(&fs, path, table_id, layout, None)?;
     assert!(
         scan.errors.iter().any(|e| matches!(
             e,
@@ -1250,7 +1315,11 @@ fn walk_block_region_caps_an_absurd_parity_trailer_length() -> crate::Result<()>
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, Some(params), false, 0)?;
+    let layout = SstLayout {
+        ecc: Some(params),
+        ..SstLayout::PLAIN
+    };
+    let scan = scan_sst_blocks(&fs, path, table_id, layout, None)?;
     assert!(
         scan.errors.iter().any(|e| matches!(
             e,
@@ -1347,7 +1416,7 @@ fn walk_block_region_reports_header_crossing_section_boundary() -> crate::Result
     }
 
     let table_id: TableId = 7;
-    let scan = scan_sst_blocks(&fs, path, table_id, 0, None, false, 0)?;
+    let scan = scan_sst_blocks(&fs, path, table_id, SstLayout::PLAIN, None)?;
     // The shrunken section length ALSO breaks the TOC tiling invariant
     // (the sections no longer reach the TOC start), so the walk reports
     // the tiling finding alongside the boundary violation.
@@ -3081,4 +3150,148 @@ fn verify_sst_file_walks_a_healthy_columnar_sst_clean() -> crate::Result<()> {
         report.blocks_scanned,
     );
     Ok(())
+}
+
+/// Four SSTs of incompressible 1 KiB values, about 1.2 MiB on disk in all.
+fn populate_rated_fixture(dir: &std::path::Path) {
+    let cfg = Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(CompressionType::None));
+    let tree = cfg.open().unwrap();
+    let mut seqno = 1u64;
+    for b in 0..4u32 {
+        for i in 0..300u32 {
+            let key = format!("b{b:03}k{i:08}");
+            let value: Vec<u8> = (0..1024u32)
+                .map(|j| {
+                    let [low, ..] = (j.wrapping_mul(2_654_435_761) ^ i ^ (b << 16)).to_le_bytes();
+                    low
+                })
+                .collect();
+            tree.insert(key.as_bytes(), value, seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(seqno).unwrap();
+        seqno += 1;
+    }
+}
+
+/// The on-disk bytes of the tree's tables.
+fn table_bytes(tree: &impl AbstractTree) -> u64 {
+    tree.current_version()
+        .iter_tables()
+        .map(|t| std::fs::metadata(&*t.path).unwrap().len())
+        .sum()
+}
+
+/// A rated scan of `bytes` takes what the limiter owes past its one-second
+/// burst: `(bytes - rate) / rate`, give or take the few bytes per table the
+/// scan reads without charging (trailer and TOC) and scheduling slack.
+fn assert_rated_scan(parallelism: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    populate_rated_fixture(dir.path());
+    let tree = reopen_tree(dir.path());
+    let bytes = table_bytes(&tree);
+    let rate = 400 * 1024u64;
+    assert!(
+        bytes > 2 * rate,
+        "the fixture must outlast the burst: {bytes} bytes"
+    );
+
+    let opts = VerifyOptions::default()
+        .parallelism(parallelism)
+        .max_bytes_per_sec(rate);
+    let start = std::time::Instant::now();
+    let report = tree.verify_checksum_with(&opts);
+    let elapsed = start.elapsed();
+
+    assert!(report.is_ok(), "a rated scan verifies the same: {report:?}");
+    assert_eq!(report.sst_files_scanned, 4);
+    let owed = |bytes: u64| std::time::Duration::from_millis((bytes - rate) * 1000 / rate);
+    // Trailer and TOC are read uncharged: well under 1 KiB per table, and a
+    // twentieth off for the clock.
+    let floor = owed(bytes - 4 * 1024) * 19 / 20;
+    let ceiling = owed(bytes) * 3 / 2 + std::time::Duration::from_secs(1);
+    assert!(
+        elapsed >= floor,
+        "{parallelism} worker(s): {bytes} bytes at {rate} B/s took {elapsed:?}, \
+         under the {floor:?} the limiter owes",
+    );
+    assert!(
+        elapsed <= ceiling,
+        "{parallelism} worker(s): {bytes} bytes at {rate} B/s took {elapsed:?}, \
+         past {ceiling:?}",
+    );
+}
+
+/// One worker reads at the configured rate.
+#[test]
+fn verify_at_a_byte_rate_takes_its_bytes_over_the_rate_with_one_worker() {
+    assert_rated_scan(1);
+}
+
+/// Four workers draw on the one limiter, so together they read at the rate,
+/// not four times it.
+#[test]
+fn verify_at_a_byte_rate_takes_its_bytes_over_the_rate_with_four_workers() {
+    assert_rated_scan(4);
+}
+
+/// Without a limiter, or with a rate of zero, the scan does not wait.
+#[test]
+fn verify_without_a_byte_rate_reads_at_full_speed() {
+    let dir = tempfile::tempdir().unwrap();
+    populate_rated_fixture(dir.path());
+    let tree = reopen_tree(dir.path());
+    for opts in [
+        VerifyOptions::default(),
+        VerifyOptions::default().max_bytes_per_sec(0),
+    ] {
+        let start = std::time::Instant::now();
+        let report = tree.verify_checksum_with(&opts);
+        let elapsed = start.elapsed();
+        assert!(report.is_ok(), "{report:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(900),
+            "an unrated scan of {} bytes took {elapsed:?}",
+            table_bytes(&tree),
+        );
+    }
+}
+
+/// A limit changes when blocks are read, not what is found in them.
+#[test]
+fn verify_at_a_byte_rate_still_reports_a_corrupt_block() {
+    use crate::table::block::Header;
+    let dir = tempfile::tempdir().unwrap();
+    populate_rated_fixture(dir.path());
+    let sst_path = pick_first_sst_path(dir.path());
+    let flip_offset = Header::MIN_LEN as u64 + 8;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst_path)
+            .unwrap();
+        f.seek(SeekFrom::Start(flip_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(flip_offset)).unwrap();
+        f.write_all(&byte).unwrap();
+        f.sync_all().unwrap();
+    }
+    let tree = reopen_tree(dir.path());
+    let rate = table_bytes(&tree);
+    let report = tree.verify_checksum_with(&VerifyOptions::default().max_bytes_per_sec(rate));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e, BlockVerifyError::DataCorrupted { .. })),
+        "the flipped payload byte is reported under a limit: {report:?}",
+    );
 }

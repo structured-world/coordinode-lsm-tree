@@ -3,6 +3,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::path::{Path, PathBuf};
+use crate::rate_limiter::RateLimiter;
 use crate::{checksum::Checksum, coding::Decode, io, table::TableId, table::block::Header};
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -620,6 +621,13 @@ pub struct VerifyOptions {
     /// the next, capping I/O pressure on a production box during a scrub.
     /// `None` (default) runs at full speed.
     pub throttle: Option<core::time::Duration>,
+
+    /// The budget the scan reads under: every block and raw section is charged
+    /// its on-disk bytes before it is read, through this one limiter for all
+    /// [`parallelism`](Self::parallelism) workers. Shared, so a caller can
+    /// retune it live or draw it from the same budget as compaction. `None`
+    /// (default) reads at full speed. Only a `std` build waits on it.
+    pub rate_limiter: Option<alloc::sync::Arc<RateLimiter>>,
 }
 
 impl Default for VerifyOptions {
@@ -627,6 +635,7 @@ impl Default for VerifyOptions {
         Self {
             parallelism: 1,
             throttle: None,
+            rate_limiter: None,
         }
     }
 }
@@ -644,6 +653,34 @@ impl VerifyOptions {
     pub const fn throttle(mut self, delay: core::time::Duration) -> Self {
         self.throttle = Some(delay);
         self
+    }
+
+    /// Reads the scan under `limiter` (see [`Self::rate_limiter`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::rate_limiter::RateLimiter;
+    /// use lsm_tree::verify::VerifyOptions;
+    /// use std::sync::Arc;
+    ///
+    /// // One budget for the scrub and compaction, retuned live.
+    /// let budget = Arc::new(RateLimiter::new(64 << 20));
+    /// let opts = VerifyOptions::default().rate_limiter(Arc::clone(&budget));
+    /// budget.set_rate(16 << 20);
+    /// assert_eq!(opts.rate_limiter.map(|l| l.rate()), Some(16 << 20));
+    /// ```
+    #[must_use]
+    pub fn rate_limiter(mut self, limiter: alloc::sync::Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Reads the scan at no more than `bytes_per_sec` on-disk bytes per
+    /// second, under a limiter of its own; `0` reads at full speed.
+    #[must_use]
+    pub fn max_bytes_per_sec(self, bytes_per_sec: u64) -> Self {
+        self.rate_limiter(alloc::sync::Arc::new(RateLimiter::new(bytes_per_sec)))
     }
 }
 
@@ -679,8 +716,9 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
 ///
 /// Self-contained per table: opens the file through the table's own `Fs`
 /// handle, sizes encryption overhead and ECC params from the table's
-/// descriptor, so it can run on its own worker thread without shared state.
-fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
+/// descriptor, so it can run on its own worker thread; the `limiter`, when
+/// given, is the one budget every worker draws on.
+fn scan_one_table(table: &crate::table::Table, limiter: Option<&RateLimiter>) -> BlockVerifyReport {
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -755,15 +793,13 @@ fn scan_one_table(table: &crate::table::Table) -> BlockVerifyReport {
         },
         None => 0,
     };
-    match scan_sst_blocks(
-        &*table.fs,
-        path,
-        table_id,
+    let layout = SstLayout {
         max_enc_overhead,
-        table.metadata.ecc_params,
+        ecc: table.metadata.ecc_params,
         ecc_unrecognized,
         data_start,
-    ) {
+    };
+    match scan_sst_blocks(&*table.fs, path, table_id, layout, limiter) {
         Ok(per_file) => {
             report.blocks_scanned += per_file.blocks_scanned;
             report.errors.extend(per_file.errors);
@@ -816,8 +852,8 @@ pub fn verify_block_checksums(tree: &impl crate::AbstractTree) -> BlockVerifyRep
 /// cursor and scan them concurrently (each scan is independent — its own file
 /// handle through the table's `Fs`), then their partial reports are merged.
 /// Parallel runs report the same findings as a sequential run; only the order
-/// of `errors` / `warnings` may differ. `throttle` makes each worker pause
-/// between SSTs so a scrub does not saturate production I/O.
+/// of `errors` / `warnings` may differ. `rate_limiter` holds every worker
+/// together to a byte rate; `throttle` makes each worker pause between SSTs.
 #[must_use]
 pub fn verify_block_checksums_with(
     tree: &impl crate::AbstractTree,
@@ -825,10 +861,7 @@ pub fn verify_block_checksums_with(
 ) -> BlockVerifyReport {
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
-
-    // `parallelism` + `throttle` only drive the std thread-fan-out + sleep below.
-    #[cfg(not(feature = "std"))]
-    let _ = options;
+    let limiter = options.rate_limiter.as_deref();
 
     // Parallel scan (std only): up to `parallelism` worker threads pull SSTs from
     // a shared cursor and scan them concurrently. A `no_std` build has no
@@ -846,7 +879,7 @@ pub fn verify_block_checksums_with(
                             let mut idx =
                                 cursor.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             while let Some(table) = tables.get(idx) {
-                                merge_report(&mut local, scan_one_table(table));
+                                merge_report(&mut local, scan_one_table(table, limiter));
                                 // Claim the next SST first; only pause if this
                                 // worker actually has another table to scan.
                                 idx = cursor.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -883,7 +916,7 @@ pub fn verify_block_checksums_with(
     // SSTs in deterministic table order, each over its own `Fs` handle.
     let mut report = BlockVerifyReport::default();
     for (idx, table) in tables.iter().enumerate() {
-        merge_report(&mut report, scan_one_table(table));
+        merge_report(&mut report, scan_one_table(table, limiter));
         // Inter-SST throttle (std only — `no_std` has no sleep primitive). Skip
         // after the final table so a finished scrub returns promptly instead of
         // waiting one extra throttle interval.
@@ -1141,15 +1174,13 @@ pub(crate) fn verify_sst_file_with_context(
     // as HeaderCorrupted and send the whole table to salvage.
     let max_enc_overhead =
         provider.map_or(0u32, crate::encryption::EncryptionProvider::max_overhead);
-    match scan_sst_blocks(
-        &**fs,
-        path,
-        table_id,
+    let layout = SstLayout {
         max_enc_overhead,
         ecc,
         ecc_unrecognized,
         data_start,
-    ) {
+    };
+    match scan_sst_blocks(&**fs, path, table_id, layout, None) {
         Ok(per_file) => {
             report.blocks_scanned = per_file.blocks_scanned;
             // extend, NOT assign: the mirror-divergence finding above must
@@ -2160,6 +2191,130 @@ struct PerFileScan {
     errors: Vec<BlockVerifyError>,
 }
 
+/// How one SST's blocks are framed, for [`scan_sst_blocks`].
+#[derive(Clone, Copy)]
+struct SstLayout {
+    /// The table's AEAD overhead, which widens the block length cap.
+    max_enc_overhead: u32,
+    ecc: Option<crate::table::block::EccParams>,
+    ecc_unrecognized: bool,
+    /// Byte offset to START the DATA-section walk at: `0` for a normal table,
+    /// or the punch offset of a tight-space RESTRICTED view whose
+    /// `[0, data_start)` data blocks were hole-punched (they read as zeros and
+    /// would false-flag as corruption). All other sections (index, meta, TLI …)
+    /// sit past the data region and are always walked in full.
+    data_start: u64,
+}
+
+impl SstLayout {
+    /// A table with no encryption, no Page-ECC and no punched prefix.
+    #[cfg(test)]
+    const PLAIN: Self = Self {
+        max_enc_overhead: 0,
+        ecc: None,
+        ecc_unrecognized: false,
+        data_start: 0,
+    };
+}
+
+/// What the section walks read an SST through: a seekable byte reader.
+#[cfg(feature = "std")]
+trait ScanRead: std::io::Read + std::io::Seek {}
+#[cfg(feature = "std")]
+impl<T: std::io::Read + std::io::Seek> ScanRead for T {}
+/// What the section walks read an SST through: a seekable byte reader.
+#[cfg(not(feature = "std"))]
+trait ScanRead: io::Read + io::Seek {}
+#[cfg(not(feature = "std"))]
+impl<T: io::Read + io::Seek> ScanRead for T {}
+
+/// An SST opened for a scan whose every read of the file is charged to the
+/// limiter, when there is one, before it is made: the bytes the buffered
+/// walk pulls in, trailer and TOC included, never a length a header or the
+/// TOC declares.
+struct PacedFile<'a> {
+    inner: Box<dyn crate::fs::FsFile>,
+    limiter: Option<&'a RateLimiter>,
+    /// Where the next read starts, and where the file ends.
+    pos: u64,
+    len: u64,
+}
+
+impl<'a> PacedFile<'a> {
+    fn new(
+        mut inner: Box<dyn crate::fs::FsFile>,
+        limiter: Option<&'a RateLimiter>,
+    ) -> io::Result<Self> {
+        #[cfg(not(feature = "std"))]
+        use io::{Seek, SeekFrom};
+        #[cfg(feature = "std")]
+        use std::io::{Seek, SeekFrom};
+
+        let len = inner.seek(SeekFrom::End(0))?;
+        let pos = inner.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            inner,
+            limiter,
+            pos,
+            len,
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for PacedFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.pace(buf.len());
+        let read = self.inner.read(buf)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl io::Read for PacedFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.pace(buf.len());
+        let read = self.inner.read(buf)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Seek for PacedFile<'_> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl io::Seek for PacedFile<'_> {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+impl PacedFile<'_> {
+    /// Waits until the limiter admits a read of up to `want` bytes, counted
+    /// only up to the file's end, which a read never goes past.
+    fn pace(&self, want: usize) {
+        let Some(limiter) = self.limiter else {
+            return;
+        };
+        // Zero past the end, where a seek may land: no byte is left to read.
+        let left = self.len.saturating_sub(self.pos);
+        let bytes = (want as u64).min(left);
+        if bytes > 0 {
+            // A scrub has no stop signal, so the wait always ends in a read.
+            let stopped = limiter.request_interruptible(bytes, || false);
+            debug_assert!(!stopped, "a scrub is never stopped midway");
+        }
+    }
+}
+
 /// Walks every block of one SST. Returns `Err` only on file-open or
 /// SFA trailer-parse failure (those make the whole walk impossible).
 /// Per-block AND per-section errors — corrupt block headers, mismatched
@@ -2167,27 +2322,32 @@ struct PerFileScan {
 /// cannot seek to — all land inside `PerFileScan::errors` and never
 /// cause an early return; the walker proceeds to the next section so
 /// one bad TOC entry cannot mask corruption in the others.
+///
+/// With a `limiter`, every block and raw section is charged its on-disk
+/// bytes before it is read.
 fn scan_sst_blocks(
     fs: &dyn crate::fs::Fs,
     path: &Path,
     table_id: TableId,
-    max_enc_overhead: u32,
-    ecc: Option<crate::table::block::EccParams>,
-    ecc_unrecognized: bool,
-    // Byte offset to START the DATA-section walk at: `0` for a normal table, or
-    // the punch offset of a tight-space RESTRICTED view whose `[0, data_start)`
-    // data blocks were hole-punched (they read as zeros and would false-flag as
-    // corruption). All other sections (index, meta, TLI …) sit past the data
-    // region and are always walked in full.
-    data_start: u64,
+    layout: SstLayout,
+    limiter: Option<&RateLimiter>,
 ) -> io::Result<PerFileScan> {
+    let SstLayout {
+        max_enc_overhead,
+        ecc,
+        ecc_unrecognized,
+        data_start,
+    } = layout;
     use io::BufReader;
     #[cfg(not(feature = "std"))]
     use io::{Seek, SeekFrom};
     #[cfg(feature = "std")]
     use std::io::{Seek, SeekFrom};
 
-    let mut file = fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let mut file = PacedFile::new(
+        fs.open(path, &crate::fs::FsOpenOptions::new().read(true))?,
+        limiter,
+    )?;
 
     // The SFA trailer + TOC live at the tail of the file.
     // crate::sfa::Reader::from_reader leaves the cursor at an undefined
@@ -2595,16 +2755,16 @@ pub(crate) fn toc_may_hide_deletion_section(toc: &crate::sfa::Toc, toc_pos: u64)
 /// `Err` is a TRANSIENT read/seek fault (retryable I/O), kept distinct from a
 /// structural shape defect (`Ok(Some(reason))`) so the caller can route it to an
 /// I/O finding the repair verdict treats as retryable rather than as corruption.
-fn raw_section_shape_error(
-    reader: &mut io::BufReader<Box<dyn crate::fs::FsFile>>,
+fn raw_section_shape_error<R: ScanRead>(
+    reader: &mut R,
     name: &[u8],
     pos: u64,
     len: u64,
 ) -> Result<Option<String>, io::Error> {
     #[cfg(not(feature = "std"))]
-    use io::{Read as _, Seek as _, SeekFrom};
+    use io::SeekFrom;
     #[cfg(feature = "std")]
-    use std::io::{Read as _, Seek as _, SeekFrom};
+    use std::io::SeekFrom;
 
     match name {
         b"linked_blob_files" => {
@@ -2693,8 +2853,8 @@ fn block_data_length_cap(max_enc_overhead: u32) -> u64 {
 /// Bundles the per-walk accumulators (file cursor, reused data
 /// buffer, counters, error sink) into one borrow so the function
 /// signature stays under clippy's argument-count cap.
-struct WalkCtx<'a> {
-    reader: &'a mut io::BufReader<Box<dyn crate::fs::FsFile>>,
+struct WalkCtx<'a, 'l> {
+    reader: &'a mut io::BufReader<PacedFile<'l>>,
     table_id: TableId,
     path: &'a Path,
     data_buf: &'a mut Vec<u8>,
@@ -2733,7 +2893,7 @@ struct WalkCtx<'a> {
     expected_roles: &'static [crate::table::block::BlockType],
 }
 
-fn walk_block_region(ctx: &mut WalkCtx<'_>, start_offset: u64, end_offset: u64) {
+fn walk_block_region(ctx: &mut WalkCtx<'_, '_>, start_offset: u64, end_offset: u64) {
     #[cfg(not(feature = "std"))]
     use io::Read;
     #[cfg(feature = "std")]
