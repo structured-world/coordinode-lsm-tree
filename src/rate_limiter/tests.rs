@@ -205,6 +205,26 @@ fn switching_off_makes_requests_immediate() {
     assert_eq!(Duration::ZERO, rl.acquire_wait(1_000_000, ms(0)));
 }
 
+/// Runs `work` on its own thread; the returned closure takes its result, and
+/// fails the test once `bound` passes instead of hanging on a wake-up that
+/// never comes.
+#[cfg(feature = "std")]
+fn spawn_bounded<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> impl FnOnce(Duration) -> T {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        tx.send(work()).expect("the test waits for this result");
+    });
+    move |bound| {
+        let result = rx
+            .recv_timeout(bound)
+            .expect("the waiter must finish within its bound");
+        handle.join().unwrap();
+        result
+    }
+}
+
 /// A caller already sleeping out a debt is released when throttling is
 /// switched off, instead of sleeping the wait computed at the old rate.
 #[cfg(feature = "std")]
@@ -213,7 +233,7 @@ fn switching_off_releases_a_caller_mid_wait() {
     let rl = alloc::sync::Arc::new(RateLimiter::new(1));
     let waiter = {
         let rl = alloc::sync::Arc::clone(&rl);
-        std::thread::spawn(move || {
+        spawn_bounded(move || {
             let start = std::time::Instant::now();
             // 1 B/s: roughly an hour of debt.
             let stopped = rl.request_interruptible(3_600, || false);
@@ -222,7 +242,7 @@ fn switching_off_releases_a_caller_mid_wait() {
     };
     std::thread::sleep(ms(300));
     rl.set_rate(0);
-    let (stopped, took) = waiter.join().unwrap();
+    let (stopped, took) = waiter(Duration::from_secs(5));
     assert!(!stopped, "a released caller proceeds, it is not stopped");
     assert!(took < Duration::from_secs(5), "released after {took:?}");
 }
@@ -385,6 +405,162 @@ fn a_retune_stamped_before_the_last_refill_grants_no_phantom_credit() {
     rl.set_rate_at(2_000, ms(500));
     // Still at 1 s: the 1000 B are owed at 2000 B/s.
     assert_eq!(ms(500), rl.acquire_wait(0, ms(1_000)));
+}
+
+/// Voluntary context switches of the calling thread so far: each is a sleep
+/// the thread went into.
+#[cfg(target_os = "linux")]
+fn thread_wakeups() -> libc::c_long {
+    let mut usage = core::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `getrusage` fills the struct it is handed and nothing else;
+    // `RUSAGE_THREAD` names the calling thread (Linux).
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+    assert_eq!(rc, 0, "getrusage");
+    // SAFETY: the successful call above filled it.
+    unsafe { usage.assume_init() }.ru_nvcsw
+}
+
+/// A throttled wait that nothing disturbs sleeps until its deadline in one
+/// go: it does not wake on a tick to look again.
+#[cfg(all(feature = "std", target_os = "linux"))]
+#[test]
+fn an_undisturbed_wait_wakes_once_at_its_deadline() {
+    let rl = RateLimiter::new(1_000);
+    let before = thread_wakeups();
+    let start = std::time::Instant::now();
+    // The burst, then 1000 B of debt: one second at 1000 B/s.
+    assert!(!rl.request_interruptible(2_000, || false));
+    let took = start.elapsed();
+    let woke = thread_wakeups() - before;
+    assert!(took >= ms(900), "the debt is repaid first ({took:?})");
+    assert!(woke <= 2, "a one-second wait went to sleep {woke} times");
+}
+
+/// A stop sent through the stop signal of a tree holding the limiter wakes a
+/// request waiting on it at once, though its deadline is an hour away.
+#[cfg(feature = "std")]
+#[test]
+fn a_stop_signal_wakes_a_request_waiting_on_the_limiter() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1));
+    let signal = crate::stop_signal::StopSignal::default();
+    signal.wake_on_stop(&rl);
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        let signal = signal.clone();
+        spawn_bounded(move || {
+            let start = std::time::Instant::now();
+            // 1 B/s: roughly an hour of debt.
+            let stopped = rl.request_abortable(3_600, || signal.is_stopped());
+            (stopped, start.elapsed())
+        })
+    };
+    std::thread::sleep(ms(300));
+    signal.send();
+    let (stopped, took) = waiter(Duration::from_secs(5));
+    assert!(stopped, "the stop ends the wait as a stop");
+    assert!(took < Duration::from_secs(2), "stopped after {took:?}");
+}
+
+/// A wait longer than the monotonic clock can count to (`u64::MAX` bytes at
+/// 1 B/s) sleeps without a deadline instead of panicking on it, and a stop
+/// still ends it.
+#[cfg(feature = "std")]
+#[test]
+fn a_wait_past_the_clock_range_sleeps_until_stopped() {
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1));
+    let signal = crate::stop_signal::StopSignal::default();
+    signal.wake_on_stop(&rl);
+    let waiter = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        let signal = signal.clone();
+        spawn_bounded(move || rl.request_abortable(u64::MAX, || signal.is_stopped()))
+    };
+    std::thread::sleep(ms(300));
+    signal.send();
+    // A wait that panicked never reports, and one that ended on its own
+    // reports `false`.
+    assert!(
+        waiter(Duration::from_secs(5)),
+        "the stop ends the wait as a stop"
+    );
+}
+
+/// A debit returned ahead of a waiter wakes it at once: its debt is covered,
+/// and it does not sleep out the wait it had before the return.
+#[cfg(feature = "std")]
+#[test]
+fn a_returned_debit_wakes_the_waiter_behind_it() {
+    use core::sync::atomic::AtomicBool;
+
+    let rl = alloc::sync::Arc::new(RateLimiter::new(1_000));
+    let stop_first = alloc::sync::Arc::new(AtomicBool::new(false));
+    // The burst, then 4000 B of debt: four seconds.
+    let first = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        let stop = alloc::sync::Arc::clone(&stop_first);
+        std::thread::spawn(move || rl.request_abortable(5_000, || stop.load(Ordering::Acquire)))
+    };
+    std::thread::sleep(ms(150));
+    // Queued behind it: five seconds while the first debit stands.
+    let second = {
+        let rl = alloc::sync::Arc::clone(&rl);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let stopped = rl.request_interruptible(1_000, || false);
+            (stopped, start.elapsed())
+        })
+    };
+    std::thread::sleep(ms(150));
+    // A flag of the caller's own: it rings the limiter itself.
+    stop_first.store(true, Ordering::Release);
+    rl.wake_waiters();
+    assert!(first.join().unwrap(), "the first request stops");
+    let (stopped, took) = second.join().unwrap();
+    assert!(!stopped);
+    assert!(
+        took < Duration::from_secs(2),
+        "released after {took:?}, not after the five seconds it owed behind the debit"
+    );
+}
+
+/// A tree rings its limiter when it is dropped, opened new and reopened alike:
+/// a compaction throttled to an hour-long wait ends at once.
+#[cfg(feature = "std")]
+#[test]
+fn a_tree_stop_wakes_its_throttled_compaction() -> crate::Result<()> {
+    use crate::{Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let open = || -> crate::Result<crate::Tree> {
+        let crate::AnyTree::Standard(tree) = Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .compaction_rate_limit(1)
+        .open()?
+        else {
+            panic!("a standard tree");
+        };
+        Ok(tree)
+    };
+    // Created by the first pass, recovered by the second.
+    for _ in 0..2 {
+        let tree = open()?;
+        let rl = alloc::sync::Arc::clone(&tree.compaction_rate_limiter);
+        let signal = tree.stop_signal.clone();
+        let waiter = spawn_bounded(move || {
+            let start = std::time::Instant::now();
+            let stopped = rl.request_abortable(3_600, || signal.is_stopped());
+            (stopped, start.elapsed())
+        });
+        std::thread::sleep(ms(300));
+        drop(tree);
+        let (stopped, took) = waiter(Duration::from_secs(5));
+        assert!(stopped);
+        assert!(took < Duration::from_secs(2), "stopped after {took:?}");
+    }
+    Ok(())
 }
 
 #[test]
