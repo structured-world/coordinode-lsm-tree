@@ -28,7 +28,8 @@
 //! without `std`. The blocking wrappers
 //! [`RateLimiter::request_interruptible`] and
 //! [`RateLimiter::request_abortable`] (which read the system clock and
-//! sleep in pollable chunks) are gated behind the `std` feature.
+//! sleep until a deadline or an event that moves it) are gated behind the
+//! `std` feature.
 //!
 //! # Sharing and retuning
 //!
@@ -64,10 +65,10 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 ///
 /// Debits and repayments are running totals, so a debit has a place in line:
 /// its position is the total debited once it is added, and it is repaid when
-/// the credit accrued reaches that position. A waiter re-reads the totals on
-/// every poll instead of keeping its own countdown, so everything that moves
-/// the line under it (a rate change, a debit withdrawn ahead of it) is seen
-/// on the next poll. Totals are in bytes of `u64` requests summed in `u128`,
+/// the credit accrued reaches that position. A waiter re-reads the totals each
+/// time it wakes instead of keeping its own countdown, and everything that
+/// moves the line under it (a rate change, a debit withdrawn ahead of it)
+/// wakes it. Totals are in bytes of `u64` requests summed in `u128`,
 /// which no process lives long enough to overflow.
 #[derive(Debug)]
 #[cfg_attr(
@@ -243,6 +244,47 @@ struct Ticket {
     taken_at: u64,
 }
 
+/// What a waiting request sleeps on: rung by every event that can move it
+/// (a rate change, a debit withdrawn ahead of it, a stop of the tree it works
+/// for), so a wait nothing disturbs wakes once, at its own deadline.
+///
+/// A waiter reads the generation before it reads anything the event changes,
+/// and sleeps only while the generation is still that one: an event between
+/// the two is never slept through.
+#[cfg(feature = "std")]
+#[derive(Debug, Default)]
+pub(crate) struct Wakeup {
+    generation: parking_lot::Mutex<u64>,
+    rung: parking_lot::Condvar,
+}
+
+#[cfg(feature = "std")]
+impl Wakeup {
+    /// The events rung so far.
+    fn generation(&self) -> u64 {
+        *self.generation.lock()
+    }
+
+    /// Wakes every waiter, to look again at what it waits for.
+    pub(crate) fn ring(&self) {
+        // One step per event: a u64 does not wrap. A waiter checks the
+        // generation under the lock and sleeps without releasing it in
+        // between, so the bump is seen whether it lands before or during
+        // the sleep.
+        *self.generation.lock() += 1;
+        self.rung.notify_all();
+    }
+
+    /// Sleeps for `timeout`, or until an event after `seen` is rung.
+    fn sleep(&self, seen: u64, timeout: Duration) {
+        let mut generation = self.generation.lock();
+        if *generation == seen {
+            // Woken early or late, the caller re-derives its wait either way.
+            let _ = self.rung.wait_for(&mut generation, timeout);
+        }
+    }
+}
+
 /// Compaction I/O rate limiter (leaky token bucket).
 ///
 /// One limiter bounds every compaction that holds it: a tree builds its own
@@ -285,6 +327,11 @@ pub struct RateLimiter {
     /// sees the rate its bucket state was settled against.
     rate_bytes_per_sec: AtomicU64,
     bucket: Mutex<Bucket>,
+    /// What waiting requests sleep on; shared with the stop signals of the
+    /// trees that hold this limiter.
+    // no-std: the no_std requests never wait
+    #[cfg(feature = "std")]
+    wakeup: alloc::sync::Arc<Wakeup>,
 }
 
 impl RateLimiter {
@@ -297,7 +344,29 @@ impl RateLimiter {
         Self {
             rate_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
             bucket: Mutex::new(Bucket::full(rate_bytes_per_sec, 0)),
+            #[cfg(feature = "std")]
+            wakeup: alloc::sync::Arc::default(),
         }
+    }
+
+    /// What this limiter's waiters sleep on, for a stop signal to ring.
+    #[cfg(feature = "std")]
+    pub(crate) fn wakeup(&self) -> alloc::sync::Arc<Wakeup> {
+        alloc::sync::Arc::clone(&self.wakeup)
+    }
+
+    /// Wakes every request waiting on this limiter, to check its stop
+    /// condition at once.
+    ///
+    /// A waiting request sleeps until its deadline or until something wakes
+    /// it: a rate change and a returned debit do on their own, and so does a
+    /// stop sent through the stop signal of a tree holding this limiter. A
+    /// caller that stops its requests through some other flag calls this
+    /// after setting it.
+    // no-std: the no_std requests never wait
+    #[cfg(feature = "std")]
+    pub fn wake_waiters(&self) {
+        self.wakeup.ring();
     }
 
     /// The current rate in bytes per second; `0` when throttling is off.
@@ -350,6 +419,10 @@ impl RateLimiter {
         }
         self.rate_bytes_per_sec
             .store(bytes_per_sec, Ordering::Relaxed);
+        drop(bucket);
+        // Every waiter's deadline moved, or its wait is over.
+        #[cfg(feature = "std")]
+        self.wakeup.ring();
     }
 
     /// Changes the rate now; see [`set_rate_at`](Self::set_rate_at) for what
@@ -391,9 +464,9 @@ impl RateLimiter {
     }
 
     /// Waits (sleeping the current thread) until an I/O of `bytes` may
-    /// proceed, polling `should_stop` so a shutdown can break a long wait
-    /// promptly. Use it where the I/O may still happen after a stop; a caller
-    /// that does no I/O once stopped uses
+    /// proceed, checking `should_stop` so a shutdown can break a long wait.
+    /// Use it where the I/O may still happen after a stop; a caller that does
+    /// no I/O once stopped uses
     /// [`request_abortable`](Self::request_abortable).
     ///
     /// Returns `true` if `should_stop` was set on entry or fired during the
@@ -401,11 +474,13 @@ impl RateLimiter {
     /// keeps the debit: the budget stays spent for the I/O the caller may
     /// still do.
     ///
-    /// The wait is re-derived from the shared bucket on every poll, at most
-    /// 100 ms apart, so a rate change, a switch off or a debit withdrawn
-    /// ahead of this one takes effect within one poll. A no-op returning
-    /// `false` when the rate is `0` (no clock read). Only with the `std`
-    /// feature; `no_std` callers drive `acquire_wait` with their own clock.
+    /// The wait sleeps until the debit is repaid, re-deriving it from the
+    /// shared bucket whenever something wakes it: a rate change, a switch
+    /// off, a debit withdrawn ahead of this one, or a stop (see
+    /// [`wake_waiters`](Self::wake_waiters) for which stops ring it). A
+    /// no-op returning `false` when the rate is `0` (no clock read). Only
+    /// with the `std` feature; `no_std` callers drive `acquire_wait` with
+    /// their own clock.
     // no-std: caller-provided clock + acquire_wait() + caller's wait/poll loop
     #[cfg(feature = "std")]
     pub fn request_interruptible(&self, bytes: u64, should_stop: impl Fn() -> bool) -> bool {
@@ -443,6 +518,9 @@ impl RateLimiter {
             return false;
         };
         loop {
+            // Read before the state it guards: an event from here on is not
+            // slept through.
+            let seen = self.wakeup.generation();
             if should_stop() {
                 if withdraw_on_stop {
                     self.withdraw(&ticket, bytes);
@@ -452,7 +530,7 @@ impl RateLimiter {
             let Some(wait) = self.remaining(&ticket, Self::std_now()) else {
                 return false;
             };
-            std::thread::sleep(wait.min(Self::POLL_INTERVAL));
+            self.wakeup.sleep(seen, wait);
         }
     }
 
@@ -501,6 +579,9 @@ impl RateLimiter {
         bucket.withdrawn.push((ticket.position, u128::from(bytes)));
         bucket.cap(self.rate());
         bucket.settle_withdrawn();
+        drop(bucket);
+        // The waiters behind it moved up the line.
+        self.wakeup.ring();
     }
 
     /// `no_std` variant: there is no ambient monotonic clock to throttle
@@ -521,11 +602,6 @@ impl RateLimiter {
     pub fn request_abortable(&self, _bytes: u64, should_stop: impl Fn() -> bool) -> bool {
         should_stop()
     }
-
-    /// Longest single sleep inside the request wrappers: the upper bound on
-    /// how long a stop, a rate change or a withdrawn debit goes unnoticed.
-    #[cfg(feature = "std")]
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Monotonic time since a process-global origin, for the `std`
     /// wrapper. A shared origin is fine: each limiter's bucket tracks its
