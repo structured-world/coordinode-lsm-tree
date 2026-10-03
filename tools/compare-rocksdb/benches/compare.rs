@@ -119,8 +119,9 @@
 //!
 //! Values carry the compressibility RocksDB's own `db_bench` gives its values
 //! by default (see [`ValuePool`]), and every RocksDB read borrows the value
-//! out of the block as ours does (`get_pinned`, the raw iterator), so neither
-//! engine pays for a copy or a codec shortcut the other does not. Not yet portable
+//! out of the block as ours does (`get_pinned`, the raw iterator), and both
+//! compress blocks on the same [`COMPRESSION_THREADS`] threads, so neither
+//! engine pays for a copy, a codec shortcut or a core the other does not. Not yet portable
 //! head-to-head: `readwhilewriting` (concurrency) and `mergerandom`
 //! (merge-operator semantics differ across engines) from [#244]'s list.
 
@@ -553,6 +554,8 @@ impl WorkloadInputs {
 ///   side).
 /// - **16 MiB block cache** — matches our default per-tree cache
 ///   capacity, so neither engine gets an unfair cache-size edge.
+/// - **[`COMPRESSION_THREADS`] block-compression threads**, as ours gets in
+///   [`open_ours`].
 ///
 /// `create_if_missing` is set here too. WAL handling is per-call
 /// (`WriteOptions::disable_wal`) since it only applies to the write
@@ -591,9 +594,20 @@ fn rocksdb_options(compression: Compression, hash_index: bool) -> rocksdb::Optio
             opts.set_compression_options(-14, Compression::ZSTD_MAX_LEVEL, 0, 0);
         }
     }
+    opts.set_compression_options_parallel_threads(COMPRESSION_THREADS as i32);
     opts.set_block_based_table_factory(&block_opts);
     opts
 }
+
+/// Threads compressing a table's blocks, on both engines and in every group:
+/// ours through `compaction_threads`, which sizes the pool its table writers
+/// compress on at flush and compaction alike; RocksDB through
+/// `compression_options_parallel_threads`, which does the same for its table
+/// builder. Left at their defaults, ours compresses on half the host's cores
+/// and RocksDB on one, so a write group would compare unequal parallelism and
+/// its ratio would move with the host's core count and with whatever else
+/// keeps those cores busy.
+const COMPRESSION_THREADS: usize = 4;
 
 /// Opens our engine at `dir` with the block-compression policy for the
 /// given `compression` variant. Both arms set the policy EXPLICITLY:
@@ -624,7 +638,7 @@ fn open_ours(
     // below land on top of it. Applied last, the parity preset's locator
     // switch-off undid the ribbon variant's locator, so that variant measured
     // the plain read path under the ribbon's name.
-    let config = apply_preset(config, active_preset());
+    let config = apply_preset(config, active_preset()).compaction_threads(COMPRESSION_THREADS);
     // Row cache: a key->resolved-value layer in front of the block cache so a
     // repeat point read skips the index walk + data-block decode.
     //
@@ -1713,8 +1727,9 @@ fn overwrite_variant(
 /// without rewriting — the timed compaction actually merges + recompresses.
 const COMPACTION_FLUSHES: u64 = 6;
 /// Worker threads for parallel block compression on both engines (ours via
-/// `compaction_threads`; RocksDB via `compression_options_parallel_threads`).
-const COMPACTION_THREADS: usize = 4;
+/// `compaction_threads`; RocksDB via `compression_options_parallel_threads`):
+/// the same count every group compresses with.
+const COMPACTION_THREADS: usize = COMPRESSION_THREADS;
 
 /// Bottom-level target file size for the split shape's setup: small enough
 /// that the populated bottom level holds several tables — the boundaries
@@ -2028,11 +2043,11 @@ fn bench_subcompaction(run: &mut Run) {
 const GROUP_NOTES: &[(&str, &str)] = &[
     (
         "write_throughput",
-        "Bulk insert of N fresh keys into an empty engine, then one flush. Covers open, memtable inserts and the flush that writes the table.",
+        "Bulk insert of N fresh keys into an empty engine, then one flush. Covers open, memtable inserts and the flush that writes the table. Both engines compress blocks on 4 threads.",
     ),
     (
         "overwrite",
-        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush.",
+        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads.",
     ),
     (
         "point_read",
