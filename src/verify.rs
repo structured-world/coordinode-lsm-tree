@@ -712,6 +712,24 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
     dst.incomplete |= src.incomplete;
 }
 
+/// `table`'s punch offset for `bound`, its index walk charged to `limiter`
+/// first: the walk reads through the table's own block reads, not the paced
+/// file, and reads at most the index sections, so their size is charged.
+fn paced_punch_offset(
+    table: &crate::table::Table,
+    bound: &[u8],
+    limiter: Option<&RateLimiter>,
+) -> crate::Result<u64> {
+    if let Some(limiter) = limiter {
+        let regions = &table.regions;
+        let index =
+            u64::from(regions.tli.size()) + regions.index.map_or(0, |h| u64::from(h.size()));
+        let stopped = limiter.request_interruptible(index, || false);
+        debug_assert!(!stopped, "a scrub is never stopped midway");
+    }
+    table.punch_offset_for(bound)
+}
+
 /// Scans one SST and returns a partial report (`sst_files_scanned == 1`).
 ///
 /// Self-contained per table: opens the file through the table's own `Fs`
@@ -779,7 +797,7 @@ fn scan_one_table(table: &crate::table::Table, limiter: Option<&RateLimiter>) ->
     // STRUCTURAL lookup failure both fall back to `0` (walk everything, fail
     // closed) so an unresolvable or corrupt index cannot exempt blocks.
     let data_start = match table.restrict_lower_bound() {
-        Some(bound) => match table.punch_offset_for(bound) {
+        Some(bound) => match paced_punch_offset(table, bound, limiter) {
             Ok(offset) => offset,
             Err(e) if e.is_environmental() => {
                 report.errors.push(BlockVerifyError::SstFileUnreadable {
