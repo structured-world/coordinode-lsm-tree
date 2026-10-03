@@ -4,7 +4,9 @@
 //! Rows written as cells, some of which keep their bytes in a blob file.
 //!
 //! A caller that knows the fields of its values writes a row as a sequence of
-//! [`Cell`]s instead of one opaque value. A [`Cell::Value`] carries its bytes;
+//! [`Field`]s instead of one opaque value: each names its column and physical
+//! type, as a row of the columnar format does, and holds a [`Cell`]. A
+//! [`Cell::Value`] carries its bytes;
 //! a [`Cell::Ref`] names a blob object the key already owns, which is how a
 //! metadata-only update keeps a large field without rewriting it: the caller
 //! reads the row's references through the reference-aware projection and
@@ -64,22 +66,25 @@
 //!
 //! # Encoding
 //!
-//! A row is self-describing, so the engine can list its references without
-//! the caller's schema: a little-endian `u16` cell count, a bitmap of one bit
-//! per cell set for a reference, a bitmap of the same size set for an owning
-//! reference (both least significant bit first), then each cell as a
-//! little-endian `u32` length and its bytes. A reference cell holds an encoded
-//! blob indirection.
+//! A row is self-describing, so the engine can list its references and lay
+//! its fields out by column without the caller's schema: a little-endian
+//! `u16` field count, a bitmap of one bit per field set for a reference, a
+//! bitmap of the same size set for an owning reference (both least
+//! significant bit first), one descriptor per field (its little-endian `u16`
+//! column identifier, then its type's wire tag and width byte, as the columnar
+//! format writes them), then each cell as a little-endian `u32` length and its
+//! bytes. A reference cell holds an encoded blob indirection.
 //!
-//! The logical value a plain read returns is the cells in order, each a
-//! little-endian `u32` length and its bytes, with every reference replaced by
-//! the bytes of its object: the framing the columnar format gives a row of
-//! byte cells.
+//! The logical value a plain read returns is the fields in order, with every
+//! reference replaced by the bytes of its object, framed as the columnar
+//! format frames a row's value sub-columns: a variable-width field as a
+//! little-endian `u32` length and its bytes, a fixed-width one as its bytes.
 
 use alloc::vec::Vec;
 
 use super::handle::BlobIndirection;
 use crate::coding::{Decode, Encode};
+pub use crate::table::column_type::TypeTag;
 use crate::{Error, UserKey, vlog::BlobFileId};
 
 /// A blob object a key holds, named by where its frame sits.
@@ -122,14 +127,44 @@ impl PartialEq for BlobRef<'_> {
 
 impl Eq for BlobRef<'_> {}
 
-/// One cell of a row written as cells.
+/// What a field of a row written as cells holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell<'a> {
-    /// The cell's bytes. A cell at or above its tree's separation threshold
-    /// is stored in a blob file when the row is flushed.
+    /// The field's bytes. A cell at or above its column's separation
+    /// threshold is stored in a blob file when the row is flushed.
     Value(&'a [u8]),
     /// An object the key already holds, kept without rewriting its bytes.
     Ref(BlobRef<'a>),
+}
+
+/// One field of a row written as cells: the caller's column identifier and
+/// physical type, and the cell.
+///
+/// The identifier and type are stored with the row, so a stored row always
+/// reads with the layout it was written with; the engine keeps no schema.
+/// A column identifier names the same field in every row of the tree, as in
+/// the columnar format. A reference is how a field is stored, not its type:
+/// the type stays the field's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field<'a> {
+    /// The caller-assigned column identifier.
+    pub column: u16,
+    /// The physical type of the field's value.
+    pub tag: TypeTag,
+    /// The value, or a reference to the object holding it.
+    pub cell: Cell<'a>,
+}
+
+impl<'a> Field<'a> {
+    /// A field of variable-width bytes.
+    #[must_use]
+    pub const fn bytes(column: u16, bytes: &'a [u8]) -> Self {
+        Self {
+            column,
+            tag: TypeTag::Bytes,
+            cell: Cell::Value(bytes),
+        }
+    }
 }
 
 /// A stored row's cells as written: value cells with their bytes, and every
@@ -166,41 +201,48 @@ impl core::fmt::Debug for RowCells {
 }
 
 impl RowCells {
-    /// The row's cells in order, each a [`Cell::Value`] or a [`Cell::Ref`]
-    /// bound to the row's key, ready to be written back in a newer version.
+    /// The row's fields in order, each holding a [`Cell::Value`] or a
+    /// [`Cell::Ref`] bound to the row's key, ready to be written back in a
+    /// newer version.
     ///
     /// # Errors
     ///
     /// Returns an error if the stored row is malformed.
-    pub fn cells(&self) -> crate::Result<Vec<Cell<'_>>> {
+    pub fn fields(&self) -> crate::Result<Vec<Field<'_>>> {
         Ok(decode_row(&self.row)?
             .into_iter()
-            .map(|cell| match cell {
-                RowCell::Value(bytes) => Cell::Value(bytes),
-                RowCell::Ref { indirection, .. } => Cell::Ref(BlobRef {
-                    indirection,
-                    key: &self.key,
-                    tree: self.tree,
-                    source: self.token.version(),
-                }),
+            .map(|field| Field {
+                column: field.column,
+                tag: field.tag,
+                cell: match field.cell {
+                    RowCell::Value(bytes) => Cell::Value(bytes),
+                    RowCell::Ref { indirection, .. } => Cell::Ref(BlobRef {
+                        indirection,
+                        key: &self.key,
+                        tree: self.tree,
+                        source: self.token.version(),
+                    }),
+                },
             })
             .collect())
     }
 
-    /// The bytes of the cell at `position`: its own for a value cell, its
+    /// The bytes of the field in `column`: its own for a value cell, its
     /// object's for a reference, read through the version the read saw. Only
-    /// that object is read.
+    /// that object is read. `None` when the row has no such field.
     ///
     /// # Errors
     ///
-    /// Returns an error if the stored row is malformed, has no cell at
-    /// `position`, or the object cannot be read.
-    pub fn resolve(&self, position: usize) -> crate::Result<crate::Slice> {
-        let cells = decode_row(&self.row)?;
-        match cells.get(position) {
-            None => Err(Error::BlobRef("no cell at that position")),
-            Some(RowCell::Value(bytes)) => Ok(crate::Slice::from(*bytes)),
-            Some(RowCell::Ref { indirection, .. }) => {
+    /// Returns an error if the stored row is malformed or the object cannot
+    /// be read.
+    pub fn resolve(&self, column: u16) -> crate::Result<Option<crate::Slice>> {
+        let fields = decode_row(&self.row)?;
+        let Some(field) = fields.iter().find(|field| field.column == column) else {
+            return Ok(None);
+        };
+        match &field.cell {
+            RowCell::Value(bytes) => Ok(Some(crate::Slice::from(*bytes))),
+            RowCell::Ref { indirection, .. } => {
                 let object = self
                     .source
                     .object(&self.version.version, &self.key, indirection)?;
@@ -209,7 +251,7 @@ impl RowCells {
                         "field row: referenced object differs from its recorded size",
                     ));
                 }
-                Ok(object)
+                Ok(Some(object))
             }
         }
     }
@@ -226,26 +268,88 @@ pub(crate) enum RowCell<'a> {
     },
 }
 
+/// A field of an encoded row: its column identifier, its type and its cell.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowField<'a> {
+    pub(crate) column: u16,
+    pub(crate) tag: TypeTag,
+    pub(crate) cell: RowCell<'a>,
+}
+
+#[cfg(test)]
+impl<'a> RowField<'a> {
+    /// A field of variable-width bytes.
+    pub(crate) const fn bytes(column: u16, cell: RowCell<'a>) -> Self {
+        Self {
+            column,
+            tag: TypeTag::Bytes,
+            cell,
+        }
+    }
+}
+
 const CORRUPT: Error = Error::InvalidHeader("field row: malformed cell row");
 
-/// Encodes `cells` as a row, references as their indirections.
+/// Bytes a field's descriptor takes: its column id, type tag and width.
+const DESCRIPTOR_LEN: usize = 4;
+
+/// Refuses a row a caller could not have meant: a type that has no wire form
+/// (a zero-width [`TypeTag::Fixed`]), two fields in one column, or a
+/// fixed-width field whose value or object is not its type's width.
 ///
 /// # Errors
 ///
-/// Returns an error if the row has more than `u16::MAX` cells or a cell is
+/// Returns [`Error::CellRow`] naming the fault.
+pub(crate) fn check_fields(fields: &[RowField<'_>]) -> crate::Result<()> {
+    for (i, field) in fields.iter().enumerate() {
+        let (tag, width) = field.tag.to_wire();
+        if TypeTag::from_wire(tag, width).is_err() {
+            return Err(Error::CellRow("a field's type has no wire form"));
+        }
+        if fields
+            .iter()
+            .skip(i + 1)
+            .any(|other| other.column == field.column)
+        {
+            return Err(Error::CellRow("one column in two fields"));
+        }
+        if let Some(width) = field.tag.fixed_width() {
+            let len = match field.cell {
+                RowCell::Value(bytes) => bytes.len(),
+                RowCell::Ref { indirection, .. } => indirection.size as usize,
+            };
+            if len != usize::from(width) {
+                return Err(Error::CellRow("a field is not its type's width"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encodes `fields` as a row, references as their indirections.
+///
+/// # Errors
+///
+/// Returns an error if the row has more than `u16::MAX` fields or a cell is
 /// longer than `u32::MAX` bytes.
-pub(crate) fn encode_row(cells: &[RowCell<'_>]) -> crate::Result<Vec<u8>> {
-    let count = u16::try_from(cells.len())
+pub(crate) fn encode_row(fields: &[RowField<'_>]) -> crate::Result<Vec<u8>> {
+    let count = u16::try_from(fields.len())
         .map_err(|_| Error::InvalidHeader("field row: more than u16::MAX cells"))?;
-    let bitmap_len = cells.len().div_ceil(8);
-    let mut out = Vec::with_capacity(2 + 2 * bitmap_len + cells.len() * 8);
+    let bitmap_len = fields.len().div_ceil(8);
+    let mut out = Vec::with_capacity(2 + 2 * bitmap_len + fields.len() * (DESCRIPTOR_LEN + 8));
     out.extend_from_slice(&count.to_le_bytes());
     let refs_at = out.len();
     let owners_at = refs_at + bitmap_len;
     out.resize(owners_at + bitmap_len, 0);
+    for field in fields {
+        let (tag, width) = field.tag.to_wire();
+        out.extend_from_slice(&field.column.to_le_bytes());
+        out.push(tag);
+        out.push(width);
+    }
     let mut encoded = Vec::new();
-    for (i, cell) in cells.iter().enumerate() {
-        let bytes: &[u8] = match cell {
+    for (i, field) in fields.iter().enumerate() {
+        let bytes: &[u8] = match &field.cell {
             RowCell::Value(bytes) => bytes,
             RowCell::Ref { indirection, owner } => {
                 set_bit(&mut out, refs_at, i);
@@ -275,14 +379,14 @@ fn bit(bitmap: &[u8], i: usize) -> bool {
     bitmap.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 == 1)
 }
 
-/// The cells of an encoded row, in order.
+/// The fields of an encoded row, in order.
 ///
 /// # Errors
 ///
-/// Returns an error if the row is truncated, carries trailing bytes, marks a
-/// value cell as owning, or holds a reference cell that is not one
-/// indirection.
-pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowCell<'_>>> {
+/// Returns an error if the row is truncated, carries trailing bytes, names a
+/// type that does not exist, marks a value cell as owning, or holds a
+/// reference cell that is not one indirection.
+pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
     let count = row
         .first_chunk::<2>()
         .map(|b| usize::from(u16::from_le_bytes(*b)))
@@ -290,9 +394,17 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowCell<'_>>> {
     let bitmap_len = count.div_ceil(8);
     let refs = row.get(2..2 + bitmap_len).ok_or(CORRUPT)?;
     let owners = row.get(2 + bitmap_len..2 + 2 * bitmap_len).ok_or(CORRUPT)?;
-    let mut pos = 2 + 2 * bitmap_len;
-    let mut cells = Vec::with_capacity(count);
-    for i in 0..count {
+    let descriptors_at = 2 + 2 * bitmap_len;
+    let descriptors = row
+        .get(descriptors_at..descriptors_at + count * DESCRIPTOR_LEN)
+        .ok_or(CORRUPT)?;
+    let mut pos = descriptors_at + count * DESCRIPTOR_LEN;
+    let mut fields = Vec::with_capacity(count);
+    for (i, descriptor) in descriptors.chunks_exact(DESCRIPTOR_LEN).enumerate() {
+        let [c0, c1, tag, width] =
+            <[u8; DESCRIPTOR_LEN]>::try_from(descriptor).map_err(|_| CORRUPT)?;
+        let column = u16::from_le_bytes([c0, c1]);
+        let tag = TypeTag::from_wire(tag, width).map_err(|_| CORRUPT)?;
         let len = row
             .get(pos..)
             .and_then(<[u8]>::first_chunk::<4>)
@@ -302,7 +414,7 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowCell<'_>>> {
         let end = start.checked_add(len).ok_or(CORRUPT)?;
         let bytes = row.get(start..end).ok_or(CORRUPT)?;
         let owner = bit(owners, i);
-        cells.push(if bit(refs, i) {
+        let cell = if bit(refs, i) {
             let mut reader = bytes;
             let indirection = BlobIndirection::decode_from(&mut reader)?;
             if !reader.is_empty() {
@@ -313,16 +425,17 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowCell<'_>>> {
             return Err(CORRUPT);
         } else {
             RowCell::Value(bytes)
-        });
+        };
+        fields.push(RowField { column, tag, cell });
         pos = end;
     }
     if pos != row.len() {
         return Err(CORRUPT);
     }
-    Ok(cells)
+    Ok(fields)
 }
 
-/// The references of an encoded row, in cell order, each with whether the
+/// The references of an encoded row, in field order, each with whether the
 /// row owns its object.
 ///
 /// # Errors
@@ -331,11 +444,18 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowCell<'_>>> {
 pub(crate) fn row_refs(row: &[u8]) -> crate::Result<Vec<(BlobIndirection, bool)>> {
     Ok(decode_row(row)?
         .into_iter()
-        .filter_map(|cell| match cell {
+        .filter_map(|field| match field.cell {
             RowCell::Ref { indirection, owner } => Some((indirection, owner)),
             RowCell::Value(_) => None,
         })
         .collect())
+}
+
+/// The bytes the framing of the logical value spends on a field of `tag`
+/// besides its value: a length prefix for variable-width bytes, nothing for
+/// a fixed width, whose width the tag already gives.
+fn frame_overhead(tag: TypeTag) -> u32 {
+    if tag.fixed_width().is_some() { 0 } else { 4 }
 }
 
 /// The length of the logical value `row` reads as, from the row alone: a
@@ -347,13 +467,13 @@ pub(crate) fn row_refs(row: &[u8]) -> crate::Result<Vec<(BlobIndirection, bool)>
 /// `u32::MAX` bytes, the limit of a value.
 pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
     let mut len = 0u32;
-    for cell in decode_row(row)? {
-        let cell_len = match cell {
+    for field in decode_row(row)? {
+        let cell_len = match field.cell {
             RowCell::Value(bytes) => u32::try_from(bytes.len()).map_err(|_| CORRUPT)?,
             RowCell::Ref { indirection, .. } => indirection.size,
         };
         len = len
-            .checked_add(4)
+            .checked_add(frame_overhead(field.tag))
             .and_then(|len| len.checked_add(cell_len))
             .ok_or(Error::InvalidHeader(
                 "field row: logical value exceeds u32::MAX bytes",
@@ -362,8 +482,8 @@ pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
     Ok(len)
 }
 
-/// Moves every value cell of `row` at or above its position's `threshold`
-/// into a blob file through `write`, which stores the bytes and returns their
+/// Moves every value cell of `row` at or above its column's `threshold` into
+/// a blob file through `write`, which stores the bytes and returns their
 /// handle, and returns the row with those cells replaced by owning
 /// references; `None` when no cell reaches its threshold and the row stays as
 /// it is.
@@ -373,17 +493,17 @@ pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
 /// Returns an error if the row is malformed or `write` fails.
 pub(crate) fn separate_row(
     row: &[u8],
-    threshold: impl Fn(usize) -> u32,
+    threshold: impl Fn(u16) -> u32,
     mut write: impl FnMut(&[u8]) -> crate::Result<crate::vlog::ValueHandle>,
 ) -> crate::Result<Option<Vec<u8>>> {
-    let mut cells = decode_row(row)?;
+    let mut fields = decode_row(row)?;
     let mut separated = false;
-    for (position, cell) in cells.iter_mut().enumerate() {
-        if let RowCell::Value(bytes) = *cell {
+    for field in &mut fields {
+        if let RowCell::Value(bytes) = field.cell {
             // A cell is at most `u32::MAX` bytes, the row encoding's limit.
             let size = u32::try_from(bytes.len()).map_err(|_| CORRUPT)?;
-            if size >= threshold(position) {
-                *cell = RowCell::Ref {
+            if size >= threshold(field.column) {
+                field.cell = RowCell::Ref {
                     indirection: BlobIndirection {
                         vhandle: write(bytes)?,
                         size,
@@ -395,15 +515,16 @@ pub(crate) fn separate_row(
         }
     }
     if separated {
-        encode_row(&cells).map(Some)
+        encode_row(&fields).map(Some)
     } else {
         Ok(None)
     }
 }
 
-/// The logical value of an encoded row: each cell as a little-endian `u32`
-/// length and its bytes, every reference replaced by the object `fetch`
-/// returns for it.
+/// The logical value of an encoded row: its fields in order, framed as the
+/// columnar format frames a row's value sub-columns (a variable-width field
+/// as a little-endian `u32` length and its bytes, a fixed-width one as its
+/// bytes), every reference replaced by the object `fetch` returns for it.
 ///
 /// # Errors
 ///
@@ -414,13 +535,16 @@ pub(crate) fn resolve_row(
     row: &[u8],
     mut fetch: impl FnMut(&BlobIndirection) -> crate::Result<crate::Slice>,
 ) -> crate::Result<Vec<u8>> {
-    let cells = decode_row(row)?;
+    let fields = decode_row(row)?;
     let mut out = Vec::new();
-    for cell in cells {
-        match cell {
+    for field in fields {
+        let prefixed = frame_overhead(field.tag) > 0;
+        match field.cell {
             RowCell::Value(bytes) => {
-                let len = u32::try_from(bytes.len()).map_err(|_| CORRUPT)?;
-                out.extend_from_slice(&len.to_le_bytes());
+                if prefixed {
+                    let len = u32::try_from(bytes.len()).map_err(|_| CORRUPT)?;
+                    out.extend_from_slice(&len.to_le_bytes());
+                }
                 out.extend_from_slice(bytes);
             }
             RowCell::Ref { indirection, .. } => {
@@ -430,7 +554,9 @@ pub(crate) fn resolve_row(
                         "field row: referenced object differs from its recorded size",
                     ));
                 }
-                out.extend_from_slice(&indirection.size.to_le_bytes());
+                if prefixed {
+                    out.extend_from_slice(&indirection.size.to_le_bytes());
+                }
                 out.extend_from_slice(&object);
             }
         }

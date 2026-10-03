@@ -436,23 +436,25 @@ impl BlobTree {
         )
     }
 
-    /// Writes `key` as a row of `cells` at `seqno`.
+    /// Writes `key` as a row of `fields` at `seqno`.
     ///
-    /// Plain reads of the key return the cells in order, each a
-    /// little-endian `u32` length and its bytes, with every
-    /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object: the framing
-    /// the columnar format gives a row of byte cells. A
-    /// [`Cell::Value`](field_row::Cell::Value) at or above its position's
+    /// Each [`Field`](field_row::Field) names its column and physical type,
+    /// and both are stored with the row, so a stored row always reads with
+    /// the layout it was written with. Plain reads of the key return the
+    /// fields in order, framed as the columnar format frames a row's value
+    /// sub-columns (a variable-width field as a little-endian `u32` length and
+    /// its bytes, a fixed-width one as its bytes), with every
+    /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object. A
+    /// [`Cell::Value`](field_row::Cell::Value) at or above its column's
     /// threshold
-    /// ([`KvSeparationOptions::cell_separation_thresholds`](crate::KvSeparationOptions::cell_separation_thresholds),
+    /// ([`KvSeparationOptions::cell_separation_threshold`](crate::KvSeparationOptions::cell_separation_threshold),
     /// else the tree's separation threshold) is stored in a blob file when the
     /// row is flushed.
     ///
-    /// A [`Cell::Ref`](field_row::Cell::Ref) keeps an object the key already holds without
-    /// rewriting it, which is how a metadata-only update leaves a large field
-    /// in place. Take the references from the key's latest version and write
-    /// this row above it: a reference read from an older version may name an
-    /// object a newer version already let go of.
+    /// A [`Cell::Ref`](field_row::Cell::Ref) keeps an object the key already
+    /// holds without rewriting it, which is how a metadata-only update leaves
+    /// a large field in place. Take the references from the key's latest
+    /// version and write this row above it.
     ///
     /// Returns the added item's size and the new memtable size, as
     /// [`AbstractTree::insert`] does.
@@ -460,22 +462,24 @@ impl BlobTree {
     /// # Errors
     ///
     /// Returns [`crate::Error::BlobRef`] if a reference was read from another
-    /// key, two cells name one object, or a reference is stale because a
-    /// background relocation moved its object (read the key again for the
-    /// moved one), and an error if the row has more than `u16::MAX` cells or
-    /// a cell exceeds `u32::MAX` bytes. Nothing is written then.
+    /// key or tree, two fields name one object, or a reference is stale (its
+    /// object was moved or let go of since the read: read the key again);
+    /// [`crate::Error::CellRow`] if two fields share a column or a
+    /// fixed-width field is not its type's width; and an error if the row has
+    /// more than `u16::MAX` fields or a cell exceeds `u32::MAX` bytes. Nothing
+    /// is written then.
     ///
     /// # Examples
     ///
     /// ```
     /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
-    /// # use lsm_tree::blob_tree::field_row::Cell;
+    /// # use lsm_tree::blob_tree::field_row::Field;
     /// # let folder = lsm_tree::get_tmp_folder();
     /// let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
     ///     .with_kv_separation(Some(KvSeparationOptions::default()))
     ///     .open()?;
     /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
-    /// tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(b"body")], 0)?;
+    /// tree.insert_cells("doc", &[Field::bytes(1, b"draft"), Field::bytes(2, b"body")], 0)?;
     /// let value = tree.get("doc", 1)?.expect("written");
     /// assert_eq!(&*value, b"\x05\0\0\0draft\x04\0\0\0body");
     /// # Ok::<(), lsm_tree::Error>(())
@@ -483,13 +487,13 @@ impl BlobTree {
     pub fn insert_cells<K: Into<UserKey>>(
         &self,
         key: K,
-        cells: &[field_row::Cell<'_>],
+        fields: &[field_row::Field<'_>],
         seqno: SeqNo,
     ) -> crate::Result<(u64, u64)> {
         let key = key.into();
-        let mut row = Vec::with_capacity(cells.len());
-        for cell in cells {
-            row.push(match cell {
+        let mut row = Vec::with_capacity(fields.len());
+        for field in fields {
+            let cell = match &field.cell {
                 field_row::Cell::Value(bytes) => field_row::RowCell::Value(bytes),
                 field_row::Cell::Ref(reference) => {
                     if reference.tree != self.id() {
@@ -506,15 +510,21 @@ impl BlobTree {
                         owner: false,
                     }
                 }
+            };
+            row.push(field_row::RowField {
+                column: field.column,
+                tag: field.tag,
+                cell,
             });
         }
-        let refs = cells.iter().filter_map(|cell| match cell {
+        field_row::check_fields(&row)?;
+        let refs = fields.iter().filter_map(|field| match &field.cell {
             field_row::Cell::Ref(reference) => Some(reference),
             field_row::Cell::Value(_) => None,
         });
         for (i, a) in refs.clone().enumerate() {
             if refs.clone().skip(i + 1).any(|b| a == b) {
-                return Err(crate::Error::BlobRef("one object in two cells"));
+                return Err(crate::Error::BlobRef("one object in two fields"));
             }
         }
         let value = field_row::encode_row(&row)?;
@@ -527,7 +537,7 @@ impl BlobTree {
         )
     }
 
-    /// The cells of `key` as of `seqno`, references included as references:
+    /// The fields of `key` as of `seqno`, references included as references:
     /// the read a metadata-only update starts from. No blob object is read.
     ///
     /// Returns `None` when the key is absent at `seqno`. References to write
@@ -544,20 +554,22 @@ impl BlobTree {
     ///
     /// ```
     /// # use lsm_tree::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
-    /// # use lsm_tree::blob_tree::field_row::Cell;
+    /// # use lsm_tree::blob_tree::field_row::{Cell, Field};
     /// # let folder = lsm_tree::get_tmp_folder();
     /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default())
     /// #     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(16)))
     /// #     .open()?;
     /// # let lsm_tree::AnyTree::Blob(tree) = tree else { unreachable!() };
     /// let body = vec![b'x'; 1_000];
-    /// tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    /// tree.insert_cells("doc", &[Field::bytes(1, b"draft"), Field::bytes(2, &body)], 0)?;
     /// tree.flush_active_memtable(0)?;
     ///
     /// // Change the status, keep the body where it is.
     /// let row = tree.get_cells("doc", 1)?.expect("written");
-    /// let Cell::Ref(body_ref) = row.cells()?[1].clone() else { unreachable!() };
-    /// tree.insert_cells("doc", &[Cell::Value(b"final"), Cell::Ref(body_ref)], 1)?;
+    /// let mut fields = row.fields()?;
+    /// assert!(matches!(fields[1].cell, Cell::Ref(_)));
+    /// fields[0].cell = Cell::Value(b"final");
+    /// tree.insert_cells("doc", &fields, 1)?;
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn get_cells<K: AsRef<[u8]>>(
@@ -1573,7 +1585,7 @@ impl AbstractTree for BlobTree {
                 // blob file and the row keeps owning references to them.
                 let row = field_row::separate_row(
                     &value,
-                    |position| kv_opts.cell_threshold(position),
+                    |column| kv_opts.cell_threshold(column),
                     |bytes| blob_writer.write(&item.key.user_key, item.key.seqno, bytes),
                 )?
                 .map_or(value, UserValue::from);

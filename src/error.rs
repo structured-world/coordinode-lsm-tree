@@ -565,6 +565,14 @@ pub enum Error {
     /// A caller-side error, refused before anything is written. The payload
     /// names which of these it is.
     BlobRef(&'static str),
+
+    /// A row written as cells is not one the caller could have meant: two
+    /// fields in one column, or a fixed-width field that is not its type's
+    /// width.
+    ///
+    /// A caller-side error, refused before anything is written. The payload
+    /// names which of these it is.
+    CellRow(&'static str),
 }
 
 impl core::fmt::Display for Error {

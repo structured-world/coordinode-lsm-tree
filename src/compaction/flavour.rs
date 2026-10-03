@@ -881,8 +881,8 @@ impl RelocatingCompaction {
 
         let mut cells = decode_row(&item.value)?;
         let mut rewritten = false;
-        for cell in &mut cells {
-            let RowCell::Ref { indirection, .. } = cell else {
+        for field in &mut cells {
+            let RowCell::Ref { indirection, .. } = &mut field.cell else {
                 continue;
             };
             if !self

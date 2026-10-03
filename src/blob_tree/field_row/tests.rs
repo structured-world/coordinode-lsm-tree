@@ -1,4 +1,5 @@
 use super::*;
+use crate::table::column_type::{ByteOrder, Number, NumberKind};
 use crate::vlog::ValueHandle;
 use test_log::test;
 
@@ -20,43 +21,81 @@ fn reference(indirection: BlobIndirection) -> RowCell<'static> {
     }
 }
 
-/// A row of values and references decodes to the same cells, references
+fn u64_le() -> TypeTag {
+    TypeTag::Number(Number::new(NumberKind::Unsigned, 8, ByteOrder::Little).unwrap())
+}
+
+/// A row of values and references decodes to the same fields, references
 /// marked as such, so the engine can list them without the caller's schema.
 #[test]
 fn a_row_round_trips_its_values_and_references() {
     let payload = indirection(7, 4_096, 1_000);
     let row = encode_row(&[
-        RowCell::Value(b"status"),
-        reference(payload),
-        RowCell::Value(b""),
+        RowField::bytes(3, RowCell::Value(b"status")),
+        RowField::bytes(9, reference(payload)),
+        RowField::bytes(1, RowCell::Value(b"")),
     ])
     .unwrap();
-    let cells = decode_row(&row).unwrap();
-    assert_eq!(cells.len(), 3);
-    assert!(matches!(cells[0], RowCell::Value(b"status")));
+    let fields = decode_row(&row).unwrap();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(
+        fields.iter().map(|f| f.column).collect::<Vec<_>>(),
+        [3, 9, 1]
+    );
+    assert!(matches!(fields[0].cell, RowCell::Value(b"status")));
     assert!(matches!(
-        cells[1],
+        fields[1].cell,
         RowCell::Ref { indirection, owner: false } if indirection.vhandle == payload.vhandle
     ));
-    assert!(matches!(cells[2], RowCell::Value(b"")));
+    assert!(matches!(fields[2].cell, RowCell::Value(b"")));
     let refs = row_refs(&row).unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0.vhandle, payload.vhandle);
     assert!(!refs[0].1);
 }
 
-/// Ownership is per cell: the owning reference and the borrowed one come
+/// Each field's type comes back as written, fixed-width numbers included, so
+/// a stored row reads with the layout it was written with.
+#[test]
+fn a_row_round_trips_its_field_types() {
+    let tags = [
+        TypeTag::Bytes,
+        TypeTag::Fixed(3),
+        u64_le(),
+        TypeTag::Number(Number::new(NumberKind::Float, 4, ByteOrder::Big).unwrap()),
+    ];
+    let (eight, four) = ([1u8; 8], [2u8; 4]);
+    let values: [&[u8]; 4] = [b"var", b"abc", &eight, &four];
+    let fields: Vec<_> = tags
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(column, (tag, value))| RowField {
+            column: u16::try_from(column).unwrap(),
+            tag: *tag,
+            cell: RowCell::Value(value),
+        })
+        .collect();
+    let row = encode_row(&fields).unwrap();
+    let decoded = decode_row(&row).unwrap();
+    assert_eq!(decoded.iter().map(|f| f.tag).collect::<Vec<_>>(), tags);
+}
+
+/// Ownership is per field: the owning reference and the borrowed one come
 /// back as written, so the GC charges an object only through its owner.
 #[test]
 fn ownership_round_trips_per_reference() {
     let owned = indirection(4, 0, 30);
     let borrowed = indirection(4, 30, 40);
     let row = encode_row(&[
-        RowCell::Ref {
-            indirection: owned,
-            owner: true,
-        },
-        reference(borrowed),
+        RowField::bytes(
+            0,
+            RowCell::Ref {
+                indirection: owned,
+                owner: true,
+            },
+        ),
+        RowField::bytes(1, reference(borrowed)),
     ])
     .unwrap();
     let refs = row_refs(&row).unwrap();
@@ -65,17 +104,22 @@ fn ownership_round_trips_per_reference() {
     assert_eq!((refs[1].0.vhandle, refs[1].1), (borrowed.vhandle, false));
 }
 
-/// Past eight cells both bitmaps span a second byte; a reference in it, and
+/// Past eight fields both bitmaps span a second byte; a reference in it, and
 /// its ownership, are still found.
 #[test]
-fn a_reference_past_the_eighth_cell_is_found() {
+fn a_reference_past_the_eighth_field_is_found() {
     let far = indirection(3, 64, 10);
-    let mut cells: Vec<RowCell<'_>> = (0..9).map(|_| RowCell::Value(b"x")).collect();
-    cells.push(RowCell::Ref {
-        indirection: far,
-        owner: true,
-    });
-    let row = encode_row(&cells).unwrap();
+    let mut fields: Vec<RowField<'_>> = (0..9)
+        .map(|column| RowField::bytes(column, RowCell::Value(b"x")))
+        .collect();
+    fields.push(RowField::bytes(
+        9,
+        RowCell::Ref {
+            indirection: far,
+            owner: true,
+        },
+    ));
+    let row = encode_row(&fields).unwrap();
     let refs = row_refs(&row).unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0.vhandle, far.vhandle);
@@ -83,10 +127,14 @@ fn a_reference_past_the_eighth_cell_is_found() {
 }
 
 /// A truncated or padded row is refused rather than read as fewer or more
-/// cells than it holds.
+/// fields than it holds.
 #[test]
 fn a_malformed_row_is_refused() {
-    let row = encode_row(&[RowCell::Value(b"abc"), reference(indirection(1, 0, 5))]).unwrap();
+    let row = encode_row(&[
+        RowField::bytes(0, RowCell::Value(b"abc")),
+        RowField::bytes(1, reference(indirection(1, 0, 5))),
+    ])
+    .unwrap();
     for cut in 0..row.len() {
         assert!(
             decode_row(&row[..cut]).is_err(),
@@ -98,31 +146,127 @@ fn a_malformed_row_is_refused() {
     assert!(decode_row(&padded).is_err(), "trailing bytes decoded");
 }
 
-/// An owner bit on a value cell names no object: the row is damaged, and is
+/// An owner bit on a value field names no object: the row is damaged, and is
 /// refused rather than read with the bit ignored.
 #[test]
-fn an_owning_value_cell_is_refused() {
-    let mut row = encode_row(&[RowCell::Value(b"abc")]).unwrap();
+fn an_owning_value_field_is_refused() {
+    let mut row = encode_row(&[RowField::bytes(0, RowCell::Value(b"abc"))]).unwrap();
     // Count (2 bytes), reference bitmap (1 byte), then the owner bitmap.
     row[3] |= 1;
     assert!(matches!(decode_row(&row), Err(Error::InvalidHeader(_))));
 }
 
-/// The logical value is every cell length-prefixed, references replaced by
-/// their objects: the framing of byte cells a plain read returns.
+/// A descriptor naming a type that does not exist is damage, refused rather
+/// than read with some other layout.
 #[test]
-fn a_row_resolves_to_its_cells_with_objects_in_place() {
+fn an_unknown_field_type_is_refused() {
+    let mut row = encode_row(&[RowField::bytes(0, RowCell::Value(b"abc"))]).unwrap();
+    // Count, two one-byte bitmaps, then the column id; the tag follows it.
+    row[6] = 0xFF;
+    assert!(matches!(decode_row(&row), Err(Error::InvalidHeader(_))));
+}
+
+/// Two fields in one column would make the row's layout ambiguous: the
+/// write is refused.
+#[test]
+fn two_fields_in_one_column_are_refused() {
+    let result = check_fields(&[
+        RowField::bytes(4, RowCell::Value(b"a")),
+        RowField::bytes(4, RowCell::Value(b"b")),
+    ]);
+    assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
+}
+
+/// A fixed-width field whose value, or whose referenced object, is not its
+/// type's width is refused; one of the right width passes.
+#[test]
+fn a_fixed_width_field_of_another_width_is_refused() {
+    let field = |cell| RowField {
+        column: 0,
+        tag: u64_le(),
+        cell,
+    };
+    assert!(check_fields(&[field(RowCell::Value(&[0; 8]))]).is_ok());
+    for cell in [
+        RowCell::Value(&[0; 7]),
+        RowCell::Value(&[0; 9]),
+        reference(indirection(1, 0, 4)),
+    ] {
+        let result = check_fields(&[field(cell)]);
+        assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
+    }
+    assert!(check_fields(&[field(reference(indirection(1, 0, 8)))]).is_ok());
+}
+
+/// A zero-width fixed type has no wire form: a row holding it would not
+/// decode, so the write is refused.
+#[test]
+fn a_zero_width_fixed_field_is_refused() {
+    let result = check_fields(&[RowField {
+        column: 0,
+        tag: TypeTag::Fixed(0),
+        cell: RowCell::Value(b""),
+    }]);
+    assert!(matches!(result, Err(Error::CellRow(_))), "{result:?}");
+}
+
+/// The logical value is the fields in order with references replaced by
+/// their objects, a variable-width field length-prefixed and a fixed-width
+/// one bare: the framing the columnar format gives a row's value sub-columns.
+#[test]
+fn a_row_resolves_to_its_fields_with_objects_in_place() {
     let object = crate::Slice::from(vec![b'p'; 5]);
-    let row = encode_row(&[RowCell::Value(b"ab"), reference(indirection(1, 0, 5))]).unwrap();
+    let row = encode_row(&[
+        RowField::bytes(0, RowCell::Value(b"ab")),
+        RowField {
+            column: 1,
+            tag: u64_le(),
+            cell: RowCell::Value(&[7, 0, 0, 0, 0, 0, 0, 0]),
+        },
+        RowField::bytes(2, reference(indirection(1, 0, 5))),
+    ])
+    .unwrap();
     let value = resolve_row(&row, |_| Ok(object.clone())).unwrap();
-    assert_eq!(value, b"\x02\0\0\0ab\x05\0\0\0ppppp");
+    assert_eq!(value, b"\x02\0\0\0ab\x07\0\0\0\0\0\0\0\x05\0\0\0ppppp");
+    assert_eq!(logical_len(&row).unwrap() as usize, value.len());
+}
+
+/// Separation is decided per column: a field goes to a blob file at or above
+/// its own column's threshold, wherever it sits in the row.
+#[test]
+fn separation_follows_the_column_threshold() {
+    let row = encode_row(&[
+        RowField::bytes(5, RowCell::Value(b"large-but-kept")),
+        RowField::bytes(2, RowCell::Value(b"tiny")),
+    ])
+    .unwrap();
+    let mut written = Vec::new();
+    let separated = separate_row(
+        &row,
+        |column| if column == 2 { 0 } else { u32::MAX },
+        |bytes| {
+            written.push(bytes.to_vec());
+            Ok(ValueHandle {
+                blob_file_id: 1,
+                offset: 0,
+                on_disk_size: 4,
+            })
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(written, [b"tiny".to_vec()]);
+    let fields = decode_row(&separated).unwrap();
+    assert!(matches!(fields[0].cell, RowCell::Value(b"large-but-kept")));
+    assert!(matches!(fields[1].cell, RowCell::Ref { owner: true, .. }));
+    assert_eq!(fields[1].column, 2);
 }
 
 /// An object whose length differs from the size its reference records is an
 /// error: a dangling or mis-typed reference never reads as some other value.
 #[test]
 fn an_object_of_another_size_is_an_error() {
-    let row = encode_row(&[reference(indirection(1, 0, 5))]).unwrap();
+    let row = encode_row(&[RowField::bytes(0, reference(indirection(1, 0, 5)))]).unwrap();
     let result = resolve_row(&row, |_| Ok(crate::Slice::from(vec![b'p'; 4])));
     assert!(matches!(result, Err(Error::InvalidHeader(_))), "{result:?}");
 }

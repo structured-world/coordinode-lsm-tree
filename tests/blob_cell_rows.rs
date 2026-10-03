@@ -3,10 +3,11 @@
 
 use lsm_tree::{
     AbstractTree, AnyTree, BlobTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
-    blob_tree::field_row::{Cell, RowCells},
+    blob_tree::field_row::{Cell, Field, RowCells, TypeTag},
     fs::{CrashFs, Fault, FaultFs, FaultOp, FaultRule, MemFs},
     get_tmp_folder,
     io::ErrorKind,
+    table::column_type::{ByteOrder, Number, NumberKind},
 };
 use std::sync::Arc;
 use test_log::test;
@@ -40,17 +41,32 @@ fn framed(cells: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// A row of byte fields, field `i` in column `i`.
+fn bytes<'a>(values: &[&'a [u8]]) -> Vec<Field<'a>> {
+    values
+        .iter()
+        .zip(0..)
+        .map(|(value, column)| Field::bytes(column, value))
+        .collect()
+}
+
 /// The latest version of `key`, read as cells.
 fn row_of(tree: &BlobTree, key: &str) -> lsm_tree::Result<RowCells> {
     Ok(tree.get_cells(key, SeqNo::MAX)?.expect("row exists"))
 }
 
-/// The reference `row` holds in cell `index`, borrowed from the read.
-fn reference(row: &RowCells, index: usize) -> lsm_tree::Result<Cell<'_>> {
-    match row.cells()?.swap_remove(index) {
-        reference @ Cell::Ref(_) => Ok(reference),
-        Cell::Value(_) => panic!("cell {index} is not a reference"),
-    }
+/// The field `row` holds in `column` as a reference, borrowed from the read.
+fn reference(row: &RowCells, column: u16) -> lsm_tree::Result<Field<'_>> {
+    let field = row
+        .fields()?
+        .into_iter()
+        .find(|field| field.column == column)
+        .expect("the row has the column");
+    assert!(
+        matches!(field.cell, Cell::Ref(_)),
+        "column {column} is not a reference"
+    );
+    Ok(field)
 }
 
 /// A row reads back as its cells before and after the flush that moves its
@@ -61,7 +77,7 @@ fn a_cell_row_reads_back_before_and_after_flush() -> lsm_tree::Result<()> {
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 1_000];
 
-    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
     assert_eq!(
         tree.get("doc", SeqNo::MAX)?.as_deref(),
         Some(&framed(&[b"draft", &body])[..])
@@ -80,9 +96,14 @@ fn a_cell_row_reads_back_before_and_after_flush() -> lsm_tree::Result<()> {
 
     // Only the body became a reference; the status stayed in the row.
     let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
-    let cells = row.cells()?;
-    assert!(matches!(cells[0], Cell::Value(b"draft")));
-    assert!(matches!(&cells[1], Cell::Ref(r) if r.size() == 1_000));
+    let fields = row.fields()?;
+    assert!(matches!(fields[0].cell, Cell::Value(b"draft")));
+    assert!(matches!(&fields[1].cell, Cell::Ref(r) if r.size() == 1_000));
+    assert_eq!(
+        fields.iter().map(|f| (f.column, f.tag)).collect::<Vec<_>>(),
+        [(0, TypeTag::Bytes), (1, TypeTag::Bytes)],
+        "a separated field keeps its column and type"
+    );
     Ok(())
 }
 
@@ -94,13 +115,13 @@ fn a_metadata_only_update_writes_no_blob_bytes() -> lsm_tree::Result<()> {
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 4_096];
 
-    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
     tree.flush_active_memtable(0)?;
     let blob_bytes = tree.current_version().blob_files.on_disk_size();
 
     let row = row_of(&tree, "doc")?;
     let body_ref = reference(&row, 1)?;
-    tree.insert_cells("doc", &[Cell::Value(b"final"), body_ref], 1)?;
+    tree.insert_cells("doc", &[Field::bytes(0, b"final"), body_ref], 1)?;
     tree.flush_active_memtable(0)?;
 
     assert_eq!(tree.blob_file_count(), 1, "the update wrote no blob file");
@@ -130,10 +151,10 @@ fn a_shared_object_is_charged_once_when_its_last_holder_goes() -> lsm_tree::Resu
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 4_096];
 
-    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
     tree.flush_active_memtable(0)?;
     let row = row_of(&tree, "doc")?;
-    tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 1)?;
+    tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 1)?;
     drop(row);
     tree.flush_active_memtable(0)?;
 
@@ -170,7 +191,7 @@ fn a_reference_is_refused_under_another_key_or_twice_in_a_row() -> lsm_tree::Res
     let folder = get_tmp_folder();
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 1_000];
-    tree.insert_cells("a", &[Cell::Value(&body)], 0)?;
+    tree.insert_cells("a", &bytes(&[&body]), 0)?;
     tree.flush_active_memtable(0)?;
     let row = row_of(&tree, "a")?;
     let body_ref = reference(&row, 0)?;
@@ -180,7 +201,17 @@ fn a_reference_is_refused_under_another_key_or_twice_in_a_row() -> lsm_tree::Res
         matches!(foreign, Err(lsm_tree::Error::BlobRef(_))),
         "{foreign:?}"
     );
-    let twice = tree.insert_cells("a", &[body_ref, body_ref], 1);
+    let twice = tree.insert_cells(
+        "a",
+        &[
+            body_ref,
+            Field {
+                column: 1,
+                ..body_ref
+            },
+        ],
+        1,
+    );
     assert!(
         matches!(twice, Err(lsm_tree::Error::BlobRef(_))),
         "{twice:?}"
@@ -199,9 +230,9 @@ fn a_reference_from_another_tree_is_refused() -> lsm_tree::Result<()> {
     let folder_b = get_tmp_folder();
     let a = open(folder_a.path(), KvSeparationOptions::default())?;
     let b = open(folder_b.path(), KvSeparationOptions::default())?;
-    a.insert_cells("doc", &[Cell::Value(&vec![b'a'; 1_000])], 0)?;
+    a.insert_cells("doc", &bytes(&[&vec![b'a'; 1_000]]), 0)?;
     a.flush_active_memtable(0)?;
-    b.insert_cells("doc", &[Cell::Value(&vec![b'b'; 1_000])], 0)?;
+    b.insert_cells("doc", &bytes(&[&vec![b'b'; 1_000]]), 0)?;
     b.flush_active_memtable(0)?;
 
     let row = row_of(&a, "doc")?;
@@ -225,9 +256,9 @@ fn a_reference_from_another_tree_is_refused() -> lsm_tree::Result<()> {
 fn a_reference_whose_owner_was_collected_is_refused() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open(folder.path(), KvSeparationOptions::default())?;
-    tree.insert_cells("doc", &[Cell::Value(&vec![b'd'; 1_000])], 0)?;
+    tree.insert_cells("doc", &bytes(&[&vec![b'd'; 1_000]]), 0)?;
     // Another object in the same blob file keeps the file alive.
-    tree.insert_cells("other", &[Cell::Value(&vec![b'o'; 1_000])], 0)?;
+    tree.insert_cells("other", &bytes(&[&vec![b'o'; 1_000]]), 0)?;
     tree.flush_active_memtable(0)?;
 
     let row = row_of(&tree, "doc")?;
@@ -271,7 +302,7 @@ fn get_cells_refuses_a_plain_value() -> lsm_tree::Result<()> {
 /// compaction relocates the body.
 fn stale_file_with_a_body(tree: &BlobTree, body: &[u8]) -> lsm_tree::Result<()> {
     let filler = vec![b'f'; 8_192];
-    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(body)], 0)?;
+    tree.insert_cells("doc", &bytes(&[b"draft", body]), 0)?;
     tree.insert("filler", &filler, 0);
     tree.flush_active_memtable(0)?;
     tree.insert("filler", "small", 1);
@@ -299,17 +330,23 @@ fn a_reference_moved_by_relocation_is_refused_as_stale() -> lsm_tree::Result<()>
     let before = reference(&old_row, 1)?;
     tree.major_compact(64_000_000, SeqNo::MAX)?;
 
-    let stale = tree.insert_cells("doc", &[Cell::Value(b"final"), before], 2);
+    let stale = tree.insert_cells("doc", &[Field::bytes(0, b"final"), before], 2);
     assert!(
         matches!(stale, Err(lsm_tree::Error::BlobRef(_))),
         "{stale:?}"
     );
     // The read that handed the stale reference out still resolves it: it
     // holds the version it saw, whose blob file the relocation retired.
-    assert_eq!(&*old_row.resolve(1)?, &body[..]);
+    assert_eq!(old_row.resolve(1)?.as_deref(), Some(&body[..]));
+    assert_eq!(old_row.resolve(0)?.as_deref(), Some(&b"draft"[..]));
+    assert_eq!(old_row.resolve(7)?, None, "the row has no column 7");
 
     let new_row = row_of(&tree, "doc")?;
-    tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&new_row, 1)?], 2)?;
+    tree.insert_cells(
+        "doc",
+        &[Field::bytes(0, b"final"), reference(&new_row, 1)?],
+        2,
+    )?;
     assert_eq!(
         tree.get("doc", SeqNo::MAX)?.as_deref(),
         Some(&framed(&[b"final", &body])[..])
@@ -331,7 +368,7 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
     stale_file_with_a_body(&tree, &body)?;
 
     let row = row_of(&tree, "doc")?;
-    tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 2)?;
+    tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 2)?;
     drop(row);
     tree.major_compact(64_000_000, SeqNo::MAX)?;
     assert_eq!(
@@ -359,11 +396,11 @@ fn drop_range_keeps_a_file_a_memtable_row_borrows_from() -> lsm_tree::Result<()>
     let folder = get_tmp_folder();
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 4_096];
-    tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+    tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
     tree.flush_active_memtable(0)?;
 
     let row = row_of(&tree, "doc")?;
-    tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 1)?;
+    tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 1)?;
     drop(row);
     tree.drop_range::<&str, _>(..)?;
     assert_eq!(tree.table_count(), 0, "the owner's table is gone");
@@ -388,10 +425,10 @@ fn cell_rows_survive_a_reopen() -> lsm_tree::Result<()> {
     let body = vec![b'b'; 4_096];
     {
         let tree = open(folder.path(), KvSeparationOptions::default())?;
-        tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+        tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
         tree.flush_active_memtable(0)?;
         let row = row_of(&tree, "doc")?;
-        tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 1)?;
+        tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 1)?;
         drop(row);
         tree.flush_active_memtable(0)?;
     }
@@ -401,7 +438,7 @@ fn cell_rows_survive_a_reopen() -> lsm_tree::Result<()> {
         Some(&framed(&[b"final", &body])[..])
     );
     let row = row_of(&tree, "doc")?;
-    tree.insert_cells("doc", &[Cell::Value(b"done"), reference(&row, 1)?], 2)?;
+    tree.insert_cells("doc", &[Field::bytes(0, b"done"), reference(&row, 1)?], 2)?;
     drop(row);
     tree.flush_active_memtable(0)?;
     tree.major_compact(64_000_000, SeqNo::MAX)?;
@@ -421,9 +458,9 @@ fn a_held_snapshot_keeps_the_objects_it_reads() -> lsm_tree::Result<()> {
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let first = vec![b'1'; 4_096];
     let second = vec![b'2'; 4_096];
-    tree.insert_cells("doc", &[Cell::Value(&first)], 0)?;
+    tree.insert_cells("doc", &bytes(&[&first]), 0)?;
     tree.flush_active_memtable(0)?;
-    tree.insert_cells("doc", &[Cell::Value(&second)], 1)?;
+    tree.insert_cells("doc", &bytes(&[&second]), 1)?;
     tree.flush_active_memtable(0)?;
 
     // A reader at seqno 1 still sees the first version: the watermark keeps it.
@@ -477,10 +514,10 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
         let fault = FaultFs::new(crash.clone());
         let injector = fault.injector();
         let tree = open_on(Arc::new(fault))?;
-        tree.insert_cells("doc", &[Cell::Value(b"draft"), Cell::Value(&body)], 0)?;
+        tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
         tree.flush_active_memtable(0)?;
         let row = row_of(&tree, "doc")?;
-        tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 1)?;
+        tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 1)?;
         drop(row);
         fail_next_commit(&injector);
         assert!(tree.flush_active_memtable(0).is_err());
@@ -503,7 +540,7 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
         let injector = fault.injector();
         let tree = open_on(Arc::new(fault))?;
         let row = row_of(&tree, "doc")?;
-        tree.insert_cells("doc", &[Cell::Value(b"final"), reference(&row, 1)?], 1)?;
+        tree.insert_cells("doc", &[Field::bytes(0, b"final"), reference(&row, 1)?], 1)?;
         drop(row);
         tree.flush_active_memtable(0)?;
         fail_next_commit(&injector);
@@ -548,12 +585,7 @@ fn per_field_references_keep_the_locality_accounting() -> lsm_tree::Result<()> {
     for i in 0..10u64 {
         tree.insert_cells(
             format!("k{i:02}"),
-            &[
-                Cell::Value(b"draft"),
-                Cell::Value(&fields[0]),
-                Cell::Value(&fields[1]),
-                Cell::Value(&fields[2]),
-            ],
+            &bytes(&[b"draft", &fields[0], &fields[1], &fields[2]]),
             i,
         )?;
     }
@@ -563,9 +595,9 @@ fn per_field_references_keep_the_locality_accounting() -> lsm_tree::Result<()> {
     for i in 0..10u64 {
         let key = format!("k{i:02}");
         let row = tree.get_cells(&key, SeqNo::MAX)?.expect("row exists");
-        let mut cells = row.cells()?;
-        cells[0] = Cell::Value(b"final");
-        tree.insert_cells(key, &cells, 10 + i)?;
+        let mut updated = row.fields()?;
+        updated[0].cell = Cell::Value(b"final");
+        tree.insert_cells(key, &updated, 10 + i)?;
     }
     tree.flush_active_memtable(0)?;
     assert_eq!(tree.blob_file_count(), 1, "the update wrote no blob file");
@@ -587,57 +619,61 @@ fn per_field_references_keep_the_locality_accounting() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Each cell position separates at its own threshold: a large field kept
-/// with the compact attributes stays inline, a small rarely read one goes to
-/// a blob file, and a position without its own threshold uses the tree's.
+/// Each column separates at its own threshold, wherever its field sits in
+/// the row: a large field kept with the compact attributes stays inline, a
+/// small rarely read one goes to a blob file, and a column without its own
+/// threshold uses the tree's.
 #[test]
-fn each_cell_position_separates_at_its_own_threshold() -> lsm_tree::Result<()> {
+fn each_column_separates_at_its_own_threshold() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open(
         folder.path(),
-        KvSeparationOptions::default().cell_separation_thresholds(vec![u32::MAX, 0]),
+        KvSeparationOptions::default()
+            .cell_separation_threshold(10, u32::MAX)
+            .cell_separation_threshold(20, 0),
     )?;
     let large = vec![b'l'; 4_096];
+    // Columns out of order: the threshold follows the column, not the place.
     tree.insert_cells(
         "doc",
         &[
-            Cell::Value(&large),
-            Cell::Value(b"tiny"),
-            Cell::Value(&large),
+            Field::bytes(20, b"tiny"),
+            Field::bytes(10, &large),
+            Field::bytes(30, &large),
         ],
         0,
     )?;
     tree.flush_active_memtable(0)?;
 
     let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
-    let cells = row.cells()?;
+    let fields = row.fields()?;
     assert!(
-        matches!(cells[0], Cell::Value(_)),
-        "position 0 never separates"
+        matches!(fields[0].cell, Cell::Ref(_)),
+        "column 20 always separates"
     );
     assert!(
-        matches!(cells[1], Cell::Ref(_)),
-        "position 1 always separates"
+        matches!(fields[1].cell, Cell::Value(_)),
+        "column 10 never separates"
     );
     assert!(
-        matches!(cells[2], Cell::Ref(_)),
-        "position 2 uses the tree's threshold"
+        matches!(fields[2].cell, Cell::Ref(_)),
+        "column 30 uses the tree's threshold"
     );
     assert_eq!(
         tree.get("doc", SeqNo::MAX)?.as_deref(),
-        Some(&framed(&[&large, b"tiny", &large])[..])
+        Some(&framed(&[b"tiny", &large, &large])[..])
     );
     Ok(())
 }
 
-/// Ingestion separates each heavy cell on its own, as a flush does.
+/// Ingestion separates each heavy field on its own, as a flush does.
 #[test]
-fn ingested_cells_separate_per_cell() -> lsm_tree::Result<()> {
+fn ingested_fields_separate_per_field() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 1_000];
     let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&tree)?;
-    ingestion.write_cells("doc".into(), &[b"draft", &body])?;
+    ingestion.write_cells("doc".into(), &bytes(&[b"draft", &body]))?;
     ingestion.finish()?;
 
     assert_eq!(tree.blob_file_count(), 1);
@@ -646,6 +682,105 @@ fn ingested_cells_separate_per_cell() -> lsm_tree::Result<()> {
         Some(&framed(&[b"draft", &body])[..])
     );
     let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
-    assert!(matches!(row.cells()?[1], Cell::Ref(_)));
+    assert!(matches!(row.fields()?[1].cell, Cell::Ref(_)));
+    Ok(())
+}
+
+/// An ingested key has no earlier version, so a reference in an ingested
+/// row would name an object no version of the key holds: it is refused.
+#[test]
+fn an_ingested_reference_is_refused() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    tree.insert_cells("doc", &bytes(&[&vec![b'b'; 1_000]]), 0)?;
+    tree.flush_active_memtable(0)?;
+    let row = row_of(&tree, "doc")?;
+
+    let other = open(get_tmp_folder().path(), KvSeparationOptions::default())?;
+    let mut ingestion = lsm_tree::blob_tree::ingest::BlobIngestion::new(&other)?;
+    let refused = ingestion.write_cells("doc".into(), &[reference(&row, 0)?]);
+    assert!(
+        matches!(refused, Err(lsm_tree::Error::BlobRef(_))),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
+/// Two fields in one column, or a fixed-width field of another width, are
+/// refused before anything is written.
+#[test]
+fn a_row_with_an_ambiguous_layout_is_refused() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let u32_le = TypeTag::Number(Number::new(NumberKind::Unsigned, 4, ByteOrder::Little)?);
+
+    let twice = tree.insert_cells("doc", &[Field::bytes(3, b"a"), Field::bytes(3, b"b")], 0);
+    assert!(
+        matches!(twice, Err(lsm_tree::Error::CellRow(_))),
+        "{twice:?}"
+    );
+    let narrow = Field {
+        column: 0,
+        tag: u32_le,
+        cell: Cell::Value(b"abc"),
+    };
+    let wrong_width = tree.insert_cells("doc", &[narrow], 0);
+    assert!(
+        matches!(wrong_width, Err(lsm_tree::Error::CellRow(_))),
+        "{wrong_width:?}"
+    );
+    assert!(
+        tree.get("doc", SeqNo::MAX)?.is_none(),
+        "nothing was written"
+    );
+    Ok(())
+}
+
+/// A row of typed fields reads as the columnar format frames a row's value
+/// sub-columns: fixed-width fields bare, byte fields length-prefixed, in the
+/// memtable and after the flush that separates the byte field. The types
+/// come back with the fields.
+#[test]
+fn typed_fields_read_with_their_columnar_framing() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), KvSeparationOptions::default())?;
+    let u64_le = TypeTag::Number(Number::new(NumberKind::Unsigned, 8, ByteOrder::Little)?);
+    let id = 42u64.to_le_bytes();
+    let body = vec![b'b'; 1_000];
+    let row = [
+        Field {
+            column: 1,
+            tag: u64_le,
+            cell: Cell::Value(&id),
+        },
+        Field {
+            column: 2,
+            tag: TypeTag::Fixed(2),
+            cell: Cell::Value(b"ok"),
+        },
+        Field::bytes(3, &body),
+    ];
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&id);
+    expected.extend_from_slice(b"ok");
+    expected.extend_from_slice(&framed(&[&body]));
+
+    tree.insert_cells("doc", &row, 0)?;
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&expected[..]));
+    assert_eq!(
+        tree.size_of("doc", SeqNo::MAX)?,
+        Some(u32::try_from(expected.len()).expect("small row"))
+    );
+
+    let read = row_of(&tree, "doc")?;
+    let fields = read.fields()?;
+    assert_eq!(
+        fields.iter().map(|f| (f.column, f.tag)).collect::<Vec<_>>(),
+        [(1, u64_le), (2, TypeTag::Fixed(2)), (3, TypeTag::Bytes)]
+    );
+    assert!(matches!(fields[2].cell, Cell::Ref(_)));
+    assert_eq!(read.resolve(1)?.as_deref(), Some(&id[..]));
     Ok(())
 }

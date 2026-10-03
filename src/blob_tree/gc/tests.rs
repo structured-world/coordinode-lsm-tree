@@ -142,7 +142,7 @@ fn compaction_stream_gc_count_drops() -> crate::Result<()> {
 /// twice its share and could reach its size while other objects in it live.
 #[test]
 fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
-    use crate::blob_tree::field_row::{RowCell, encode_row};
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
 
     let at = |offset, size| BlobIndirection {
         vhandle: ValueHandle {
@@ -153,15 +153,21 @@ fn a_dropped_cell_row_charges_only_its_owned_objects() -> crate::Result<()> {
         size,
     };
     let row = encode_row(&[
-        RowCell::Ref {
-            indirection: at(0, 100),
-            owner: true,
-        },
-        RowCell::Value(b"status"),
-        RowCell::Ref {
-            indirection: at(100, 40),
-            owner: false,
-        },
+        RowField::bytes(
+            0,
+            RowCell::Ref {
+                indirection: at(0, 100),
+                owner: true,
+            },
+        ),
+        RowField::bytes(1, RowCell::Value(b"status")),
+        RowField::bytes(
+            2,
+            RowCell::Ref {
+                indirection: at(100, 40),
+                owner: false,
+            },
+        ),
     ])?;
 
     let mut map = FragmentationMap::default();

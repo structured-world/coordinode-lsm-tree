@@ -1,5 +1,5 @@
 use super::*;
-use crate::blob_tree::field_row::{RowCell, encode_row, row_refs};
+use crate::blob_tree::field_row::{RowCell, RowField, encode_row, row_refs};
 use crate::vlog::ValueHandle;
 use test_log::test;
 
@@ -15,9 +15,12 @@ fn object(offset: u64) -> BlobIndirection {
 }
 
 fn cell_row(key: &str, seqno: u64, refs: &[(BlobIndirection, bool)]) -> InternalValue {
-    let cells: Vec<RowCell<'_>> = refs
+    let cells: Vec<RowField<'_>> = refs
         .iter()
-        .map(|&(indirection, owner)| RowCell::Ref { indirection, owner })
+        .zip(0..)
+        .map(|(&(indirection, owner), column)| {
+            RowField::bytes(column, RowCell::Ref { indirection, owner })
+        })
         .collect();
     InternalValue::from_components(key, encode_row(&cells).unwrap(), seqno, ValueType::CellRow)
 }

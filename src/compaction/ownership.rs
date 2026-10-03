@@ -141,8 +141,8 @@ fn adopt(rows: &mut [InternalValue], orphan: &BlobIndirection) -> crate::Result<
         }
         let mut cells = decode_row(&row.value)?;
         let mut found = false;
-        for cell in &mut cells {
-            if let RowCell::Ref { indirection, owner } = cell
+        for field in &mut cells {
+            if let RowCell::Ref { indirection, owner } = &mut field.cell
                 && indirection.vhandle == orphan.vhandle
             {
                 *owner = true;

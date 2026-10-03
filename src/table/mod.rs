@@ -7,6 +7,7 @@ pub(crate) mod block_index;
 pub(crate) mod block_layout;
 #[cfg(feature = "columnar")]
 pub(crate) mod column_page;
+pub mod column_type;
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]

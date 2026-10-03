@@ -1448,8 +1448,8 @@ fn rewrite_row_refs(
 
     let mut cells = decode_row(row)?;
     let mut changed = false;
-    for cell in &mut cells {
-        let RowCell::Ref { indirection, .. } = cell else {
+    for field in &mut cells {
+        let RowCell::Ref { indirection, .. } = &mut field.cell else {
             continue;
         };
         match rewrite.get(&indirection.vhandle.blob_file_id) {
