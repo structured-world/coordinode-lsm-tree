@@ -784,15 +784,25 @@ impl MergeStream {
         // Laid out over every chosen row, so the sources' columns are checked
         // whether or not the predicate keeps a row of them.
         let layout = self.layout(&pending)?;
+        // Each source's value-type cells, found once for the rows asked
+        // about; only a tree that merges has operands to ask about.
+        let types: Vec<Option<&[u8]>> = if scan.resolver.is_some() {
+            self.sources
+                .iter()
+                .map(|s| s.batch.as_ref().and_then(value_types))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let timing = if layout.judged {
-            scan.predicate_timing(|| pending.iter().any(|pick| self.holds_operand(pick)))
+            scan.predicate_timing(|| pending.iter().any(|pick| holds_operand(&types, pick)))
         } else {
             PredicateTiming::AfterValues
         };
         let pending = match timing {
-            PredicateTiming::BeforeValues => self.judge(scan, pending, false, &layout, support)?,
+            PredicateTiming::BeforeValues => self.judge(scan, pending, None, &layout, support)?,
             PredicateTiming::BeforeValuesExceptOperands => {
-                self.judge(scan, pending, true, &layout, support)?
+                self.judge(scan, pending, Some(&types), &layout, support)?
             }
             PredicateTiming::AfterValues => pending,
         };
@@ -809,32 +819,23 @@ impl MergeStream {
         }))
     }
 
-    /// Whether `pick` is a merge operand in the batch it was taken from.
-    fn holds_operand(&self, pick: &Pick) -> bool {
-        self.sources
-            .get(pick.source)
-            .and_then(|s| s.batch.as_ref())
-            .and_then(value_types)
-            .and_then(|types| types.get(pick.row as usize))
-            .is_some_and(|&byte| is_operand(byte))
-    }
-
     /// The chosen rows of `pending` the scan's filtering predicate keeps,
     /// judged in the batches they were taken from, and every operand among
-    /// them when `keep_operands` leaves those to the judgement after their
-    /// values are read. How far it ran is counted when it judges every row.
+    /// them when `operands` (each source's value-type cells) leaves those to
+    /// the judgement after their values are read. How far it ran is counted
+    /// when it judges every row.
     fn judge(
         &self,
         scan: &ColumnarScan,
         pending: Vec<Pick>,
-        keep_operands: bool,
+        operands: Option<&[Option<&[u8]>]>,
         layout: &Layout,
         support: &mut PredicateSupport,
     ) -> crate::Result<Vec<Pick>> {
         let Some(pred) = scan.predicate.as_ref() else {
             return Ok(pending);
         };
-        if !keep_operands {
+        if operands.is_none() {
             *support = (*support).min(pred.support(layout.type_of(pred.column_id)));
         }
         if pred.apply != PredicateApply::Filter {
@@ -864,7 +865,7 @@ impl MergeStream {
             } else {
                 matcher.matches(pick.row)
             };
-            if keep || (keep_operands && self.holds_operand(&pick)) {
+            if keep || operands.is_some_and(|types| holds_operand(types, &pick)) {
                 kept.push(pick);
             }
         }
@@ -1044,6 +1045,17 @@ impl MergeStream {
         }
         Ok(ColumnBatch { row_count, columns })
     }
+}
+
+/// Whether `pick` is a merge operand, per `types`, each source's value-type
+/// cells.
+fn holds_operand(types: &[Option<&[u8]>], pick: &Pick) -> bool {
+    types
+        .get(pick.source)
+        .copied()
+        .flatten()
+        .and_then(|cells| cells.get(pick.row as usize))
+        .is_some_and(|&byte| is_operand(byte))
 }
 
 /// A chosen row's batch is gone before the output taking it was gathered.
