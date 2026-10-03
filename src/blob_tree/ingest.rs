@@ -22,6 +22,9 @@ pub struct BlobIngestion<'a> {
     pub(crate) blob: BlobFileWriter,
     seqno: SeqNo,
     separation_threshold: u32,
+    /// Separation thresholds of a cell row's fields, by column; see
+    /// [`KvSeparationOptions::cell_separation_threshold`](crate::KvSeparationOptions::cell_separation_threshold).
+    cell_thresholds: Vec<(u16, u32)>,
     last_key: Option<UserKey>,
 }
 
@@ -77,6 +80,7 @@ impl<'a> BlobIngestion<'a> {
         };
 
         let separation_threshold = kv.separation_threshold;
+        let cell_thresholds = kv.cell_separation_thresholds.clone();
 
         Ok(Self {
             tree,
@@ -84,6 +88,7 @@ impl<'a> BlobIngestion<'a> {
             blob,
             seqno: 0,
             separation_threshold,
+            cell_thresholds,
             last_key: None,
         })
     }
@@ -127,6 +132,67 @@ impl<'a> BlobIngestion<'a> {
             }
             res
         }
+    }
+
+    /// Writes `key` as a row of value fields, as
+    /// [`BlobTree::insert_cells`](crate::BlobTree::insert_cells) writes one:
+    /// each field at or above its column's separation threshold goes to a
+    /// blob file on its own, and the row keeps a reference to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::BlobRef`] for a
+    /// [`Cell::Ref`](crate::blob_tree::field_row::Cell::Ref) field (an
+    /// ingested key has no earlier version to keep an object of),
+    /// [`crate::Error::CellRow`] if two fields share a column or a
+    /// fixed-width field is not its type's width, and an error if an IO error
+    /// occurs, the row has more than `u16::MAX` fields or a field exceeds
+    /// `u32::MAX` bytes.
+    pub fn write_cells(
+        &mut self,
+        key: UserKey,
+        fields: &[crate::blob_tree::field_row::Field<'_>],
+    ) -> crate::Result<()> {
+        use crate::blob_tree::field_row::{
+            Cell, RowCell, RowField, encode_row, order_fields, separate_row,
+        };
+
+        // Check order before any blob I/O to avoid partial writes on failure
+        if let Some(prev) = &self.last_key {
+            assert!(
+                self.tree.index.config.comparator.compare(prev, &key) == Ordering::Less,
+                "next key in ingestion must be ordered after last key by configured comparator"
+            );
+        }
+
+        let mut row = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Cell::Value(bytes) = field.cell else {
+                return Err(crate::Error::BlobRef("a reference in an ingested row"));
+            };
+            row.push(RowField {
+                column: field.column,
+                tag: field.tag,
+                cell: RowCell::Value(bytes),
+            });
+        }
+        order_fields(&mut row)?;
+        let row = encode_row(&row)?;
+        let (thresholds, default) = (&self.cell_thresholds, self.separation_threshold);
+        let (blob, seqno) = (&mut self.blob, self.seqno);
+        let row = separate_row(
+            &row,
+            |column| crate::config::cell_threshold(thresholds, default, column),
+            |bytes| blob.write(&key, seqno, bytes),
+        )?
+        .unwrap_or(row);
+
+        let cloned_key = key.clone();
+        let res = self.table.write_cell_row(key, &UserValue::from(row));
+        if res.is_ok() {
+            self.last_key = Some(cloned_key);
+        }
+        res
     }
 
     /// Writes a tombstone for a key.

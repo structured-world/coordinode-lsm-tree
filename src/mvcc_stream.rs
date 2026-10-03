@@ -213,7 +213,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     found_base = true;
                     break;
                 }
-                ValueType::Indirection => {
+                ValueType::Indirection | ValueType::CellRow => {
                     // Read now, as RocksDB's iterator fetches a blob base when
                     // it lands on a merged key: the merged value is the item
                     // this stream yields, so there is no pointer left for a
@@ -292,7 +292,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
                     base_value = Some(entry.value);
                     break;
                 }
-                ValueType::Indirection => {
+                ValueType::Indirection | ValueType::CellRow => {
                     base_value = Some(self.value_log.read(entry)?);
                     break;
                 }

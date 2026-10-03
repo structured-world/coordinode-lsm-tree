@@ -182,6 +182,20 @@ impl<'a> ItemAccessor<'a> {
                     Err(crate::Error::Unrecoverable)
                 }
             }
+            crate::ValueType::CellRow => {
+                let value = crate::blob_tree::field_row::resolve_row(&self.item.value, |vptr| {
+                    self.shared
+                        .get_indirect_value(&self.item.key.user_key, &vptr.vhandle)?
+                        .ok_or_else(|| {
+                            log::error!(
+                                "failed to read a cell's blob during execution of compaction filter. key: {:?}, vptr: {vptr:?}",
+                                self.item.key,
+                            );
+                            crate::Error::Unrecoverable
+                        })
+                })?;
+                Ok(UserValue::from(value))
+            }
             crate::ValueType::WeakTombstone | crate::ValueType::Tombstone => {
                 unreachable!("tombstones are filtered out before calling filter")
             }

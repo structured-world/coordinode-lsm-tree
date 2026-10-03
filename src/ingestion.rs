@@ -203,17 +203,17 @@ impl AnyTree {
     /// Runs a projected columnar scan across the tree.
     ///
     /// Delegates to [`Tree::columnar_scan`](crate::Tree::columnar_scan) on a
-    /// standard tree: reads the memtables and every table intersecting `range`
-    /// at `seqno`, and yields projected
+    /// standard tree and to [`BlobTree::columnar_scan`](crate::BlobTree::columnar_scan)
+    /// on a blob tree: reads the memtables and every table intersecting
+    /// `range` at `seqno`, and yields projected
     /// [`ColumnBatch`](crate::table::columnar::ColumnBatch)es in key order, one
     /// row per key, its newest visible version. See
     /// [`Tree::columnar_scan`](crate::Tree::columnar_scan) for the full contract.
     ///
     /// # Errors
     ///
-    /// Returns an error if the tree is a blob tree (columnar scan does not support
-    /// KV separation), and otherwise as
-    /// [`Tree::columnar_scan`](crate::Tree::columnar_scan).
+    /// As [`Tree::columnar_scan`](crate::Tree::columnar_scan) and
+    /// [`BlobTree::columnar_scan`](crate::BlobTree::columnar_scan).
     ///
     /// # Examples
     ///
@@ -263,9 +263,7 @@ impl AnyTree {
     ) -> crate::Result<crate::tree::columnar_scan::ColumnarScan> {
         match self {
             Self::Standard(t) => t.columnar_scan(projection, predicate, seqno, range),
-            Self::Blob(_) => Err(crate::Error::FeatureUnsupported(
-                "columnar scan is not supported for blob trees",
-            )),
+            Self::Blob(t) => t.columnar_scan(projection, predicate, seqno, range),
         }
     }
 }

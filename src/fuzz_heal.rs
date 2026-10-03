@@ -410,6 +410,7 @@ fn salvage_and_check_minimality(
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = crate::salvage::salvage_with_context(

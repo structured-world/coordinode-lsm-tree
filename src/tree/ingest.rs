@@ -220,6 +220,9 @@ impl<'a> Ingestion<'a> {
         // tables are columnar too (a row ingest is transposed at spill, a
         // columnar batch is stored directly via `write_columnar_batch`).
         writer = writer.use_columnar(rc.columnar);
+        // The index of a blob tree takes rows written as cells, which its
+        // columnar tables split into the columns of their fields.
+        writer = writer.use_cell_rows(rc.columnar && tree.config.kv_separation_opts.is_some());
         // Flag every ingested SST: its entries are written at local seqno 0 and
         // rely on the `global_seqno` allocated at commit, so manifest repair must
         // recognize the manifest-only offset (and fail closed when it is lost)
@@ -286,6 +289,33 @@ impl<'a> Ingestion<'a> {
 
         // Remember the last user key to validate the next call's ordering
         self.last_key = Some(cloned_key);
+
+        Ok(())
+    }
+
+    /// Writes an encoded cell row and links the blob files it references.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs or `row` is not a well-formed
+    /// cell row.
+    pub(crate) fn write_cell_row(&mut self, key: UserKey, row: &UserValue) -> crate::Result<()> {
+        if let Some(prev) = &self.last_key {
+            assert!(
+                self.tree.config.comparator.compare(prev, &key) == Ordering::Less,
+                "next key in ingestion must be ordered after last key by configured comparator"
+            );
+        }
+
+        self.write_row(crate::InternalValue::from_components(
+            key.clone(),
+            row.clone(),
+            self.seqno,
+            crate::ValueType::CellRow,
+        ))?;
+        self.writer.register_cell_row(row)?;
+
+        self.last_key = Some(key);
 
         Ok(())
     }
