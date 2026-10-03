@@ -1016,9 +1016,11 @@ impl MergeStream {
         else {
             return pending;
         };
-        // An operand reads as the value it resolves to, not as its own
-        // cells; and with no payload read late, there is nothing to spare.
-        if scan.resolver.is_some() || !self.sources.iter().any(|s| s.late.batch_late) {
+        // An operand reads as the value it resolves to, not as its own cells.
+        // Otherwise the rows are judged here whether or not their payload is
+        // read late: what survives is also what the density is counted on,
+        // and a row dropped here is not gathered either.
+        if scan.resolver.is_some() {
             return pending;
         }
         let matchers: Vec<Option<(RowMatcher<'_>, &Column)>> = self

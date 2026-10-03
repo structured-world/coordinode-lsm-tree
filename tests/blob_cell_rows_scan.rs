@@ -469,6 +469,52 @@ fn the_payload_of_rows_the_predicate_drops_is_not_read() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// Rows the predicate keeps all at the start of a table turn the scan to
+/// reading the note with the rest, and the long run of rows it drops after
+/// them turns it back: most of the notes are never read.
+#[test]
+fn a_dense_start_does_not_keep_a_sparse_scan_reading_everything() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let (any, tree) = open_paged(folder.path())?;
+    let rows = 3_000u32;
+    for i in 0..rows {
+        insert(
+            &tree,
+            &format!("k{i:05}"),
+            b"s",
+            i,
+            &[b'n'; 200],
+            u64::from(i),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let m = any.metrics();
+    let metadata = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()));
+    rows_of_scan(&any, metadata, None)?;
+
+    let first_200 = ColumnRangePredicate {
+        column_id: PRICE,
+        lower: Some(0u32.to_be_bytes().to_vec()),
+        upper: Some(199u32.to_be_bytes().to_vec()),
+        apply: PredicateApply::Filter,
+    };
+    let notes = Projection::new()
+        .column(COL_USER_KEY)
+        .field(field(PRICE, u32_le()))
+        .field(field(BODY, TypeTag::Bytes));
+    let before = m.bytes_read();
+    assert_eq!(rows_of_scan(&any, notes, Some(&first_200))?.len(), 200);
+    let read = m.bytes_read() - before;
+    let all_notes = u64::from(rows) * 200;
+    assert!(
+        read * 2 < all_notes,
+        "{read} bytes read for 200 notes out of {all_notes} bytes of them"
+    );
+    Ok(())
+}
+
 /// A predicate keeping one row per page needs every page of the note: the
 /// scan reads it with the rest once it sees its choices are dense, and
 /// returns the same rows as one that reads every note.

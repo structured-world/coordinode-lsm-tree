@@ -602,6 +602,17 @@ fn verify_cells_scan(
             Absent::Error,
         )?);
     }
+    // A blob tree filters on a field it is told the type of: the predicate's
+    // field is declared too, and comes back beside the others.
+    if let Some(predicate) = predicate
+        && predicate.column_id != fixtures::CELL_GROUP
+    {
+        projection = projection.field(ProjectedField::new(
+            predicate.column_id,
+            fixtures::u64_be(),
+            Absent::Error,
+        )?);
+    }
     let mut check = lockstep(fixture, |v| selects(v.seed));
     for batch in fixture
         .tree
