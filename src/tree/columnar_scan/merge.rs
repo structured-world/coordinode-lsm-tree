@@ -703,7 +703,7 @@ impl MergeStream {
         let (merged, resolved) = if self.late == Late::No {
             (merged, Resolved::default())
         } else {
-            let (merged, resolved) = scan.read_late(merged)?;
+            let (merged, resolved) = scan.read_late(merged, early)?;
             // Every declared column now holds its declared type: read out of
             // a value, or conformed when its source was loaded.
             let (merged, mistyped) = conform_lenient(merged, &scan.fields, self.predicate_column)?;
@@ -952,12 +952,22 @@ impl MergeStream {
         } else {
             PredicateTiming::AfterValues
         };
+        // Whether every row has its final verdict before the values are read,
+        // so the predicate is not run over the returned rows again.
+        let mut early = timing == PredicateTiming::BeforeValues;
         let pending = match timing {
             PredicateTiming::BeforeValues => self.judge(scan, pending, None, &layout, support)?,
             PredicateTiming::BeforeValuesExceptOperands => {
                 self.judge(scan, pending, Some(&types), &layout, support)?
             }
-            PredicateTiming::AfterValues if layout.judged => self.prejudge(scan, pending),
+            PredicateTiming::AfterValues if layout.judged => {
+                let (pending, settled) = self.prejudge(scan, pending);
+                if settled && let Some(pred) = scan.predicate.as_ref() {
+                    *support = (*support).min(pred.support(layout.type_of(pred.column_id)));
+                    early = true;
+                }
+                pending
+            }
             PredicateTiming::AfterValues => pending,
         };
         if pending.is_empty() {
@@ -975,7 +985,6 @@ impl MergeStream {
         // them yet: only now is their payload read, from their row pages.
         self.fill_late(scan, &pending)?;
         scan.record_payload(self.late_useful(&pending)?, 0);
-        let early = timing == PredicateTiming::BeforeValues;
         // The columns the merge decoded for itself leave the output once its
         // rows are decided. Read again after the gather only to read the
         // values, to bring back a column left out, to check a row taken from
@@ -1006,22 +1015,23 @@ impl MergeStream {
     /// stores the predicate's field as a column of its declared type, with a
     /// cell for the row, holds there the value its field reads as, so the
     /// predicate's verdict on that cell is final. Every other row is kept,
-    /// for the predicate to judge once its value is read; the predicate runs
-    /// over every row again then, so what it drops here it drops anyway.
-    fn prejudge(&self, scan: &ColumnarScan, pending: Vec<Pick>) -> Vec<Pick> {
+    /// for the predicate to judge once its value is read. Also returns
+    /// whether every row got its final verdict here, in which case the
+    /// predicate has nothing left to judge after the values.
+    fn prejudge(&self, scan: &ColumnarScan, pending: Vec<Pick>) -> (Vec<Pick>, bool) {
         let Some(pred) = scan
             .predicate
             .as_ref()
             .filter(|p| p.apply == PredicateApply::Filter)
         else {
-            return pending;
+            return (pending, false);
         };
         // An operand reads as the value it resolves to, not as its own cells.
         // Otherwise the rows are judged here whether or not their payload is
         // read late: what survives is also what the density is counted on,
         // and a row dropped here is not gathered either.
         if scan.resolver.is_some() {
-            return pending;
+            return (pending, false);
         }
         let matchers: Vec<Option<(RowMatcher<'_>, &Column)>> = self
             .sources
@@ -1038,17 +1048,18 @@ impl MergeStream {
                 Some((pred.matcher(batch), column))
             })
             .collect();
-        pending
-            .into_iter()
-            .filter(
-                |pick| match matchers.get(pick.source).and_then(Option::as_ref) {
-                    Some((matcher, column)) if column.is_valid(pick.row) => {
-                        matcher.matches(pick.row)
-                    }
-                    _ => true,
-                },
-            )
-            .collect()
+        let mut pending = pending;
+        let mut settled = true;
+        pending.retain(
+            |pick| match matchers.get(pick.source).and_then(Option::as_ref) {
+                Some((matcher, column)) if column.is_valid(pick.row) => matcher.matches(pick.row),
+                _ => {
+                    settled = false;
+                    true
+                }
+            },
+        );
+        (pending, settled)
     }
 
     /// The bytes of the cells the rows of `pending` take from payload read

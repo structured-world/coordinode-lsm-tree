@@ -64,7 +64,8 @@ struct Rows {
 /// read first. Rows the scan's predicate rejects on a declared field are
 /// dropped before any object of another field is read. The row's value type
 /// reads as a value, the form every read gives it, and the columns the scan
-/// carried the values in leave the batch.
+/// carried the values in leave the batch. `judged` says every row already
+/// has its final verdict on the predicate, which is then not run again.
 ///
 /// # Errors
 ///
@@ -76,6 +77,7 @@ pub(super) fn materialize(
     scan: &ColumnarScan,
     cells: &CellSource,
     batch: ColumnBatch,
+    judged: bool,
 ) -> crate::Result<ColumnBatch> {
     let declared: Vec<ProjectedField> = scan
         .fields
@@ -83,11 +85,12 @@ pub(super) fn materialize(
         .filter(|f| projection::is_declared(f))
         .cloned()
         .collect();
-    // The predicate's field, when it is a declared one: read before the rest.
+    // The predicate's field, when it is a declared one still to be judged:
+    // read before the rest.
     let judged = scan
         .predicate
         .as_ref()
-        .filter(|p| p.apply == PredicateApply::Filter)
+        .filter(|p| !judged && p.apply == PredicateApply::Filter)
         .and_then(|p| declared.iter().position(|f| f.column_id() == p.column_id));
 
     let row_count = batch.row_count as usize;

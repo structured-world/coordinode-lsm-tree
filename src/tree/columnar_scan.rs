@@ -1183,11 +1183,16 @@ impl ColumnarScan {
     /// value column dropped. Only returned rows get here, so a shadowed,
     /// deleted or invisible version is never resolved or projected. Also
     /// returns which keys were resolved to a value: such a row holds no cell
-    /// of its own for a column no field declares.
-    pub(super) fn read_late(&self, batch: ColumnBatch) -> crate::Result<(ColumnBatch, Resolved)> {
+    /// of its own for a column no field declares. `judged` says the merge
+    /// already gave every row its final verdict on the predicate.
+    pub(super) fn read_late(
+        &self,
+        batch: ColumnBatch,
+        judged: bool,
+    ) -> crate::Result<(ColumnBatch, Resolved)> {
         let (batch, resolved) = self.resolve_operands(batch)?;
         if let Some(cells) = &self.cells {
-            return Ok((cells::materialize(self, cells, batch)?, resolved));
+            return Ok((cells::materialize(self, cells, batch, judged)?, resolved));
         }
         let mut batch = if self.declared {
             projection::project_decided(
