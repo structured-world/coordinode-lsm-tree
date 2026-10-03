@@ -303,26 +303,27 @@ pub(crate) fn logical_len(row: &[u8]) -> crate::Result<u32> {
     Ok(len)
 }
 
-/// Moves every value cell of `row` at or above `threshold` bytes into a blob
-/// file through `write`, which stores the bytes and returns their handle, and
-/// returns the row with those cells replaced by owning references; `None`
-/// when no cell reaches the threshold and the row stays as it is.
+/// Moves every value cell of `row` at or above its position's `threshold`
+/// into a blob file through `write`, which stores the bytes and returns their
+/// handle, and returns the row with those cells replaced by owning
+/// references; `None` when no cell reaches its threshold and the row stays as
+/// it is.
 ///
 /// # Errors
 ///
 /// Returns an error if the row is malformed or `write` fails.
 pub(crate) fn separate_row(
     row: &[u8],
-    threshold: u32,
+    threshold: impl Fn(usize) -> u32,
     mut write: impl FnMut(&[u8]) -> crate::Result<crate::vlog::ValueHandle>,
 ) -> crate::Result<Option<Vec<u8>>> {
     let mut cells = decode_row(row)?;
     let mut separated = false;
-    for cell in &mut cells {
+    for (position, cell) in cells.iter_mut().enumerate() {
         if let RowCell::Value(bytes) = *cell {
             // A cell is at most `u32::MAX` bytes, the row encoding's limit.
             let size = u32::try_from(bytes.len()).map_err(|_| CORRUPT)?;
-            if size >= threshold {
+            if size >= threshold(position) {
                 *cell = RowCell::Ref {
                     indirection: BlobIndirection {
                         vhandle: write(bytes)?,

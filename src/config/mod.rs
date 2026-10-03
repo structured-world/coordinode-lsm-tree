@@ -278,6 +278,12 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub separation_threshold: u32,
 
+    /// Separation thresholds of the cells of rows written as cells, by cell
+    /// position; a position past the end uses `separation_threshold`. See
+    /// [`Self::cell_separation_thresholds`].
+    #[doc(hidden)]
+    pub cell_separation_thresholds: alloc::vec::Vec<u32>,
+
     #[doc(hidden)]
     pub staleness_threshold: f32,
 
@@ -321,6 +327,7 @@ impl Default for KvSeparationOptions {
         Self {
             file_target_size: /* 64 MiB */ 64 * 1_024 * 1_024,
             separation_threshold: /* 1 KiB */ 1_024,
+            cell_separation_thresholds: alloc::vec::Vec::new(),
 
             staleness_threshold: 0.25,
             age_cutoff: 0.25,
@@ -361,6 +368,40 @@ impl KvSeparationOptions {
     pub fn separation_threshold(mut self, bytes: u32) -> Self {
         self.separation_threshold = bytes;
         self
+    }
+
+    /// Sets the separation threshold of each cell position of rows written as
+    /// cells (see [`BlobTree::insert_cells`](crate::BlobTree::insert_cells)):
+    /// a value cell at position `i` goes to a blob file when it is at least
+    /// `thresholds[i]` bytes. Positions past the end use
+    /// [`Self::separation_threshold`].
+    ///
+    /// A field that is always read with the row's compact attributes can stay
+    /// inline whatever its size (`u32::MAX`), and a field that is rarely read
+    /// can go to a blob file however small (`0`). Defaults to none: every cell
+    /// uses the tree's threshold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::KvSeparationOptions;
+    ///
+    /// // A status cell never separates; a body cell separates from 256 bytes.
+    /// let opts = KvSeparationOptions::default().cell_separation_thresholds(vec![u32::MAX, 256]);
+    /// ```
+    #[must_use]
+    pub fn cell_separation_thresholds(mut self, thresholds: alloc::vec::Vec<u32>) -> Self {
+        self.cell_separation_thresholds = thresholds;
+        self
+    }
+
+    /// The separation threshold of the cell at `position`.
+    #[must_use]
+    pub(crate) fn cell_threshold(&self, position: usize) -> u32 {
+        self.cell_separation_thresholds
+            .get(position)
+            .copied()
+            .unwrap_or(self.separation_threshold)
     }
 
     /// Sets how many upcoming values a scan reads ahead in one batch.

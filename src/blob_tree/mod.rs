@@ -416,8 +416,11 @@ impl BlobTree {
     /// little-endian `u32` length and its bytes, with every
     /// [`Cell::Ref`](field_row::Cell::Ref) replaced by its object: the framing
     /// the columnar format gives a row of byte cells. A
-    /// [`Cell::Value`](field_row::Cell::Value) at or above the separation
-    /// threshold is stored in a blob file when the row is flushed.
+    /// [`Cell::Value`](field_row::Cell::Value) at or above its position's
+    /// threshold
+    /// ([`KvSeparationOptions::cell_separation_thresholds`](crate::KvSeparationOptions::cell_separation_thresholds),
+    /// else the tree's separation threshold) is stored in a blob file when the
+    /// row is flushed.
     ///
     /// A [`Cell::Ref`](field_row::Cell::Ref) keeps an object the key already holds without
     /// rewriting it, which is how a metadata-only update leaves a large field
@@ -1520,9 +1523,11 @@ impl AbstractTree for BlobTree {
             if item.key.value_type.is_cell_row() {
                 // Each cell is weighed on its own: the large ones go to the
                 // blob file and the row keeps owning references to them.
-                let row = field_row::separate_row(&value, separation_threshold, |bytes| {
-                    blob_writer.write(&item.key.user_key, item.key.seqno, bytes)
-                })?
+                let row = field_row::separate_row(
+                    &value,
+                    |position| kv_opts.cell_threshold(position),
+                    |bytes| blob_writer.write(&item.key.user_key, item.key.seqno, bytes),
+                )?
                 .map_or(value, UserValue::from);
                 table_writer.write(InternalValue::new(item.key, row.clone()))?;
                 table_writer.register_cell_row(&row)?;

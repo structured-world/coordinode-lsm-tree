@@ -22,6 +22,9 @@ pub struct BlobIngestion<'a> {
     pub(crate) blob: BlobFileWriter,
     seqno: SeqNo,
     separation_threshold: u32,
+    /// Separation thresholds of a cell row's cells, by position; see
+    /// [`KvSeparationOptions::cell_separation_thresholds`](crate::KvSeparationOptions::cell_separation_thresholds).
+    cell_thresholds: Vec<u32>,
     last_key: Option<UserKey>,
 }
 
@@ -77,6 +80,7 @@ impl<'a> BlobIngestion<'a> {
         };
 
         let separation_threshold = kv.separation_threshold;
+        let cell_thresholds = kv.cell_separation_thresholds.clone();
 
         Ok(Self {
             tree,
@@ -84,6 +88,7 @@ impl<'a> BlobIngestion<'a> {
             blob,
             seqno: 0,
             separation_threshold,
+            cell_thresholds,
             last_key: None,
         })
     }
@@ -151,9 +156,13 @@ impl<'a> BlobIngestion<'a> {
         }
 
         let row = encode_row(&cells.iter().map(|c| RowCell::Value(c)).collect::<Vec<_>>())?;
-        let row = separate_row(&row, self.separation_threshold, |bytes| {
-            self.blob.write(&key, self.seqno, bytes)
-        })?
+        let (thresholds, default) = (&self.cell_thresholds, self.separation_threshold);
+        let (blob, seqno) = (&mut self.blob, self.seqno);
+        let row = separate_row(
+            &row,
+            |position| thresholds.get(position).copied().unwrap_or(default),
+            |bytes| blob.write(&key, seqno, bytes),
+        )?
         .unwrap_or(row);
 
         let cloned_key = key.clone();

@@ -506,6 +506,49 @@ fn per_field_references_keep_the_locality_accounting() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Each cell position separates at its own threshold: a large field kept
+/// with the compact attributes stays inline, a small rarely read one goes to
+/// a blob file, and a position without its own threshold uses the tree's.
+#[test]
+fn each_cell_position_separates_at_its_own_threshold() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default().cell_separation_thresholds(vec![u32::MAX, 0]),
+    )?;
+    let large = vec![b'l'; 4_096];
+    tree.insert_cells(
+        "doc",
+        &[
+            Cell::Value(&large),
+            Cell::Value(b"tiny"),
+            Cell::Value(&large),
+        ],
+        0,
+    )?;
+    tree.flush_active_memtable(0)?;
+
+    let row = tree.get_cells("doc", SeqNo::MAX)?.expect("row exists");
+    let cells = row.cells()?;
+    assert!(
+        matches!(cells[0], Cell::Value(_)),
+        "position 0 never separates"
+    );
+    assert!(
+        matches!(cells[1], Cell::Ref(_)),
+        "position 1 always separates"
+    );
+    assert!(
+        matches!(cells[2], Cell::Ref(_)),
+        "position 2 uses the tree's threshold"
+    );
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[&large, b"tiny", &large])[..])
+    );
+    Ok(())
+}
+
 /// Ingestion separates each heavy cell on its own, as a flush does.
 #[test]
 fn ingested_cells_separate_per_cell() -> lsm_tree::Result<()> {
