@@ -25,7 +25,9 @@ case "$body" in
 esac
 json="${body#"$prefix"}"
 
-# `--slurpfile` wraps the file's array in one more array.
+# `--slurpfile` wraps the file's array in one more array. The `$` names are
+# jq's own variables, which the shell must not expand.
+# shellcheck disable=SC2016
 retired='def retired($suite; $name):
   any($rules[0][]; . as $r | ($suite | test($r.suite)) and ($name | test($r.series)));'
 
