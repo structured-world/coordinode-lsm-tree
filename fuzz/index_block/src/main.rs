@@ -157,8 +157,10 @@ fn main() {
                 std::mem::swap(&mut lo, &mut hi);
             }
 
-            // Seeking lands on the first entry of an end key and seeking upper
-            // on its last, so widen the model range to whole keys.
+            // `seek` lands on the first entry ending at its key. `seek_upper`
+            // ends the walk at the first entry past its key: every block that
+            // may hold a key up to the bound, including the one its older
+            // versions may run on into.
             let lo_key = items[lo].end_key().clone();
             let hi_key = items[hi].end_key().clone();
             let lo = items
@@ -167,8 +169,8 @@ fn main() {
                 .expect("lo key present");
             let hi = items
                 .iter()
-                .rposition(|it| *it.end_key() == hi_key)
-                .expect("hi key present");
+                .position(|it| *it.end_key() > hi_key)
+                .unwrap_or(items.len() - 1);
 
             let mut iter = index_block.iter(comparator.clone());
             assert!(iter.seek(&lo_key, SeqNo::MAX), "should seek");
