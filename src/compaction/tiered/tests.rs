@@ -24,6 +24,195 @@ fn flush_overlapping(
     Ok(())
 }
 
+/// Flushes one run spanning "a".."z" with `keys` incompressible values, so its
+/// size grows with `keys` and it overlaps every other run.
+fn flush_sized_run(tree: &impl AbstractTree, keys: u16, seqno: u64) -> crate::Result<()> {
+    tree.insert("a", "v", seqno);
+    for k in 0..keys {
+        let key = [b"m".as_slice(), &k.to_be_bytes()].concat();
+        let noise = u64::from(k)
+            .wrapping_add(seqno << 16)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        tree.insert(
+            key,
+            format!("{noise:016x}{:016x}", noise.rotate_left(17)),
+            seqno,
+        );
+    }
+    tree.insert("z", "v", seqno);
+    tree.flush_active_memtable(seqno)
+}
+
+/// On-disk size of each L0 run, newest first.
+fn l0_run_sizes(tree: &crate::AnyTree) -> Vec<u64> {
+    tree.current_version()
+        .l0()
+        .iter()
+        .map(|run| run.iter().map(Table::file_size).sum())
+        .collect()
+}
+
+/// L0 run order is recency order: every run holds only data older than the
+/// runs in front of it (all runs here overlap).
+fn assert_l0_in_recency_order(tree: &crate::AnyTree) {
+    let highest: Vec<u64> = tree
+        .current_version()
+        .l0()
+        .iter()
+        .map(|run| {
+            run.iter()
+                .map(Table::get_highest_seqno)
+                .max()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert!(
+        highest.windows(2).all(|w| w.first() > w.get(1)),
+        "L0 runs out of recency order (highest seqno per run, front to back): {highest:?}"
+    );
+}
+
+/// Two small runs separated in age by a large one are not merged around it:
+/// the merged run would hold data both newer and older than the large run.
+#[test]
+fn stcs_does_not_merge_runs_around_a_differently_sized_one() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    flush_sized_run(&tree, 1, 0)?;
+    flush_sized_run(&tree, 2_000, 1)?;
+    flush_sized_run(&tree, 1, 2)?;
+
+    let sizes = l0_run_sizes(&tree);
+    let (Some(&newest), Some(&middle), Some(&oldest)) = (sizes.first(), sizes.get(1), sizes.get(2))
+    else {
+        panic!("expected three L0 runs, got {sizes:?}");
+    };
+    assert!(
+        middle > 4 * newest.max(oldest),
+        "the middle run must be far larger than its neighbours: {sizes:?}"
+    );
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_size_ratio(0.5)
+            .with_min_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 3)?;
+
+    assert_eq!(3, tree.table_count(), "no run pair is adjacent and similar");
+    assert_l0_in_recency_order(&tree);
+    Ok(())
+}
+
+/// A run held by a running compaction between two available runs splits
+/// them: neither rule merges the two around it.
+#[test]
+fn stcs_does_not_merge_around_a_busy_run() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    flush_overlapping(&tree, 3, 0)?;
+
+    let version = tree.current_version();
+    let middle: Vec<TableId> = version
+        .l0()
+        .iter()
+        .nth(1)
+        .map(|run| run.iter().map(Table::id).collect())
+        .unwrap_or_default();
+    assert!(!middle.is_empty(), "expected three L0 runs");
+    let mut state = CompactionState::default();
+    state.hidden_set_mut().hide(middle);
+
+    let size_ratio = Strategy::default()
+        .with_min_merge_width(2)
+        .with_max_space_amplification_percent(u64::MAX);
+    assert!(
+        matches!(
+            size_ratio.choose(&version, &Config::default(), &state),
+            Choice::DoNothing
+        ),
+        "the size-ratio rule must not merge across the busy run"
+    );
+
+    let space_amp = Strategy::default()
+        .with_min_merge_width(100)
+        .with_max_space_amplification_percent(0);
+    assert!(
+        matches!(
+            space_amp.choose(&version, &Config::default(), &state),
+            Choice::DoNothing
+        ),
+        "the space-amplification rule must wait for the busy run"
+    );
+    Ok(())
+}
+
+/// A merge of the newest runs lands in front of the older runs it did not
+/// take, not behind them.
+#[test]
+fn stcs_merged_run_takes_the_slot_of_its_inputs() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    flush_overlapping(&tree, 4, 0)?;
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_min_merge_width(2)
+            .with_max_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 4)?;
+
+    assert_eq!(3, tree.l0_run_count());
+    assert_l0_in_recency_order(&tree);
+    Ok(())
+}
+
+/// Flushes of mixed sizes interleaved with merges keep L0 in recency order
+/// after every merge.
+#[test]
+fn stcs_l0_stays_in_recency_order_across_merges() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_min_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+
+    let sizes = [1u16, 300, 2, 2, 600, 1, 40, 40, 1, 900, 3, 3, 3, 150, 1];
+    let mut seqno = 0u64;
+    for keys in sizes {
+        flush_sized_run(&tree, keys, seqno)?;
+        seqno += 1;
+        tree.compact(strategy.clone(), seqno)?;
+        assert_l0_in_recency_order(&tree);
+    }
+    Ok(())
+}
+
 #[test]
 fn stcs_empty_levels() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -172,7 +361,7 @@ fn stcs_max_merge_width_cap() -> crate::Result<()> {
     );
     tree.compact(strategy, 8)?;
 
-    // 8 runs -> merge 3 smallest into 1 -> 6 runs total
+    // 8 runs -> merge the 3 newest into 1 -> 6 runs total
     // (8 - 3 + 1 = 6)
     assert_eq!(6, tree.table_count());
 
@@ -355,7 +544,7 @@ fn stcs_max_merge_width_less_than_min_no_merge() -> crate::Result<()> {
     assert_eq!(4, tree.table_count());
 
     // Configure max_merge_width=2 but min_merge_width=4.
-    // prefix_len might be >= 4 (min), but merge_count = min(prefix, 2) = 2 < 4 (min).
+    // The similar stretch is 4 long (min), but merge_count = min(4, 2) = 2 < 4 (min).
     // Guard should prevent merge.
     let strategy = Arc::new(
         Strategy::default()

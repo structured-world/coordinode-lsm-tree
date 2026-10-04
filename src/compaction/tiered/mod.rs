@@ -4,7 +4,7 @@
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
-    HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
+    KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
     version::Version,
 };
 #[cfg(not(feature = "std"))]
@@ -27,14 +27,19 @@ pub const NAME: &str = "SizeTieredCompaction";
 ///
 /// # Algorithm
 ///
+/// Only runs that are contiguous in L0 order (newest to oldest) are merged
+/// together, so the merged run is older than every run in front of it and
+/// newer than every run behind it.
+///
 /// 1. **Space amplification check:** if `total_size / largest_run_size - 1`
 ///    exceeds [`max_space_amplification_percent`](Strategy::with_max_space_amplification_percent),
-///    all runs are merged (full compaction).
-/// 2. **Size-ratio merge:** runs are sorted by size (smallest first). The
-///    longest prefix where each consecutive pair satisfies
-///    `next.size / prev.size <= 1.0 + size_ratio` is selected. If the prefix
-///    length ≥ [`min_merge_width`](Strategy::with_min_merge_width), those runs
-///    are merged.
+///    all runs are merged (full compaction). While a compaction holds a run
+///    between two others, this waits for it to land.
+/// 2. **Size-ratio merge:** walking L0 from the newest run, the first stretch
+///    of consecutive runs where each neighbouring pair satisfies
+///    `larger / smaller <= 1.0 + size_ratio` and that is at least
+///    [`min_merge_width`](Strategy::with_min_merge_width) long is merged (its
+///    newest [`max_merge_width`](Strategy::with_max_merge_width) runs).
 ///
 /// # Trade-offs vs Leveled
 ///
@@ -165,13 +170,13 @@ struct RunInfo {
     table_ids: Vec<TableId>,
 }
 
-/// Collects run information from L0, filtering out runs with hidden tables.
-fn collect_available_runs(version: &Version, state: &CompactionState) -> Vec<RunInfo> {
-    let l0 = version.l0();
-
-    l0.iter()
-        .filter_map(|run| {
-            // Skip runs that have any table in the hidden set (being compacted)
+/// Collects L0 runs in L0 order (newest first), `None` for a run with a
+/// table in the hidden set (being compacted).
+fn collect_runs(version: &Version, state: &CompactionState) -> Vec<Option<RunInfo>> {
+    version
+        .l0()
+        .iter()
+        .map(|run| {
             if run
                 .iter()
                 .any(|table| state.hidden_set().is_hidden(table.id()))
@@ -185,6 +190,34 @@ fn collect_available_runs(version: &Version, state: &CompactionState) -> Vec<Run
             Some(RunInfo { size, table_ids })
         })
         .collect()
+}
+
+/// Whether two runs neighbouring in L0 are close enough in size to merge.
+fn similar(a: &RunInfo, b: &RunInfo, size_ratio: f64) -> bool {
+    let (smaller, larger) = if a.size <= b.size {
+        (a.size, b.size)
+    } else {
+        (b.size, a.size)
+    };
+    if smaller == 0 {
+        // A zero-size run is similar to anything.
+        return true;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for ratio comparison"
+    )]
+    let ratio = larger as f64 / smaller as f64;
+    ratio <= 1.0 + size_ratio
+}
+
+fn merge_runs<'a>(runs: impl Iterator<Item = &'a RunInfo>, target_size: u64) -> Choice {
+    Choice::Merge(CompactionInput {
+        table_ids: runs.flat_map(|r| r.table_ids.iter().copied()).collect(),
+        dest_level: 0,
+        canonical_level: 0,
+        target_size,
+    })
 }
 
 impl CompactionStrategy for Strategy {
@@ -268,11 +301,23 @@ impl CompactionStrategy for Strategy {
     }
 
     fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
-        let runs = collect_available_runs(version, state);
+        let all_runs = collect_runs(version, state);
+        let runs: Vec<&RunInfo> = all_runs.iter().flatten().collect();
 
         if runs.len() < 2 {
             return Choice::DoNothing;
         }
+
+        // The available runs are contiguous unless a busy run sits between two
+        // of them.
+        let first_available = all_runs.iter().position(Option::is_some);
+        let last_available = all_runs.iter().rposition(Option::is_some);
+        let available_contiguous = match (first_available, last_available) {
+            (Some(first), Some(last)) => all_runs
+                .get(first..=last)
+                .is_some_and(|span| span.iter().all(Option::is_some)),
+            _ => false,
+        };
 
         // --- Space amplification check ---
         //
@@ -281,7 +326,9 @@ impl CompactionStrategy for Strategy {
         let total_size: u64 = runs.iter().map(|r| r.size).sum();
         let largest_run_size = runs.iter().map(|r| r.size).max().unwrap_or(0);
 
-        if largest_run_size > 0 {
+        // A busy run between available ones would split the merge into two
+        // ranges of different age; wait for that compaction to land instead.
+        if largest_run_size > 0 && available_contiguous {
             // Integer arithmetic to avoid f64 precision loss on large sizes.
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
@@ -299,73 +346,46 @@ impl CompactionStrategy for Strategy {
                 .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
 
             if lhs >= rhs {
-                let table_ids: HashSet<TableId> = runs
-                    .iter()
-                    .flat_map(|r| r.table_ids.iter().copied())
-                    .collect();
-
-                return Choice::Merge(CompactionInput {
-                    table_ids,
-                    dest_level: 0,
-                    canonical_level: 0,
-                    target_size: self.target_size,
-                });
+                return merge_runs(runs.iter().copied(), self.target_size);
             }
         }
 
         // --- Size-ratio triggered merge ---
         //
-        // Sort runs by size (smallest first), then find the longest prefix
-        // where adjacent runs have similar sizes.
-        let mut sorted_runs = runs;
-        sorted_runs.sort_by(|a, b| a.size.cmp(&b.size));
-
-        let mut prefix_len = 1;
-
-        for window in sorted_runs.windows(2) {
-            // NOTE: windows(2) guarantees exactly 2 elements
-            let (Some(smaller), Some(larger)) = (window.first(), window.get(1)) else {
-                unreachable!("windows(2) always yields slices of length 2");
-            };
-
-            if smaller.size == 0 {
-                // Zero-size run: always "similar" to the next
-                prefix_len += 1;
+        // Walk L0 from the newest run and take the first stretch of
+        // consecutive available runs whose neighbours have similar sizes, as
+        // `RocksDB` universal compaction picks from its newest sorted run
+        // (`UniversalCompactionBuilder::PickCompactionToReduceSortedRuns`).
+        // Merging by size alone could join runs around a differently sized one
+        // between them in age.
+        // Cap at max_merge_width, but still meet min_merge_width (guards
+        // against a misconfigured max < min).
+        let merge_count_for = |stretch: usize| {
+            let count = stretch.min(self.max_merge_width);
+            (count >= self.min_merge_width).then_some(count)
+        };
+        let mut start = 0;
+        while start < all_runs.len() {
+            let Some(Some(first)) = all_runs.get(start) else {
+                start += 1;
                 continue;
+            };
+            let mut prev = first;
+            let mut len = 1;
+            while let Some(Some(next)) = all_runs.get(start + len) {
+                if !similar(prev, next, self.size_ratio) {
+                    break;
+                }
+                prev = next;
+                len += 1;
             }
-
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "precision loss is acceptable for ratio comparison"
-            )]
-            let ratio = larger.size as f64 / smaller.size as f64;
-
-            if ratio <= 1.0 + self.size_ratio {
-                prefix_len += 1;
-            } else {
-                break;
+            if let Some(count) = merge_count_for(len) {
+                return merge_runs(
+                    all_runs.iter().skip(start).take(count).flatten(),
+                    self.target_size,
+                );
             }
-        }
-
-        if prefix_len >= self.min_merge_width {
-            // Cap at max_merge_width, but ensure we still meet min_merge_width
-            // (guards against misconfigured max < min)
-            let merge_count = prefix_len.min(self.max_merge_width);
-
-            if merge_count >= self.min_merge_width {
-                let table_ids: HashSet<TableId> = sorted_runs
-                    .iter()
-                    .take(merge_count)
-                    .flat_map(|r| r.table_ids.iter().copied())
-                    .collect();
-
-                return Choice::Merge(CompactionInput {
-                    table_ids,
-                    dest_level: 0,
-                    canonical_level: 0,
-                    target_size: self.target_size,
-                });
-            }
+            start += len;
         }
 
         Choice::DoNothing
