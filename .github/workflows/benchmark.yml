@@ -7,22 +7,23 @@
 name: Benchmark
 
 on:
-  # Auto-triggered ONLY on merges/pushes to main; also runnable
-  # manually from any branch via workflow_dispatch (see below).
+  # Auto-triggered ONLY on merges/pushes to this maintained line's branch,
+  # 5.x.x (main runs its own copy of this workflow for the 6.0 line); also
+  # runnable manually from any branch via workflow_dispatch (see below).
   # `pull_request` is deliberately omitted: the self-hosted bench
   # host is shared with future cross-engine benches (issue #244)
   # and other perf workloads — every PR pushing a commit would
   # queue behind the host's serial concurrency group and hold up
   # every subsequent PR, even when the change can't affect the
   # bench (CI, docs, comment-only fixes). Restricting the
-  # AUTO-trigger to main keeps the bench timeline a clean "one
-  # entry per merged change" series, which is what the gh-pages
+  # AUTO-trigger to the line's branch keeps the bench timeline a clean
+  # "one entry per merged change" series, which is what the gh-pages
   # dashboard is meant to show. Manual runs through
-  # workflow_dispatch don't update the dashboard's main-branch
-  # series (auto-push gating below is push+main only), so they
-  # can't contaminate the trend.
+  # workflow_dispatch don't update the dashboard's series (auto-push
+  # gating below is push to 5.x.x only), so they can't contaminate the
+  # trend.
   push:
-    branches: [main]
+    branches: [5.x.x]
   # Manual dispatch from any branch when a contributor explicitly
   # wants to measure their PR against main before merging.
   # workflow_dispatch requires actions:write on the repo, so only
@@ -403,16 +404,16 @@ jobs:
           # store, not the commit measured, and has failed outright on a
           # branch named with `#` ("No commit found for SHA").
           ref: ${{ github.sha }}
-          # The dashboard series is the history of main, so only a push to
-          # main extends it. A manual dispatch measures a branch and is
-          # compared against that series without joining it.
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # The line's dashboard series is the history of 5.x.x, so only a
+          # push to 5.x.x extends it. A manual dispatch measures a branch and
+          # is compared against that series without joining it.
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/5.x.x' }}
           # Comment the comparison on the commit that regressed.
           comment-on-alert: true
           alert-comment-cc-users: "@polaz"
           # A run 15% below the series is flagged. Advisory, not a gate:
-          # neither trigger sits on the merge path. The push runs on main
-          # once the change has landed, so failing it reddens main after the
+          # neither trigger sits on the merge path. The push runs on 5.x.x
+          # once the change has landed, so failing it reddens 5.x.x after the
           # fact without stopping anything; the dispatch is opt-in and
           # maintainer-only, so no PR is required to have one and failing it
           # would turn a voluntary measurement into a red X. Gating would
@@ -421,7 +422,7 @@ jobs:
           # would be dead config while nothing fails the job.
           alert-threshold: "115%"
           fail-on-alert: false
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/5.x.x' }}
           benchmark-data-dir-path: dev/bench
 
       # Publish the head-to-head under dev/compare, alongside the db_bench
@@ -431,21 +432,15 @@ jobs:
       # keeps the workflow's "every `uses:` pinned to a SHA" hardening policy
       # intact, with the App-scoped token the store uses.
       - name: Publish the compare-rocksdb page to gh-pages
-        # Publish on main pushes AND on manual workflow_dispatch. The page is a
-        # ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
-        # per-commit trend that dev/bench is — so a manual dispatch refreshing it
-        # can't contaminate any time series. This lets a maintainer populate the
-        # page on demand (e.g. right after a runner fix) without waiting for
-        # the next merge to main. The db_bench trend (benchmark-action auto-push /
-        # save-data above) stays push+main only.
+        # The page is one snapshot for both lines (dev/compare is replaced
+        # wholesale each run), and each push to main refreshes it with the 6.0
+        # line, so a push to 5.x.x does not overwrite it. A manual dispatch from
+        # this line publishes it on demand, naming the line it measured.
         if: >
           !cancelled() &&
           steps.compare.outcome == 'success' &&
           steps.bot-token.outputs.token != '' &&
-          (
-            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-            github.event_name == 'workflow_dispatch'
-          )
+          github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}

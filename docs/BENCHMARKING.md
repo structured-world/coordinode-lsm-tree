@@ -139,8 +139,10 @@ with points of its own line measured on the same machine.
 commit, the version it will ship as, not the version already in `Cargo.toml`:
 that one moves only when the release PR merges. A manual dispatch from this
 branch is therefore compared against the `5.x` suites and writes nothing; only
-a push to the default branch extends a suite. The RocksDB head-to-head page
-(`dev/compare/`) is a snapshot replaced on every run and names the line, branch
+a push to `5.x.x` runs the benchmark on its own and extends the `5.x` suites,
+as a push to `main` does for the 6.0 line. The RocksDB head-to-head page
+(`dev/compare/`) is one snapshot for both lines, refreshed by every push to
+`main` and by a manual dispatch from either line, and names the line, branch
 and commit it measured.
 
 ## Checklist for format-changing PRs
