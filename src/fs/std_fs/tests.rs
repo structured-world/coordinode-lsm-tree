@@ -32,7 +32,7 @@ fn std_fs_remove_file_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
         drop(holder);
     });
     StdFs.remove_file(&path)?;
-    release.join().expect("holder thread");
+    assert!(release.join().is_ok(), "holder thread panicked");
     assert!(!path.exists(), "the file is gone once the hold ended");
     Ok(())
 }
@@ -54,7 +54,7 @@ fn std_fs_rename_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
         drop(holder);
     });
     StdFs.rename(&from, &to)?;
-    release.join().expect("holder thread");
+    assert!(release.join().is_ok(), "holder thread panicked");
     assert_eq!(std::fs::read(&to)?, b"new");
     Ok(())
 }
