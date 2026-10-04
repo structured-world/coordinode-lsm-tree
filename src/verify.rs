@@ -627,6 +627,13 @@ pub struct VerifyOptions {
     /// [`parallelism`](Self::parallelism) workers. Shared, so a caller can
     /// retune it live or draw it from the same budget as compaction. `None`
     /// (default) reads at full speed. Only a `std` build waits on it.
+    ///
+    /// The scan reports how long each charged read took, so a limiter with a
+    /// [`LatencyBackoff`](crate::rate_limiter::LatencyBackoff) backs the scan
+    /// off while the device is slow to answer. The backoff lowers what the
+    /// limiter grants to every holder: on a budget shared with compaction it
+    /// slows compaction too, so a scan that should back off alone gets a
+    /// limiter of its own.
     pub rate_limiter: Option<alloc::sync::Arc<RateLimiter>>,
 }
 
@@ -2522,6 +2529,12 @@ impl PacedFile<'_> {
         #[cfg(feature = "std")]
         use std::io::ErrorKind;
 
+        // The time the device takes to answer the charged read is what a
+        // latency backoff on the limiter steers by; the wait for the limiter
+        // itself is not part of it.
+        // no-std: a caller-provided monotonic clock passed to record_read_latency_at
+        #[cfg(feature = "std")]
+        let started = std::time::Instant::now();
         let mut read = 0;
         while read < charged {
             let Some(rest) = buf.get_mut(read..charged) else {
@@ -2546,6 +2559,10 @@ impl PacedFile<'_> {
             }
             read += got;
             self.pos += got as u64;
+        }
+        #[cfg(feature = "std")]
+        if let Some(limiter) = self.limiter {
+            limiter.record_read_latency(started.elapsed());
         }
         Ok(read)
     }
