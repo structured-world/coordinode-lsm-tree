@@ -306,9 +306,10 @@ impl<'a> BlobIngestion<'a> {
         // files created above, so they must share the same sequence number
         // for MVCC correctness.
         //
-        // We intentionally do NOT pin filter/index blocks here. Large ingests
-        // are typically placed in level 1, and pinning would increase memory
-        // pressure unnecessarily.
+        // The tables are installed as a new L0 run, so they pin their filter
+        // and index blocks by the L0 policy, as a flushed table does.
+        let pin_filter = index.config.filter_block_pinning_policy.get(0);
+        let pin_index = index.config.index_block_pinning_policy.get(0);
         let table_folder = &self.table.folder;
         let created_tables = results
             .into_iter()
@@ -323,6 +324,8 @@ impl<'a> BlobIngestion<'a> {
                 );
                 params.global_seqno = global_seqno;
                 params.tree_id = index.id;
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
                 params
                     .descriptor_table
                     .clone_from(&index.config.descriptor_table);
