@@ -55,6 +55,42 @@ pub fn optimize_runs<T: Clone + Ranged>(
     }
 }
 
+/// A table reduced to what placement looks at, for the fuzz adapter below.
+#[derive(Clone)]
+struct RangedId {
+    id: u64,
+    key_range: crate::KeyRange,
+}
+
+impl Ranged for RangedId {
+    fn key_range(&self) -> &crate::KeyRange {
+        &self.key_range
+    }
+}
+
+/// Runs `optimize_runs` over runs given newest first as `(id, key range)`
+/// lists under the bytewise comparator, returning the ids per output run.
+/// Exists for the `optimize_runs` fuzz target; production code calls
+/// `optimize_runs` directly. An input run that is empty is skipped.
+#[doc(hidden)]
+#[must_use]
+pub fn optimize_key_ranges(runs: Vec<Vec<(u64, crate::KeyRange)>>) -> Vec<Vec<u64>> {
+    let runs = runs
+        .into_iter()
+        .filter_map(|run| {
+            Run::new(
+                run.into_iter()
+                    .map(|(id, key_range)| RangedId { id, key_range })
+                    .collect(),
+            )
+        })
+        .collect();
+    optimize_runs(runs, &crate::comparator::DefaultUserComparator)
+        .iter()
+        .map(|run| run.iter().map(|table| table.id).collect())
+        .collect()
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests;

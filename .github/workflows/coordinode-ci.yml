@@ -213,10 +213,10 @@ jobs:
         # of them had drifted to the pre-2024 import order unnoticed.
         #
         # rustfmt is invoked on their sources directly rather than through
-        # `cargo fmt`: the tool crates carry their own `[workspace]` but the
-        # fuzz crates do not, so `cargo metadata` refuses to run inside them.
-        # rustfmt reads `.rustfmt.toml` by walking UP from each file, which is
-        # the same config the workspace gate uses.
+        # `cargo fmt` in each crate, so one command covers every excluded
+        # crate however many there are. rustfmt reads `.rustfmt.toml` by
+        # walking UP from each file, which is the same config the workspace
+        # gate uses.
         run: |
           set -euo pipefail
           cargo fmt --all -- --check

@@ -53,6 +53,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
+#[doc(hidden)]
+pub use optimize::optimize_key_ranges;
 use optimize::optimize_runs;
 use run::Ranged;
 
