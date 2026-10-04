@@ -4,8 +4,8 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::{
-    HashSet, KvPair, compaction::state::CompactionState, config::Config, time::unix_timestamp,
-    version::Version,
+    HashSet, KvPair, compaction::state::CompactionState, config::Config, table::Table,
+    time::unix_timestamp, version::Version,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -16,10 +16,11 @@ pub const NAME: &str = "FifoCompaction";
 /// FIFO-style compaction
 ///
 /// Limits the tree size to roughly `limit` bytes, deleting the oldest table(s)
-/// when the threshold is reached.
-///
-/// Will also merge tables if the number of tables in level 0 grows too much, which
-/// could cause write stalls.
+/// when the threshold is reached. Tables are dropped whole, oldest first by
+/// creation time, from whichever level they are in, so a tree that was
+/// major-compacted keeps its limit, and overlapping tables are fine: the
+/// older one goes first. Tables another compaction is working on are left
+/// for a later round.
 ///
 /// Additionally, a (lazy) TTL can be configured to drop old tables.
 ///
@@ -74,22 +75,18 @@ impl CompactionStrategy for Strategy {
     }
 
     fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
-        let first_level = version.l0();
-
         // Early return avoids unnecessary work and keeps FIFO a no-op when there is nothing to do.
-        if first_level.is_empty() {
+        if version.iter_tables().next().is_none() {
             return Choice::DoNothing;
         }
 
-        assert!(first_level.is_disjoint(), "L0 needs to be disjoint");
-
-        assert!(
-            !version.level_is_busy(0, state.hidden_set()),
-            "FIFO compaction never compacts",
-        );
-
-        // Account for both table file bytes and value-log (blob) bytes to enforce the true space limit.
-        let db_size = first_level.size() + version.blob_files.on_disk_size();
+        // Account for both table file bytes and value-log (blob) bytes to enforce the true space
+        // limit. A table another compaction holds still occupies its space, so it counts here,
+        // but only free tables can be dropped below.
+        // Summed on-disk sizes cannot overflow u64.
+        let db_size = version.iter_tables().map(Table::file_size).sum::<u64>()
+            + version.blob_files.on_disk_size();
+        let hidden = state.hidden_set();
 
         let mut ids_to_drop: HashSet<_> = HashSet::default();
 
@@ -109,7 +106,10 @@ impl CompactionStrategy for Strategy {
         let mut ttl_dropped_bytes = 0u64;
         let mut alive = Vec::new();
 
-        for table in first_level.iter().flat_map(|run| run.iter()) {
+        for table in version.iter_tables() {
+            if hidden.is_hidden(table.id()) {
+                continue;
+            }
             let expired =
                 ttl_cutoff.is_some_and(|cutoff| u128::from(table.metadata.created_at) <= cutoff);
 
