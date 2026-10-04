@@ -54,12 +54,16 @@ impl<'a> Arbitrary<'a> for FuzzyValue {
         let vtype = FuzzyValueType::arbitrary(u)?;
 
         let key = if key.is_empty() { vec![0] } else { key };
+        let vtype: ValueType = vtype.into();
+        // A table stores no value for a tombstone, so the model carries none.
+        let value = if vtype == ValueType::Tombstone {
+            Vec::new()
+        } else {
+            value
+        };
 
         Ok(Self(InternalValue::from_components(
-            key,
-            value,
-            seqno,
-            vtype.into(),
+            key, value, seqno, vtype,
         )))
     }
 }
