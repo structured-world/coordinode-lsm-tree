@@ -443,7 +443,7 @@ pub fn rewrite_atomic(
                     .and_then(|()| FsFile::sync_all_with(&*file, mode));
                 if let Err(e) = write_result {
                     drop(file);
-                    let _ = fs.remove_file(&candidate);
+                    remove_temp_or_log(fs, &candidate);
                     return Err(e);
                 }
                 break candidate;
@@ -457,12 +457,21 @@ pub fn rewrite_atomic(
     // std::fs::rename overwrites existing destinations on all platforms
     // (Rust uses MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows).
     if let Err(e) = fs.rename(&tmp_path, path) {
-        let _ = fs.remove_file(&tmp_path);
+        remove_temp_or_log(fs, &tmp_path);
         return Err(e);
     }
     fsync_directory(folder, fs, mode)?;
 
     Ok(())
+}
+
+/// Removes the temp file of a failed [`rewrite_atomic`]. The write's own error
+/// is what the caller sees; a temp that cannot be removed is only logged, and
+/// the next open sweeps it.
+fn remove_temp_or_log(fs: &dyn Fs, tmp: &Path) {
+    if let Err(e) = fs.remove_file(tmp) {
+        log::warn!("could not remove temp file {}: {e}", tmp.display());
+    }
 }
 
 /// Delegates directory sync to the backend.
