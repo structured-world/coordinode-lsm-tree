@@ -93,16 +93,19 @@ impl<'a> Iter<'a> {
         self.seek_with_cache_resets(needle, seqno, true, true)
     }
 
-    /// Full upper-bound re-seek: resets both front and back caches.
+    /// Upper-bound re-seek: positions the back of the walk at `needle`,
+    /// keeping where a preceding [`seek`](Self::seek) put the front.
     ///
-    /// For incremental bound adjustment that preserves a prior `seek_lower`'s
-    /// front cache, use `seek_upper_bound_cursor` instead.
+    /// The front is kept because `seek` holds its candidate in the front
+    /// cache after the decoder's low cursor has already moved past it:
+    /// clearing that cache would drop the candidate, and with it the whole
+    /// range when both seeks land on one entry.
     pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         // seek_upper_impl may return Err on a poisoned/clamped cursor;
         // the public bool-returning API treats that as "not found" for
         // backward compatibility — callers that need error propagation
         // should use seek_upper_bound_cursor instead.
-        self.seek_upper_impl(needle, true, true, true)
+        self.seek_upper_impl(needle, false, true, true)
             .unwrap_or(false)
     }
 

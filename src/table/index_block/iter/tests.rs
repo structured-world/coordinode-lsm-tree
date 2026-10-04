@@ -113,6 +113,54 @@ fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, Inde
     (handles, index)
 }
 
+/// The end keys a walk of `index` yields after `seek(lo)` then
+/// `seek_upper(hi)`, with what `seek_upper` returned.
+fn walk_between(index: &IndexBlock, lo: &[u8], hi: &[u8]) -> (bool, Vec<Vec<u8>>) {
+    let mut iter = index.iter(default_comparator());
+    assert!(iter.seek(lo, SeqNo::MAX), "seek lands");
+    let landed = iter.seek_upper(hi, SeqNo::MAX);
+    let keys = iter
+        .map(|item| item.materialize(index.as_slice()).end_key().to_vec())
+        .collect();
+    (landed, keys)
+}
+
+/// `seek_upper` after `seek` keeps the entry `seek` landed on, when both land
+/// on the same entry: alone in its block, or inside one restart interval with
+/// others.
+#[test]
+fn seek_upper_keeps_the_entry_seek_landed_on() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let single = make_handles(1);
+        let bytes =
+            IndexBlock::encode_into_vec_with_restart_interval(&single, restart_interval).unwrap();
+        let index = IndexBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Index),
+        });
+        let key = single[0].end_key().to_vec();
+        assert_eq!(
+            (true, vec![key.clone()]),
+            walk_between(&index, &key, &key),
+            "restart interval {restart_interval}: single entry"
+        );
+
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let key = |i: usize| handles[i].end_key().to_vec();
+        assert_eq!(
+            (true, vec![key(5)]),
+            walk_between(&index, &key(5), &key(5)),
+            "restart interval {restart_interval}: one entry of many"
+        );
+        assert_eq!(
+            (true, (5..=7).map(key).collect::<Vec<_>>()),
+            walk_between(&index, &key(5), &key(7)),
+            "restart interval {restart_interval}: three neighbours"
+        );
+    }
+}
+
 /// An entry naming a row group reads back with its tag and directory length,
 /// through a full walk and through a seek that probes the restart heads; an
 /// entry naming none reads back with none.
