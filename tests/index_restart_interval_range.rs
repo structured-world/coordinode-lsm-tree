@@ -38,18 +38,14 @@ fn small_block_tree(
     interval: u8,
     shape: IndexShape,
 ) -> lsm_tree::Result<lsm_tree::AnyTree> {
-    configure(
-        Config::new(
-            folder,
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .data_block_size_policy(BlockSizePolicy::all(256))
-        .index_block_partition_size_policy(BlockSizePolicy::all(256)),
-        interval,
-        shape,
+    let mut config = Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
     )
-    .open()
+    .data_block_size_policy(BlockSizePolicy::all(256));
+    config.index_block_partition_size_policy = BlockSizePolicy::all(256);
+    configure(config, interval, shape).open()
 }
 
 /// The versions of the range's upper-bound key span several blocks, and the
