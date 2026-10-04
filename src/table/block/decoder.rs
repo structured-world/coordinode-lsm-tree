@@ -1160,38 +1160,11 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             return;
         };
 
-        let should_restore = if let Some(&offset) = self.hi_scanner.stack.last() {
-            let is_restart = self.hi_scanner.stack.len() == 1;
-
-            let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
-                return;
-            };
-
-            let Some(item) = Self::parse_current_item(
-                &mut reader,
-                offset,
-                self.hi_scanner.base_key_offset,
-                self.hi_scanner.base_key_end,
-                is_restart,
-                entries_end,
-            ) else {
-                return;
-            };
-
-            cmp(&item, self.entries()) == core::cmp::Ordering::Less
-        } else {
-            true
-        };
-
-        if should_restore {
-            // `candidate_offset` is the first item with key > needle.
-            //
-            // For reverse upper seeks we intentionally keep that first-greater item:
-            // it is the covering interval boundary that may still contain `needle`.
-            // Dropping it would incorrectly move `next_back()` to the previous item
-            // (< needle) and skip the covering block.
-            self.hi_scanner.stack.push(candidate_offset);
-        }
+        // `candidate_offset` is the first item with key > needle, and it stays
+        // in the bound: the block it names may hold `needle` itself (a needle
+        // between two end keys) or the older versions of a `needle` whose
+        // versions run on past the block ending at it.
+        self.hi_scanner.stack.push(candidate_offset);
 
         let Some(&offset) = self.hi_scanner.stack.last() else {
             return;

@@ -93,20 +93,21 @@ impl<'a> Iter<'a> {
         self.seek_with_cache_resets(needle, seqno, true, true)
     }
 
-    /// Upper-bound re-seek: positions the back of the walk at `needle`,
-    /// keeping where a preceding [`seek`](Self::seek) put the front.
+    /// Upper-bound re-seek: the walk ends at the first entry whose end key is
+    /// past `needle`, so it covers every block that may hold a key up to
+    /// `needle`: each block ending at or before it, and the block after, which
+    /// holds `needle` when it falls between two end keys and the older versions
+    /// of a `needle` whose versions run on past the block ending at it.
     ///
-    /// The front is kept because `seek` holds its candidate in the front
-    /// cache after the decoder's low cursor has already moved past it:
-    /// clearing that cache would drop the candidate, and with it the whole
-    /// range when both seeks land on one entry.
+    /// Keeps where a preceding [`seek`](Self::seek) put the front: `seek` holds
+    /// its candidate in the front cache after the decoder's low cursor has
+    /// already moved past it, so clearing that cache would drop the candidate.
     pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         // seek_upper_impl may return Err on a poisoned/clamped cursor;
         // the public bool-returning API treats that as "not found" for
         // backward compatibility — callers that need error propagation
         // should use seek_upper_bound_cursor instead.
-        self.seek_upper_impl(needle, false, true, true)
-            .unwrap_or(false)
+        self.seek_upper_impl(needle, false, true).unwrap_or(false)
     }
 
     pub(crate) fn seek_upper_impl(
@@ -114,7 +115,6 @@ impl<'a> Iter<'a> {
         needle: &[u8],
         reset_front: bool,
         reset_back: bool,
-        check_back_cache: bool,
     ) -> crate::Result<bool> {
         let cmp = &self.comparator;
         if reset_front {
@@ -126,47 +126,18 @@ impl<'a> Iter<'a> {
         let restart_interval = self.decoder.inner_mut().restart_interval();
         // Same devirtualization strategy as `seek_with_cache_resets`: split on
         // `is_lexicographic()` so the inner binary-search predicate is a static
-        // slice comparison on the lex path. The three predicate shapes (strict <,
-        // ≤, ≤) each get their own pair of monomorphizations.
+        // slice comparison on the lex path.
+        //
+        // The bound takes *all* blocks whose end_key ≤ needle (they may contain
+        // entries at needle) plus the first block with end_key > needle (it may
+        // start at a key ≤ needle). With a restart interval of one, ≤ with
+        // partition_point_2 finds that first-greater block and places
+        // hi_scanner.offset after it. When all blocks share the same end_key ==
+        // needle (e.g. a pure-merge scenario with 4 000 operands for one
+        // user_key), the predicate is true for every entry, so partition_point_2
+        // returns the last entry and every block is visited.
         let lex = cmp.is_lexicographic();
-        let found = if restart_interval == 1 {
-            if check_back_cache {
-                // BACK CURSOR (reverse iteration): find the first block whose
-                // end_key ≥ needle.  Using strict-less here together with
-                // partition_point_2 lands exactly on that block.
-                if lex {
-                    self.decoder
-                        .inner_mut()
-                        .seek_upper(|end_key, _s| end_key < needle, true)
-                } else {
-                    self.decoder.inner_mut().seek_upper(
-                        |end_key, _s| cmp.compare(end_key, needle) == core::cmp::Ordering::Less,
-                        true,
-                    )
-                }
-            } else {
-                // FORWARD LIMIT (upper-bound for forward scan): we must include
-                // *all* blocks whose end_key ≤ needle (they may contain entries
-                // at needle) plus the first block with end_key > needle (it may
-                // start at a key ≤ needle).  Using ≤ with partition_point_2
-                // finds the first block with end_key > needle; that block is
-                // included because hi_scanner.offset is placed *after* it.
-                // When all blocks share the same end_key == needle (e.g. a
-                // pure-merge scenario with 4 000 operands for one user_key),
-                // the predicate is true for every entry so partition_point_2
-                // returns the last entry — allowing all blocks to be visited.
-                if lex {
-                    self.decoder
-                        .inner_mut()
-                        .seek_upper(|end_key, _s| end_key <= needle, true)
-                } else {
-                    self.decoder.inner_mut().seek_upper(
-                        |end_key, _s| cmp.compare(end_key, needle) != core::cmp::Ordering::Greater,
-                        true,
-                    )
-                }
-            }
-        } else if lex {
+        let found = if lex {
             self.decoder
                 .inner_mut()
                 .seek_upper(|end_key, _s| end_key <= needle, true)
@@ -187,12 +158,19 @@ impl<'a> Iter<'a> {
                     item.compare_key(needle, bytes, cmp.as_ref())
                 });
 
-            while self
-                .decoder
-                .inner_mut()
-                .upper_stack_tail_cmp(|item, bytes| item.compare_key(needle, bytes, cmp.as_ref()))
-                == Some(core::cmp::Ordering::Less)
-            {
+            // An interval whose last entry ends at or before `needle` does not
+            // hold the first entry past it: move to the next one, whose head
+            // the trim keeps when it is past `needle`.
+            while matches!(
+                self.decoder
+                    .inner_mut()
+                    .upper_stack_tail_cmp(|item, bytes| item.compare_key(
+                        needle,
+                        bytes,
+                        cmp.as_ref()
+                    )),
+                Some(core::cmp::Ordering::Less | core::cmp::Ordering::Equal)
+            ) {
                 if !self.decoder.inner_mut().advance_upper_restart_interval() {
                     break;
                 }
@@ -217,11 +195,7 @@ impl<'a> Iter<'a> {
             }
         }
 
-        if check_back_cache {
-            Ok(self.decoder.peek_back().is_some())
-        } else {
-            Ok(true)
-        }
+        Ok(true)
     }
 
     #[expect(
@@ -252,7 +226,7 @@ impl<'a> Iter<'a> {
         // end_key >= lo_needle, and seek_upper positions hi at the first block with
         // end_key > hi_needle. Since lo_needle <= hi_needle, front_peeked is always
         // within the bounded window.
-        self.seek_upper_impl(needle, false, true, false)
+        self.seek_upper_impl(needle, false, true)
     }
 }
 

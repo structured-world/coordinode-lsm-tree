@@ -128,14 +128,12 @@ impl OwnedIndexBlockIter {
         self.with_dependent_mut(|_, m| {
             // reset_front=false: preserve front cache from prior seek_lower
             // reset_back=true: clear stale back state from reverse iteration
-            // check_back_cache=false: forward-limit mode, don't require peek_back
             //
             // seek_upper_impl may return Err on a poisoned/clamped cursor;
             // the public bool-returning API treats that as "not found" for
             // backward compatibility — callers that need error propagation
             // should use from_block_with_bounds / seek_upper_bound_cursor.
-            m.seek_upper_impl(needle, false, true, false)
-                .unwrap_or(false)
+            m.seek_upper_impl(needle, false, true).unwrap_or(false)
         })
     }
 }
