@@ -3,9 +3,9 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 pub(crate) mod binary_index;
-// Crate-internal: Decoder, Decodable, ParsedItem are not part of the public API.
+// Crate-internal: Decoder and Decodable are not part of the public API.
 // They are re-exported as pub(crate) below; narrowing the module prevents
-// external code from reaching these traits via lsm_tree::table::block::decoder::*.
+// external code from reaching them via lsm_tree::table::block::decoder::*.
 pub(crate) mod decoder;
 mod encoder;
 pub mod hash_index;
@@ -17,7 +17,12 @@ mod trailer;
 mod transform;
 mod r#type;
 
-pub(crate) use decoder::{Decodable, Decoder, DecoderMeta, ParsedItem};
+/// The items the public block iterators yield implement this; it is what
+/// turns one into an owned value. Exposed for the fuzz targets, not a stable
+/// API.
+#[doc(hidden)]
+pub use decoder::ParsedItem;
+pub(crate) use decoder::{Decodable, Decoder, DecoderMeta};
 pub(crate) use encoder::{Encodable, Encoder};
 pub use header::{ChecksumAt, Header};
 pub use identity::BlockIdentity;
