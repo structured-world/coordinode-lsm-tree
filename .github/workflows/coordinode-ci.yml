@@ -222,6 +222,21 @@ jobs:
           cargo fmt --all -- --check
           find tools fuzz -name '*.rs' -not -path '*/target/*' -print0 \
             | xargs -0 rustfmt --check --
+      - name: Fuzz targets compile
+        # The fuzz crates are `workspace.exclude`d, so no other step builds
+        # them, and an API change that breaks one would only surface the next
+        # time someone fuzzes. Type-checking needs no AFL toolchain. One
+        # target dir under `target/` shares the engine build across the
+        # crates and is kept by the cache step above.
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/fuzz
+        run: |
+          set -euo pipefail
+          for manifest in fuzz/*/Cargo.toml; do
+            echo "::group::$manifest"
+            cargo clippy --manifest-path "$manifest" -- -D warnings
+            echo "::endgroup::"
+          done
       - name: Manifest metadata limits
         # crates.io rejects a description over 255 characters, and nothing
         # local catches it: `cargo package` and `cargo publish --dry-run`
