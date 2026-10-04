@@ -8,6 +8,9 @@ use crate::version::Run;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+/// Fuses L0 runs, given newest first, into as few runs as the overlaps allow,
+/// keeping them newest first: a table never ends up behind a run holding
+/// older data it overlaps, so the run order stays recency order.
 pub fn optimize_runs<T: Clone + Ranged>(
     runs: Vec<Run<T>>,
     cmp: &dyn UserComparator,
@@ -17,27 +20,34 @@ pub fn optimize_runs<T: Clone + Ranged>(
     } else {
         let mut new_runs: Vec<Run<T>> = Vec::new();
 
-        for run in runs.iter().rev() {
-            'run: for table in run.iter().rev() {
-                for existing_run in new_runs.iter_mut().rev() {
-                    if existing_run.iter().all(|x| {
-                        !table
+        // Newest first, so every table already placed is newer than `table`:
+        // it belongs behind the last placed run it overlaps. No run after
+        // that one overlaps it, so joining the next run keeps every run
+        // internally disjoint.
+        for run in &runs {
+            for table in run.iter() {
+                let last_overlap = new_runs.iter().rposition(|existing_run| {
+                    existing_run.iter().any(|x| {
+                        table
                             .key_range()
                             .overlaps_with_key_range_cmp(x.key_range(), cmp)
-                    }) {
-                        existing_run.push_cmp(table.clone(), cmp);
-                        continue 'run;
-                    }
-                }
+                    })
+                });
 
-                #[expect(
-                    clippy::expect_used,
-                    reason = "we pass in a table, so the run cannot be None"
-                )]
-                new_runs.insert(
-                    0,
-                    Run::new(vec![table.clone()]).expect("run should not be empty"),
-                );
+                let target = match last_overlap {
+                    Some(idx) => new_runs.get_mut(idx + 1),
+                    None => new_runs.first_mut(),
+                };
+
+                if let Some(target) = target {
+                    target.push_cmp(table.clone(), cmp);
+                } else {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "we pass in a table, so the run cannot be None"
+                    )]
+                    new_runs.push(Run::new(vec![table.clone()]).expect("run should not be empty"));
+                }
             }
         }
 
