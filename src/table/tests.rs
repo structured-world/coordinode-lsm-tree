@@ -4284,14 +4284,21 @@ fn a_paced_block_read_paces_each_portion_it_reads_from_the_file() -> crate::Resu
     let file_len = std::fs::metadata(&file)?.len();
     let table = Table::recover(test_recover_params(file, checksum))?;
 
-    let paced = std::sync::Mutex::new(Vec::<(u64, u64)>::new());
-    let pace = |offset, len| {
-        paced
-            .lock()
-            .expect("lock is not poisoned")
-            .push((offset, len));
-    };
-    let taken = || core::mem::take(&mut *paced.lock().expect("lock is not poisoned"));
+    /// Records each portion it is asked to pace.
+    struct Recorder(std::sync::Mutex<Vec<(u64, u64)>>);
+    impl crate::table::util::ReadPacer for Recorder {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, offset: u64, len: u64) {
+            self.0
+                .lock()
+                .expect("lock is not poisoned")
+                .push((offset, len));
+        }
+    }
+    let pace = Recorder(std::sync::Mutex::new(Vec::new()));
+    let taken = || core::mem::take(&mut *pace.0.lock().expect("lock is not poisoned"));
     let cache = Cache::with_capacity_bytes(10_000_000);
     let read = |handle: &BlockHandle| {
         load_block_paced(
@@ -4310,7 +4317,7 @@ fn a_paced_block_read_paces_each_portion_it_reads_from_the_file() -> crate::Resu
             #[cfg(feature = "metrics")]
             &table.metrics,
             crate::table::util::ReadCharge::Foreground,
-            Some(&pace as &(dyn Fn(u64, u64) + Send + Sync)),
+            Some(&pace),
         )
     };
 

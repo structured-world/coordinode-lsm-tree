@@ -1398,11 +1398,9 @@ fn a_paced_read_alternates_each_portion_with_its_read() -> crate::Result<()> {
         inner: fs.open(path, &FsOpenOptions::new().read(true))?,
         log: std::sync::Arc::clone(&log),
     };
-    let sink = std::sync::Arc::clone(&log);
-    let pace = move |offset: u64, len: u64| {
-        sink.lock()
-            .expect("lock is not poisoned")
-            .push(('p', offset, len));
+    let pace = LogPacer {
+        active: true,
+        log: std::sync::Arc::clone(&log),
     };
 
     let read = crate::file::read_exact_paced(&file, 0, size, Some(&pace))?;
@@ -1427,7 +1425,40 @@ fn a_paced_read_alternates_each_portion_with_its_read() -> crate::Result<()> {
         vec![('r', 0, size as u64)],
         "an unpaced read is one read"
     );
+
+    // A pacer not active now, as a limiter at rate zero, leaves the read
+    // whole and uncharged.
+    log.lock().expect("lock is not poisoned").clear();
+    let idle = LogPacer {
+        active: false,
+        log: std::sync::Arc::clone(&log),
+    };
+    crate::file::read_exact_paced(&file, 0, size, Some(&idle))?;
+    assert_eq!(
+        *log.lock().expect("lock is not poisoned"),
+        vec![('r', 0, size as u64)],
+        "a read under an idle pacer is one read, not charged"
+    );
     Ok(())
+}
+
+/// A pacer that logs each portion it paces, `('p', offset, len)`, into a log
+/// a file can share; `active` says whether it paces at all.
+struct LogPacer {
+    active: bool,
+    log: std::sync::Arc<std::sync::Mutex<Vec<(char, u64, u64)>>>,
+}
+
+impl crate::table::util::ReadPacer for LogPacer {
+    fn active(&self) -> bool {
+        self.active
+    }
+    fn pace(&self, offset: u64, len: u64) {
+        self.log
+            .lock()
+            .expect("lock is not poisoned")
+            .push(('p', offset, len));
+    }
 }
 
 /// A `ScriptedReads` over a fresh file holding `bytes`.
@@ -1659,16 +1690,17 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
         // What one walk for `bound` is charged. Untraced, so no walk leaves a
         // cached partition for the next to skip.
         let charged = |bound: &[u8]| -> crate::Result<u64> {
-            let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let sink = std::sync::Arc::clone(&total);
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             table.punch_offset_paced(
                 bound,
                 crate::table::util::ReadCharge::Untraced,
-                std::sync::Arc::new(move |_offset, len| {
-                    sink.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                std::sync::Arc::new(LogPacer {
+                    active: true,
+                    log: std::sync::Arc::clone(&log),
                 }),
             )?;
-            Ok(total.load(std::sync::atomic::Ordering::Relaxed))
+            let paced = log.lock().expect("lock is not poisoned");
+            Ok(paced.iter().map(|&(_, _, len)| len).sum())
         };
         let first = charged(b"k00000")?;
         let middle = charged(b"k01000")?;

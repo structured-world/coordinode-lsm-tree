@@ -33,10 +33,20 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
-/// Paces the block reads a walk issues: told the file offset and length of
-/// each portion of a read just before that portion is read, never for a block
-/// served from the cache or refused before reading.
-pub type Pacer = alloc::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+/// Paces the block reads a walk issues, never for a block served from the
+/// cache or refused before reading.
+pub(crate) trait ReadPacer: Send + Sync {
+    /// Whether reads are paced now. Decided once per read: a read decided
+    /// unpaced is one read, uncharged.
+    fn active(&self) -> bool;
+
+    /// Told the file offset and length of each portion of a paced read just
+    /// before that portion is read.
+    fn pace(&self, offset: u64, len: u64);
+}
+
+/// A walk's pacer, shared with the iterators that load its blocks.
+pub(crate) type Pacer = alloc::sync::Arc<dyn ReadPacer>;
 
 /// The most a paced read takes from the file in one go: a larger read is
 /// paced and made a portion at a time, so a shared limiter serves other
@@ -125,7 +135,7 @@ pub(crate) fn load_block_paced(
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
     charge: ReadCharge,
-    pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    pace: Option<&dyn ReadPacer>,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
     use core::sync::atomic::Ordering::Relaxed;

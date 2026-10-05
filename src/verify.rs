@@ -730,15 +730,34 @@ fn paced_punch_offset(
     // The length on disk, read once for the walk: the table's recorded size
     // predates the index sections written after it.
     let file_size = table.fs.metadata(&table.path)?.len;
-    let limiter = alloc::sync::Arc::clone(limiter);
     table.punch_offset_paced(
         bound,
         crate::table::util::ReadCharge::Maintenance,
-        alloc::sync::Arc::new(move |offset, len| {
-            // A rate of zero admits every request at once.
-            charge_in_portions(&limiter, bytes_in_file(offset, len, file_size));
+        alloc::sync::Arc::new(LimiterPacer {
+            limiter: alloc::sync::Arc::clone(limiter),
+            file_size,
         }),
     )
+}
+
+/// Paces a walk's block reads through a limiter, each portion cut at the end
+/// of a file of `file_size` bytes.
+struct LimiterPacer {
+    limiter: alloc::sync::Arc<RateLimiter>,
+    file_size: u64,
+}
+
+impl crate::table::util::ReadPacer for LimiterPacer {
+    // A limiter at rate zero reads at full speed: whole reads, uncharged, as
+    // the scan's own reads do. Asked per read, so a rate set while the walk
+    // runs applies to the reads still to come.
+    fn active(&self) -> bool {
+        self.limiter.rate() > 0
+    }
+
+    fn pace(&self, offset: u64, len: u64) {
+        charge_in_portions(&self.limiter, bytes_in_file(offset, len, self.file_size));
+    }
 }
 
 /// The bytes a read of `len` at `offset` takes from a file of `file_size`

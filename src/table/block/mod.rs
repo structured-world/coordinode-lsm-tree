@@ -1482,7 +1482,7 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         on_issue: impl FnOnce(),
-        pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
         produced: &mut usize,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
         let (header, payload, ecc_status, recovery) =
@@ -1534,7 +1534,7 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         on_issue: impl FnOnce(),
-        pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         let encryption = transform.encryption();
         // `identity` (tree/table + compression context) feeds AAD

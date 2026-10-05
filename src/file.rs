@@ -377,7 +377,7 @@ pub(crate) fn read_exact_paced(
     file: &dyn FsFile,
     offset: u64,
     size: usize,
-    pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    pace: Option<&dyn crate::table::util::ReadPacer>,
 ) -> crate::io::Result<Slice> {
     // SAFETY: This slice builder starts uninitialized, but we know its length
     //
@@ -408,17 +408,18 @@ pub(crate) fn read_exact_paced(
 /// Reads `buf` from `file` at `offset` and returns the bytes read, fewer only
 /// at the file's end. Without `pace` this is one [`FsFile::read_at`], which has
 /// fill-or-EOF semantics (implementations retry EINTR and short reads). With
-/// `pace`, the read is made a portion at a time, each portion's offset and
-/// length handed to `pace` just before it is read, so a rate limiter's waits
-/// and the reads they pay for alternate instead of one wait and then one read
-/// of the whole.
+/// an active `pace`, the read is made a portion at a time, each portion's
+/// offset and length handed to `pace` just before it is read, so a rate
+/// limiter's waits and the reads they pay for alternate instead of one wait
+/// and then one read of the whole. A pacer that is not active now, as a
+/// limiter at rate zero, leaves the read whole.
 pub(crate) fn read_at_paced(
     file: &dyn FsFile,
     buf: &mut [u8],
     offset: u64,
-    pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+    pace: Option<&dyn crate::table::util::ReadPacer>,
 ) -> crate::io::Result<usize> {
-    let Some(pace) = pace else {
+    let Some(pace) = pace.filter(|pace| pace.active()) else {
         return file.read_at(buf, offset);
     };
     let mut read = 0usize;
@@ -431,7 +432,7 @@ pub(crate) fn read_at_paced(
                 "read_at_paced: offset past the largest file position",
             )
         })?;
-        pace(at, portion.len() as u64);
+        pace.pace(at, portion.len() as u64);
         let got = file.read_at(portion, at)?;
         read += got;
         if got < portion.len() {
