@@ -1280,10 +1280,9 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
             dir.path(),
             crate::SequenceNumberCounter::default(),
             crate::SequenceNumberCounter::default(),
-        )
-        .data_block_size_policy(BlockSizePolicy::all(256));
-        // Small index partitions only for the partitioned shape: a partition
-        // size is what makes the writer split the index.
+        );
+        // Small blocks and index partitions only for the partitioned shape: an
+        // index larger than a partition is what makes the writer split it.
         let config = match shape {
             "pinned" => config
                 .index_block_partitioning_policy(PinningPolicy::all(false))
@@ -1292,6 +1291,7 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
                 .index_block_partitioning_policy(PinningPolicy::all(false))
                 .index_block_pinning_policy(PinningPolicy::all(false)),
             _ => config
+                .data_block_size_policy(BlockSizePolicy::all(256))
                 .index_block_partitioning_policy(PinningPolicy::all(true))
                 .index_block_partition_size_policy(BlockSizePolicy::all(256)),
         };
