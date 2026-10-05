@@ -1281,8 +1281,9 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
             crate::SequenceNumberCounter::default(),
             crate::SequenceNumberCounter::default(),
         )
-        .data_block_size_policy(BlockSizePolicy::all(256))
-        .index_block_partition_size_policy(BlockSizePolicy::all(256));
+        .data_block_size_policy(BlockSizePolicy::all(256));
+        // Small index partitions only for the partitioned shape: a partition
+        // size is what makes the writer split the index.
         let config = match shape {
             "pinned" => config
                 .index_block_partitioning_policy(PinningPolicy::all(false))
@@ -1290,7 +1291,9 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
             "volatile" => config
                 .index_block_partitioning_policy(PinningPolicy::all(false))
                 .index_block_pinning_policy(PinningPolicy::all(false)),
-            _ => config.index_block_partitioning_policy(PinningPolicy::all(true)),
+            _ => config
+                .index_block_partitioning_policy(PinningPolicy::all(true))
+                .index_block_partition_size_policy(BlockSizePolicy::all(256)),
         };
         let tree = config.open()?;
         for (seqno, key) in keys.iter().enumerate() {
