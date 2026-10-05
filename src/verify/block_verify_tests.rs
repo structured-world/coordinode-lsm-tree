@@ -1284,8 +1284,12 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
         .data_block_size_policy(BlockSizePolicy::all(256))
         .index_block_partition_size_policy(BlockSizePolicy::all(256));
         let config = match shape {
-            "pinned" => config,
-            "volatile" => config.index_block_pinning_policy(PinningPolicy::all(false)),
+            "pinned" => config
+                .index_block_partitioning_policy(PinningPolicy::all(false))
+                .index_block_pinning_policy(PinningPolicy::all(true)),
+            "volatile" => config
+                .index_block_partitioning_policy(PinningPolicy::all(false))
+                .index_block_pinning_policy(PinningPolicy::all(false)),
             _ => config.index_block_partitioning_policy(PinningPolicy::all(true)),
         };
         let tree = config.open()?;
