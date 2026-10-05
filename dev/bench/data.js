@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791186981659,
+  "lastUpdate": 1791188619899,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -30548,6 +30548,90 @@ window.BENCHMARK_DATA = {
             "value": 326673.9610457668,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 20.4us | P99.9: 86.7us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "24efe88e9a134b7c6397da9898d794aceb426b69",
+          "message": "fix(salvage): stamp a verbatim copy for where it lands (#839)\n\n## Summary\n\n- `repair_with_salvage` on a table whose first data block is damaged no\nlonger publishes a replacement that fails its own checksums.\n- A verbatim block copy is stamped for the offset it is written at: the\nwriter now writes out the block that row-by-row re-emits left pending,\nand drains parallel compression, before it reads that offset.\n\nLands the change of #820, which GitHub shows as merged but whose merge\nnever reached `main`.\n\n## Changes\n\n- `Writer::settle_pending_blocks` writes out the pending row chunk and\nevery block still being compressed; `append_verbatim_extent` calls it\nbefore `restamp_extent`, and `account_direct_block` keeps calling it for\nthe columnar path.\n- The accounting of a verbatim extent stays after the restamp, so an\nextent the restamp refuses counts no rows.\n- Tests: a row table with a damaged first block, and a columnar table\nwith a damaged first row group, repaired with salvage, read every\nsurviving key with its value.\n\nColumnar row groups were not affected: a re-encoded group is written at\nonce, so no rows are pending when a copy follows it. `5.x.x` is not\naffected: its block checksums are not bound to the position.\n\n## Testing\n\nTests with default and all features, clippy in both configurations, doc\ntests, the doc build, the no-std check and the sst-dump suite pass on\nLinux.\n\nCloses #819",
+          "timestamp": "2026-10-05T11:10:57+03:00",
+          "tree_id": "0594591c2eed9833e28437c6a47598307cd123ec",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/24efe88e9a134b7c6397da9898d794aceb426b69"
+        },
+        "date": 1791188618770,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 95555.45647833197,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.5us | P99.9: 46.3us\nthreads: 1 | elapsed: 5.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2650439.4395460277,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 481752.83224356873,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.4us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 381198.2102324712,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 16.2us | P99.9: 41.4us\nthreads: 1 | elapsed: 0.52s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2192581.5166452513,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 225509.50458911783,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 16.2us | P99.9: 35.6us\nthreads: 1 | elapsed: 0.89s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 104792.04287359364,
+            "unit": "ops/sec",
+            "extra": "P50: 6.7us | P99: 38.0us | P99.9: 57.6us\nthreads: 1 | elapsed: 1.91s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 411268.43261931813,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 6.5us | P99.9: 30.5us\nthreads: 1 | elapsed: 0.49s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 731144.7475552037,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.8us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 306483.8959147896,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 13.6us | P99.9: 82.0us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
