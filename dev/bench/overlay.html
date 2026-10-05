@@ -44,6 +44,7 @@
     <label>Show <select id="suite">
       <option value="rates">Throughput (higher is better)</option>
       <option value="costs">Read cost per row (lower is better)</option>
+      <option value="timings">Time to first batch (lower is better)</option>
     </select></label>
     <span class="status" id="status"></span>
   </div>
@@ -56,9 +57,11 @@
 (function () {
   "use strict";
   // Rate suites: one per version line and runner. Cost suites: one per line,
-  // bytes counted by the engine, the same on every runner.
+  // bytes counted by the engine, the same on every runner. Timing suites: one
+  // per line and runner, times that improve by shrinking.
   const RATE = /^lsm-tree db_bench (\d+)\.x · (.+)$/;
   const COST = /^lsm-tree db_bench costs (\d+)\.x$/;
+  const TIMING = /^lsm-tree db_bench timings (\d+)\.x · (.+)$/;
   const ALL = "*";
   const PALETTE = ["#58a6ff", "#f78166", "#3fb950", "#d2a8ff", "#e3b341", "#79c0ff", "#ff7b72"];
 
@@ -109,8 +112,9 @@
   const repo = data.repoUrl || "";
   const rateSuites = suites.filter(function (s) { return RATE.test(s); });
   const costSuites = suites.filter(function (s) { return COST.test(s); });
-  const lineOf = function (s) { return Number((RATE.exec(s) || COST.exec(s))[1]); };
-  const runnerOf = function (s) { return RATE.exec(s)[2]; };
+  const timingSuites = suites.filter(function (s) { return TIMING.test(s); });
+  const lineOf = function (s) { return Number((RATE.exec(s) || COST.exec(s) || TIMING.exec(s))[1]); };
+  const runnerOf = function (s) { return (RATE.exec(s) || TIMING.exec(s))[2]; };
   const lastDate = function (s) {
     const entries = data.entries[s];
     return entries.length ? entries[entries.length - 1].date : 0;
@@ -302,6 +306,33 @@
     });
   };
 
+  // One chart per timed figure, one line per runner, like the rates.
+  const drawTimings = function (line, runner) {
+    const here = timingSuites.filter(function (s) {
+      return lineOf(s) === line && (runner === ALL || runnerOf(s) === runner);
+    });
+    if (!here.length) {
+      section("No timing series", "This line and runner have no timed results.");
+      return;
+    }
+    const live = {};
+    here.forEach(function (s) { Object.assign(live, current(s)); });
+    const NAME = /^(.+?) \/ (\S+) (.+)$/;
+    const grids = {};
+    Object.keys(live).forEach(function (name) {
+      const m = NAME.exec(name);
+      const workload = m ? m[1] : name;
+      const scenario = m ? m[2] : name;
+      if (!(workload in grids)) {
+        grids[workload] = section(
+          "Time to first batch: " + workload,
+          "Wall time from creating a scan to its first batch, on the runner that measured it. Lower is better.");
+      }
+      const sets = here.map(function (s) { return series(s, name, runnerOf(s), colorOf(runnerOf(s))); });
+      card(grids[workload], scenario, COST_NOTES[scenario] || "", live[name], sets);
+    });
+  };
+
   const draw = function () {
     charts.splice(0).forEach(function (c) { c.destroy(); });
     container.innerHTML = "";
@@ -309,6 +340,8 @@
     runnerSel.disabled = suiteSel.value === "costs";
     if (suiteSel.value === "costs") {
       drawCosts(line);
+    } else if (suiteSel.value === "timings") {
+      drawTimings(line, runnerSel.value);
     } else {
       drawRates(line, runnerSel.value);
     }
