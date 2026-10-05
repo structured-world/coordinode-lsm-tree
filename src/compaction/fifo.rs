@@ -122,8 +122,10 @@ impl CompactionStrategy for Strategy {
 
         for table in version.iter_tables() {
             let held = hidden.is_hidden(table.id());
-            let expired = !held
-                && ttl_cutoff.is_some_and(|cutoff| u128::from(table.metadata.created_at) <= cutoff);
+            // A table stamped while the clock read zero has no age at all: it
+            // is never TTL-expired, though the clock has run since.
+            let age = u128::from(table.metadata.created_at);
+            let expired = !held && age != 0 && ttl_cutoff.is_some_and(|cutoff| age <= cutoff);
 
             if expired {
                 ids_to_drop.insert(table.id());

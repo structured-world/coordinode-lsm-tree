@@ -512,6 +512,35 @@ fn fifo_ttl_is_off_while_the_clock_reads_zero() -> crate::Result<()> {
     })
 }
 
+/// Tables written while the clock read zero carry no age, and a clock that
+/// starts later must not read that missing age as the epoch and expire them.
+#[test]
+fn fifo_ttl_spares_tables_stamped_before_the_clock_started() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    with_test_clock(|clock| {
+        clock.set_secs(0);
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        tree.major_compact(u64::MAX, 0)?;
+        clock.set_secs(1_000_000);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
+        assert!(
+            tree.get([b'k', 0].as_slice(), 3)?.is_some(),
+            "a table with no age must not expire once the clock starts"
+        );
+        Ok(())
+    })
+}
+
 /// The outputs of a major compaction of a KV-separated tree share its blob
 /// file, which goes only with the last of them. Counting its bytes as freed
 /// by the first output dropped stops the round with the file still on disk
