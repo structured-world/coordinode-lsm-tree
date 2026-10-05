@@ -718,13 +718,15 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
 /// portion just before reading it: the walk is charged what it really reads,
 /// whatever an unverified handle or top-level key claimed, nothing for a
 /// block the cache serves or the loader refuses unread, and a rate set while
-/// the walk runs applies to the reads still to come.
+/// the walk runs applies to the reads still to come. A limiter at rate zero
+/// when the walk starts walks as none does: it reads nothing the unlimited
+/// walk does not, the file's metadata included.
 fn paced_punch_offset(
     table: &crate::table::Table,
     bound: &[u8],
     limiter: Option<&alloc::sync::Arc<RateLimiter>>,
 ) -> crate::Result<u64> {
-    let Some(limiter) = limiter else {
+    let Some(limiter) = limiter.filter(|limiter| limiter.rate() > 0) else {
         return table.punch_offset_for(bound);
     };
     // The length on disk, read once for the walk: the table's recorded size

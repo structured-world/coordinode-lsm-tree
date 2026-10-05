@@ -1635,6 +1635,42 @@ fn a_paced_portion_is_charged_only_the_bytes_inside_the_file() {
     assert_eq!(bytes_in_file(u64::MAX, 4096, 8192), 0);
 }
 
+/// A limiter at rate zero reads at full speed, so the punch-offset walk under
+/// it must not depend on anything a walk without a limiter does not: a file
+/// whose metadata cannot be read still has its offset found.
+#[test]
+fn a_restricted_lookup_at_rate_zero_reads_no_metadata() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(std::sync::Arc::new(fs))
+    .open()?;
+    for i in 0..100u32 {
+        tree.insert(format!("k{i:05}"), "v", u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+    let expected = table.punch_offset_for(b"k00050")?;
+
+    injector.arm(FaultRule::new(
+        FaultOp::Metadata,
+        Fault::Error(crate::io::ErrorKind::Other),
+    ));
+    let idle = std::sync::Arc::new(crate::rate_limiter::RateLimiter::new(0));
+    let found = super::paced_punch_offset(table, b"k00050", Some(&idle));
+    injector.clear();
+    assert_eq!(found?, expected, "an idle limiter walks as no limiter does");
+    Ok(())
+}
+
 /// The punch-offset walk is charged what it reads, as the loader reads it:
 /// nothing for an index held in memory, the index block for one loaded per
 /// read, and for a partitioned index only the partitions the walk loads up to
