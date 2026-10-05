@@ -84,7 +84,9 @@
     if (ns >= 1e3) { return (ns / 1e3).toFixed(2) + " µs"; }
     return ns.toFixed(0) + " ns";
   };
-  const fmtRatio = function (x) { return "×" + (x >= 10 ? x.toFixed(0) : x >= 1 ? x.toFixed(2) : x.toPrecision(2)); };
+  // Three significant digits from 1 up (×10.5 rather than ×10, which would hide
+  // up to 5%), two below.
+  const fmtRatio = function (x) { return "×" + (x >= 1 ? x.toPrecision(3) : x.toPrecision(2)); };
 
   Promise.all([
     fetch("summary.json").then(function (r) { return r.ok ? r.json() : null; }),
