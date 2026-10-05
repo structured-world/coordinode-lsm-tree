@@ -325,6 +325,9 @@ pub(super) fn prepare_table_writer(
         .use_seqno_in_index(rc.seqno_in_index)
         .use_zone_map(rc.zone_map)
         .use_columnar(rc.columnar)
+        // A blob tree's rows may be written as cells, which its columnar
+        // tables split into the columns of their fields.
+        .use_cell_rows(rc.columnar && opts.config.kv_separation_opts.is_some())
         // Per-level delete strategy: under copy-on-write the output SSTs persist
         // no delete-bitmap (deleted rows are dropped); merge-on-read / adaptive
         // keep a populated bitmap. Read off the live snapshot so a policy change
@@ -430,6 +433,10 @@ pub(super) struct ProducedOutput {
     /// installed or dropped: the budget keeps the room its filters take until
     /// then (see [`crate::filter_budget::FilterSizing::release_replaced`]).
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
+    /// The cell-row objects this output charged as garbage, recorded at the
+    /// install for the references read before it (see
+    /// [`crate::blob_tree::released`]).
+    released_objects: Vec<crate::vlog::ValueHandle>,
 }
 
 #[cfg_attr(
@@ -478,6 +485,17 @@ impl ProducedOutput {
         self.collected_below_watermark = true;
     }
 
+    /// Records the cell-row objects the run charged as garbage (called by the
+    /// producer, which owns the ownership ledger).
+    pub(super) fn set_released_objects(&mut self, objects: Vec<crate::vlog::ValueHandle>) {
+        self.released_objects = objects;
+    }
+
+    /// The cell-row objects the run charged as garbage.
+    pub(super) fn released_objects(&self) -> &[crate::vlog::ValueHandle] {
+        &self.released_objects
+    }
+
     /// Builds the output for a merge-on-read relocation: the `created` segment
     /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
     /// `deleted` source segment, with no blob files and no fragmentation. Lets
@@ -503,6 +521,7 @@ impl ProducedOutput {
             collected_below_watermark: true,
             // The source's filter is reused verbatim, not sized again.
             filter_sizing: None,
+            released_objects: Vec::new(),
         }
     }
 }
@@ -549,7 +568,9 @@ pub(super) fn install_merge(
     // keeps the outputs' room until then.
     let mut filter_sizings = Vec::new();
 
+    let mut released_objects = Vec::new();
     for out in outputs {
+        released_objects.extend(out.released_objects);
         filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
@@ -605,6 +626,63 @@ pub(super) fn install_merge(
         }
     }
 
+    // A file a cell row still references stays, whatever its counts say: a
+    // borrowed reference charges nothing when it goes, so a file's counts can
+    // reach its size while a row that does not own an object still points at
+    // it, from a table this edit keeps or writes or from a memtable. The
+    // install holds the version lock that orders writes of such rows, so no
+    // memtable gains a reference to these files behind this check.
+    let kept = referenced_blob_files(
+        &blob_files_to_drop,
+        &current_version,
+        &payload.table_ids,
+        &created_tables,
+    )?;
+    if !kept.is_empty() {
+        blob_files_to_drop.retain(|file| !kept.contains(&file.id()));
+        // A relocated file that stays is fully charged: every object in it
+        // was copied or is garbage, so it goes as soon as its last reference
+        // does, and nothing charges it further (its rows only borrow).
+        for &id in &kept {
+            let Some(file) = current_version.version.blob_files.get(id) else {
+                continue;
+            };
+            // What the stats and this pass charged so far, as objects,
+            // uncompressed bytes and bytes on disk.
+            let charged = |map: &FragmentationMap| {
+                map.get(&id)
+                    .map_or((0, 0, 0), |e| (e.len, e.bytes, e.on_disk_bytes))
+            };
+            let (stats, pass) = (
+                charged(current_version.version.gc_stats()),
+                charged(&blob_frag_map),
+            );
+            let meta = &file.0.meta;
+            // The rest of each counter, so the file reads as fully charged
+            // for what it frees on disk too. A counter already at its total
+            // adds nothing.
+            let rest = |total: u64, a: u64, b: u64| total.saturating_sub(a + b);
+            // A file of more objects than a `usize` counts is not one this
+            // build wrote.
+            let len = usize::try_from(meta.item_count)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(stats.0 + pass.0);
+            let bytes = rest(meta.total_uncompressed_bytes, stats.1, pass.1);
+            let on_disk = rest(meta.total_compressed_bytes, stats.2, pass.2);
+            // Any counter short of its total: objects of zero bytes still
+            // count, and a file is dead only when its entry reaches every
+            // total, so an entry is made for them too.
+            if len > 0 || bytes > 0 || on_disk > 0 {
+                let mut fill = FragmentationMap::default();
+                fill.insert(
+                    id,
+                    crate::blob_tree::FragmentationEntry::new(len, bytes, on_disk),
+                );
+                fill.merge_into(&mut blob_frag_map);
+            }
+        }
+    }
+
     // The outputs take the probe counts of the inputs they replace, by the
     // range each covers. Read off the payload rather than the outputs' delete
     // lists, which parallel sub-compactions each fill with the same inputs.
@@ -657,6 +735,14 @@ pub(super) fn install_merge(
     )?;
     // The version names the outputs now, so the run must not remove them.
     opts.outputs.installed();
+    // Still under the write lock that published the version: a reference read
+    // from an older version names an object this run let go of.
+    if !released_objects.is_empty() {
+        let published = super_version.latest_version().version.id();
+        super_version
+            .released()
+            .record(published, released_objects, []);
+    }
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -670,6 +756,46 @@ pub(super) fn install_merge(
     drop(filter_sizings);
 
     Ok(tables_out)
+}
+
+/// The ids among `candidates` that something will still reference once an
+/// edit replacing the tables `replaced` with `created` installs over
+/// `current`: a table the edit keeps or writes links them, or a memtable row
+/// references them.
+///
+/// # Errors
+///
+/// Returns an error if a table's blob links cannot be read.
+pub(super) fn referenced_blob_files(
+    candidates: &[BlobFile],
+    current: &crate::version::SuperVersion,
+    replaced: &HashSet<crate::TableId>,
+    created: &[Table],
+) -> crate::Result<HashSet<BlobFileId>> {
+    let mut referenced = HashSet::default();
+    if candidates.is_empty() {
+        return Ok(referenced);
+    }
+    for file in candidates {
+        if current.memtables_reference_blob_file(file.id()) {
+            referenced.insert(file.id());
+        }
+    }
+    let kept_tables = current
+        .version
+        .iter_tables()
+        .filter(|table| !replaced.contains(&table.id()));
+    for table in kept_tables.chain(created.iter()) {
+        if referenced.len() == candidates.len() {
+            break;
+        }
+        for link in table.blob_links()? {
+            if candidates.iter().any(|file| file.id() == link.blob_file_id) {
+                referenced.insert(link.blob_file_id);
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 /// Compaction worker that will relocate blobs that sit in blob files that are being rewritten
@@ -706,9 +832,23 @@ pub struct RelocatingCompaction {
     /// into the frontier. `None` for a whole-file relocation, which drops the
     /// stale files outright and has no frontier to move.
     drain_below: Option<crate::UserKey>,
+    /// The tree the rewritten files belong to, which names them in the
+    /// descriptor table a cell row's frames are read through.
+    tree_id: crate::TreeId,
+    /// The copies made for the cell rows of the current key, by the handle of
+    /// the frame each copies. Every version that holds an object is a version
+    /// of one key, so a later version of the key that holds the same object
+    /// points at the same copy, and no other key can.
+    cell_copies: crate::HashMap<crate::vlog::ValueHandle, BlobIndirection>,
+    /// The key `cell_copies` belongs to.
+    cell_copies_key: Option<crate::UserKey>,
 }
 
 impl RelocatingCompaction {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent input of the pass; a struct would only rename them"
+    )]
     pub fn new(
         inner: StandardCompaction,
         blob_scanner: Peekable<BlobFileMergeScanner>,
@@ -717,6 +857,7 @@ impl RelocatingCompaction {
         rate_limiter: alloc::sync::Arc<crate::rate_limiter::RateLimiter>,
         stop_signal: crate::stop_signal::StopSignal,
         comparator: crate::comparator::SharedComparator,
+        tree_id: crate::TreeId,
     ) -> Self {
         Self {
             inner,
@@ -732,7 +873,123 @@ impl RelocatingCompaction {
             consumed_through: crate::HashMap::default(),
             comparator,
             drain_below: None,
+            tree_id,
+            cell_copies: crate::HashMap::default(),
+            cell_copies_key: None,
         }
+    }
+
+    /// Writes the cell row `item`, every reference into a file being rewritten
+    /// pointed at a copy of its object.
+    ///
+    /// A row's frames are read by handle, not matched against the sequential
+    /// scan: the frames of one key sit in the scan newest version first, and a
+    /// row's borrowed objects belong to older versions, so claiming them in
+    /// cell order would drain frames a version still to come holds. The scan
+    /// drains them later like any frame no pointer claimed, after they are
+    /// copied.
+    ///
+    /// Each reference keeps its owner bit: the rows that reach a relocation
+    /// already carry exactly one owner among the kept holders of an object.
+    /// Every holder is in the pass, since a file is relocated only when every
+    /// table that links it is an input, and the ownership ledger settled the
+    /// key before writing it: ownership moved off an owner the pass dropped,
+    /// and an object whose owner went with a whole-table drop passed to its
+    /// oldest holder. So the copy has exactly one owner.
+    fn write_cell_row(&mut self, item: InternalValue) -> crate::Result<()> {
+        use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
+
+        if self
+            .cell_copies_key
+            .as_ref()
+            .is_none_or(|key| !crate::comparator::same_user_key(key, &item.key.user_key))
+        {
+            self.cell_copies.clear();
+            self.cell_copies_key = Some(item.key.user_key.clone());
+        }
+
+        let mut cells = decode_row(&item.value)?;
+        let mut rewritten = false;
+        for field in &mut cells {
+            let RowCell::Ref { indirection, .. } = &mut field.cell else {
+                continue;
+            };
+            if !self
+                .rewriting_blob_file_codecs
+                .contains_key(&indirection.vhandle.blob_file_id)
+            {
+                continue;
+            }
+            rewritten = true;
+            if let Some(copy) = self.cell_copies.get(&indirection.vhandle) {
+                *indirection = *copy;
+                continue;
+            }
+            let copy = self.copy_frame(&item.key.user_key, item.key.seqno, indirection)?;
+            self.cell_copies.insert(indirection.vhandle, copy);
+            *indirection = copy;
+        }
+
+        let row = if rewritten {
+            crate::UserValue::from(encode_row(&cells)?)
+        } else {
+            item.value
+        };
+        self.inner
+            .table_writer
+            .write(InternalValue::from_components(
+                item.key.user_key,
+                row.clone(),
+                item.key.seqno,
+                crate::ValueType::CellRow,
+            ))?;
+        self.inner.table_writer.register_cell_row(&row)
+    }
+
+    /// Copies the frame `indirection` names, verbatim, into this pass's
+    /// output and returns the copy's indirection.
+    fn copy_frame(
+        &mut self,
+        key: &[u8],
+        seqno: crate::SeqNo,
+        indirection: &BlobIndirection,
+    ) -> crate::Result<BlobIndirection> {
+        let blob_file_id = indirection.vhandle.blob_file_id;
+        let Some(blob_file) = self
+            .rewriting_blob_files
+            .iter()
+            .find(|file| file.id() == blob_file_id)
+        else {
+            return Err(crate::Error::InvalidHeader(
+                "cell row references a rewritten blob file the pass does not hold",
+            ));
+        };
+        let file_id = crate::GlobalTableId::from((self.tree_id, blob_file_id));
+        let (file, _) = blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&file_id, &blob_file.0.path)?;
+        let (stored, uncompressed_len) =
+            crate::vlog::blob_file::reader::Reader::new(blob_file, file.as_ref())
+                .read_raw(key, &indirection.vhandle)?;
+
+        // Paced like a matched frame: see the whole-value path in `write`.
+        let _ = self
+            .rate_limiter
+            .request_interruptible(stored.len() as u64, || self.stop_signal.is_stopped());
+
+        self.blob_writer
+            .record_source_compression(blob_file.compression())?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a frame's decoded length is bounded by the 256 MiB value cap"
+        )]
+        let vhandle = self
+            .blob_writer
+            .write_raw(key, seqno, &stored, uncompressed_len as u32)?;
+        Ok(BlobIndirection {
+            vhandle,
+            size: indirection.size,
+        })
     }
 
     /// Marks this as a tight-space slice ending (exclusively) at `bound`; see
@@ -809,6 +1066,9 @@ impl CompactionFlavour for RelocatingCompaction {
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+        if item.key.value_type.is_cell_row() {
+            return self.write_cell_row(item);
+        }
         if item.key.value_type.is_indirection() {
             let mut reader = &item.value[..];
 
@@ -981,6 +1241,8 @@ impl CompactionFlavour for RelocatingCompaction {
             filter_transformed: false,
             collected_below_watermark: false,
             filter_sizing,
+            // The producer owns the ownership ledger and sets this after.
+            released_objects: Vec::new(),
         })
     }
 }
@@ -1047,6 +1309,14 @@ impl CompactionFlavour for StandardCompaction {
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+        if item.key.value_type.is_cell_row() {
+            // The row is kept as it is, ownership included; the slice clone
+            // is a reference-count bump, since the writer takes the item.
+            let row = item.value.clone();
+            self.table_writer.write(item)?;
+            return self.table_writer.register_cell_row(&row);
+        }
+
         let indirection = if item.key.value_type.is_indirection() {
             Some({
                 let mut reader = &item.value[..];
@@ -1093,6 +1363,8 @@ impl CompactionFlavour for StandardCompaction {
             filter_transformed: false,
             collected_below_watermark: false,
             filter_sizing,
+            // The producer owns the ownership ledger and sets this after.
+            released_objects: Vec::new(),
         })
     }
 }

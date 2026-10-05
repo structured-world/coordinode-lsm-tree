@@ -385,7 +385,7 @@ fn cell_of(column: &Column, rows: u32, row: u32) -> crate::Result<&[u8]> {
 }
 
 /// A whole value holds declared fields and no projector is set to read them.
-const UNREADABLE: Error = Error::Projection(
+pub(super) const UNREADABLE: Error = Error::Projection(
     "projection: a row returned stores its value whole, and declared fields are read out \
      of it through a projector, which is not set",
 );

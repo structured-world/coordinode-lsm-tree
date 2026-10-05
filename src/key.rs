@@ -32,6 +32,7 @@ impl core::fmt::Debug for InternalKey {
                 ValueType::WeakTombstone => "W",
                 ValueType::MergeOperand => "M",
                 ValueType::Indirection => "Vb",
+                ValueType::CellRow => "Vc",
             },
         )
     }

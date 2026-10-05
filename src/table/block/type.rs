@@ -98,6 +98,11 @@ pub enum BlockType {
     /// prune never pays for it. The key column's zones live in the
     /// [`Self::ColumnPageDirectory`], which every point read reads anyway.
     ColumnZones,
+    /// Optional per-table list of the blob objects the table's cell rows own,
+    /// sorted by blob file and offset: what dropping the whole table releases,
+    /// read without reading its data. Absent when the table owns no cell-row
+    /// object.
+    OwnedBlobObjects,
 }
 
 // Wire tags are renumbered contiguously `0..=6` for V5. The previous
@@ -130,6 +135,7 @@ impl From<BlockType> for u8 {
             BlockType::ColumnPageDirectory => 13,
             BlockType::ColumnPage => 14,
             BlockType::ColumnZones => 15,
+            BlockType::OwnedBlobObjects => 16,
         }
     }
 }
@@ -154,6 +160,7 @@ impl TryFrom<u8> for BlockType {
             13 => Ok(Self::ColumnPageDirectory),
             14 => Ok(Self::ColumnPage),
             15 => Ok(Self::ColumnZones),
+            16 => Ok(Self::OwnedBlobObjects),
             _ => Err(crate::Error::InvalidTag(("BlockType", value))),
         }
     }

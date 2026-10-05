@@ -376,6 +376,24 @@ fn number_and_bytes(
     (numbers, bytes)
 }
 
+/// A value of another width than its number's is refused rather than encoded
+/// as if zero-extended or cut, which would order it among the wrong values.
+#[test]
+fn a_comparable_encoding_of_another_width_is_refused() {
+    for number in numbers() {
+        let width = usize::from(number.width());
+        for len in [width - 1, width + 1] {
+            assert!(
+                matches!(
+                    number.comparable(&vec![0u8; len]),
+                    Err(crate::Error::InvalidHeader(_))
+                ),
+                "{len} bytes encoded for a {width}-byte number"
+            );
+        }
+    }
+}
+
 /// A descriptor, values of it, their null marks, and two optional bounds.
 type NumberCase = (
     Number,

@@ -269,6 +269,48 @@ fn scan_since_resolves_blob_values_on_blob_tree() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A row written as cells comes back as an Insert carrying its logical value,
+/// with the field kept in a blob file read in: the same value a point read
+/// returns, never the encoded row or its reference.
+#[test]
+fn scan_since_resolves_cell_rows_on_blob_tree() -> lsm_tree::Result<()> {
+    use lsm_tree::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let folder = get_tmp_folder();
+    let tree = open_blob_tree(folder.path())?;
+    let body = b"blobby".repeat(40_000);
+    tree.insert_cells(
+        "doc",
+        &[
+            Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+            Field::bytes(FIRST_FIELD_COLUMN + 1, &body),
+        ],
+        0,
+    )?;
+    tree.flush_active_memtable(0)?;
+    assert!(tree.blob_file_count() > 0, "the body must be separated");
+
+    let got: Vec<ScanSinceEvent> = tree.scan_since_seqno(0)?.collect();
+    let value = got
+        .iter()
+        .find_map(|e| match e {
+            ScanSinceEvent::Insert { key, value, .. } if &**key == b"doc" => Some(value.to_vec()),
+            _ => None,
+        })
+        .expect("an Insert for the cell row must be emitted");
+    let read = tree.get("doc", SeqNo::MAX)?.expect("the row reads");
+    assert_eq!(
+        value,
+        read.to_vec(),
+        "the event carries the row as a read gives it"
+    );
+    assert!(
+        value.windows(body.len()).any(|w| w == body.as_slice()),
+        "the separated body is read in"
+    );
+    Ok(())
+}
+
 #[test]
 fn scan_since_seqno_translates_ingested_global_seqno() -> lsm_tree::Result<()> {
     // Bulk-ingested tables store entries at LOCAL seqno 0 but carry a

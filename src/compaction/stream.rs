@@ -592,7 +592,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 // type, so nothing tells the two apart, and that release
                 // already read it as a put when it was the newest version and
                 // collected the versions under it in its own compaction.
-                ValueType::Value | ValueType::Indirection => {
+                ValueType::Value | ValueType::Indirection | ValueType::CellRow => {
                     found_boundary = true;
                     // A covered base is not a base: the tombstone hides it from
                     // every reader. Where this compaction may delete it, it
@@ -626,7 +626,10 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                             watcher.on_dropped(&next);
                         }
                         self.note_transform();
-                    } else if next.key.value_type == ValueType::Indirection {
+                    } else if matches!(
+                        next.key.value_type,
+                        ValueType::Indirection | ValueType::CellRow
+                    ) {
                         let Some(value) = self.filter.read_separated_base(&next)? else {
                             // This stream cannot read the value log: the chain
                             // and its base go back unchanged, in order.
@@ -1102,13 +1105,16 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                     }
                     continue;
                 } else if head.key.value_type == ValueType::WeakTombstone
-                    && peeked.key.value_type == ValueType::Value
+                    && peeked.key.value_type.is_put()
                     && head.key.seqno < self.gc_watermark
                 {
                     // The weak delete and the put it consumed leave the output
                     // together: an annihilation, a visibility transform rather
                     // than a GC fold, and it needs no bottom level because a
                     // weak delete is contracted to a key written at most once.
+                    // The put may be a value, an indirection or a cell row:
+                    // the drain reports it to the dropped-version callback,
+                    // which charges the blob objects it owned.
                     //
                     // It is bounded by the watermark for the reason above: a
                     // snapshot between the put and the delete resolves to the

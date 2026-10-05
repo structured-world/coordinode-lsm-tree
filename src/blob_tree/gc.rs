@@ -132,6 +132,27 @@ impl crate::coding::Decode for FragmentationMap {
     }
 }
 
+impl FragmentationMap {
+    /// Charges the object `vptr` names as garbage in its blob file.
+    pub(crate) fn charge(&mut self, vptr: &BlobIndirection) {
+        let size = u64::from(vptr.size);
+        let on_disk_size = u64::from(vptr.vhandle.on_disk_size);
+
+        self.0
+            .entry(vptr.vhandle.blob_file_id)
+            .and_modify(|counter| {
+                counter.len += 1;
+                counter.bytes += size;
+                counter.on_disk_bytes += on_disk_size;
+            })
+            .or_insert_with(|| FragmentationEntry {
+                bytes: size,
+                on_disk_bytes: on_disk_size,
+                len: 1,
+            });
+    }
+}
+
 impl DroppedKvCallback for FragmentationMap {
     fn on_dropped(&mut self, kv: &crate::InternalValue) {
         if kv.key.value_type.is_indirection() {
@@ -144,21 +165,21 @@ impl DroppedKvCallback for FragmentationMap {
             let vptr =
                 BlobIndirection::decode_from(&mut reader).expect("should parse BlobIndirection");
 
-            let size = u64::from(vptr.size);
-            let on_disk_size = u64::from(vptr.vhandle.on_disk_size);
-
-            self.0
-                .entry(vptr.vhandle.blob_file_id)
-                .and_modify(|counter| {
-                    counter.len += 1;
-                    counter.bytes += size;
-                    counter.on_disk_bytes += on_disk_size;
-                })
-                .or_insert_with(|| FragmentationEntry {
-                    bytes: size,
-                    on_disk_bytes: on_disk_size,
-                    len: 1,
-                });
+            self.charge(&vptr);
+        } else if kv.key.value_type.is_cell_row() {
+            // Only the owning references are charged: a borrowed one leaving
+            // frees nothing, its object is charged once, through its owner.
+            #[expect(
+                clippy::expect_used,
+                reason = "data is read and checked for corruption, so we expect the cell row to decode"
+            )]
+            let refs =
+                crate::blob_tree::field_row::row_refs(&kv.value).expect("should parse a cell row");
+            for (vptr, owned) in refs {
+                if owned {
+                    self.charge(&vptr);
+                }
+            }
         }
     }
 }

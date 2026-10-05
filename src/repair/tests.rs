@@ -13600,6 +13600,215 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
     Ok(())
 }
 
+/// A table that is itself a salvaged replacement and also references a
+/// salvaged blob is rewritten a second time, from the replacement. That
+/// rewrite must take over the replacement's pending swap: queued as a second
+/// swap onto the replacement's own name, it would run after the first and
+/// leave the un-remapped bytes under the name the manifest gives the rewrite,
+/// with the rewrite parked under a temporary name until some later open.
+#[test]
+fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite() -> crate::Result<()>
+{
+    use crate::fs::{Fs, MemFs};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    damage_a_table_and_its_blob(&memfs, &root)?;
+
+    let report = chained_config(&root, memfs.clone()).repair_with_salvage(true)?;
+    assert_eq!(
+        report.salvaged, 1,
+        "the damaged table is salvaged: {report:?}"
+    );
+    assert_eq!(
+        report.blob_files_salvaged.len(),
+        1,
+        "the damaged blob is salvaged: {report:?}",
+    );
+    assert_eq!(report.recovered, 1, "one table is published: {report:?}");
+    // The repair finishes its own swaps: the name the manifest gives the table
+    // holds the rewrite, and no temporary is left for the next open to finish.
+    let names: Vec<String> = memfs
+        .read_dir(&root.join(crate::file::TABLES_FOLDER))?
+        .into_iter()
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(names, ["0"], "only the published table is left");
+
+    // Every surviving key reads its own value: the published table is the
+    // remapped rewrite, not the replacement it was rewritten from.
+    assert_chained_rewrite_reads(&chained_config(&root, memfs))
+}
+
+/// A crash between the manifest commit and the swap that follows it leaves
+/// the copy the manifest names where the next open finishes swaps from: that
+/// open reads the remapped rewrite. Whichever rename into the table's names
+/// fails, a repair that committed reopens.
+#[test]
+fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use std::sync::Arc;
+
+    let mut lost_after_commit = 0;
+    for skip in 0..3u64 {
+        let memfs = Arc::new(MemFs::new());
+        let root = std::path::absolute("/db")?;
+        damage_a_table_and_its_blob(&memfs, &root)?;
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+                .on_path(root.join("tables").join("0").to_string_lossy())
+                .skip(skip)
+                .times(1),
+        );
+        let result = chained_config(&root, Arc::new(fault)).repair_with_salvage(true);
+        if result.is_ok() || !memfs.exists(&root.join("current"))? {
+            continue;
+        }
+        lost_after_commit += 1;
+        assert_chained_rewrite_reads(&chained_config(&root, memfs))?;
+    }
+    assert!(
+        lost_after_commit > 0,
+        "some rename lands on the swap after the commit"
+    );
+    Ok(())
+}
+
+/// The configuration of the chained-rewrite tree: 128-byte data blocks and
+/// every value separated.
+fn chained_config(root: &std::path::Path, fs: std::sync::Arc<dyn crate::fs::Fs>) -> crate::Config {
+    crate::Config::new(
+        root,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(128))
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(16),
+    ))
+}
+
+/// The value of key `i` in the chained-rewrite tree.
+#[expect(clippy::expect_used, reason = "test code")]
+fn chained_value(i: u32) -> Vec<u8> {
+    alloc::vec![b'a' + u8::try_from(i % 26).expect("small i"); 64]
+}
+
+/// Opens the chained-rewrite tree and reads it back: the earlier blocks as a
+/// prefix of the keys with their own values, the damaged last block lost.
+fn assert_chained_rewrite_reads(config: &crate::Config) -> crate::Result<()> {
+    use crate::AbstractTree;
+
+    let n = 40u32;
+    let crate::AnyTree::Blob(tree) = config.clone().open()? else {
+        panic!("expected blob tree");
+    };
+    let mut readable = 0u32;
+    for i in 0..n {
+        if let Some(v) = tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)? {
+            assert_eq!(readable, i, "k{i:04} reads after a lost key");
+            assert_eq!(
+                &*v,
+                chained_value(i).as_slice(),
+                "k{i:04} reads its own value"
+            );
+            readable += 1;
+        }
+    }
+    assert!(
+        readable > n / 2 && readable < n,
+        "the earlier blocks survive, the last does not: {readable} of {n} keys read",
+    );
+    Ok(())
+}
+
+/// Writes 40 separated values in one table, then damages the table's last
+/// data block and the blob file's last frame and drops the manifest: phase
+/// one salvages the table into a replacement, the blob stage salvages the
+/// blob file, and the replacement is rewritten through the remap.
+#[expect(clippy::expect_used, reason = "test code")]
+fn damage_a_table_and_its_blob(
+    memfs: &std::sync::Arc<crate::fs::MemFs>,
+    root: &std::path::Path,
+) -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::Fs;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let n = 40u32;
+    {
+        let crate::AnyTree::Blob(tree) = chained_config(root, memfs.clone()).open()? else {
+            panic!("expected blob tree");
+        };
+        for i in 0..n {
+            tree.insert(
+                format!("k{i:04}").as_bytes(),
+                chained_value(i),
+                u64::from(i),
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // Damage the LAST data block of the table, so phase one salvages it into a
+    // replacement holding the earlier blocks.
+    let table_path = memfs
+        .read_dir(&root.join(crate::file::TABLES_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one table")
+        .path;
+    let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
+        .data_block_handles()
+        .filter_map(Result::ok)
+        .map(|kh| *kh.as_ref().offset())
+        .collect::<Vec<_>>();
+    assert!(
+        block_offsets.len() > 2,
+        "the table spans several data blocks"
+    );
+    let flip_table_at = block_offsets.last().expect("a last block") + 16;
+
+    // Damage the LAST blob frame, so the blob stage salvages the blob file and
+    // every surviving reference has to be remapped.
+    let blob_path = memfs
+        .read_dir(&root.join(crate::file::BLOBS_FOLDER))?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let frames: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let flip_blob_at = frames.last().expect("last frame").frame_end - 8;
+
+    for (path, at) in [(&table_path, flip_table_at), (&blob_path, flip_blob_at)] {
+        let mut file = memfs.open(
+            path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, at, 1)?;
+        file.seek(SeekFrom::Start(at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    for e in memfs.read_dir(root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    Ok(())
+}
+
 /// A repair that fails part-way must leave the tree byte-for-byte as it was
 /// found, so the retry re-derives everything from the untouched originals.
 /// This is what makes recovery safe without a journal: the salvaged
@@ -14565,6 +14774,379 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
             "record k{i:04} above the frontier must survive the rewrite",
         );
     }
+    Ok(())
+}
+
+/// The same for rows written as cells: a recovered table whose cell row
+/// references an object below a punched blob file's frontier is rewritten,
+/// the row dropped and every other row kept.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let fs_dyn: Arc<dyn Fs> = memfs.clone();
+    let root = std::path::absolute("/db")?;
+    let open = || -> crate::Result<crate::BlobTree> {
+        match Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .open()?
+        {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+
+    {
+        let tree = open()?;
+        for i in 0..8u32 {
+            tree.insert_cells(
+                format!("k{i:04}"),
+                &[
+                    Field::bytes(FIRST_FIELD_COLUMN, b"s"),
+                    Field::bytes(FIRST_FIELD_COLUMN + 1, &[b'v'; 64]),
+                ],
+                u64::from(i),
+            )?;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(entries.len() >= 2, "several frames written");
+    let frontier = entries.first().expect("first frame").frame_end;
+    let data_start = {
+        let mut file = fs_dyn.open(&blob_path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        reader
+            .toc()
+            .section(b"data")
+            .expect("blob file has a data section")
+            .pos()
+    };
+    memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 1,
+        "the table survives, rewritten: {report:?}"
+    );
+    assert_eq!(report.salvaged, 1, "{report:?}");
+
+    let tree = open()?;
+    assert_eq!(
+        tree.get(b"k0000", crate::MAX_SEQNO)?,
+        None,
+        "the row referencing the punched record reads as absent"
+    );
+    for i in 1..8u32 {
+        assert!(
+            tree.get(format!("k{i:04}").as_bytes(), crate::MAX_SEQNO)?
+                .is_some(),
+            "row k{i:04} above the frontier must survive the rewrite",
+        );
+    }
+    Ok(())
+}
+
+/// An object whose owning row went with a table the rebuild could not find is
+/// handed to the oldest row left that borrows it: when that row goes too, the
+/// object is charged as garbage and its file dropped, as it would have been
+/// with its owner.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    const STATUS: u16 = FIRST_FIELD_COLUMN;
+    const BODY: u16 = FIRST_FIELD_COLUMN + 1;
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        // The object's charge is its stored size: uncompressed, its length.
+        .blob_compression(crate::CompressionType::None)
+    };
+    let open = || -> crate::Result<crate::BlobTree> {
+        match config().open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+    let body = vec![b'b'; 4_096];
+
+    {
+        let tree = open()?;
+        // The owner, then a metadata-only update borrowing its body, each in
+        // a table of its own.
+        tree.insert_cells(
+            "doc",
+            &[Field::bytes(STATUS, b"draft"), Field::bytes(BODY, &body)],
+            0,
+        )?;
+        tree.flush_active_memtable(0)?;
+        let row = tree.get_cells("doc", crate::MAX_SEQNO)?.expect("the row");
+        let held = row
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        assert!(matches!(held.cell, Cell::Ref(_)), "the body is a reference");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"final"), held], 1)?;
+        drop(row);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The manifest is lost, and with it the owner's table.
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let tables = root.join(crate::file::TABLES_FOLDER);
+    let owner = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| e.file_name.parse::<u64>().ok().map(|id| (id, e.path)))
+        .min_by_key(|(id, _)| *id)
+        .expect("the owner's table")
+        .1;
+    memfs.remove_file(&owner)?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 1, "{report:?}");
+
+    let tree = open()?;
+    let framed = |cells: &[&[u8]]| {
+        let mut out = Vec::new();
+        for cell in cells {
+            out.extend_from_slice(&u32::try_from(cell.len()).expect("small").to_le_bytes());
+            out.extend_from_slice(cell);
+        }
+        out
+    };
+    assert_eq!(
+        tree.get("doc", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"final", &body])[..])
+    );
+    // The borrower now owns the body: overwritten, it is charged once, and
+    // the next install drops the file, which held nothing else.
+    tree.insert("doc", "gone", 2);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged");
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
+    Ok(())
+}
+
+/// Of several rows left that borrow an object whose owner was lost, the one
+/// with the oldest seqno becomes its owner, wherever the tables holding them
+/// fall in the scan. An object whose owner survived is handed to no one, and
+/// tables with no reference into the lost owner's files, or rows with no blob
+/// reference at all, change nothing.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    const STATUS: u16 = FIRST_FIELD_COLUMN;
+    const BODY: u16 = FIRST_FIELD_COLUMN + 1;
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&memfs) as Arc<dyn Fs>)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .blob_compression(crate::CompressionType::None)
+    };
+    let open = || -> crate::Result<crate::BlobTree> {
+        match config().open()? {
+            crate::AnyTree::Blob(t) => Ok(t),
+            crate::AnyTree::Standard(_) => panic!("expected blob tree"),
+        }
+    };
+    let body = vec![b'b'; 4_096];
+    let kept_body = vec![b'k'; 4_096];
+    let held_body = |tree: &crate::BlobTree,
+                     key: &str|
+     -> crate::Result<crate::blob_tree::field_row::RowCells> {
+        Ok(tree.get_cells(key, crate::MAX_SEQNO)?.expect("the row"))
+    };
+
+    {
+        let tree = open()?;
+        // The owner of `doc`'s body, in the table the manifest loss takes.
+        tree.insert_cells(
+            "doc",
+            &[Field::bytes(STATUS, b"draft"), Field::bytes(BODY, &body)],
+            0,
+        )?;
+        tree.flush_active_memtable(0)?;
+
+        // The NEWER borrower first, in an older table, beside an inline value
+        // and `kept`, whose owner stays.
+        let doc = held_body(&tree, "doc")?;
+        let doc_body = doc
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"third"), doc_body], 3)?;
+        tree.insert("note", "x", 3);
+        tree.insert_cells(
+            "kept",
+            &[
+                Field::bytes(STATUS, b"draft"),
+                Field::bytes(BODY, &kept_body),
+            ],
+            3,
+        )?;
+        drop(doc);
+        tree.flush_active_memtable(0)?;
+
+        // The OLDER borrower, in a newer table, with `kept`'s borrower.
+        let doc = held_body(&tree, "doc")?;
+        let doc_body = doc
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        let kept = held_body(&tree, "kept")?;
+        let kept_ref = kept
+            .fields()?
+            .into_iter()
+            .find(|f| f.column == BODY)
+            .expect("the body");
+        tree.insert_cells("doc", &[Field::bytes(STATUS, b"second"), doc_body], 2)?;
+        tree.insert_cells("kept", &[Field::bytes(STATUS, b"final"), kept_ref], 4)?;
+        drop((doc, kept));
+        tree.flush_active_memtable(0)?;
+
+        // A table whose only reference is into a file of its own.
+        tree.insert("other", vec![b'o'; 4_096], 5);
+        tree.flush_active_memtable(0)?;
+    }
+
+    for e in memfs.read_dir(&root)? {
+        let is_version = e
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_version || e.file_name == "current" {
+            memfs.remove_file(&e.path)?;
+        }
+    }
+    let tables = root.join(crate::file::TABLES_FOLDER);
+    let owner = memfs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .filter_map(|e| e.file_name.parse::<u64>().ok().map(|id| (id, e.path)))
+        .min_by_key(|(id, _)| *id)
+        .expect("the owner's table")
+        .1;
+    memfs.remove_file(&owner)?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 3, "{report:?}");
+
+    let tree = open()?;
+    let framed = |cells: &[&[u8]]| {
+        let mut out = Vec::new();
+        for cell in cells {
+            out.extend_from_slice(&u32::try_from(cell.len()).expect("small").to_le_bytes());
+            out.extend_from_slice(cell);
+        }
+        out
+    };
+    assert_eq!(
+        tree.get("doc", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"third", &body])[..])
+    );
+    assert_eq!(
+        tree.get("note", crate::MAX_SEQNO)?.as_deref(),
+        Some(&b"x"[..])
+    );
+    assert_eq!(
+        tree.get("kept", crate::MAX_SEQNO)?.as_deref(),
+        Some(&framed(&[b"final", &kept_body])[..])
+    );
+
+    // Overwritten, `doc`'s body is charged once, by the one row that owns it,
+    // and its file goes; `kept`'s body, owned as before, is not charged.
+    tree.insert("doc", "gone", 10);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
+    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
+    assert_eq!(
+        tree.blob_file_count(),
+        2,
+        "the file that held only the object goes; `kept`'s and `other`'s stay"
+    );
     Ok(())
 }
 

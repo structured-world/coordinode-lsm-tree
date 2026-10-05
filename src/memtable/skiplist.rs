@@ -650,7 +650,7 @@ impl SkipMap {
         // flag and is not part of the type.
         let byte = m[10] & VALUE_TYPE_MASK;
         debug_assert!(
-            byte <= 4,
+            ValueType::try_from(byte).is_ok(),
             "invalid ValueType byte {byte} at node offset {node}, meta={m:?}",
         );
         ValueType::try_from(byte).expect("valid ValueType discriminant")

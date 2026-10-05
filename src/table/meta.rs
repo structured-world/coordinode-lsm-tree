@@ -46,6 +46,10 @@ pub enum ValueLayout {
     /// The value split into caller fields, one column each: a columnar batch
     /// ingested as it was built. A field without a column is not in the table.
     Split,
+    /// The table of a tree whose rows may be written as cells: a cell row's
+    /// fields in the columns their ids name, its references beside them, and
+    /// every other value whole, read back as it was written.
+    Cells,
 }
 
 impl ValueLayout {
@@ -55,6 +59,7 @@ impl ValueLayout {
         match self {
             Self::Whole => 0,
             Self::Split => 1,
+            Self::Cells => 2,
         }
     }
 }
@@ -522,6 +527,7 @@ impl ParsedMeta {
             Some(v) => match v.value.as_ref() {
                 [0] => ValueLayout::Whole,
                 [1] => ValueLayout::Split,
+                [2] => ValueLayout::Cells,
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
         };
