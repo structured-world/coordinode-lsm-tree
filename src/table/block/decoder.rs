@@ -1193,6 +1193,14 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         }
     }
 
+    /// Whether the low cursor stands at or before the upper bound, so the item
+    /// that ends at it lies inside the bound. Always true with no bound set.
+    #[must_use]
+    pub fn lo_within_upper_bound(&self) -> bool {
+        self.hi_scanner.base_key_offset.is_none()
+            || self.lo_scanner.offset <= self.hi_scanner.offset
+    }
+
     #[must_use]
     pub fn upper_stack_tail_cmp(
         &self,

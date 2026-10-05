@@ -102,6 +102,8 @@ impl<'a> Iter<'a> {
     /// Keeps where a preceding [`seek`](Self::seek) put the front: `seek` holds
     /// its candidate in the front cache after the decoder's low cursor has
     /// already moved past it, so clearing that cache would drop the candidate.
+    /// A candidate past the new bound is dropped, so a bound below it walks
+    /// nothing.
     pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         // seek_upper_impl may return Err on a poisoned/clamped cursor;
         // the public bool-returning API treats that as "not found" for
@@ -148,6 +150,7 @@ impl<'a> Iter<'a> {
             )
         };
         if !found {
+            self.decoder.reset_front_peeked();
             return Ok(false);
         }
 
@@ -191,8 +194,16 @@ impl<'a> Iter<'a> {
                 .upper_stack_tail_cmp(|item, bytes| item.compare_key(needle, bytes, cmp.as_ref()))
                 .is_none()
             {
+                self.decoder.reset_front_peeked();
                 return Err(crate::Error::InvalidTrailer);
             }
+        }
+
+        // A front entry cached by a preceding `seek` ends where the low cursor
+        // stands: past the bound it lies outside the range, and `next` would
+        // hand it out before the decoder checks the bound.
+        if !self.decoder.inner_mut().lo_within_upper_bound() {
+            self.decoder.reset_front_peeked();
         }
 
         Ok(true)
@@ -219,13 +230,8 @@ impl<'a> Iter<'a> {
         // Keep the front cache intact: lower-bound cursor seeks intentionally
         // seed the first candidate via `peek()`. Clearing front cache here
         // would skip that candidate because the underlying decoder has already
-        // advanced its low cursor past the peeked item.
-        //
-        // The cached candidate cannot fall outside the upper bound because callers
-        // guarantee lo <= hi: seek_lower positions lo at the first block with
-        // end_key >= lo_needle, and seek_upper positions hi at the first block with
-        // end_key > hi_needle. Since lo_needle <= hi_needle, front_peeked is always
-        // within the bounded window.
+        // advanced its low cursor past the peeked item. `seek_upper_impl`
+        // drops it only when it lies past the bound.
         self.seek_upper_impl(needle, false, true)
     }
 }
