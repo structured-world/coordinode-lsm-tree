@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.16](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.15...v5.11.16) - 2026-10-05
+
+### Fixed
+
+- *(version)* a failed manifest rotation no longer blocks the next install (5.x.x) ([#841](https://github.com/structured-world/coordinode-lsm-tree/pull/841))
+- *(index_block)* an upper bound keeps the block a key's older versions run into (5.x.x) ([#840](https://github.com/structured-world/coordinode-lsm-tree/pull/840))
+
+### Performance
+
+- *(bench)* pair the head-to-head engines in rounds ([#823](https://github.com/structured-world/coordinode-lsm-tree/pull/823))
+- *(bench)* fit the benchmark workflow in 30 minutes ([#816](https://github.com/structured-world/coordinode-lsm-tree/pull/816))
+
 ## [5.11.15](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.14...v5.11.15) - 2026-10-03
 
 ### Fixed
