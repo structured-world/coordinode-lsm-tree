@@ -604,6 +604,70 @@ fn a_mistyped_field_or_a_field_by_id_is_refused() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A row the predicate drops does not fail the scan over a projected field it
+/// stores under another type, in the memtable, a row table or a columnar
+/// table; a row it keeps does.
+#[test]
+fn a_mistyped_field_fails_only_the_rows_the_predicate_keeps() -> lsm_tree::Result<()> {
+    for (columnar, flushed) in [(false, false), (false, true), (true, true)] {
+        let folder = get_tmp_folder();
+        let (any, tree) = open(folder.path(), columnar)?;
+        insert(&tree, "a", b"s", 1, b"body", 0);
+        let price = 50u32.to_le_bytes();
+        let body = 7u32.to_le_bytes();
+        tree.insert_cells(
+            "b",
+            &[
+                Field {
+                    column: PRICE,
+                    tag: u32_le(),
+                    cell: Cell::Value(&price),
+                },
+                // The body, stored as a number.
+                Field {
+                    column: BODY,
+                    tag: u32_le(),
+                    cell: Cell::Value(&body),
+                },
+            ],
+            1,
+        )?;
+        if flushed {
+            tree.flush_active_memtable(0)?;
+        }
+
+        let projection = Projection::new()
+            .column(COL_USER_KEY)
+            .field(field(PRICE, u32_le()))
+            .field(field(BODY, TypeTag::Bytes));
+        let range = |lower: u32, upper: u32| ColumnRangePredicate {
+            column_id: PRICE,
+            lower: Some(lower.to_be_bytes().to_vec()),
+            upper: Some(upper.to_be_bytes().to_vec()),
+            apply: PredicateApply::Filter,
+        };
+        let got =
+            rows(any.columnar_scan(projection.clone(), Some(&range(0, 19)), SeqNo::MAX, ..)?)?;
+        assert_eq!(
+            got,
+            vec![(
+                b"a".to_vec(),
+                vec![Some(1u32.to_le_bytes().to_vec()), Some(b"body".to_vec())]
+            )],
+            "columnar={columnar}, flushed={flushed}: the dropped row does not fail the scan"
+        );
+
+        let kept: lsm_tree::Result<Vec<ColumnBatch>> = any
+            .columnar_scan(projection, Some(&range(40, 60)), SeqNo::MAX, ..)?
+            .collect();
+        assert!(
+            matches!(kept, Err(lsm_tree::Error::Projection(_))),
+            "columnar={columnar}, flushed={flushed}: a kept mistyped row fails: {kept:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A tree whose columnar tables cut rows into small pages and keep every
 /// field inline, so a field is read page by page.
 fn open_paged(path: &std::path::Path) -> lsm_tree::Result<(AnyTree, BlobTree)> {

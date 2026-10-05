@@ -184,6 +184,9 @@ fn read_fields(
     let mut now: Vec<Fetch> = Vec::new();
     let mut later: Vec<Fetch> = Vec::new();
     let mut out_types: Vec<u8> = Vec::with_capacity(row_count);
+    // Rows holding a field other than the predicate's under another type than
+    // declared: they fail the scan only if the predicate keeps them.
+    let mut mistyped: Vec<u32> = Vec::new();
     for row in 0..batch.row_count {
         let at = row as usize;
         rows.keys.push(Slice::from(bytes_column_row(
@@ -228,7 +231,10 @@ fn read_fields(
                     let Some(held) = held else {
                         continue;
                     };
-                    check_type(field, held)?;
+                    if !holds_declared_type(field, held, judged == Some(index))? {
+                        mistyped.push(row);
+                        continue;
+                    }
                     match held.cell {
                         RowCell::Value(bytes) => *slot = Some(Slice::from(bytes)),
                         RowCell::Ref { indirection, .. } => reference(index, indirection),
@@ -247,8 +253,11 @@ fn read_fields(
                         else {
                             continue;
                         };
-                        if let Some(field) = declared.get(index) {
-                            check_type(field, &held)?;
+                        if let Some(field) = declared.get(index)
+                            && !holds_declared_type(field, &held, judged == Some(index))?
+                        {
+                            mistyped.push(row);
+                            continue;
                         }
                         if let RowCell::Ref { indirection, .. } = held.cell {
                             reference(index, indirection);
@@ -314,6 +323,16 @@ fn read_fields(
         }
     }
 
+    // A mistyped row the predicate dropped never reaches the caller; one it
+    // kept would, under the wrong type.
+    let returned = |row: &u32| {
+        kept.as_ref()
+            .is_none_or(|kept| kept.binary_search(row).is_ok())
+    };
+    if mistyped.iter().any(returned) {
+        return Err(projection::MISTYPED);
+    }
+
     read_objects(cells, &mut rows, later)?;
     project(scan, declared, &mut rows)?;
 
@@ -351,13 +370,21 @@ fn without_values(batch: ColumnBatch) -> ColumnBatch {
     ColumnBatch { row_count, columns }
 }
 
-/// Refuses a field stored under another type than its declaration.
-fn check_type(field: &ProjectedField, held: &RowField<'_>) -> crate::Result<()> {
+/// Whether a field is stored under the type it is declared with. The
+/// predicate's own field (`judged`) under another type is refused at once: the
+/// predicate cannot judge the row, which then stays and would fail the scan.
+fn holds_declared_type(
+    field: &ProjectedField,
+    held: &RowField<'_>,
+    judged: bool,
+) -> crate::Result<bool> {
     if field.type_tag() == Some(held.tag) {
-        Ok(())
-    } else {
-        Err(projection::MISTYPED)
+        return Ok(true);
     }
+    if judged {
+        return Err(projection::MISTYPED);
+    }
+    Ok(false)
 }
 
 /// Reads `fetches`, in blob file and offset order, into the rows: a field's
