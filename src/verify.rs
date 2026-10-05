@@ -609,11 +609,7 @@ impl BlockVerifyReport {
 
 /// Options for the block-checksum scrubber
 /// ([`verify_block_checksums_with`] / [`AbstractTree::verify_checksum_with`](crate::AbstractTree::verify_checksum_with)).
-// Non-exhaustive: options are added over releases, and a caller building the
-// struct by literal would break on each; `Default` plus the builder methods is
-// the construction path.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct VerifyOptions {
     /// Number of SSTs to scan concurrently. Clamped to `>= 1` and to the table
     /// count. `1` (the default) scans sequentially in table order with no
@@ -724,20 +720,30 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
 ///
 /// A block the cache already holds is still counted: telling a hit from a
 /// read would need the limiter inside the block loader, which every table
-/// read shares.
-fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8]) -> u64 {
+/// read shares. A handle that does not lie inside the file of `file_size`
+/// bytes is not counted, nor anything after it: the loader refuses it without
+/// reading.
+fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8], file_size: u64) -> u64 {
     use crate::table::block::ParsedItem;
     use crate::table::block_index::BlockIndexImpl;
 
     match &*table.block_index {
         BlockIndexImpl::Full(_) | BlockIndexImpl::Closed => 0,
-        BlockIndexImpl::VolatileFull(index) => u64::from(index.handle.size()),
+        BlockIndexImpl::VolatileFull(index) => {
+            handle_bytes_in_file(*index.handle.offset(), index.handle.size(), file_size)
+                .unwrap_or(0)
+        }
         BlockIndexImpl::TwoLevel(index) => {
             let tli = &index.top_level_index;
             let mut bytes = 0;
             for item in tli.iter(table.comparator.clone()) {
                 let partition = item.materialize(tli.as_slice());
-                bytes += u64::from(partition.size());
+                let Some(size) =
+                    handle_bytes_in_file(*partition.offset(), partition.size(), file_size)
+                else {
+                    break;
+                };
+                bytes += size;
                 if table.comparator.compare(partition.end_key(), bound) != core::cmp::Ordering::Less
                 {
                     break;
@@ -746,6 +752,18 @@ fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8]) -> u64 {
             bytes
         }
     }
+}
+
+/// The bytes a block handle names when they lie inside a file of `file_size`
+/// bytes, `None` when they run past its end: a corrupt handle may declare up
+/// to 4 GiB, which must not become a wait.
+fn handle_bytes_in_file(offset: u64, size: u32, file_size: u64) -> Option<u64> {
+    let size = u64::from(size);
+    let end = offset.checked_add(size)?;
+    if end > file_size {
+        return None;
+    }
+    Some(size)
 }
 
 /// `table`'s punch offset for `bound`, its index walk charged to `limiter`
@@ -757,7 +775,10 @@ fn paced_punch_offset(
     limiter: Option<&RateLimiter>,
 ) -> crate::Result<u64> {
     if let Some(limiter) = limiter {
-        let index = index_lookup_bytes(table, bound);
+        // The length on disk: the table's recorded size predates the index
+        // sections written after it.
+        let file_size = table.fs.metadata(&table.path)?.len;
+        let index = index_lookup_bytes(table, bound, file_size);
         if index > 0 {
             let stopped = limiter.request_interruptible(index, || false);
             debug_assert!(!stopped, "a scrub is never stopped midway");
@@ -2288,11 +2309,17 @@ type FileRead = std::io::Result<usize>;
 /// What a read of the file returns: the byte count, or the backend's error.
 #[cfg(not(feature = "std"))]
 type FileRead = io::Result<usize>;
+/// The backend's read error.
+#[cfg(feature = "std")]
+type FileError = std::io::Error;
+/// The backend's read error.
+#[cfg(not(feature = "std"))]
+type FileError = io::Error;
 
-/// The most a scan charges its limiter in one request: a block larger than
-/// this is charged in portions, so a shared limiter serves other requests
-/// between them.
-const PACE_PORTION: u64 = 64 * 1024;
+/// The most a rated scan reads in one go: a larger read is charged and made a
+/// portion at a time, so a shared limiter serves other requests between the
+/// portions and the device never sees one read as large as a block.
+const PACE_PORTION: usize = 64 * 1024;
 
 /// An SST opened for a scan whose every read of the file is charged to the
 /// limiter, when there is one, before it is made: the bytes the buffered
@@ -2304,6 +2331,9 @@ struct PacedFile<'a> {
     /// Where the next read starts, and where the file ends.
     pos: u64,
     len: u64,
+    /// An error the backend returned after bytes of the same read, which went
+    /// back first: the next read returns it, as the backend may not fail again.
+    pending: Option<FileError>,
 }
 
 impl<'a> PacedFile<'a> {
@@ -2323,6 +2353,7 @@ impl<'a> PacedFile<'a> {
             limiter,
             pos,
             len,
+            pending: None,
         })
     }
 }
@@ -2330,16 +2361,14 @@ impl<'a> PacedFile<'a> {
 #[cfg(feature = "std")]
 impl std::io::Read for PacedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let charged = self.pace(buf.len());
-        self.fill(buf, charged)
+        self.read_paced(buf)
     }
 }
 
 #[cfg(not(feature = "std"))]
 impl io::Read for PacedFile<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let charged = self.pace(buf.len());
-        self.fill(buf, charged)
+        self.read_paced(buf)
     }
 }
 
@@ -2360,6 +2389,22 @@ impl io::Seek for PacedFile<'_> {
 }
 
 impl PacedFile<'_> {
+    /// One read: an error held back from the last one first; under a limiter at
+    /// most one portion, charged and then read, a caller wanting more reading
+    /// again, as `Read` lets it.
+    fn read_paced(&mut self, buf: &mut [u8]) -> FileRead {
+        if let Some(e) = self.pending.take() {
+            return Err(e);
+        }
+        let want = match self.limiter {
+            Some(_) => buf.len().min(PACE_PORTION),
+            None => buf.len(),
+        };
+        let (head, _) = buf.split_at_mut(want);
+        let charged = self.pace(head.len());
+        self.fill(head, charged)
+    }
+
     /// Waits until the limiter admits a read of up to `want` bytes, counted
     /// only up to the file's end, which a read never goes past, and returns
     /// how many it admitted.
@@ -2367,20 +2412,12 @@ impl PacedFile<'_> {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
-        if let Some(limiter) = self.limiter {
-            // Charged a portion at a time, each waited for before the next is
-            // asked: on a limiter shared with compaction, one debit as large as
-            // a block would hold every request behind it until the whole block
-            // was repaid. The read itself still happens once, after the last
-            // portion.
-            let mut owed = bytes;
-            while owed > 0 {
-                let portion = owed.min(PACE_PORTION);
-                // A scrub has no stop signal, so the wait always ends in a read.
-                let stopped = limiter.request_interruptible(portion, || false);
-                debug_assert!(!stopped, "a scrub is never stopped midway");
-                owed -= portion;
-            }
+        if let Some(limiter) = self.limiter
+            && bytes > 0
+        {
+            // A scrub has no stop signal, so the wait always ends in a read.
+            let stopped = limiter.request_interruptible(bytes, || false);
+            debug_assert!(!stopped, "a scrub is never stopped midway");
         }
         // At most `want`, so it fits a `usize`.
         usize::try_from(bytes).unwrap_or(want)
@@ -2413,9 +2450,12 @@ impl PacedFile<'_> {
                 // the file, and an error would make the caller retry into the
                 // same buffer and lose them.
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                // The bytes already read are handed back first; the error
-                // comes again on the next read.
-                Err(_) if read > 0 => break,
+                // The bytes already read are handed back first, the error
+                // with the next read.
+                Err(e) if read > 0 => {
+                    self.pending = Some(e);
+                    break;
+                }
                 Err(e) => return Err(e),
             };
             if got == 0 {

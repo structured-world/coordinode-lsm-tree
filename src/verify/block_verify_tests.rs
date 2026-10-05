@@ -1263,6 +1263,158 @@ impl crate::fs::FsFile for InterruptedReads {
     }
 }
 
+/// A file that hands back at most `cap` bytes a read, records the largest read
+/// asked of it, and fails the read numbered `fail_at` once.
+struct ScriptedReads {
+    inner: Box<dyn crate::fs::FsFile>,
+    cap: usize,
+    fail_at: Option<usize>,
+    calls: usize,
+    largest: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for ScriptedReads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        self.largest
+            .fetch_max(buf.len(), std::sync::atomic::Ordering::Relaxed);
+        if self.fail_at == Some(self.calls) {
+            return Err(std::io::ErrorKind::Other.into());
+        }
+        let cap = buf.len().min(self.cap);
+        match buf.get_mut(..cap) {
+            Some(head) => self.inner.read(head),
+            None => Ok(0),
+        }
+    }
+}
+
+impl std::io::Write for ScriptedReads {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for ScriptedReads {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for ScriptedReads {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// A `ScriptedReads` over a fresh file holding `bytes`.
+fn scripted_file(
+    bytes: &[u8],
+    cap: usize,
+    fail_at: Option<usize>,
+) -> crate::Result<(
+    ScriptedReads,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+)> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(bytes)?;
+    }
+    let largest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let file = ScriptedReads {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        cap,
+        fail_at,
+        calls: 0,
+        largest: std::sync::Arc::clone(&largest),
+    };
+    Ok((file, largest))
+}
+
+/// Under a limiter, a read larger than a portion reaches the file a portion at
+/// a time, each just after it is charged, never as one read after the whole
+/// of it was waited for; without one, it reaches the file whole.
+#[test]
+fn a_paced_read_reaches_the_file_a_portion_at_a_time() -> crate::Result<()> {
+    let bytes: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 30);
+
+    let (file, largest) = scripted_file(&bytes, usize::MAX, None)?;
+    let mut paced = PacedFile::new(Box::new(file), Some(&limiter))?;
+    let mut read = vec![0u8; bytes.len()];
+    std::io::Read::read_exact(&mut paced, &mut read)?;
+    assert_eq!(read, bytes, "the file reads back whole");
+    let largest = largest.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        largest <= PACE_PORTION,
+        "a read of {largest} bytes reached the file at once"
+    );
+
+    let (file, largest) = scripted_file(&bytes, usize::MAX, None)?;
+    let mut unpaced = PacedFile::new(Box::new(file), None)?;
+    std::io::Read::read_exact(&mut unpaced, &mut read)?;
+    assert_eq!(read, bytes, "the file reads back whole");
+    assert_eq!(
+        largest.load(std::sync::atomic::Ordering::Relaxed),
+        bytes.len(),
+        "an unrated read is not split"
+    );
+    Ok(())
+}
+
+/// An error the file returns after some bytes of a read is not lost: the
+/// bytes come back first and the error on the next read, though the file
+/// would not fail again.
+#[test]
+fn a_paced_file_reports_an_error_that_followed_a_partial_read() -> crate::Result<()> {
+    let bytes = vec![7u8; 16 * 1024];
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 30);
+    let (file, _) = scripted_file(&bytes, 512, Some(2))?;
+    let mut paced = PacedFile::new(Box::new(file), Some(&limiter))?;
+
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(std::io::Read::read(&mut paced, &mut buf)?, 512);
+    let next = std::io::Read::read(&mut paced, &mut buf);
+    assert!(
+        matches!(&next, Err(e) if e.kind() == std::io::ErrorKind::Other),
+        "the failure reached the caller: {next:?}"
+    );
+    Ok(())
+}
+
+/// A block handle is charged only when it lies inside the file: a corrupt
+/// one declaring more than the file holds charges nothing.
+#[test]
+fn an_index_handle_past_the_file_end_is_not_charged() {
+    assert_eq!(handle_bytes_in_file(0, 4096, 8192), Some(4096));
+    assert_eq!(handle_bytes_in_file(4096, 4096, 8192), Some(4096));
+    assert_eq!(handle_bytes_in_file(4097, 4096, 8192), None);
+    assert_eq!(handle_bytes_in_file(0, u32::MAX, 8192), None);
+    assert_eq!(handle_bytes_in_file(u64::MAX, 1, 8192), None);
+}
+
 /// The punch-offset walk is charged what it reads: nothing for an index held
 /// in memory, the index block for one loaded per read, and for a partitioned
 /// index only the partitions up to the bound, all of them for a bound past the
@@ -1311,9 +1463,11 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
         let version = tree.current_version();
         let table = version.iter_tables().next().expect("one table");
 
-        let first = index_lookup_bytes(table, b"k00000");
-        let middle = index_lookup_bytes(table, b"k01000");
-        let past = index_lookup_bytes(table, b"z");
+        let file_size = table.fs.metadata(&table.path)?.len;
+        let first = index_lookup_bytes(table, b"k00000", file_size);
+        let middle = index_lookup_bytes(table, b"k01000", file_size);
+        let past = index_lookup_bytes(table, b"z", file_size);
+        assert!(past <= file_size, "never more than the file holds");
         match &*table.block_index {
             BlockIndexImpl::Full(_) => {
                 assert_eq!(shape, "pinned");
