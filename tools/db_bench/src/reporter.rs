@@ -27,11 +27,9 @@ pub struct Summary {
 /// the engine. Such a workload states its own series and the harness reports
 /// those instead.
 ///
-/// Each series states its [`Direction`], and the dashboard keeps the two
-/// directions in separate suites: `github-action-benchmark` fixes one
-/// direction per suite, so a cost that improves by shrinking is published as a
-/// smaller-is-better series rather than as a reciprocal that reads upside down
-/// or divides by zero.
+/// Each series states the [`Suite`] it belongs to: which way it improves, and
+/// whether it is counted by the engine (the same on every host) or timed on
+/// the host that ran it.
 ///
 /// Every output mode reports these in place of the rate: the dashboard entries,
 /// the `--json` report and the human summary.
@@ -41,7 +39,7 @@ pub struct PublishedSeries {
     pub value: f64,
     pub unit: String,
     pub extra: String,
-    pub direction: Direction,
+    pub suite: Suite,
 }
 
 /// The lower median of each published series across `iterations`, by its own
@@ -70,41 +68,55 @@ pub fn median_series(iterations: &[&[PublishedSeries]]) -> Vec<PublishedSeries> 
         .collect()
 }
 
-/// Dashboard entries, one suite per direction.
-///
-/// `github-action-benchmark` takes a single direction per suite, so yields and
-/// costs are written to separate files and stored as separate suites; mixing
-/// them would read one of the two upside down.
+/// Dashboard entries, one file and one suite per [`Suite`].
 #[derive(Default)]
 pub struct GithubSuites {
-    /// Bigger-is-better entries: the `customBiggerIsBetter` suite.
-    pub yields: Vec<serde_json::Value>,
-    /// Smaller-is-better entries: the `customSmallerIsBetter` suite.
+    /// The `customBiggerIsBetter` suite of each host.
+    pub rates: Vec<serde_json::Value>,
+    /// The `customSmallerIsBetter` suite shared by every host.
     pub costs: Vec<serde_json::Value>,
+    /// The `customSmallerIsBetter` suite of each host.
+    pub timings: Vec<serde_json::Value>,
 }
 
 impl GithubSuites {
-    /// Adds `entry` to the suite its direction belongs to.
-    pub fn push(&mut self, direction: Direction, entry: serde_json::Value) {
-        match direction {
-            Direction::BiggerIsBetter => self.yields.push(entry),
-            Direction::SmallerIsBetter => self.costs.push(entry),
+    /// Adds `entry` to the suite it belongs to.
+    pub fn push(&mut self, suite: Suite, entry: serde_json::Value) {
+        match suite {
+            Suite::Rates => self.rates.push(entry),
+            Suite::Costs => self.costs.push(entry),
+            Suite::Timings => self.timings.push(entry),
         }
     }
 }
 
-/// Which way a series improves.
+/// The dashboard suite a series belongs to.
+///
+/// Two things decide it. `github-action-benchmark` fixes one direction per
+/// suite, so a cost that improves by shrinking cannot share a suite with a
+/// rate. And a suite is either one series per host or one series for all of
+/// them: a figure the engine counts (bytes) is the same on every host, while
+/// a figure timed on a host means nothing as a baseline for another, and in a
+/// suite shared across hosts it would alert on whichever host ran last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Direction {
-    /// A yield: operations per second.
-    BiggerIsBetter,
-    /// A cost: bytes read, decoded or copied per emitted row.
+pub enum Suite {
+    /// Bigger is better, timed: operations per second, one series per host.
+    Rates,
+    /// Smaller is better, counted by the engine: bytes read, decoded or
+    /// copied, one series across every host.
     #[cfg_attr(
         all(not(feature = "counters"), not(test)),
         expect(dead_code, reason = "only the counters workload publishes a cost")
     )]
-    SmallerIsBetter,
+    Costs,
+    /// Smaller is better, timed: wall time to a point of a run, one series
+    /// per host.
+    #[cfg_attr(
+        all(not(feature = "counters"), not(test)),
+        expect(dead_code, reason = "only the counters workload publishes a timing")
+    )]
+    Timings,
 }
 
 /// Collects per-operation latencies and computes summary statistics.
@@ -132,7 +144,7 @@ impl Reporter {
     }
 
     /// Publish a series this workload computes itself. See [`PublishedSeries`]
-    /// for why a workload would, and [`Direction`] for which way it improves.
+    /// for why a workload would, and [`Suite`] for where it goes.
     #[cfg_attr(
         all(not(feature = "counters"), not(test)),
         expect(dead_code, reason = "only the counters workload publishes series")
@@ -143,14 +155,14 @@ impl Reporter {
         value: f64,
         unit: impl Into<String>,
         extra: impl Into<String>,
-        direction: Direction,
+        suite: Suite,
     ) {
         self.published.push(PublishedSeries {
             name: name.into(),
             value,
             unit: unit.into(),
             extra: extra.into(),
-            direction,
+            suite,
         });
     }
 

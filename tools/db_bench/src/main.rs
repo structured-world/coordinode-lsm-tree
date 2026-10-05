@@ -8,7 +8,7 @@ mod tests;
 mod workloads;
 
 use crate::config::{BenchConfig, ColumnEncodingArg, Compression};
-use crate::reporter::{Direction, GithubSuites, JsonConfig, Reporter};
+use crate::reporter::{GithubSuites, JsonConfig, Reporter, Suite};
 use crate::workloads::{available_benchmarks, create_workload};
 use clap::Parser;
 use lsm_tree::AbstractTree; // for get_highest_seqno
@@ -101,11 +101,19 @@ struct Cli {
     #[arg(long)]
     github_json: bool,
 
-    /// With --github-json: write the smaller-is-better series (costs such as
+    /// With --github-json: write the series the engine counts (costs such as
     /// bytes read per emitted row) to this file, in the same format, for a
-    /// customSmallerIsBetter suite. Without it those series are not written.
+    /// customSmallerIsBetter suite shared by every host. Without it those
+    /// series are not written.
     #[arg(long, requires = "github_json")]
     github_json_costs: Option<PathBuf>,
+
+    /// With --github-json: write the smaller-is-better series timed on this
+    /// host (such as the time to a scan's first batch) to this file, for a
+    /// customSmallerIsBetter suite of this host. Without it those series are
+    /// not written.
+    #[arg(long, requires = "github_json")]
+    github_json_timings: Option<PathBuf>,
 
     /// With --github-json: append the bigger-is-better series to the JSON
     /// array already in this file instead of printing them, so a second run
@@ -176,6 +184,50 @@ fn append_github_json(
     std::fs::write(path, json).map_err(|e| e.to_string())
 }
 
+/// Refuses two GitHub JSON flags naming one file: each suite is written to its
+/// own file, and a shared one would let the later write replace the earlier
+/// suite while the run reports success. Paths are compared made absolute, so
+/// `./x.json` and `x.json` clash; symlinks are not followed.
+fn distinct_github_outputs(outputs: &[(&str, Option<&std::path::Path>)]) -> Result<(), String> {
+    let mut seen: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for &(flag, path) in outputs {
+        let Some(path) = path else {
+            continue;
+        };
+        let absolute = std::path::absolute(path).map_err(|e| format!("{flag}: {e}"))?;
+        if let Some((other, _)) = seen.iter().find(|(_, p)| *p == absolute) {
+            return Err(format!(
+                "{other} and {flag} both name {}; each suite needs its own file",
+                path.display()
+            ));
+        }
+        seen.push((flag, absolute));
+    }
+    Ok(())
+}
+
+/// Writes one smaller-is-better suite's `entries` to `path`. Without a path,
+/// a suite that has entries is reported as not written, naming the `flag`
+/// that would write it, and an empty one is skipped silently.
+fn write_github_suite(
+    entries: Vec<serde_json::Value>,
+    path: Option<&std::path::Path>,
+    flag: &str,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        if !entries.is_empty() {
+            eprintln!(
+                "Note: {} series not written; pass {flag} <PATH>",
+                entries.len()
+            );
+        }
+        return Ok(());
+    };
+    let json = serde_json::to_string_pretty(&serde_json::Value::Array(entries))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(path, json).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -234,6 +286,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Before measuring anything, not at the end of a run that took minutes.
+    if let Err(e) = distinct_github_outputs(&[
+        ("--github-json-append", cli.github_json_append.as_deref()),
+        ("--github-json-costs", cli.github_json_costs.as_deref()),
+        ("--github-json-timings", cli.github_json_timings.as_deref()),
+    ]) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
     // Set up flamegraph tracing if requested.
     #[cfg(feature = "flamegraph")]
     let _flame_guard = if cli.flamegraph {
@@ -278,15 +340,19 @@ fn main() {
     }
 
     if cli.github_json {
-        let GithubSuites { yields, costs } = github_entries;
+        let GithubSuites {
+            rates,
+            costs,
+            timings,
+        } = github_entries;
         match &cli.github_json_append {
             Some(path) => {
-                if let Err(e) = append_github_json(path, yields) {
+                if let Err(e) = append_github_json(path, rates) {
                     eprintln!("Error: failed to append to {}: {e}", path.display());
                     failures += 1;
                 }
             }
-            None => match serde_json::to_string_pretty(&serde_json::Value::Array(yields)) {
+            None => match serde_json::to_string_pretty(&serde_json::Value::Array(rates)) {
                 Ok(json) => println!("{json}"),
                 Err(e) => {
                     eprintln!("Error: failed to serialize GitHub JSON: {e}");
@@ -294,21 +360,14 @@ fn main() {
                 }
             },
         }
-        match &cli.github_json_costs {
-            Some(path) => {
-                let written = serde_json::to_string_pretty(&serde_json::Value::Array(costs))
-                    .map_err(|e| e.to_string())
-                    .and_then(|json| std::fs::write(path, json).map_err(|e| e.to_string()));
-                if let Err(e) = written {
-                    eprintln!("Error: failed to write {}: {e}", path.display());
-                    failures += 1;
-                }
+        for (entries, path, flag) in [
+            (costs, &cli.github_json_costs, "--github-json-costs"),
+            (timings, &cli.github_json_timings, "--github-json-timings"),
+        ] {
+            if let Err(e) = write_github_suite(entries, path.as_deref(), flag) {
+                eprintln!("Error: {e}");
+                failures += 1;
             }
-            None if !costs.is_empty() => eprintln!(
-                "Note: {} smaller-is-better series not written; pass --github-json-costs <PATH>",
-                costs.len(),
-            ),
-            None => {}
         }
     }
 
@@ -493,7 +552,7 @@ fn run_single(
         // than an absent one because it still moves.
         for series in median.reporter.published() {
             github_entries.push(
-                series.direction,
+                series.suite,
                 serde_json::json!({
                     "name": format!("{benchmark_name} / {}", series.name),
                     "value": series.value,
@@ -516,7 +575,7 @@ fn run_single(
         // the host actually delivered and let the dashboard show
         // the absolute trend.
         github_entries.push(
-            Direction::BiggerIsBetter,
+            Suite::Rates,
             serde_json::json!({
                 "name": benchmark_name,
                 "value": s.ops_per_sec,
