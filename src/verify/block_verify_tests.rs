@@ -1281,8 +1281,9 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
             crate::SequenceNumberCounter::default(),
             crate::SequenceNumberCounter::default(),
         );
-        // Small blocks and index partitions only for the partitioned shape: an
-        // index larger than a partition is what makes the writer split it.
+        // The writer keeps a small table's index in one block until it outgrows
+        // the spill threshold, so the partitioned shape spills at once, with
+        // small blocks and partitions to give it several.
         let config = match shape {
             "pinned" => config
                 .index_block_partitioning_policy(PinningPolicy::all(false))
@@ -1290,10 +1291,17 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
             "volatile" => config
                 .index_block_partitioning_policy(PinningPolicy::all(false))
                 .index_block_pinning_policy(PinningPolicy::all(false)),
-            _ => config
-                .data_block_size_policy(BlockSizePolicy::all(256))
-                .index_block_partitioning_policy(PinningPolicy::all(true))
-                .index_block_partition_size_policy(BlockSizePolicy::all(256)),
+            _ => {
+                let runtime = crate::runtime_config::RuntimeConfig {
+                    index_partition_spill_threshold: 0,
+                    ..Default::default()
+                };
+                config
+                    .data_block_size_policy(BlockSizePolicy::all(256))
+                    .index_block_partitioning_policy(PinningPolicy::all(true))
+                    .index_block_partition_size_policy(BlockSizePolicy::all(256))
+                    .with_runtime_config(runtime)
+            }
         };
         let tree = config.open()?;
         for (seqno, key) in keys.iter().enumerate() {
