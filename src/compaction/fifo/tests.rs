@@ -523,7 +523,7 @@ fn fifo_counts_a_shared_blob_file_freed_only_with_its_last_table() -> crate::Res
     // Incompressible values, so the blob file outweighs the tables.
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     let mut value = || {
-        (0..1024)
+        (0..256)
             .map(|_| {
                 state ^= state << 13;
                 state ^= state >> 7;
@@ -532,7 +532,9 @@ fn fifo_counts_a_shared_blob_file_freed_only_with_its_last_table() -> crate::Res
             })
             .collect::<Vec<u8>>()
     };
-    let keys = 200u32;
+    // Enough pointers that the tables split into several outputs, each far
+    // smaller than the one blob file they share.
+    let keys = 4_000u32;
     for key in 0..keys {
         tree.insert(key.to_be_bytes().as_slice(), value(), u64::from(key));
     }
