@@ -143,10 +143,18 @@ fn from_block_with_bounds_compressed_both_bounds() {
     .unwrap()
     .unwrap();
 
+    // The upper bound keeps the block after "f" too, as with a restart interval
+    // of one: it may hold older versions of "f".
     let keys: Vec<_> = iter.map(|h| h.end_key().to_vec()).collect();
     assert_eq!(
         keys,
-        vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec(), b"f".to_vec(),]
+        vec![
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec(),
+            b"f".to_vec(),
+            b"g".to_vec(),
+        ]
     );
 }
 
@@ -236,11 +244,14 @@ fn from_block_with_upper_bound_restart_interval_gt_one() {
     .unwrap()
     .unwrap();
 
+    // The walk starts at the block after the bound: it may hold older
+    // versions of "edge-0002".
     let keys: Vec<_> =
         std::iter::from_fn(|| iter.next_back().map(|h| h.end_key().to_vec())).collect();
     assert_eq!(
         keys,
         vec![
+            b"adj:out:vertex-0001:edge-0003".to_vec(),
             b"adj:out:vertex-0001:edge-0002".to_vec(),
             b"adj:out:vertex-0001:edge-0001".to_vec(),
             b"adj:out:vertex-0001:edge-0000".to_vec(),
