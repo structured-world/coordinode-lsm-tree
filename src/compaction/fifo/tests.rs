@@ -376,6 +376,92 @@ fn fifo_choose_drops_no_newer_table_while_the_oldest_is_held() -> crate::Result<
     Ok(())
 }
 
+/// A clock at zero is no clock, which leaves TTL off: tables written
+/// meanwhile carry time zero too and must not all count as expired.
+#[test]
+fn fifo_ttl_is_off_while_the_clock_reads_zero() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    with_test_clock(|clock| {
+        clock.set_secs(0);
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        tree.major_compact(u64::MAX, 0)?;
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
+        assert!(
+            tree.table_count() > 0,
+            "no table may expire without a clock"
+        );
+        assert!(tree.get([b'k', 0].as_slice(), 3)?.is_some());
+        Ok(())
+    })
+}
+
+/// The outputs of a major compaction of a KV-separated tree share its blob
+/// file, which goes only with the last of them. Counting its bytes as freed
+/// by the first output dropped stops the round with the file still on disk
+/// and the tree over its limit.
+#[test]
+fn fifo_counts_a_shared_blob_file_freed_only_with_its_last_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()?;
+
+    // Incompressible values, so the blob file outweighs the tables.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut value = || {
+        (0..1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_be_bytes()[0]
+            })
+            .collect::<Vec<u8>>()
+    };
+    let keys = 200u32;
+    for key in 0..keys {
+        tree.insert(key.to_be_bytes().as_slice(), value(), u64::from(key));
+    }
+    tree.flush_active_memtable(u64::from(keys))?;
+    tree.major_compact(4 * 1024, 0)?;
+
+    let disk = || {
+        let version = tree.current_version();
+        version
+            .iter_tables()
+            .map(crate::table::Table::file_size)
+            .sum::<u64>()
+            + version.blob_files.on_disk_size()
+    };
+    let version = tree.current_version();
+    assert!(version.iter_tables().count() > 1, "several outputs");
+    assert_eq!(1, version.blob_files.len(), "sharing one blob file");
+    drop(version);
+
+    let limit = disk() / 2;
+    tree.compact(Arc::new(Strategy::new(limit, None)), u64::from(keys) + 1)?;
+    let after = disk();
+    assert!(
+        after <= limit,
+        "one round must bring the tree within its limit: {after} > {limit}"
+    );
+    Ok(())
+}
+
 #[test]
 fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
