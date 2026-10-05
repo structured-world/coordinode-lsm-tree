@@ -165,7 +165,7 @@ pub struct MultiWriter {
     lineage: Option<Vec<TableId>>,
 
     /// The compaction inputs every output takes its age from (see
-    /// [`Writer::use_inherited_age`]); `None` for a flush or an ingest.
+    /// [`Writer::finish_aged`]); `None` for a flush or an ingest.
     inherited_age: Option<super::writer::AgeSweep>,
 
     /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),

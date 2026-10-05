@@ -130,7 +130,7 @@ struct DirectBlockInputs {
 }
 
 /// One compaction input as an output sees it for its age: the input's key
-/// range and its `created_at` (see [`Writer::use_inherited_age`]).
+/// range and its `created_at` (see [`AgeSweep`]).
 #[derive(Clone, Debug)]
 pub(crate) struct InputAge {
     pub min: UserKey,
