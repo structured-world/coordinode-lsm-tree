@@ -170,15 +170,18 @@ pub(super) fn prepare_table_writer(
     // write time instead would make a rewrite look like fresh data: a TTL
     // would restart at every compaction, and age-ordered drops would follow
     // the order the outputs were written in, which is key order.
-    let input_ages: alloc::sync::Arc<[crate::table::writer::InputAge]> = version
-        .iter_tables()
-        .filter(|t| payload.table_ids.contains(&t.id()))
-        .map(|t| crate::table::writer::InputAge {
-            min: t.metadata.key_range.min().clone(),
-            max: t.metadata.key_range.max().clone(),
-            created_at: *t.metadata.created_at,
-        })
-        .collect();
+    let input_ages = alloc::sync::Arc::new(crate::table::writer::InheritedAges::new(
+        version
+            .iter_tables()
+            .filter(|t| payload.table_ids.contains(&t.id()))
+            .map(|t| crate::table::writer::InputAge {
+                min: t.metadata.key_range.min().clone(),
+                max: t.metadata.key_range.max().clone(),
+                created_at: *t.metadata.created_at,
+            })
+            .collect(),
+        opts.config.comparator.clone(),
+    ));
 
     let mut table_writer = MultiWriter::new(
         table_base_folder,

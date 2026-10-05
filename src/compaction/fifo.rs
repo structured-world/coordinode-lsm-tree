@@ -112,10 +112,8 @@ impl CompactionStrategy for Strategy {
             _ => None,
         };
         // A table whose blob references cannot be read leaves the bytes it
-        // frees unknown: wait for a round that can read them.
-        let Some(mut blob_credit) = BlobCredit::new(version) else {
-            return Choice::DoNothing;
-        };
+        // frees unknown: the round waits for one that can read them.
+        let mut blob_credit = BlobCredit::new(version);
 
         let mut ttl_dropped_bytes = 0u64;
         // Every table not expired, held ones included: they keep their place in
@@ -129,9 +127,12 @@ impl CompactionStrategy for Strategy {
 
             if expired {
                 ids_to_drop.insert(table.id());
+                let Some(freed) = blob_credit.drop_table(table.id()) else {
+                    return Choice::DoNothing;
+                };
                 // Accumulated dropped-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                ttl_dropped_bytes += table.file_size() + blob_credit.drop_table(table.id());
+                ttl_dropped_bytes += table.file_size() + freed;
             } else {
                 alive.push((table, held));
             }
@@ -165,10 +166,13 @@ impl CompactionStrategy for Strategy {
                 }
 
                 ids_to_drop.insert(table.id());
+                let Some(freed) = blob_credit.drop_table(table.id()) else {
+                    return Choice::DoNothing;
+                };
 
                 // Accumulated collected-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                collected_bytes += table.file_size() + blob_credit.drop_table(table.id());
+                collected_bytes += table.file_size() + freed;
             }
         }
 
@@ -184,18 +188,27 @@ impl CompactionStrategy for Strategy {
 /// last table that references it, so several tables sharing one, as the
 /// outputs of a compaction do, free its bytes together and none of them
 /// alone.
+///
+/// The references are read on the first drop, so a round that drops nothing
+/// reads none.
 struct BlobCredit<'v> {
     version: &'v Version,
+    /// Every table's references, once read.
+    refs: Option<BlobRefs>,
+}
+
+/// Every table's blob references, and how many tables reference each file.
+struct BlobRefs {
     /// The blob files each table references.
     files_of: HashMap<TableId, Vec<BlobFileId>>,
     /// How many tables, dropped or not yet, still reference each blob file.
     refs: HashMap<BlobFileId, usize>,
 }
 
-impl<'v> BlobCredit<'v> {
+impl BlobRefs {
     /// The references of every table in `version`, or `None` when one cannot
     /// be read. A version without blob files reads none.
-    fn new(version: &'v Version) -> Option<Self> {
+    fn read(version: &Version) -> Option<Self> {
         let mut files_of = HashMap::default();
         let mut refs: HashMap<BlobFileId, usize> = HashMap::default();
         if version.blob_files.len() > 0 {
@@ -213,22 +226,33 @@ impl<'v> BlobCredit<'v> {
                 files_of.insert(table.id(), files);
             }
         }
-        Some(Self {
+        Some(Self { files_of, refs })
+    }
+}
+
+impl<'v> BlobCredit<'v> {
+    fn new(version: &'v Version) -> Self {
+        Self {
             version,
-            files_of,
-            refs,
-        })
+            refs: None,
+        }
     }
 
     /// The blob bytes freed by dropping `table` after the tables dropped
     /// before it: those of every blob file it was the last to reference.
-    fn drop_table(&mut self, table: TableId) -> u64 {
-        let Some(files) = self.files_of.remove(&table) else {
-            return 0;
+    /// `None` when the references cannot be read, which leaves what dropping
+    /// frees unknown.
+    fn drop_table(&mut self, table: TableId) -> Option<u64> {
+        if self.refs.is_none() {
+            self.refs = Some(BlobRefs::read(self.version)?);
+        }
+        let refs = self.refs.as_mut()?;
+        let Some(files) = refs.files_of.remove(&table) else {
+            return Some(0);
         };
         let mut freed = 0;
         for file in files {
-            let Some(count) = self.refs.get_mut(&file) else {
+            let Some(count) = refs.refs.get_mut(&file) else {
                 continue;
             };
             // Counted from the same lists, once per referencing table, and a
@@ -243,7 +267,7 @@ impl<'v> BlobCredit<'v> {
                     .map_or(0, |blob_file| blob_file.meta().total_compressed_bytes);
             }
         }
-        freed
+        Some(freed)
     }
 }
 
