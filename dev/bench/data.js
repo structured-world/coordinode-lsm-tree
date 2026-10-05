@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791186409974,
+  "lastUpdate": 1791186981659,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -28336,6 +28336,90 @@ window.BENCHMARK_DATA = {
             "value": 579374.2757821552,
             "unit": "ops/sec",
             "extra": "P50: 1.4us | P99: 6.8us | P99.9: 77.8us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f6d3f200570fc1e99cb874cea921abb0db7a5938",
+          "message": "perf(bench): pair the head-to-head engines in rounds (#823)\n\n## Summary\n- Backport of the head-to-head part of #822 to the 5.x line: every\nengine of a group is measured in the same rounds, so load on a shared\nbench host no longer decides which engine looks faster, and both engines\ncompress blocks on the same four threads.\n- The benchmark runs on pushes to `5.x.x`, which its copy of the\nworkflow never did.\n\n## Changes\n- `tools/compare-rocksdb`: the paired runner (`benches/paired.rs`), one\nsample per engine per round with the arms taking turns at going first,\nthe rounds a multiple of the arm count; each group reports per engine\nthe median time per operation and the median per-round ratio to RocksDB,\neach with a distribution-free 95% interval. The harness writes\n`target/head-to-head/summary.json` and no longer depends on Criterion.\n- Both engines compress on four threads (`compaction_threads`,\n`compression_options_parallel_threads`).\n- The workflow runs the harness with its defaults and publishes the new\nsummary; the page shows each engine relative to RocksDB, or its time per\noperation. A refused gh-pages push is rebased and retried, three\nattempts in all.\n- The workflow's push trigger and its series stores follow `5.x.x`\ninstead of `main`, a branch that never runs this file: a push to `5.x.x`\nnow extends the 5.x suites. Pull requests still run nothing; the\nhead-to-head page, shared by both lines, is refreshed by `main` and by\nmanual dispatches.\n- `docs/BENCHMARKING.md` and README: the shared compression threads, the\npaired rounds, which pushes run the benchmark.\n\nNot carried over from #822, since the 5.x line has none of them: the\ntimings suite (the mixed-layout workload is 6.0 only) and the\nretired-series job (it runs on pushes to `main`).\n\n## Testing\nFormatting, clippy and the paired-runner tests pass on Linux; a full\nharness run on Linux; actionlint on the workflow. Workflow dispatch on\nthis branch @ 9b18ca4d (gpu-win11-ro): 13 min 54 s, of which the build 6\nmin 15 s on a cache restored by prefix (the harness manifest changed),\ndb_bench 28 s, head-to-head 5 min 30 s.\n\nPart of #678",
+          "timestamp": "2026-10-05T10:31:45+03:00",
+          "tree_id": "fc6506f2e371ee7c6eca94252e3304cb058ad24a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f6d3f200570fc1e99cb874cea921abb0db7a5938"
+        },
+        "date": 1791186979234,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 245475.3833695427,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 13.2us | P99.9: 31.7us\nthreads: 1 | elapsed: 2.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3052335.341769988,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1139018.9743475842,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 699204.1308980053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.4us | P99.9: 73.5us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2541318.6648419998,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 331066.57566750055,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 7.9us | P99.9: 14.6us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198685.9112515732,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.7us | P99.9: 12.1us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1107186.7491889857,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 454128.06956515426,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 625413.5547130541,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 6.7us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
           }
         ]
       }
