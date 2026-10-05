@@ -74,12 +74,37 @@ Beyond the preset, the harness gives every engine the same work:
   values.
 - **Matched block options.** Block size, a 10-bit bloom filter and a 16 MiB
   LRU block cache on both sides, compaction scenarios included; no WAL.
+- **The same cores.** Both engines compress a table's blocks on four threads
+  wherever they compress (ours through `compaction_threads`, RocksDB through
+  `compression_options_parallel_threads`). At their defaults ours would use
+  half the host's cores and RocksDB one, and a write group would compare
+  unequal parallelism.
 - **One untimed setup.** A read or overwrite scenario writes its starting
   state once per engine, codec and size, and every timed iteration opens a
   copy of it, so only the measured operation is timed.
 
-The run writes `target/criterion/summary.json` (every group and engine, the
-mean time and its 95% confidence interval per key count), which the published
+## Paired measurement
+
+The bench hosts are shared machines, and a burst of other work on them lasts
+seconds. Measured one engine after another, such a burst fell on whichever
+engine was running, and two runs of one commit on one host disagreed on the
+ratio of our engine to RocksDB by a median 15-20%, up to 3x on single arms.
+
+So the engines of a group are measured in the same **rounds**: one sample each
+per round, taking turns at going first. A burst slows every engine of the
+rounds it overlaps and divides out of their ratio. Each group reports, per
+engine, the median over the rounds of its time over RocksDB's in the same
+round and its median time per operation, each with a distribution-free 95%
+confidence interval. An arm runs as many iterations per sample as fill 20 ms,
+and a group as many rounds as fit a 4-second budget, between ten and forty,
+rounded to a multiple of the group's engine count so every engine takes every
+position equally often.
+Two runs of one commit on one quiet host agreed on the ratio to within 2% on
+the median arm and 7% on nine arms in ten, so a ratio within a few percent of
+1 is parity. `cargo bench --bench compare -- --help` lists the flags that
+change these settings, and a positional filter selects groups.
+
+The run writes `target/head-to-head/summary.json`, which the published
 head-to-head page draws from.
 
 ## Running
@@ -114,8 +139,10 @@ with points of its own line measured on the same machine.
 commit, the version it will ship as, not the version already in `Cargo.toml`:
 that one moves only when the release PR merges. A manual dispatch from this
 branch is therefore compared against the `5.x` suites and writes nothing; only
-a push to the default branch extends a suite. The RocksDB head-to-head page
-(`dev/compare/`) is a snapshot replaced on every run and names the line, branch
+a push to `5.x.x` runs the benchmark on its own and extends the `5.x` suites,
+as a push to `main` does for the 6.0 line. The RocksDB head-to-head page
+(`dev/compare/`) is one snapshot for both lines, refreshed by every push to
+`main` and by a manual dispatch from either line, and names the line, branch
 and commit it measured.
 
 ## Checklist for format-changing PRs

@@ -7,22 +7,23 @@
 name: Benchmark
 
 on:
-  # Auto-triggered ONLY on merges/pushes to main; also runnable
-  # manually from any branch via workflow_dispatch (see below).
+  # Auto-triggered ONLY on merges/pushes to this maintained line's branch,
+  # 5.x.x (main runs its own copy of this workflow for the 6.0 line); also
+  # runnable manually from any branch via workflow_dispatch (see below).
   # `pull_request` is deliberately omitted: the self-hosted bench
   # host is shared with future cross-engine benches (issue #244)
   # and other perf workloads — every PR pushing a commit would
   # queue behind the host's serial concurrency group and hold up
   # every subsequent PR, even when the change can't affect the
   # bench (CI, docs, comment-only fixes). Restricting the
-  # AUTO-trigger to main keeps the bench timeline a clean "one
-  # entry per merged change" series, which is what the gh-pages
+  # AUTO-trigger to the line's branch keeps the bench timeline a clean
+  # "one entry per merged change" series, which is what the gh-pages
   # dashboard is meant to show. Manual runs through
-  # workflow_dispatch don't update the dashboard's main-branch
-  # series (auto-push gating below is push+main only), so they
-  # can't contaminate the trend.
+  # workflow_dispatch don't update the dashboard's series (auto-push
+  # gating below is push to 5.x.x only), so they can't contaminate the
+  # trend.
   push:
-    branches: [main]
+    branches: [5.x.x]
   # Manual dispatch from any branch when a contributor explicitly
   # wants to measure their PR against main before merging.
   # workflow_dispatch requires actions:write on the repo, so only
@@ -196,7 +197,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/compare-rocksdb/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: compare-rocksdb-${{ runner.os }}-${{ runner.arch }}-
 
@@ -282,7 +283,7 @@ jobs:
         with:
           path: |
             tools/compare-rocksdb/target
-            !tools/compare-rocksdb/target/criterion
+            !tools/compare-rocksdb/target/head-to-head
           key: ${{ steps.compare-cache.outputs.cache-primary-key }}
 
       # The db_bench pass: under a minute on an idle host, ~3 min on a loaded
@@ -294,23 +295,20 @@ jobs:
 
       # Head-to-head RocksDB comparison. Distinct from the db_bench
       # trend above (single-engine, value-over-commits): this runs the
-      # standalone `tools/compare-rocksdb` criterion harness where every
-      # scenario runs BOTH engines in the same process, so each criterion
-      # group is an ours-vs-rocksdb comparison. Because the comparison
-      # is a ratio measured on one host in one run, it stays meaningful
-      # even if this runner's CPU changes between runs.
+      # standalone `tools/compare-rocksdb` harness, where every scenario runs
+      # every engine in the same process and the same rounds, one sample each
+      # per round, so a burst of other load on a shared host slows every
+      # engine of the rounds it overlaps and divides out of their ratio.
+      # Because the comparison is a ratio measured on one host in one run, it
+      # stays meaningful even if this runner's CPU changes between runs.
       #
       # It runs straight after the db_bench pass, before any step below
       # switches the checkout to gh-pages and back: that rewrites the
       # engine's sources, and cargo would then rebuild the harness the build
       # step already compiled.
       #
-      # Bounded criterion settings keep the harness fast: this is a
-      # ratio comparison (both engines in one process per scenario), so a
-      # short warm-up + measurement window per scenario still yields a
-      # stable median. An arm whose single iteration outlasts the window runs
-      # at Criterion's floor of ten samples regardless, so what bounds the
-      # matrix is its sizes.
+      # The harness's own defaults set the rounds (a per-group budget, ten at
+      # least), so the published run and a local `cargo bench` measure alike.
       - name: Run compare-rocksdb head-to-head benches
         id: compare
         # Runs whatever the db_bench pass did, so a host that cannot build
@@ -327,20 +325,16 @@ jobs:
         env:
           LSM_BENCH_PRESET: rocksdb-parity
           LIBCLANG_OUTCOME: ${{ steps.libclang.outcome }}
-        # A workspace left by an earlier run on this runner may still hold
-        # Criterion's results under target/criterion, and the summary the
-        # harness writes collects every result there, so they go before the
-        # run. `--noplot`: the published page draws its charts from that
-        # summary, so Criterion spends no time rendering any.
+        # A summary an earlier run on this runner left behind goes first, so a
+        # run that fails before writing its own cannot publish the old one.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
             echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
             exit 1
           fi
           cd tools/compare-rocksdb
-          rm -rf target/criterion
-          cargo bench --bench compare -- \
-            --sample-size 10 --warm-up-time 0.5 --measurement-time 0.5 --noplot
+          rm -rf target/head-to-head
+          cargo bench --bench compare
 
       # Issued after the benches, right before its first use: an installation
       # token lives one hour, so one issued at the start of the job would let
@@ -410,16 +404,16 @@ jobs:
           # store, not the commit measured, and has failed outright on a
           # branch named with `#` ("No commit found for SHA").
           ref: ${{ github.sha }}
-          # The dashboard series is the history of main, so only a push to
-          # main extends it. A manual dispatch measures a branch and is
-          # compared against that series without joining it.
-          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # The line's dashboard series is the history of 5.x.x, so only a
+          # push to 5.x.x extends it. A manual dispatch measures a branch and
+          # is compared against that series without joining it.
+          auto-push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/5.x.x' }}
           # Comment the comparison on the commit that regressed.
           comment-on-alert: true
           alert-comment-cc-users: "@polaz"
           # A run 15% below the series is flagged. Advisory, not a gate:
-          # neither trigger sits on the merge path. The push runs on main
-          # once the change has landed, so failing it reddens main after the
+          # neither trigger sits on the merge path. The push runs on 5.x.x
+          # once the change has landed, so failing it reddens 5.x.x after the
           # fact without stopping anything; the dispatch is opt-in and
           # maintainer-only, so no PR is required to have one and failing it
           # would turn a voluntary measurement into a red X. Gating would
@@ -428,7 +422,7 @@ jobs:
           # would be dead config while nothing fails the job.
           alert-threshold: "115%"
           fail-on-alert: false
-          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          save-data-file: ${{ github.event_name == 'push' && github.ref == 'refs/heads/5.x.x' }}
           benchmark-data-dir-path: dev/bench
 
       # Publish the head-to-head under dev/compare, alongside the db_bench
@@ -438,21 +432,15 @@ jobs:
       # keeps the workflow's "every `uses:` pinned to a SHA" hardening policy
       # intact, with the App-scoped token the store uses.
       - name: Publish the compare-rocksdb page to gh-pages
-        # Publish on main pushes AND on manual workflow_dispatch. The page is a
-        # ratio SNAPSHOT (dev/compare is replaced wholesale each run), not the
-        # per-commit trend that dev/bench is — so a manual dispatch refreshing it
-        # can't contaminate any time series. This lets a maintainer populate the
-        # page on demand (e.g. right after a runner fix) without waiting for
-        # the next merge to main. The db_bench trend (benchmark-action auto-push /
-        # save-data above) stays push+main only.
+        # The page is one snapshot for both lines (dev/compare is replaced
+        # wholesale each run), and each push to main refreshes it with the 6.0
+        # line, so a push to 5.x.x does not overwrite it. A manual dispatch from
+        # this line publishes it on demand, naming the line it measured.
         if: >
           !cancelled() &&
           steps.compare.outcome == 'success' &&
           steps.bot-token.outputs.token != '' &&
-          (
-            (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-            github.event_name == 'workflow_dispatch'
-          )
+          github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -462,7 +450,7 @@ jobs:
           MEASURED_RUNNER: ${{ runner.name }}
         run: |
           set -euo pipefail
-          summary="tools/compare-rocksdb/target/criterion/summary.json"
+          summary="tools/compare-rocksdb/target/head-to-head/summary.json"
           if [ ! -f "$summary" ]; then
             echo "::error::the harness wrote no summary at $summary"
             exit 1
@@ -470,6 +458,7 @@ jobs:
           # Explicit template (not bare `mktemp -d`, which is GNU-only and
           # fails on macOS/BSD with "too few X's") so the step survives a
           # future runner-OS change.
+          push_gh_pages="$PWD/.github/scripts/push-gh-pages.sh"
           work="$(mktemp -d "${TMPDIR:-/tmp}/compare-ghpages.XXXXXXXX")"
           # Remove the temp clone on every exit path (success, error, or
           # cancellation) so it doesn't leak disk on a long-lived
@@ -526,7 +515,7 @@ jobs:
             echo "::notice::compare-rocksdb page unchanged, nothing to publish"
           else
             git commit -m "bench: refresh the compare-rocksdb page (dev/compare)"
-            git push origin gh-pages
+            bash "$push_gh_pages"
             echo "::notice::published the compare-rocksdb page to dev/compare/"
           fi
 
