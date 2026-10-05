@@ -513,8 +513,9 @@ impl ValuePool {
     /// block is compressed on its own, so the wrap gives a codec nothing to
     /// match across blocks.
     fn value(&self, i: u64) -> &[u8] {
-        let slots = (Self::SIZE / VALUE_SIZE) as u64;
-        let start = (i % slots) as usize * VALUE_SIZE;
+        let slots = u64::try_from(Self::SIZE / VALUE_SIZE).expect("slot count fits u64");
+        let start =
+            usize::try_from(i % slots).expect("a slot below the count fits usize") * VALUE_SIZE;
         &self.bytes[start..start + VALUE_SIZE]
     }
 }
@@ -594,7 +595,9 @@ fn rocksdb_options(compression: Compression, hash_index: bool) -> rocksdb::Optio
             opts.set_compression_options(-14, Compression::ZSTD_MAX_LEVEL, 0, 0);
         }
     }
-    opts.set_compression_options_parallel_threads(COMPRESSION_THREADS as i32);
+    opts.set_compression_options_parallel_threads(
+        i32::try_from(COMPRESSION_THREADS).expect("COMPRESSION_THREADS fits i32"),
+    );
     opts.set_block_based_table_factory(&block_opts);
     opts
 }
@@ -1802,11 +1805,15 @@ fn open_rocksdb_for_compaction(
     opts.set_compression_options(-14, level, 0, 0);
     // Our compaction threads drive both the range split and the
     // block-compression pool, so RocksDB gets both knobs.
-    opts.set_compression_options_parallel_threads(shape.threads() as i32);
+    opts.set_compression_options_parallel_threads(
+        i32::try_from(shape.threads()).expect("thread count fits i32"),
+    );
     match shape {
         CompactionShape::Major => opts.set_max_subcompactions(1),
         CompactionShape::Split => {
-            opts.set_max_subcompactions(SUBCOMPACTION_THREADS as u32);
+            opts.set_max_subcompactions(
+                u32::try_from(SUBCOMPACTION_THREADS).expect("thread count fits u32"),
+            );
             // Several bottom files, so the split has boundaries to cut on.
             opts.set_target_file_size_base(SUBCOMPACTION_BOTTOM_TARGET);
         }
@@ -1837,7 +1844,7 @@ fn write_compaction_state(
     inputs: &WorkloadInputs,
     dir: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let total = inputs.keys.len() as u64;
+    let total = u64::try_from(inputs.keys.len()).expect("key count fits u64");
     let flush_points: Vec<u64> = (1..COMPACTION_FLUSHES)
         .map(|b| (b * total) / COMPACTION_FLUSHES)
         .collect();
@@ -2084,6 +2091,11 @@ struct Run {
     settings: paired::Settings,
     /// Only groups whose name contains it run.
     filter: Option<String>,
+    /// Started by `cargo bench`, which passes `--bench`. Without it (`cargo
+    /// test` runs a bench target too) every group runs once as a smoke test
+    /// and no summary is written, so a test run neither takes the minutes a
+    /// measurement does nor replaces the last measurement's summary.
+    measuring: bool,
     results: Vec<paired::ArmResult>,
 }
 
@@ -2091,20 +2103,18 @@ impl Run {
     const USAGE: &str = "usage: compare [FILTER] [--warm-up SECS] [--sample SECS] \
         [--budget SECS] [--min-rounds N] [--max-rounds N]";
 
-    /// Settings from the command line, defaulting to the published run's.
+    /// Settings from the command line. A measurement defaults to the published
+    /// run's settings, a smoke test to one round with no warm-up; a flag given
+    /// explicitly holds in either.
     ///
     /// The budget is per group and key count. Ten rounds is the floor: the
     /// confidence interval of a median needs six values to reach 95% at all,
     /// and ten give it the ranks 2 and 9. The defaults keep the whole matrix
     /// at a few minutes on the bench runner.
     fn from_args() -> Self {
-        let mut settings = paired::Settings {
-            warm_up: Duration::from_millis(300),
-            sample_target: Duration::from_millis(20),
-            budget: Duration::from_secs(4),
-            min_rounds: 10,
-            max_rounds: 40,
-        };
+        let (mut warm_up, mut sample_target, mut budget) = (None, None, None);
+        let (mut min_rounds, mut max_rounds) = (None, None);
+        let mut measuring = false;
         let mut filter = None;
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -2121,13 +2131,17 @@ impl Run {
                     .unwrap_or_else(|_| panic!("not a count: {v}\n{}", Self::USAGE))
             };
             match arg.as_str() {
-                // Cargo passes it to every bench binary it runs.
-                "--bench" => {}
-                "--warm-up" => settings.warm_up = secs(value()),
-                "--sample" => settings.sample_target = secs(value()),
-                "--budget" => settings.budget = secs(value()),
-                "--min-rounds" => settings.min_rounds = count(value()),
-                "--max-rounds" => settings.max_rounds = count(value()),
+                // `cargo bench` passes it to every bench binary it runs.
+                "--bench" => measuring = true,
+                // A test runner listing tests (nextest's `--list --format
+                // terse`): this target has none of its own to offer.
+                "--list" => std::process::exit(0),
+                "--format" => drop(value()),
+                "--warm-up" => warm_up = Some(secs(value())),
+                "--sample" => sample_target = Some(secs(value())),
+                "--budget" => budget = Some(secs(value())),
+                "--min-rounds" => min_rounds = Some(count(value())),
+                "--max-rounds" => max_rounds = Some(count(value())),
                 "-h" | "--help" => {
                     eprintln!("{}", Self::USAGE);
                     std::process::exit(0);
@@ -2136,6 +2150,23 @@ impl Run {
                 _ => filter = Some(arg),
             }
         }
+        let settings = if measuring {
+            paired::Settings {
+                warm_up: warm_up.unwrap_or(Duration::from_millis(300)),
+                sample_target: sample_target.unwrap_or(Duration::from_millis(20)),
+                budget: budget.unwrap_or(Duration::from_secs(4)),
+                min_rounds: min_rounds.unwrap_or(10),
+                max_rounds: max_rounds.unwrap_or(40),
+            }
+        } else {
+            paired::Settings {
+                warm_up: warm_up.unwrap_or(Duration::ZERO),
+                sample_target: sample_target.unwrap_or(Duration::ZERO),
+                budget: budget.unwrap_or(Duration::ZERO),
+                min_rounds: min_rounds.unwrap_or(1),
+                max_rounds: max_rounds.unwrap_or(1),
+            }
+        };
         assert!(
             settings.min_rounds >= 1 && settings.min_rounds <= settings.max_rounds,
             "rounds: need 1 <= --min-rounds <= --max-rounds\n{}",
@@ -2144,6 +2175,7 @@ impl Run {
         Self {
             settings,
             filter,
+            measuring,
             results: Vec::new(),
         }
     }
@@ -2215,11 +2247,19 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
 
 fn main() {
     let mut run = Run::from_args();
-    eprintln!("compare-rocksdb: {:?}", run.settings);
+    let mode = if run.measuring {
+        "measurement"
+    } else {
+        "smoke test (no --bench)"
+    };
+    eprintln!("compare-rocksdb: {mode}, {:?}", run.settings);
     bench_write_throughput(&mut run);
     bench_seeded(&mut run);
     bench_compaction(&mut run);
     bench_subcompaction(&mut run);
+    if !run.measuring {
+        return;
+    }
     match write_summary(&run) {
         Ok(path) => eprintln!("compare-rocksdb: summary at {}", path.display()),
         Err(e) => panic!("compare-rocksdb: writing the summary failed: {e}"),
