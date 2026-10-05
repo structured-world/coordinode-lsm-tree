@@ -189,7 +189,9 @@ impl TestClock {
 /// The clock lock, held for one [`with_test_clock`] call; dropping it clears
 /// the override.
 #[cfg(test)]
-struct HeldClock(MutexGuard<'static, ()>);
+struct HeldClock {
+    _owner: MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl Drop for HeldClock {
@@ -207,7 +209,9 @@ impl Drop for HeldClock {
 pub fn with_test_clock<R>(f: impl FnOnce(&TestClock) -> R) -> R {
     // A test that panicked while holding the clock poisons the lock; the
     // override it left is cleared below, so the lock is still usable.
-    let held = HeldClock(CLOCK_OWNER.lock().unwrap_or_else(PoisonError::into_inner));
+    let held = HeldClock {
+        _owner: CLOCK_OWNER.lock().unwrap_or_else(PoisonError::into_inner),
+    };
     set_unix_timestamp_for_test(None);
     let result = f(&TestClock { _lent: () });
     drop(held);
