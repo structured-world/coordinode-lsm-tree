@@ -23,13 +23,13 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
-    # Single `main` base: feat/#NNN and fix/#NNN are PR source branches,
-    # not long-lived integration targets — there are no release/* branches
-    # in this repo. The `upstream-monitor.yml` workflow also creates
-    # `chore/upstream-sync-*` sync PRs, and those ALWAYS target `main`
-    # (see the `--base main` flag on `gh pr create`). Widen this list if
-    # either convention ever changes.
-    base_branches: ["main"]
+    # Bases that take reviewed PRs: `main`, and the maintained
+    # `<major>.x.x` release lines, which receive bug-fix backports.
+    # feat/#NNN and fix/#NNN are PR source branches, not integration
+    # targets. The `upstream-monitor.yml` workflow's
+    # `chore/upstream-sync-*` sync PRs always target `main` (see the
+    # `--base main` flag on `gh pr create`). Entries are regex patterns.
+    base_branches: ["main", "^\\d+\\.x\\.x$"]
     ignore_title_keywords: ["WIP", "DO NOT MERGE"]
   path_instructions:
     - path: "src/**/*.rs"

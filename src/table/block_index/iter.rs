@@ -123,20 +123,12 @@ impl OwnedIndexBlockIter {
     ///
     /// Preserves the current front cursor and re-seeks only the back cursor,
     /// so this tightens the existing forward window instead of performing a
-    /// full upper re-seek.
-    pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
-        self.with_dependent_mut(|_, m| {
-            // reset_front=false: preserve front cache from prior seek_lower
-            // reset_back=true: clear stale back state from reverse iteration
-            // check_back_cache=false: forward-limit mode, don't require peek_back
-            //
-            // seek_upper_impl may return Err on a poisoned/clamped cursor;
-            // the public bool-returning API treats that as "not found" for
-            // backward compatibility — callers that need error propagation
-            // should use from_block_with_bounds / seek_upper_bound_cursor.
-            m.seek_upper_impl(needle, false, true, false)
-                .unwrap_or(false)
-        })
+    /// full upper re-seek. Returns whether the range holds an entry.
+    pub fn seek_upper(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
+        // The block iterator's own upper seek: it keeps the front, re-seeks the
+        // back, and answers false for an empty range or a poisoned cursor.
+        // Callers that need the error use from_block_with_bounds.
+        self.with_dependent_mut(|_, m| m.seek_upper(needle, seqno))
     }
 }
 
