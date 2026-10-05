@@ -1,4 +1,4 @@
-use super::{Direction, GithubSuites, JsonConfig, PublishedSeries, Reporter, median_series};
+use super::{GithubSuites, JsonConfig, PublishedSeries, Reporter, Suite, median_series};
 
 fn series(name: &str, value: f64) -> PublishedSeries {
     PublishedSeries {
@@ -6,7 +6,7 @@ fn series(name: &str, value: f64) -> PublishedSeries {
         value,
         unit: "B/row".to_string(),
         extra: String::new(),
-        direction: Direction::SmallerIsBetter,
+        suite: Suite::Costs,
     }
 }
 
@@ -48,7 +48,7 @@ fn json_published_series_omits_rate() {
         12.5,
         "B/row",
         "rows: 100",
-        Direction::SmallerIsBetter,
+        Suite::Costs,
     );
     reporter.stop();
 
@@ -65,40 +65,46 @@ fn json_published_series_omits_rate() {
 }
 
 #[test]
-fn github_suites_cost_series_goes_to_the_smaller_is_better_suite() {
-    // github-action-benchmark fixes one direction per suite. A cost landing in
-    // the yield suite would alert on every improvement and stay silent on
-    // every regression, so the split is the whole of the contract.
+fn github_suites_each_series_goes_to_its_own_suite() {
+    // github-action-benchmark fixes one direction per suite: a cost in the
+    // rate suite would alert on every improvement and stay silent on every
+    // regression. And a timing in the cost suite, which every host shares,
+    // would be compared against another host's time.
     let mut suites = GithubSuites::default();
+    suites.push(Suite::Rates, serde_json::json!({"name": "ops per sec"}));
     suites.push(
-        Direction::BiggerIsBetter,
-        serde_json::json!({"name": "ops per sec"}),
-    );
-    suites.push(
-        Direction::SmallerIsBetter,
+        Suite::Costs,
         serde_json::json!({"name": "bytes copied per row"}),
     );
+    suites.push(
+        Suite::Timings,
+        serde_json::json!({"name": "time to first batch"}),
+    );
     assert_eq!(
-        suites.yields,
+        suites.rates,
         vec![serde_json::json!({"name": "ops per sec"})]
     );
     assert_eq!(
         suites.costs,
         vec![serde_json::json!({"name": "bytes copied per row"})],
     );
+    assert_eq!(
+        suites.timings,
+        vec![serde_json::json!({"name": "time to first batch"})],
+    );
 }
 
 #[test]
-fn json_series_direction_is_reported() {
-    // The --json report carries each series' direction, so a consumer can
-    // tell a yield from a cost without knowing the series by name.
+fn json_series_suite_is_reported() {
+    // The --json report carries each series' suite, so a consumer can tell a
+    // rate from a cost or a timing without knowing the series by name.
     let mut reporter = Reporter::new();
     reporter.start();
-    reporter.publish_series("copied", 0.0, "B/row", "", Direction::SmallerIsBetter);
+    reporter.publish_series("copied", 0.0, "B/row", "", Suite::Costs);
     reporter.stop();
     let json: serde_json::Value =
         serde_json::from_str(&reporter.to_json("mixed-layout", &json_config())).expect("json");
-    assert_eq!(json["series"][0]["direction"], "smaller_is_better");
+    assert_eq!(json["series"][0]["suite"], "costs");
 }
 
 #[test]

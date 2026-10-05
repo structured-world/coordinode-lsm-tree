@@ -1,7 +1,7 @@
 //! Mixed-layout scenarios: the instrument the read-path work is measured with.
 //!
-//! The sibling `mixed` workload walks a real write / rewrite / delete /
-//! compact / read cycle and reports ops/sec, but it is row-major throughout —
+//! The sibling `lifecycle-zstd22` workload walks a real write / rewrite /
+//! delete / compact / read cycle and reports ops/sec, but it is row-major throughout —
 //! one opaque value per key, no projection, no columnar segment, no blob — so
 //! a change that halves the bytes read for a two-field projection over a wide
 //! record is invisible to it. This workload holds the shapes that change is
@@ -46,7 +46,7 @@ pub mod fixtures;
 mod tests;
 
 use crate::config::{BenchConfig, DEFAULT_KEY_SIZE, DEFAULT_VALUE_SIZE};
-use crate::reporter::{Direction, Reporter};
+use crate::reporter::{Reporter, Suite};
 use crate::workloads::Workload;
 use fixtures::{Fixture, FixtureFn};
 use lsm_tree::table::columnar::{COL_USER_KEY, COL_VALUE};
@@ -208,34 +208,42 @@ impl Readings {
                 value,
                 "B/row",
                 annotation.clone(),
-                Direction::SmallerIsBetter,
+                Suite::Costs,
             );
         }
         let Some(scan) = &self.scan else {
             return;
         };
+        // Bytes are counted by the engine and go with the costs; the time to
+        // the first batch is timed on this host, so it goes to the host's own
+        // timings.
         #[expect(
             clippy::cast_precision_loss,
             reason = "byte counts far below f64's exact range"
         )]
-        let mut figures = vec![("retained payload", scan.retained as f64, "B")];
+        let mut figures = vec![("retained payload", scan.retained as f64, "B", Suite::Costs)];
         if let Some((time, bytes)) = scan.first_batch {
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "byte counts far below f64's exact range"
             )]
             figures.extend([
-                ("time to first batch", time.as_secs_f64() * 1e6, "us"),
-                ("bytes read to first batch", bytes as f64, "B"),
+                (
+                    "time to first batch",
+                    time.as_secs_f64() * 1e6,
+                    "us",
+                    Suite::Timings,
+                ),
+                ("bytes read to first batch", bytes as f64, "B", Suite::Costs),
             ]);
         }
-        for (figure, value, unit) in figures {
+        for (figure, value, unit, suite) in figures {
             reporter.publish_series(
                 format!("{scenario} {figure}"),
                 value,
                 unit,
                 annotation.clone(),
-                Direction::SmallerIsBetter,
+                suite,
             );
         }
     }

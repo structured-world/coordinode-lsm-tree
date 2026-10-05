@@ -1,0 +1,12 @@
+[
+  {
+    "suite": "^lsm-tree db_bench [0-9]+\\.x · ",
+    "series": "^mixed$",
+    "reason": "Renamed lifecycle-zstd22 when its values changed from a constant fill to half-compressible data: the old points measured other data, so they are not the start of the new series."
+  },
+  {
+    "suite": "^lsm-tree db_bench costs ",
+    "series": " time to first batch$",
+    "reason": "A time measured on one host, published in the suite every host shares; it now goes to each host's timings suite."
+  }
+]
