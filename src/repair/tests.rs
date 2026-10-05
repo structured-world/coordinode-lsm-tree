@@ -13660,7 +13660,7 @@ fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<
         let fault = FaultFs::new((*memfs).clone());
         fault.injector().arm(
             FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
-                .on_path("tables/0")
+                .on_path(root.join("tables").join("0").to_string_lossy())
                 .skip(skip)
                 .times(1),
         );
