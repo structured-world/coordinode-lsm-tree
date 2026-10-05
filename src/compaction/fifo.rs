@@ -27,6 +27,12 @@ pub const NAME: &str = "FifoCompaction";
 /// another compaction is working on is left for a later round, and no newer
 /// table is dropped ahead of it.
 ///
+/// Age is as fine as a table and the clock, no finer: a table goes whole, so
+/// newer records of it go with its oldest, and data of one age is equally old
+/// to FIFO whatever order it was inserted in. FIFO itself never merges
+/// tables; only another compaction run on the tree (`major_compact`, another
+/// strategy) produces outputs, which a FIFO tree has no use for.
+///
 /// Additionally, a (lazy) TTL can be configured to drop old tables. It is off
 /// while the clock reads zero, which is no clock.
 ///
@@ -154,6 +160,10 @@ impl CompactionStrategy for Strategy {
             // after a major compaction, even one that zeroed the sequence
             // numbers. The highest sequence number orders tables of one age:
             // FIFO admits only inserts, so it follows insertion while kept.
+            // Once a bottommost compaction has zeroed it, tables of one age
+            // fall to key order: they are equally old, which is all the
+            // order FIFO promises, so the zeroing stays (it is what keeps a
+            // bottom-level record's sequence number at one byte).
             alive.sort_by_key(|(t, _)| (t.metadata.created_at, t.get_highest_seqno(), t.id()));
 
             for (table, held) in alive {
