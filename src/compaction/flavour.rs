@@ -669,7 +669,10 @@ pub(super) fn install_merge(
                 .saturating_sub(stats.0 + pass.0);
             let bytes = rest(meta.total_uncompressed_bytes, stats.1, pass.1);
             let on_disk = rest(meta.total_compressed_bytes, stats.2, pass.2);
-            if bytes > 0 {
+            // Any counter short of its total: objects of zero bytes still
+            // count, and a file is dead only when its entry reaches every
+            // total, so an entry is made for them too.
+            if len > 0 || bytes > 0 || on_disk > 0 {
                 let mut fill = FragmentationMap::default();
                 fill.insert(
                     id,

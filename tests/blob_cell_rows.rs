@@ -691,6 +691,85 @@ fn a_memtable_reference_keeps_its_file_through_relocation() -> lsm_tree::Result<
     Ok(())
 }
 
+/// A relocated file kept for a memtable row goes once that row no longer needs
+/// it, even when the object the row borrows is empty: a zero-length cell
+/// separated by a zero threshold leaves the file nothing but zero-byte objects
+/// to charge, and it is charged all the same.
+#[test]
+fn a_kept_file_of_empty_objects_goes_with_its_last_borrower() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        KvSeparationOptions::default()
+            .age_cutoff(1.0)
+            .cell_separation_threshold(BODY, 0),
+    )?;
+    stale_file_with_a_body(&tree, &[])?;
+
+    let row = row_of(&tree, "doc")?;
+    tree.insert_cells(
+        "doc",
+        &[Field::bytes(STATUS, b"final"), reference(&row, BODY)?],
+        2,
+    )?;
+    drop(row);
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &[]])[..])
+    );
+
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(
+        tree.get("doc", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &[]])[..])
+    );
+    assert_eq!(
+        tree.blob_file_count(),
+        1,
+        "only the file holding the moved object is left"
+    );
+    Ok(())
+}
+
+/// References read from two trees name different objects even where the blob
+/// file number and position match: file numbers are local to a tree.
+#[test]
+fn references_from_two_trees_are_not_equal() -> lsm_tree::Result<()> {
+    let body = vec![b'b'; 4_096];
+    let first_folder = get_tmp_folder();
+    let second_folder = get_tmp_folder();
+    let first = open(first_folder.path(), KvSeparationOptions::default())?;
+    let second = open(second_folder.path(), KvSeparationOptions::default())?;
+    for tree in [&first, &second] {
+        tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
+        tree.flush_active_memtable(0)?;
+    }
+
+    let first_row = row_of(&first, "doc")?;
+    let second_row = row_of(&second, "doc")?;
+    let (Cell::Ref(a), Cell::Ref(b)) = (
+        reference(&first_row, BODY)?.cell,
+        reference(&second_row, BODY)?.cell,
+    ) else {
+        panic!("both bodies are references");
+    };
+    assert_eq!(
+        (a.blob_file_id(), a.size()),
+        (b.blob_file_id(), b.size()),
+        "the two trees laid the object out alike"
+    );
+    assert_ne!(a, b, "a reference is bound to its tree");
+    let again = row_of(&first, "doc")?;
+    let Cell::Ref(a_again) = reference(&again, BODY)?.cell else {
+        panic!("a reference");
+    };
+    assert_eq!(a, a_again, "the same object of the same tree is equal");
+    Ok(())
+}
+
 /// Dropping the table that owns an object keeps the file while a memtable row
 /// borrows the object.
 #[test]

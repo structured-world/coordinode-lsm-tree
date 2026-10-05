@@ -120,8 +120,10 @@ impl BlobRef<'_> {
 }
 
 impl PartialEq for BlobRef<'_> {
+    /// The same object: the same position in the same tree's blob files,
+    /// whose numbers are local to the tree.
     fn eq(&self, other: &Self) -> bool {
-        self.indirection.vhandle == other.indirection.vhandle
+        self.tree == other.tree && self.indirection.vhandle == other.indirection.vhandle
     }
 }
 
