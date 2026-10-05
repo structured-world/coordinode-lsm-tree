@@ -164,6 +164,10 @@ pub struct MultiWriter {
     /// for every output of the run. `None` (flush / ingest) omits the key.
     lineage: Option<Vec<TableId>>,
 
+    /// The compaction inputs every output takes its age from (see
+    /// [`Writer::use_inherited_age`]); `None` for a flush or an ingest.
+    inherited_age: Option<Arc<[super::writer::InputAge]>>,
+
     /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
     /// shared with the filter adapter. An output whose window saw one is not
     /// derivable from its inputs, so it is marked transformed before its meta
@@ -303,6 +307,7 @@ impl MultiWriter {
             bulk_ingested: false,
             recency: None,
             lineage: None,
+            inherited_age: None,
             transform_marker: None,
             transforms_at_output_start: 0,
             transforms_after_last_write: 0,
@@ -823,6 +828,18 @@ impl MultiWriter {
         self
     }
 
+    /// Lets this and every rotated successor writer take its age from the
+    /// compaction `inputs` its key range meets (see
+    /// [`Writer::use_inherited_age`]). Call after [`Self::set_comparator`].
+    #[must_use]
+    pub(crate) fn use_inherited_age(mut self, inputs: Arc<[super::writer::InputAge]>) -> Self {
+        self.writer = self
+            .writer
+            .use_inherited_age(Some(Arc::clone(&inputs)), self.comparator.clone());
+        self.inherited_age = Some(inputs);
+        self
+    }
+
     /// Declares that this writer receives the run's ENTIRE merged stream
     /// (see the `owns_whole_run` field), allowing its final output to carry
     /// the `lineage_last` marker. Never set on a parallel sub-compaction or
@@ -936,6 +953,8 @@ impl MultiWriter {
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
+        new_writer =
+            new_writer.use_inherited_age(self.inherited_age.clone(), self.comparator.clone());
         // The adjacency link: this successor follows the writer being closed,
         // which is what lets manifest repair union UNBROKEN sibling chains.
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
