@@ -28,7 +28,9 @@
 //! A compaction meets a key's versions newest first, so it holds a key's kept
 //! rows until the key ends; when it drops the owner of an object a kept row
 //! also holds, ownership passes to the oldest such row, rewritten before it
-//! is written. A relocation keeps each reference's owner bit on the copy.
+//! is written. A relocation keeps each reference's owner bit on the copy, and
+//! an object none of its holders owns (its owner went with a whole-table
+//! drop) passes to its oldest holder there, so the copy has exactly one owner.
 //!
 //! **Charging.** An object's bytes are charged to its blob file once: when its
 //! owning reference leaves the tree and no kept row takes it over (a
@@ -52,7 +54,11 @@
 //! orders writes against version installs, together with registering the
 //! file in the memtable the row lands in. A reference a background relocation
 //! has already moved is refused as stale; the caller reads the key again and
-//! gets the moved one.
+//! gets the moved one. So is a reference whose object was released after the
+//! read that handed it out: charged by a compaction, or owned by a table a
+//! whole-table drop took. Each table lists the objects its rows own in its
+//! `owned_blob_objects` section, which the drop reads instead of the table's
+//! data, so it releases exactly those.
 //!
 //! **Visibility.** A reference exists only inside a written version: in the
 //! memtable until a flush, then in a table. An object stays live while any

@@ -3751,15 +3751,17 @@ fn drop_tables(
 
     let mut dropped_blob_files = vec![];
 
-    // The files the dropped tables charged the objects they owned to, read
-    // before the edit: nothing that can fail may run once the drop is
-    // published, or an error would report a drop that happened and leave its
-    // files unmarked.
-    let mut released_files = Vec::new();
-    for table in &tables {
-        for link in table.blob_links()? {
-            if link.len > 0 && !released_files.contains(&link.blob_file_id) {
-                released_files.push(link.blob_file_id);
+    // The objects the dropped tables owned, read from their owned-objects
+    // sections before the edit: nothing that can fail may run once the drop
+    // is published, or an error would report a drop that happened and leave
+    // its objects unrecorded. Read only while some read holds references:
+    // with none, no reference can be stale through this drop.
+    let mut released_tables = Vec::new();
+    if version_history_lock.released().holds_reads() {
+        for table in &tables {
+            let owned = table.owned_blob_objects()?;
+            if !owned.is_empty() {
+                released_tables.push(crate::blob_tree::released::OwnedObjects::from(owned));
             }
         }
     }
@@ -3792,14 +3794,13 @@ fn drop_tables(
         crate::version::RetentionEffect::DropsData,
     )?;
 
-    // Still under the write lock that published the drop: the dropped tables
-    // charged the objects they owned, by file, so a reference into one of
-    // those files read before the drop is stale.
-    if !released_files.is_empty() {
+    // Still under the write lock that published the drop: a reference read
+    // before it to an object a dropped table owned is stale.
+    if !released_tables.is_empty() {
         let published = version_history_lock.latest_version().version.id();
         version_history_lock
             .released()
-            .record(published, [], released_files);
+            .record(published, [], released_tables);
     }
 
     drop(version_history_lock);

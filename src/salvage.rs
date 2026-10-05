@@ -1579,12 +1579,30 @@ fn rewrite_row_refs(
     })
 }
 
+/// How an entry holds a recovered blob reference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holding {
+    /// An indirection entry, which owns its object.
+    Indirection,
+    /// A cell row's reference with its owner bit set.
+    OwnedCell,
+    /// A cell row's borrowed reference.
+    BorrowedCell,
+}
+
+impl Holding {
+    /// Whether the entry owns the object.
+    fn owns(self) -> bool {
+        self != Self::BorrowedCell
+    }
+}
+
 /// One blob reference recovered from an entry: the entry's key, the
-/// reference, and whether the entry owns the object.
+/// reference, and how the entry holds it.
 type RecoveredRef = (
     crate::UserKey,
     crate::blob_tree::handle::BlobIndirection,
-    bool,
+    Holding,
 );
 
 /// Decodes every blob reference in `entries`, with the entry's key: the
@@ -1603,11 +1621,16 @@ fn collect_indirections(entries: &[crate::InternalValue]) -> crate::Result<Vec<R
             out.push((
                 entry.key.user_key.clone(),
                 crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?,
-                true,
+                Holding::Indirection,
             ));
         } else if entry.key.value_type == crate::ValueType::CellRow {
             for (ind, owned) in crate::blob_tree::field_row::row_refs(&entry.value)? {
-                out.push((entry.key.user_key.clone(), ind, owned));
+                let holding = if owned {
+                    Holding::OwnedCell
+                } else {
+                    Holding::BorrowedCell
+                };
+                out.push((entry.key.user_key.clone(), ind, holding));
             }
         }
     }
@@ -1641,14 +1664,19 @@ fn collect_columnar_indirections(
 /// Folds one block's recovered references into the walk's derived blob-link
 /// map, mirroring the accumulation the live write path does per entry: an
 /// owned reference adds to its file's counts, a borrowed one only links the
-/// file. Blocks are folded in key order, so a blob file's first key is the
-/// first seen and its last key the latest.
+/// file. An object a cell row owns also goes to `owned_cells`, the copy's
+/// `owned_blob_objects`. Blocks are folded in key order, so a blob file's
+/// first key is the first seen and its last key the latest.
 fn fold_blob_links(
     derived: &mut crate::HashMap<crate::vlog::BlobFileId, crate::table::writer::LinkedFile>,
+    owned_cells: &mut Vec<(crate::vlog::BlobFileId, u64)>,
     refs: &[RecoveredRef],
 ) {
-    for (key, ind, owned) in refs {
-        let (len, bytes, on_disk_bytes) = if *owned {
+    for (key, ind, holding) in refs {
+        if *holding == Holding::OwnedCell {
+            owned_cells.push((ind.vhandle.blob_file_id, ind.vhandle.offset));
+        }
+        let (len, bytes, on_disk_bytes) = if holding.owns() {
             (1, u64::from(ind.size), u64::from(ind.vhandle.on_disk_size))
         } else {
             (0, 0, 0)
@@ -1793,6 +1821,8 @@ fn salvage_blocks(
         crate::vlog::BlobFileId,
         crate::table::writer::LinkedFile,
     > = crate::HashMap::default();
+    // The objects the recovered cell rows own, derived the same way.
+    let mut derived_owned_cells: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
     // Lower bound for a dropped block's range: the previous block's last key,
     // since the index stores each block's last key (so block N covers
     // `(end_key[N-1], end_key[N]]`).
@@ -2381,7 +2411,11 @@ fn salvage_blocks(
                                 entries_salvaged += rows;
                                 blocks_salvaged += 1;
                                 columns_salvaged += batch.columns.len() as u64;
-                                fold_blob_links(&mut derived_blob_links, &block_links);
+                                fold_blob_links(
+                                    &mut derived_blob_links,
+                                    &mut derived_owned_cells,
+                                    &block_links,
+                                );
                             }
                             Err(
                                 e @ (crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_)),
@@ -2648,7 +2682,11 @@ fn salvage_blocks(
                                         entries_salvaged += rows;
                                         blocks_salvaged += 1;
                                         columns_salvaged += batch.columns.len() as u64;
-                                        fold_blob_links(&mut derived_blob_links, &block_links);
+                                        fold_blob_links(
+                                            &mut derived_blob_links,
+                                            &mut derived_owned_cells,
+                                            &block_links,
+                                        );
                                     }
                                     Err(
                                         e @ (crate::Error::InvalidHeader(_)
@@ -2905,7 +2943,11 @@ fn salvage_blocks(
                                     }
                                     entries_salvaged += count;
                                     blocks_salvaged += 1;
-                                    fold_blob_links(&mut derived_blob_links, &block_links);
+                                    fold_blob_links(
+                                        &mut derived_blob_links,
+                                        &mut derived_owned_cells,
+                                        &block_links,
+                                    );
                                 }
                                 Err(
                                     e @ (crate::Error::InvalidHeader(_)
@@ -2990,6 +3032,7 @@ fn salvage_blocks(
         for link in links {
             writer.link_blob_file(link);
         }
+        writer.own_blob_objects(derived_owned_cells);
         // The caller syncs the destination's directory: the publish after its
         // rename, or the direct path once the attempt returns.
         writer.finish_deferring_dir_sync()?;

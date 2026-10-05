@@ -558,6 +558,64 @@ fn a_dropped_owner_keeps_the_file_a_kept_table_borrows_from() -> lsm_tree::Resul
     Ok(())
 }
 
+/// A whole-table drop releases exactly the objects the dropped table owned: a
+/// reference read before it to an object a kept table owns in the same blob
+/// file is still written, while one to an object the dropped table owned is
+/// refused.
+#[test]
+fn a_table_drop_releases_only_the_objects_the_table_owned() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Blob(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(THRESHOLD),
+    ))
+    // A block per row, so a compaction to small outputs gives each row a
+    // table of its own.
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    let body = |b: u8| vec![b; 4_096];
+    tree.insert_cells("a", &bytes(&[b"draft", &body(b'a')]), 0)?;
+    tree.insert_cells("z", &bytes(&[b"draft", &body(b'z')]), 1)?;
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.blob_file_count(), 1, "both bodies in one blob file");
+    // Small outputs put each key in a table of its own, both linking the file.
+    tree.major_compact(1, 0)?;
+    assert_eq!(tree.table_count(), 2, "one table per key");
+
+    let a = row_of(&tree, "a")?;
+    let z = row_of(&tree, "z")?;
+    tree.drop_range("a"..="a")?;
+    assert_eq!(tree.table_count(), 1, "the table of a is dropped");
+
+    tree.insert_cells(
+        "z",
+        &[Field::bytes(STATUS, b"final"), reference(&z, BODY)?],
+        2,
+    )?;
+    assert_eq!(
+        tree.get("z", SeqNo::MAX)?.as_deref(),
+        Some(&framed(&[b"final", &body(b'z')])[..]),
+        "the kept table's object is live: its reference is written"
+    );
+    let refused = tree.insert_cells(
+        "a",
+        &[Field::bytes(STATUS, b"final"), reference(&a, BODY)?],
+        3,
+    );
+    assert!(
+        matches!(refused, Err(lsm_tree::Error::BlobRef(_))),
+        "the dropped table's object was released: {refused:?}"
+    );
+    Ok(())
+}
+
 /// Two kept versions of a key that hold one object, moved by a relocation,
 /// share the one copy the relocation writes: the object is copied once, and
 /// the newest version reads it.

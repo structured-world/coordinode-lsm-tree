@@ -2937,6 +2937,71 @@ fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
     Ok(())
 }
 
+/// `verify_blob_links` must reject a table whose cell rows own blob objects
+/// but whose `owned_blob_objects` section is gone: a drop of the table would
+/// then release nothing, and a reference to an object it owned could be
+/// written back after it. The honest table passes.
+#[test]
+fn verify_blob_links_rejects_a_missing_owned_objects_section() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let body = vec![b'b'; 4_096];
+    for i in 0u32..4 {
+        tree.insert_cells(
+            format!("key{i:05}"),
+            &[
+                Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+                Field::bytes(FIRST_FIELD_COLUMN + 1, &body),
+            ],
+            u64::from(i) + 1,
+        )?;
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        assert_eq!(table.owned_blob_objects()?.len(), 4, "one owned body a row");
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    open(source.clone(), &fs)?.verify_blob_links()?;
+
+    crate::test_forge::forge_section_omitted(&source, b"owned_blob_objects")?;
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_blob_links() else {
+        panic!("a table whose owned objects vanished must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "owned_blob_objects disagrees with the objects the table's cell rows own"
+            )
+        ),
+        "the rejection names the owned-objects reason, got {err:?}",
+    );
+    Ok(())
+}
+
 /// `verify_blob_links` must reject a table that still carries indirection
 /// entries but advertises NO `linked_blob_files` section (dropped or renamed
 /// away): returning `Ok` there lets a healed-digest refresh or salvage accept a
@@ -10097,8 +10162,8 @@ fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
 }
 
 /// A recovered block's references include a cell row's, each with its owner
-/// bit: an owned reference adds its object to the file's link, a borrowed one
-/// only links the file.
+/// bit: an owned reference adds its object to the file's link and to the
+/// copy's owned objects, a borrowed one only links the file.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn recovered_cell_row_references_link_their_files_by_ownership() -> crate::Result<()> {
@@ -10131,13 +10196,19 @@ fn recovered_cell_row_references_link_their_files_by_ownership() -> crate::Resul
     let refs = super::collect_indirections(&entries)?;
     assert_eq!(
         refs.iter()
-            .map(|(_, ind, owned)| (ind.vhandle.blob_file_id, *owned))
+            .map(|(_, ind, holding)| (ind.vhandle.blob_file_id, holding.owns()))
             .collect::<Vec<_>>(),
         [(7, true), (8, false)]
     );
 
     let mut derived = crate::HashMap::default();
-    super::fold_blob_links(&mut derived, &refs);
+    let mut owned_cells = Vec::new();
+    super::fold_blob_links(&mut derived, &mut owned_cells, &refs);
+    assert_eq!(
+        owned_cells,
+        [(7, 0)],
+        "only the owned cell object is listed"
+    );
     let owned = derived.get(&7).expect("the owned file is linked");
     assert_eq!((owned.len, owned.bytes, owned.on_disk_bytes), (1, 100, 64));
     let borrowed = derived.get(&8).expect("the borrowed file is linked");

@@ -296,15 +296,17 @@ pub(crate) fn record_block_load_cached(metrics: &Metrics, block_type: BlockType)
             &metrics.data_block_load_cached
         }
         // Manifest variants are rejected by `load_block`'s guard before any
-        // cache lookup; the remaining sections are loaded once on open via
-        // `Block::from_file`, never through this cached path.
+        // cache lookup; the remaining sections are loaded once on open, or on
+        // a table's drop, via `Block::from_file`, never through this cached
+        // path.
         BlockType::Manifest
         | BlockType::ManifestFooter
         | BlockType::BlockLayout
         | BlockType::Locator
         | BlockType::SeqnoBounds
         | BlockType::ZoneMap
-        | BlockType::DeleteBitmap => return,
+        | BlockType::DeleteBitmap
+        | BlockType::OwnedBlobObjects => return,
     };
     cached.fetch_add(1, Relaxed);
 }
@@ -327,15 +329,16 @@ pub(crate) fn record_block_read(metrics: &Metrics, block_type: BlockType, on_dis
             &metrics.data_block_io_requested
         }
         // Manifest variants never reach a table read path; the remaining
-        // sections are loaded once on open via `Block::from_file`, outside
-        // these per-read counters.
+        // sections are loaded once on open, or on a table's drop, via
+        // `Block::from_file`, outside these per-read counters.
         BlockType::Manifest
         | BlockType::ManifestFooter
         | BlockType::BlockLayout
         | BlockType::Locator
         | BlockType::SeqnoBounds
         | BlockType::ZoneMap
-        | BlockType::DeleteBitmap => return,
+        | BlockType::DeleteBitmap
+        | BlockType::OwnedBlobObjects => return,
     };
     requested.fetch_add(on_disk, Relaxed);
 }
@@ -360,7 +363,8 @@ pub(crate) fn record_block_loaded(metrics: &Metrics, block_type: BlockType) {
         | BlockType::Locator
         | BlockType::SeqnoBounds
         | BlockType::ZoneMap
-        | BlockType::DeleteBitmap => return,
+        | BlockType::DeleteBitmap
+        | BlockType::OwnedBlobObjects => return,
     };
     loads.fetch_add(1, Relaxed);
 }

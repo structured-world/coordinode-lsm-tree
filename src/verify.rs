@@ -2461,6 +2461,7 @@ fn expected_section_roles(name: &[u8]) -> Option<&'static [crate::table::block::
         b"seqno_bounds" => &[BlockType::SeqnoBounds],
         b"zone_map" => &[BlockType::ZoneMap],
         b"delete_bitmap" => &[BlockType::DeleteBitmap],
+        b"owned_blob_objects" => &[BlockType::OwnedBlobObjects],
         b"locator" => &[BlockType::Locator],
         _ => return None,
     })

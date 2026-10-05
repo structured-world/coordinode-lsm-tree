@@ -87,6 +87,11 @@ pub struct MultiWriter {
 
     linked_blobs: LinkedBlobFiles,
 
+    /// The blob objects the current table's cell rows own, as `(blob file,
+    /// offset)`: what dropping the table releases, handed to its writer at
+    /// rotation for its `owned_blob_objects` section.
+    owned_objects: Vec<(BlobFileId, u64)>,
+
     /// Range tombstones to distribute across output tables, ordered by start.
     /// During compaction these are clipped to each table's key range; during
     /// flush each is cut into the zones of the outputs it spans, the first and
@@ -307,6 +312,7 @@ impl MultiWriter {
             comparator: crate::comparator::default_comparator(),
 
             linked_blobs: LinkedBlobFiles::default(),
+            owned_objects: Vec::new(),
             range_tombstones: Vec::new(),
             clip_range_tombstones: false,
             output_lower: None,
@@ -660,6 +666,10 @@ impl MultiWriter {
                 key,
                 owned,
             );
+            if owned {
+                self.owned_objects
+                    .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+            }
         }
         Ok(())
     }
@@ -1119,6 +1129,7 @@ impl MultiWriter {
         for linked in self.linked_blobs.take() {
             old_writer.link_blob_file(linked);
         }
+        old_writer.own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         // The install that names the tables syncs their folder once.
         if let Some((table_id, checksum)) = old_writer.finish_deferring_dir_sync()? {
@@ -1189,6 +1200,17 @@ impl MultiWriter {
         use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = self.linked_blobs.section_len();
+        let owned = if self.owned_objects.is_empty() {
+            0
+        } else {
+            framed_len_bound(
+                crate::table::writer::owned_blob_objects_len(self.owned_objects.len()),
+                BlockType::OwnedBlobObjects,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
@@ -1210,11 +1232,15 @@ impl MultiWriter {
             * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
                 + 1
                 + core::mem::size_of::<LinkedFile>()) as u64;
+        // The owned objects' list moves to the writer at rotation, which sorts
+        // it in place.
+        let owned_held =
+            self.owned_objects.capacity() as u64 * core::mem::size_of::<(BlobFileId, u64)>() as u64;
         let (alone_written, alone_held) = alone;
         let size_hint = self.writer.output_size_hint();
         let writer_held = self.writer.held_state_bytes();
-        let size = size_hint + alone_written + linked + tombstone_block;
-        let held = writer_held + alone_held + tombstones_held + linked_held;
+        let size = size_hint + alone_written + linked + owned + tombstone_block;
+        let held = writer_held + alone_held + tombstones_held + linked_held + owned_held;
         // Closing a table sheds none of its metadata or of what it held at its
         // first record, the tombstones carried into it included, which the
         // next table carries alike: a target below that counts only once the
@@ -1542,6 +1568,8 @@ impl MultiWriter {
         for linked in self.linked_blobs.take() {
             self.writer.link_blob_file(linked);
         }
+        self.writer
+            .own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         if let Some((table_id, checksum)) = self.writer.finish_deferring_dir_sync()? {
             self.results.push((table_id, checksum));

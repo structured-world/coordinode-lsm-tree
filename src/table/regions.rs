@@ -103,6 +103,11 @@ pub struct ParsedRegions {
     /// rows by position, applied as a mask at scan time. Absent otherwise, so a
     /// segment without deletes pays nothing.
     pub delete_bitmap: Option<BlockHandle>,
+    /// Optional owned-blob-objects section (the `owned_blob_objects` section).
+    /// Present only when the table's cell rows own blob objects; lists them,
+    /// so a drop of the whole table learns what it releases without reading
+    /// the table's data.
+    pub owned_blob_objects: Option<BlockHandle>,
     pub linked_blob_files: Option<BlockHandle>,
     pub metadata: BlockHandle,
     /// Mid-file backup of the meta block. Writer order:
@@ -164,6 +169,10 @@ impl ParsedRegions {
                 .transpose()?,
             delete_bitmap: toc
                 .section(b"delete_bitmap")
+                .map(toc_entry_to_handle)
+                .transpose()?,
+            owned_blob_objects: toc
+                .section(b"owned_blob_objects")
                 .map(toc_entry_to_handle)
                 .transpose()?,
             linked_blob_files: toc
