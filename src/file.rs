@@ -369,6 +369,16 @@ pub(crate) fn checksum_from_with_overrides(
 /// Uses [`FsFile::read_at`] (equivalent to `pread(2)`) so multiple threads
 /// can call this concurrently on the same file handle.
 pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> crate::io::Result<Slice> {
+    read_exact_paced(file, offset, size, None)
+}
+
+/// [`read_exact`], a portion at a time under `pace` (see [`read_at_paced`]).
+pub(crate) fn read_exact_paced(
+    file: &dyn FsFile,
+    offset: u64,
+    size: usize,
+    pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> crate::io::Result<Slice> {
     // SAFETY: This slice builder starts uninitialized, but we know its length
     //
     // We use FsFile::read_at which gives us the number of bytes read.
@@ -380,9 +390,7 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> crate::io::Res
     #[expect(unsafe_code, reason = "see safety")]
     let mut builder = unsafe { Slice::builder_unzeroed(size) };
 
-    // Single call is correct: FsFile::read_at has fill-or-EOF semantics —
-    // implementations handle EINTR/short-read retry internally.
-    let bytes_read = file.read_at(&mut builder, offset)?;
+    let bytes_read = read_at_paced(file, &mut builder, offset, pace)?;
 
     if bytes_read != size {
         return Err(crate::io::Error::new(
@@ -395,6 +403,42 @@ pub fn read_exact(file: &dyn FsFile, offset: u64, size: usize) -> crate::io::Res
     }
 
     Ok(builder.freeze().into())
+}
+
+/// Reads `buf` from `file` at `offset` and returns the bytes read, fewer only
+/// at the file's end. Without `pace` this is one [`FsFile::read_at`], which has
+/// fill-or-EOF semantics (implementations retry EINTR and short reads). With
+/// `pace`, the read is made a portion at a time, each portion's offset and
+/// length handed to `pace` just before it is read, so a rate limiter's waits
+/// and the reads they pay for alternate instead of one wait and then one read
+/// of the whole.
+pub(crate) fn read_at_paced(
+    file: &dyn FsFile,
+    buf: &mut [u8],
+    offset: u64,
+    pace: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> crate::io::Result<usize> {
+    let Some(pace) = pace else {
+        return file.read_at(buf, offset);
+    };
+    let mut read = 0usize;
+    for portion in buf.chunks_mut(crate::table::util::PACE_PORTION) {
+        // A corrupt handle may name an offset this read would carry past
+        // `u64::MAX`: that is no position in any file.
+        let at = offset.checked_add(read as u64).ok_or_else(|| {
+            crate::io::Error::new(
+                crate::io::ErrorKind::InvalidInput,
+                "read_at_paced: offset past the largest file position",
+            )
+        })?;
+        pace(at, portion.len() as u64);
+        let got = file.read_at(portion, at)?;
+        read += got;
+        if got < portion.len() {
+            break;
+        }
+    }
+    Ok(read)
 }
 
 /// Reads several `(offset, size)` regions of a file in one batched request

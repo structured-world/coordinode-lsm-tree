@@ -4257,6 +4257,83 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     Ok(())
 }
 
+/// A paced block read tells its pacer each portion it reads from the file,
+/// offset and length, before reading it: a block the cache serves is not read,
+/// so not paced, and a handle running past the end is paced for the portion
+/// it then fails to read in full, from where it starts.
+#[test]
+fn a_paced_block_read_paces_each_portion_it_reads_from_the_file() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::load_block_paced},
+    };
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+    let file_len = std::fs::metadata(&file)?.len();
+    let table = Table::recover(test_recover_params(file, checksum))?;
+
+    let paced = std::sync::Mutex::new(Vec::<(u64, u64)>::new());
+    let pace = |offset, len| {
+        paced
+            .lock()
+            .expect("lock is not poisoned")
+            .push((offset, len));
+    };
+    let taken = || core::mem::take(&mut *paced.lock().expect("lock is not poisoned"));
+    let cache = Cache::with_capacity_bytes(10_000_000);
+    let read = |handle: &BlockHandle| {
+        load_block_paced(
+            table.global_id(),
+            &table.path,
+            &table.file_accessor,
+            &cache,
+            handle,
+            BlockType::Index,
+            CompressionType::None,
+            None,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            None,
+            #[cfg(feature = "metrics")]
+            &table.metrics,
+            crate::table::util::ReadCharge::Foreground,
+            Some(&pace as &(dyn Fn(u64, u64) + Send + Sync)),
+        )
+    };
+
+    let tli = table.regions.tli;
+    read(&tli)?;
+    assert_eq!(taken(), vec![(*tli.offset(), u64::from(tli.size()))]);
+    read(&tli)?;
+    assert_eq!(
+        taken(),
+        vec![],
+        "a cached block is not read again, so not paced again"
+    );
+
+    let past_end = BlockHandle::new(crate::table::BlockOffset(file_len - 100), 4096);
+    assert!(read(&past_end).is_err(), "the read runs out of file");
+    assert_eq!(
+        taken(),
+        vec![(file_len - 100, 4096)],
+        "the portion is paced from where it starts; the pacer cuts it at the end"
+    );
+    Ok(())
+}
+
 /// A block read from disk under the wrong role is rejected only after its
 /// transform ran, so the decoded bytes it produced are counted: decoded is
 /// what the transform output, whether or not the caller could use it.
