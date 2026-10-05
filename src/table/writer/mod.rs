@@ -363,6 +363,63 @@ pub(crate) struct InputAge {
     pub created_at: u128,
 }
 
+/// The inputs of one compaction, indexed so that each output meets only the
+/// inputs that can overlap its key range: near one input per output when the
+/// inputs are disjoint, as below L0 they are, instead of every input.
+pub(crate) struct InheritedAges {
+    /// The inputs by ascending max key.
+    inputs: Vec<InputAge>,
+    /// For each position, the smallest min key among the inputs from there
+    /// on: once it lies past an output's last key, no later input meets it.
+    least_min_from: Vec<UserKey>,
+    comparator: crate::SharedComparator,
+}
+
+impl InheritedAges {
+    pub(crate) fn new(mut inputs: Vec<InputAge>, comparator: crate::SharedComparator) -> Self {
+        inputs.sort_by(|a, b| comparator.compare(&a.max, &b.max));
+        let mut least_min_from: Vec<UserKey> = Vec::with_capacity(inputs.len());
+        for input in inputs.iter().rev() {
+            let least = match least_min_from.last() {
+                Some(least)
+                    if comparator.compare(least, &input.min) != core::cmp::Ordering::Greater =>
+                {
+                    least.clone()
+                }
+                _ => input.min.clone(),
+            };
+            least_min_from.push(least);
+        }
+        least_min_from.reverse();
+        Self {
+            inputs,
+            least_min_from,
+            comparator,
+        }
+    }
+
+    /// The newest `created_at` among the inputs whose key range meets
+    /// `first..=last`, or `None` when none does.
+    fn age_of(&self, first: &[u8], last: &[u8]) -> Option<u128> {
+        use core::cmp::Ordering::{Greater, Less};
+
+        // Inputs ending before `first` cannot meet the range.
+        let start = self
+            .inputs
+            .partition_point(|input| self.comparator.compare(&input.max, first) == Less);
+        let mut age = None;
+        for (input, least_min) in self.inputs.iter().zip(&self.least_min_from).skip(start) {
+            if self.comparator.compare(least_min, last) == Greater {
+                break;
+            }
+            if self.comparator.compare(&input.min, last) != Greater {
+                age = Some(age.map_or(input.created_at, |age: u128| age.max(input.created_at)));
+            }
+        }
+        age
+    }
+}
+
 /// One blob file a table references: how many of its objects the table owns,
 /// their bytes, and the span of the table's keys that point there.
 ///
@@ -741,7 +798,7 @@ pub struct Writer {
     /// written, and an age-based policy (FIFO's TTL and drop order) sees the
     /// same data as old after a compaction as before it. `None` (a flush, an
     /// ingest, a salvage copy) stamps the clock.
-    inherited_age: Option<(Arc<[InputAge]>, crate::SharedComparator)>,
+    inherited_age: Option<Arc<InheritedAges>>,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -2168,30 +2225,18 @@ impl Writer {
     }
 
     /// Sets the inputs this compaction output takes its age from (see the
-    /// `inherited_age` field), compared under `comparator`.
+    /// `inherited_age` field).
     #[must_use]
-    pub(crate) fn use_inherited_age(
-        mut self,
-        inputs: Option<Arc<[InputAge]>>,
-        comparator: crate::SharedComparator,
-    ) -> Self {
+    pub(crate) fn use_inherited_age(mut self, inputs: Option<Arc<InheritedAges>>) -> Self {
         self.assert_not_started("use_inherited_age");
-        self.inherited_age = inputs.map(|inputs| (inputs, comparator));
+        self.inherited_age = inputs;
         self
     }
 
     /// The newest `created_at` among the inherited inputs whose key range
     /// meets `first..=last`, or `None` without inputs or when none meets it.
     fn inherited_created_at(&self, first: &[u8], last: &[u8]) -> Option<u128> {
-        let (inputs, comparator) = self.inherited_age.as_ref()?;
-        inputs
-            .iter()
-            .filter(|input| {
-                comparator.compare(&input.min, last) != core::cmp::Ordering::Greater
-                    && comparator.compare(&input.max, first) != core::cmp::Ordering::Less
-            })
-            .map(|input| input.created_at)
-            .max()
+        self.inherited_age.as_ref()?.age_of(first, last)
     }
 
     /// Sets the previous-output link (see [`Self::lineage_prev`]).

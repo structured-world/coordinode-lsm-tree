@@ -193,7 +193,7 @@ pub struct MultiWriter {
 
     /// The compaction inputs every output takes its age from (see
     /// [`Writer::use_inherited_age`]); `None` for a flush or an ingest.
-    inherited_age: Option<Arc<[super::writer::InputAge]>>,
+    inherited_age: Option<Arc<super::writer::InheritedAges>>,
 
     /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
     /// shared with the filter adapter. An output whose window saw one is not
@@ -963,12 +963,10 @@ impl MultiWriter {
 
     /// Lets this and every rotated successor writer take its age from the
     /// compaction `inputs` its key range meets (see
-    /// [`Writer::use_inherited_age`]). Call after [`Self::set_comparator`].
+    /// [`Writer::use_inherited_age`]).
     #[must_use]
-    pub(crate) fn use_inherited_age(mut self, inputs: Arc<[super::writer::InputAge]>) -> Self {
-        self.writer = self
-            .writer
-            .use_inherited_age(Some(Arc::clone(&inputs)), self.comparator.clone());
+    pub(crate) fn use_inherited_age(mut self, inputs: Arc<super::writer::InheritedAges>) -> Self {
+        self.writer = self.writer.use_inherited_age(Some(Arc::clone(&inputs)));
         self.inherited_age = Some(inputs);
         self
     }
@@ -1094,8 +1092,7 @@ impl MultiWriter {
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
-        new_writer =
-            new_writer.use_inherited_age(self.inherited_age.clone(), self.comparator.clone());
+        new_writer = new_writer.use_inherited_age(self.inherited_age.clone());
         // The adjacency link: this successor follows the writer being closed,
         // which is what lets manifest repair union UNBROKEN sibling chains.
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));

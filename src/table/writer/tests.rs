@@ -174,6 +174,54 @@ fn linked_blob_files_reject_a_count_the_section_cannot_hold() {
     ));
 }
 
+/// The indexed lookup of an output's inherited age must give what checking
+/// every input gives, for disjoint inputs, overlapping ones (an L0 table
+/// spanning many others), and ranges before, between and after them.
+#[test]
+fn inherited_ages_match_every_input_checked() {
+    let key = |n: u32| UserKey::from(n.to_be_bytes().as_slice());
+    let mut inputs: Vec<InputAge> = (0..40u32)
+        .map(|i| InputAge {
+            min: key(i * 10),
+            max: key(i * 10 + 5),
+            created_at: u128::from(i * 7 % 13),
+        })
+        .collect();
+    // Wide tables overlapping many disjoint ones, as L0 tables over a level.
+    inputs.push(InputAge {
+        min: key(3),
+        max: key(390),
+        created_at: 5,
+    });
+    inputs.push(InputAge {
+        min: key(150),
+        max: key(160),
+        created_at: 100,
+    });
+    let comparator = crate::comparator::default_comparator();
+    let naive = |first: &[u8], last: &[u8]| {
+        inputs
+            .iter()
+            .filter(|input| {
+                comparator.compare(&input.min, last) != core::cmp::Ordering::Greater
+                    && comparator.compare(&input.max, first) != core::cmp::Ordering::Less
+            })
+            .map(|input| input.created_at)
+            .max()
+    };
+    let indexed = InheritedAges::new(inputs.clone(), comparator.clone());
+    for first in (0..420u32).step_by(3) {
+        for width in [0u32, 1, 4, 9, 30, 200] {
+            let (first, last) = (key(first), key(first + width));
+            assert_eq!(
+                indexed.age_of(&first, &last),
+                naive(&first, &last),
+                "range {first:?}..={last:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn finish_rejects_a_delete_bitmap_without_a_zone_map() -> crate::Result<()> {
     // The positional mask resolves each block's start row from the zone map,
