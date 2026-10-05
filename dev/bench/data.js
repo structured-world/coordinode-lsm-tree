@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791201819436,
+  "lastUpdate": 1791201823600,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -31710,6 +31710,60 @@ window.BENCHMARK_DATA = {
             "value": 414.88,
             "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 99.344526ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "243be78bf861e45c18c42527f7a1067b6666150f",
+          "message": "feat(blob_tree): field-level blob references with late materialization (#815)\n\n## Summary\n\n- A blob tree stores a row as cells: each field keeps its own column id\nand type, and a heavy field goes to a blob file on its own, so compact\nfields stay in the row and an update to them keeps the reference to the\nunchanged object instead of rewriting it.\n- Objects are owned by exactly one live reference of their key, so a\nversion that goes charges its object only when no newer version holds\nit, and blob files are removed only when no table or memtable row still\nlinks them.\n- `columnar_scan` reads blob trees: it decides rows on keys, seqnos and\nvalue types, applies the predicate, and only then reads the payload of\nthe rows it returns, page by page or with the rest when the choices are\ndense, fetching blob objects in file and offset order.\n\n## Changes\n\n- Write and read API: `BlobTree::insert_cells` with `Cell::Value` /\n`Cell::Ref`, `get_cells` and `range_cells` returning `RowCells` whose\nreferences stay bound to the tree and the version they were read from;\nper-column separation thresholds in `KvSeparationOptions`.\n- Ownership: the owner bit in each row, ownership handed to the oldest\nkept holder during compaction, fragmentation charged once, removal\nguarded by table links and memtable registrations; reachability after a\nrestart comes from the tables alone. A weak delete consumes the put\nbefore it in any physical form (value, indirection, cell row).\n- Columnar layout `2` (cells): split cell rows put each field in its\ncolumn, references in a references column, other rows whole; a row whose\nvalue or reference has another type than an earlier split row gave that\nid is kept whole. Written by flush, compaction, ingest and table\nrotation.\n- Late materialization: the merge reads a segment's payload only for the\nrows it chose, from those rows' pages, and a scan of intrinsic columns\nalone reads no value at all. A predicate on a cell the segment stores\ndrops rows before their payload is read; a row of a page read late that\nholds the predicate's field in a referenced object or its whole value is\njudged on those alone before the rest of its payload is read, and a page\nread with its payload is judged once, after the values. The density\ndecision turns a segment eager when three of its last four row pages\nhold a chosen row and back at one in four, counting rows by the\npredicate's verdict. A predicate that has already given every chosen row\nits final verdict is not run again over the rows returned, one that\nkeeps every row does not copy the output again, and a masked batch that\nkeeps every row is not gathered.\n- Counters: `bytes_materialized`, `payload_bytes_useful`,\n`payload_bytes_incidental`, `blob_bytes_prefetched`, beside read,\ndecoded and copied bytes.\n- Recovery and repair rewrite, drop or refuse cell rows by the objects\nthey reference, as they do indirections. Repair hands each object whose\nowning row the rebuild lost to the oldest row left that borrows it\n(`salvage::OwnerPromotions`, `SalvageOptions::owner_promotions`).\n- A dangling indirection or reference is an `InvalidHeader` error\ninstead of a panic or an empty value.\n- `db_bench` mixed-layout: cell-row fixtures for a clustered ~1%\nselection, one row per page, ~90%, projected header fields, scattered\nblobs filtered before fetch, a predicate on a field kept in a blob file,\nthe sparse scan under concurrent compaction (P50 / P99), and eager\npasses the late scans are timed against; `docs/BENCHMARKING.md` and\n`docs/columnar-addressing.md` describe them and the cells layout.\n\n## Testing\n\nUnit, integration and property tests (eager and late paths return the\nsame rows, GC and compaction during the fetch, crash between publishing\na reference and dropping its owner, a lost owner across repair) pass\nwith default and all features on Linux, together with clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench tests. Mixed-layout runs on macOS and Windows:\nthe existing scenarios read, decode and copy the same bytes as `main`,\nand each late cell-row scan is no slower than its eager pass.\n\n## Related\n\n- Replaces #811, the same change as one commit, for a fresh review.\n- #812: the dangling-indirection fix on `5.x.x`\n\nCloses #685\nCloses #687\nCloses #810\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added cell-based rows for blob-backed data, with per-field storage,\nconfigurable separation thresholds, and reads that fetch referenced\npayloads only when needed.\n* Enabled projected columnar scans on blob trees, including filtering\nbefore payload reads and tracking materialized, useful, incidental, and\nprefetched bytes.\n* Added support for cell rows across ingestion, compaction, repair, and\nsalvage.\n\n* **Bug Fixes**\n* Improved handling of blob references during compaction and repair,\npreserving referenced files and transferring ownership where needed.\n* Missing or invalid blob references now return errors rather than\ncausing a panic or being silently accepted.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-05T11:45:35Z",
+          "tree_id": "c324be6ec238eb964ed5a4e76c2f3cb8ec9abe8f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/243be78bf861e45c18c42527f7a1067b6666150f"
+        },
+        "date": 1791201822324,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 501.43500000000006,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 218.571128ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 152.954,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 53.892719ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 456.03799999999995,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 147.676459ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3484.198,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9701.733,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
         ]
       }
