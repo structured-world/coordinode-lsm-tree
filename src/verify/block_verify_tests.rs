@@ -1206,6 +1206,200 @@ fn a_paced_file_charges_short_reads_once() -> crate::Result<()> {
     Ok(())
 }
 
+/// A file that hands back at most 512 bytes a read and, every other read,
+/// `Interrupted` instead, as a backend may when a signal lands mid-read.
+struct InterruptedReads {
+    inner: Box<dyn crate::fs::FsFile>,
+    calls: usize,
+}
+
+impl std::io::Read for InterruptedReads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if self.calls.is_multiple_of(2) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let cap = buf.len().min(512);
+        match buf.get_mut(..cap) {
+            Some(head) => self.inner.read(head),
+            None => Ok(0),
+        }
+    }
+}
+
+impl std::io::Write for InterruptedReads {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for InterruptedReads {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for InterruptedReads {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// The punch-offset walk is charged what it reads: nothing for an index held
+/// in memory, the index block for one loaded per read, and for a partitioned
+/// index only the partitions up to the bound, all of them for a bound past the
+/// last key.
+#[test]
+fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
+    use crate::config::{BlockSizePolicy, PinningPolicy};
+    use crate::table::block::ParsedItem;
+    use crate::table::block_index::BlockIndexImpl;
+
+    let keys: Vec<String> = (0..2_000).map(|i| format!("k{i:05}")).collect();
+    for shape in ["pinned", "volatile", "partitioned"] {
+        let dir = tempfile::tempdir()?;
+        let config = crate::Config::new(
+            dir.path(),
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(BlockSizePolicy::all(256))
+        .index_block_partition_size_policy(BlockSizePolicy::all(256));
+        let config = match shape {
+            "pinned" => config,
+            "volatile" => config.index_block_pinning_policy(PinningPolicy::all(false)),
+            _ => config.index_block_partitioning_policy(PinningPolicy::all(true)),
+        };
+        let tree = config.open()?;
+        for (seqno, key) in keys.iter().enumerate() {
+            tree.insert(key, "v", seqno as u64);
+        }
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let table = version.iter_tables().next().expect("one table");
+
+        let first = index_lookup_bytes(table, b"k00000");
+        let middle = index_lookup_bytes(table, b"k01000");
+        let past = index_lookup_bytes(table, b"z");
+        match &*table.block_index {
+            BlockIndexImpl::Full(_) => {
+                assert_eq!(shape, "pinned");
+                assert_eq!((0, 0, 0), (first, middle, past));
+            }
+            BlockIndexImpl::VolatileFull(index) => {
+                assert_eq!(shape, "volatile");
+                let size = u64::from(index.handle.size());
+                assert!(size > 0);
+                assert_eq!((size, size, size), (first, middle, past));
+            }
+            BlockIndexImpl::TwoLevel(index) => {
+                assert_eq!(shape, "partitioned");
+                let tli = &index.top_level_index;
+                let all: u64 = tli
+                    .iter(table.comparator.clone())
+                    .map(|item| u64::from(item.materialize(tli.as_slice()).size()))
+                    .sum();
+                assert!(tli.len() > 2, "several partitions");
+                assert!(0 < first && first < middle && middle < past);
+                assert_eq!(all, past, "a bound past the end walks every partition");
+            }
+            BlockIndexImpl::Closed => panic!("a live table"),
+        }
+    }
+    Ok(())
+}
+
+/// A read interrupted after the backend already returned bytes keeps those
+/// bytes: the file reads back whole, nothing skipped and nothing overwritten.
+#[test]
+fn a_paced_file_keeps_the_bytes_read_before_an_interruption() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    let bytes: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&bytes)?;
+    }
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 30);
+    let file = InterruptedReads {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        calls: 0,
+    };
+    let mut reader = std::io::BufReader::with_capacity(
+        4 * 1024,
+        PacedFile::new(Box::new(file), Some(&limiter))?,
+    );
+    let mut read = vec![0u8; bytes.len()];
+    reader.read_exact(&mut read[..])?;
+    assert_eq!(read, bytes, "the file reads back whole");
+    Ok(())
+}
+
+/// A large read on a limiter shared with other work is charged in bounded
+/// portions, so a small request arriving meanwhile waits one portion, not the
+/// whole large read.
+#[test]
+fn a_large_paced_read_lets_a_shared_limiter_serve_others_between_portions() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use std::time::{Duration, Instant};
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    // Eight seconds of rate in one read.
+    let rate: u64 = 256 * 1024;
+    let bytes = vec![3u8; 8 * 256 * 1024];
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&bytes)?;
+    }
+    let limiter = std::sync::Arc::new(crate::rate_limiter::RateLimiter::new(rate));
+    // Drain the starting burst so every byte below waits for the rate.
+    assert!(!limiter.request_interruptible(rate, || false));
+
+    let scan = {
+        let limiter = std::sync::Arc::clone(&limiter);
+        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        std::thread::spawn(move || -> crate::Result<()> {
+            let mut paced = PacedFile::new(file, Some(&limiter))?;
+            let mut buf = vec![0u8; 8 * 256 * 1024];
+            // One read call, as BufReader makes for a destination larger than
+            // its buffer.
+            std::io::Read::read_exact(&mut paced, &mut buf)?;
+            Ok(())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    assert!(!limiter.request_interruptible(1024, || false));
+    let waited = started.elapsed();
+    scan.join().expect("scan thread")?;
+    assert!(
+        waited < Duration::from_secs(2),
+        "a small request waited {waited:?} behind one large read"
+    );
+    Ok(())
+}
+
 /// The parity-trailer drain reports a truncated read when an SST whose ECC
 /// descriptor claims per-block parity is missing those trailer bytes. Forges
 /// a `data` section of header + its full payload (so the data read and its

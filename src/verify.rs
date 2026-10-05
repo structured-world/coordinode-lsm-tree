@@ -609,7 +609,11 @@ impl BlockVerifyReport {
 
 /// Options for the block-checksum scrubber
 /// ([`verify_block_checksums_with`] / [`AbstractTree::verify_checksum_with`](crate::AbstractTree::verify_checksum_with)).
+// Non-exhaustive: options are added over releases, and a caller building the
+// struct by literal would break on each; `Default` plus the builder methods is
+// the construction path.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct VerifyOptions {
     /// Number of SSTs to scan concurrently. Clamped to `>= 1` and to the table
     /// count. `1` (the default) scans sequentially in table order with no
@@ -712,20 +716,52 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
     dst.incomplete |= src.incomplete;
 }
 
+/// The on-disk bytes `table`'s punch-offset walk for `bound` reads: nothing
+/// for an index held in memory, the index block for one loaded per read, and
+/// for a partitioned index (whose top level is held in memory) the partitions
+/// up to and including the first whose end key reaches `bound`, where the
+/// walk stops. Found from what is resident, without reading.
+///
+/// A block the cache already holds is still counted: telling a hit from a
+/// read would need the limiter inside the block loader, which every table
+/// read shares.
+fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8]) -> u64 {
+    use crate::table::block::ParsedItem;
+    use crate::table::block_index::BlockIndexImpl;
+
+    match &*table.block_index {
+        BlockIndexImpl::Full(_) | BlockIndexImpl::Closed => 0,
+        BlockIndexImpl::VolatileFull(index) => u64::from(index.handle.size()),
+        BlockIndexImpl::TwoLevel(index) => {
+            let tli = &index.top_level_index;
+            let mut bytes = 0;
+            for item in tli.iter(table.comparator.clone()) {
+                let partition = item.materialize(tli.as_slice());
+                bytes += u64::from(partition.size());
+                if table.comparator.compare(partition.end_key(), bound) != core::cmp::Ordering::Less
+                {
+                    break;
+                }
+            }
+            bytes
+        }
+    }
+}
+
 /// `table`'s punch offset for `bound`, its index walk charged to `limiter`
 /// first: the walk reads through the table's own block reads, not the paced
-/// file, and reads at most the index sections, so their size is charged.
+/// file, so what it reads ([`index_lookup_bytes`]) is charged before it runs.
 fn paced_punch_offset(
     table: &crate::table::Table,
     bound: &[u8],
     limiter: Option<&RateLimiter>,
 ) -> crate::Result<u64> {
     if let Some(limiter) = limiter {
-        let regions = &table.regions;
-        let index =
-            u64::from(regions.tli.size()) + regions.index.map_or(0, |h| u64::from(h.size()));
-        let stopped = limiter.request_interruptible(index, || false);
-        debug_assert!(!stopped, "a scrub is never stopped midway");
+        let index = index_lookup_bytes(table, bound);
+        if index > 0 {
+            let stopped = limiter.request_interruptible(index, || false);
+            debug_assert!(!stopped, "a scrub is never stopped midway");
+        }
     }
     table.punch_offset_for(bound)
 }
@@ -2253,6 +2289,11 @@ type FileRead = std::io::Result<usize>;
 #[cfg(not(feature = "std"))]
 type FileRead = io::Result<usize>;
 
+/// The most a scan charges its limiter in one request: a block larger than
+/// this is charged in portions, so a shared limiter serves other requests
+/// between them.
+const PACE_PORTION: u64 = 64 * 1024;
+
 /// An SST opened for a scan whose every read of the file is charged to the
 /// limiter, when there is one, before it is made: the bytes the buffered
 /// walk pulls in, trailer and TOC included, never a length a header or the
@@ -2326,12 +2367,20 @@ impl PacedFile<'_> {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
-        if let Some(limiter) = self.limiter
-            && bytes > 0
-        {
-            // A scrub has no stop signal, so the wait always ends in a read.
-            let stopped = limiter.request_interruptible(bytes, || false);
-            debug_assert!(!stopped, "a scrub is never stopped midway");
+        if let Some(limiter) = self.limiter {
+            // Charged a portion at a time, each waited for before the next is
+            // asked: on a limiter shared with compaction, one debit as large as
+            // a block would hold every request behind it until the whole block
+            // was repaid. The read itself still happens once, after the last
+            // portion.
+            let mut owed = bytes;
+            while owed > 0 {
+                let portion = owed.min(PACE_PORTION);
+                // A scrub has no stop signal, so the wait always ends in a read.
+                let stopped = limiter.request_interruptible(portion, || false);
+                debug_assert!(!stopped, "a scrub is never stopped midway");
+                owed -= portion;
+            }
         }
         // At most `want`, so it fits a `usize`.
         usize::try_from(bytes).unwrap_or(want)
@@ -2348,12 +2397,27 @@ impl PacedFile<'_> {
             self.pos += read as u64;
             return Ok(read);
         }
+        #[cfg(not(feature = "std"))]
+        use io::ErrorKind;
+        #[cfg(feature = "std")]
+        use std::io::ErrorKind;
+
         let mut read = 0;
         while read < charged {
             let Some(rest) = buf.get_mut(read..charged) else {
                 break;
             };
-            let got = self.inner.read(rest)?;
+            let got = match self.inner.read(rest) {
+                Ok(got) => got,
+                // Retried here: the bytes before it are already taken from
+                // the file, and an error would make the caller retry into the
+                // same buffer and lose them.
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                // The bytes already read are handed back first; the error
+                // comes again on the next read.
+                Err(_) if read > 0 => break,
+                Err(e) => return Err(e),
+            };
             if got == 0 {
                 break;
             }
