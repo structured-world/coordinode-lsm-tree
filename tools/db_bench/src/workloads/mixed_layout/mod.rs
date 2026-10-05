@@ -259,7 +259,7 @@ impl Readings {
                 materialized,
                 "B/row",
                 annotation.clone(),
-                Direction::SmallerIsBetter,
+                Suite::Costs,
             );
         }
         if self.payload_useful + self.payload_incidental > 0 {
@@ -273,7 +273,7 @@ impl Readings {
                         value,
                         "B/row",
                         annotation.clone(),
-                        Direction::SmallerIsBetter,
+                        Suite::Costs,
                     );
                 }
             }
@@ -1210,13 +1210,14 @@ impl Workload for MixedLayout {
                         percentile_us(&latencies, 99.0),
                     );
                     eprintln!("  {:<34} scan P50={p50:.1}us P99={p99:.1}us", "");
+                    // Timed on this host, so the host's own timings.
                     for (figure, value) in [("scan P50", p50), ("scan P99", p99)] {
                         reporter.publish_series(
                             format!("{name} {figure}"),
                             value,
                             "us",
                             format!("keys: {keys} | scans: {}", latencies.len()),
-                            Direction::SmallerIsBetter,
+                            Suite::Timings,
                         );
                     }
                 }
