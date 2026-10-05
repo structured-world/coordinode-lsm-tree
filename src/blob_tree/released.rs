@@ -22,6 +22,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::HashMap;
 use crate::vlog::{BlobFileId, ValueHandle};
