@@ -1850,12 +1850,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 51.253105ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 121.30799999999999,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 72.811928ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -1884,12 +1878,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 96.682836ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 444.942,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 98.438906ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -2108,12 +2096,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.5747ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 144.3,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 56.3799ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -2142,12 +2124,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 81.1256ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 687.5,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 88.3271ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -2366,12 +2342,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 48.773525ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 111.462,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 48.422758ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -2400,12 +2370,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 95.742516ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 419.675,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.180566ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -2624,12 +2588,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 148.89999999999998,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.0689ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -2658,12 +2616,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.9186ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 687.6,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 81.2061ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -2882,12 +2834,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 56.5305ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 118.7,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 49.174ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -2915,12 +2861,6 @@ window.BENCHMARK_DATA = {
             "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
             "value": 132496,
             "unit": "B",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 88.728ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 725.9,
-            "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 88.728ms\niterations: 3"
           },
           {
@@ -3140,12 +3080,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 47.8937ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 120.8,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 56.1005ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -3173,12 +3107,6 @@ window.BENCHMARK_DATA = {
             "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
             "value": 132496,
             "unit": "B",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 683.3,
-            "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 89.1809ms\niterations: 3"
           },
           {
@@ -3398,12 +3326,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 46.7715ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 127.69999999999999,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 46.7715ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -3432,12 +3354,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 79.38ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 681.5,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 86.4501ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -3602,12 +3518,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 15731016 B | elapsed: 79.942425ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
-            "value": 481.07,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 15731016 B | elapsed: 79.299628ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read to first batch",
             "value": 165256,
             "unit": "B",
@@ -3692,12 +3602,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 51.715595ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 102.562,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 54.606896ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -3725,12 +3629,6 @@ window.BENCHMARK_DATA = {
             "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
             "value": 132496,
             "unit": "B",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 94.94736ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 428.663,
-            "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 28555168 B | elapsed: 94.94736ms\niterations: 3"
           },
           {
@@ -3896,12 +3794,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 81.120839ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
-            "value": 515.398,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 81.120839ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read to first batch",
             "value": 165256,
             "unit": "B",
@@ -3986,12 +3878,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 57.444402ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 128.37,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 55.849677ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -4020,12 +3906,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 110.631944ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 436.74399999999997,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 96.834694ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -4190,12 +4070,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 83.427253ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
-            "value": 503.111,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 83.427253ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read to first batch",
             "value": 165256,
             "unit": "B",
@@ -4280,12 +4154,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 50.795696ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 140.078,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 53.485078ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -4314,12 +4182,6 @@ window.BENCHMARK_DATA = {
             "value": 132496,
             "unit": "B",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 95.644222ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 427.679,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 99.130252ms\niterations: 3"
           },
           {
             "name": "mixed-layout / columnar-scan-overlap-8 bytes read to first batch",
@@ -4484,12 +4346,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 64.2276ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
-            "value": 527.4,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 66.7988ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / row-updates-over-columnar-base-scan bytes read to first batch",
             "value": 165256,
             "unit": "B",
@@ -4574,12 +4430,6 @@ window.BENCHMARK_DATA = {
             "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 51.4709ms\niterations: 3"
           },
           {
-            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
-            "value": 137.89999999999998,
-            "unit": "us",
-            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 51.4709ms\niterations: 3"
-          },
-          {
             "name": "mixed-layout / columnar-scan-one-segment bytes read to first batch",
             "value": 16629,
             "unit": "B",
@@ -4607,12 +4457,6 @@ window.BENCHMARK_DATA = {
             "name": "mixed-layout / columnar-scan-overlap-8 retained payload",
             "value": 132496,
             "unit": "B",
-            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 83.875ms\niterations: 3"
-          },
-          {
-            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
-            "value": 701.2,
-            "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 83.875ms\niterations: 3"
           },
           {
@@ -26446,12 +26290,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 132883.8642800727,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.2us | P99.9: 7.8us\nthreads: 1 | elapsed: 4.03s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4322580.431821031,
             "unit": "ops/sec",
@@ -26529,12 +26367,6 @@ window.BENCHMARK_DATA = {
         "date": 1788852194418,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 68053.6817867915,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 6.2us | P99.9: 9.0us\nthreads: 1 | elapsed: 7.86s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4325314.330324342,
@@ -26614,12 +26446,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 136601.3151672654,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.4us | P99.9: 8.8us\nthreads: 1 | elapsed: 3.92s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4330715.899168895,
             "unit": "ops/sec",
@@ -26697,12 +26523,6 @@ window.BENCHMARK_DATA = {
         "date": 1788865104019,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 136160.55348922074,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.4us | P99.9: 8.7us\nthreads: 1 | elapsed: 3.93s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4308785.214489712,
@@ -26782,12 +26602,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 122694.82833261658,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 6.5us | P99.9: 11.0us\nthreads: 1 | elapsed: 4.36s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4362676.067244718,
             "unit": "ops/sec",
@@ -26865,12 +26679,6 @@ window.BENCHMARK_DATA = {
         "date": 1788886915359,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 136834.62067759814,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.5us | P99.9: 9.2us\nthreads: 1 | elapsed: 3.91s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4334987.362211343,
@@ -26950,12 +26758,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 137241.86967852418,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 6.4us | P99.9: 9.4us\nthreads: 1 | elapsed: 3.90s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4309421.274026963,
             "unit": "ops/sec",
@@ -27033,12 +26835,6 @@ window.BENCHMARK_DATA = {
         "date": 1789457655618,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 133558.61397340006,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.5us | P99.9: 8.9us\nthreads: 1 | elapsed: 4.01s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4254720.500709123,
@@ -27118,12 +26914,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 134283.71322585264,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.4us | P99.9: 7.9us\nthreads: 1 | elapsed: 3.99s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4417109.993592098,
             "unit": "ops/sec",
@@ -27201,12 +26991,6 @@ window.BENCHMARK_DATA = {
         "date": 1789482101106,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 133016.73432006774,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 4.02s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4363390.204961309,
@@ -27286,12 +27070,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 120702.3770545537,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 6.4us | P99.9: 10.0us\nthreads: 1 | elapsed: 4.43s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4306290.881637913,
             "unit": "ops/sec",
@@ -27369,12 +27147,6 @@ window.BENCHMARK_DATA = {
         "date": 1789497492043,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 132421.77879371843,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.3us | P99.9: 8.4us\nthreads: 1 | elapsed: 4.04s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4339516.008138241,
@@ -27454,12 +27226,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 74735.53079931246,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 6.5us | P99.9: 10.1us\nthreads: 1 | elapsed: 7.16s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4357150.958331389,
             "unit": "ops/sec",
@@ -27538,12 +27304,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 74025.54781312554,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.2us | P99.9: 7.7us\nthreads: 1 | elapsed: 7.23s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 4386794.170301491,
             "unit": "ops/sec",
@@ -27621,12 +27381,6 @@ window.BENCHMARK_DATA = {
         "date": 1789723671013,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 74788.11138726688,
-            "unit": "ops/sec",
-            "extra": "P50: 0.3us | P99: 5.3us | P99.9: 7.9us\nthreads: 1 | elapsed: 7.16s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 4419146.011964882,
@@ -27708,12 +27462,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 69810.64924386382,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.8us | P99.9: 28.5us\nthreads: 1 | elapsed: 7.67s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3158300.329094894,
             "unit": "ops/sec",
@@ -27791,12 +27539,6 @@ window.BENCHMARK_DATA = {
         "date": 1789813298241,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 75133.1274401527,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.7us | P99.9: 27.5us\nthreads: 1 | elapsed: 7.12s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3232098.6177930264,
@@ -27876,12 +27618,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 74998.83698836596,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.6us | P99.9: 28.7us\nthreads: 1 | elapsed: 7.14s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3174295.822150554,
             "unit": "ops/sec",
@@ -27959,12 +27695,6 @@ window.BENCHMARK_DATA = {
         "date": 1789914598283,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 77753.6284675552,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.6us | P99.9: 30.3us\nthreads: 1 | elapsed: 6.88s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3148763.323204811,
@@ -28044,12 +27774,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 77424.60680547597,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.5us | P99.9: 30.9us\nthreads: 1 | elapsed: 6.91s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3170692.653663656,
             "unit": "ops/sec",
@@ -28127,12 +27851,6 @@ window.BENCHMARK_DATA = {
         "date": 1790004447837,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 79767.14622184963,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.7us | P99.9: 28.0us\nthreads: 1 | elapsed: 6.71s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3163205.5925474875,
@@ -28212,12 +27930,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 59310.973459802095,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 10.2us | P99.9: 39.0us\nthreads: 1 | elapsed: 9.02s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3006248.4874812295,
             "unit": "ops/sec",
@@ -28295,12 +28007,6 @@ window.BENCHMARK_DATA = {
         "date": 1790026172882,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 76837.2896460044,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.5us | P99.9: 27.7us\nthreads: 1 | elapsed: 6.97s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3176211.446748433,
@@ -28382,12 +28088,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 80601.05946632141,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.2us | P99.9: 27.8us\nthreads: 1 | elapsed: 6.64s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3214209.376813015,
             "unit": "ops/sec",
@@ -28465,12 +28165,6 @@ window.BENCHMARK_DATA = {
         "date": 1790102273431,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 80651.45472703277,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.4us | P99.9: 27.4us\nthreads: 1 | elapsed: 6.64s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3165839.3273224593,
@@ -28550,12 +28244,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 38190.36220216429,
-            "unit": "ops/sec",
-            "extra": "P50: 0.6us | P99: 18.1us | P99.9: 86.8us\nthreads: 1 | elapsed: 14.02s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3159937.0540538835,
             "unit": "ops/sec",
@@ -28633,12 +28321,6 @@ window.BENCHMARK_DATA = {
         "date": 1790644343196,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 81824.47607279205,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 7.7us | P99.9: 28.4us\nthreads: 1 | elapsed: 6.54s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3086310.208125329,
@@ -28718,12 +28400,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 82110.71354277569,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.0us | P99.9: 28.7us\nthreads: 1 | elapsed: 6.52s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 3135376.135398083,
             "unit": "ops/sec",
@@ -28801,12 +28477,6 @@ window.BENCHMARK_DATA = {
         "date": 1790697196011,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 82325.13345841758,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 7.9us | P99.9: 29.3us\nthreads: 1 | elapsed: 6.50s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3090287.381275022,
@@ -28886,12 +28556,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 69059.2426475531,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.0us | P99.9: 27.4us\nthreads: 1 | elapsed: 7.75s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2654195.486805994,
             "unit": "ops/sec",
@@ -28969,12 +28633,6 @@ window.BENCHMARK_DATA = {
         "date": 1790784429643,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 82616.5267103951,
-            "unit": "ops/sec",
-            "extra": "P50: 0.4us | P99: 8.1us | P99.9: 29.0us\nthreads: 1 | elapsed: 6.48s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 3048896.680513739,
@@ -29140,12 +28798,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 11986.553741104697,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 10.9us | P99.9: 21.9us\nthreads: 1 | elapsed: 44.65s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 1788108.5950535731,
             "unit": "ops/sec",
@@ -29223,12 +28875,6 @@ window.BENCHMARK_DATA = {
         "date": 1790172697656,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 20269.45745795171,
-            "unit": "ops/sec",
-            "extra": "P50: 0.7us | P99: 12.3us | P99.9: 28.3us\nthreads: 1 | elapsed: 26.41s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2219253.2066488913,
@@ -29308,12 +28954,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 17066.526543796237,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 12.6us | P99.9: 33.0us\nthreads: 1 | elapsed: 31.36s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2346423.6672774055,
             "unit": "ops/sec",
@@ -29391,12 +29031,6 @@ window.BENCHMARK_DATA = {
         "date": 1790277429765,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 18481.56760802304,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 13.4us | P99.9: 25.1us\nthreads: 1 | elapsed: 28.96s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2399774.382811626,
@@ -29476,12 +29110,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 33215.575389178295,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 12.9us | P99.9: 24.1us\nthreads: 1 | elapsed: 16.11s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2461957.767034834,
             "unit": "ops/sec",
@@ -29559,12 +29187,6 @@ window.BENCHMARK_DATA = {
         "date": 1790412436061,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 33026.2737660981,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.3us | P99.9: 15.7us\nthreads: 1 | elapsed: 16.21s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2452404.469772006,
@@ -29644,12 +29266,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 32993.53781629849,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 13.0us | P99.9: 23.1us\nthreads: 1 | elapsed: 16.22s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2495817.695891552,
             "unit": "ops/sec",
@@ -29727,12 +29343,6 @@ window.BENCHMARK_DATA = {
         "date": 1790445465529,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 32890.006305858034,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.4us | P99.9: 17.0us\nthreads: 1 | elapsed: 16.27s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2497108.3797101504,
@@ -29812,12 +29422,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 25054.03394100816,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 13.5us | P99.9: 25.1us\nthreads: 1 | elapsed: 21.36s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2488816.286246327,
             "unit": "ops/sec",
@@ -29895,12 +29499,6 @@ window.BENCHMARK_DATA = {
         "date": 1790536485302,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 32225.30069700428,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.3us | P99.9: 16.4us\nthreads: 1 | elapsed: 16.61s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2749187.7902686973,
@@ -29980,12 +29578,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 33158.29380158819,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 10.4us | P99.9: 20.4us\nthreads: 1 | elapsed: 16.14s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2710060.737339233,
             "unit": "ops/sec",
@@ -30063,12 +29655,6 @@ window.BENCHMARK_DATA = {
         "date": 1790614985166,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 29204.476116211237,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.8us | P99.9: 17.6us\nthreads: 1 | elapsed: 18.33s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2641093.3820234747,
@@ -30148,12 +29734,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 30355.307228690297,
-            "unit": "ops/sec",
-            "extra": "P50: 0.6us | P99: 13.7us | P99.9: 28.3us\nthreads: 1 | elapsed: 17.63s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2741260.6451888625,
             "unit": "ops/sec",
@@ -30231,12 +29811,6 @@ window.BENCHMARK_DATA = {
         "date": 1790669055295,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 31709.86755506658,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.5us | P99.9: 18.5us\nthreads: 1 | elapsed: 16.88s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 2775589.302712292,
@@ -30316,12 +29890,6 @@ window.BENCHMARK_DATA = {
         "tool": "customBiggerIsBetter",
         "benches": [
           {
-            "name": "mixed",
-            "value": 31049.013416093356,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 9.5us | P99.9: 15.2us\nthreads: 1 | elapsed: 17.24s | num: 200000 | iterations: 3"
-          },
-          {
             "name": "fillseq",
             "value": 2837997.120426222,
             "unit": "ops/sec",
@@ -30399,12 +29967,6 @@ window.BENCHMARK_DATA = {
         "date": 1791012886236,
         "tool": "customBiggerIsBetter",
         "benches": [
-          {
-            "name": "mixed",
-            "value": 24286.703628831303,
-            "unit": "ops/sec",
-            "extra": "P50: 0.5us | P99: 14.3us | P99.9: 37.8us\nthreads: 1 | elapsed: 22.04s | num: 200000 | iterations: 3"
-          },
           {
             "name": "fillseq",
             "value": 1814612.6071553696,
