@@ -138,60 +138,101 @@ pub(crate) struct InputAge {
     pub created_at: u128,
 }
 
-/// The inputs of one compaction, indexed so that each output meets only the
-/// inputs that can overlap its key range: near one input per output when the
-/// inputs are disjoint, as below L0 they are, instead of every input.
-pub(crate) struct InheritedAges {
-    /// The inputs by ascending max key.
-    inputs: Vec<InputAge>,
-    /// For each position, the smallest min key among the inputs from there
-    /// on: once it lies past an output's last key, no later input meets it.
-    least_min_from: Vec<UserKey>,
+/// The inputs of one compaction, swept in step with the outputs one writer
+/// chain produces in ascending key order: an input joins the live set once
+/// an output reaches its min key and leaves it once outputs pass its max key,
+/// so each joins and leaves once, whatever its width, and the whole run costs
+/// near-linear time in inputs and outputs rather than their product.
+pub(crate) struct AgeSweep {
+    /// The inputs by ascending min key.
+    by_min: Vec<InputAge>,
+    /// Each input's rank among the inputs by ascending max key.
+    max_rank: Vec<usize>,
+    /// The next input of `by_min` to join.
+    next: usize,
+    /// The live inputs by ascending max rank, as `(rank, index)`.
+    live: alloc::collections::BinaryHeap<core::cmp::Reverse<(usize, usize)>>,
+    /// The ages of the live inputs, with their counts.
+    ages: alloc::collections::BTreeMap<u128, usize>,
     comparator: crate::SharedComparator,
+    /// The last range queried, held in debug builds to check the ascending
+    /// order the sweep relies on.
+    #[cfg(debug_assertions)]
+    last_range: Option<(UserKey, UserKey)>,
 }
 
-impl InheritedAges {
+impl AgeSweep {
     pub(crate) fn new(mut inputs: Vec<InputAge>, comparator: crate::SharedComparator) -> Self {
-        inputs.sort_by(|a, b| comparator.compare(&a.max, &b.max));
-        let mut least_min_from: Vec<UserKey> = Vec::with_capacity(inputs.len());
-        for input in inputs.iter().rev() {
-            let least = match least_min_from.last() {
-                Some(least)
-                    if comparator.compare(least, &input.min) != core::cmp::Ordering::Greater =>
-                {
-                    least.clone()
-                }
-                _ => input.min.clone(),
-            };
-            least_min_from.push(least);
+        inputs.sort_by(|a, b| comparator.compare(&a.min, &b.min));
+        let mut by_max: Vec<usize> = (0..inputs.len()).collect();
+        by_max.sort_by(|&a, &b| match (inputs.get(a), inputs.get(b)) {
+            (Some(a), Some(b)) => comparator.compare(&a.max, &b.max),
+            _ => core::cmp::Ordering::Equal,
+        });
+        let mut max_rank = alloc::vec![0; inputs.len()];
+        for (rank, index) in by_max.into_iter().enumerate() {
+            if let Some(slot) = max_rank.get_mut(index) {
+                *slot = rank;
+            }
         }
-        least_min_from.reverse();
         Self {
-            inputs,
-            least_min_from,
+            by_min: inputs,
+            max_rank,
+            next: 0,
+            live: alloc::collections::BinaryHeap::new(),
+            ages: alloc::collections::BTreeMap::new(),
             comparator,
+            #[cfg(debug_assertions)]
+            last_range: None,
         }
     }
 
     /// The newest `created_at` among the inputs whose key range meets
-    /// `first..=last`, or `None` when none does.
-    fn age_of(&self, first: &[u8], last: &[u8]) -> Option<u128> {
+    /// `first..=last`, or `None` when none does. Successive calls must pass
+    /// ranges that follow one another in ascending key order, as the outputs
+    /// of one writer chain do.
+    pub(crate) fn age_of(&mut self, first: &[u8], last: &[u8]) -> Option<u128> {
         use core::cmp::Ordering::{Greater, Less};
 
-        // Inputs ending before `first` cannot meet the range.
-        let start = self
-            .inputs
-            .partition_point(|input| self.comparator.compare(&input.max, first) == Less);
-        let mut age = None;
-        for (input, least_min) in self.inputs.iter().zip(&self.least_min_from).skip(start) {
-            if self.comparator.compare(least_min, last) == Greater {
+        #[cfg(debug_assertions)]
+        {
+            if let Some((_, previous_last)) = &self.last_range {
+                debug_assert!(
+                    self.comparator.compare(previous_last, first) != Greater,
+                    "outputs swept out of key order"
+                );
+            }
+            self.last_range = Some((first.into(), last.into()));
+        }
+
+        // Join every input that starts at or before `last`.
+        while let Some(input) = self.by_min.get(self.next) {
+            if self.comparator.compare(&input.min, last) == Greater {
                 break;
             }
-            if self.comparator.compare(&input.min, last) != Greater {
-                age = Some(age.map_or(input.created_at, |age: u128| age.max(input.created_at)));
+            let rank = self.max_rank.get(self.next).copied().unwrap_or_default();
+            self.live.push(core::cmp::Reverse((rank, self.next)));
+            *self.ages.entry(input.created_at).or_insert(0) += 1;
+            self.next += 1;
+        }
+        // Leave every input that ends before `first`: the live input with the
+        // lowest max rank goes first, so once it reaches `first`, all do.
+        while let Some(&core::cmp::Reverse((_, index))) = self.live.peek() {
+            let Some(input) = self.by_min.get(index) else {
+                break;
+            };
+            if self.comparator.compare(&input.max, first) != Less {
+                break;
+            }
+            self.live.pop();
+            if let Some(count) = self.ages.get_mut(&input.created_at) {
+                *count -= 1;
+                if *count == 0 {
+                    self.ages.remove(&input.created_at);
+                }
             }
         }
-        age
+        self.ages.last_key_value().map(|(&age, _)| age)
     }
 }
 
@@ -509,14 +550,6 @@ pub struct Writer {
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
 
-    /// The compaction inputs this output takes its age from: its `created_at`
-    /// is the newest of those whose key range meets its own, so a rewrite
-    /// keeps the age of the data it carries instead of the time it was
-    /// written, and an age-based policy (FIFO's TTL and drop order) sees the
-    /// same data as old after a compaction as before it. `None` (a flush, an
-    /// ingest, a salvage copy) stamps the clock.
-    inherited_age: Option<Arc<InheritedAges>>,
-
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -690,7 +723,6 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
-            inherited_age: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -1731,21 +1763,6 @@ impl Writer {
             ids
         });
         self
-    }
-
-    /// Sets the inputs this compaction output takes its age from (see the
-    /// `inherited_age` field).
-    #[must_use]
-    pub(crate) fn use_inherited_age(mut self, inputs: Option<Arc<InheritedAges>>) -> Self {
-        self.assert_not_started("use_inherited_age");
-        self.inherited_age = inputs;
-        self
-    }
-
-    /// The newest `created_at` among the inherited inputs whose key range
-    /// meets `first..=last`, or `None` without inputs or when none meets it.
-    fn inherited_created_at(&self, first: &[u8], last: &[u8]) -> Option<u128> {
-        self.inherited_age.as_ref()?.age_of(first, last)
     }
 
     /// Sets the previous-output link (see [`Self::lineage_prev`]).
@@ -2882,10 +2899,23 @@ impl Writer {
         )
     }
 
+    /// Finishes the table, making sure all data is written durably
+    pub fn finish(self) -> crate::Result<Option<(TableId, Checksum)>> {
+        self.finish_aged(None)
+    }
+
     // TODO: split meta writing into new function
     #[expect(clippy::too_many_lines)]
-    /// Finishes the table, making sure all data is written durably
-    pub fn finish(mut self) -> crate::Result<Option<(TableId, Checksum)>> {
+    /// [`Self::finish`], a compaction output taking its `created_at` from
+    /// `ages`: the newest age among the compaction inputs its key range
+    /// meets, so a rewrite keeps the age of the data it carries instead of
+    /// the time it was written, and an age-based policy (FIFO's TTL and drop
+    /// order) sees the same data as old after a compaction as before it.
+    /// Without `ages` (a flush, an ingest, a salvage copy) the clock is read.
+    pub(crate) fn finish_aged(
+        mut self,
+        ages: Option<&mut AgeSweep>,
+    ) -> crate::Result<Option<(TableId, Checksum)>> {
         #[cfg(not(feature = "std"))]
         use crate::io::Write;
         #[cfg(feature = "std")]
@@ -3265,8 +3295,8 @@ impl Writer {
         // created_at so MID-fallback recovery produces the same timestamp as
         // a clean TAIL recovery. A compaction output inherits the age of the
         // inputs it carries data from; anything else reads the clock.
-        let created_at_nanos = self
-            .inherited_created_at(first_key, last_key)
+        let created_at_nanos = ages
+            .and_then(|ages| ages.age_of(first_key, last_key))
             .unwrap_or_else(|| unix_timestamp().as_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
