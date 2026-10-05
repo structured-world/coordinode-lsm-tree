@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791188624544,
+  "lastUpdate": 1791188628022,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -30952,6 +30952,50 @@ window.BENCHMARK_DATA = {
             "value": 690.5,
             "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 83.4471ms\niterations: 3"
+          }
+        ]
+      }
+    ],
+    "lsm-tree db_bench timings 6.x · Linux · runner1-sw": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "24efe88e9a134b7c6397da9898d794aceb426b69",
+          "message": "fix(salvage): stamp a verbatim copy for where it lands (#839)\n\n## Summary\n\n- `repair_with_salvage` on a table whose first data block is damaged no\nlonger publishes a replacement that fails its own checksums.\n- A verbatim block copy is stamped for the offset it is written at: the\nwriter now writes out the block that row-by-row re-emits left pending,\nand drains parallel compression, before it reads that offset.\n\nLands the change of #820, which GitHub shows as merged but whose merge\nnever reached `main`.\n\n## Changes\n\n- `Writer::settle_pending_blocks` writes out the pending row chunk and\nevery block still being compressed; `append_verbatim_extent` calls it\nbefore `restamp_extent`, and `account_direct_block` keeps calling it for\nthe columnar path.\n- The accounting of a verbatim extent stays after the restamp, so an\nextent the restamp refuses counts no rows.\n- Tests: a row table with a damaged first block, and a columnar table\nwith a damaged first row group, repaired with salvage, read every\nsurviving key with its value.\n\nColumnar row groups were not affected: a re-encoded group is written at\nonce, so no rows are pending when a copy follows it. `5.x.x` is not\naffected: its block checksums are not bound to the position.\n\n## Testing\n\nTests with default and all features, clippy in both configurations, doc\ntests, the doc build, the no-std check and the sst-dump suite pass on\nLinux.\n\nCloses #819",
+          "timestamp": "2026-10-05T11:10:57+03:00",
+          "tree_id": "0594591c2eed9833e28437c6a47598307cd123ec",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/24efe88e9a134b7c6397da9898d794aceb426b69"
+        },
+        "date": 1791188626840,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 495.70099999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | elapsed: 77.187841ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 107.479,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | elapsed: 52.088697ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 414.88,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 99.344526ms\niterations: 3"
           }
         ]
       }
