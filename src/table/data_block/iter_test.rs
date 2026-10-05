@@ -336,6 +336,47 @@ mod tests {
         Ok(())
     }
 
+    /// An upper bound below the key `seek` landed on walks nothing, forward and
+    /// back: the entry `seek` holds lies outside the range.
+    #[test]
+    fn data_block_seek_upper_below_the_seeked_key_walks_nothing() -> crate::Result<()> {
+        let items = ["b", "c", "d", "e", "f", "g"]
+            .map(|key| InternalValue::from_components(key, key, 0, Value));
+
+        for restart_interval in 1..=8 {
+            let bytes = DataBlock::encode_into_vec(&items, restart_interval, 0.0)?;
+            let data_block = DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header::test_dummy(BlockType::Data),
+            });
+
+            for (exclusive, back) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut iter = data_block.iter(default_comparator());
+                assert!(iter.seek(b"e", SeqNo::MAX), "seek lands");
+                if exclusive {
+                    iter.seek_upper_exclusive(b"c", SeqNo::MAX);
+                } else {
+                    iter.seek_upper(b"c", SeqNo::MAX);
+                }
+                let walked: Vec<_> = if back {
+                    iter.rev()
+                        .map(|item| item.materialize(&data_block.inner.data).key.user_key)
+                        .collect()
+                } else {
+                    iter.map(|item| item.materialize(&data_block.inner.data).key.user_key)
+                        .collect()
+                };
+                assert!(
+                    walked.is_empty(),
+                    "restart interval {restart_interval}, exclusive {exclusive}, \
+                     reverse {back}: walked {walked:?}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn data_block_iter_range_edges() -> crate::Result<()> {
         let items = [
