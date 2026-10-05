@@ -1447,6 +1447,47 @@ fn a_zero_rate_limiter_does_not_split_reads() -> crate::Result<()> {
     Ok(())
 }
 
+/// A charge larger than a portion, as an index read up to a late bound, goes
+/// to the limiter a portion at a time and adds up to the whole.
+#[test]
+fn a_large_charge_is_made_a_portion_at_a_time() {
+    let portion = PACE_PORTION as u64;
+    let parts: Vec<u64> = pace_portions(3 * portion + 5).collect();
+    assert_eq!(parts, vec![portion, portion, portion, 5]);
+    assert_eq!(pace_portions(0).count(), 0, "nothing to charge, no request");
+    assert_eq!(pace_portions(portion).collect::<Vec<_>>(), vec![portion]);
+}
+
+/// A read that failed partway was charged for bytes it never read. They stay
+/// to the file's credit across a seek, so the next read is not charged again
+/// for budget already spent, and the limiter is left with what was read.
+#[test]
+fn bytes_charged_but_not_read_are_credited_to_the_next_read() -> crate::Result<()> {
+    let bytes: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    // One second of rate holds 8 KiB: two 4 KiB charges empty it.
+    let limiter = crate::rate_limiter::RateLimiter::new(8 * 1024);
+    let (file, _) = scripted_file(&bytes, 512, Some(2))?;
+    let mut paced = PacedFile::new(Box::new(file), Some(&limiter))?;
+
+    let mut buf = vec![0u8; 4096];
+    // Charged 4 KiB, read 512 bytes, then the read failed.
+    assert_eq!(std::io::Read::read(&mut paced, &mut buf)?, 512);
+    std::io::Seek::seek(&mut paced, SeekFrom::Start(8192))?;
+    // Charged only what the credit does not cover.
+    assert!(std::io::Read::read(&mut paced, &mut buf)? > 0);
+
+    // About 4.5 KiB of budget was spent, not 8 KiB, so 3 KiB more is admitted
+    // at once instead of after a third of a second.
+    let started = std::time::Instant::now();
+    assert!(!limiter.request_interruptible(3 * 1024, || false));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(150),
+        "the next request waited {:?} for bytes never read",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 /// A block handle is charged only when it lies inside the file: a corrupt
 /// one declaring more than the file holds charges nothing.
 #[test]

@@ -792,11 +792,10 @@ fn paced_punch_offset(
         // The length on disk: the table's recorded size predates the index
         // sections written after it.
         let file_size = table.fs.metadata(&table.path)?.len;
-        let index = index_lookup_bytes(table, bound, file_size);
-        if index > 0 {
-            let stopped = limiter.request_interruptible(index, || false);
-            debug_assert!(!stopped, "a scrub is never stopped midway");
-        }
+        // A portion at a time: a partitioned index read up to a late bound
+        // may total far more than other users of the limiter should wait
+        // behind at once, though the walk loads it one partition at a time.
+        charge_in_portions(limiter, index_lookup_bytes(table, bound, file_size));
     }
     table.punch_offset_for(bound)
 }
@@ -2330,12 +2329,39 @@ type FileError = std::io::Error;
 #[cfg(not(feature = "std"))]
 type FileError = io::Error;
 
-/// The most a rated scan reads in one go: a larger read is charged and made a
-/// portion at a time, so a shared limiter serves other requests between the
-/// portions and the device never sees one read as large as a block.
-// no-std: none; the no_std limiter never waits, so a read there goes whole.
+/// The most a rated scan reads or charges in one go: a larger read is charged
+/// and made a portion at a time, so a shared limiter serves other requests
+/// between the portions and the device never sees one read as large as a
+/// block.
 #[cfg(feature = "std")]
 const PACE_PORTION: usize = 64 * 1024;
+/// The no_std limiter never waits, so portions would only multiply backend
+/// calls: a read there goes whole.
+#[cfg(not(feature = "std"))]
+const PACE_PORTION: usize = usize::MAX;
+
+/// Charges `bytes` to `limiter` a portion at a time, so the requests of other
+/// users of a shared limiter are served between the portions rather than
+/// behind one long reservation.
+fn charge_in_portions(limiter: &RateLimiter, bytes: u64) {
+    for portion in pace_portions(bytes) {
+        // A scrub has no stop signal, so the wait always ends in a charge.
+        let stopped = limiter.request_interruptible(portion, || false);
+        debug_assert!(!stopped, "a scrub is never stopped midway");
+    }
+}
+
+/// `bytes` split into portions of at most [`PACE_PORTION`].
+fn pace_portions(bytes: u64) -> impl Iterator<Item = u64> {
+    let portion = u64::try_from(PACE_PORTION).unwrap_or(u64::MAX);
+    let mut left = bytes;
+    core::iter::from_fn(move || {
+        let next = left.min(portion);
+        // `next` is at most `left`, so this does not wrap.
+        left -= next;
+        (next > 0).then_some(next)
+    })
+}
 
 /// An SST opened for a scan whose every read of the file is charged to the
 /// limiter, when there is one, before it is made: the bytes the buffered
@@ -2350,6 +2376,9 @@ struct PacedFile<'a> {
     /// An error the backend returned after bytes of the same read, which went
     /// back first: the next read returns it, as the backend may not fail again.
     pending: Option<FileError>,
+    /// Bytes charged but never read, as when a read failed partway: the next
+    /// charge takes them off first, wherever the scan reads next.
+    credit: u64,
 }
 
 impl<'a> PacedFile<'a> {
@@ -2370,6 +2399,7 @@ impl<'a> PacedFile<'a> {
             pos,
             len,
             pending: None,
+            credit: 0,
         })
     }
 }
@@ -2418,32 +2448,44 @@ impl PacedFile<'_> {
         if let Some(e) = self.pending.take() {
             return Err(e);
         }
-        // A rate of zero reads at full speed, as no limiter does. Without
-        // `std` the limiter admits every request at once, so portions would
-        // only multiply backend calls: the read goes whole.
-        let want = match self.limiter {
-            #[cfg(feature = "std")]
-            Some(limiter) if limiter.rate() > 0 => buf.len().min(PACE_PORTION),
-            _ => buf.len(),
+        // Decided once for the read, its size and its charge alike: a rate
+        // switched on after this check finds the read uncharged and whole, as
+        // it was decided, rather than charging the whole buffer at once. A
+        // rate of zero reads at full speed, as no limiter does.
+        let limiter = self.limiter.filter(|limiter| limiter.rate() > 0);
+        let want = if limiter.is_some() {
+            buf.len().min(PACE_PORTION)
+        } else {
+            buf.len()
         };
         let (head, _) = buf.split_at_mut(want);
-        let charged = self.pace(head.len());
-        self.fill(head, charged)
+        let admitted = self.pace(head.len(), limiter);
+        let read = self.fill(head, admitted);
+        if limiter.is_some() {
+            // What was charged and not read stays to the file's credit: a
+            // read that failed partway, or a file that ended early.
+            let got = read.as_ref().map_or(0, |got| *got);
+            // `fill` reads at most what was admitted, save past the end of the
+            // file as opened, where nothing was admitted and nothing is owed.
+            if let Some(unread) = admitted.checked_sub(got) {
+                self.credit += unread as u64;
+            }
+        }
+        read
     }
 
-    /// Waits until the limiter admits a read of up to `want` bytes, counted
-    /// only up to the file's end, which a read never goes past, and returns
-    /// how many it admitted.
-    fn pace(&self, want: usize) -> usize {
+    /// Waits until `limiter`, when there is one, admits a read of up to
+    /// `want` bytes, counted only up to the file's end, which a read never
+    /// goes past, and returns how many it admitted. Credit left from earlier
+    /// reads is spent first.
+    fn pace(&mut self, want: usize, limiter: Option<&RateLimiter>) -> usize {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
-        if let Some(limiter) = self.limiter
-            && bytes > 0
-        {
-            // A scrub has no stop signal, so the wait always ends in a read.
-            let stopped = limiter.request_interruptible(bytes, || false);
-            debug_assert!(!stopped, "a scrub is never stopped midway");
+        if let Some(limiter) = limiter {
+            let from_credit = self.credit.min(bytes);
+            self.credit -= from_credit;
+            charge_in_portions(limiter, bytes - from_credit);
         }
         // At most `want`, so it fits a `usize`.
         usize::try_from(bytes).unwrap_or(want)
