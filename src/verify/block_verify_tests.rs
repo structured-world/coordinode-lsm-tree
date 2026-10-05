@@ -1408,11 +1408,27 @@ fn a_paced_file_reports_an_error_that_followed_a_partial_read() -> crate::Result
 /// one declaring more than the file holds charges nothing.
 #[test]
 fn an_index_handle_past_the_file_end_is_not_charged() {
-    assert_eq!(handle_bytes_in_file(0, 4096, 8192), Some(4096));
-    assert_eq!(handle_bytes_in_file(4096, 4096, 8192), Some(4096));
-    assert_eq!(handle_bytes_in_file(4097, 4096, 8192), None);
-    assert_eq!(handle_bytes_in_file(0, u32::MAX, 8192), None);
-    assert_eq!(handle_bytes_in_file(u64::MAX, 1, 8192), None);
+    let in_file =
+        |offset, size, file_size| handle_bytes_in_file(offset, size, file_size, None, None);
+    assert_eq!(in_file(0, 4096, 8192), Some(4096));
+    assert_eq!(in_file(4096, 4096, 8192), Some(4096));
+    assert_eq!(in_file(4097, 4096, 8192), None);
+    assert_eq!(in_file(0, u32::MAX, 8192), None);
+    assert_eq!(in_file(u64::MAX, 1, 8192), None);
+}
+
+/// A handle larger than any block the loader accepts is not charged either,
+/// though it lies inside a file large enough to hold it: the loader refuses
+/// it before reading, so charging it would be a wait for bytes never read.
+#[test]
+fn an_index_handle_past_the_block_size_limit_is_not_charged() {
+    let huge = 512 * 1024 * 1024;
+    assert_eq!(handle_bytes_in_file(0, huge, u64::MAX, None, None), None);
+    assert_eq!(
+        handle_bytes_in_file(0, 4096, u64::MAX, None, None),
+        Some(4096),
+        "an ordinary block is charged"
+    );
 }
 
 /// The punch-offset walk is charged what it reads: nothing for an index held

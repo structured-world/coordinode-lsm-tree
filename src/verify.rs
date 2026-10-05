@@ -727,20 +727,26 @@ fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8], file_size: u64)
     use crate::table::block::ParsedItem;
     use crate::table::block_index::BlockIndexImpl;
 
+    let charge = |offset: u64, size: u32| {
+        handle_bytes_in_file(
+            offset,
+            size,
+            file_size,
+            table.encryption.as_deref(),
+            table.metadata.ecc_params,
+        )
+    };
     match &*table.block_index {
         BlockIndexImpl::Full(_) | BlockIndexImpl::Closed => 0,
         BlockIndexImpl::VolatileFull(index) => {
-            handle_bytes_in_file(*index.handle.offset(), index.handle.size(), file_size)
-                .unwrap_or(0)
+            charge(*index.handle.offset(), index.handle.size()).unwrap_or(0)
         }
         BlockIndexImpl::TwoLevel(index) => {
             let tli = &index.top_level_index;
             let mut bytes = 0;
             for item in tli.iter(table.comparator.clone()) {
                 let partition = item.materialize(tli.as_slice());
-                let Some(size) =
-                    handle_bytes_in_file(*partition.offset(), partition.size(), file_size)
-                else {
+                let Some(size) = charge(*partition.offset(), partition.size()) else {
                     break;
                 };
                 bytes += size;
@@ -754,15 +760,23 @@ fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8], file_size: u64)
     }
 }
 
-/// The bytes a block handle names when they lie inside a file of `file_size`
-/// bytes, `None` when they run past its end: a corrupt handle may declare up
-/// to 4 GiB, which must not become a wait.
-fn handle_bytes_in_file(offset: u64, size: u32, file_size: u64) -> Option<u64> {
+/// The bytes a block handle names when the block loader would read them:
+/// inside a file of `file_size` bytes and within the largest block it accepts
+/// under `encryption` and `ecc`. `None` otherwise: a corrupt handle may declare
+/// up to 4 GiB, which the loader refuses unread and so must not become a wait.
+fn handle_bytes_in_file(
+    offset: u64,
+    size: u32,
+    file_size: u64,
+    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+) -> Option<u64> {
     let size = u64::from(size);
     let end = offset.checked_add(size)?;
     if end > file_size {
         return None;
     }
+    crate::table::block::check_on_disk_size(size, encryption, ecc).ok()?;
     Some(size)
 }
 
