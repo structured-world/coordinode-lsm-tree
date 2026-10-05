@@ -259,6 +259,28 @@ fn from_block_with_upper_bound_restart_interval_gt_one() {
     );
 }
 
+/// An upper seek below where forward iteration already got to reports the
+/// range empty, and neither end yields an entry.
+#[test]
+fn seek_upper_behind_the_consumed_front_reports_an_empty_range() {
+    for restart_interval in [1, 4] {
+        let block = make_index_block(&[b"a", b"b", b"c", b"d", b"e"], restart_interval);
+        let mut iter = OwnedIndexBlockIter::from_block(block, default_comparator()).unwrap();
+        for _ in 0..3 {
+            assert!(iter.next().is_some(), "the block holds five entries");
+        }
+        assert!(
+            !iter.seek_upper(b"a", SeqNo::MAX),
+            "restart interval {restart_interval}: the range is empty"
+        );
+        assert!(
+            iter.next_back().is_none(),
+            "restart interval {restart_interval}"
+        );
+        assert!(iter.next().is_none(), "restart interval {restart_interval}");
+    }
+}
+
 #[test]
 fn seek_upper_with_equal_end_keys_keeps_full_forward_limit_span() {
     let block = make_index_block(&[b"k", b"k", b"k", b"k"], 1);
