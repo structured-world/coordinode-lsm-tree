@@ -58,6 +58,7 @@ pub fn persist_version(
     );
 
     let path = folder.join(format!("v{}", version.id()));
+    clear_unnamed_snapshot(folder, &path, version.id(), fs)?;
 
     // Compose the Blocks-based manifest. The writer reserves the
     // 4 KiB head region on create(), accepts per-section writes
@@ -142,3 +143,61 @@ pub fn persist_version(
 
     Ok(log_bytes)
 }
+
+/// Removes a `v{id}` snapshot that `CURRENT` does not name, so the rotation
+/// about to write `v{id}` can create it.
+///
+/// Such a file is left by an attempt that failed between writing the snapshot
+/// and repointing `CURRENT` (or by a crash there). Recovery never reads it,
+/// but the writer creates the snapshot with `create_new`, and a failed install
+/// leaves the in-memory version where it was, so the retry derives the same id
+/// and would be refused on every rotation until the process restarts.
+///
+/// A `v{id}` that `CURRENT` already names is never touched: that is the state
+/// after a failure past the repoint (the directory sync), and rewriting the
+/// snapshot under the pointer that names it would break the next open.
+fn clear_unnamed_snapshot(
+    folder: &Path,
+    path: &Path,
+    id: crate::version::VersionId,
+    fs: &dyn Fs,
+) -> crate::Result<()> {
+    match fs.metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+    if named_by_current(folder, fs)? == Some(id) {
+        return Err(crate::Error::from(crate::io::Error::new(
+            crate::io::ErrorKind::AlreadyExists,
+            format!(
+                "manifest snapshot {} is the one CURRENT names; reopen the tree",
+                path.display()
+            ),
+        )));
+    }
+    log::warn!(
+        "removing manifest snapshot {} that CURRENT does not name, left by an earlier failed rotation",
+        path.display()
+    );
+    fs.remove_file(path)?;
+    Ok(())
+}
+
+/// The version id `CURRENT` names, or `None` when there is no `CURRENT` yet.
+fn named_by_current(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<u64>> {
+    use crate::fs::FsOpenOptions;
+    use crate::io::{LittleEndian, ReadBytesExt};
+
+    match fs.open(
+        &folder.join(CURRENT_VERSION_FILE),
+        &FsOpenOptions::new().read(true),
+    ) {
+        Ok(mut file) => Ok(Some(file.read_u64::<LittleEndian>()?)),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests;
