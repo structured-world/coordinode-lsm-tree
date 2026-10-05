@@ -426,11 +426,9 @@ fn fifo_after_a_seqno_zeroing_major_compaction_drops_oldest_data_first() -> crat
         // The outputs that carry the newest flush's keys. Their order among
         // themselves is key order, as nothing else is left to tell their
         // data apart, so the limit keeps all of them.
-        let newest_age = version
-            .iter_tables()
-            .map(|t| t.metadata.created_at)
-            .max()
-            .unwrap_or_default();
+        let Some(newest_age) = version.iter_tables().map(|t| t.metadata.created_at).max() else {
+            panic!("the compaction wrote tables");
+        };
         let newest = version
             .iter_tables()
             .filter(|t| t.metadata.created_at == newest_age)
