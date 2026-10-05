@@ -712,92 +712,29 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
     dst.incomplete |= src.incomplete;
 }
 
-/// The on-disk bytes `table`'s punch-offset walk for `bound` reads: nothing
-/// for an index held in memory, the index block for one loaded per read, and
-/// for a partitioned index (whose top level is held in memory) the partitions
-/// up to and including the first whose end key reaches `bound`, where the
-/// walk stops. Found from what is resident, without reading.
-///
-/// A block the cache already holds is still counted: telling a hit from a
-/// read would need the limiter inside the block loader, which every table
-/// read shares. A handle that does not lie inside the file of `file_size`
-/// bytes is not counted, nor anything after it: the loader refuses it without
-/// reading.
-fn index_lookup_bytes(table: &crate::table::Table, bound: &[u8], file_size: u64) -> u64 {
-    use crate::table::block::ParsedItem;
-    use crate::table::block_index::BlockIndexImpl;
-
-    let charge = |offset: u64, size: u32| {
-        handle_bytes_in_file(
-            offset,
-            size,
-            file_size,
-            table.encryption.as_deref(),
-            table.metadata.ecc_params,
-        )
-    };
-    match &*table.block_index {
-        BlockIndexImpl::Full(_) | BlockIndexImpl::Closed => 0,
-        BlockIndexImpl::VolatileFull(index) => {
-            charge(*index.handle.offset(), index.handle.size()).unwrap_or(0)
-        }
-        BlockIndexImpl::TwoLevel(index) => {
-            let tli = &index.top_level_index;
-            let mut bytes = 0;
-            for item in tli.iter(table.comparator.clone()) {
-                let partition = item.materialize(tli.as_slice());
-                let Some(size) = charge(*partition.offset(), partition.size()) else {
-                    break;
-                };
-                bytes += size;
-                if table.comparator.compare(partition.end_key(), bound) != core::cmp::Ordering::Less
-                {
-                    break;
-                }
-            }
-            bytes
-        }
-    }
-}
-
-/// The bytes a block handle names when the block loader would read them:
-/// inside a file of `file_size` bytes and within the largest block it accepts
-/// under `encryption` and `ecc`. `None` otherwise: a corrupt handle may declare
-/// up to 4 GiB, which the loader refuses unread and so must not become a wait.
-fn handle_bytes_in_file(
-    offset: u64,
-    size: u32,
-    file_size: u64,
-    encryption: Option<&dyn crate::encryption::EncryptionProvider>,
-    ecc: Option<crate::table::block::EccParams>,
-) -> Option<u64> {
-    let size = u64::from(size);
-    let end = offset.checked_add(size)?;
-    if end > file_size {
-        return None;
-    }
-    crate::table::block::check_on_disk_size(size, encryption, ecc).ok()?;
-    Some(size)
-}
-
-/// `table`'s punch offset for `bound`, its index walk charged to `limiter`
-/// first: the walk reads through the table's own block reads, not the paced
-/// file, so what it reads ([`index_lookup_bytes`]) is charged before it runs.
+/// `table`'s punch offset for `bound`, its index walk charged to `limiter`.
+/// The walk reads through the table's own block loader, not the paced file,
+/// so the loader charges each index block it reads from the file just before
+/// the read: the walk is charged what it really reads, whatever an
+/// unverified handle or top-level key claimed, and nothing for a block the
+/// cache serves or the loader refuses unread.
 fn paced_punch_offset(
     table: &crate::table::Table,
     bound: &[u8],
-    limiter: Option<&RateLimiter>,
+    limiter: Option<&alloc::sync::Arc<RateLimiter>>,
 ) -> crate::Result<u64> {
-    if let Some(limiter) = limiter {
-        // The length on disk: the table's recorded size predates the index
-        // sections written after it.
-        let file_size = table.fs.metadata(&table.path)?.len;
-        // A portion at a time: a partitioned index read up to a late bound
-        // may total far more than other users of the limiter should wait
-        // behind at once, though the walk loads it one partition at a time.
-        charge_in_portions(limiter, index_lookup_bytes(table, bound, file_size));
+    match limiter {
+        // At rate zero the walk reads at full speed, as with no limiter.
+        Some(limiter) if limiter.rate() > 0 => {
+            let limiter = alloc::sync::Arc::clone(limiter);
+            table.punch_offset_paced(
+                bound,
+                crate::table::util::ReadCharge::Maintenance,
+                alloc::sync::Arc::new(move |bytes| charge_in_portions(&limiter, bytes)),
+            )
+        }
+        _ => table.punch_offset_for(bound),
     }
-    table.punch_offset_for(bound)
 }
 
 /// Scans one SST and returns a partial report (`sst_files_scanned == 1`).
@@ -806,7 +743,10 @@ fn paced_punch_offset(
 /// handle, sizes encryption overhead and ECC params from the table's
 /// descriptor, so it can run on its own worker thread; the `limiter`, when
 /// given, is the one budget every worker draws on.
-fn scan_one_table(table: &crate::table::Table, limiter: Option<&RateLimiter>) -> BlockVerifyReport {
+fn scan_one_table(
+    table: &crate::table::Table,
+    limiter: Option<&alloc::sync::Arc<RateLimiter>>,
+) -> BlockVerifyReport {
     let mut report = BlockVerifyReport {
         sst_files_scanned: 1,
         ..BlockVerifyReport::default()
@@ -887,7 +827,7 @@ fn scan_one_table(table: &crate::table::Table, limiter: Option<&RateLimiter>) ->
         ecc_unrecognized,
         data_start,
     };
-    match scan_sst_blocks(&*table.fs, path, table_id, layout, limiter) {
+    match scan_sst_blocks(&*table.fs, path, table_id, layout, limiter.map(|l| &**l)) {
         Ok(per_file) => {
             report.blocks_scanned += per_file.blocks_scanned;
             report.errors.extend(per_file.errors);
@@ -949,7 +889,7 @@ pub fn verify_block_checksums_with(
 ) -> BlockVerifyReport {
     let version = tree.current_version();
     let tables: Vec<crate::table::Table> = version.iter_tables().cloned().collect();
-    let limiter = options.rate_limiter.as_deref();
+    let limiter = options.rate_limiter.as_ref();
 
     // Parallel scan (std only): up to `parallelism` worker threads pull SSTs from
     // a shared cursor and scan them concurrently. A `no_std` build has no

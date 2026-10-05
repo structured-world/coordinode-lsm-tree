@@ -4257,6 +4257,81 @@ fn load_block_cache_hit_rejects_wrong_block_type() -> crate::Result<()> {
     Ok(())
 }
 
+/// A paced read is charged the bytes it takes from the file. A handle running
+/// past the end reads the prefix the file holds before it fails, so that
+/// prefix is charged, not the handle's whole declared size and not nothing;
+/// a block the cache serves is not charged at all.
+#[test]
+fn a_paced_block_read_is_charged_what_it_takes_from_the_file() -> crate::Result<()> {
+    use crate::{
+        CompressionType,
+        cache::Cache,
+        table::{block::BlockType, util::load_block_paced},
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    writer.write(InternalValue::from_components(
+        b"a",
+        b"v1",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+    let file_len = std::fs::metadata(&file)?.len();
+    let table = Table::recover(test_recover_params(file, checksum))?;
+
+    let charged = AtomicU64::new(0);
+    let pace = |bytes| {
+        charged.fetch_add(bytes, Ordering::Relaxed);
+    };
+    let cache = Cache::with_capacity_bytes(10_000_000);
+    let read = |handle: &BlockHandle| {
+        load_block_paced(
+            table.global_id(),
+            &table.path,
+            &table.file_accessor,
+            &cache,
+            handle,
+            BlockType::Index,
+            CompressionType::None,
+            None,
+            None,
+            #[cfg(zstd_any)]
+            None,
+            None,
+            #[cfg(feature = "metrics")]
+            &table.metrics,
+            crate::table::util::ReadCharge::Foreground,
+            Some(&pace as &(dyn Fn(u64) + Send + Sync)),
+        )
+    };
+
+    let tli = table.regions.tli;
+    read(&tli)?;
+    assert_eq!(charged.load(Ordering::Relaxed), u64::from(tli.size()));
+    read(&tli)?;
+    assert_eq!(
+        charged.load(Ordering::Relaxed),
+        u64::from(tli.size()),
+        "a cached block is not read again, so not charged again"
+    );
+
+    charged.store(0, Ordering::Relaxed);
+    let past_end = BlockHandle::new(crate::table::BlockOffset(file_len - 100), 4096);
+    assert!(read(&past_end).is_err(), "the read runs out of file");
+    assert_eq!(
+        charged.load(Ordering::Relaxed),
+        100,
+        "the prefix the file holds is what the read took"
+    );
+    Ok(())
+}
+
 /// A block read from disk under the wrong role is rejected only after its
 /// transform ran, so the decoded bytes it produced are counted: decoded is
 /// what the transform output, whether or not the caller could use it.

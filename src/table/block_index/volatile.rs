@@ -12,7 +12,7 @@ use crate::{
         BlockHandle, IndexBlock,
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::{ReadCharge, load_block},
+        util::{ReadCharge, load_block_paced},
     },
 };
 use alloc::sync::Arc;
@@ -73,6 +73,8 @@ pub struct Iter {
     metrics: Arc<Metrics>,
     /// Whose walk this is, for the index block it loads.
     pub(crate) charge: ReadCharge,
+    /// Told the bytes of the index block when the walk reads it from the file.
+    pub(crate) pace: Option<crate::table::util::Pacer>,
 
     poisoned: bool,
 }
@@ -97,6 +99,7 @@ impl Iter {
             #[cfg(feature = "metrics")]
             metrics: index.metrics.clone(),
             charge: ReadCharge::Foreground,
+            pace: None,
             poisoned: false,
         }
     }
@@ -116,7 +119,7 @@ impl Iter {
     /// subsequent `next()` / `next_back()` calls return `None` without
     /// re-loading the block from disk.
     fn init_inner(&mut self) -> crate::Result<Option<OwnedIndexBlockIter>> {
-        let block = load_block(
+        let block = load_block_paced(
             self.table_id,
             &self.path,
             &self.file_accessor,
@@ -136,6 +139,7 @@ impl Iter {
             #[cfg(feature = "metrics")]
             &self.metrics,
             self.charge,
+            self.pace.as_deref(),
         )?;
         let index_block = IndexBlock::new(block);
         let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));

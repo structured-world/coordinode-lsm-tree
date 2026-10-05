@@ -44,6 +44,19 @@ impl BlockIndexIterImpl {
         }
         self
     }
+
+    /// This walk with every block it reads from the file paced by `pace`,
+    /// told the bytes just before each read is made.
+    #[must_use]
+    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
+        match &mut self {
+            Self::Volatile(i) => i.pace = Some(pace),
+            Self::TwoLevel(i) => i.pace = Some(pace),
+            // A pinned index loads nothing while it is walked.
+            Self::Full(_) => {}
+        }
+        self
+    }
 }
 
 impl BlockIndexIter for BlockIndexIterImpl {

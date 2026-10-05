@@ -33,6 +33,11 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
+/// Paces the block reads a walk issues: called with the bytes a read takes
+/// from the file just before it is made, never for a block served from the
+/// cache or refused before reading.
+pub type Pacer = alloc::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
@@ -68,6 +73,48 @@ pub fn load_block(
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
     charge: ReadCharge,
+) -> crate::Result<Block> {
+    load_block_paced(
+        table_id,
+        path,
+        file_accessor,
+        cache,
+        handle,
+        block_type,
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+        heal_hints,
+        #[cfg(feature = "metrics")]
+        metrics,
+        charge,
+        None,
+    )
+}
+
+/// [`load_block`], with `pace`, when given, told the bytes a read takes from
+/// the file just before it is issued.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and heal context"
+)]
+pub(crate) fn load_block_paced(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    cache: &Cache,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+    charge: ReadCharge,
+    pace: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
     use core::sync::atomic::Ordering::Relaxed;
@@ -141,6 +188,16 @@ pub fn load_block(
     // Charged as the read is issued, before it is validated: a block that then
     // fails its checksum, decryption or decompression was still asked of the
     // filesystem, while a handle refused before reading asked nothing.
+    //
+    // A paced read is charged the bytes it takes from the file: the handle's,
+    // cut at the file's end, where a handle running past it reads its prefix
+    // and then fails. Bytes left past an offset beyond the end are none.
+    let paced_bytes = pace.map(|_| {
+        let size = u64::from(handle.size());
+        fd.metadata().map_or(size, |meta| {
+            meta.len.saturating_sub(*handle.offset()).min(size)
+        })
+    });
     let mut produced = 0;
     let read = Block::from_file_issuing(
         fd.as_ref(),
@@ -156,6 +213,11 @@ pub fn load_block(
             #[cfg(feature = "metrics")]
             if charge.is_counted() {
                 record_block_read(metrics, block_type, handle.size().into());
+            }
+            if let (Some(pace), Some(bytes)) = (pace, paced_bytes)
+                && bytes > 0
+            {
+                pace(bytes);
             }
         },
         &mut produced,
