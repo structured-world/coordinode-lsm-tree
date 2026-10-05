@@ -2333,6 +2333,8 @@ type FileError = io::Error;
 /// The most a rated scan reads in one go: a larger read is charged and made a
 /// portion at a time, so a shared limiter serves other requests between the
 /// portions and the device never sees one read as large as a block.
+// no-std: none; the no_std limiter never waits, so a read there goes whole.
+#[cfg(feature = "std")]
 const PACE_PORTION: usize = 64 * 1024;
 
 /// An SST opened for a scan whose every read of the file is charged to the
@@ -2409,15 +2411,18 @@ impl io::Seek for PacedFile<'_> {
 }
 
 impl PacedFile<'_> {
-    /// One read: an error held back from the last one first; under a limiter at
-    /// most one portion, charged and then read, a caller wanting more reading
-    /// again, as `Read` lets it.
+    /// One read: an error held back from the last one first; under a limiter
+    /// that waits, at most one portion, charged and then read, a caller wanting
+    /// more reading again, as `Read` lets it.
     fn read_paced(&mut self, buf: &mut [u8]) -> FileRead {
         if let Some(e) = self.pending.take() {
             return Err(e);
         }
-        // A rate of zero reads at full speed, as no limiter does.
+        // A rate of zero reads at full speed, as no limiter does. Without
+        // `std` the limiter admits every request at once, so portions would
+        // only multiply backend calls: the read goes whole.
         let want = match self.limiter {
+            #[cfg(feature = "std")]
             Some(limiter) if limiter.rate() > 0 => buf.len().min(PACE_PORTION),
             _ => buf.len(),
         };
