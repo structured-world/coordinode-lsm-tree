@@ -21,7 +21,9 @@ pub const NAME: &str = "FifoCompaction";
 /// its limit, and overlapping tables are fine: the older one goes first. A
 /// table's age is its `created_at`: the write time of a flushed table, and for
 /// a compaction output the newest age among the inputs its key range meets,
-/// so a compaction neither makes data look newer nor restarts its TTL. A table
+/// so a compaction neither makes data look newer nor restarts its TTL. Tables
+/// of one age, as the outputs that split one input, go by their highest
+/// sequence number, and in key order once a compaction has zeroed it. A table
 /// another compaction is working on is left for a later round, and no newer
 /// table is dropped ahead of it.
 ///
