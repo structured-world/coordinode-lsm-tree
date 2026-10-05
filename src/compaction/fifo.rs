@@ -18,13 +18,15 @@ pub const NAME: &str = "FifoCompaction";
 /// Limits the tree size to roughly `limit` bytes, deleting the oldest table(s)
 /// when the threshold is reached. Tables are dropped whole, oldest data first,
 /// from whichever level they are in, so a tree that was major-compacted keeps
-/// its limit, and overlapping tables are fine: the older one goes first. Age
-/// is the table's highest sequence number, which a compaction carries over,
-/// unlike the creation time it stamps on its outputs. A table another
-/// compaction is working on is left for a later round, and no newer table is
-/// dropped ahead of it.
+/// its limit, and overlapping tables are fine: the older one goes first. A
+/// table's age is its `created_at`: the write time of a flushed table, and for
+/// a compaction output the newest age among the inputs its key range meets,
+/// so a compaction neither makes data look newer nor restarts its TTL. A table
+/// another compaction is working on is left for a later round, and no newer
+/// table is dropped ahead of it.
 ///
-/// Additionally, a (lazy) TTL can be configured to drop old tables.
+/// Additionally, a (lazy) TTL can be configured to drop old tables. It is off
+/// while the clock reads zero, which is no clock.
 ///
 /// ###### Caution
 ///
@@ -142,11 +144,12 @@ impl CompactionStrategy for Strategy {
 
             let mut collected_bytes = 0u64;
 
-            // Oldest data first. FIFO admits only inserts, so the highest
-            // sequence number orders tables by insertion and survives
-            // compaction; `created_at` is when the table was written, which a
-            // compaction resets in its own key order.
-            alive.sort_by_key(|(t, _)| (t.get_highest_seqno(), t.id()));
+            // Oldest data first, by age: a compaction output carries the
+            // newest age of the inputs its keys came from, so the order holds
+            // after a major compaction, even one that zeroed the sequence
+            // numbers. The highest sequence number orders tables of one age:
+            // FIFO admits only inserts, so it follows insertion while kept.
+            alive.sort_by_key(|(t, _)| (t.metadata.created_at, t.get_highest_seqno(), t.id()));
 
             for (table, held) in alive {
                 if collected_bytes >= overshoot {

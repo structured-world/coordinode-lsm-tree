@@ -376,6 +376,106 @@ fn fifo_choose_drops_no_newer_table_while_the_oldest_is_held() -> crate::Result<
     Ok(())
 }
 
+/// A major compaction under a watermark above every live sequence number
+/// zeroes them at the last level, so they no longer order the outputs. Each
+/// output keeps the age of the flushes its keys came from, so with keys
+/// inserted in decreasing order the newest key still survives the limit.
+#[test]
+fn fifo_after_a_seqno_zeroing_major_compaction_drops_oldest_data_first() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Incompressible values so the compaction splits into several outputs.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut value = || {
+        (0..256)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state.to_be_bytes()[0]
+            })
+            .collect::<Vec<u8>>()
+    };
+    let keys = 400u32;
+    with_test_clock(|clock| {
+        // Seqno 0 carries key 399 and is flushed first, at t=1000s; each
+        // later flush of lower keys is a second newer.
+        for key in (0..keys).rev() {
+            let seqno = u64::from(keys - 1 - key);
+            tree.insert(key.to_be_bytes().as_slice(), value(), seqno);
+            if key % 100 == 0 {
+                clock.set_secs(1_000 + seqno / 100);
+                tree.flush_active_memtable(seqno)?;
+            }
+        }
+        let watermark = u64::from(keys);
+        tree.major_compact(16 * 1024, watermark)?;
+        let version = tree.current_version();
+        assert!(version.iter_tables().count() > 1, "several outputs");
+        assert!(
+            version.iter_tables().all(|t| t.get_highest_seqno() == 0),
+            "the compaction zeroed every sequence number"
+        );
+        let newest = version
+            .iter_tables()
+            .max_by_key(|t| t.metadata.created_at)
+            .map(crate::table::Table::file_size)
+            .unwrap_or_default();
+        drop(version);
+
+        tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
+        assert!(
+            tree.get(0u32.to_be_bytes(), watermark)?.is_some(),
+            "the newest key must survive"
+        );
+        assert!(
+            tree.get((keys - 1).to_be_bytes(), watermark)?.is_none(),
+            "the oldest key goes first"
+        );
+        Ok(())
+    })
+}
+
+/// A major compaction shortly before data expires must not restart its TTL:
+/// the outputs keep the age of the data they carry, not the time they were
+/// written, so the data expires on its own time.
+#[test]
+fn fifo_ttl_counts_from_the_data_age_not_from_a_later_compaction() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    with_test_clock(|clock| {
+        clock.set_secs(1_000);
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        // Rewritten at t=1009s, a second before a 10s TTL runs out.
+        clock.set_secs(1_009);
+        tree.major_compact(u64::MAX, 0)?;
+
+        clock.set_secs(1_011);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
+        assert_eq!(
+            0,
+            tree.table_count(),
+            "data written at 1000s expires at 1010s whatever rewrote it"
+        );
+        Ok(())
+    })
+}
+
 /// A clock at zero is no clock, which leaves TTL off: tables written
 /// meanwhile carry time zero too and must not all count as expired.
 #[test]

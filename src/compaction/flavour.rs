@@ -258,6 +258,21 @@ pub(super) fn prepare_table_writer(
         .map(crate::table::Table::l0_recency)
         .max();
 
+    // The outputs' age: each takes the newest age among the inputs its key
+    // range meets, as the data it carries is no newer than that. Stamping the
+    // write time instead would make a rewrite look like fresh data: a TTL
+    // would restart at every compaction, and age-ordered drops would follow
+    // the order the outputs were written in, which is key order.
+    let input_ages: alloc::sync::Arc<[crate::table::writer::InputAge]> = version
+        .iter_tables()
+        .filter(|t| payload.table_ids.contains(&t.id()))
+        .map(|t| crate::table::writer::InputAge {
+            min: t.metadata.key_range.min().clone(),
+            max: t.metadata.key_range.max().clone(),
+            created_at: *t.metadata.created_at,
+        })
+        .collect();
+
     let mut table_writer = MultiWriter::new(
         table_base_folder,
         opts.table_id_generator.clone(),
@@ -267,6 +282,7 @@ pub(super) fn prepare_table_writer(
     )?
     .use_output_ledger(opts.outputs.clone())
     .set_comparator(opts.config.comparator.clone())
+    .use_inherited_age(input_ages)
     .use_recency(recency)
     // The outputs' compaction lineage: the input ids this run merges. Lets a
     // manifest-loss rebuild recognize the output as DERIVED and exclude it

@@ -354,6 +354,15 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
+/// One compaction input as an output sees it for its age: the input's key
+/// range and its `created_at` (see [`Writer::use_inherited_age`]).
+#[derive(Clone, Debug)]
+pub(crate) struct InputAge {
+    pub min: UserKey,
+    pub max: UserKey,
+    pub created_at: u128,
+}
+
 /// One blob file a table references: how many of its objects the table owns,
 /// their bytes, and the span of the table's keys that point there.
 ///
@@ -726,6 +735,14 @@ pub struct Writer {
     #[cfg(feature = "columnar")]
     group_tag_base: u64,
 
+    /// The compaction inputs this output takes its age from: its `created_at`
+    /// is the newest of those whose key range meets its own, so a rewrite
+    /// keeps the age of the data it carries instead of the time it was
+    /// written, and an age-based policy (FIFO's TTL and drop order) sees the
+    /// same data as old after a compaction as before it. `None` (a flush, an
+    /// ingest, a salvage copy) stamps the clock.
+    inherited_age: Option<(Arc<[InputAge]>, crate::SharedComparator)>,
+
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
     zstd_dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
@@ -975,6 +992,7 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
+            inherited_age: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -2147,6 +2165,33 @@ impl Writer {
             ids
         });
         self
+    }
+
+    /// Sets the inputs this compaction output takes its age from (see the
+    /// `inherited_age` field), compared under `comparator`.
+    #[must_use]
+    pub(crate) fn use_inherited_age(
+        mut self,
+        inputs: Option<Arc<[InputAge]>>,
+        comparator: crate::SharedComparator,
+    ) -> Self {
+        self.assert_not_started("use_inherited_age");
+        self.inherited_age = inputs.map(|inputs| (inputs, comparator));
+        self
+    }
+
+    /// The newest `created_at` among the inherited inputs whose key range
+    /// meets `first..=last`, or `None` without inputs or when none meets it.
+    fn inherited_created_at(&self, first: &[u8], last: &[u8]) -> Option<u128> {
+        let (inputs, comparator) = self.inherited_age.as_ref()?;
+        inputs
+            .iter()
+            .filter(|input| {
+                comparator.compare(&input.min, last) != core::cmp::Ordering::Greater
+                    && comparator.compare(&input.max, first) != core::cmp::Ordering::Less
+            })
+            .map(|input| input.created_at)
+            .max()
     }
 
     /// Sets the previous-output link (see [`Self::lineage_prev`]).
@@ -4291,10 +4336,13 @@ impl Writer {
         #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
         let last_key = self.meta.last_key.as_ref().expect("last_key should exist");
         let range_tombstone_count = self.range_tombstones.len() as u64;
-        // Snapshot the wall-clock once — both MID and TAIL copies
-        // must report the SAME created_at so MID-fallback recovery
-        // produces the same timestamp as a clean TAIL recovery.
-        let created_at_nanos = unix_timestamp().as_nanos();
+        // Decided once — both MID and TAIL copies must report the SAME
+        // created_at so MID-fallback recovery produces the same timestamp as
+        // a clean TAIL recovery. A compaction output inherits the age of the
+        // inputs it carries data from; anything else reads the clock.
+        let created_at_nanos = self
+            .inherited_created_at(first_key, last_key)
+            .unwrap_or_else(|| unix_timestamp().as_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
             last_key,
