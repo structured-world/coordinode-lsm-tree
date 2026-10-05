@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791188628022,
+  "lastUpdate": 1791201814305,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -30908,6 +30908,90 @@ window.BENCHMARK_DATA = {
             "value": 306483.8959147896,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 13.6us | P99.9: 82.0us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "243be78bf861e45c18c42527f7a1067b6666150f",
+          "message": "feat(blob_tree): field-level blob references with late materialization (#815)\n\n## Summary\n\n- A blob tree stores a row as cells: each field keeps its own column id\nand type, and a heavy field goes to a blob file on its own, so compact\nfields stay in the row and an update to them keeps the reference to the\nunchanged object instead of rewriting it.\n- Objects are owned by exactly one live reference of their key, so a\nversion that goes charges its object only when no newer version holds\nit, and blob files are removed only when no table or memtable row still\nlinks them.\n- `columnar_scan` reads blob trees: it decides rows on keys, seqnos and\nvalue types, applies the predicate, and only then reads the payload of\nthe rows it returns, page by page or with the rest when the choices are\ndense, fetching blob objects in file and offset order.\n\n## Changes\n\n- Write and read API: `BlobTree::insert_cells` with `Cell::Value` /\n`Cell::Ref`, `get_cells` and `range_cells` returning `RowCells` whose\nreferences stay bound to the tree and the version they were read from;\nper-column separation thresholds in `KvSeparationOptions`.\n- Ownership: the owner bit in each row, ownership handed to the oldest\nkept holder during compaction, fragmentation charged once, removal\nguarded by table links and memtable registrations; reachability after a\nrestart comes from the tables alone. A weak delete consumes the put\nbefore it in any physical form (value, indirection, cell row).\n- Columnar layout `2` (cells): split cell rows put each field in its\ncolumn, references in a references column, other rows whole; a row whose\nvalue or reference has another type than an earlier split row gave that\nid is kept whole. Written by flush, compaction, ingest and table\nrotation.\n- Late materialization: the merge reads a segment's payload only for the\nrows it chose, from those rows' pages, and a scan of intrinsic columns\nalone reads no value at all. A predicate on a cell the segment stores\ndrops rows before their payload is read; a row of a page read late that\nholds the predicate's field in a referenced object or its whole value is\njudged on those alone before the rest of its payload is read, and a page\nread with its payload is judged once, after the values. The density\ndecision turns a segment eager when three of its last four row pages\nhold a chosen row and back at one in four, counting rows by the\npredicate's verdict. A predicate that has already given every chosen row\nits final verdict is not run again over the rows returned, one that\nkeeps every row does not copy the output again, and a masked batch that\nkeeps every row is not gathered.\n- Counters: `bytes_materialized`, `payload_bytes_useful`,\n`payload_bytes_incidental`, `blob_bytes_prefetched`, beside read,\ndecoded and copied bytes.\n- Recovery and repair rewrite, drop or refuse cell rows by the objects\nthey reference, as they do indirections. Repair hands each object whose\nowning row the rebuild lost to the oldest row left that borrows it\n(`salvage::OwnerPromotions`, `SalvageOptions::owner_promotions`).\n- A dangling indirection or reference is an `InvalidHeader` error\ninstead of a panic or an empty value.\n- `db_bench` mixed-layout: cell-row fixtures for a clustered ~1%\nselection, one row per page, ~90%, projected header fields, scattered\nblobs filtered before fetch, a predicate on a field kept in a blob file,\nthe sparse scan under concurrent compaction (P50 / P99), and eager\npasses the late scans are timed against; `docs/BENCHMARKING.md` and\n`docs/columnar-addressing.md` describe them and the cells layout.\n\n## Testing\n\nUnit, integration and property tests (eager and late paths return the\nsame rows, GC and compaction during the fetch, crash between publishing\na reference and dropping its owner, a lost owner across repair) pass\nwith default and all features on Linux, together with clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench tests. Mixed-layout runs on macOS and Windows:\nthe existing scenarios read, decode and copy the same bytes as `main`,\nand each late cell-row scan is no slower than its eager pass.\n\n## Related\n\n- Replaces #811, the same change as one commit, for a fresh review.\n- #812: the dangling-indirection fix on `5.x.x`\n\nCloses #685\nCloses #687\nCloses #810\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added cell-based rows for blob-backed data, with per-field storage,\nconfigurable separation thresholds, and reads that fetch referenced\npayloads only when needed.\n* Enabled projected columnar scans on blob trees, including filtering\nbefore payload reads and tracking materialized, useful, incidental, and\nprefetched bytes.\n* Added support for cell rows across ingestion, compaction, repair, and\nsalvage.\n\n* **Bug Fixes**\n* Improved handling of blob references during compaction and repair,\npreserving referenced files and transferring ownership where needed.\n* Missing or invalid blob references now return errors rather than\ncausing a panic or being silently accepted.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-05T11:45:35Z",
+          "tree_id": "c324be6ec238eb964ed5a4e76c2f3cb8ec9abe8f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/243be78bf861e45c18c42527f7a1067b6666150f"
+        },
+        "date": 1791201812994,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 68444.03446690018,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 16.6us | P99.9: 31.0us\nthreads: 1 | elapsed: 7.82s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2472372.8099860717,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 548708.2888351488,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.2us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 418843.58613602014,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.7us | P99.9: 31.7us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2205880.787739,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.1us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 247806.96228182025,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 8.6us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 120075.3215681652,
+            "unit": "ops/sec",
+            "extra": "P50: 6.9us | P99: 18.8us | P99.9: 42.0us\nthreads: 1 | elapsed: 1.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 604282.0611244116,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.4us | P99.9: 13.5us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 705119.7244815188,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 284185.6567503388,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 17.9us | P99.9: 95.6us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
           }
         ]
       }
