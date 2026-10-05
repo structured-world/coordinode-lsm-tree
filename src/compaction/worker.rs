@@ -2145,7 +2145,11 @@ fn run_subcompaction(
     // The blob accounting of the dropped versions, shared by the stream that
     // reports them and the loop that settles a key's ownership before its
     // kept rows are written (see `ownership`).
-    let ledger = core::cell::RefCell::new(super::ownership::OwnershipLedger::default());
+    let mut ownership = super::ownership::OwnershipLedger::default();
+    if let Some(reloc) = &relocation {
+        ownership.relocating(reloc.stale_files.iter().map(BlobFile::id));
+    }
+    let ledger = core::cell::RefCell::new(ownership);
     let ledger_error = core::cell::RefCell::new(None);
     let mut ledger_hook = super::ownership::LedgerHook {
         ledger: &ledger,
@@ -3439,6 +3443,9 @@ fn merge_tables(
                         .map(BlobFile::id)
                         .collect::<Vec<_>>(),
                 );
+                ledger
+                    .borrow_mut()
+                    .relocating(blob_files_to_rewrite.iter().map(BlobFile::id));
 
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite

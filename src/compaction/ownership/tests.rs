@@ -34,7 +34,14 @@ fn value(key: &str, seqno: u64) -> InternalValue {
 fn run(
     events: Vec<Result<InternalValue, InternalValue>>,
 ) -> (Vec<InternalValue>, FragmentationMap) {
-    let mut ledger = OwnershipLedger::default();
+    run_with(OwnershipLedger::default(), events)
+}
+
+/// [`run`] through `ledger`.
+fn run_with(
+    mut ledger: OwnershipLedger,
+    events: Vec<Result<InternalValue, InternalValue>>,
+) -> (Vec<InternalValue>, FragmentationMap) {
     let mut written = Vec::new();
     for event in events {
         match event {
@@ -148,6 +155,62 @@ fn a_drop_of_the_next_key_settles_with_its_own_key() {
     assert!(frag.is_empty(), "{frag:?}");
     assert_eq!(order(&written), vec![(&b"a"[..], 2), (&b"b"[..], 3)]);
     assert!(row_refs(&written[1].value).unwrap()[0].1);
+}
+
+/// In a pass that relocates its file, an object every kept holder borrows (its
+/// owner went with a whole-table drop before the pass) passes to the oldest
+/// holder, so its copy has one owner. An object already owned, or in a file
+/// the pass does not relocate, is left as it is.
+#[test]
+fn an_ownerless_object_in_a_relocated_file_passes_to_its_oldest_holder() {
+    let x = object(0);
+    let owners = |written: &[InternalValue]| -> Vec<bool> {
+        written
+            .iter()
+            .map(|row| row_refs(&row.value).unwrap()[0].1)
+            .collect()
+    };
+    let relocating = |files: &[u64]| {
+        let mut ledger = OwnershipLedger::default();
+        ledger.relocating(files.iter().copied());
+        ledger
+    };
+    let borrowed = || {
+        vec![
+            Ok(cell_row("k", 5, &[(x, false)])),
+            Ok(cell_row("k", 3, &[(x, false)])),
+        ]
+    };
+
+    let (written, frag) = run_with(relocating(&[1]), borrowed());
+    assert!(frag.is_empty(), "nothing is charged: {frag:?}");
+    assert_eq!(
+        owners(&written),
+        vec![false, true],
+        "the oldest holder owns it"
+    );
+
+    let (written, _) = run_with(relocating(&[2]), borrowed());
+    assert_eq!(
+        owners(&written),
+        vec![false, false],
+        "a file the pass keeps"
+    );
+    let (written, _) = run(borrowed());
+    assert_eq!(
+        owners(&written),
+        vec![false, false],
+        "a pass that relocates nothing"
+    );
+
+    let (written, _) = run_with(
+        relocating(&[1]),
+        vec![
+            Ok(cell_row("k", 5, &[(x, false)])),
+            Ok(cell_row("k", 3, &[(x, true)])),
+        ],
+    );
+    assert_eq!(owners(&written), vec![false, true], "one owner, kept");
 }
 
 /// A dropped indirection is charged as before, whatever the ledger holds.

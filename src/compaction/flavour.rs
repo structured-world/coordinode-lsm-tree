@@ -890,11 +890,12 @@ impl RelocatingCompaction {
     /// copied.
     ///
     /// Each reference keeps its owner bit: the rows that reach a relocation
-    /// already carry exactly one owner among the kept holders of an object
-    /// (the compaction moved ownership off a dropped owner before writing
-    /// them), and every holder is in the pass, since a file is relocated only
-    /// when every table that links it is an input. So the copy has the one
-    /// owner the original had.
+    /// already carry exactly one owner among the kept holders of an object.
+    /// Every holder is in the pass, since a file is relocated only when every
+    /// table that links it is an input, and the ownership ledger settled the
+    /// key before writing it: ownership moved off an owner the pass dropped,
+    /// and an object whose owner went with a whole-table drop passed to its
+    /// oldest holder. So the copy has exactly one owner.
     fn write_cell_row(&mut self, item: InternalValue) -> crate::Result<()> {
         use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
 

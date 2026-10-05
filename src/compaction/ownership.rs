@@ -37,9 +37,20 @@ pub struct OwnershipLedger {
     /// The cell-row objects charged as garbage, which references read before
     /// this compaction must no longer be written back.
     released: Vec<crate::vlog::ValueHandle>,
+    /// The blob files this pass relocates. Every holder of an object in one
+    /// is an input, so an object no kept row owns lost its owner outside the
+    /// pass (a whole-table drop charged it) and passes to its oldest holder
+    /// here: otherwise its copy would have no owner, nothing would ever charge
+    /// it, and its new file could never become dead.
+    relocating: Vec<crate::vlog::BlobFileId>,
 }
 
 impl OwnershipLedger {
+    /// Marks `files` as relocated by this pass (see `relocating`).
+    pub fn relocating(&mut self, files: impl IntoIterator<Item = crate::vlog::BlobFileId>) {
+        self.relocating.extend(files);
+    }
+
     /// Whether the open group is `key`'s.
     fn is_open_for(&self, key: &[u8]) -> bool {
         self.key
@@ -109,6 +120,11 @@ impl OwnershipLedger {
                 self.released.push(orphan.vhandle);
             }
         }
+        if !self.relocating.is_empty() {
+            for unowned in unowned_refs(&kept, &self.relocating)? {
+                adopt(&mut kept, &unowned)?;
+            }
+        }
         self.ready.append(&mut kept);
         Ok(())
     }
@@ -130,6 +146,37 @@ impl OwnershipLedger {
         }
         Ok((self.frag, self.released))
     }
+}
+
+/// The objects in `files` that the cell rows of `rows` reference and none of
+/// them owns, each once.
+fn unowned_refs(
+    rows: &[InternalValue],
+    files: &[crate::vlog::BlobFileId],
+) -> crate::Result<Vec<BlobIndirection>> {
+    let mut seen: Vec<(BlobIndirection, bool)> = Vec::new();
+    for row in rows {
+        if row.key.value_type != ValueType::CellRow {
+            continue;
+        }
+        for (indirection, owned) in row_refs(&row.value)? {
+            if !files.contains(&indirection.vhandle.blob_file_id) {
+                continue;
+            }
+            match seen
+                .iter_mut()
+                .find(|(held, _)| held.vhandle == indirection.vhandle)
+            {
+                Some((_, any_owner)) => *any_owner |= owned,
+                None => seen.push((indirection, owned)),
+            }
+        }
+    }
+    Ok(seen
+        .into_iter()
+        .filter(|&(_, any_owner)| !any_owner)
+        .map(|(indirection, _)| indirection)
+        .collect())
 }
 
 /// Makes the oldest row of `rows` that references `orphan` its owner;
