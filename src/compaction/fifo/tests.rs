@@ -1,5 +1,7 @@
 use super::Strategy;
-use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, time::TestClock};
+use crate::{
+    AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, time::with_test_clock,
+};
 use std::sync::Arc;
 
 #[test]
@@ -100,26 +102,28 @@ fn fifo_ttl() -> crate::Result<()> {
     )
     .open()?;
 
-    // Freeze time and create first (older) table at t=1000s
-    let clock = TestClock::at_secs(1_000);
-    tree.insert("a", "1", 0);
-    tree.flush_active_memtable(0)?;
+    with_test_clock(|clock| {
+        // Freeze time and create first (older) table at t=1000s
+        clock.set_secs(1_000);
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
 
-    // Advance time and create second (newer) table at t=1005s
-    clock.set_secs(1_005);
-    tree.insert("b", "2", 1);
-    tree.flush_active_memtable(1)?;
+        // Advance time and create second (newer) table at t=1005s
+        clock.set_secs(1_005);
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(1)?;
 
-    // Now set current time to t=1011s; with TTL=10s, cutoff=1001s => drop first only
-    clock.set_secs(1_011);
+        // Now set current time to t=1011s; with TTL=10s, cutoff=1001s => drop first only
+        clock.set_secs(1_011);
 
-    assert_eq!(2, tree.table_count());
+        assert_eq!(2, tree.table_count());
 
-    let fifo = Arc::new(Strategy::new(u64::MAX, Some(10)));
-    tree.compact(fifo, 2)?;
+        let fifo = Arc::new(Strategy::new(u64::MAX, Some(10)));
+        tree.compact(fifo, 2)?;
 
-    assert_eq!(1, tree.table_count());
-    Ok(())
+        assert_eq!(1, tree.table_count());
+        Ok(())
+    })
 }
 
 /// Two flushes whose key ranges overlap (`a..c`, then `b`) leave L0 not
@@ -200,18 +204,20 @@ fn fifo_ttl_applies_after_major_compaction() -> crate::Result<()> {
     )
     .open()?;
 
-    let clock = TestClock::at_secs(1_000);
-    for i in 0..3u8 {
-        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
-        tree.flush_active_memtable(u64::from(i))?;
-    }
-    tree.major_compact(u64::MAX, 0)?;
+    with_test_clock(|clock| {
+        clock.set_secs(1_000);
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        tree.major_compact(u64::MAX, 0)?;
 
-    clock.set_secs(1_011);
-    tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
+        clock.set_secs(1_011);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
 
-    assert_eq!(0, tree.table_count(), "expired tables below L0 must drop");
-    Ok(())
+        assert_eq!(0, tree.table_count(), "expired tables below L0 must drop");
+        Ok(())
+    })
 }
 
 /// A major compaction rewrites the data in key order and stamps each output
@@ -387,12 +393,14 @@ fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     tree.insert("b", "$", 1);
     tree.flush_active_memtable(1)?;
 
-    let _clock = TestClock::at_secs(10_000_000);
+    with_test_clock(|clock| {
+        clock.set_secs(10_000_000);
 
-    // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
-    let fifo = Arc::new(Strategy::new(1, Some(1)));
-    tree.compact(fifo, 2)?;
+        // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
+        let fifo = Arc::new(Strategy::new(1, Some(1)));
+        tree.compact(fifo, 2)?;
 
-    assert_eq!(0, tree.table_count());
-    Ok(())
+        assert_eq!(0, tree.table_count());
+        Ok(())
+    })
 }
