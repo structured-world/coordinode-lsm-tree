@@ -306,6 +306,33 @@ fn a_tagged_entry_with_an_impossible_directory_length_is_refused() {
     }
 }
 
+/// An upper bound below the entry `seek` landed on walks nothing, unless that
+/// entry is the first past the bound, which the bound keeps: the entry `seek`
+/// holds is kept only inside the bound.
+#[test]
+fn seek_upper_below_the_entry_seek_landed_on_keeps_only_what_the_bound_covers() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let key = |i: usize| handles[i].end_key().to_vec();
+        assert_eq!(
+            Vec::<Vec<u8>>::new(),
+            walk_between(&index, &key(11), &key(3)).1,
+            "restart interval {restart_interval}: a bound far below"
+        );
+        assert_eq!(
+            Vec::<Vec<u8>>::new(),
+            walk_between(&index, &key(6), &key(4)).1,
+            "restart interval {restart_interval}: a bound two entries below"
+        );
+        assert_eq!(
+            (true, vec![key(6)]),
+            walk_between(&index, &key(6), &key(5)),
+            "restart interval {restart_interval}: the entry is the first past the bound"
+        );
+    }
+}
+
 #[test]
 fn seek_clears_stale_front_cache_before_reposition() {
     let index = make_index_block(8);
