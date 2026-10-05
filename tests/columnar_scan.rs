@@ -969,8 +969,10 @@ fn tree_columnar_scan_block_decode_count_drops_with_predicate() {
 }
 
 #[test]
-fn tree_columnar_scan_blob_tree_unsupported() {
-    // Columnar scan is a standard-tree feature; a blob tree must reject it.
+fn tree_columnar_scan_of_a_blob_tree_projects_declared_fields_only() {
+    // A blob tree stores a row as cells, an indirection or a value: a value
+    // column by id would read that stored form, not a value, so it is
+    // refused; the intrinsic columns are read as on any tree.
     let folder = get_tmp_folder();
     let any = Config::new(
         folder.path(),
@@ -980,13 +982,21 @@ fn tree_columnar_scan_blob_tree_unsupported() {
     .with_kv_separation(Some(Default::default()))
     .open()
     .expect("open blob tree");
+    any.insert("k", "v", 0);
     assert!(
         matches!(
             any.columnar_scan(&[3], None, SeqNo::MAX, ..),
-            Err(lsm_tree::Error::FeatureUnsupported(_))
+            Err(lsm_tree::Error::Projection(_))
         ),
-        "columnar scan over a blob tree must be rejected"
+        "a value column by id over a blob tree must be refused"
     );
+    let rows: u32 = any
+        .columnar_scan(&[COL_USER_KEY], None, SeqNo::MAX, ..)
+        .expect("scan")
+        .map(|batch| batch.map(|b| b.row_count))
+        .sum::<lsm_tree::Result<u32>>()
+        .expect("batches");
+    assert_eq!(rows, 1);
 }
 
 /// Collects `(key, sub-column-3)` pairs from a bounded-range tree scan, asserting

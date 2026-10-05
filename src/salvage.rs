@@ -115,6 +115,12 @@ pub struct SalvageOptions {
     /// [`SalvageReport::entries_dropped_by_rewrite`]. A set rewrite disables
     /// verbatim block copy-through (raw block bytes would carry stale handles).
     pub blob_rewrite: Option<Arc<crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>>,
+    /// Cell rows to make the owners of objects they reference, or `None`
+    /// (the default) to keep every owner bit as written. [`crate::repair`]
+    /// fills it for objects whose owning row it could not keep. Like
+    /// [`Self::blob_rewrite`], a set promotion disables verbatim block
+    /// copy-through.
+    pub owner_promotions: Option<Arc<OwnerPromotions>>,
     /// Shared live-progress counters the block walk ticks per inspected /
     /// re-emitted / dropped block and per recovered row, or `None` (the
     /// default) to skip publishing. [`crate::repair`] forwards the handle set
@@ -151,6 +157,85 @@ pub enum BlobFileRewrite {
     /// by a crash) points into zeroed bytes — its entry is removed; handles at
     /// or above the frontier are kept untouched.
     DropBelow(u64),
+}
+
+/// The cell rows a salvage makes the owners of objects they reference, each
+/// named by its user key and seqno, with the field columns whose references
+/// it is to own.
+///
+/// An object is owned by exactly one row of its key, and the drop of that row
+/// is what charges the object's bytes as garbage. A row that only borrows it
+/// is never charged, so an object whose owning row is gone while a borrowing
+/// one stays would be live data no compaction ever counts as garbage once
+/// the borrower goes too. Repair names, for each such object, the oldest row
+/// still referencing it.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::salvage::OwnerPromotions;
+///
+/// let mut promotions = OwnerPromotions::default();
+/// promotions.insert(b"doc".to_vec().into(), 7, 4);
+/// assert!(!promotions.is_empty());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct OwnerPromotions(crate::HashMap<UserKey, Vec<(crate::SeqNo, u16)>>);
+
+impl OwnerPromotions {
+    /// Makes the row of `key` at `seqno` the owner of the object its field
+    /// in `column` references.
+    pub fn insert(&mut self, key: UserKey, seqno: crate::SeqNo, column: u16) {
+        let rows = self.0.entry(key).or_default();
+        if !rows.contains(&(seqno, column)) {
+            rows.push((seqno, column));
+        }
+    }
+
+    /// Whether no row is named.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The `(seqno, column)` pairs named for rows of `key`.
+    fn of_key(&self, key: &UserKey) -> &[(crate::SeqNo, u16)] {
+        self.0.get(key).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// What a salvage rewrites in the rows it re-emits: blob handles into the
+/// files repair reshaped, and the owner bits it hands to other rows.
+#[derive(Clone, Copy)]
+struct RowRewrites<'a> {
+    blobs: Option<&'a crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>,
+    owners: Option<&'a OwnerPromotions>,
+}
+
+impl<'a> RowRewrites<'a> {
+    /// The rewrites `options` asks for, `None` when it asks for none.
+    fn of(options: &'a SalvageOptions) -> Option<Self> {
+        let blobs = options.blob_rewrite.as_deref();
+        let owners = options
+            .owner_promotions
+            .as_deref()
+            .filter(|o| !o.is_empty());
+        (blobs.is_some() || owners.is_some()).then_some(Self { blobs, owners })
+    }
+
+    /// How the handles into `file` are rewritten.
+    fn blob(&self, file: crate::vlog::BlobFileId) -> Option<&'a BlobFileRewrite> {
+        self.blobs.and_then(|blobs| blobs.get(&file))
+    }
+
+    /// The handle rewrites `blobs` alone.
+    #[cfg(test)]
+    fn of_blobs(blobs: &'a crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>) -> Self {
+        Self {
+            blobs: Some(blobs),
+            owners: None,
+        }
+    }
 }
 
 /// Why a block could not be salvaged and had to be dropped.
@@ -1144,7 +1229,7 @@ fn salvage_attempt(
         comparator,
         !delete_mask_unpositionable,
         allow_verbatim && !resealed,
-        options.blob_rewrite.as_deref(),
+        RowRewrites::of(options),
         options.progress.as_deref(),
     ) {
         Ok(walk) => walk,
@@ -1296,12 +1381,11 @@ fn suppress_columnar_boundary(
     if let Some(key) = carry {
         return Ok(BoundarySuppression::Emptied(key));
     }
-    if batch.columns.len() > 4 {
+    let Some(rebuilt) = crate::table::columnar::transpose_like(batch, &kept)? else {
         return Err(crate::Error::FeatureUnsupported(
             "boundary-key suppression in a columnar block with value sub-columns",
         ));
-    }
-    let rebuilt = crate::table::columnar::entries_to_column_batch(&kept)?;
+    };
     Ok(BoundarySuppression::Rebuilt(rebuilt, kept))
 }
 
@@ -1351,7 +1435,7 @@ fn classify_drop(
 /// answers when it groups a key's versions.
 fn rewrite_block_indirections(
     entries: Vec<crate::InternalValue>,
-    rewrite: &crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>,
+    rewrite: RowRewrites<'_>,
     dropped_entries: &mut u64,
 ) -> crate::Result<(Vec<crate::InternalValue>, Option<UserKey>)> {
     use crate::coding::{Decode, Encode};
@@ -1369,13 +1453,39 @@ fn rewrite_block_indirections(
         }
         // A different key: the previous key's chain has ended.
         headless = None;
+        if entry.key.value_type == crate::ValueType::CellRow {
+            // A cell row loses its head the same way when any object it
+            // references is gone: a row with a missing field is not the row.
+            let seqno = entry.key.seqno;
+            let named = rewrite
+                .owners
+                .map_or(&[][..], |o| o.of_key(&entry.key.user_key));
+            // Empty, and so not allocated, for a row no promotion names.
+            let owns: Vec<u16> = named
+                .iter()
+                .filter(|&&(at, _)| at == seqno)
+                .map(|&(_, column)| column)
+                .collect();
+            match rewrite_row_refs(&entry.value, rewrite, &owns)? {
+                RowRewrite::Unchanged => out.push(entry),
+                RowRewrite::Rewritten(row) => {
+                    entry.value = row.into();
+                    out.push(entry);
+                }
+                RowRewrite::Lost => {
+                    *dropped_entries += 1;
+                    headless = Some(entry.key.user_key);
+                }
+            }
+            continue;
+        }
         if entry.key.value_type != crate::ValueType::Indirection {
             out.push(entry);
             continue;
         }
         let mut cursor = &entry.value[..];
         let mut ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-        match rewrite.get(&ind.vhandle.blob_file_id) {
+        match rewrite.blob(ind.vhandle.blob_file_id) {
             None => out.push(entry),
             Some(BlobFileRewrite::Remap { new_id, offsets }) => {
                 if let Some(&relocation) = offsets.get(&ind.vhandle.offset) {
@@ -1408,14 +1518,100 @@ fn rewrite_block_indirections(
     Ok((out, headless))
 }
 
-/// Decodes the [`crate::blob_tree::handle::BlobIndirection`] of every
-/// indirection entry in `entries`, with the entry's key. An entry TAGGED as an
-/// indirection whose value fails to decode is corrupt content the live read
-/// path could not follow either — the caller drops the block rather than
-/// laundering it into the recovered copy.
-fn collect_indirections(
-    entries: &[crate::InternalValue],
-) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
+/// What a row rewrite does to one cell row.
+enum RowRewrite {
+    /// No reference names a rewritten file or is handed ownership.
+    Unchanged,
+    /// Every reference into a rewritten file was remapped, and each one the
+    /// row is to own owns its object: the new row.
+    Rewritten(Vec<u8>),
+    /// A reference names a record that no longer exists.
+    Lost,
+}
+
+/// Applies a [`BlobFileRewrite`] set to the references of the cell row `row`,
+/// as [`rewrite_block_indirections`] applies it to an indirection, and makes
+/// the row own the objects its fields in the columns of `owns` reference.
+///
+/// # Errors
+///
+/// Returns an error if the row is malformed.
+fn rewrite_row_refs(
+    row: &[u8],
+    rewrite: RowRewrites<'_>,
+    owns: &[u16],
+) -> crate::Result<RowRewrite> {
+    use crate::blob_tree::field_row::{RowCell, decode_row, encode_row};
+
+    let mut cells = decode_row(row)?;
+    let mut changed = false;
+    for field in &mut cells {
+        let column = field.column;
+        let RowCell::Ref { indirection, owner } = &mut field.cell else {
+            continue;
+        };
+        if !*owner && owns.contains(&column) {
+            *owner = true;
+            changed = true;
+        }
+        match rewrite.blob(indirection.vhandle.blob_file_id) {
+            None => {}
+            Some(BlobFileRewrite::Remap { new_id, offsets }) => {
+                let Some(&relocation) = offsets.get(&indirection.vhandle.offset) else {
+                    return Ok(RowRewrite::Lost);
+                };
+                indirection.vhandle.blob_file_id = *new_id;
+                indirection.vhandle.offset = relocation.offset;
+                indirection.vhandle.on_disk_size = relocation.on_disk_size;
+                changed = true;
+            }
+            Some(BlobFileRewrite::DropBelow(frontier)) => {
+                if indirection.vhandle.offset < *frontier {
+                    return Ok(RowRewrite::Lost);
+                }
+            }
+        }
+    }
+    Ok(if changed {
+        RowRewrite::Rewritten(encode_row(&cells)?)
+    } else {
+        RowRewrite::Unchanged
+    })
+}
+
+/// How an entry holds a recovered blob reference.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Holding {
+    /// An indirection entry, which owns its object.
+    Indirection,
+    /// A cell row's reference with its owner bit set.
+    OwnedCell,
+    /// A cell row's borrowed reference.
+    BorrowedCell,
+}
+
+impl Holding {
+    /// Whether the entry owns the object.
+    fn owns(self) -> bool {
+        self != Self::BorrowedCell
+    }
+}
+
+/// One blob reference recovered from an entry: the entry's key, the
+/// reference, and how the entry holds it.
+type RecoveredRef = (
+    crate::UserKey,
+    crate::blob_tree::handle::BlobIndirection,
+    Holding,
+);
+
+/// Decodes every blob reference in `entries`, with the entry's key: the
+/// [`crate::blob_tree::handle::BlobIndirection`] of an indirection entry, which
+/// owns its object, and each reference of a cell row with its owner bit. An
+/// entry TAGGED as either whose value fails to decode is corrupt content the
+/// live read path could not follow either: the caller drops the block rather
+/// than laundering it into the recovered copy.
+fn collect_indirections(entries: &[crate::InternalValue]) -> crate::Result<Vec<RecoveredRef>> {
     use crate::coding::Decode;
 
     let mut out = Vec::new();
@@ -1425,7 +1621,17 @@ fn collect_indirections(
             out.push((
                 entry.key.user_key.clone(),
                 crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?,
+                Holding::Indirection,
             ));
+        } else if entry.key.value_type == crate::ValueType::CellRow {
+            for (ind, owned) in crate::blob_tree::field_row::row_refs(&entry.value)? {
+                let holding = if owned {
+                    Holding::OwnedCell
+                } else {
+                    Holding::BorrowedCell
+                };
+                out.push((entry.key.user_key.clone(), ind, holding));
+            }
         }
     }
     Ok(out)
@@ -1433,44 +1639,61 @@ fn collect_indirections(
 
 /// [`collect_indirections`] for a columnar batch: a cheap value-type-column
 /// scan first, so the per-row materialization is only paid when the batch
-/// actually holds indirections (KV-separated columnar sources are rare).
+/// actually holds blob references (KV-separated columnar sources are rare).
 #[cfg(feature = "columnar")]
 fn collect_columnar_indirections(
     batch: &crate::table::columnar::ColumnBatch,
-) -> crate::Result<Vec<(crate::UserKey, crate::blob_tree::handle::BlobIndirection)>> {
-    let tag = u8::from(crate::ValueType::Indirection);
+) -> crate::Result<Vec<RecoveredRef>> {
+    let tags = [
+        u8::from(crate::ValueType::Indirection),
+        u8::from(crate::ValueType::CellRow),
+    ];
     // Columns are key / seqno / value-type / values...; the value-type column
     // holds one tag byte per row.
-    let has_indirections = batch.columns.get(2).is_some_and(|c| c.data.contains(&tag));
-    if !has_indirections {
+    let has_refs = batch
+        .columns
+        .get(2)
+        .is_some_and(|c| c.data.iter().any(|tag| tags.contains(tag)));
+    if !has_refs {
         return Ok(Vec::new());
     }
     let entries = crate::table::columnar::column_batch_to_entries(batch)?;
     collect_indirections(&entries)
 }
 
-/// Folds one block's recovered indirections into the walk's derived blob-link
-/// map, mirroring the accumulation the live write path does per entry. Blocks
-/// are folded in key order, so a blob file's first key is the first seen and
-/// its last key the latest.
+/// Folds one block's recovered references into the walk's derived blob-link
+/// map, mirroring the accumulation the live write path does per entry: an
+/// owned reference adds to its file's counts, a borrowed one only links the
+/// file. An object a cell row owns also goes to `owned_cells`, the copy's
+/// `owned_blob_objects`. Blocks are folded in key order, so a blob file's
+/// first key is the first seen and its last key the latest.
 fn fold_blob_links(
     derived: &mut crate::HashMap<crate::vlog::BlobFileId, crate::table::writer::LinkedFile>,
-    indirections: &[(crate::UserKey, crate::blob_tree::handle::BlobIndirection)],
+    owned_cells: &mut Vec<(crate::vlog::BlobFileId, u64)>,
+    refs: &[RecoveredRef],
 ) {
-    for (key, ind) in indirections {
+    for (key, ind, holding) in refs {
+        if *holding == Holding::OwnedCell {
+            owned_cells.push((ind.vhandle.blob_file_id, ind.vhandle.offset));
+        }
+        let (len, bytes, on_disk_bytes) = if holding.owns() {
+            (1, u64::from(ind.size), u64::from(ind.vhandle.on_disk_size))
+        } else {
+            (0, 0, 0)
+        };
         derived
             .entry(ind.vhandle.blob_file_id)
             .and_modify(|link| {
-                link.bytes += u64::from(ind.size);
-                link.on_disk_bytes += u64::from(ind.vhandle.on_disk_size);
-                link.len += 1;
+                link.bytes += bytes;
+                link.on_disk_bytes += on_disk_bytes;
+                link.len += len;
                 link.last_key.clone_from(key);
             })
             .or_insert_with(|| crate::table::writer::LinkedFile {
                 blob_file_id: ind.vhandle.blob_file_id,
-                bytes: u64::from(ind.size),
-                on_disk_bytes: u64::from(ind.vhandle.on_disk_size),
-                len: 1,
+                bytes,
+                on_disk_bytes,
+                len,
                 first_key: key.clone(),
                 last_key: key.clone(),
             });
@@ -1566,14 +1789,15 @@ fn salvage_blocks(
     comparator: &crate::comparator::SharedComparator,
     apply_delete_mask: bool,
     allow_verbatim: bool,
-    blob_rewrite: Option<&crate::HashMap<crate::vlog::BlobFileId, BlobFileRewrite>>,
+    blob_rewrite: Option<RowRewrites<'_>>,
     progress: Option<&crate::RecoveryProgress>,
 ) -> crate::Result<SalvageWalk> {
     use crate::table::block::ParsedItem;
     use alloc::format;
 
-    // A handle rewrite invalidates every raw block byte (it carries the old
-    // handles), so the verbatim copy-through is disabled for the whole walk.
+    // A row rewrite invalidates every raw block byte (it carries the old
+    // handles and owner bits), so the verbatim copy-through is disabled for
+    // the whole walk.
     let allow_verbatim = allow_verbatim && blob_rewrite.is_none();
     let mut blocks_total = 0usize;
     let mut blocks_salvaged = 0usize;
@@ -1597,6 +1821,8 @@ fn salvage_blocks(
         crate::vlog::BlobFileId,
         crate::table::writer::LinkedFile,
     > = crate::HashMap::default();
+    // The objects the recovered cell rows own, derived the same way.
+    let mut derived_owned_cells: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
     // Lower bound for a dropped block's range: the previous block's last key,
     // since the index stores each block's last key (so block N covers
     // `(end_key[N-1], end_key[N]]`).
@@ -2063,7 +2289,7 @@ fn salvage_blocks(
                         let mut rewrite_carry: Option<UserKey> = None;
                         let batch = match blob_rewrite {
                             Some(rw) => {
-                                if batch.columns.len() > 4 {
+                                if !crate::table::columnar::rows_round_trip(&batch) {
                                     return Err(crate::Error::FeatureUnsupported(
                                         "blob-handle rewrite of a columnar block \
                                          with value sub-columns",
@@ -2089,9 +2315,16 @@ fn salvage_blocks(
                                     }
                                     Ok((entries, carry)) => {
                                         rewrite_carry = carry;
-                                        match crate::table::columnar::entries_to_column_batch(
-                                            &entries,
-                                        ) {
+                                        let rebuilt = crate::table::columnar::transpose_like(
+                                            &batch, &entries,
+                                        )
+                                        .and_then(|rebuilt| {
+                                            rebuilt.ok_or(crate::Error::FeatureUnsupported(
+                                                "blob-handle rewrite of a columnar block \
+                                                         with value sub-columns",
+                                            ))
+                                        });
+                                        match rebuilt {
                                             Ok(batch) => batch,
                                             Err(e) => {
                                                 dropped.push(classify_drop(
@@ -2178,7 +2411,11 @@ fn salvage_blocks(
                                 entries_salvaged += rows;
                                 blocks_salvaged += 1;
                                 columns_salvaged += batch.columns.len() as u64;
-                                fold_blob_links(&mut derived_blob_links, &block_links);
+                                fold_blob_links(
+                                    &mut derived_blob_links,
+                                    &mut derived_owned_cells,
+                                    &block_links,
+                                );
                             }
                             Err(
                                 e @ (crate::Error::InvalidHeader(_) | crate::Error::InvalidTag(_)),
@@ -2253,13 +2490,12 @@ fn salvage_blocks(
                             Ok((batch, entries)) => {
                                 // Apply the blob-handle rewrite by round-tripping
                                 // through the row entries, then rebuilding the
-                                // batch, so the emitted block carries the NEW
-                                // handles. A batch with value SUB-COLUMNS cannot
-                                // round-trip (they are not reconstructible from
-                                // entries) — a KV-separated columnar flush never
-                                // writes them (indirections live in the opaque
-                                // value column), so fail closed on the exotic
-                                // combination instead of silently dropping data.
+                                // batch as the source laid it out, so the emitted
+                                // block carries the NEW handles. A batch of caller
+                                // sub-columns cannot round-trip (rows are not
+                                // split back into them); a blob tree never writes
+                                // one, so fail closed on that combination instead
+                                // of silently dropping data.
                                 // A chain the rewrite beheads at this block's tail
                                 // continues into the next block, so its key is
                                 // handed on once this block's own suppression has
@@ -2267,7 +2503,7 @@ fn salvage_blocks(
                                 let mut rewrite_carry: Option<UserKey> = None;
                                 let (batch, entries) = match blob_rewrite {
                                     Some(rw) => {
-                                        if batch.columns.len() > 4 {
+                                        if !crate::table::columnar::rows_round_trip(&batch) {
                                             return Err(crate::Error::FeatureUnsupported(
                                                 "blob-handle rewrite of a columnar block \
                                                  with value sub-columns",
@@ -2302,9 +2538,16 @@ fn salvage_blocks(
                                             prev_end = end_key.or(prev_end);
                                             continue;
                                         }
-                                        match crate::table::columnar::entries_to_column_batch(
-                                            &entries,
-                                        ) {
+                                        let rebuilt = crate::table::columnar::transpose_like(
+                                            &batch, &entries,
+                                        )
+                                        .and_then(|rebuilt| {
+                                            rebuilt.ok_or(crate::Error::FeatureUnsupported(
+                                                "blob-handle rewrite of a columnar block \
+                                                         with value sub-columns",
+                                            ))
+                                        });
+                                        match rebuilt {
                                             Ok(batch) => (batch, entries),
                                             Err(e) => {
                                                 dropped.push(classify_drop(
@@ -2439,7 +2682,11 @@ fn salvage_blocks(
                                         entries_salvaged += rows;
                                         blocks_salvaged += 1;
                                         columns_salvaged += batch.columns.len() as u64;
-                                        fold_blob_links(&mut derived_blob_links, &block_links);
+                                        fold_blob_links(
+                                            &mut derived_blob_links,
+                                            &mut derived_owned_cells,
+                                            &block_links,
+                                        );
                                     }
                                     Err(
                                         e @ (crate::Error::InvalidHeader(_)
@@ -2696,7 +2943,11 @@ fn salvage_blocks(
                                     }
                                     entries_salvaged += count;
                                     blocks_salvaged += 1;
-                                    fold_blob_links(&mut derived_blob_links, &block_links);
+                                    fold_blob_links(
+                                        &mut derived_blob_links,
+                                        &mut derived_owned_cells,
+                                        &block_links,
+                                    );
                                 }
                                 Err(
                                     e @ (crate::Error::InvalidHeader(_)
@@ -2781,6 +3032,7 @@ fn salvage_blocks(
         for link in links {
             writer.link_blob_file(link);
         }
+        writer.own_blob_objects(derived_owned_cells);
         // The caller syncs the destination's directory: the publish after its
         // rename, or the direct path once the attempt returns.
         writer.finish_deferring_dir_sync()?;

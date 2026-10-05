@@ -24,6 +24,19 @@ use crate::table::row_group::{PageWant, RowGroupBlocks, RowPageSelect, RowPageSe
 use crate::table::util::ReadCharge;
 use crate::{SeqNo, Table, UserKey};
 
+/// Where a batch a [`ColumnarCursor`] yielded was read from: its row page,
+/// and the rows of that page the batch kept. Other columns of the same rows
+/// are read through it later, without reading the rest of the group.
+#[derive(Clone, Debug)]
+pub(crate) struct PageAt {
+    /// The row group the page belongs to.
+    pub(crate) group: BlockHandle,
+    /// The row page's ordinal in its group.
+    pub(crate) ordinal: u16,
+    /// The rows of the page the batch kept, or `None` when it kept every one.
+    pub(crate) rows: Option<crate::table::columnar_predicate::Selection>,
+}
+
 /// A lazy projected scan of one columnar table.
 ///
 /// Yields one [`ColumnBatch`] per row page of every row group that survives
@@ -54,7 +67,7 @@ pub struct ColumnarCursor {
     /// Whether the last row group read took every page, so the next is read
     /// whole in one request.
     expect_whole: bool,
-    pending: VecDeque<ColumnBatch>,
+    pending: VecDeque<(ColumnBatch, PageAt)>,
     /// The bytes of the batches in `pending`, kept as they come and go.
     pending_bytes: u64,
     /// The page bytes this cursor may hold at once, or `None` for a group at
@@ -364,7 +377,11 @@ impl ColumnarCursor {
             )),
             None => None,
         };
-        let (bytes, rows) = self.yield_pages(blocks, bound_keys.as_ref().map(|(b, k)| (*b, k)))?;
+        let (bytes, rows) = self.yield_pages(
+            &group.handle,
+            blocks,
+            bound_keys.as_ref().map(|(b, k)| (*b, k)),
+        )?;
         self.learn(bytes, rows, group.share);
         group.next_page = pages.end;
         Ok(())
@@ -443,7 +460,8 @@ impl ColumnarCursor {
         // pages it turns out not to want.
         self.expect_whole = blocks.pages.len() == blocks.directory.entries().len();
         let group_rows = blocks.directory.row_count();
-        let (bytes, rows) = self.yield_pages(&blocks, bound_keys.as_ref().map(|(b, k)| (*b, k)))?;
+        let (bytes, rows) =
+            self.yield_pages(handle, &blocks, bound_keys.as_ref().map(|(b, k)| (*b, k)))?;
         if let Some(share) = self.share {
             self.learn(bytes, rows, share);
         }
@@ -463,6 +481,7 @@ impl ColumnarCursor {
     /// straddles the restriction bound.
     fn yield_pages(
         &mut self,
+        group: &BlockHandle,
         blocks: &RowGroupBlocks,
         bound_keys: Option<(&UserKey, &crate::table::row_group::RowPages)>,
     ) -> crate::Result<(u64, u32)> {
@@ -583,10 +602,18 @@ impl ColumnarCursor {
                         None => c.decode(row_count, &mut copied, &mut budget),
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
-                out.push(ColumnBatch {
-                    row_count: keep.as_ref().map_or(row_count, Selection::count),
-                    columns,
-                });
+                let at = PageAt {
+                    group: *group,
+                    ordinal,
+                    rows: keep.clone(),
+                };
+                out.push((
+                    ColumnBatch {
+                        row_count: keep.as_ref().map_or(row_count, Selection::count),
+                        columns,
+                    },
+                    at,
+                ));
             }
             Ok(())
         };
@@ -597,7 +624,7 @@ impl ColumnarCursor {
         let _ = copied;
         self.support = support;
         read?;
-        let built: u64 = out.iter().map(|b| b.data_size() as u64).sum();
+        let built: u64 = out.iter().map(|(b, _)| b.data_size() as u64).sum();
         self.pending.extend(out);
         self.pending_bytes += built;
         Ok((loaded.max(built) + bound_bytes, rows_read))
@@ -645,15 +672,15 @@ struct OpenGroup {
     share: u64,
 }
 
-impl Iterator for ColumnarCursor {
-    type Item = crate::Result<ColumnBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl ColumnarCursor {
+    /// The next batch with the row page it was read from, as
+    /// [`Iterator::next`] yields the batch alone.
+    pub(crate) fn next_located(&mut self) -> Option<crate::Result<(ColumnBatch, PageAt)>> {
         loop {
-            if let Some(batch) = self.pending.pop_front() {
+            if let Some((batch, at)) = self.pending.pop_front() {
                 // Counted in when pushed, so it is never more than the total.
                 self.pending_bytes -= batch.data_size() as u64;
-                return Some(Ok(batch));
+                return Some(Ok((batch, at)));
             }
             let read = if let Some(group) = self.open.take() {
                 self.read_run(group)
@@ -667,5 +694,75 @@ impl Iterator for ColumnarCursor {
                 return Some(Err(e));
             }
         }
+    }
+
+    /// The table this cursor reads.
+    pub(crate) fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Decodes `projection` (and the predicate's column, as at the start)
+    /// from the next row group read on; the batches already read keep the
+    /// columns they were read with.
+    pub(crate) fn set_projection(&mut self, projection: &[u16]) {
+        let mut decode_projection = projection.to_vec();
+        self.added_predicate_column = match &self.predicate {
+            Some(pred) if !decode_projection.contains(&pred.column_id) => {
+                decode_projection.push(pred.column_id);
+                Some(pred.column_id)
+            }
+            _ => None,
+        };
+        self.decode_projection = decode_projection;
+    }
+}
+
+impl Iterator for ColumnarCursor {
+    type Item = crate::Result<ColumnBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_located()
+            .map(|located| located.map(|(batch, _)| batch))
+    }
+}
+
+impl Table {
+    /// The `columns` of the rows a batch read at `at` holds, read from that
+    /// row page alone, each a column of the batch's rows (a view of the page
+    /// where the column is stored plain and the batch kept every row). A
+    /// column the group does not store is not returned.
+    ///
+    /// # Errors
+    ///
+    /// Any read or decode error of the page.
+    pub(crate) fn columns_at(
+        &self,
+        at: &PageAt,
+        columns: &[u16],
+        copied: &mut usize,
+    ) -> crate::Result<Vec<crate::table::columnar::Column>> {
+        use crate::table::columnar::DecodeBudget;
+
+        let blocks =
+            self.group_read(&at.group, ReadCharge::Foreground)
+                .load(&PageWant::projected(
+                    columns,
+                    RowPageSelect::Range(at.ordinal..at.ordinal + 1),
+                ))?;
+        let mut budget = DecodeBudget::default();
+        let mut pages = blocks.page_columns(|_| true, &mut budget)?;
+        let Some(page) = pages.pop().filter(|page| page.ordinal == at.ordinal) else {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: a row page read again is not the one asked for",
+            ));
+        };
+        let rows = page.rows;
+        page.columns
+            .into_iter()
+            .map(|column| match &at.rows {
+                Some(kept) => column.decode_rows(rows, kept, copied, &mut budget),
+                None => column.decode(rows, copied, &mut budget),
+            })
+            .collect()
     }
 }

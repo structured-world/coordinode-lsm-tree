@@ -1595,6 +1595,9 @@ struct TableSalvage<'a> {
     /// frontier); `None` on the plain corrupt-table salvage paths.
     blob_rewrite:
         Option<Arc<crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>>,
+    /// Cell rows of the table to make the owners of objects whose owning row
+    /// the rebuild lost; `None` everywhere but the ownership pass.
+    owner_promotions: Option<Arc<crate::salvage::OwnerPromotions>>,
     /// The source's RECOVERED bulk-ingest sequence offset, when it is known:
     /// from a clean manifest record, or from a source the scan already
     /// admitted (the blob-handle rewrite). A salvaged copy preserves local
@@ -1619,6 +1622,7 @@ fn try_salvage_table(
         table_id,
         reject_punched_without_bound,
         blob_rewrite,
+        owner_promotions,
         recovered_global_seqno,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
@@ -1660,6 +1664,7 @@ fn try_salvage_table(
             // prefix scans see the salvaged copy as definitely absent.
             prefix_extractor: config.prefix_extractor.clone(),
             blob_rewrite,
+            owner_promotions,
             // A repair replacement always keeps the SOURCE's identity: it is
             // built at `{id}.repair-tmp` and swapped onto `{id}`, so the name it
             // ends up under is the identity it was stamped with.
@@ -2498,22 +2503,220 @@ fn handle_below_blob_frontier(
 
     for entry in table.scan()? {
         let entry = entry?;
-        if entry.key.value_type != crate::ValueType::Indirection {
+        let handles = if entry.key.value_type == crate::ValueType::Indirection {
+            let mut cursor = &entry.value[..];
+            vec![crate::blob_tree::handle::BlobIndirection::decode_from(
+                &mut cursor,
+            )?]
+        } else if entry.key.value_type == crate::ValueType::CellRow {
+            crate::blob_tree::field_row::row_refs(&entry.value)?
+                .into_iter()
+                .map(|(ind, _)| ind)
+                .collect()
+        } else {
             continue;
-        }
-        let mut cursor = &entry.value[..];
-        let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-        if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
-            && ind.vhandle.offset < frontier
-        {
-            return Ok(Some(format!(
-                "blob handle into file {} at offset {} lies below its recovered \
-                 live-data frontier {frontier}",
-                ind.vhandle.blob_file_id, ind.vhandle.offset,
-            )));
+        };
+        for ind in handles {
+            if let Some(&frontier) = frontiers.get(&ind.vhandle.blob_file_id)
+                && ind.vhandle.offset < frontier
+            {
+                return Ok(Some(format!(
+                    "blob handle into file {} at offset {} lies below its recovered \
+                     live-data frontier {frontier}",
+                    ind.vhandle.blob_file_id, ind.vhandle.offset,
+                )));
+            }
         }
     }
     Ok(None)
+}
+
+/// One table the blob-handle stage keeps: the table, its fidelity, its
+/// scanned source and that source's filesystem, and whether its handles need
+/// rewriting.
+#[cfg(feature = "std")]
+type AdmittedTable = ((Table, Fidelity, PathBuf, Arc<dyn crate::fs::Fs>), bool);
+
+/// For each table of `tables`, the cell rows to make the owners of the
+/// objects whose owning row the rebuild does not keep, `None` for a table
+/// with none.
+///
+/// An object is owned by one row of its key, and only that row's drop charges
+/// the object as garbage: an object whose owner went with a table set aside,
+/// a block dropped or a row the handle rewrite loses, while a row borrowing it
+/// stays, would never be counted again. The oldest row left that references
+/// it becomes its owner, as a compaction hands ownership to the oldest row it
+/// keeps. The rows a table's handle rewrite will lose are left out here, as
+/// the rewrite leaves them out. A version a table and a redundant copy of it
+/// both hold is named in both, so the copy the lineage pass keeps owns it.
+#[cfg(feature = "std")]
+fn owner_promotions(
+    tables: &[AdmittedTable],
+    rewrites: &crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>,
+) -> crate::Result<Vec<Option<crate::salvage::OwnerPromotions>>> {
+    /// A row referencing an object by the field in `column`.
+    struct Holder {
+        table: usize,
+        key: UserKey,
+        seqno: SeqNo,
+        column: u16,
+    }
+    type Object = (crate::vlog::BlobFileId, u64);
+
+    // Only borrowed references can lose their owner, and they are rare: a
+    // first pass finds them and the oldest of each object's borrowers.
+    let mut borrowed: crate::HashMap<Object, (SeqNo, Vec<Holder>)> = crate::HashMap::default();
+    for (index, ((table, ..), rewrite)) in tables.iter().enumerate() {
+        if table
+            .list_blob_file_references()?
+            .is_none_or(|links| links.is_empty())
+        {
+            continue;
+        }
+        let global = table.global_seqno();
+        visit_kept_refs(table, rewrite.then_some(rewrites), |key, seqno, field| {
+            let Some((column, true)) = field.owner else {
+                return Ok(());
+            };
+            let eff = seqno
+                .checked_add(global)
+                .ok_or(crate::Error::Unrecoverable)?;
+            let holder = Holder {
+                table: index,
+                key: key.clone(),
+                seqno,
+                column,
+            };
+            let object = (field.file, field.offset);
+            match borrowed.get_mut(&object) {
+                Some((oldest, holders)) if eff == *oldest => holders.push(holder),
+                Some((oldest, holders)) if eff < *oldest => {
+                    *oldest = eff;
+                    *holders = alloc::vec![holder];
+                }
+                Some(_) => {}
+                None => {
+                    borrowed.insert(object, (eff, alloc::vec![holder]));
+                }
+            }
+            Ok(())
+        })?;
+    }
+    let mut promotions: Vec<Option<crate::salvage::OwnerPromotions>> =
+        tables.iter().map(|_| None).collect();
+    if borrowed.is_empty() {
+        return Ok(promotions);
+    }
+
+    // Then every owning reference into the files those objects are in.
+    let files: crate::HashSet<crate::vlog::BlobFileId> =
+        borrowed.keys().map(|&(file, _)| file).collect();
+    for ((table, ..), rewrite) in tables {
+        let linked = table
+            .list_blob_file_references()?
+            .is_some_and(|links| links.iter().any(|l| files.contains(&l.blob_file_id)));
+        if !linked {
+            continue;
+        }
+        visit_kept_refs(table, rewrite.then_some(rewrites), |_, _, field| {
+            if field.owner.is_none_or(|(_, borrows)| !borrows) {
+                borrowed.remove(&(field.file, field.offset));
+            }
+            Ok(())
+        })?;
+    }
+
+    for (_, (_, holders)) in borrowed {
+        for holder in holders {
+            if let Some(slot) = promotions.get_mut(holder.table) {
+                slot.get_or_insert_with(Default::default).insert(
+                    holder.key,
+                    holder.seqno,
+                    holder.column,
+                );
+            }
+        }
+    }
+    Ok(promotions)
+}
+
+/// A blob reference a row holds: the object's file and offset, and for a
+/// cell row's field its column and whether the row owns the object, `None`
+/// for an indirection, which always does.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+struct HeldRef {
+    file: crate::vlog::BlobFileId,
+    offset: u64,
+    /// The field's column and whether the row only BORROWS the object.
+    owner: Option<(u16, bool)>,
+}
+
+/// Calls `visit` with every blob reference of `table`'s rows, by the row's
+/// key and local seqno, leaving out the rows the handle rewrite `rewrites`
+/// loses: a row with a reference to a record that no longer exists, and every
+/// older version of its key in the table, as the rewrite does.
+#[cfg(feature = "std")]
+fn visit_kept_refs(
+    table: &Table,
+    rewrites: Option<&crate::HashMap<crate::vlog::BlobFileId, crate::salvage::BlobFileRewrite>>,
+    mut visit: impl FnMut(&UserKey, SeqNo, HeldRef) -> crate::Result<()>,
+) -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, decode_row};
+    use crate::coding::Decode;
+    use crate::salvage::BlobFileRewrite;
+
+    let lost =
+        |file: crate::vlog::BlobFileId, offset: u64| match rewrites.and_then(|r| r.get(&file)) {
+            Some(BlobFileRewrite::Remap { offsets, .. }) => !offsets.contains_key(&offset),
+            Some(BlobFileRewrite::DropBelow(frontier)) => offset < *frontier,
+            None => false,
+        };
+    let mut headless: Option<UserKey> = None;
+    let mut refs: Vec<HeldRef> = Vec::new();
+    for entry in table.scan()? {
+        let entry = entry?;
+        let key = &entry.key.user_key;
+        if headless
+            .as_ref()
+            .is_some_and(|h| crate::comparator::same_user_key(key, h))
+        {
+            continue;
+        }
+        headless = None;
+        refs.clear();
+        match entry.key.value_type {
+            crate::ValueType::Indirection => {
+                let mut cursor = &entry.value[..];
+                let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
+                refs.push(HeldRef {
+                    file: ind.vhandle.blob_file_id,
+                    offset: ind.vhandle.offset,
+                    owner: None,
+                });
+            }
+            crate::ValueType::CellRow => {
+                for field in decode_row(&entry.value)? {
+                    if let RowCell::Ref { indirection, owner } = field.cell {
+                        refs.push(HeldRef {
+                            file: indirection.vhandle.blob_file_id,
+                            offset: indirection.vhandle.offset,
+                            owner: Some((field.column, !owner)),
+                        });
+                    }
+                }
+            }
+            _ => continue,
+        }
+        if refs.iter().any(|r| lost(r.file, r.offset)) {
+            headless = Some(key.clone());
+            continue;
+        }
+        for &held in &refs {
+            visit(key, entry.key.seqno, held)?;
+        }
+    }
+    Ok(())
 }
 
 /// What the blob directory scan recovered, and how, for the rebuilt manifest.
@@ -4994,6 +5197,7 @@ fn scan_table_folders(
                                     // on this arm.
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
+                                    owner_promotions: None,
                                     recovered_global_seqno: manifest_global_seqno,
                                 },
                             ) {
@@ -5190,6 +5394,7 @@ fn scan_table_folders(
                             table_id,
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
+                            owner_promotions: None,
                             recovered_global_seqno: manifest_global_seqno,
                         },
                     ) {
@@ -5516,6 +5721,8 @@ fn rebuild_from_scan(
     // the relocated records and only entries whose record no longer exists are
     // dropped, so intact live data is never discarded over a reshaped
     // dependency.
+    // Shared with the ownership pass below, which rewrites tables again.
+    let blob_rewrites = Arc::new(blob_rewrites);
     if config.kv_separation_opts.is_some() {
         // Frontiers of the punched-but-intact blob files (the `DropBelow`
         // rewrite entries): a handle below one dereferences zeroed bytes.
@@ -5527,9 +5734,7 @@ fn rebuild_from_scan(
                 crate::salvage::BlobFileRewrite::Remap { .. } => None,
             })
             .collect();
-        let blob_rewrites = Arc::new(blob_rewrites);
-        let mut kept: Vec<(Table, Fidelity, PathBuf, Arc<dyn crate::fs::Fs>)> =
-            Vec::with_capacity(recovered_tables.len());
+        let mut admitted: Vec<AdmittedTable> = Vec::with_capacity(recovered_tables.len());
         for (table, fidelity, source_path, source_fs) in recovered_tables {
             // One reference read drives everything below: the missing-id check
             // and the rewrite decision.
@@ -5598,7 +5803,28 @@ fn rebuild_from_scan(
                     }
                 }
             }
-            if !needs_rewrite {
+            admitted.push(((table, fidelity, source_path, source_fs), needs_rewrite));
+        }
+        // Derived from the rows themselves, every time: a table file that is
+        // simply gone takes its owners with it and leaves no trace the scan
+        // could gate this on.
+        // A row the walk cannot read leaves it unknown whether an object it
+        // borrows has an owner elsewhere, and two owners would charge the
+        // object twice: no ownership is handed then.
+        let promotions = match owner_promotions(&admitted, &blob_rewrites) {
+            Ok(promotions) => promotions,
+            Err(e) if is_environmental(&e) => return Err(e),
+            Err(e) => {
+                log::warn!("repair: no blob object ownership handed on: a table's rows ({e})");
+                admitted.iter().map(|_| None).collect()
+            }
+        };
+        let mut kept: Vec<(Table, Fidelity, PathBuf, Arc<dyn crate::fs::Fs>)> =
+            Vec::with_capacity(admitted.len());
+        for (((table, fidelity, source_path, source_fs), needs_rewrite), promote) in
+            admitted.into_iter().zip(promotions)
+        {
+            if !needs_rewrite && promote.is_none() {
                 kept.push((table, fidelity, source_path, source_fs));
                 continue;
             }
@@ -5633,7 +5859,21 @@ fn rebuild_from_scan(
             // (and delete) its healthy replacement.
             let source_global_seqno = table.global_seqno();
             let fs = table.fs.clone();
-            drop(table); // release the handle before reading the source again
+            // A table rewritten only to hand ownership loses nothing: it stays
+            // as it was, its owners unchanged, if the rewrite cannot be made.
+            let kept_as_is = if needs_rewrite {
+                // Its descriptor too: a replacement may be renamed over below,
+                // which a backend refuses for an open file (Windows).
+                release_held(config, table);
+                None
+            } else {
+                Some(table)
+            };
+            let fidelity = if needs_rewrite {
+                Fidelity::Salvaged
+            } else {
+                fidelity
+            };
             match try_salvage_table(
                 config,
                 &fs,
@@ -5644,10 +5884,14 @@ fn rebuild_from_scan(
                     table_id: source_id,
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
+                    owner_promotions: promote.map(Arc::new),
                     recovered_global_seqno: Some(source_global_seqno),
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
+                    if let Some(table) = kept_as_is {
+                        release_held(config, table);
+                    }
                     let rewritten = restrict_salvaged_output(
                         &*fs,
                         config,
@@ -5657,8 +5901,56 @@ fn rebuild_from_scan(
                         allow_resurrection,
                     )?;
                     let restricted = rewritten.restrict_lower_bound().is_some();
-                    kept.push((rewritten, Fidelity::Salvaged, source_path, source_fs));
-                    swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
+                    if let Some(pending) = swap_after_commit
+                        .iter_mut()
+                        .find(|(_, tmp, ..)| *tmp == path)
+                    {
+                        // A source that is itself a replacement this repair
+                        // built is superseded by the copy, which takes the
+                        // replacement's name before the manifest can name it:
+                        // a crash between the commit and the swap then leaves
+                        // the copy the manifest names where the next open
+                        // finishes swaps from, not under a name no scan reads.
+                        // The replacement is no longer needed: a failed commit
+                        // is retried from the untouched original.
+                        let checksum = rewritten.checksum();
+                        let bound = rewritten.restrict_lower_bound().cloned();
+                        release_held(config, rewritten);
+                        commit_repair_tmp(&*fs, &output_path, &path, config.sync_mode, restricted)?;
+                        let published = Table::recover(held_recover_params(
+                            config,
+                            path.clone(),
+                            checksum,
+                            source_id,
+                            Arc::clone(&fs),
+                            Some(source_global_seqno),
+                        ))?;
+                        let published = match bound {
+                            Some(bound) => {
+                                published.reopen_restricted_with(bound, held_descriptors(config))?
+                            }
+                            None => published,
+                        };
+                        pending.3 = restricted;
+                        kept.push((published, fidelity, source_path, source_fs));
+                    } else {
+                        swap_after_commit.push((Arc::clone(&fs), output_path, path, restricted));
+                        kept.push((rewritten, fidelity, source_path, source_fs));
+                    }
+                }
+                // A retryable failure leaves the source where it was found, so
+                // the retry re-derives the same rewrite from it; nothing to
+                // restore.
+                Err(e) if is_environmental(&e) => return Err(e),
+                Ok(_) | Err(_) if kept_as_is.is_some() => {
+                    if let Some(table) = kept_as_is {
+                        log::warn!(
+                            "repair: table {source_id} keeps the objects it borrows unowned: \
+                             its rewrite produced nothing usable"
+                        );
+                        discard_unreferenced(&*fs, &output_path, config.sync_mode)?;
+                        kept.push((table, fidelity, source_path, source_fs));
+                    }
                 }
                 Ok(SalvageOutcome::Unusable | SalvageOutcome::PunchedBoundLost) => {
                     set_aside_path(
@@ -5669,10 +5961,6 @@ fn rebuild_from_scan(
                         &mut discard_after_commit,
                     );
                 }
-                // A retryable failure leaves the source where it was found, so
-                // the retry re-derives the same rewrite from it; nothing to
-                // restore.
-                Err(e) if is_environmental(&e) => return Err(e),
                 Err(e) => {
                     set_aside_path(
                         &fs,

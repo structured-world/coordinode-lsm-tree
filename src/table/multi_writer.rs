@@ -87,6 +87,11 @@ pub struct MultiWriter {
 
     linked_blobs: LinkedBlobFiles,
 
+    /// The blob objects the current table's cell rows own, as `(blob file,
+    /// offset)`: what dropping the table releases, handed to its writer at
+    /// rotation for its `owned_blob_objects` section.
+    owned_objects: Vec<(BlobFileId, u64)>,
+
     /// Range tombstones to distribute across output tables, ordered by start.
     /// During compaction these are clipped to each table's key range; during
     /// flush each is cut into the zones of the outputs it spans, the first and
@@ -160,6 +165,11 @@ pub struct MultiWriter {
     /// after a row, split after an ingested batch, `None` before either. A
     /// table records one layout, so a write of the other one rotates first.
     value_layout: Option<crate::table::meta::ValueLayout>,
+
+    /// Preserved across writer rotation: every table of a tree whose rows may
+    /// be written as cells splits them into their fields (see
+    /// [`Writer::use_cell_rows`]).
+    cell_rows: bool,
 
     /// Preserved across writer rotation so every successor [`Writer`] of one
     /// bulk ingest is uniformly flagged bulk-ingested (see
@@ -302,6 +312,7 @@ impl MultiWriter {
             comparator: crate::comparator::default_comparator(),
 
             linked_blobs: LinkedBlobFiles::default(),
+            owned_objects: Vec::new(),
             range_tombstones: Vec::new(),
             clip_range_tombstones: false,
             output_lower: None,
@@ -323,6 +334,7 @@ impl MultiWriter {
             use_zstd_two_pass_seed: true,
             use_columnar: false,
             value_layout: None,
+            cell_rows: false,
             bulk_ingested: false,
             recency: None,
             lineage: None,
@@ -627,7 +639,39 @@ impl MultiWriter {
             u64::from(indirection.size),
             u64::from(indirection.vhandle.on_disk_size),
             key,
+            true,
         );
+    }
+
+    /// Records the blob files the cell row just written references, as
+    /// [`Self::register_blob`] does for an indirection: each owned reference
+    /// adds to its file's counts, each borrowed one only links the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `row` is not a well-formed cell row.
+    pub fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
+        debug_assert!(
+            self.current_key.is_some(),
+            "a cell row is registered after it is written"
+        );
+        let Some(key) = self.current_key.as_ref() else {
+            return Ok(());
+        };
+        for (indirection, owned) in crate::blob_tree::field_row::row_refs(row)? {
+            self.linked_blobs.register(
+                indirection.vhandle.blob_file_id,
+                u64::from(indirection.size),
+                u64::from(indirection.vhandle.on_disk_size),
+                key,
+                owned,
+            );
+            if owned {
+                self.owned_objects
+                    .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -868,6 +912,15 @@ impl MultiWriter {
         self
     }
 
+    /// Splits the cell rows of every table of this run into their fields
+    /// (see [`Writer::use_cell_rows`]), re-applied to each rotated successor.
+    #[must_use]
+    pub(crate) fn use_cell_rows(mut self, cell_rows: bool) -> Self {
+        self.cell_rows = cell_rows;
+        self.writer = self.writer.use_cell_rows(cell_rows);
+        self
+    }
+
     /// Marks every table in this run as bulk-ingested (re-applied to each rotated
     /// successor), so manifest repair can recognize their manifest-only
     /// `global_seqno` dependence. See [`Writer::use_bulk_ingested`].
@@ -1020,6 +1073,7 @@ impl MultiWriter {
         }
         new_writer = new_writer.use_zone_map(self.use_zone_map);
         new_writer = new_writer.use_columnar(self.use_columnar);
+        new_writer = new_writer.use_cell_rows(self.cell_rows);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
@@ -1075,6 +1129,7 @@ impl MultiWriter {
         for linked in self.linked_blobs.take() {
             old_writer.link_blob_file(linked);
         }
+        old_writer.own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         // The install that names the tables syncs their folder once.
         if let Some((table_id, checksum)) = old_writer.finish_deferring_dir_sync()? {
@@ -1145,6 +1200,17 @@ impl MultiWriter {
         use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = self.linked_blobs.section_len();
+        let owned = if self.owned_objects.is_empty() {
+            0
+        } else {
+            framed_len_bound(
+                crate::table::writer::owned_blob_objects_len(self.owned_objects.len()),
+                BlockType::OwnedBlobObjects,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            )
+        };
         let (tombstone_block, tombstones_held) = if tombstones == 0 {
             (0, 0)
         } else {
@@ -1166,11 +1232,15 @@ impl MultiWriter {
             * (core::mem::size_of::<(BlobFileId, LinkedFile)>()
                 + 1
                 + core::mem::size_of::<LinkedFile>()) as u64;
+        // The owned objects' list moves to the writer at rotation, which sorts
+        // it in place.
+        let owned_held =
+            self.owned_objects.capacity() as u64 * core::mem::size_of::<(BlobFileId, u64)>() as u64;
         let (alone_written, alone_held) = alone;
         let size_hint = self.writer.output_size_hint();
         let writer_held = self.writer.held_state_bytes();
-        let size = size_hint + alone_written + linked + tombstone_block;
-        let held = writer_held + alone_held + tombstones_held + linked_held;
+        let size = size_hint + alone_written + linked + owned + tombstone_block;
+        let held = writer_held + alone_held + tombstones_held + linked_held + owned_held;
         // Closing a table sheds none of its metadata or of what it held at its
         // first record, the tombstones carried into it included, which the
         // next table carries alike: a target below that counts only once the
@@ -1283,7 +1353,11 @@ impl MultiWriter {
 
         self.writer.write(item)?;
         if self.use_columnar {
-            self.value_layout = Some(crate::table::meta::ValueLayout::Whole);
+            self.value_layout = Some(if self.cell_rows {
+                crate::table::meta::ValueLayout::Cells
+            } else {
+                crate::table::meta::ValueLayout::Whole
+            });
         }
         self.note_output_base();
 
@@ -1308,7 +1382,14 @@ impl MultiWriter {
     ) -> crate::Result<Option<crate::UserKey>> {
         // A table records one value layout, so a batch after rows starts the
         // next table.
-        if self.table_full() || self.value_layout == Some(crate::table::meta::ValueLayout::Whole) {
+        if self.table_full()
+            || matches!(
+                self.value_layout,
+                Some(
+                    crate::table::meta::ValueLayout::Whole | crate::table::meta::ValueLayout::Cells
+                )
+            )
+        {
             self.rotate()?;
         }
         // A batch lands whole, so the output's base is what it held before
@@ -1487,6 +1568,8 @@ impl MultiWriter {
         for linked in self.linked_blobs.take() {
             self.writer.link_blob_file(linked);
         }
+        self.writer
+            .own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         if let Some((table_id, checksum)) = self.writer.finish_deferring_dir_sync()? {
             self.results.push((table_id, checksum));

@@ -31,9 +31,15 @@ impl BlobFileList {
         self.0.contains_key(&key)
     }
 
-    pub fn prune_dead(&mut self, gc_stats: &FragmentationMap) -> Vec<BlobFile> {
+    /// Removes and returns the files whose charged bytes reach their size and
+    /// that `referenced` reports no table or memtable still points into.
+    pub fn prune_dead(
+        &mut self,
+        gc_stats: &FragmentationMap,
+        mut referenced: impl FnMut(BlobFileId) -> bool,
+    ) -> Vec<BlobFile> {
         self.0
-            .extract_if(|_, blob_file| blob_file.is_dead(gc_stats))
+            .extract_if(|&id, blob_file| blob_file.is_dead(gc_stats) && !referenced(id))
             .map(|(_, v)| v)
             .collect()
     }

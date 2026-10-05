@@ -73,7 +73,7 @@ struct HandleMeta {
 const META_SEPARATOR_LEN: usize = 4_096;
 
 /// Every section a table can carry, which bounds its table of contents.
-const TABLE_SECTIONS: [&str; 17] = [
+const TABLE_SECTIONS: [&str; 18] = [
     "data",
     "index",
     "tli",
@@ -83,6 +83,7 @@ const TABLE_SECTIONS: [&str; 17] = [
     "seqno_bounds",
     "zone_map",
     "delete_bitmap",
+    "owned_blob_objects",
     "locator",
     "range_tombstones",
     "meta_mid",
@@ -134,19 +135,30 @@ impl LinkedBlobFiles {
     /// Records that the table's entry at `key` points at a value of `bytes`
     /// (`on_disk_bytes` stored) in `blob_file_id`. Keys arrive in order, so
     /// the first key seen for a file is its first and the latest its last.
+    ///
+    /// Only an `owned` reference adds to the counts: the counts are what
+    /// dropping the table charges to the file, and an object is charged
+    /// through its owner alone. A borrowed one still links the file, which is
+    /// what keeps it from being removed or relocated under this table.
     pub(crate) fn register(
         &mut self,
         blob_file_id: BlobFileId,
         bytes: u64,
         on_disk_bytes: u64,
         key: &UserKey,
+        owned: bool,
     ) {
+        let (len, bytes, on_disk_bytes) = if owned {
+            (1, bytes, on_disk_bytes)
+        } else {
+            (0, 0, 0)
+        };
         match self.files.entry(blob_file_id) {
             hashbrown::hash_map::Entry::Occupied(mut entry) => {
                 let link = entry.get_mut();
                 link.bytes += bytes;
                 link.on_disk_bytes += on_disk_bytes;
-                link.len += 1;
+                link.len += len;
                 // The record grows or shrinks by the change in its last key.
                 self.records_len = self.records_len - link.last_key.len() as u64 + key.len() as u64;
                 link.last_key.clone_from(key);
@@ -157,7 +169,7 @@ impl LinkedBlobFiles {
                     blob_file_id,
                     bytes,
                     on_disk_bytes,
-                    len: 1,
+                    len,
                     first_key: key.clone(),
                     last_key: key.clone(),
                 });
@@ -263,6 +275,68 @@ pub(crate) fn parse_linked_blob_files(buf: &[u8]) -> crate::Result<Vec<LinkedFil
     Ok(links)
 }
 
+/// Bytes the payload of an `owned_blob_objects` block holding `count` objects
+/// takes: a four-byte count, then each object's blob file and offset.
+#[must_use]
+pub(crate) fn owned_blob_objects_len(count: usize) -> u64 {
+    4 + count as u64 * 16
+}
+
+/// Encodes `objects`, sorted by blob file and offset with no repeat, as the
+/// payload of an `owned_blob_objects` block.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when there are more objects than the
+/// four-byte count holds.
+pub(crate) fn encode_owned_blob_objects(
+    out: &mut Vec<u8>,
+    objects: &[(BlobFileId, u64)],
+) -> crate::Result<()> {
+    use crate::io::{LE, WriteBytesExt};
+
+    let count = u32::try_from(objects.len()).map_err(|_| {
+        crate::Error::InvalidHeader("owned_blob_objects: more objects than the count holds")
+    })?;
+    out.write_u32::<LE>(count)?;
+    for &(blob_file_id, offset) in objects {
+        out.write_u64::<LE>(blob_file_id)?;
+        out.write_u64::<LE>(offset)?;
+    }
+    Ok(())
+}
+
+/// Parses the payload of an `owned_blob_objects` block: the objects, sorted by
+/// blob file and offset with no repeat, filling the payload exactly.
+///
+/// # Errors
+///
+/// [`crate::Error::InvalidHeader`] when the count disagrees with the payload
+/// length or the objects are not strictly ascending.
+pub(crate) fn parse_owned_blob_objects(buf: &[u8]) -> crate::Result<Vec<(BlobFileId, u64)>> {
+    use crate::io::{LE, ReadBytesExt};
+
+    let mut reader = buf;
+    let count = reader.read_u32::<LE>()? as usize;
+    const MISMATCH: crate::Error = crate::Error::InvalidHeader(
+        "owned_blob_objects: the count disagrees with the payload length",
+    );
+    if count.checked_mul(16).ok_or(MISMATCH)? != reader.len() {
+        return Err(MISMATCH);
+    }
+    let mut objects: Vec<(BlobFileId, u64)> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let object = (reader.read_u64::<LE>()?, reader.read_u64::<LE>()?);
+        if objects.last().is_some_and(|&last| last >= object) {
+            return Err(crate::Error::InvalidHeader(
+                "owned_blob_objects: the objects are not strictly ascending",
+            ));
+        }
+        objects.push(object);
+    }
+    Ok(objects)
+}
+
 /// Heap bytes a vector of handles holds: `logical`, its entries and their
 /// end keys, plus the slots its allocation reserves past its `len` entries.
 fn handles_held(logical: usize, handles: &[KeyedBlockHandle], capacity: usize) -> usize {
@@ -280,13 +354,19 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
-/// One blob file a table references: how many of its values the table points
-/// at, their bytes, and the span of the table's keys that point there.
+/// One blob file a table references: how many of its objects the table owns,
+/// their bytes, and the span of the table's keys that point there.
+///
+/// A table whose rows only borrow objects of the file (cell-row references
+/// whose owner lives in another version) links it with zero counts.
 #[derive(Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
+    /// Bytes of the objects the table owns, before compression.
     pub bytes: u64,
+    /// Bytes of the objects the table owns, as stored.
     pub on_disk_bytes: u64,
+    /// Objects of the file the table owns.
     pub len: usize,
     /// The table's first key whose value lives in this blob file.
     pub first_key: UserKey,
@@ -396,6 +476,10 @@ pub struct Writer {
     previous_weak_tombstone_key: Option<UserKey>,
 
     linked_blob_files: Vec<LinkedFile>,
+
+    /// The blob objects this table's cell rows own, as `(blob file, offset)`,
+    /// for the `owned_blob_objects` section.
+    owned_blob_objects: Vec<(BlobFileId, u64)>,
 
     /// Range tombstones to be written as a separate block
     range_tombstones: Vec<RangeTombstone>,
@@ -869,6 +953,7 @@ impl Writer {
             previous_weak_tombstone_key: None,
 
             linked_blob_files: Vec::new(),
+            owned_blob_objects: Vec::new(),
             range_tombstones: Vec::new(),
             range_tombstone_coverage: None,
 
@@ -1437,6 +1522,16 @@ impl Writer {
         self.linked_blob_files.push(link);
     }
 
+    /// Records the blob objects, as `(blob file, offset)`, that this table's
+    /// cell rows own, for the `owned_blob_objects` section.
+    pub fn own_blob_objects(&mut self, objects: Vec<(BlobFileId, u64)>) {
+        if self.owned_blob_objects.is_empty() {
+            self.owned_blob_objects = objects;
+        } else {
+            self.owned_blob_objects.extend(objects);
+        }
+    }
+
     fn assert_not_started(&self, setting: &str) {
         // A parallel spill clears `chunk` and submits the block to the
         // pipeline immediately, but `data_block_count` only ticks once
@@ -1988,6 +2083,19 @@ impl Writer {
         self
     }
 
+    /// Sets up a columnar table of a tree whose rows may be written as cells
+    /// ([`ValueLayout::Cells`](crate::table::meta::ValueLayout::Cells)): its
+    /// blocks split each cell row into the columns of its fields. Must be set
+    /// before the first key is written; `false` leaves the writer as it is.
+    #[must_use]
+    pub(crate) fn use_cell_rows(self, cell_rows: bool) -> Self {
+        if cell_rows {
+            self.use_value_layout(crate::table::meta::ValueLayout::Cells)
+        } else {
+            self
+        }
+    }
+
     /// Records that a columnar block storing values as `layout` is written:
     /// the first fixes the table's layout, and one of the other layout is
     /// refused, since the descriptor records one per table.
@@ -2197,7 +2305,7 @@ impl Writer {
             self.meta.weak_tombstone_count += 1;
         }
 
-        if value_type == ValueType::Value
+        if value_type.is_put()
             && let Some(prev_key) = &self.previous_weak_tombstone_key
             && crate::comparator::same_user_key(prev_key, user_key)
         {
@@ -2512,9 +2620,15 @@ impl Writer {
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
     ) -> crate::Result<()> {
-        // The transpose keeps each row's value whole, as it was written.
-        self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
-        let batch = crate::table::columnar::entries_to_column_batch(&self.chunk)?;
+        // The transpose keeps each row's value whole, as it was written, or,
+        // in a table set up for cell rows, splits each cell row into its
+        // fields and keeps every other value whole.
+        let batch = if self.value_layout == Some(crate::table::meta::ValueLayout::Cells) {
+            crate::table::columnar::entries_to_cells_batch(&self.chunk)?
+        } else {
+            self.claim_value_layout(crate::table::meta::ValueLayout::Whole)?;
+            crate::table::columnar::entries_to_column_batch(&self.chunk)?
+        };
         self.encode_columnar_batch_block(
             &batch,
             last_key,
@@ -2898,6 +3012,12 @@ impl Writer {
         // Validate the batch shape and obtain per-row keys / seqnos / value-types.
         // The framed values feed the shape accounting; the block stores the
         // consumer's sub-columns (not a re-transpose).
+        // An ingested batch names only field ids: one the engine keeps would
+        // make the group read as rows written as cells.
+        if require_zero_seqno {
+            let value_cols = batch.columns.get(3..).unwrap_or_default();
+            crate::table::columnar::check_ingested_field_ids(value_cols)?;
+        }
         let entries = crate::table::columnar::column_batch_to_entries(batch)?;
 
         // Ingest contract. Unsorted keys would corrupt the sorted block index /
@@ -3248,7 +3368,7 @@ impl Writer {
             if e.key.value_type == ValueType::WeakTombstone {
                 self.meta.weak_tombstone_count += 1;
             }
-            if e.key.value_type == ValueType::Value
+            if e.key.value_type.is_put()
                 && let Some(prev_key) = &self.previous_weak_tombstone_key
                 && crate::comparator::same_user_key(prev_key, user_key)
             {
@@ -3993,6 +4113,44 @@ impl Writer {
                 crate::table::block::BlockIdentity {
                     table_id: self.table_id,
                     block_type: crate::table::block::BlockType::DeleteBitmap,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &{
+                    let t = match self.encryption.as_deref() {
+                        Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+                        None => crate::table::block::BlockTransform::PLAIN,
+                    };
+                    if let Some(ecc) = self.ecc {
+                        t.with_ecc(ecc)
+                    } else {
+                        t
+                    }
+                },
+                at,
+            )?;
+        }
+
+        // Write the optional owned-blob-objects section: the cell-row objects
+        // this table owns, which dropping it releases. Absent when it owns none.
+        if !self.owned_blob_objects.is_empty() {
+            self.owned_blob_objects.sort_unstable();
+            self.owned_blob_objects.dedup();
+            start_section(
+                &mut self.file_writer,
+                &mut self.written_back,
+                &mut self.writeback_bytes,
+                "owned_blob_objects",
+            )?;
+            self.block_buffer.clear();
+            encode_owned_blob_objects(&mut self.block_buffer, &self.owned_blob_objects)?;
+            let at = next_block_at(self.table_id, &self.file_writer);
+            Block::write_into(
+                &mut self.file_writer,
+                &self.block_buffer,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::OwnedBlobObjects,
                     dict_id: 0,
                     window_log: 0,
                 },

@@ -62,289 +62,13 @@ use crate::table::zone_map::ColumnStats;
 use crate::{Error, Result, Slice, ValueType, key::InternalKey, value::InternalValue};
 use alloc::vec::Vec;
 
-/// Physical layout category of a column's values.
-///
-/// Drives codec selection, decode framing and, for a [`TypeTag::Number`], the
-/// order the engine filters and prunes by; it carries no logical (schema)
-/// meaning.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum TypeTag {
-    /// Fixed-width opaque values: every row occupies exactly `N` bytes
-    /// (`N > 0`). The engine defines no order on them, so such a column has no
-    /// statistics, is never pruned on and a predicate over it does not run.
-    Fixed(u8),
-    /// Fixed-width numbers: every row occupies [`Number::width`] bytes, ordered
-    /// as the [`Number`] describes. Statistics, pruning and row filtering run
-    /// on the column's comparable encoding ([`Number::comparable`]).
-    Number(Number),
-    /// Variable-width opaque byte arrays. The column data is a
-    /// `(row_count + 1)`-entry little-endian `u32` offset array followed by the
-    /// concatenated value bytes; row `i` spans `offset[i]..offset[i + 1]`.
-    Bytes,
-}
+pub(crate) use super::column_type::comparable_bytes;
+pub use super::column_type::{ByteOrder, Number, NumberKind, TypeTag};
 
-impl TypeTag {
-    /// The byte width of every row, or `None` for the variable-width
-    /// [`TypeTag::Bytes`].
-    #[must_use]
-    pub const fn fixed_width(self) -> Option<u8> {
-        match self {
-            Self::Fixed(width) => Some(width),
-            Self::Number(number) => Some(number.width),
-            Self::Bytes => None,
-        }
-    }
-
-    /// Wire form: a `(tag, width)` pair. `width` is the fixed byte width, or `0`
-    /// for the variable-width [`TypeTag::Bytes`]. A [`TypeTag::Number`] takes
-    /// tags `2..=7`: kind in steps of two, byte order in the low bit.
-    const fn to_wire(self) -> (u8, u8) {
-        match self {
-            Self::Fixed(width) => (0, width),
-            Self::Bytes => (1, 0),
-            Self::Number(number) => {
-                let kind = match number.kind {
-                    NumberKind::Unsigned => 0,
-                    NumberKind::Signed => 1,
-                    NumberKind::Float => 2,
-                };
-                let order = match number.order {
-                    ByteOrder::Little => 0,
-                    ByteOrder::Big => 1,
-                };
-                (2 + kind * 2 + order, number.width)
-            }
-        }
-    }
-
-    fn from_wire(tag: u8, width: u8) -> Result<Self> {
-        match tag {
-            0 => {
-                if width == 0 {
-                    return Err(Error::InvalidHeader("columnar: fixed column width is zero"));
-                }
-                Ok(Self::Fixed(width))
-            }
-            1 => {
-                if width != 0 {
-                    return Err(Error::InvalidHeader(
-                        "columnar: bytes column width must be zero",
-                    ));
-                }
-                Ok(Self::Bytes)
-            }
-            2..=7 => {
-                let kind = match (tag - 2) / 2 {
-                    0 => NumberKind::Unsigned,
-                    1 => NumberKind::Signed,
-                    _ => NumberKind::Float,
-                };
-                let order = if tag.is_multiple_of(2) {
-                    ByteOrder::Little
-                } else {
-                    ByteOrder::Big
-                };
-                Number::new(kind, width, order).map(Self::Number)
-            }
-            _ => Err(Error::InvalidTag(("ColumnTypeTag", tag))),
-        }
-    }
-}
-
-/// What a fixed-width number is, as far as ordering it goes.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum NumberKind {
-    /// An unsigned integer.
-    Unsigned,
-    /// A two's-complement signed integer.
-    Signed,
-    /// An IEEE 754 binary floating-point number, ordered by the standard's
-    /// `totalOrder` predicate (IEEE 754-2019 5.10): `-NaN < -inf < ... < -0 <
-    /// +0 < ... < +inf < +NaN`, so `-0` sorts below `+0` and every NaN has a
-    /// place by its sign and payload.
-    Float,
-}
-
-/// The order of a fixed-width number's bytes in the column.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum ByteOrder {
-    /// Least significant byte first.
-    Little,
-    /// Most significant byte first.
-    Big,
-}
-
-/// The physical description of a fixed-width number column: its kind, byte
-/// width and byte order. Enough to order the values and nothing more; the
-/// engine still attaches no logical meaning to the column.
-///
-/// Nulls live in the column's validity bitmap: a null row has no value, so it
-/// is excluded from the statistics and matches no predicate.
-///
-/// # Examples
-///
-/// ```
-/// use lsm_tree::table::columnar::{ByteOrder, Number, NumberKind};
-///
-/// let n = Number::new(NumberKind::Signed, 4, ByteOrder::Little).unwrap();
-/// // -1 sorts below 1 in the comparable encoding.
-/// let minus_one = n.comparable(&(-1i32).to_le_bytes()).unwrap();
-/// let one = n.comparable(&1i32.to_le_bytes()).unwrap();
-/// assert!(minus_one < one);
-/// ```
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Number {
-    kind: NumberKind,
-    width: u8,
-    order: ByteOrder,
-}
-
-impl Number {
-    /// The engine's own seqno column: an unsigned little-endian `u64`.
-    pub const U64_LE: Self = Self {
-        kind: NumberKind::Unsigned,
-        width: 8,
-        order: ByteOrder::Little,
-    };
-
-    /// A number of `kind`, `width` bytes wide, stored in `order`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidHeader`] for a width the kind has no encoding
-    /// at: an integer is 1, 2, 4, 8 or 16 bytes, a float 4 or 8.
-    pub fn new(kind: NumberKind, width: u8, order: ByteOrder) -> Result<Self> {
-        let valid = match kind {
-            NumberKind::Unsigned | NumberKind::Signed => matches!(width, 1 | 2 | 4 | 8 | 16),
-            NumberKind::Float => matches!(width, 4 | 8),
-        };
-        if !valid {
-            return Err(Error::InvalidHeader(
-                "columnar: no number of this kind has this width",
-            ));
-        }
-        Ok(Self { kind, width, order })
-    }
-
-    /// The kind of number.
-    #[must_use]
-    pub const fn kind(self) -> NumberKind {
-        self.kind
-    }
-
-    /// The byte width of every value.
-    #[must_use]
-    pub const fn width(self) -> u8 {
-        self.width
-    }
-
-    /// The byte order of every value.
-    #[must_use]
-    pub const fn order(self) -> ByteOrder {
-        self.order
-    }
-
-    /// The comparable encoding of one value stored as `native`: [`Self::width`]
-    /// bytes whose byte-wise order is the numbers' order. Predicate bounds over
-    /// a number column are given in this encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidHeader`] when `native` is not
-    /// [`Self::width`] bytes long.
-    pub fn comparable(self, native: &[u8]) -> Result<Vec<u8>> {
-        if native.len() != usize::from(self.width) {
-            return Err(Error::InvalidHeader(
-                "columnar: a number value is not its column's width",
-            ));
-        }
-        Ok(comparable_bytes(self, self.ordinal(native)).to_vec())
-    }
-
-    /// The largest ordinal a value of this width has: `2^(8 * width) - 1`.
-    pub(crate) const fn max_ordinal(self) -> u128 {
-        // `width` is 1..=16, so the shift is 0..=120.
-        u128::MAX >> (128 - 8 * self.width as u32)
-    }
-
-    /// The comparable encoding of `native` read as an unsigned integer: the
-    /// number's position in its order. `native` is [`Self::width`] bytes; a
-    /// shorter slice reads as if zero-extended, which a caller that checked the
-    /// column's framing never passes.
-    #[inline]
-    pub(crate) fn ordinal(self, native: &[u8]) -> u128 {
-        let mut raw = 0u128;
-        match self.order {
-            ByteOrder::Big => {
-                for &b in native {
-                    raw = (raw << 8) | u128::from(b);
-                }
-            }
-            ByteOrder::Little => {
-                for &b in native.iter().rev() {
-                    raw = (raw << 8) | u128::from(b);
-                }
-            }
-        }
-        let sign = 1u128 << (8 * u32::from(self.width) - 1);
-        match self.kind {
-            NumberKind::Unsigned => raw,
-            // Flipping the sign bit moves the negatives below the positives
-            // and keeps each half in order.
-            NumberKind::Signed => raw ^ sign,
-            // IEEE 754-2019 5.10 totalOrder: a negative's magnitude grows as
-            // its bits do, so all of it is inverted; a positive only moves
-            // above the negatives.
-            NumberKind::Float => {
-                if raw & sign == 0 {
-                    raw | sign
-                } else {
-                    !raw & self.max_ordinal()
-                }
-            }
-        }
-    }
-
-    /// Writes the value whose [`Self::ordinal`] is `ordinal` into `out`, which
-    /// is [`Self::width`] bytes: the inverse of [`Self::ordinal`].
-    ///
-    /// Returns `false`, leaving `out` unspecified, when `ordinal` is past
-    /// [`Self::max_ordinal`] or `out` is not the width: no value has it.
-    #[inline]
-    pub(crate) fn write_ordinal(self, ordinal: u128, out: &mut [u8]) -> bool {
-        if ordinal > self.max_ordinal() || out.len() != usize::from(self.width) {
-            return false;
-        }
-        let sign = 1u128 << (8 * u32::from(self.width) - 1);
-        let raw = match self.kind {
-            NumberKind::Unsigned => ordinal,
-            NumberKind::Signed => ordinal ^ sign,
-            // The inverse of the two totalOrder cases: a positive's ordinal
-            // has the sign bit set, a negative's has it clear.
-            NumberKind::Float => {
-                if ordinal & sign == 0 {
-                    !ordinal & self.max_ordinal()
-                } else {
-                    ordinal ^ sign
-                }
-            }
-        };
-        let bytes = raw.to_le_bytes();
-        let low = bytes.get(..out.len()).unwrap_or_default();
-        match self.order {
-            ByteOrder::Little => out.copy_from_slice(low),
-            ByteOrder::Big => {
-                for (dst, &src) in out.iter_mut().zip(low.iter().rev()) {
-                    *dst = src;
-                }
-            }
-        }
-        true
-    }
-}
-
+mod cells;
 mod expr;
 
+pub(crate) use cells::{cell_refs, entries_to_cells_batch};
 pub(crate) use expr::{Bounds, Cell, Choice, Values};
 pub use expr::{Candidate, Expression, candidates};
 
@@ -1944,31 +1668,6 @@ fn validity_bit(bitmap: &[u8], row: u32) -> bool {
         .is_some_and(|b| (b >> (row % 8)) & 1 == 1)
 }
 
-/// A number's comparable encoding held inline: at most 16 bytes, so building
-/// one for a statistic or a bound never allocates.
-pub(crate) struct Comparable {
-    bytes: [u8; 16],
-    width: usize,
-}
-
-impl core::ops::Deref for Comparable {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        // `width` is a `Number`'s, at most 16.
-        self.bytes.get(16 - self.width..).unwrap_or_default()
-    }
-}
-
-/// `ordinal` as `number`'s comparable encoding: its low [`Number::width`]
-/// bytes, most significant first.
-pub(crate) fn comparable_bytes(number: Number, ordinal: u128) -> Comparable {
-    Comparable {
-        bytes: ordinal.to_be_bytes(),
-        width: usize::from(number.width),
-    }
-}
-
 /// Reads row `i` of a `Fixed(8)` column body as a little-endian `u64`.
 pub(crate) fn fixed_u64_row(data: &[u8], i: u32) -> Result<u64> {
     let base = i as usize * 8;
@@ -2078,7 +1777,30 @@ fn column_cell(col: &Column, row_count: u32, row: u32) -> Result<&[u8]> {
 /// validity bitmap, the row is framed with [`frame_value_cells_nullable`] (a
 /// presence bitmap plus the present cells), which the consumer reverses with
 /// [`unframe_value_cells_nullable`] / [`unframe_value_cells_with_defaults`].
-fn reconstruct_row_value(value_cols: &[Column], row_count: u32, row: u32) -> Result<Slice> {
+///
+/// A group that holds rows written as cells gives back each row's whole value
+/// or the cell row its fields encode to (see [`cells`]).
+fn reconstruct_row_value(
+    value_cols: &[Column],
+    row_count: u32,
+    row: u32,
+    value_type: ValueType,
+) -> Result<Slice> {
+    // The whole-value column's id is the engine's in every table this format
+    // reads: an ingested batch may not use it, and nothing else writes caller
+    // sub-columns. A table of the previous format that used it as a caller id
+    // is renumbered by the converter, never read here.
+    if cells::holds_cells(value_cols.iter().map(|c| &c.column_id)) {
+        let mut row_cells = Vec::with_capacity(value_cols.len());
+        for col in value_cols {
+            row_cells.push((
+                col.column_id,
+                col.type_tag,
+                column_value_cell(col, row_count, row)?,
+            ));
+        }
+        return cells::row_value(value_type, &row_cells);
+    }
     if value_cols.iter().any(|c| c.validity.is_some()) {
         let mut cells = Vec::with_capacity(value_cols.len());
         for col in value_cols {
@@ -2156,6 +1878,13 @@ fn validate_columnar_columns(
         seen_value_column_ids.push(col.column_id);
         col.validate(batch.row_count)?;
     }
+    if cells::holds_cells(seen_value_column_ids.iter()) {
+        let shapes: Vec<(u16, TypeTag)> = value_cols
+            .iter()
+            .map(|c| (c.column_id, c.type_tag))
+            .collect();
+        cells::check_value_columns(&shapes)?;
+    }
     Ok((key_col, seqno_col, vt_col, value_cols))
 }
 
@@ -2178,7 +1907,8 @@ pub fn validate_columnar_ingest_batch(
     batch: &ColumnBatch,
     comparator: &crate::SharedComparator,
 ) -> Result<()> {
-    let (key_col, seqno_col, vt_col, _value_cols) = validate_columnar_columns(batch)?;
+    let (key_col, seqno_col, vt_col, value_cols) = validate_columnar_columns(batch)?;
+    check_ingested_field_ids(value_cols)?;
     // Reject a malformed value-type tag on submit rather than letting it surface
     // only at flush-time decode (`column_batch_to_entries`).
     for &vt_byte in vt_col.data.iter() {
@@ -2211,6 +1941,62 @@ pub fn validate_columnar_ingest_batch(
     Ok(())
 }
 
+/// `entries`, rows decoded from `batch`, laid out again as `batch` lays its
+/// rows out: whole values, or a group of rows written as cells. `None` for a
+/// batch of caller sub-columns, which rows cannot be split back into.
+///
+/// # Errors
+///
+/// As [`entries_to_column_batch`].
+pub(crate) fn transpose_like(
+    batch: &ColumnBatch,
+    entries: &[InternalValue],
+) -> Result<Option<ColumnBatch>> {
+    if cells::holds_cells(batch.columns.iter().map(|c| &c.column_id)) {
+        return entries_to_cells_batch(entries).map(Some);
+    }
+    if !rows_round_trip(batch) {
+        return Ok(None);
+    }
+    entries_to_column_batch(entries).map(Some)
+}
+
+/// Whether the rows of `batch`, once decoded, can be laid out again as the
+/// batch lays them out ([`transpose_like`]): every layout but a batch of
+/// caller sub-columns.
+pub(crate) fn rows_round_trip(batch: &ColumnBatch) -> bool {
+    // A batch of the intrinsic columns and one caller sub-column has as many
+    // columns as a whole-value batch: the value column itself tells them
+    // apart, written whole as a non-null bytes column.
+    cells::holds_cells(batch.columns.iter().map(|c| &c.column_id))
+        || matches!(
+            batch.columns.as_slice(),
+            [_, _, _, value]
+                if value.column_id == COL_VALUE
+                    && value.type_tag == TypeTag::Bytes
+                    && value.validity.is_none()
+        )
+}
+
+/// Refuses a value sub-column of an ingested batch whose id the engine keeps
+/// for itself (from [`RESERVED_COLUMNS`](crate::blob_tree::field_row::RESERVED_COLUMNS)
+/// on): a group holding one would read as a group of rows written as cells.
+///
+/// # Errors
+///
+/// [`Error::InvalidHeader`] naming the fault.
+pub(crate) fn check_ingested_field_ids(value_cols: &[Column]) -> Result<()> {
+    if value_cols
+        .iter()
+        .any(|c| c.column_id >= crate::blob_tree::field_row::RESERVED_COLUMNS)
+    {
+        return Err(Error::InvalidHeader(
+            "columnar: a value sub-column id is one the engine keeps for itself",
+        ));
+    }
+    Ok(())
+}
+
 /// Reconstructs the entries from an intrinsic columnar batch produced by
 /// [`entries_to_column_batch`].
 ///
@@ -2234,7 +2020,7 @@ pub fn column_batch_to_entries(batch: &ColumnBatch) -> Result<Vec<InternalValue>
         }
         let seqno = fixed_u64_row(&seqno_col.data, i)?;
         let value_type = value_type_row(&vt_col.data, i)?;
-        let value = reconstruct_row_value(value_cols, batch.row_count, i)?;
+        let value = reconstruct_row_value(value_cols, batch.row_count, i, value_type)?;
         out.push(InternalValue {
             key: InternalKey {
                 user_key: Slice::from(user_key),
@@ -2308,7 +2094,7 @@ pub fn column_batch_into_entries(
         let value = match &value_source {
             ValueSource::SharedBytes(data) => bytes_row_slice(data, row_count, i)?,
             ValueSource::Reconstruct(cols) => {
-                let value = reconstruct_row_value(cols, row_count, i)?;
+                let value = reconstruct_row_value(cols, row_count, i, value_type)?;
                 *rebuilt += value.len();
                 value
             }
@@ -2506,6 +2292,11 @@ pub(crate) fn page_match_entries(
             "columnar: batch carries no value column",
         ));
     }
+    let holds_cells = cells::holds_cells(values.iter().map(|(id, ..)| id));
+    if holds_cells {
+        let shapes: Vec<(u16, TypeTag)> = values.iter().map(|&(id, tag, ..)| (id, tag)).collect();
+        cells::check_value_columns(&shapes)?;
+    }
     // Copied once and shared by every version the run holds.
     let user_key = Slice::from(needle);
     *copied += user_key.len();
@@ -2535,7 +2326,22 @@ pub(crate) fn page_match_entries(
         };
         let value_type =
             ValueType::try_from(vt_byte).map_err(|()| Error::InvalidTag(("ValueType", vt_byte)))?;
-        let value = if let (false, [(_, type_tag, _, access)]) = (nullable, values.as_slice()) {
+        let value = if holds_cells {
+            let mut row_cells = Vec::with_capacity(values.len());
+            for (id, type_tag, validity, access) in &values {
+                let cell = if validity.is_none_or(|v| validity_bit(v, row)) {
+                    Some(access.get(*type_tag, rows, row)?)
+                } else {
+                    None
+                };
+                row_cells.push((*id, *type_tag, cell));
+            }
+            let borrowed: Vec<(u16, TypeTag, Option<&[u8]>)> = row_cells
+                .iter()
+                .map(|(id, tag, cell)| (*id, *tag, cell.as_deref()))
+                .collect();
+            cells::row_value(value_type, &borrowed)?
+        } else if let (false, [(_, type_tag, _, access)]) = (nullable, values.as_slice()) {
             // One value column without nulls, the common shape: its cell is
             // the value, with no framing to build.
             Slice::from(&*access.get(*type_tag, rows, row)?)

@@ -7,6 +7,7 @@ pub(crate) mod block_index;
 pub(crate) mod block_layout;
 #[cfg(feature = "columnar")]
 pub(crate) mod column_page;
+pub mod column_type;
 #[cfg(feature = "columnar")]
 pub mod columnar;
 #[cfg(feature = "columnar")]
@@ -806,6 +807,51 @@ impl Table {
                 .file_accessor
                 .peek_or_open_table(&self.global_id(), &self.path)?)
         })
+    }
+
+    /// The blob objects this table's cell rows own, as `(blob file, offset)`
+    /// sorted ascending: read from the `owned_blob_objects` section, not kept.
+    /// Empty for a table that owns none. What dropping the whole table
+    /// releases, learned without reading its data.
+    ///
+    /// # Errors
+    ///
+    /// When the section cannot be read, fails its checks, or does not parse.
+    pub(crate) fn owned_blob_objects(&self) -> crate::Result<Vec<(crate::vlog::BlobFileId, u64)>> {
+        let Some(handle) = self.regions.owned_blob_objects else {
+            return Ok(Vec::new());
+        };
+        // Taken without promoting or caching the descriptor: a drop reads this
+        // once, for a table that is going.
+        let fd = self
+            .file_accessor
+            .peek_or_open_table(&self.global_id(), &self.path)?;
+        let transform = match self.encryption.as_deref() {
+            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+            None => crate::table::block::BlockTransform::PLAIN,
+        };
+        let transform = match self.metadata.ecc_params {
+            Some(ecc) => transform.with_ecc(ecc),
+            None => transform,
+        };
+        let block = Block::from_file(
+            fd.as_ref(),
+            handle,
+            crate::table::block::BlockIdentity {
+                table_id: self.metadata.id,
+                block_type: BlockType::OwnedBlobObjects,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        if block.header.block_type != BlockType::OwnedBlobObjects {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                block.header.block_type.into(),
+            )));
+        }
+        crate::table::writer::parse_owned_blob_objects(&block.data)
     }
 
     /// Reads and parses the `linked_blob_files` section through the descriptor
@@ -3921,19 +3967,37 @@ impl Table {
         // and the latest the last.
         let mut derived: BTreeMap<crate::vlog::BlobFileId, (usize, u64, u64, UserKey, UserKey)> =
             BTreeMap::new();
+        // The objects the cell rows own, as the `owned_blob_objects` section
+        // lists them.
+        let mut derived_owned: Vec<(crate::vlog::BlobFileId, u64)> = Vec::new();
         {
+            // An owned reference adds to its file's counts, a borrowed one
+            // (a cell-row reference whose owner is another version) only
+            // links the file, as the writer registers them.
+            let mut add =
+                |ind: &crate::blob_tree::handle::BlobIndirection, owned: bool, key: &UserKey| {
+                    let slot = derived
+                        .entry(ind.vhandle.blob_file_id)
+                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
+                    if owned {
+                        slot.0 += 1;
+                        slot.1 += u64::from(ind.size);
+                        slot.2 += u64::from(ind.vhandle.on_disk_size);
+                    }
+                    slot.4.clone_from(key);
+                };
             let mut accumulate = |kv: InternalValue| -> crate::Result<()> {
                 if kv.key.value_type == crate::ValueType::Indirection {
                     let mut cursor = &kv.value[..];
                     let ind = crate::blob_tree::handle::BlobIndirection::decode_from(&mut cursor)?;
-                    let key = &kv.key.user_key;
-                    let slot = derived
-                        .entry(ind.vhandle.blob_file_id)
-                        .or_insert_with(|| (0, 0, 0, key.clone(), key.clone()));
-                    slot.0 += 1;
-                    slot.1 += u64::from(ind.size);
-                    slot.2 += u64::from(ind.vhandle.on_disk_size);
-                    slot.4.clone_from(key);
+                    add(&ind, true, &kv.key.user_key);
+                } else if kv.key.value_type == crate::ValueType::CellRow {
+                    for (ind, owned) in crate::blob_tree::field_row::row_refs(&kv.value)? {
+                        add(&ind, owned, &kv.key.user_key);
+                        if owned {
+                            derived_owned.push((ind.vhandle.blob_file_id, ind.vhandle.offset));
+                        }
+                    }
                 }
                 Ok(())
             };
@@ -3954,6 +4018,10 @@ impl Table {
                 }
             }
         }
+        // The owned objects a drop of this table releases: a list that leaves
+        // one out would let a reference to it be written back after the drop,
+        // a row holding what the accounting already charged.
+        self.verify_owned_blob_objects(derived_owned, restricted)?;
         let Some(recorded) = self.untraced_blob_file_references()? else {
             // No section is valid ONLY for a table with no indirections; a
             // non-empty derived map with no recorded section is a dropped /
@@ -4032,6 +4100,45 @@ impl Table {
         if derived != recorded_map {
             return Err(crate::Error::InvalidHeader(
                 "linked_blob_files disagrees with the table's indirection entries",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cross-checks the `owned_blob_objects` section against `derived`, the
+    /// objects the scanned cell rows own: equal for a whole table, containing
+    /// them for a `restricted` view, whose punched prefix cannot be scanned.
+    /// The writer omits the section when the table owns nothing, so a present
+    /// but empty one is a forgery.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::InvalidHeader`] when the section disagrees, and any
+    /// error reading it.
+    #[cfg(feature = "std")]
+    fn verify_owned_blob_objects(
+        &self,
+        mut derived: Vec<(crate::vlog::BlobFileId, u64)>,
+        restricted: bool,
+    ) -> crate::Result<()> {
+        let recorded = self.owned_blob_objects()?;
+        if self.regions.owned_blob_objects.is_some() && recorded.is_empty() {
+            return Err(crate::Error::InvalidHeader(
+                "owned_blob_objects section is present but lists no object",
+            ));
+        }
+        derived.sort_unstable();
+        derived.dedup();
+        let agrees = if restricted {
+            derived
+                .iter()
+                .all(|object| recorded.binary_search(object).is_ok())
+        } else {
+            derived == recorded
+        };
+        if !agrees {
+            return Err(crate::Error::InvalidHeader(
+                "owned_blob_objects disagrees with the objects the table's cell rows own",
             ));
         }
         Ok(())

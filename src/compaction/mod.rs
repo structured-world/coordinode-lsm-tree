@@ -16,6 +16,7 @@ pub(crate) mod heal;
 pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod output_ledger;
+pub(crate) mod ownership;
 pub(crate) mod pulldown;
 pub(crate) mod seqno_zeroer;
 pub(crate) mod state;

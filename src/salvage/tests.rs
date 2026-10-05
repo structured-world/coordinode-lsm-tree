@@ -1597,6 +1597,7 @@ fn salvage_propagates_an_environmental_failure_from_the_mirror_probe() -> crate:
             sync_mode: crate::fs::SyncMode::Normal,
             prefix_extractor: None,
             blob_rewrite: None,
+            owner_promotions: None,
             progress: None,
         };
         match super::meta_mirrors_diverge(&source, &fs, &options) {
@@ -2932,6 +2933,71 @@ fn salvage_preserves_the_source_linked_blob_files() -> crate::Result<()> {
     assert_eq!(
         recovered_links, source_links,
         "the salvaged copy references the same blob files as the source",
+    );
+    Ok(())
+}
+
+/// `verify_blob_links` must reject a table whose cell rows own blob objects
+/// but whose `owned_blob_objects` section is gone: a drop of the table would
+/// then release nothing, and a reference to an object it owned could be
+/// written back after it. The honest table passes.
+#[test]
+fn verify_blob_links_rejects_a_missing_owned_objects_section() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let dir = tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .open()?
+    else {
+        unreachable!("kv separation configured");
+    };
+    let body = vec![b'b'; 4_096];
+    for i in 0u32..4 {
+        tree.insert_cells(
+            format!("key{i:05}"),
+            &[
+                Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+                Field::bytes(FIRST_FIELD_COLUMN + 1, &body),
+            ],
+            u64::from(i) + 1,
+        )?;
+    }
+    tree.flush_active_memtable(10)?;
+    let source = {
+        let binding = tree.index.version_history.read().latest_version();
+        let Some(table) = binding.version.iter_tables().next() else {
+            panic!("flush produced one table");
+        };
+        assert_eq!(table.owned_blob_objects()?.len(), 4, "one owned body a row");
+        (*table.path).clone()
+    };
+    drop(tree);
+
+    open(source.clone(), &fs)?.verify_blob_links()?;
+
+    crate::test_forge::forge_section_omitted(&source, b"owned_blob_objects")?;
+    let table = open(source, &fs)?;
+    let Err(err) = table.verify_blob_links() else {
+        panic!("a table whose owned objects vanished must be rejected");
+    };
+    assert!(
+        matches!(
+            err,
+            crate::Error::InvalidHeader(
+                "owned_blob_objects disagrees with the objects the table's cell rows own"
+            )
+        ),
+        "the rejection names the owned-objects reason, got {err:?}",
     );
     Ok(())
 }
@@ -7613,6 +7679,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7698,6 +7765,7 @@ fn a_salvaged_copy_under_a_new_id_reads_every_value() -> crate::Result<()> {
                 sync_mode: crate::fs::SyncMode::Normal,
                 prefix_extractor: None,
                 blob_rewrite: None,
+                owner_promotions: None,
                 progress: None,
             };
             let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7786,6 +7854,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -7936,6 +8005,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
@@ -7959,6 +8029,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         sync_mode: crate::fs::SyncMode::Normal,
         prefix_extractor: None,
         blob_rewrite: None,
+        owner_promotions: None,
         progress: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
@@ -9870,7 +9941,11 @@ fn blob_handle_rewrite_installs_the_relocated_size() -> crate::Result<()> {
     );
 
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     assert_eq!(dropped, 0, "the record survived, nothing drops");
     assert!(carry.is_none(), "nothing was beheaded, nothing to suppress");
     let entry = out.first().expect("one rewritten entry");
@@ -9936,7 +10011,11 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"z".to_vec(), b"v".to_vec(), 1, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
         keys,
@@ -9961,12 +10040,182 @@ fn blob_handle_rewrite_drops_older_versions_when_the_head_record_is_lost() -> cr
         InternalValue::from_components(b"k".to_vec(), b"old".to_vec(), 5, ValueType::Value),
     ];
     let mut dropped = 0u64;
-    let (out, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
     assert!(out.is_empty(), "the whole block was one beheaded key");
     assert_eq!(
         carry.as_deref(),
         Some(b"k".as_slice()),
         "nothing proved the run ended, so the key keeps suppressing",
+    );
+    Ok(())
+}
+
+/// A cell row's references take a blob-file rewrite the way an indirection
+/// does: a reference into a remapped file names the re-emitted record, one
+/// into an untouched file and a value cell stay as written, and a row whose
+/// referenced record is gone loses its key's head, taking the older versions
+/// behind it.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn blob_handle_rewrite_remaps_and_beheads_cell_rows() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let reference = |blob_file_id: u64, offset: u64, owner: bool| RowCell::Ref {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id,
+                offset,
+                on_disk_size: 64,
+            },
+            size: 100,
+        },
+        owner,
+    };
+    let row = |cells: Vec<RowCell<'_>>| -> crate::Result<Vec<u8>> {
+        let fields: Vec<RowField<'_>> = cells
+            .into_iter()
+            .zip(3u16..)
+            .map(|(cell, column)| RowField::bytes(column, cell))
+            .collect();
+        encode_row(&fields)
+    };
+    let cell_row = |key: &[u8], seqno, value: Vec<u8>| {
+        InternalValue::from_components(key.to_vec(), value, seqno, ValueType::CellRow)
+    };
+
+    let mut offsets = crate::HashMap::default();
+    offsets.insert(
+        400u64,
+        super::BlobRecordRelocation {
+            offset: 16,
+            on_disk_size: 61,
+        },
+    );
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    rewrite.insert(8u64, super::BlobFileRewrite::DropBelow(500));
+
+    let entries = vec![
+        // Remapped, beside an untouched file and a value cell.
+        cell_row(
+            b"a",
+            3,
+            row(vec![
+                reference(7, 400, true),
+                reference(5, 10, false),
+                RowCell::Value(b"inline"),
+            ])?,
+        ),
+        // Untouched entirely.
+        cell_row(b"b", 3, row(vec![reference(5, 20, true)])?),
+        // Its record is gone from the remapped file: the key's head is lost,
+        // and its older version goes with it.
+        cell_row(b"c", 4, row(vec![reference(7, 999, true)])?),
+        InternalValue::from_components(b"c".to_vec(), b"old".to_vec(), 2, ValueType::Value),
+        // Below the punched frontier: lost the same way.
+        cell_row(b"d", 3, row(vec![reference(8, 100, false)])?),
+        // At or past the frontier: kept.
+        cell_row(b"e", 3, row(vec![reference(8, 600, false)])?),
+    ];
+    let untouched = entries.get(1).expect("row b").value.clone();
+    let mut dropped = 0u64;
+    let (out, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
+    let keys: Vec<_> = out.iter().map(|e| e.key.user_key.to_vec()).collect();
+    assert_eq!(keys, [b"a".to_vec(), b"b".to_vec(), b"e".to_vec()]);
+    assert_eq!(dropped, 3, "the two lost heads and the version behind one");
+    assert!(carry.is_none(), "the last entry is a kept key");
+
+    let a = decode_row(&out.first().expect("row a").value)?;
+    let field = |i: usize| a.get(i).expect("a field of row a");
+    let RowCell::Ref { indirection, owner } = field(0).cell else {
+        panic!("the first field stays a reference");
+    };
+    assert_eq!(
+        (
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+            indirection.vhandle.on_disk_size,
+            owner
+        ),
+        (9, 16, 61, true),
+        "remapped to the re-emitted record, ownership kept"
+    );
+    assert!(
+        matches!(field(1).cell, RowCell::Ref { indirection, .. } if indirection.vhandle.blob_file_id == 5)
+    );
+    assert!(matches!(field(2).cell, RowCell::Value(b"inline")));
+    let b = out.get(1).expect("row b");
+    assert_eq!(b.value, untouched, "an untouched row is copied as is");
+    assert_eq!(b.key.value_type, ValueType::CellRow);
+    Ok(())
+}
+
+/// A recovered block's references include a cell row's, each with its owner
+/// bit: an owned reference adds its object to the file's link and to the
+/// copy's owned objects, a borrowed one only links the file.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn recovered_cell_row_references_link_their_files_by_ownership() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let reference = |blob_file_id: u64, owner: bool| RowCell::Ref {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id,
+                offset: 0,
+                on_disk_size: 64,
+            },
+            size: 100,
+        },
+        owner,
+    };
+    let value = encode_row(&[
+        RowField::bytes(3, reference(7, true)),
+        RowField::bytes(4, reference(8, false)),
+    ])?;
+    let entries = vec![InternalValue::from_components(
+        b"k".to_vec(),
+        value,
+        1,
+        ValueType::CellRow,
+    )];
+    let refs = super::collect_indirections(&entries)?;
+    assert_eq!(
+        refs.iter()
+            .map(|(_, ind, holding)| (ind.vhandle.blob_file_id, holding.owns()))
+            .collect::<Vec<_>>(),
+        [(7, true), (8, false)]
+    );
+
+    let mut derived = crate::HashMap::default();
+    let mut owned_cells = Vec::new();
+    super::fold_blob_links(&mut derived, &mut owned_cells, &refs);
+    assert_eq!(
+        owned_cells,
+        [(7, 0)],
+        "only the owned cell object is listed"
+    );
+    let owned = derived.get(&7).expect("the owned file is linked");
+    assert_eq!((owned.len, owned.bytes, owned.on_disk_bytes), (1, 100, 64));
+    let borrowed = derived.get(&8).expect("the borrowed file is linked");
+    assert_eq!(
+        (borrowed.len, borrowed.bytes, borrowed.on_disk_bytes),
+        (0, 0, 0),
+        "a borrowed reference charges nothing to its file"
     );
     Ok(())
 }
@@ -10347,7 +10596,11 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
     rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
 
     let mut dropped = 0u64;
-    let (kept, carry) = super::rewrite_block_indirections(entries, &rewrite, &mut dropped)?;
+    let (kept, carry) = super::rewrite_block_indirections(
+        entries,
+        super::RowRewrites::of_blobs(&rewrite),
+        &mut dropped,
+    )?;
 
     let keys: Vec<_> = kept.iter().map(|e| e.key.user_key.to_vec()).collect();
     assert_eq!(
@@ -10363,6 +10616,204 @@ fn the_blob_rewrite_suppresses_only_the_beheaded_key() -> crate::Result<()> {
         carry.is_none(),
         "a surviving different key ended the run inside this block",
     );
+    Ok(())
+}
+
+/// A columnar table of a blob tree's cell rows takes a blob-file rewrite as
+/// it lays its rows out: a reference into the remapped file names the
+/// re-emitted record in the copy, which keeps the cells layout, and a row whose
+/// record is gone is dropped.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+        encode_row(&[
+            RowField::bytes(3, RowCell::Value(b"status")),
+            RowField::bytes(
+                4,
+                RowCell::Ref {
+                    indirection: BlobIndirection {
+                        vhandle: ValueHandle {
+                            blob_file_id: 7,
+                            offset,
+                            on_disk_size: 64,
+                        },
+                        size: 100,
+                    },
+                    owner: true,
+                },
+            ),
+        ])
+    };
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_cell_rows(true)
+        .use_row_group_size(1);
+    for (key, offset) in [(b"a", 400u64), (b"b", 999), (b"c", 500)] {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            row(offset)?,
+            1,
+            ValueType::CellRow,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let mut offsets = crate::HashMap::default();
+    for (from, to) in [(400u64, 16u64), (500, 80)] {
+        offsets.insert(
+            from,
+            super::BlobRecordRelocation {
+                offset: to,
+                on_disk_size: 61,
+            },
+        );
+    }
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    let options = SalvageOptions {
+        encryption: None,
+        #[cfg(zstd_any)]
+        zstd_dictionary: None,
+        #[cfg(zstd_any)]
+        zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
+        table_id: 0,
+        expected_stored_id: None,
+        output_id: None,
+        allow_delete_resurrection: false,
+        sync_mode: crate::fs::SyncMode::Normal,
+        prefix_extractor: None,
+        blob_rewrite: Some(Arc::new(rewrite)),
+        owner_promotions: None,
+        progress: None,
+    };
+    salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+
+    let recovered = open(dest, &fs)?;
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+        let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
+            return Ok(None);
+        };
+        assert_eq!(entry.key.value_type, ValueType::CellRow);
+        let fields = decode_row(&entry.value)?;
+        let RowCell::Ref { indirection, .. } = fields.get(1).expect("the body field").cell else {
+            panic!("the body stays a reference");
+        };
+        Ok(Some((
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+        )))
+    };
+    assert_eq!(field_ref(b"a")?, Some((9, 16)));
+    assert_eq!(field_ref(b"b")?, None, "its record is gone, so is the row");
+    assert_eq!(field_ref(b"c")?, Some((9, 80)));
+    Ok(())
+}
+
+/// The same rewrite over a cells table whose delete bitmap masks a row: the
+/// masked row stays gone, the live ones are remapped, and a row whose record
+/// is gone is dropped, all through the masked columnar arm.
+#[cfg(feature = "columnar")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn salvage_remaps_the_references_of_a_delete_masked_columnar_cells_table() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, decode_row, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::config::DeleteStrategy;
+    use crate::table::Writer;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, ValueType};
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+
+    let row = |offset: u64| -> crate::Result<Vec<u8>> {
+        encode_row(&[
+            RowField::bytes(3, RowCell::Value(b"status")),
+            RowField::bytes(
+                4,
+                RowCell::Ref {
+                    indirection: BlobIndirection {
+                        vhandle: ValueHandle {
+                            blob_file_id: 7,
+                            offset,
+                            on_disk_size: 64,
+                        },
+                        size: 100,
+                    },
+                    owner: true,
+                },
+            ),
+        ])
+    };
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_cell_rows(true)
+        .use_zone_map(true)
+        .use_row_group_size(4_096)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    for (key, offset) in [(b"a", 400u64), (b"b", 450), (b"c", 500), (b"d", 999)] {
+        writer.write(InternalValue::from_components(
+            key.as_slice(),
+            row(offset)?,
+            1,
+            ValueType::CellRow,
+        ))?;
+    }
+    // Row position 1 is "b".
+    writer.delete_bitmap_mut().insert(1);
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let mut offsets = crate::HashMap::default();
+    for (from, to) in [(400u64, 16u64), (450, 48), (500, 80)] {
+        offsets.insert(
+            from,
+            super::BlobRecordRelocation {
+                offset: to,
+                on_disk_size: 61,
+            },
+        );
+    }
+    let mut rewrite = crate::HashMap::default();
+    rewrite.insert(7u64, super::BlobFileRewrite::Remap { new_id: 9, offsets });
+    let options = SalvageOptions {
+        blob_rewrite: Some(Arc::new(rewrite)),
+        ..SalvageOptions::default()
+    };
+    salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
+
+    let recovered = open(dest, &fs)?;
+    let field_ref = |key: &[u8]| -> crate::Result<Option<(u64, u64)>> {
+        let Some(entry) = recovered.get(key, crate::SeqNo::MAX, crate::hash::hash64(key))? else {
+            return Ok(None);
+        };
+        assert_eq!(entry.key.value_type, ValueType::CellRow);
+        let fields = decode_row(&entry.value)?;
+        let RowCell::Ref { indirection, .. } = fields.get(1).expect("the body field").cell else {
+            panic!("the body stays a reference");
+        };
+        Ok(Some((
+            indirection.vhandle.blob_file_id,
+            indirection.vhandle.offset,
+        )))
+    };
+    assert_eq!(field_ref(b"a")?, Some((9, 16)));
+    assert_eq!(field_ref(b"b")?, None, "the masked row stays deleted");
+    assert_eq!(field_ref(b"c")?, Some((9, 80)));
+    assert_eq!(field_ref(b"d")?, None, "its record is gone, so is the row");
     Ok(())
 }
 

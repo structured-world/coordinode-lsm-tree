@@ -1577,6 +1577,81 @@ fn repair_excludes_tables_referencing_an_unrecoverable_blob_file() -> lsm_tree::
     Ok(())
 }
 
+/// The same for rows written as cells: a table whose rows reference a field's
+/// object in an unrecoverable blob file is excluded and named, never
+/// published with a dangling reference, as a table of indirections is.
+#[test]
+fn repair_excludes_tables_of_cell_rows_referencing_an_unrecoverable_blob_file()
+-> lsm_tree::Result<()> {
+    use lsm_tree::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let dir = lsm_tree::get_tmp_folder();
+    {
+        let lsm_tree::AnyTree::Blob(tree) = Config::new(
+            &dir,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_kv_separation(Some(KvSeparationOptions::default()))
+        .open()?
+        else {
+            panic!("a tree with kv separation opens as a blob tree");
+        };
+        let body = vec![b'b'; 4_096];
+        for i in 0..20 {
+            tree.insert_cells(
+                key(i),
+                &[
+                    Field::bytes(FIRST_FIELD_COLUMN, b"status"),
+                    Field::bytes(FIRST_FIELD_COLUMN + 1, &body),
+                ],
+                i,
+            )?;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let blobs = dir.path().join("blobs");
+    for entry in std::fs::read_dir(&blobs)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::write(entry.path(), b"not a blob file at all")?;
+        }
+    }
+    nuke_manifest(dir.path())?;
+
+    let report = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .repair()?;
+    assert_eq!(
+        report.recovered, 0,
+        "a table of cell rows whose blob file is unrecoverable must not be published: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .iter()
+            .any(|(_, reason)| reason.contains("blob file")),
+        "the report must name the missing blob dependency: {:?}",
+        report.unreadable_files,
+    );
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open()?;
+    for i in 0..20 {
+        assert!(tree.get(key(i), MAX_SEQNO)?.is_none());
+    }
+    Ok(())
+}
+
 /// `salvaged` is documented as a subset of `recovered`, so a block-salvaged
 /// table that the blob-dependency filter later drops (its referenced
 /// blob file is unrecoverable) must not be counted: reporting it as salvaged

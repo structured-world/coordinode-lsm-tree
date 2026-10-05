@@ -330,6 +330,12 @@ impl<'a> Accessor<'a> {
         // then fails is counted, and whether or not every record it covers is
         // then parsed.
         self.count_request(span_len);
+        #[cfg(feature = "metrics")]
+        if let Some(metrics) = self.metrics {
+            metrics
+                .blob_bytes_prefetched
+                .fetch_add(span_len as u64, core::sync::atomic::Ordering::Relaxed);
+        }
         let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
             return;
         };
