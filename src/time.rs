@@ -168,46 +168,50 @@ fn set_unix_timestamp_for_test(value: Option<std::time::Duration>) {
     *cell.lock().expect("lock is poisoned") = value;
 }
 
-/// Exclusive use of the test clock override for the lifetime of the guard.
-///
-/// The override is process-wide, so a test that sets it takes this guard
-/// first: other clock tests wait until it is dropped, and the drop clears the
-/// override even when the test returns early or panics.
+/// Handle to the test clock override, lent by [`with_test_clock`].
 #[cfg(test)]
 pub struct TestClock {
-    _owner: MutexGuard<'static, ()>,
+    _lent: (),
 }
 
 #[cfg(test)]
 impl TestClock {
-    /// Takes the clock with no override set: [`unix_timestamp`] reads the
-    /// real clock until [`Self::set`].
-    pub fn take() -> Self {
-        // A test that panicked while holding the clock poisons the lock; the
-        // override it left is cleared below, so the lock is still usable.
-        let owner = CLOCK_OWNER.lock().unwrap_or_else(PoisonError::into_inner);
-        set_unix_timestamp_for_test(None);
-        Self { _owner: owner }
-    }
-
-    /// Takes the clock and pins it at `secs` since the epoch.
-    pub fn at_secs(secs: u64) -> Self {
-        let clock = Self::take();
-        clock.set_secs(secs);
-        clock
-    }
-
     /// Pins [`unix_timestamp`] at `secs` since the epoch.
+    #[expect(
+        clippy::unused_self,
+        reason = "the receiver proves the caller holds the clock"
+    )]
     pub fn set_secs(&self, secs: u64) {
         set_unix_timestamp_for_test(Some(Duration::from_secs(secs)));
     }
 }
 
+/// The clock lock, held for one [`with_test_clock`] call; dropping it clears
+/// the override.
 #[cfg(test)]
-impl Drop for TestClock {
+struct HeldClock(MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for HeldClock {
     fn drop(&mut self) {
         set_unix_timestamp_for_test(None);
     }
+}
+
+/// Runs `f` with exclusive use of the test clock override.
+///
+/// The override is process-wide, so every test that sets it runs inside this
+/// call: other clock tests wait until it returns, and the override starts and
+/// ends unset, even when `f` returns early or panics.
+#[cfg(test)]
+pub fn with_test_clock<R>(f: impl FnOnce(&TestClock) -> R) -> R {
+    // A test that panicked while holding the clock poisons the lock; the
+    // override it left is cleared below, so the lock is still usable.
+    let held = HeldClock(CLOCK_OWNER.lock().unwrap_or_else(PoisonError::into_inner));
+    set_unix_timestamp_for_test(None);
+    let result = f(&TestClock { _lent: () });
+    drop(held);
+    result
 }
 
 #[cfg(test)]
