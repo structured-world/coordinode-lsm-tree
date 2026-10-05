@@ -199,10 +199,9 @@ impl<'v> BlobCredit<'v> {
         if version.blob_files.len() > 0 {
             for table in version.iter_tables() {
                 let files: Vec<BlobFileId> = table
-                    .list_blob_file_references()
+                    .blob_links()
                     .ok()?
-                    .unwrap_or_default()
-                    .into_iter()
+                    .iter()
                     .map(|file| file.blob_file_id)
                     .collect();
                 for &file in &files {
