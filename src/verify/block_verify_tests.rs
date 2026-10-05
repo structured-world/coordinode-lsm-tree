@@ -1404,6 +1404,49 @@ fn a_paced_file_reports_an_error_that_followed_a_partial_read() -> crate::Result
     Ok(())
 }
 
+/// An error held back after a partial read belongs to where it happened: a
+/// seek away from there drops it, so the next read, of other bytes, is not
+/// failed by it. Bytes it may concern are read again from wherever the scan
+/// goes back to them, and a fault that persists fails that read.
+#[test]
+fn a_seek_drops_an_error_held_back_from_a_partial_read() -> crate::Result<()> {
+    let bytes: Vec<u8> = (0..16 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let limiter = crate::rate_limiter::RateLimiter::new(1 << 30);
+    let (file, _) = scripted_file(&bytes, 512, Some(2))?;
+    let mut paced = PacedFile::new(Box::new(file), Some(&limiter))?;
+
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(std::io::Read::read(&mut paced, &mut buf)?, 512);
+    std::io::Seek::seek(&mut paced, SeekFrom::Start(8192))?;
+    let read = std::io::Read::read(&mut paced, &mut buf)?;
+    assert!(read > 0, "the read after the seek returns bytes");
+    assert_eq!(
+        buf.get(..read),
+        bytes.get(8192..8192 + read),
+        "the bytes at the seek"
+    );
+    Ok(())
+}
+
+/// A limiter at rate zero reads at full speed, like no limiter: a large read
+/// reaches the file whole, not in portions.
+#[test]
+fn a_zero_rate_limiter_does_not_split_reads() -> crate::Result<()> {
+    let bytes: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let limiter = crate::rate_limiter::RateLimiter::new(0);
+    let (file, largest) = scripted_file(&bytes, usize::MAX, None)?;
+    let mut paced = PacedFile::new(Box::new(file), Some(&limiter))?;
+    let mut read = vec![0u8; bytes.len()];
+    std::io::Read::read_exact(&mut paced, &mut read)?;
+    assert_eq!(read, bytes, "the file reads back whole");
+    assert_eq!(
+        largest.load(std::sync::atomic::Ordering::Relaxed),
+        bytes.len(),
+        "an unrated read is not split"
+    );
+    Ok(())
+}
+
 /// A block handle is charged only when it lies inside the file: a corrupt
 /// one declaring more than the file holds charges nothing.
 #[test]

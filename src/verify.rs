@@ -2386,10 +2386,15 @@ impl io::Read for PacedFile<'_> {
     }
 }
 
+// A seek drops an error held back from a partial read: it belongs to the bytes
+// after those already handed out, which a scan that seeks away reads again
+// from wherever it comes back to them, so a fault that persists fails that
+// read. Kept, it would fail a read of other bytes, under another section.
 #[cfg(feature = "std")]
 impl std::io::Seek for PacedFile<'_> {
     fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
         self.pos = self.inner.seek(to)?;
+        self.pending = None;
         Ok(self.pos)
     }
 }
@@ -2398,6 +2403,7 @@ impl std::io::Seek for PacedFile<'_> {
 impl io::Seek for PacedFile<'_> {
     fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
         self.pos = self.inner.seek(to)?;
+        self.pending = None;
         Ok(self.pos)
     }
 }
@@ -2410,9 +2416,10 @@ impl PacedFile<'_> {
         if let Some(e) = self.pending.take() {
             return Err(e);
         }
+        // A rate of zero reads at full speed, as no limiter does.
         let want = match self.limiter {
-            Some(_) => buf.len().min(PACE_PORTION),
-            None => buf.len(),
+            Some(limiter) if limiter.rate() > 0 => buf.len().min(PACE_PORTION),
+            _ => buf.len(),
         };
         let (head, _) = buf.split_at_mut(want);
         let charged = self.pace(head.len());
