@@ -192,8 +192,8 @@ pub struct MultiWriter {
     lineage: Option<Vec<TableId>>,
 
     /// The compaction inputs every output takes its age from (see
-    /// [`Writer::use_inherited_age`]); `None` for a flush or an ingest.
-    inherited_age: Option<Arc<super::writer::InheritedAges>>,
+    /// [`Writer::finish_deferring_dir_sync`]); `None` for a flush or an ingest.
+    inherited_age: Option<super::writer::AgeSweep>,
 
     /// Counter of compaction-filter TRANSFORMATIONS (any non-`Keep` verdict),
     /// shared with the filter adapter. An output whose window saw one is not
@@ -963,10 +963,10 @@ impl MultiWriter {
 
     /// Lets this and every rotated successor writer take its age from the
     /// compaction `inputs` its key range meets (see
-    /// [`Writer::use_inherited_age`]).
+    /// [`Writer::finish_deferring_dir_sync`]), swept as this chain's outputs
+    /// advance.
     #[must_use]
-    pub(crate) fn use_inherited_age(mut self, inputs: Arc<super::writer::InheritedAges>) -> Self {
-        self.writer = self.writer.use_inherited_age(Some(Arc::clone(&inputs)));
+    pub(crate) fn use_inherited_age(mut self, inputs: super::writer::AgeSweep) -> Self {
         self.inherited_age = Some(inputs);
         self
     }
@@ -1092,7 +1092,6 @@ impl MultiWriter {
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
         new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
         new_writer = new_writer.use_lineage(self.lineage.clone());
-        new_writer = new_writer.use_inherited_age(self.inherited_age.clone());
         // The adjacency link: this successor follows the writer being closed,
         // which is what lets manifest repair union UNBROKEN sibling chains.
         new_writer = new_writer.use_lineage_prev(Some(self.current_writer_id));
@@ -1148,7 +1147,9 @@ impl MultiWriter {
         old_writer.own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         // The install that names the tables syncs their folder once.
-        if let Some((table_id, checksum)) = old_writer.finish_deferring_dir_sync()? {
+        if let Some((table_id, checksum)) =
+            old_writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
+        {
             self.results.push((table_id, checksum));
         }
 
@@ -1587,7 +1588,10 @@ impl MultiWriter {
         self.writer
             .own_blob_objects(core::mem::take(&mut self.owned_objects));
 
-        if let Some((table_id, checksum)) = self.writer.finish_deferring_dir_sync()? {
+        if let Some((table_id, checksum)) = self
+            .writer
+            .finish_deferring_dir_sync(self.inherited_age.as_mut())?
+        {
             self.results.push((table_id, checksum));
         }
 

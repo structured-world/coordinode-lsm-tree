@@ -174,11 +174,11 @@ fn linked_blob_files_reject_a_count_the_section_cannot_hold() {
     ));
 }
 
-/// The indexed lookup of an output's inherited age must give what checking
+/// The swept age of each output in an ascending chain must be what checking
 /// every input gives, for disjoint inputs, overlapping ones (an L0 table
-/// spanning many others), and ranges before, between and after them.
+/// spanning many others), and outputs before, between and after them.
 #[test]
-fn inherited_ages_match_every_input_checked() {
+fn swept_ages_match_every_input_checked() {
     let key = |n: u32| UserKey::from(n.to_be_bytes().as_slice());
     let mut inputs: Vec<InputAge> = (0..40u32)
         .map(|i| InputAge {
@@ -209,15 +209,18 @@ fn inherited_ages_match_every_input_checked() {
             .map(|input| input.created_at)
             .max()
     };
-    let indexed = InheritedAges::new(inputs.clone(), comparator.clone());
-    for first in (0..420u32).step_by(3) {
-        for width in [0u32, 1, 4, 9, 30, 200] {
-            let (first, last) = (key(first), key(first + width));
+    // One chain per output width, each output starting after the last ended.
+    for width in [0u32, 1, 4, 9, 30, 200] {
+        let mut sweep = AgeSweep::new(inputs.clone(), comparator.clone());
+        let mut first = 0u32;
+        while first < 420 {
+            let (lo, hi) = (key(first), key(first + width));
             assert_eq!(
-                indexed.age_of(&first, &last),
-                naive(&first, &last),
-                "range {first:?}..={last:?}"
+                sweep.age_of(&lo, &hi),
+                naive(&lo, &hi),
+                "output {lo:?}..={hi:?} of width {width}"
             );
+            first += width + 1;
         }
     }
 }
