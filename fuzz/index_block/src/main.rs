@@ -180,6 +180,25 @@ fn main() {
                 all_parts(&items[lo..=hi]),
                 all_parts(&iter.map(materialize).collect::<Vec<_>>()),
             );
+
+            // The bounds the other way round: the walk holds only the entries
+            // both bounds cover, nothing when the upper one ends first.
+            let from = items
+                .iter()
+                .position(|it| *it.end_key() == hi_key)
+                .expect("hi key present");
+            let to = items
+                .iter()
+                .position(|it| *it.end_key() > lo_key)
+                .unwrap_or(items.len() - 1);
+            let mut iter = index_block.iter(comparator.clone());
+            assert!(iter.seek(&hi_key, SeqNo::MAX), "should seek");
+            iter.seek_upper(&lo_key, SeqNo::MAX);
+
+            assert_eq!(
+                all_parts(items.get(from..=to).unwrap_or_default()),
+                all_parts(&iter.map(materialize).collect::<Vec<_>>()),
+            );
         }
     });
 }
