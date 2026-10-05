@@ -1501,11 +1501,14 @@ fn a_restricted_index_lookup_is_charged_what_it_reads() -> crate::Result<()> {
     let keys: Vec<String> = (0..2_000).map(|i| format!("k{i:05}")).collect();
     for shape in ["pinned", "volatile", "partitioned"] {
         let dir = tempfile::tempdir()?;
+        // A cache too small to keep any block: a block the cache serves is
+        // not read, so not charged, and every walk here reads what it walks.
         let config = crate::Config::new(
             dir.path(),
             crate::SequenceNumberCounter::default(),
             crate::SequenceNumberCounter::default(),
-        );
+        )
+        .use_cache(std::sync::Arc::new(crate::Cache::with_capacity_bytes(1)));
         // The writer keeps a small table's index in one block until it outgrows
         // the spill threshold, so the partitioned shape spills at once, with
         // small blocks and partitions to give it several.
