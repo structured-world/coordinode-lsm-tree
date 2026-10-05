@@ -4,8 +4,8 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::{
-    HashSet, KvPair, compaction::state::CompactionState, config::Config, table::Table,
-    time::unix_timestamp, version::Version,
+    HashMap, HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config,
+    table::Table, time::unix_timestamp, version::Version, vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -94,15 +94,23 @@ impl CompactionStrategy for Strategy {
 
         // Compute TTL cutoff once and perform a single pass to mark expired tables and
         // accumulate their sizes. Also collect non-expired tables for possible size-based drops.
+        let now = unix_timestamp();
         let ttl_cutoff = match self.ttl_seconds {
-            Some(s) if s > 0 => Some(
+            // A clock at zero is no clock (a `no_std` build before one is
+            // registered): TTL is off then, as tables written meanwhile carry
+            // time zero too and would all look expired.
+            Some(s) if s > 0 && !now.is_zero() => Some(
                 // Clamp-to-zero: a TTL longer than the wall clock leaves no
                 // expiry cutoff rather than wrapping.
-                unix_timestamp()
-                    .as_nanos()
+                now.as_nanos()
                     .saturating_sub(u128::from(s) * 1_000_000_000u128),
             ),
             _ => None,
+        };
+        // A table whose blob references cannot be read leaves the bytes it
+        // frees unknown: wait for a round that can read them.
+        let Some(mut blob_credit) = BlobCredit::new(version) else {
+            return Choice::DoNothing;
         };
 
         let mut ttl_dropped_bytes = 0u64;
@@ -117,10 +125,9 @@ impl CompactionStrategy for Strategy {
 
             if expired {
                 ids_to_drop.insert(table.id());
-                let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
                 // Accumulated dropped-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                ttl_dropped_bytes += table.file_size() + linked_blob_file_bytes;
+                ttl_dropped_bytes += table.file_size() + blob_credit.drop_table(table.id());
             } else {
                 alive.push((table, held));
             }
@@ -154,10 +161,9 @@ impl CompactionStrategy for Strategy {
 
                 ids_to_drop.insert(table.id());
 
-                let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
                 // Accumulated collected-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                collected_bytes += table.file_size() + linked_blob_file_bytes;
+                collected_bytes += table.file_size() + blob_credit.drop_table(table.id());
             }
         }
 
@@ -166,6 +172,73 @@ impl CompactionStrategy for Strategy {
         } else {
             Choice::Drop(ids_to_drop)
         }
+    }
+}
+
+/// What dropping tables frees in blob files. A blob file goes only with the
+/// last table that references it, so several tables sharing one, as the
+/// outputs of a compaction do, free its bytes together and none of them
+/// alone.
+struct BlobCredit<'v> {
+    version: &'v Version,
+    /// The blob files each table references.
+    files_of: HashMap<TableId, Vec<BlobFileId>>,
+    /// How many tables, dropped or not yet, still reference each blob file.
+    refs: HashMap<BlobFileId, usize>,
+}
+
+impl<'v> BlobCredit<'v> {
+    /// The references of every table in `version`, or `None` when one cannot
+    /// be read. A version without blob files reads none.
+    fn new(version: &'v Version) -> Option<Self> {
+        let mut files_of = HashMap::default();
+        let mut refs: HashMap<BlobFileId, usize> = HashMap::default();
+        if version.blob_files.len() > 0 {
+            for table in version.iter_tables() {
+                let files: Vec<BlobFileId> = table
+                    .list_blob_file_references()
+                    .ok()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|file| file.blob_file_id)
+                    .collect();
+                for &file in &files {
+                    *refs.entry(file).or_insert(0) += 1;
+                }
+                files_of.insert(table.id(), files);
+            }
+        }
+        Some(Self {
+            version,
+            files_of,
+            refs,
+        })
+    }
+
+    /// The blob bytes freed by dropping `table` after the tables dropped
+    /// before it: those of every blob file it was the last to reference.
+    fn drop_table(&mut self, table: TableId) -> u64 {
+        let Some(files) = self.files_of.remove(&table) else {
+            return 0;
+        };
+        let mut freed = 0;
+        for file in files {
+            let Some(count) = self.refs.get_mut(&file) else {
+                continue;
+            };
+            // Counted from the same lists, once per referencing table, and a
+            // table's list leaves `files_of` on its first drop.
+            debug_assert!(*count > 0, "blob file {file} released twice");
+            *count -= 1;
+            if *count == 0 {
+                freed += self
+                    .version
+                    .blob_files
+                    .get(file)
+                    .map_or(0, |blob_file| blob_file.meta().total_compressed_bytes);
+            }
+        }
+        freed
     }
 }
 
