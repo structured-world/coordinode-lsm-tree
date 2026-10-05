@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791210111646,
+  "lastUpdate": 1791213263385,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -29326,6 +29326,90 @@ window.BENCHMARK_DATA = {
             "value": 625413.5547130541,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 6.7us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "79e88cbe84ca23fffe0dff2d129494cbd9bf7f21",
+          "message": "fix(version): a failed manifest rotation no longer blocks the next install (5.x.x) (#841)\n\n## Summary\n\n- A manifest rotation that fails after it created `v{N}` no longer\nblocks every later install. The leftover file made the retry, which\nderives the same id, fail with `AlreadyExists` until the process\nrestarted.\n\nBackport of the fix for #825 to the 5.x line; the change to `main`\nfollows in its own pull request.\n\n## Changes\n\n- Before writing `v{N}`, a `v{N}` that `CURRENT` does not name is\nremoved: it is the leftover of an attempt that failed, or crashed,\nbefore the repoint, and recovery reads nothing from it. A `v{N}` that\n`CURRENT` already names is refused, never rewritten.\n- `rewrite_atomic` logs a temporary file it cannot remove instead of\ndiscarding the error.\n- Tests: an install retried after the `CURRENT` rename failed once\nsucceeds; the named/unnamed rule on its own.\n\nNo format or public API change.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux, on top of the current\n`5.x.x`. The regression test fails on `5.x.x` without the fix.\n\nRefs #825",
+          "timestamp": "2026-10-05T18:04:23+03:00",
+          "tree_id": "1e84d432938de7792435cacab13ca41591c8719a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/79e88cbe84ca23fffe0dff2d129494cbd9bf7f21"
+        },
+        "date": 1791213260849,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 250543.59966049946,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 13.0us | P99.9: 31.4us\nthreads: 1 | elapsed: 2.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3104944.002334918,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1141715.427429713,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 717623.6896191428,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.4us | P99.9: 73.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2502734.237154091,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.9us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 328973.9893425586,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.2us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 198016.5474508043,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 5.6us | P99.9: 12.0us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1103170.7333217133,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 466067.9247393515,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.8us | P99.9: 3.4us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 625172.1176986538,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 6.6us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
           }
         ]
       }
