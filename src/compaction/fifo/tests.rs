@@ -379,7 +379,8 @@ fn fifo_choose_drops_no_newer_table_while_the_oldest_is_held() -> crate::Result<
 /// A major compaction under a watermark above every live sequence number
 /// zeroes them at the last level, so they no longer order the outputs. Each
 /// output keeps the age of the flushes its keys came from, so with keys
-/// inserted in decreasing order the newest key still survives the limit.
+/// inserted in decreasing order the newest flush's keys survive a limit that
+/// holds them, and the oldest flush's go first.
 #[test]
 fn fifo_after_a_seqno_zeroing_major_compaction_drops_oldest_data_first() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -422,11 +423,19 @@ fn fifo_after_a_seqno_zeroing_major_compaction_drops_oldest_data_first() -> crat
             version.iter_tables().all(|t| t.get_highest_seqno() == 0),
             "the compaction zeroed every sequence number"
         );
+        // The outputs that carry the newest flush's keys. Their order among
+        // themselves is key order, as nothing else is left to tell their
+        // data apart, so the limit keeps all of them.
+        let newest_age = version
+            .iter_tables()
+            .map(|t| t.metadata.created_at)
+            .max()
+            .unwrap_or_default();
         let newest = version
             .iter_tables()
-            .max_by_key(|t| t.metadata.created_at)
+            .filter(|t| t.metadata.created_at == newest_age)
             .map(crate::table::Table::file_size)
-            .unwrap_or_default();
+            .sum::<u64>();
         drop(version);
 
         tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
