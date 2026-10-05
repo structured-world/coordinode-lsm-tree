@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791201823600,
+  "lastUpdate": 1791210111646,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -31764,6 +31764,92 @@ window.BENCHMARK_DATA = {
             "value": 9701.733,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      }
+    ],
+    "lsm-tree db_bench 5.x · Linux · runner1-sw": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2171fd4aebf672fce84c0f52c6ac5f54cface52f",
+          "message": "fix(index_block): an upper bound keeps the block a key's older versions run into (5.x.x) (#840)\n\n## Summary\n\n- A snapshot range ending at a key whose versions run on past the block\nending at it now reads the version that sits in the next block. With an\nindex restart interval above one, the bound stopped at the last index\nentry ending at the key and dropped that next block, so such a range\nread nothing, forward and in reverse, through pinned, volatile and\npartitioned indexes.\n- The public `table::index_block::Iter::seek_upper` keeps the entry a\npreceding `seek` landed on, and walks the same entries whatever the\nrestart interval.\n\nBackport of the fix for #838 to the 5.x line; the change to `main`\nfollows in its own pull request.\n\n## Changes\n\n- `seek_upper`, `seek_upper_bound_cursor` and the table's index walk\nshare one bound: every entry ending at or before the needle plus the\nfirst past it. The restart-interval trim always keeps the first entry\npast the needle, and the walk moves on while an interval ends at or\nbefore it.\n- The public `seek_upper` no longer clears the front cache.\n- `.coderabbit.yaml`: automatic review covers pull requests into the\nmaintained `<major>.x.x` lines, as on `main`.\n- Tests: snapshot ranges (forward and reverse) ending at a key whose\nversions span blocks, over every index shape with restart intervals 1\nand 4; entries sharing one end key; exact matches keep the next entry;\n`seek` then `seek_upper` on one entry. The tests that pinned the old\nbound now state the new one.\n\nNo format or public API change.\n\n## Testing\n\nTests with default and all features, clippy in both configurations, doc\ntests, the doc build, the no-std check and the sst-dump suite pass on\nLinux, on top of the current `5.x.x`. The regression tests fail on\n`5.x.x` without the fix.\n\nRefs #838\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Fixed inclusive upper-bound range reads so they include older versions\nof the boundary key, even when those versions span index blocks.\n* Improved consistency of range results across forward and reverse\nsnapshot reads, including ranges that cross index entries and ranges\ncontained within a single entry.\n* Corrected upper-bound iteration so entries after an exact match remain\navailable, preventing matching records from being skipped.\n* Fixed upper-bound searches below the first matching key so they return\nno entries in either iteration direction.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-05T17:11:54+03:00",
+          "tree_id": "80444fbea7b7565541d6f76458c28c77656c1880",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2171fd4aebf672fce84c0f52c6ac5f54cface52f"
+        },
+        "date": 1791210110447,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 119791.41984403208,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.6us | P99.9: 28.9us\nthreads: 1 | elapsed: 4.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2591328.5233438793,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 695263.3391242744,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.7us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 443099.0264378845,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.1us | P99.9: 30.7us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2355207.8839547625,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 254856.33135671943,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.4us | P99.9: 21.0us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 143988.5668585471,
+            "unit": "ops/sec",
+            "extra": "P50: 6.2us | P99: 13.9us | P99.9: 35.7us\nthreads: 1 | elapsed: 1.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 681984.1721157827,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.9us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 732649.3880344507,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 310094.47265331657,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 18.5us | P99.9: 89.5us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
