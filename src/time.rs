@@ -151,16 +151,63 @@ mod nostd_clock {
 }
 
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 #[cfg(test)]
 static NOW_OVERRIDE: OnceLock<Mutex<Option<std::time::Duration>>> = OnceLock::new();
 
+/// Held for a whole test that overrides the clock, so two such tests in one
+/// process never see each other's override.
+#[cfg(test)]
+static CLOCK_OWNER: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-pub fn set_unix_timestamp_for_test(value: Option<std::time::Duration>) {
+fn set_unix_timestamp_for_test(value: Option<std::time::Duration>) {
     let cell = NOW_OVERRIDE.get_or_init(|| Mutex::new(None));
     *cell.lock().expect("lock is poisoned") = value;
+}
+
+/// Exclusive use of the test clock override for the lifetime of the guard.
+///
+/// The override is process-wide, so a test that sets it takes this guard
+/// first: other clock tests wait until it is dropped, and the drop clears the
+/// override even when the test returns early or panics.
+#[cfg(test)]
+pub struct TestClock {
+    _owner: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestClock {
+    /// Takes the clock with no override set: [`unix_timestamp`] reads the
+    /// real clock until [`Self::set`].
+    pub fn take() -> Self {
+        // A test that panicked while holding the clock poisons the lock; the
+        // override it left is cleared below, so the lock is still usable.
+        let owner = CLOCK_OWNER.lock().unwrap_or_else(PoisonError::into_inner);
+        set_unix_timestamp_for_test(None);
+        Self { _owner: owner }
+    }
+
+    /// Takes the clock and pins it at `secs` since the epoch.
+    pub fn at_secs(secs: u64) -> Self {
+        let clock = Self::take();
+        clock.set_secs(secs);
+        clock
+    }
+
+    /// Pins [`unix_timestamp`] at `secs` since the epoch.
+    pub fn set_secs(&self, secs: u64) {
+        set_unix_timestamp_for_test(Some(Duration::from_secs(secs)));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestClock {
+    fn drop(&mut self) {
+        set_unix_timestamp_for_test(None);
+    }
 }
 
 #[cfg(test)]

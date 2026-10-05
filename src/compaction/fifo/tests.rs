@@ -1,5 +1,5 @@
 use super::Strategy;
-use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter, time::TestClock};
 use std::sync::Arc;
 
 #[test]
@@ -101,17 +101,17 @@ fn fifo_ttl() -> crate::Result<()> {
     .open()?;
 
     // Freeze time and create first (older) table at t=1000s
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_000)));
+    let clock = TestClock::at_secs(1_000);
     tree.insert("a", "1", 0);
     tree.flush_active_memtable(0)?;
 
     // Advance time and create second (newer) table at t=1005s
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_005)));
+    clock.set_secs(1_005);
     tree.insert("b", "2", 1);
     tree.flush_active_memtable(1)?;
 
     // Now set current time to t=1011s; with TTL=10s, cutoff=1001s => drop first only
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_011)));
+    clock.set_secs(1_011);
 
     assert_eq!(2, tree.table_count());
 
@@ -119,9 +119,6 @@ fn fifo_ttl() -> crate::Result<()> {
     tree.compact(fifo, 2)?;
 
     assert_eq!(1, tree.table_count());
-
-    // Reset override
-    crate::time::set_unix_timestamp_for_test(None);
     Ok(())
 }
 
@@ -139,14 +136,11 @@ fn fifo_overlapping_l0_compacts_without_panic_and_drops_oldest_first() -> crate:
     )
     .open()?;
 
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_000)));
     tree.insert("a", "old", 0);
     tree.insert("c", "old", 1);
     tree.flush_active_memtable(1)?;
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_001)));
     tree.insert("b", "new", 2);
     tree.flush_active_memtable(2)?;
-    crate::time::set_unix_timestamp_for_test(None);
 
     // Nothing to drop: the tree is left as it is.
     tree.compact(Arc::new(Strategy::new(u64::MAX, None)), 3)?;
@@ -156,7 +150,7 @@ fn fifo_overlapping_l0_compacts_without_panic_and_drops_oldest_first() -> crate:
     let newest_size = tree
         .current_version()
         .iter_tables()
-        .max_by_key(|t| t.metadata.created_at)
+        .max_by_key(|t| t.get_highest_seqno())
         .map(crate::table::Table::file_size)
         .unwrap_or_default();
     tree.compact(Arc::new(Strategy::new(newest_size, None)), 3)?;
@@ -206,18 +200,80 @@ fn fifo_ttl_applies_after_major_compaction() -> crate::Result<()> {
     )
     .open()?;
 
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_000)));
+    let clock = TestClock::at_secs(1_000);
     for i in 0..3u8 {
         tree.insert([b'k', i].as_slice(), "v", u64::from(i));
         tree.flush_active_memtable(u64::from(i))?;
     }
     tree.major_compact(u64::MAX, 0)?;
 
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(1_011)));
+    clock.set_secs(1_011);
     tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 3)?;
-    crate::time::set_unix_timestamp_for_test(None);
 
     assert_eq!(0, tree.table_count(), "expired tables below L0 must drop");
+    Ok(())
+}
+
+/// A major compaction rewrites the data in key order and stamps each output
+/// with the time it was written. With keys inserted in decreasing order the
+/// newest data has the lowest keys and lands in the first output written, so
+/// the creation time would rank it oldest. The size limit must still drop
+/// the oldest data first.
+#[test]
+fn fifo_after_major_compaction_drops_oldest_data_first_for_decreasing_keys() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    // Incompressible values so the compaction splits into several outputs.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut value = || {
+        (0..256)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state.to_be_bytes()[0]
+            })
+            .collect::<Vec<u8>>()
+    };
+
+    // Seqno 0 carries key 399, the last seqno carries key 0.
+    let keys = 400u32;
+    for key in (0..keys).rev() {
+        let seqno = u64::from(keys - 1 - key);
+        tree.insert(key.to_be_bytes().as_slice(), value(), seqno);
+        if key % 100 == 0 {
+            tree.flush_active_memtable(seqno)?;
+        }
+    }
+    let watermark = u64::from(keys);
+    tree.major_compact(16 * 1024, 0)?;
+    assert!(
+        tree.table_count() > 1,
+        "the compaction must produce several outputs"
+    );
+
+    let newest = tree
+        .current_version()
+        .iter_tables()
+        .max_by_key(|t| t.get_highest_seqno())
+        .map(crate::table::Table::file_size)
+        .unwrap_or_default();
+    tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
+
+    assert!(
+        tree.get(0u32.to_be_bytes(), watermark)?.is_some(),
+        "the newest key must survive"
+    );
+    assert!(
+        tree.get((keys - 1).to_be_bytes(), watermark)?.is_none(),
+        "the oldest key goes first"
+    );
     Ok(())
 }
 
@@ -240,22 +296,26 @@ fn fifo_choose_skips_hidden_tables_instead_of_panicking() -> crate::Result<()> {
         tree.flush_active_memtable(u64::from(i))?;
     }
     let version = tree.current_version();
-    let ids: Vec<_> = version.iter_tables().map(crate::table::Table::id).collect();
-    let Some(&hidden) = ids.first() else {
+    let Some(newest) = version
+        .iter_tables()
+        .max_by_key(|t| t.get_highest_seqno())
+        .map(crate::table::Table::id)
+    else {
         panic!("three tables were flushed");
     };
+    let ids: Vec<_> = version.iter_tables().map(crate::table::Table::id).collect();
 
     let mut state = CompactionState::default();
-    state.hidden_set_mut().hide([hidden]);
+    state.hidden_set_mut().hide([newest]);
     let choice = Strategy::new(1, None).choose(&version, &Config::default(), &state);
     let Choice::Drop(dropped) = choice else {
-        panic!("expected a drop of the tables not held");
+        panic!("expected a drop of the older tables not held");
     };
     assert!(
-        !dropped.contains(&hidden),
+        !dropped.contains(&newest),
         "a held table must not be dropped"
     );
-    assert!(!dropped.is_empty());
+    assert_eq!(2, dropped.len(), "both older tables go");
 
     let mut all_held = CompactionState::default();
     all_held.hidden_set_mut().hide(ids.iter().copied());
@@ -263,6 +323,50 @@ fn fifo_choose_skips_hidden_tables_instead_of_panicking() -> crate::Result<()> {
         Strategy::new(1, None).choose(&version, &Config::default(), &all_held),
         Choice::DoNothing
     ));
+    Ok(())
+}
+
+/// The oldest table is held by another compaction and its bytes alone push
+/// the tree over the limit. Dropping the newer tables in its place would lose
+/// recent data while the older stays, so FIFO must wait for a later round.
+#[test]
+fn fifo_choose_drops_no_newer_table_while_the_oldest_is_held() -> crate::Result<()> {
+    use super::super::{Choice, CompactionStrategy, state::CompactionState};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    for i in 0..3u8 {
+        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+        tree.flush_active_memtable(u64::from(i))?;
+    }
+    let version = tree.current_version();
+    let Some((oldest, oldest_size)) = version
+        .iter_tables()
+        .min_by_key(|t| t.get_highest_seqno())
+        .map(|t| (t.id(), t.file_size()))
+    else {
+        panic!("three tables were flushed");
+    };
+    let total = version
+        .iter_tables()
+        .map(crate::table::Table::file_size)
+        .sum::<u64>();
+
+    let mut state = CompactionState::default();
+    state.hidden_set_mut().hide([oldest]);
+    // Over the limit by exactly the held table's bytes.
+    let choice =
+        Strategy::new(total - oldest_size, None).choose(&version, &Config::default(), &state);
+    assert!(
+        matches!(choice, Choice::DoNothing),
+        "no newer table may go while the oldest is held"
+    );
     Ok(())
 }
 
@@ -283,14 +387,12 @@ fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     tree.insert("b", "$", 1);
     tree.flush_active_memtable(1)?;
 
-    crate::time::set_unix_timestamp_for_test(Some(std::time::Duration::from_secs(10_000_000)));
+    let _clock = TestClock::at_secs(10_000_000);
 
     // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
     let fifo = Arc::new(Strategy::new(1, Some(1)));
     tree.compact(fifo, 2)?;
 
     assert_eq!(0, tree.table_count());
-
-    crate::time::set_unix_timestamp_for_test(None);
     Ok(())
 }

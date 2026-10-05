@@ -16,11 +16,13 @@ pub const NAME: &str = "FifoCompaction";
 /// FIFO-style compaction
 ///
 /// Limits the tree size to roughly `limit` bytes, deleting the oldest table(s)
-/// when the threshold is reached. Tables are dropped whole, oldest first by
-/// creation time, from whichever level they are in, so a tree that was
-/// major-compacted keeps its limit, and overlapping tables are fine: the
-/// older one goes first. Tables another compaction is working on are left
-/// for a later round.
+/// when the threshold is reached. Tables are dropped whole, oldest data first,
+/// from whichever level they are in, so a tree that was major-compacted keeps
+/// its limit, and overlapping tables are fine: the older one goes first. Age
+/// is the table's highest sequence number, which a compaction carries over,
+/// unlike the creation time it stamps on its outputs. A table another
+/// compaction is working on is left for a later round, and no newer table is
+/// dropped ahead of it.
 ///
 /// Additionally, a (lazy) TTL can be configured to drop old tables.
 ///
@@ -104,14 +106,14 @@ impl CompactionStrategy for Strategy {
         };
 
         let mut ttl_dropped_bytes = 0u64;
+        // Every table not expired, held ones included: they keep their place in
+        // the age order below.
         let mut alive = Vec::new();
 
         for table in version.iter_tables() {
-            if hidden.is_hidden(table.id()) {
-                continue;
-            }
-            let expired =
-                ttl_cutoff.is_some_and(|cutoff| u128::from(table.metadata.created_at) <= cutoff);
+            let held = hidden.is_hidden(table.id());
+            let expired = !held
+                && ttl_cutoff.is_some_and(|cutoff| u128::from(table.metadata.created_at) <= cutoff);
 
             if expired {
                 ids_to_drop.insert(table.id());
@@ -120,7 +122,7 @@ impl CompactionStrategy for Strategy {
                 // cannot overflow u64.
                 ttl_dropped_bytes += table.file_size() + linked_blob_file_bytes;
             } else {
-                alive.push(table);
+                alive.push((table, held));
             }
         }
 
@@ -133,11 +135,20 @@ impl CompactionStrategy for Strategy {
 
             let mut collected_bytes = 0u64;
 
-            // Oldest-first list by creation time from the non-expired set.
-            alive.sort_by_key(|t| t.metadata.created_at);
+            // Oldest data first. FIFO admits only inserts, so the highest
+            // sequence number orders tables by insertion and survives
+            // compaction; `created_at` is when the table was written, which a
+            // compaction resets in its own key order.
+            alive.sort_by_key(|(t, _)| (t.get_highest_seqno(), t.id()));
 
-            for table in alive {
+            for (table, held) in alive {
                 if collected_bytes >= overshoot {
+                    break;
+                }
+                // A held table still counts against the limit, and dropping
+                // newer tables in its place would lose recent data while the
+                // older one stays: wait for the round after its compaction.
+                if held {
                     break;
                 }
 
