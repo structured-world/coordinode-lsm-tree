@@ -136,13 +136,15 @@ pub fn run(
         up
     };
 
-    // samples[arm][round], nanoseconds per operation.
+    // samples[arm][round], nanoseconds per operation. A group's key count is a
+    // few hundred thousand at most, exact in f64 through u32.
+    let ops = f64::from(u32::try_from(n).expect("a group's key count fits u32"));
     let mut samples = vec![Vec::with_capacity(rounds); arms.len()];
     for round in 0..rounds {
         for i in 0..arms.len() {
             let a = (round + i) % arms.len();
             let elapsed = (arms[a].routine)(u64::from(iters[a]));
-            samples[a].push(elapsed.as_nanos() as f64 / (f64::from(iters[a]) * n as f64));
+            samples[a].push(elapsed.as_secs_f64() * 1e9 / (f64::from(iters[a]) * ops));
         }
     }
 
@@ -201,7 +203,10 @@ pub fn estimate(mut values: Vec<f64>) -> Estimate {
     // Largest rank l (1-based) with P(X <= l - 1) <= 2.5%, X ~ Binomial(m, 1/2):
     // the interval [x_(l), x_(m + 1 - l)] then covers the median with at least
     // 95% probability.
-    let mut pmf = 0.5_f64.powi(i32::try_from(m).unwrap_or(i32::MAX));
+    // The values are a group's rounds, a few dozen: they fit i32 and u32, and
+    // are exact in f64.
+    let count = |x: usize| f64::from(u32::try_from(x).expect("a round count fits u32"));
+    let mut pmf = 0.5_f64.powi(i32::try_from(m).expect("a round count fits i32"));
     let mut cdf = 0.0;
     let mut l = 1;
     for k in 0..m {
@@ -211,7 +216,7 @@ pub fn estimate(mut values: Vec<f64>) -> Estimate {
             break;
         }
         l = k + 1;
-        pmf *= (m - k) as f64 / (k + 1) as f64;
+        pmf *= count(m - k) / count(k + 1);
     }
     let l = l.min(m.div_ceil(2));
     Estimate {

@@ -184,6 +184,28 @@ fn append_github_json(
     std::fs::write(path, json).map_err(|e| e.to_string())
 }
 
+/// Refuses two GitHub JSON flags naming one file: each suite is written to its
+/// own file, and a shared one would let the later write replace the earlier
+/// suite while the run reports success. Paths are compared made absolute, so
+/// `./x.json` and `x.json` clash; symlinks are not followed.
+fn distinct_github_outputs(outputs: &[(&str, Option<&std::path::Path>)]) -> Result<(), String> {
+    let mut seen: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for &(flag, path) in outputs {
+        let Some(path) = path else {
+            continue;
+        };
+        let absolute = std::path::absolute(path).map_err(|e| format!("{flag}: {e}"))?;
+        if let Some((other, _)) = seen.iter().find(|(_, p)| *p == absolute) {
+            return Err(format!(
+                "{other} and {flag} both name {}; each suite needs its own file",
+                path.display()
+            ));
+        }
+        seen.push((flag, absolute));
+    }
+    Ok(())
+}
+
 /// Writes one smaller-is-better suite's `entries` to `path`. Without a path,
 /// a suite that has entries is reported as not written, naming the `flag`
 /// that would write it, and an empty one is skipped silently.
@@ -261,6 +283,16 @@ fn main() {
 
     if iterations == 0 {
         eprintln!("Error: --iterations must be > 0");
+        std::process::exit(1);
+    }
+
+    // Before measuring anything, not at the end of a run that took minutes.
+    if let Err(e) = distinct_github_outputs(&[
+        ("--github-json-append", cli.github_json_append.as_deref()),
+        ("--github-json-costs", cli.github_json_costs.as_deref()),
+        ("--github-json-timings", cli.github_json_timings.as_deref()),
+    ]) {
+        eprintln!("Error: {e}");
         std::process::exit(1);
     }
 

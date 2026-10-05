@@ -1,7 +1,39 @@
-use super::append_github_json;
+use super::{append_github_json, distinct_github_outputs};
 use serde_json::json;
+use std::path::Path;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn github_outputs_sharing_a_file_are_refused() {
+    // Each suite is written to its own file. Two flags naming one file would
+    // let the later write replace the earlier suite and still report success,
+    // so the run refuses them before it measures anything; `./` spelling the
+    // same path does not hide the clash.
+    let rates = Path::new("results.json");
+    let costs = Path::new("costs.json");
+    let timings = Path::new("./costs.json");
+    let err = distinct_github_outputs(&[
+        ("--github-json-append", Some(rates)),
+        ("--github-json-costs", Some(costs)),
+        ("--github-json-timings", Some(timings)),
+    ])
+    .expect_err("costs and timings name one file");
+    assert!(
+        err.contains("--github-json-costs") && err.contains("--github-json-timings"),
+        "{err}"
+    );
+
+    assert!(
+        distinct_github_outputs(&[
+            ("--github-json-append", Some(rates)),
+            ("--github-json-costs", Some(costs)),
+            ("--github-json-timings", Some(Path::new("timings.json"))),
+            ("--github-json-unused", None),
+        ])
+        .is_ok()
+    );
+}
 
 #[test]
 fn github_json_append_extends_the_array_already_in_the_file() -> TestResult {
