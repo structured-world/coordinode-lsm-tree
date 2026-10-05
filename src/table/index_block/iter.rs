@@ -103,13 +103,18 @@ impl<'a> Iter<'a> {
     /// its candidate in the front cache after the decoder's low cursor has
     /// already moved past it, so clearing that cache would drop the candidate.
     /// A candidate past the new bound is dropped, so a bound below it walks
-    /// nothing.
+    /// nothing. Returns whether the range holds an entry.
     pub fn seek_upper(&mut self, needle: &[u8], _seqno: SeqNo) -> bool {
         // seek_upper_impl may return Err on a poisoned/clamped cursor;
         // the public bool-returning API treats that as "not found" for
         // backward compatibility — callers that need error propagation
         // should use seek_upper_bound_cursor instead.
+        //
+        // `peek_back` falls back to the front cache, so an entry either end
+        // still holds counts; a front that already walked past the bound
+        // leaves nothing.
         self.seek_upper_impl(needle, false, true).unwrap_or(false)
+            && self.decoder.peek_back().is_some()
     }
 
     pub(crate) fn seek_upper_impl(
