@@ -146,13 +146,13 @@ fn seek_upper_below_the_entry_seek_landed_on_keeps_only_what_the_bound_covers() 
         let handles = make_handles(16);
         let key = |i: usize| handles[i].end_key().to_vec();
         assert_eq!(
-            Vec::<Vec<u8>>::new(),
-            walk_between(&index, &key(11), &key(3)).1,
+            (false, Vec::<Vec<u8>>::new()),
+            walk_between(&index, &key(11), &key(3)),
             "restart interval {restart_interval}: a bound far below"
         );
         assert_eq!(
-            Vec::<Vec<u8>>::new(),
-            walk_between(&index, &key(6), &key(4)).1,
+            (false, Vec::<Vec<u8>>::new()),
+            walk_between(&index, &key(6), &key(4)),
             "restart interval {restart_interval}: a bound two entries below"
         );
         assert_eq!(
@@ -160,6 +160,29 @@ fn seek_upper_below_the_entry_seek_landed_on_keeps_only_what_the_bound_covers() 
             walk_between(&index, &key(6), &key(5)),
             "restart interval {restart_interval}: the entry is the first past the bound"
         );
+    }
+}
+
+/// An upper seek below where forward iteration already got to finds nothing:
+/// it reports the range empty, and neither end yields an entry.
+#[test]
+fn seek_upper_behind_the_consumed_front_reports_an_empty_range() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let mut iter = index.iter(default_comparator());
+        for _ in 0..8 {
+            assert!(iter.next().is_some(), "the block holds 16 entries");
+        }
+        assert!(
+            !iter.seek_upper(handles[3].end_key(), SeqNo::MAX),
+            "restart interval {restart_interval}: the range is empty"
+        );
+        assert!(
+            iter.next_back().is_none(),
+            "restart interval {restart_interval}"
+        );
+        assert!(iter.next().is_none(), "restart interval {restart_interval}");
     }
 }
 

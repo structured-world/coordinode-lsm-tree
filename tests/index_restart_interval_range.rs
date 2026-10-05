@@ -27,7 +27,15 @@ fn configure(config: Config, interval: u8, shape: IndexShape) -> Config {
     match shape {
         IndexShape::Pinned => config,
         IndexShape::Volatile => config.index_block_pinning_policy(PinningPolicy::all(false)),
-        IndexShape::Partitioned => config.index_block_partitioning_policy(PinningPolicy::all(true)),
+        IndexShape::Partitioned => {
+            // The writer keeps an index in one block until it outgrows the
+            // spill threshold, far above these tables: spill at once.
+            let mut runtime = lsm_tree::runtime_config::RuntimeConfig::default();
+            runtime.index_partition_spill_threshold = 0;
+            config
+                .index_block_partitioning_policy(PinningPolicy::all(true))
+                .with_runtime_config(runtime)
+        }
     }
 }
 
