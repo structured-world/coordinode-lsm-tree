@@ -30,8 +30,9 @@ pub const NAME: &str = "FifoCompaction";
 /// Age is as fine as a table and the clock, no finer: a table goes whole, so
 /// newer records of it go with its oldest, and data of one age is equally old
 /// to FIFO whatever order it was inserted in. FIFO itself never merges
-/// tables; only another compaction run on the tree (`major_compact`, another
-/// strategy) produces outputs, which a FIFO tree has no use for.
+/// tables; another compaction run on the tree (`major_compact`, another
+/// strategy) can, and FIFO applies its limit and TTL to those outputs by the
+/// age they carry.
 ///
 /// Additionally, a (lazy) TTL can be configured to drop old tables. It is off
 /// while the clock reads zero, which is no clock.
