@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791318355678,
+  "lastUpdate": 1791323019866,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -32976,6 +32976,90 @@ window.BENCHMARK_DATA = {
             "value": 638852.9267928848,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.6us | P99.9: 74.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c7c4ec7a7cc8b5b338e48c6d79b17fbd6fbe08f",
+          "message": "fix(version): a failed manifest rotation no longer blocks the next install (#853)\n\n## Summary\n\n- A manifest rotation that fails after creating `v{N}` no longer blocks\nevery later install with `AlreadyExists` until the process restarts.\n\nThe 5.x line got the same fix in #841.\n\n## Changes\n\n- Before writing `v{N}`, a `v{N}` that `CURRENT` does not name is\nremoved: it is the leftover of an attempt that failed before the\nrepoint, or of a crash there, and holds nothing recovery reads. A `v{N}`\nthat `CURRENT` already names is refused, never rewritten, since that is\nthe state after a failure past the repoint.\n- `rewrite_atomic` logs a temp file it cannot remove instead of\ndiscarding the error.\n- An integration test fails the `CURRENT` rename once and installs again\n(the old persist fails with `AlreadyExists`), and a unit test covers the\nnamed/unnamed rule.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #825",
+          "timestamp": "2026-10-07T00:28:38+03:00",
+          "tree_id": "fb7ad70c66a1d3cfcfa2c1b9d648505dcf6248b3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9c7c4ec7a7cc8b5b338e48c6d79b17fbd6fbe08f"
+        },
+        "date": 1791323017435,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 252040.5779491429,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 12.7us | P99.9: 28.4us\nthreads: 1 | elapsed: 2.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2989442.7828124976,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1158970.1391343651,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 762642.4187051781,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.2us | P99.9: 72.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2561206.430677106,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 335146.64425205905,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 7.9us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 190131.36461178077,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 7.1us | P99.9: 12.3us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1115972.4109300568,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 448251.9965143925,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.8us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 646711.9386580792,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.5us | P99.9: 74.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
