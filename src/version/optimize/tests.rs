@@ -184,6 +184,38 @@ fn l0_order_repairs_a_persisted_order_with_a_newer_table_behind() {
     );
 }
 
+/// A recovered L0 is laid out again only when it breaks recency order: the
+/// earlier placement's `[B], [A, C]` with `C` newer than the `B` it overlaps
+/// is caught, a layout a run per table newest first (as repair writes it) and
+/// disjoint tables in one run both pass.
+#[test]
+fn recency_order_is_checked_only_among_overlapping_tables() {
+    let broken = [
+        Run::new(vec![s(1, "m", "p")]).unwrap(),
+        Run::new(vec![s(0, "a", "c"), s(2, "n", "z")]).unwrap(),
+    ];
+    assert!(!in_recency_order(
+        &broken.iter().collect::<Vec<_>>(),
+        default_cmp()
+    ));
+
+    let per_table = [
+        Run::new(vec![s(2, "a", "z")]).unwrap(),
+        Run::new(vec![s(1, "b", "c")]).unwrap(),
+        Run::new(vec![s(0, "x", "y")]).unwrap(),
+    ];
+    assert!(in_recency_order(
+        &per_table.iter().collect::<Vec<_>>(),
+        default_cmp()
+    ));
+
+    let disjoint = [Run::new(vec![s(0, "a", "b"), s(5, "c", "d"), s(3, "e", "f")]).unwrap()];
+    assert!(in_recency_order(
+        &disjoint.iter().collect::<Vec<_>>(),
+        default_cmp()
+    ));
+}
+
 /// Whatever run order L0 is handed in, the layout keeps every newer table
 /// ahead of each older one it overlaps, keeps runs disjoint and loses nothing.
 #[test]

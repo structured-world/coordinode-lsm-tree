@@ -557,16 +557,22 @@ impl Version {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
-                // L0 is laid out again from its tables' ages, not taken in the
-                // order persisted: a manifest an earlier placement wrote may
-                // hold a newer table behind an older one it overlaps.
+                // A persisted L0 is kept as written when it is in recency order
+                // (repair, for one, writes a run per table), and laid out again
+                // from its tables' ages when it is not: a manifest an earlier
+                // placement wrote may hold a newer table behind an older one
+                // it overlaps.
                 if level_idx == 0 {
-                    let tables = level_runs.iter().flat_map(|run| run.iter().cloned());
-                    let level_runs = order_by_age(tables, comparator)
-                        .into_iter()
-                        .map(Arc::new)
-                        .collect();
-                    return Ok(Level::from_runs(level_runs));
+                    let persisted: Vec<&Run<Table>> =
+                        level_runs.iter().map(Arc::as_ref).collect();
+                    if !optimize::in_recency_order(&persisted, comparator) {
+                        let tables = level_runs.iter().flat_map(|run| run.iter().cloned());
+                        let level_runs = order_by_age(tables, comparator)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect();
+                        return Ok(Level::from_runs(level_runs));
+                    }
                 }
                 Ok(Level::from_runs(level_runs))
             })
