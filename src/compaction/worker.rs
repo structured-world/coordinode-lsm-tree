@@ -637,6 +637,13 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
 /// how long they take, for a latency backoff on the limiter to steer by. A
 /// limiter shared with a verification scan would otherwise keep a rate the
 /// scan lowered after the scan ends, since only reads report latency.
+#[cfg_attr(
+    feature = "std",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "a no-std build times no reads and has no pacer to give"
+    )
+)]
 fn input_pacer(
     limiter: &Arc<crate::rate_limiter::RateLimiter>,
 ) -> Option<crate::table::util::Pacer> {
@@ -660,7 +667,7 @@ fn create_compaction_stream<'a>(
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
-    pace: Option<crate::table::util::Pacer>,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -671,21 +678,17 @@ fn create_compaction_stream<'a>(
                 continue;
             };
 
-            readers.push(Box::new(RunScanner::culled_paced(
+            readers.push(Box::new(RunScanner::culled(
                 run.clone(),
                 (Some(lo), Some(hi)),
-                pace.clone(),
+                pace.cloned(),
             )?));
 
             found += hi - lo + 1;
         } else {
             for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
                 found += 1;
-                let scanner = table.scan()?;
-                readers.push(Box::new(match &pace {
-                    Some(pace) => scanner.with_pace(Arc::clone(pace)),
-                    None => scanner,
-                }));
+                readers.push(Box::new(table.scan_paced(pace)?));
             }
         }
     }
@@ -715,7 +718,7 @@ fn create_bounded_compaction_stream<'a>(
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
-    pace: Option<crate::table::util::Pacer>,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -726,7 +729,7 @@ fn create_bounded_compaction_stream<'a>(
             // Compaction input is maintenance, not a read a caller made, so
             // it stays out of the read counters like the serial scanner's.
             let reader = table.range_iter(bounds.clone()).for_maintenance();
-            let reader = match &pace {
+            let reader = match pace {
                 Some(pace) => reader.with_pace(Arc::clone(pace)),
                 None => reader,
             };
@@ -2206,7 +2209,7 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        input_pacer(&opts.rate_limiter),
+        input_pacer(&opts.rate_limiter).as_ref(),
     ) else {
         // The caller validated every input exists, so a missing table here is
         // unexpected. Fail closed: an empty output would let the install delete
@@ -3352,7 +3355,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        input_pacer(&opts.rate_limiter),
+        input_pacer(&opts.rate_limiter).as_ref(),
     )?
     else {
         log::warn!(

@@ -102,6 +102,7 @@ impl Scanner {
         start_offset: u64,
         lower_bound: Option<crate::UserKey>,
         groups: alloc::vec::Vec<super::BlockHandle>,
+        pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -132,8 +133,12 @@ impl Scanner {
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(start_offset))?;
         }
+        let mut timed = TimedFile::new(file);
+        if let Some(pace) = pace {
+            timed.set_pace(pace);
+        }
         let mut reader = BlockStream {
-            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, TimedFile::new(file)),
+            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, timed),
             position: start_offset,
         };
         let mut groups = groups.into_iter();
@@ -180,18 +185,6 @@ impl Scanner {
             lower_bound,
             groups,
         })
-    }
-
-    /// Tells `pace` how long each read of the rest of the scan takes from the
-    /// file (the first block is read when the scanner is made).
-    #[must_use]
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "its compaction consumer is std-gated")
-    )]
-    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
-        self.reader.reader.get_mut().set_pace(pace);
-        self
     }
 
     #[expect(

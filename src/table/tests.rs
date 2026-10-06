@@ -8699,7 +8699,7 @@ fn a_scan_refuses_a_group_whose_lengths_disagree_with_its_index_entry() -> crate
     );
     let scanned = |groups: Vec<BlockHandle>| {
         table
-            .scan_groups(groups.len(), 0, groups)?
+            .scan_groups(groups.len(), 0, groups, None)?
             .collect::<crate::Result<Vec<_>>>()
     };
     assert_eq!(

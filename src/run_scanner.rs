@@ -19,16 +19,9 @@ pub struct RunScanner {
 }
 
 impl RunScanner {
+    /// Scans tables `lo..=hi` of `run`, telling `pace` how long the reads of
+    /// every one of them take.
     pub fn culled(
-        run: Arc<Run<Table>>,
-        (lo, hi): (Option<usize>, Option<usize>),
-    ) -> crate::Result<Self> {
-        Self::culled_paced(run, (lo, hi), None)
-    }
-
-    /// [`Self::culled`], telling `pace` how long the reads of every table of
-    /// the run take.
-    pub(crate) fn culled_paced(
         run: Arc<Run<Table>>,
         (lo, hi): (Option<usize>, Option<usize>),
         pace: Option<crate::table::util::Pacer>,
@@ -54,11 +47,7 @@ impl RunScanner {
     }
 
     fn scan(table: &Table, pace: Option<&crate::table::util::Pacer>) -> crate::Result<Scanner> {
-        let scanner = table.scan()?;
-        Ok(match pace {
-            Some(pace) => scanner.with_pace(Arc::clone(pace)),
-            None => scanner,
-        })
+        table.scan_paced(pace)
     }
 }
 
