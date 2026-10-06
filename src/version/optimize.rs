@@ -23,15 +23,15 @@ pub fn optimize_runs<T: Clone + Ranged>(
         // Newest first, so every table already placed is newer than `table`:
         // it belongs behind the last placed run it overlaps. No run after
         // that one overlaps it, so joining the next run keeps every run
-        // internally disjoint.
+        // internally disjoint. Every placed run stays sorted and disjoint, so
+        // the overlap is a binary search and the table is inserted at its
+        // place: a wide run costs a logarithm per table, not a scan.
         for run in &runs {
             for table in run.iter() {
                 let last_overlap = new_runs.iter().rposition(|existing_run| {
-                    existing_run.iter().any(|x| {
-                        table
-                            .key_range()
-                            .overlaps_with_key_range_cmp(x.key_range(), cmp)
-                    })
+                    !existing_run
+                        .get_overlapping_cmp(table.key_range(), cmp)
+                        .is_empty()
                 });
 
                 let target = match last_overlap {
@@ -40,7 +40,7 @@ pub fn optimize_runs<T: Clone + Ranged>(
                 };
 
                 if let Some(target) = target {
-                    target.push_cmp(table.clone(), cmp);
+                    target.insert_sorted_cmp(table.clone(), cmp);
                 } else {
                     #[expect(
                         clippy::expect_used,

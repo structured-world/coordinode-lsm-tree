@@ -184,6 +184,46 @@ fn l0_order_repairs_a_persisted_order_with_a_newer_table_behind() {
     );
 }
 
+/// Laying out a wide L0 of disjoint tables, the shape a version change keeps
+/// handing back, costs a logarithm of comparisons per table: each table finds
+/// its run's overlap and its place in that run by binary search, rather than
+/// scanning the growing run and sorting it again after every table.
+#[test]
+fn l0_order_of_a_wide_disjoint_run_compares_n_log_n_keys() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counts the keys it compares.
+    struct Counting(AtomicU64);
+    impl UserComparator for Counting {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            a.cmp(b)
+        }
+    }
+
+    let n: u64 = 512;
+    let tables: Vec<FakeTable> = (0..n)
+        .map(|i| {
+            let key = format!("k{i:06}");
+            s(i, &key, &key)
+        })
+        .collect();
+    let cmp = Counting(AtomicU64::new(0));
+    let runs = order_by_age(tables, &cmp);
+    assert_eq!(runs.len(), 1, "disjoint tables share one run");
+    assert_eq!(runs.first().map(|run| run.len()), Some(512));
+
+    let compared = cmp.0.load(Ordering::Relaxed);
+    let bound = 4 * n * (u64::from(n.ilog2()) + 1);
+    assert!(
+        compared <= bound,
+        "laying out {n} disjoint tables compared {compared} keys, over {bound}"
+    );
+}
+
 /// A recovered L0 is laid out again only when it breaks recency order: the
 /// earlier placement's `[B], [A, C]` with `C` newer than the `B` it overlaps
 /// is caught, a layout a run per table newest first (as repair writes it) and

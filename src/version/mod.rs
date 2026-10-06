@@ -77,6 +77,15 @@ fn place_runs(
 }
 use run::Ranged;
 
+/// Whether `level` holds a table `named` picks: a level that holds none is
+/// left as it stands by a change, its layout neither rebuilt nor copied.
+fn level_holds_any(level: &Level, named: impl Fn(TableId) -> bool) -> bool {
+    level
+        .iter()
+        .flat_map(|run| run.iter())
+        .any(|table| named(table.id()))
+}
+
 /// Context threaded through [`Version`] transformation methods.
 ///
 /// Bundles the user comparator required for maintaining correct table ordering
@@ -767,11 +776,15 @@ impl Version {
         let mut dropped_tables: Vec<Table> = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the drop takes nothing from keeps its layout as it is.
+            if !level_holds_any(level, |id| ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
 
                     let removed_tables = run
@@ -882,11 +895,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the merge neither takes from nor writes to keeps its
+            // layout as it is.
+            if level_idx != dest_level && !level_holds_any(level, |id| old_ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
                     run.retain(|x| !old_ids.contains(&x.metadata.id));
                     run
@@ -988,11 +1006,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the move neither takes from nor moves to keeps its
+            // layout as it is.
+            if level_idx != dest_level && !level_holds_any(level, |id| ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
                     run.retain(|x| !ids.contains(&x.metadata.id));
                     run
@@ -1116,6 +1139,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the slice neither consumes, restricts nor writes to
+            // keeps its layout as it is.
+            if level_idx != dest_level
+                && !level_holds_any(level, |id| {
+                    removed_ids.contains(&id) || restricted.iter().any(|(rid, _)| *rid == id)
+                })
+            {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
