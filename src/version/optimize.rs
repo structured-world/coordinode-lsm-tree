@@ -55,6 +55,52 @@ pub fn optimize_runs<T: Clone + Ranged>(
     }
 }
 
+/// What orders L0 tables by recency: a table whose age compares greater
+/// holds newer data.
+pub trait Aged {
+    /// The table's age; greater is newer.
+    type Age: Ord;
+
+    /// The age of the table's data.
+    fn age(&self) -> Self::Age;
+}
+
+/// A table's age is its sequence numbers, the version every read resolves
+/// by: of two tables that overlap, the one holding the higher sequence
+/// numbers holds the newer data. The table id breaks a tie. Bounds that do
+/// not fit together (damaged metadata) cannot tell an age, and sort oldest.
+impl Aged for crate::table::Table {
+    type Age = (Option<(crate::SeqNo, crate::SeqNo)>, crate::table::TableId);
+
+    fn age(&self) -> Self::Age {
+        (
+            self.seqno_range()
+                .map(|(lowest, highest)| (highest, lowest)),
+            self.id(),
+        )
+    }
+}
+
+/// Lays L0 out from its tables' ages rather than from any run order they came
+/// in: every table on its own, newest first, fused by [`optimize_runs`].
+/// Which run a table sat in says nothing about its age (a table joins any run
+/// it does not overlap), so a flush that joined a compaction input's run, an
+/// output placed among runs it did not come from, or an order a manifest
+/// persisted wrongly all come out in recency order again.
+pub fn order_by_age<T: Clone + Ranged + Aged>(
+    tables: impl IntoIterator<Item = T>,
+    cmp: &dyn UserComparator,
+) -> Vec<Run<T>> {
+    let mut tables: Vec<T> = tables.into_iter().collect();
+    // Newest first.
+    tables.sort_by_key(|table| core::cmp::Reverse(table.age()));
+    let runs = tables
+        .into_iter()
+        .filter_map(|table| Run::new(alloc::vec![table]))
+        .collect();
+    optimize_runs(runs, cmp)
+}
+
 /// A table reduced to what placement looks at, for the fuzz adapter below.
 #[derive(Clone)]
 struct RangedId {

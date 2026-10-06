@@ -6235,7 +6235,8 @@ impl Tree {
             &config.current_zstd_dictionaries(),
         )?;
 
-        let version = Version::from_recovery(recovery, &tables, &blob_files)?;
+        let version =
+            Version::from_recovery(recovery, &tables, &blob_files, config.comparator.as_ref())?;
 
         // Registered ids the tree no longer holds are dropped. One a recovered
         // file names cannot be among them, since that file would have refused

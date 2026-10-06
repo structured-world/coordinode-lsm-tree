@@ -55,7 +55,26 @@ use core::ops::Deref;
 
 #[doc(hidden)]
 pub use optimize::optimize_key_ranges;
-use optimize::optimize_runs;
+use optimize::{optimize_runs, order_by_age};
+
+/// Lays out the runs of level `level_idx`: L0 from its tables' ages, since its
+/// runs overlap and their order is what recency means there; a deeper level
+/// by fusing its disjoint tables.
+fn place_runs(
+    level_idx: usize,
+    runs: Vec<Run<Table>>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<Run<Table>> {
+    if level_idx == 0 {
+        order_by_age(
+            runs.into_iter()
+                .flat_map(|mut run| core::mem::take(run.inner_mut())),
+            cmp,
+        )
+    } else {
+        optimize_runs(runs, cmp)
+    }
+}
 use run::Ranged;
 
 /// Context threaded through [`Version`] transformation methods.
@@ -495,11 +514,13 @@ impl Version {
         recovery: Recovery,
         tables: &[Table],
         blob_files: &[BlobFile],
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Self> {
         let version_levels = recovery
             .table_ids
             .iter()
-            .map(|level| {
+            .enumerate()
+            .map(|(level_idx, level)| {
                 let level_runs = level
                     .iter()
                     .map(|run| {
@@ -536,6 +557,17 @@ impl Version {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
+                // L0 is laid out again from its tables' ages, not taken in the
+                // order persisted: a manifest an earlier placement wrote may
+                // hold a newer table behind an older one it overlaps.
+                if level_idx == 0 {
+                    let tables = level_runs.iter().flat_map(|run| run.iter().cloned());
+                    let level_runs = order_by_age(tables, comparator)
+                        .into_iter()
+                        .map(Arc::new)
+                        .collect();
+                    return Ok(Level::from_runs(level_runs));
+                }
                 Ok(Level::from_runs(level_runs))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -669,7 +701,7 @@ impl Version {
 
             runs.extend(prev_runs);
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(0, runs, comparator);
 
             Level::from_runs(runs.into_iter().map(Arc::new).collect())
         });
@@ -728,7 +760,7 @@ impl Version {
 
         let mut dropped_tables: Vec<Table> = vec![];
 
-        for level in &self.levels {
+        for (level_idx, level) in self.levels.iter().enumerate() {
             let runs = level
                 .runs
                 .iter()
@@ -747,7 +779,7 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -860,18 +892,16 @@ impl Version {
                 && let Some(run) = Run::new(new_tables.to_vec())
             {
                 if dest_level == 0 {
-                    // NOTE: dest_level == 0 in with_merge only occurs for intra-L0
-                    // compaction (memtable flushes use with_new_l0_run, not with_merge).
-                    // Append the merged (older) run so that any concurrently flushed
-                    // (newer) runs remain at the front and are searched first during
-                    // point reads.
+                    // Intra-L0 compaction (flushes use with_new_l0_run). Where
+                    // the output goes is decided by its tables' ages below, so
+                    // a run flushed while it ran stays in front of it.
                     runs.push(run);
                 } else {
                     runs.insert(0, run);
                 }
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -970,7 +1000,7 @@ impl Version {
                 runs.insert(0, run);
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -1108,7 +1138,7 @@ impl Version {
                 }
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
