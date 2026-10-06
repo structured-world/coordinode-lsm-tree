@@ -58,7 +58,7 @@ jobs:
     # Runs only in this repository and never on the code of a pull request
     # from a fork: a self-hosted runner executes whatever the job checks out.
     if: >
-      github.repository_owner == 'structured-world' &&
+      github.repository == 'structured-world/coordinode-lsm-tree' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # Self-hosted bare-metal runner. Shared GitHub-hosted runners
     # have ±15-20% noise on every db_bench workload — large enough
