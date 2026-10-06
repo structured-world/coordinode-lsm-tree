@@ -221,6 +221,128 @@ fn stcs_does_not_merge_runs_a_run_ahead_overlaps() -> crate::Result<()> {
     Ok(())
 }
 
+/// An L0 table `id` in `fs` holding `keys` (sorted), each with an
+/// incompressible value of 64 bytes, so its size grows with the key count.
+#[expect(clippy::expect_used, reason = "test code")]
+fn mem_table(fs: &Arc<dyn crate::fs::Fs>, id: TableId, keys: &[Vec<u8>]) -> crate::Result<Table> {
+    use crate::{InternalValue, ValueType};
+
+    let path = std::path::absolute(format!("/l0/{id}"))?;
+    let mut writer = crate::table::Writer::new(path.clone(), id, 0, Arc::clone(fs))?;
+    for (i, key) in (0u64..).zip(keys) {
+        let noise = (i ^ id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let value: Vec<u8> = (0..8u32)
+            .flat_map(|n| noise.rotate_left(n * 7).to_le_bytes())
+            .collect();
+        writer.write(InternalValue::from_components(
+            key.clone(),
+            value,
+            7,
+            ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("the table is not empty");
+    Table::recover(crate::table::RecoverParams::new(
+        path,
+        checksum,
+        id,
+        Arc::clone(fs),
+        crate::comparator::default_comparator(),
+        Arc::new(crate::Cache::with_capacity_bytes(1_000_000)),
+    ))
+}
+
+/// An in-memory filesystem with the folder `mem_table` writes to.
+fn l0_fs() -> crate::Result<Arc<dyn crate::fs::Fs>> {
+    use crate::fs::Fs;
+
+    let fs = crate::fs::MemFs::new();
+    fs.create_dir_all(&std::path::absolute("/l0")?)?;
+    Ok(Arc::new(fs))
+}
+
+/// A version whose L0 holds `runs` as given, newest first. L0 laid out by a
+/// compaction's output keeps that layout until the next flush re-packs it, so
+/// a run need not overlap the run in front of it.
+fn version_with_l0(runs: Vec<Vec<Table>>) -> Version {
+    use crate::version::{DEFAULT_LEVEL_COUNT, Level, Run};
+
+    let mut levels = vec![Level::from_runs(
+        runs.into_iter()
+            .filter_map(Run::new)
+            .map(Arc::new)
+            .collect(),
+    )];
+    levels.extend((1..DEFAULT_LEVEL_COUNT).map(|_| Level::empty()));
+    Version::from_levels(
+        0,
+        crate::TreeType::Standard,
+        levels,
+        crate::version::BlobFileList::new(crate::HashMap::default()),
+        crate::blob_tree::FragmentationMap::default(),
+    )
+}
+
+/// The table ids a choice merges, sorted, or `None` when it merges nothing.
+fn merged_ids(choice: &Choice) -> Option<Vec<TableId>> {
+    let Choice::Merge(input) = choice else {
+        return None;
+    };
+    let mut ids: Vec<TableId> = input.table_ids.iter().copied().collect();
+    ids.sort_unstable();
+    Some(ids)
+}
+
+/// `padding` keys under the prefix `prefix`, plus `prefix` itself.
+fn keys_under(prefix: &[u8], padding: u16) -> Vec<Vec<u8>> {
+    let mut keys = vec![prefix.to_vec()];
+    keys.extend((0..padding).map(|i| [prefix, &i.to_be_bytes()].concat()));
+    keys
+}
+
+/// A run ahead that overlaps only the head of a size-similar stretch rules out
+/// the stretch from there, not the runs behind it: with L0 laid out as
+/// `[L], [a], [b1], [b2]`, where the large `L` overlaps `a` alone, the pair
+/// `b1`, `b2` is merged instead of nothing ever being.
+#[test]
+fn stcs_merges_the_stretch_behind_a_run_a_run_ahead_overlaps() -> crate::Result<()> {
+    let fs = l0_fs()?;
+    let large = mem_table(&fs, 4, &keys_under(b"k", 500))?;
+    let a = mem_table(&fs, 3, &[b"k".to_vec()])?;
+    let b1 = mem_table(&fs, 2, &[b"x".to_vec()])?;
+    let b2 = mem_table(&fs, 1, &[b"x".to_vec()])?;
+    let version = version_with_l0(vec![vec![large], vec![a], vec![b1], vec![b2]]);
+
+    let strategy = Strategy::default()
+        .with_size_ratio(0.5)
+        .with_min_merge_width(2)
+        .with_max_space_amplification_percent(u64::MAX);
+    let choice = strategy.choose(&version, &Config::default(), &CompactionState::default());
+    assert_eq!(merged_ids(&choice), Some(vec![1, 2]));
+    Ok(())
+}
+
+/// A run ahead that overlaps only the tail of a size-similar stretch cuts the
+/// stretch short there: with L0 laid out as `[P], [a], [b], [c]`, where the
+/// large `P` overlaps `c` alone, `a` and `b` are merged.
+#[test]
+fn stcs_merges_the_head_of_a_stretch_a_run_ahead_overlaps_at_its_tail() -> crate::Result<()> {
+    let fs = l0_fs()?;
+    let large = mem_table(&fs, 4, &keys_under(b"q", 500))?;
+    let a = mem_table(&fs, 3, &[b"a".to_vec()])?;
+    let b = mem_table(&fs, 2, &[b"b".to_vec()])?;
+    let c = mem_table(&fs, 1, &[b"q".to_vec()])?;
+    let version = version_with_l0(vec![vec![large], vec![a], vec![b], vec![c]]);
+
+    let strategy = Strategy::default()
+        .with_size_ratio(0.5)
+        .with_min_merge_width(2)
+        .with_max_space_amplification_percent(u64::MAX);
+    let choice = strategy.choose(&version, &Config::default(), &CompactionState::default());
+    assert_eq!(merged_ids(&choice), Some(vec![2, 3]));
+    Ok(())
+}
+
 /// A merge of the newest runs lands in front of the older runs it did not
 /// take, not behind them.
 #[test]
