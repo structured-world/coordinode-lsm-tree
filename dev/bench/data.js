@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791250677292,
+  "lastUpdate": 1791250680932,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -32560,6 +32560,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 9701.733,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5c7e9e3c71442b9fc8ab473a7b7acd4f1707bd66",
+          "message": "feat(verify): rate the scrub by bytes read (#843)\n\n## Summary\n\n- The block-checksum scrub can be held to a byte rate: every read of an\nSST file is charged before it is made, through one `RateLimiter` shared\nby all workers.\n- An operator sets a disk load instead of a pause between files of any\nsize, and can retune it live or draw it from the same budget as\ncompaction.\n\nReplaces #821, squashed into one commit on the current `main`.\n\n## Changes\n\n- `VerifyOptions::rate_limiter(Arc<RateLimiter>)` and the shorthand\n`VerifyOptions::max_bytes_per_sec(n)`; no limiter, or a rate of `0`,\nreads at full speed.\n- The scan reads each SST through a file wrapper that charges every\nread, buffer refills, trailer and TOC included, up to the file's end:\nthe bytes read, never a length a header or the TOC declares, so a forged\nlength cannot stall the scan and no refill reads ahead of the budget.\n- Under a limiter with a rate set, a read takes at most 64 KiB, charged\nand then read, so other users of a shared limiter are served between\nportions and the device never sees one block-sized read; at rate zero,\nand without `std`, where the limiter never waits, reads go whole.\nWhether a read is rated is decided once, for its size and its charge\nalike. An interrupted read is retried, an error after bytes of a read\ncomes with the next read unless a seek moves away first, and bytes\ncharged but not read stay to the file's credit.\n- A restricted table's index lookup is paced by the block loader: each\nindex block it reads from the file is read a portion at a time, each\nportion charged just before it is read and cut at the file's end.\nNothing is charged for a block the cache serves or the loader refuses\nunread, and a rate set while the walk runs applies to the reads still to\ncome.\n- The out-of-band walk used by repair and `sst-dump` reads unrated.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #764\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added optional byte-rate limiting for data verification, with\nconfigurable throughput or a shared rate limiter.\n* Verification reads are paced in portions across file scans and index\nlookups, helping control disk I/O during verification. Without a\nlimiter, existing read behavior is preserved.\n* **Bug Fixes**\n* Improved handling of partial reads, interrupted reads, and reads that\nextend beyond the end of a file during verification.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-06T01:23:40Z",
+          "tree_id": "f0d2fea100a002e0c238b8adc32b67d5bb558f30",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5c7e9e3c71442b9fc8ab473a7b7acd4f1707bd66"
+        },
+        "date": 1791250679670,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 528.36,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.163753ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 147.374,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.791612ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 916.697,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 102.129062ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3276.6000000000004,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9642.033,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
