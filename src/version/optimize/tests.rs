@@ -216,6 +216,42 @@ fn recency_order_is_checked_only_among_overlapping_tables() {
     ));
 }
 
+/// The range-maximum check answers as comparing every overlapping pair does,
+/// for L0 laid out a table per run in any order, ages in any order, and
+/// tables touching at a bound.
+#[test]
+fn recency_order_check_matches_comparing_every_pair() {
+    use proptest::prelude::*;
+
+    let range = (0u8..12, 0u8..12).prop_map(|(x, y)| (x.min(y), x.max(y)));
+    proptest!(|(tables in proptest::collection::vec((range, any::<u16>()), 0..30))| {
+        // Ages are unique, as a table's id makes them: the random part orders,
+        // the position breaks a tie.
+        let runs: Vec<Run<FakeTable>> = tables
+            .iter()
+            .enumerate()
+            .map(|(at, ((lo, hi), age))| {
+                Run::new(vec![FakeTable {
+                    id: (u64::from(*age) << 8) | at as u64,
+                    key_range: KeyRange::new((vec![b'a' + lo].into(), vec![b'a' + hi].into())),
+                }])
+                .unwrap()
+            })
+            .collect();
+        let refs: Vec<&Run<FakeTable>> = runs.iter().collect();
+
+        let every_pair = refs.iter().enumerate().all(|(i, a)| {
+            refs.iter().skip(i + 1).all(|b| {
+                a.iter().zip(b.iter()).all(|(a, b)| {
+                    !a.key_range().overlaps_with_key_range_cmp(b.key_range(), default_cmp())
+                        || a.id >= b.id
+                })
+            })
+        });
+        prop_assert_eq!(in_recency_order(&refs, default_cmp()), every_pair);
+    });
+}
+
 /// Whatever run order L0 is handed in, the layout keeps every newer table
 /// ahead of each older one it overlaps, keeps runs disjoint and loses nothing.
 #[test]

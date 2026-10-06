@@ -103,26 +103,114 @@ pub fn order_by_age<T: Clone + Ranged + Aged>(
 /// table it overlaps: the order a layout from ages produces. A layout that
 /// holds it is kept as it stands, so a recovered L0 is laid out again only
 /// when a manifest holds a newer table behind an older one.
+///
+/// O(n log n) in the table count: the tables are taken newest first, and each
+/// is checked against the newer ones it overlaps through a range maximum of
+/// their run positions over the key space, so an open does not compare every
+/// pair of a wide L0.
 pub fn in_recency_order<T: Ranged + Aged>(runs: &[&Run<T>], cmp: &dyn UserComparator) -> bool {
-    let placed: Vec<(usize, &T)> = runs
+    let mut placed: Vec<(usize, &T)> = runs
         .iter()
         .enumerate()
         .flat_map(|(at, run)| run.iter().map(move |table| (at, table)))
         .collect();
-    placed.iter().enumerate().all(|(i, (run_a, a))| {
-        placed.iter().skip(i + 1).all(|(run_b, b)| {
-            if run_a == run_b
-                || !a
-                    .key_range()
-                    .overlaps_with_key_range_cmp(b.key_range(), cmp)
-            {
-                return true;
-            }
-            // The one in front must be the newer.
-            let a_first = run_a < run_b;
-            a_first == (a.age() > b.age())
+
+    // Every table's bounds, in key order: two tables overlap exactly when
+    // their index ranges over these points do.
+    let mut points: Vec<&[u8]> = placed
+        .iter()
+        .flat_map(|&(_, table)| {
+            let range = table.key_range();
+            [range.min().as_ref(), range.max().as_ref()]
         })
+        .collect();
+    points.sort_by(|a, b| cmp.compare(a, b));
+    points.dedup_by(|a, b| cmp.compare(a, b) == core::cmp::Ordering::Equal);
+    let index = |key: &[u8]| {
+        points
+            .binary_search_by(|point| cmp.compare(point, key))
+            .unwrap_or_else(|at| at)
+    };
+
+    placed.sort_by(|(_, a), (_, b)| b.age().cmp(&a.age()));
+    // One past the furthest-back run of a newer table, per key point.
+    let mut newer_runs = RangeMax::new(points.len());
+    placed.iter().all(|(run, table)| {
+        let range = table.key_range();
+        let (lo, hi) = (index(range.min()), index(range.max()));
+        // Every table recorded so far is newer than this one: none it
+        // overlaps may sit in a run behind it.
+        let in_order = newer_runs.max(lo, hi) <= run + 1;
+        newer_runs.raise(lo, hi, run + 1);
+        in_order
     })
+}
+
+/// A maximum over points `0..len` that inclusive index ranges raise and read,
+/// each in O(log len). A node keeps the highest value raised over all of its
+/// range (`whole`) and over any part of it (`any`).
+struct RangeMax {
+    len: usize,
+    whole: Vec<usize>,
+    any: Vec<usize>,
+}
+
+impl RangeMax {
+    fn new(len: usize) -> Self {
+        let nodes = 4 * len.max(1);
+        Self {
+            len,
+            whole: alloc::vec![0; nodes],
+            any: alloc::vec![0; nodes],
+        }
+    }
+
+    /// Raises every point of `lo..=hi` to at least `value`.
+    fn raise(&mut self, lo: usize, hi: usize, value: usize) {
+        if self.len > 0 {
+            self.raise_at(1, 0, self.len - 1, lo, hi, value);
+        }
+    }
+
+    fn raise_at(&mut self, node: usize, l: usize, r: usize, lo: usize, hi: usize, value: usize) {
+        if hi < l || r < lo {
+            return;
+        }
+        if let Some(any) = self.any.get_mut(node) {
+            *any = (*any).max(value);
+        }
+        if lo <= l && r <= hi {
+            if let Some(whole) = self.whole.get_mut(node) {
+                *whole = (*whole).max(value);
+            }
+            return;
+        }
+        let mid = l + (r - l) / 2;
+        self.raise_at(2 * node, l, mid, lo, hi, value);
+        self.raise_at(2 * node + 1, mid + 1, r, lo, hi, value);
+    }
+
+    /// The highest value raised over any point of `lo..=hi`.
+    fn max(&self, lo: usize, hi: usize) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        self.max_at(1, 0, self.len - 1, lo, hi)
+    }
+
+    fn max_at(&self, node: usize, l: usize, r: usize, lo: usize, hi: usize) -> usize {
+        if hi < l || r < lo {
+            return 0;
+        }
+        if lo <= l && r <= hi {
+            return self.any.get(node).copied().unwrap_or(0);
+        }
+        let mid = l + (r - l) / 2;
+        let whole = self.whole.get(node).copied().unwrap_or(0);
+        whole
+            .max(self.max_at(2 * node, l, mid, lo, hi))
+            .max(self.max_at(2 * node + 1, mid + 1, r, lo, hi))
+    }
 }
 
 /// A table reduced to what placement looks at, for the fuzz adapter below.
