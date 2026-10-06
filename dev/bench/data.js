@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791314985494,
+  "lastUpdate": 1791317406533,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -31632,6 +31632,90 @@ window.BENCHMARK_DATA = {
             "value": 650020.5081470321,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.5us | P99.9: 73.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "6257c15e11fb7746fefa9ad2f225054454e33402",
+          "message": "fix(compaction): FIFO drops from every level and never panics on L0 shape (#852)\n\n## Summary\n\n- FIFO compaction no longer panics on an L0 whose tables overlap (keys\nnot strictly monotonic across flushes) or that another compaction holds,\nas when `major_compact` runs on a FIFO tree.\n- The size limit and the TTL keep applying after a major compaction\nmoved the tables below L0, with the data keeping its age through it.\n\nThe 5.x line got the same fix in #842.\n\n## Changes\n\n- A compaction output's `created_at` is the newest `created_at` among\nthe inputs whose key range meets its own, not the time it was written; a\nflush or an ingest keeps the write time. An input stamped while the\nclock read zero has no age, and an output meeting one has none either.\nThe ages are found by a sweep that advances with the outputs in key\norder, so each input is visited once whatever its width.\n- FIFO walks the tables of every level, counts all of them against the\nsize limit, and drops whole tables oldest first by that age, then by the\nhighest sequence number. Age is as fine as a table and the clock: tables\nof one age, as the outputs that split one input, go in key order once a\ncompaction has zeroed their sequence numbers.\n- The TTL counts from the data's age, so a compaction does not restart\nit; it is off while the clock reads zero, and a table stamped while it\nread zero has no age and never expires.\n- A table another compaction holds is never dropped and keeps its place\nin the age order: no newer table is dropped ahead of it.\n- A blob file is credited as freed only with the last table that\nreferences it, read from each table's cached blob links, and never while\na memtable row references it, since such a file outlives its last table;\na table whose references cannot be read makes the round wait.\n- Tests that pin the clock, and tests whose drop order follows flush\nages on the real clock, run inside a helper that holds the process-wide\noverride for the whole test.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux. The regression tests fail\nwithout the fix.\n\nCloses #824\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* FIFO compaction now considers tables across all levels, including\noverlapping tables, and counts both table and blob data toward its size\nlimit.\n* Compaction outputs retain the age of the newest applicable input data,\nkeeping age-based selection consistent after compaction.\n* TTL-based selection applies only to tables with a known creation time\nthat meets the cutoff; TTL selection is skipped when the clock is zero.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-06T22:53:57+03:00",
+          "tree_id": "4900c4f4c24ec851d0fb102981404316e28b3cba",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6257c15e11fb7746fefa9ad2f225054454e33402"
+        },
+        "date": 1791317403760,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 252347.17906414196,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 12.5us | P99.9: 29.0us\nthreads: 1 | elapsed: 2.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3048836.2591998633,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1153558.2079703952,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 762289.24608069,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.2us | P99.9: 76.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2556805.83360819,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 333860.4433299441,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.1us | P99.9: 14.8us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 187570.40337859312,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 7.2us | P99.9: 13.3us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1122171.3566883376,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 446032.0210848257,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 638852.9267928848,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.6us | P99.9: 74.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
