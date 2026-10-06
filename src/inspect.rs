@@ -85,10 +85,11 @@ pub struct TableProperties {
     /// Codec used to compress index blocks. Often `None` since the
     /// TLI is small and compression overhead dominates the win.
     pub index_block_compression: CompressionType,
-    /// Wall-clock nanoseconds since the Unix epoch when the writer
-    /// finalised the table. Recovered identically from MID or TAIL
-    /// meta — the writer snapshots `unix_timestamp()` once and emits
-    /// the same value to both copies.
+    /// The age of the table's data, as wall-clock nanoseconds since the Unix
+    /// epoch: when the writer finalised a flushed or ingested table, and for a
+    /// compaction output the newest age among the inputs its key range meets.
+    /// Recovered identically from MID or TAIL meta: the writer decides it
+    /// once and emits the same value to both copies.
     pub created_at_nanos: u128,
     /// `true` when the table was written with a recognized, applicable Page
     /// ECC scheme (the read path sizes + recovers its parity trailers).
