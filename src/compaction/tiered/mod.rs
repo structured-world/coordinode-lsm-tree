@@ -27,9 +27,10 @@ pub const NAME: &str = "SizeTieredCompaction";
 ///
 /// # Algorithm
 ///
-/// Only runs that are contiguous in L0 order (newest to oldest) are merged
-/// together, so the merged run is older than every run in front of it and
-/// newer than every run behind it.
+/// Only runs that are contiguous in L0 order (newest to oldest), and that no
+/// run ahead of them overlaps, are merged together, so the merged run is older
+/// than every run in front of it that shares a key with it and newer than
+/// every run behind it.
 ///
 /// 1. **Space amplification check:** if `total_size / largest_run_size - 1`
 ///    exceeds [`max_space_amplification_percent`](Strategy::with_max_space_amplification_percent),
@@ -211,6 +212,28 @@ fn similar(a: &RunInfo, b: &RunInfo, size_ratio: f64) -> bool {
     ratio <= 1.0 + size_ratio
 }
 
+/// Whether L0 runs `start..start + count` may be merged on their own: no table
+/// ahead of them overlaps one of theirs. A table ahead that overlaps a merged
+/// one is newer than the data the two share, so the output, which takes that
+/// data, would belong behind it while belonging ahead of the older tables
+/// behind its inputs, and the output's single recency cannot say both. This is
+/// Pebble's rule for intra-L0 compactions: a merge that takes an older version
+/// of a key takes every newer version of it L0 holds.
+fn nothing_ahead_overlaps(
+    version: &Version,
+    start: usize,
+    count: usize,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> bool {
+    let merged = || version.l0().iter().skip(start).take(count);
+    version
+        .l0()
+        .iter()
+        .take(start)
+        .flat_map(|run| run.iter())
+        .all(|table| merged().all(|run| run.get_overlapping_cmp(table.key_range(), cmp).is_empty()))
+}
+
 fn merge_runs<'a>(runs: impl Iterator<Item = &'a RunInfo>, target_size: u64) -> Choice {
     Choice::Merge(CompactionInput {
         table_ids: runs.flat_map(|r| r.table_ids.iter().copied()).collect(),
@@ -300,7 +323,8 @@ impl CompactionStrategy for Strategy {
         u64::try_from(debt).unwrap_or(u64::MAX)
     }
 
-    fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
+    fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
+        let cmp = config.comparator.as_ref();
         let all_runs = collect_runs(version, state);
         let runs: Vec<&RunInfo> = all_runs.iter().flatten().collect();
 
@@ -308,14 +332,17 @@ impl CompactionStrategy for Strategy {
             return Choice::DoNothing;
         }
 
-        // The available runs are contiguous unless a busy run sits between two
-        // of them.
+        // The available runs can merge as one unless a busy run sits between
+        // two of them, or a busy run ahead of them overlaps one.
         let first_available = all_runs.iter().position(Option::is_some);
         let last_available = all_runs.iter().rposition(Option::is_some);
         let available_contiguous = match (first_available, last_available) {
-            (Some(first), Some(last)) => all_runs
-                .get(first..=last)
-                .is_some_and(|span| span.iter().all(Option::is_some)),
+            (Some(first), Some(last)) => {
+                all_runs
+                    .get(first..=last)
+                    .is_some_and(|span| span.iter().all(Option::is_some))
+                    && nothing_ahead_overlaps(version, first, last - first + 1, cmp)
+            }
             _ => false,
         };
 
@@ -379,7 +406,9 @@ impl CompactionStrategy for Strategy {
                 prev = next;
                 len += 1;
             }
-            if let Some(count) = merge_count_for(len) {
+            if let Some(count) = merge_count_for(len)
+                && nothing_ahead_overlaps(version, start, count, cmp)
+            {
                 return merge_runs(
                     all_runs.iter().skip(start).take(count).flatten(),
                     self.target_size,

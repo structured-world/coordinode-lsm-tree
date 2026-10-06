@@ -159,6 +159,68 @@ fn stcs_does_not_merge_around_a_busy_run() -> crate::Result<()> {
     Ok(())
 }
 
+/// A stretch of runs behind a run that overlaps one of its tables is not
+/// merged on its own: the table ahead is newer than the data it overlaps, yet
+/// a disjoint, even newer table in the stretch lifts the output above it.
+/// Flushing `C`, `A`, `S`, `B`, `T` (`k` in `C`, `A` and the large `S`, `x` in
+/// `B` and `T`, every `k` at one seqno) lays L0 out as `[S, T], [A, B], [C]`;
+/// the large `S` keeps the stretch from the newest run short, so size-tiered
+/// looks at `[A, B], [C]`. Merged, the output's recency (`B`'s) is above `S`'s
+/// and a read of `k` would see `A`'s older value instead of `S`'s.
+#[test]
+fn stcs_does_not_merge_runs_a_run_ahead_overlaps() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    let flush = |pairs: &[(&[u8], &str)]| -> crate::Result<()> {
+        for (key, value) in pairs {
+            tree.insert(*key, *value, 7);
+        }
+        tree.flush_active_memtable(7)
+    };
+    flush(&[(b"k", "c")])?;
+    flush(&[(b"k", "a")])?;
+    let padding: Vec<Vec<u8>> = (0..2_000u16)
+        .map(|i| [b"k".as_slice(), &i.to_be_bytes()].concat())
+        .collect();
+    let mut s: Vec<(&[u8], &str)> = vec![(b"k", "s")];
+    s.extend(
+        padding
+            .iter()
+            .map(|key| (key.as_slice(), "padding-padding-padding")),
+    );
+    flush(&s)?;
+    flush(&[(b"x", "b")])?;
+    flush(&[(b"x", "t")])?;
+
+    let runs: Vec<usize> = tree
+        .current_version()
+        .l0()
+        .iter()
+        .map(|run| run.len())
+        .collect();
+    assert_eq!(runs, vec![2, 2, 1], "L0 is [S, T], [A, B], [C]");
+
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_min_merge_width(2)
+            .with_max_space_amplification_percent(u64::MAX),
+    );
+    tree.compact(strategy, 8)?;
+
+    assert_eq!(
+        tree.get(b"k", MAX_SEQNO)?.as_deref(),
+        Some(b"s".as_slice()),
+        "the newest write of k is S's"
+    );
+    Ok(())
+}
+
 /// A merge of the newest runs lands in front of the older runs it did not
 /// take, not behind them.
 #[test]
