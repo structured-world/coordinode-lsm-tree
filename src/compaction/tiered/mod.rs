@@ -4,7 +4,7 @@
 
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
-    HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
+    KvPair, TableId, compaction::state::CompactionState, config::Config, table::Table,
     version::Version,
 };
 #[cfg(not(feature = "std"))]
@@ -27,14 +27,23 @@ pub const NAME: &str = "SizeTieredCompaction";
 ///
 /// # Algorithm
 ///
+/// Only runs that are contiguous in L0 order (newest to oldest), and that no
+/// run ahead of them overlaps, are merged together, so the merged run is older
+/// than every run in front of it that shares a key with it and newer than
+/// every run behind it.
+///
 /// 1. **Space amplification check:** if `total_size / largest_run_size - 1`
 ///    exceeds [`max_space_amplification_percent`](Strategy::with_max_space_amplification_percent),
-///    all runs are merged (full compaction).
-/// 2. **Size-ratio merge:** runs are sorted by size (smallest first). The
-///    longest prefix where each consecutive pair satisfies
-///    `next.size / prev.size <= 1.0 + size_ratio` is selected. If the prefix
-///    length ≥ [`min_merge_width`](Strategy::with_min_merge_width), those runs
-///    are merged.
+///    all runs are merged (full compaction). While a compaction holds a run
+///    between two others, this waits for it to land.
+/// 2. **Size-ratio merge:** walking L0 from the newest run, the first stretch
+///    of consecutive runs where each neighbouring pair satisfies
+///    `larger / smaller <= 1.0 + size_ratio`, that no run ahead of it
+///    overlaps, and that is at least
+///    [`min_merge_width`](Strategy::with_min_merge_width) long is merged (its
+///    newest [`max_merge_width`](Strategy::with_max_merge_width) runs). A
+///    stretch a run ahead overlaps is cut short there, and the runs behind
+///    are tried as stretches of their own.
 ///
 /// # Trade-offs vs Leveled
 ///
@@ -165,13 +174,13 @@ struct RunInfo {
     table_ids: Vec<TableId>,
 }
 
-/// Collects run information from L0, filtering out runs with hidden tables.
-fn collect_available_runs(version: &Version, state: &CompactionState) -> Vec<RunInfo> {
-    let l0 = version.l0();
-
-    l0.iter()
-        .filter_map(|run| {
-            // Skip runs that have any table in the hidden set (being compacted)
+/// Collects L0 runs in L0 order (newest first), `None` for a run with a
+/// table in the hidden set (being compacted).
+fn collect_runs(version: &Version, state: &CompactionState) -> Vec<Option<RunInfo>> {
+    version
+        .l0()
+        .iter()
+        .map(|run| {
             if run
                 .iter()
                 .any(|table| state.hidden_set().is_hidden(table.id()))
@@ -185,6 +194,71 @@ fn collect_available_runs(version: &Version, state: &CompactionState) -> Vec<Run
             Some(RunInfo { size, table_ids })
         })
         .collect()
+}
+
+/// Whether two runs neighbouring in L0 are close enough in size to merge.
+fn similar(a: &RunInfo, b: &RunInfo, size_ratio: f64) -> bool {
+    let (smaller, larger) = if a.size <= b.size {
+        (a.size, b.size)
+    } else {
+        (b.size, a.size)
+    };
+    if smaller == 0 {
+        // A zero-size run is similar to anything.
+        return true;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "precision loss is acceptable for ratio comparison"
+    )]
+    let ratio = larger as f64 / smaller as f64;
+    ratio <= 1.0 + size_ratio
+}
+
+/// For each L0 run, the frontmost run ahead of it (L0 is newest first, so the
+/// lowest index) that holds a table overlapping one of its tables, if any.
+/// Computed once per choice: every candidate stretch is then checked against
+/// it without looking at a table again.
+fn frontmost_overlap_ahead(
+    version: &Version,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<Option<usize>> {
+    let l0 = version.l0();
+    l0.iter()
+        .enumerate()
+        .map(|(at, run)| {
+            l0.iter().take(at).position(|ahead| {
+                ahead.iter().any(|table| {
+                    !run.get_overlapping_cmp(&table.metadata.key_range, cmp)
+                        .is_empty()
+                })
+            })
+        })
+        .collect()
+}
+
+/// Whether L0 run `run` may be merged in a stretch that starts at run `start`:
+/// no run ahead of the stretch overlaps it. A table ahead that overlaps a
+/// merged one is newer than the data the two share, so the output, which
+/// takes that data, would belong behind it while belonging ahead of the older
+/// tables behind its inputs, and the output's single recency cannot say both.
+/// This is Pebble's rule for intra-L0 compactions: a merge that takes an older
+/// version of a key takes every newer version of it L0 holds.
+fn clear_of_runs_ahead(ahead: &[Option<usize>], run: usize, start: usize) -> bool {
+    ahead
+        .get(run)
+        .copied()
+        .flatten()
+        .is_none_or(|overlap| overlap >= start)
+}
+
+fn merge_runs<'a>(runs: impl Iterator<Item = &'a RunInfo>, target_size: u64) -> Choice {
+    Choice::Merge(CompactionInput {
+        table_ids: runs.flat_map(|r| r.table_ids.iter().copied()).collect(),
+        dest_level: 0,
+        canonical_level: 0,
+        target_size,
+    })
 }
 
 impl CompactionStrategy for Strategy {
@@ -267,12 +341,28 @@ impl CompactionStrategy for Strategy {
         u64::try_from(debt).unwrap_or(u64::MAX)
     }
 
-    fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
-        let runs = collect_available_runs(version, state);
+    fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
+        let cmp = config.comparator.as_ref();
+        let all_runs = collect_runs(version, state);
+        let runs: Vec<&RunInfo> = all_runs.iter().flatten().collect();
 
         if runs.len() < 2 {
             return Choice::DoNothing;
         }
+
+        let ahead = frontmost_overlap_ahead(version, cmp);
+
+        // The available runs can merge as one unless a busy run sits between
+        // two of them, or a busy run ahead of them overlaps one.
+        let first_available = all_runs.iter().position(Option::is_some);
+        let last_available = all_runs.iter().rposition(Option::is_some);
+        let available_contiguous = match (first_available, last_available) {
+            (Some(first), Some(last)) => all_runs.get(first..=last).is_some_and(|span| {
+                span.iter().all(Option::is_some)
+                    && (first..=last).all(|run| clear_of_runs_ahead(&ahead, run, first))
+            }),
+            _ => false,
+        };
 
         // --- Space amplification check ---
         //
@@ -281,7 +371,9 @@ impl CompactionStrategy for Strategy {
         let total_size: u64 = runs.iter().map(|r| r.size).sum();
         let largest_run_size = runs.iter().map(|r| r.size).max().unwrap_or(0);
 
-        if largest_run_size > 0 {
+        // A busy run between available ones would split the merge into two
+        // ranges of different age; wait for that compaction to land instead.
+        if largest_run_size > 0 && available_contiguous {
             // Integer arithmetic to avoid f64 precision loss on large sizes.
             //   (total / largest - 1) * 100 >= threshold
             // is equivalent to:
@@ -299,73 +391,55 @@ impl CompactionStrategy for Strategy {
                 .saturating_mul(100 + u128::from(self.max_space_amplification_percent));
 
             if lhs >= rhs {
-                let table_ids: HashSet<TableId> = runs
-                    .iter()
-                    .flat_map(|r| r.table_ids.iter().copied())
-                    .collect();
-
-                return Choice::Merge(CompactionInput {
-                    table_ids,
-                    dest_level: 0,
-                    canonical_level: 0,
-                    target_size: self.target_size,
-                });
+                return merge_runs(runs.iter().copied(), self.target_size);
             }
         }
 
         // --- Size-ratio triggered merge ---
         //
-        // Sort runs by size (smallest first), then find the longest prefix
-        // where adjacent runs have similar sizes.
-        let mut sorted_runs = runs;
-        sorted_runs.sort_by(|a, b| a.size.cmp(&b.size));
-
-        let mut prefix_len = 1;
-
-        for window in sorted_runs.windows(2) {
-            // NOTE: windows(2) guarantees exactly 2 elements
-            let (Some(smaller), Some(larger)) = (window.first(), window.get(1)) else {
-                unreachable!("windows(2) always yields slices of length 2");
-            };
-
-            if smaller.size == 0 {
-                // Zero-size run: always "similar" to the next
-                prefix_len += 1;
-                continue;
+        // Walk L0 from the newest run and take the first stretch of
+        // consecutive available runs whose neighbours have similar sizes and
+        // that no run ahead of it overlaps, as `RocksDB` universal compaction
+        // picks from its newest sorted run
+        // (`UniversalCompactionBuilder::PickCompactionToReduceSortedRuns`).
+        // Merging by size alone could join runs around a differently sized one
+        // between them in age.
+        // Cap at max_merge_width, but still meet min_merge_width (guards
+        // against a misconfigured max < min).
+        let merge_count_for = |stretch: usize| {
+            let count = stretch.min(self.max_merge_width);
+            (count >= self.min_merge_width).then_some(count)
+        };
+        let mut start = 0;
+        while start < all_runs.len() {
+            let mut len = 0;
+            if let Some(Some(first)) = all_runs.get(start)
+                && clear_of_runs_ahead(&ahead, start, start)
+            {
+                // The stretch ends at the first run that is busy, differs in
+                // size from its neighbour, or is overlapped by a run ahead of
+                // `start`: a run the stretch's own runs overlap stays mergeable
+                // with them.
+                let mut prev = first;
+                len = 1;
+                while let Some(Some(next)) = all_runs.get(start + len)
+                    && similar(prev, next, self.size_ratio)
+                    && clear_of_runs_ahead(&ahead, start + len, start)
+                {
+                    prev = next;
+                    len += 1;
+                }
+                if let Some(count) = merge_count_for(len) {
+                    return merge_runs(
+                        all_runs.iter().skip(start).take(count).flatten(),
+                        self.target_size,
+                    );
+                }
             }
-
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "precision loss is acceptable for ratio comparison"
-            )]
-            let ratio = larger.size as f64 / smaller.size as f64;
-
-            if ratio <= 1.0 + self.size_ratio {
-                prefix_len += 1;
-            } else {
-                break;
-            }
-        }
-
-        if prefix_len >= self.min_merge_width {
-            // Cap at max_merge_width, but ensure we still meet min_merge_width
-            // (guards against misconfigured max < min)
-            let merge_count = prefix_len.min(self.max_merge_width);
-
-            if merge_count >= self.min_merge_width {
-                let table_ids: HashSet<TableId> = sorted_runs
-                    .iter()
-                    .take(merge_count)
-                    .flat_map(|r| r.table_ids.iter().copied())
-                    .collect();
-
-                return Choice::Merge(CompactionInput {
-                    table_ids,
-                    dest_level: 0,
-                    canonical_level: 0,
-                    target_size: self.target_size,
-                });
-            }
+            // A stretch starting inside this one ends where this one ended,
+            // or sooner, so it is shorter still. A run that could not start a
+            // stretch is passed over alone: the run behind it may.
+            start += len.max(1);
         }
 
         Choice::DoNothing
