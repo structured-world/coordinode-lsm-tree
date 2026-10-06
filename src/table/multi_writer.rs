@@ -271,10 +271,8 @@ impl MultiWriter {
 
         let path = base_path.join(current_table_id.to_string());
         // Own-id recency until `use_recency` overrides it (see the `recency`
-        // field): a flush / ingest table's id IS its content recency, and
-        // persisting it keeps the key present on every new table.
-        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?
-            .use_recency(Some(current_table_id));
+        // field): a flush / ingest table's id IS its content recency.
+        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?;
 
         Ok(Self {
             fs,
@@ -946,7 +944,7 @@ impl MultiWriter {
     #[must_use]
     pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
         self.recency = recency;
-        if recency.is_some() {
+        if let Some(recency) = recency {
             self.writer = self.writer.use_recency(recency);
         }
         self
@@ -1090,7 +1088,9 @@ impl MultiWriter {
         new_writer = new_writer.use_columnar(self.use_columnar);
         new_writer = new_writer.use_cell_rows(self.cell_rows);
         new_writer = new_writer.use_bulk_ingested(Some(self.bulk_ingested));
-        new_writer = new_writer.use_recency(Some(self.recency.unwrap_or(new_table_id)));
+        if let Some(recency) = self.recency {
+            new_writer = new_writer.use_recency(recency);
+        }
         new_writer = new_writer.use_lineage(self.lineage.clone());
         // The adjacency link: this successor follows the writer being closed,
         // which is what lets manifest repair union UNBROKEN sibling chains.

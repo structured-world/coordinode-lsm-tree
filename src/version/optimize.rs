@@ -81,6 +81,11 @@ impl Aged for crate::table::Table {
 
 /// Lays L0 out from its tables' ages rather than from any run order they came
 /// in: every table on its own, newest first, fused by [`optimize_runs`].
+///
+/// A compaction output's age, its newest input's, is its age only when no
+/// table left ahead of its inputs overlaps them: an output also holding older
+/// data could otherwise pass that table. Size-tiered picks its inputs so; a
+/// compaction that merges all of L0 leaves nothing ahead.
 /// Which run a table sat in says nothing about its age (a table joins any run
 /// it does not overlap), so a flush that joined a compaction input's run, an
 /// output placed among runs it did not come from, or an order a manifest

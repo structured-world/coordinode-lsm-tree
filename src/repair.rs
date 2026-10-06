@@ -6455,107 +6455,9 @@ fn rebuild_from_scan(
             }
         })
         .collect();
-    // A pair of L0 tables whose KEY ranges overlap and whose SEQNO ranges
-    // intersect can hold tied entries, and a tied read is settled by run
-    // order. The persisted recency key makes that order trustworthy; when
-    // EITHER table lacks it, the id fallback restores ALLOCATION order,
-    // which a legacy compaction output does not follow (its high id predates
-    // a concurrent newer flush's install) — and a missing key cannot tell
-    // such an output from a flush. The tree still commits the deterministic
-    // id order (an openable tree, always), and the overlap is REPORTED: the
-    // key-range intersection under a seqno ceiling of the intersection's top
-    // (ties need the seqno present in BOTH tables). A reconciling deployment
-    // replays the range and its WAL's authoritative order settles the ties —
-    // the replayed memtable copy is the newest source and wins them.
-    // Serialized flushes have DISJOINT seqno ranges, so an ordinary tree
-    // reports nothing; only caller-assigned-seqno deployments (which have a
-    // WAL to heal from) can intersect.
-    //
-    // An INTERVAL SWEEP, not an all-pairs scan: probes sort by key-range MIN
-    // and walk in that order against an active list pruned of every probe
-    // whose MAX fell below the incoming MIN — each remaining active overlaps
-    // the incoming probe by construction, so the pair work is bounded by the
-    // overlapping pairs actually inspected instead of `n²` (50k recovered
-    // tables would otherwise cost ~1.25 billion pair visits on top of the
-    // full-file verification). A store where every table carries the recency
-    // key skips the sweep entirely.
-    struct RecencyProbe {
-        min: UserKey,
-        max: UserKey,
-        lo_seqno: SeqNo,
-        hi_seqno: SeqNo,
-        modern: bool,
-        path: PathBuf,
-    }
-    let mut ambiguous_order_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
-    if recovered_tables
-        .iter()
-        .any(|(t, ..)| t.metadata.recency.is_none())
-    {
-        let cmp = config.comparator.as_ref();
-        let mut probes: Vec<RecencyProbe> = recovered_tables
-            .iter()
-            .map(|(t, _, path, _)| RecencyProbe {
-                min: t.metadata.key_range.min().clone(),
-                max: t.metadata.key_range.max().clone(),
-                lo_seqno: t.get_lowest_seqno(),
-                hi_seqno: t.get_highest_seqno(),
-                modern: t.metadata.recency.is_some(),
-                path: path.clone(),
-            })
-            .collect();
-        probes.sort_by(|a, b| cmp.compare(&a.min, &b.min));
-        let mut active: Vec<&RecencyProbe> = Vec::new();
-        for probe in &probes {
-            active.retain(|other| cmp.compare(&other.max, &probe.min) != core::cmp::Ordering::Less);
-            for other in &active {
-                if probe.modern && other.modern {
-                    continue;
-                }
-                if probe.lo_seqno > other.hi_seqno || other.lo_seqno > probe.hi_seqno {
-                    continue;
-                }
-                // Under a configured MERGE OPERATOR the pair is not
-                // publishable at all: it may be a pre-lineage compaction
-                // output beside its surviving input, and publishing both
-                // applies the input's merge operands twice on every read —
-                // a multiplicity the reported replay cannot remove (the
-                // reconciliation sees both physical copies as survivors, or
-                // the operand as folded into the output's value). Without
-                // lineage neither side can be proven redundant, so the
-                // repair fails closed. Value-only deployments proceed to
-                // the report below: their duplicate records are
-                // byte-identical and reads dedupe them, so ties are the
-                // only hazard and the WAL replay settles those.
-                if config.merge_operator.is_some() {
-                    log::error!(
-                        "repair: tables {} and {} overlap with intersecting seqno \
-                         ranges and no trustworthy order or lineage; under a merge \
-                         operator publishing both would double-apply operands, and \
-                         no replay can undo that",
-                        probe.path.display(),
-                        other.path.display(),
-                    );
-                    return Err(crate::Error::Unrecoverable);
-                }
-                // `other.min <= probe.min` (sort order) and
-                // `other.max >= probe.min` (retained above), so the key
-                // intersection is `[probe.min, min(maxes)]`.
-                let hi = if cmp.compare(&probe.max, &other.max) == core::cmp::Ordering::Less {
-                    &probe.max
-                } else {
-                    &other.max
-                };
-                ambiguous_order_coverage.push((
-                    probe.path.clone(),
-                    probe.min.clone(),
-                    hi.clone(),
-                    Some(probe.hi_seqno.min(other.hi_seqno)),
-                ));
-            }
-            active.push(probe);
-        }
-    }
+    // Every table carries its L0 recency key (a table without one is refused
+    // as it is read), so the order rebuilt from it is the order the live tree
+    // kept and ties in it need no report.
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, ..)| t).collect();
     publish_repaired_manifest(
         config,
@@ -6568,12 +6470,7 @@ fn rebuild_from_scan(
             unreadable_files,
             redundant_unreadable,
             excluded_files,
-            lost_coverage_scoped: (
-                salvaged_coverage,
-                ambiguous_order_coverage,
-                lineage_partial,
-                salvaged_unknowable,
-            ),
+            lost_coverage_scoped: (salvaged_coverage, lineage_partial, salvaged_unknowable),
             coverage_by_path,
             manifest_referenced,
             scanned_table_ids,
@@ -6603,9 +6500,8 @@ struct RepairPublication<'a> {
     /// as corruption, but contributing no lost coverage.
     redundant_unreadable: crate::HashSet<PathBuf>,
     excluded_files: Vec<(PathBuf, String)>,
-    #[expect(clippy::type_complexity, reason = "the four coverage channels")]
+    #[expect(clippy::type_complexity, reason = "the three coverage channels")]
     lost_coverage_scoped: (
-        Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
         Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
         Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>, bool)>,
         Vec<PathBuf>,
@@ -6649,8 +6545,7 @@ fn publish_repaired_manifest(
         unreadable_files,
         redundant_unreadable,
         excluded_files,
-        lost_coverage_scoped:
-            (salvaged_coverage, ambiguous_order_coverage, lineage_partial, salvaged_unknowable),
+        lost_coverage_scoped: (salvaged_coverage, lineage_partial, salvaged_unknowable),
         coverage_by_path,
         manifest_referenced,
         scanned_table_ids,
@@ -7136,7 +7031,6 @@ fn publish_repaired_manifest(
         }
     }
     lost_coverage.extend(salvaged_coverage);
-    lost_coverage.extend(ambiguous_order_coverage);
     lost_coverage.extend(
         lineage_partial
             .into_iter()

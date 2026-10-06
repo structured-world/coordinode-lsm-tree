@@ -782,16 +782,14 @@ pub struct Writer {
     /// Default `Some(false)`.
     bulk_ingested: Option<bool>,
 
-    /// Recency key for manifest repair's L0 ordering: the highest
-    /// [`Table::l0_recency`](crate::table::Table::l0_recency) among this
-    /// table's compaction INPUTS. A compaction output's own id says nothing
-    /// about how new its CONTENT is (the id is allocated when the compaction
-    /// starts writing, while newer flushes with lower ids can install first,
-    /// and an intra-L0 output is appended at the BACK of L0 regardless of its
-    /// id), so repair orders recovered tables by this key instead. `None` —
-    /// a flush / ingest table, whose own id IS its recency — omits the
-    /// on-disk key. Persisted as `recency`.
-    recency: Option<TableId>,
+    /// L0 recency key, persisted as `recency`: the table's own id by default,
+    /// as a flush or ingest table's is, or the highest
+    /// [`Table::l0_recency`](crate::table::Table::l0_recency) among a
+    /// compaction output's INPUTS. An output's own id says nothing about how
+    /// new its CONTENT is (it is allocated when the compaction starts writing,
+    /// while newer flushes with lower ids can install first), so L0 is
+    /// ordered by this key.
+    recency: TableId,
 
     /// Compaction lineage for manifest repair: the sorted ids of the INPUT
     /// tables this output was merged from. A crashed compaction that
@@ -1085,7 +1083,7 @@ impl Writer {
             use_columnar: false,
             value_layout: None,
             bulk_ingested: Some(false),
-            recency: None,
+            recency: table_id,
             lineage: None,
             lineage_prev: None,
             lineage_transformed: false,
@@ -2021,9 +2019,8 @@ impl Writer {
             .use_bulk_ingested(meta.bulk_ingested)
             // A rewrite keeps the source's L0 recency key AND its compaction
             // lineage: the copy carries the same content, so it belongs at the
-            // same position (a `None` recency falls back to its own id, which
-            // the same-id copy shares) and stays recognizable as the same
-            // derived output for the manifest-repair lineage dedup.
+            // same position and stays recognizable as the same derived output
+            // for the manifest-repair lineage dedup.
             .use_recency(meta.recency)
             .use_lineage(meta.lineage.clone())
             .use_lineage_prev(meta.lineage_prev)
@@ -2241,12 +2238,11 @@ impl Writer {
     }
 
     /// Sets the recency key (see [`Self::recency`] field): the highest
-    /// `l0_recency` among a compaction's inputs, so manifest repair can place
-    /// this output where its CONTENT belongs in L0 instead of where its id
-    /// falls. `None` (the default) is a flush / ingest table, whose own id is
-    /// its recency.
+    /// `l0_recency` among a compaction's inputs, so L0 places this output
+    /// where its CONTENT belongs instead of where its id falls. The default,
+    /// the table's own id, is a flush or ingest table's.
     #[must_use]
-    pub(crate) fn use_recency(mut self, recency: Option<TableId>) -> Self {
+    pub(crate) fn use_recency(mut self, recency: TableId) -> Self {
         self.assert_not_started("use_recency");
         self.recency = recency;
         self
@@ -4767,10 +4763,8 @@ struct MetaSectionParams<'a> {
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
-    /// L0 recency key: `Some(_)` writes `recency` (a compaction output whose
-    /// content position differs from its id), `None` omits it (a flush /
-    /// ingest table, whose own id is its recency).
-    recency: Option<TableId>,
+    /// L0 recency key, written as `recency` on every table.
+    recency: TableId,
     /// Compaction lineage: `Some(_)` writes `lineage` (the sorted input ids a
     /// compaction output merges), `None` omits it.
     lineage: Option<Vec<TableId>>,
@@ -5054,14 +5048,8 @@ fn encode_meta_payload(
         meta_items.push(meta("descriptor#value_layout", &[p.value_layout.to_byte()]));
     }
 
-    // L0 recency key: emitted ONLY for a table whose content position differs
-    // from its id (a compaction output). Absence means "my own id is my
-    // recency" — a flush / ingest table, or any table from before this key
-    // existed, for which that id order matches what manifest repair assumed
-    // all along.
-    if let Some(recency) = p.recency {
-        meta_items.push(meta("recency", &recency.to_le_bytes()));
-    }
+    // L0 recency key, on every table: the reader requires it.
+    meta_items.push(meta("recency", &p.recency.to_le_bytes()));
 
     // Hashes the filter holds, which a prefix extractor makes more than the
     // keys: what a filter's size follows. Emitted only when there is a filter.

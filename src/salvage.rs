@@ -1161,7 +1161,7 @@ fn salvage_attempt(
     // position during manifest repair. Pinned explicitly (not just mirrored):
     // a copy published under a FRESH id would otherwise fall back to that new
     // id and claim a recency its content does not have.
-    .use_recency(Some(table.l0_recency()))
+    .use_recency(table.l0_recency())
     // The source's compaction lineage travels with the copy for the same
     // reason: the content is the same derived output.
     .use_lineage(table.metadata.lineage.clone())

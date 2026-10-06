@@ -275,14 +275,13 @@ pub struct ParsedMeta {
     /// SST alone.
     pub bulk_ingested: Option<bool>,
 
-    /// L0 recency key from the optional `recency` property: the highest
-    /// recency among this table's compaction INPUTS. A compaction output's own
-    /// id says nothing about how new its content is (ids are allocated at
-    /// write start, and an intra-L0 output is appended at the BACK of L0), so
-    /// manifest repair orders L0 by this key. `None` — a flush / ingest table,
-    /// or one from before this key existed — means the table's own id is its
-    /// recency (see [`Table::l0_recency`](crate::table::Table::l0_recency)).
-    pub recency: Option<TableId>,
+    /// L0 recency key from the required `recency` property: a flush or
+    /// ingest table's own id, a compaction output's highest recency among its
+    /// INPUTS. An output's own id says nothing about how new its content is
+    /// (ids are allocated at write start, while a newer flush with a lower id
+    /// may still install), so L0 is ordered by this key. Every table carries
+    /// it; one without it is refused as it is read.
+    pub recency: TableId,
 
     /// Compaction lineage from the optional `lineage` property: the sorted
     /// ids of the INPUT tables a compaction output was merged from. Manifest
@@ -733,7 +732,9 @@ impl ParsedMeta {
             },
             None => None,
         };
-        let recency = read_opt_u64(b"recency")?;
+        // Required: L0 is ordered by it, and a table id is no stand-in for a
+        // compaction output's age.
+        let recency = read_u64!(block, b"recency", &cmp);
         // Compaction lineage: consecutive little-endian input ids. A payload
         // that is not a whole number of ids is corrupt meta.
         let lineage = match block.point_read(b"lineage", SeqNo::MAX, &cmp)? {

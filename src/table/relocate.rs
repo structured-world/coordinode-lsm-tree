@@ -316,23 +316,9 @@ impl Table {
             0,
             crate::ValueType::Value,
         ));
-        // The copy's id is allocated at relocation time, so its CONTENT
-        // position must be stated explicitly: a byte-exact copy of a
-        // compaction output already carries the source's `recency`, but a
-        // flush/ingest source encodes "my id is my recency" by omission —
-        // which would silently become the copy's NEWER id. Pin it to the
-        // source's position.
-        if !entries
-            .iter()
-            .any(|e| e.key.user_key.as_ref() == b"recency")
-        {
-            entries.push(InternalValue::from_components(
-                b"recency".to_vec(),
-                &self.metadata.id.to_le_bytes()[..],
-                0,
-                crate::ValueType::Value,
-            ));
-        }
+        // The copy's id is allocated at relocation time, but it keeps the
+        // source's `recency` entry, which every table carries: its content
+        // position is the source's, not its own newer id.
         entries.sort_by(|a, b| cmp.compare(a.key.user_key.as_ref(), b.key.user_key.as_ref()));
 
         // Same encode parameters the writer uses for the meta block
