@@ -2,6 +2,57 @@ use super::*;
 use crate::fs::StdFs;
 use test_log::test;
 
+/// The swept age of each output in an ascending chain must be what checking
+/// every input gives, for disjoint inputs, overlapping ones (an L0 table
+/// spanning many others), and outputs before, between and after them.
+#[test]
+fn swept_ages_match_every_input_checked() {
+    let key = |n: u32| UserKey::from(n.to_be_bytes().as_slice());
+    let mut inputs: Vec<InputAge> = (0..40u32)
+        .map(|i| InputAge {
+            min: key(i * 10),
+            max: key(i * 10 + 5),
+            created_at: u128::from(i * 7 % 13),
+        })
+        .collect();
+    // Wide tables overlapping many disjoint ones, as L0 tables over a level.
+    inputs.push(InputAge {
+        min: key(3),
+        max: key(390),
+        created_at: 5,
+    });
+    inputs.push(InputAge {
+        min: key(150),
+        max: key(160),
+        created_at: 100,
+    });
+    let comparator = crate::comparator::default_comparator();
+    let naive = |first: &[u8], last: &[u8]| {
+        inputs
+            .iter()
+            .filter(|input| {
+                comparator.compare(&input.min, last) != core::cmp::Ordering::Greater
+                    && comparator.compare(&input.max, first) != core::cmp::Ordering::Less
+            })
+            .map(|input| input.created_at)
+            .max()
+    };
+    // One chain per output width, each output starting after the last ended.
+    for width in [0u32, 1, 4, 9, 30, 200] {
+        let mut sweep = AgeSweep::new(inputs.clone(), comparator.clone());
+        let mut first = 0u32;
+        while first < 420 {
+            let (lo, hi) = (key(first), key(first + width));
+            assert_eq!(
+                sweep.age_of(&lo, &hi),
+                naive(&lo, &hi),
+                "output {lo:?}..={hi:?} of width {width}"
+            );
+            first += width + 1;
+        }
+    }
+}
+
 #[test]
 fn finish_rejects_a_delete_bitmap_without_a_zone_map() -> crate::Result<()> {
     // The positional mask resolves each block's start row from the zone map,

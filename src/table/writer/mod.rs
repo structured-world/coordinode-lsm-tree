@@ -129,6 +129,113 @@ struct DirectBlockInputs {
     zone_block_min: Option<UserKey>,
 }
 
+/// One compaction input as an output sees it for its age: the input's key
+/// range and its `created_at` (see [`AgeSweep`]).
+#[derive(Clone, Debug)]
+pub(crate) struct InputAge {
+    pub min: UserKey,
+    pub max: UserKey,
+    pub created_at: u128,
+}
+
+/// The inputs of one compaction, swept in step with the outputs one writer
+/// chain produces in ascending key order: an input joins the live set once
+/// an output reaches its min key and leaves it once outputs pass its max key,
+/// so each joins and leaves once, whatever its width, and the whole run costs
+/// near-linear time in inputs and outputs rather than their product.
+pub(crate) struct AgeSweep {
+    /// The inputs by ascending min key.
+    by_min: Vec<InputAge>,
+    /// Each input's rank among the inputs by ascending max key.
+    max_rank: Vec<usize>,
+    /// The next input of `by_min` to join.
+    next: usize,
+    /// The live inputs by ascending max rank, as `(rank, index)`.
+    live: alloc::collections::BinaryHeap<core::cmp::Reverse<(usize, usize)>>,
+    /// The ages of the live inputs, with their counts.
+    ages: alloc::collections::BTreeMap<u128, usize>,
+    comparator: crate::SharedComparator,
+    /// The last range queried, held in debug builds to check the ascending
+    /// order the sweep relies on.
+    #[cfg(debug_assertions)]
+    last_range: Option<(UserKey, UserKey)>,
+}
+
+impl AgeSweep {
+    pub(crate) fn new(mut inputs: Vec<InputAge>, comparator: crate::SharedComparator) -> Self {
+        inputs.sort_by(|a, b| comparator.compare(&a.min, &b.min));
+        let mut by_max: Vec<usize> = (0..inputs.len()).collect();
+        by_max.sort_by(|&a, &b| match (inputs.get(a), inputs.get(b)) {
+            (Some(a), Some(b)) => comparator.compare(&a.max, &b.max),
+            _ => core::cmp::Ordering::Equal,
+        });
+        let mut max_rank = alloc::vec![0; inputs.len()];
+        for (rank, index) in by_max.into_iter().enumerate() {
+            if let Some(slot) = max_rank.get_mut(index) {
+                *slot = rank;
+            }
+        }
+        Self {
+            by_min: inputs,
+            max_rank,
+            next: 0,
+            live: alloc::collections::BinaryHeap::new(),
+            ages: alloc::collections::BTreeMap::new(),
+            comparator,
+            #[cfg(debug_assertions)]
+            last_range: None,
+        }
+    }
+
+    /// The newest `created_at` among the inputs whose key range meets
+    /// `first..=last`, or `None` when none does. Successive calls must pass
+    /// ranges that follow one another in ascending key order, as the outputs
+    /// of one writer chain do.
+    pub(crate) fn age_of(&mut self, first: &[u8], last: &[u8]) -> Option<u128> {
+        use core::cmp::Ordering::{Greater, Less};
+
+        #[cfg(debug_assertions)]
+        {
+            if let Some((_, previous_last)) = &self.last_range {
+                debug_assert!(
+                    self.comparator.compare(previous_last, first) != Greater,
+                    "outputs swept out of key order"
+                );
+            }
+            self.last_range = Some((first.into(), last.into()));
+        }
+
+        // Join every input that starts at or before `last`.
+        while let Some(input) = self.by_min.get(self.next) {
+            if self.comparator.compare(&input.min, last) == Greater {
+                break;
+            }
+            let rank = self.max_rank.get(self.next).copied().unwrap_or_default();
+            self.live.push(core::cmp::Reverse((rank, self.next)));
+            *self.ages.entry(input.created_at).or_insert(0) += 1;
+            self.next += 1;
+        }
+        // Leave every input that ends before `first`: the live input with the
+        // lowest max rank goes first, so once it reaches `first`, all do.
+        while let Some(&core::cmp::Reverse((_, index))) = self.live.peek() {
+            let Some(input) = self.by_min.get(index) else {
+                break;
+            };
+            if self.comparator.compare(&input.max, first) != Less {
+                break;
+            }
+            self.live.pop();
+            if let Some(count) = self.ages.get_mut(&input.created_at) {
+                *count -= 1;
+                if *count == 0 {
+                    self.ages.remove(&input.created_at);
+                }
+            }
+        }
+        self.ages.last_key_value().map(|(&age, _)| age)
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, core::hash::Hash)]
 pub struct LinkedFile {
     pub blob_file_id: BlobFileId,
@@ -2792,10 +2899,23 @@ impl Writer {
         )
     }
 
+    /// Finishes the table, making sure all data is written durably
+    pub fn finish(self) -> crate::Result<Option<(TableId, Checksum)>> {
+        self.finish_aged(None)
+    }
+
     // TODO: split meta writing into new function
     #[expect(clippy::too_many_lines)]
-    /// Finishes the table, making sure all data is written durably
-    pub fn finish(mut self) -> crate::Result<Option<(TableId, Checksum)>> {
+    /// [`Self::finish`], a compaction output taking its `created_at` from
+    /// `ages`: the newest age among the compaction inputs its key range
+    /// meets, so a rewrite keeps the age of the data it carries instead of
+    /// the time it was written, and an age-based policy (FIFO's TTL and drop
+    /// order) sees the same data as old after a compaction as before it.
+    /// Without `ages` (a flush, an ingest, a salvage copy) the clock is read.
+    pub(crate) fn finish_aged(
+        mut self,
+        ages: Option<&mut AgeSweep>,
+    ) -> crate::Result<Option<(TableId, Checksum)>> {
         #[cfg(not(feature = "std"))]
         use crate::io::Write;
         #[cfg(feature = "std")]
@@ -3171,10 +3291,13 @@ impl Writer {
         #[expect(clippy::expect_used, reason = "non-empty table guaranteed earlier")]
         let last_key = self.meta.last_key.as_ref().expect("last_key should exist");
         let range_tombstone_count = self.range_tombstones.len() as u64;
-        // Snapshot the wall-clock once — both MID and TAIL copies
-        // must report the SAME created_at so MID-fallback recovery
-        // produces the same timestamp as a clean TAIL recovery.
-        let created_at_nanos = unix_timestamp().as_nanos();
+        // Decided once — both MID and TAIL copies must report the SAME
+        // created_at so MID-fallback recovery produces the same timestamp as
+        // a clean TAIL recovery. A compaction output inherits the age of the
+        // inputs it carries data from; anything else reads the clock.
+        let created_at_nanos = ages
+            .and_then(|ages| ages.age_of(first_key, last_key))
+            .unwrap_or_else(|| unix_timestamp().as_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
             last_key,

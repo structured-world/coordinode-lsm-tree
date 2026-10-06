@@ -4,8 +4,8 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::{
-    HashSet, KvPair, compaction::state::CompactionState, config::Config, time::unix_timestamp,
-    version::Version,
+    HashMap, HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config,
+    table::Table, time::unix_timestamp, version::Version, vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -16,12 +16,26 @@ pub const NAME: &str = "FifoCompaction";
 /// FIFO-style compaction
 ///
 /// Limits the tree size to roughly `limit` bytes, deleting the oldest table(s)
-/// when the threshold is reached.
+/// when the threshold is reached. Tables are dropped whole, oldest data first,
+/// from whichever level they are in, so a tree that was major-compacted keeps
+/// its limit, and overlapping tables are fine: the older one goes first. A
+/// table's age is its `created_at`: the write time of a flushed table, and for
+/// a compaction output the newest age among the inputs its key range meets,
+/// so a compaction neither makes data look newer nor restarts its TTL. Tables
+/// of one age, as the outputs that split one input, go by their highest
+/// sequence number, and in key order once a compaction has zeroed it. A table
+/// another compaction is working on is left for a later round, and no newer
+/// table is dropped ahead of it.
 ///
-/// Will also merge tables if the number of tables in level 0 grows too much, which
-/// could cause write stalls.
+/// Age is as fine as a table and the clock, no finer: a table goes whole, so
+/// newer records of it go with its oldest, and data of one age is equally old
+/// to FIFO whatever order it was inserted in. FIFO itself never merges
+/// tables; another compaction run on the tree (`major_compact`, another
+/// strategy) can, and FIFO applies its limit and TTL to those outputs by the
+/// age they carry.
 ///
-/// Additionally, a (lazy) TTL can be configured to drop old tables.
+/// Additionally, a (lazy) TTL can be configured to drop old tables. It is off
+/// while the clock reads zero, which is no clock.
 ///
 /// ###### Caution
 ///
@@ -74,53 +88,62 @@ impl CompactionStrategy for Strategy {
     }
 
     fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
-        let first_level = version.l0();
-
         // Early return avoids unnecessary work and keeps FIFO a no-op when there is nothing to do.
-        if first_level.is_empty() {
+        if version.iter_tables().next().is_none() {
             return Choice::DoNothing;
         }
 
-        assert!(first_level.is_disjoint(), "L0 needs to be disjoint");
-
-        assert!(
-            !version.level_is_busy(0, state.hidden_set()),
-            "FIFO compaction never compacts",
-        );
-
-        // Account for both table file bytes and value-log (blob) bytes to enforce the true space limit.
-        let db_size = first_level.size() + version.blob_files.on_disk_size();
+        // Account for both table file bytes and value-log (blob) bytes to enforce the true space
+        // limit. A table another compaction holds still occupies its space, so it counts here,
+        // but only free tables can be dropped below.
+        // Summed on-disk sizes cannot overflow u64.
+        let db_size = version.iter_tables().map(Table::file_size).sum::<u64>()
+            + version.blob_files.on_disk_size();
+        let hidden = state.hidden_set();
 
         let mut ids_to_drop: HashSet<_> = HashSet::default();
 
         // Compute TTL cutoff once and perform a single pass to mark expired tables and
         // accumulate their sizes. Also collect non-expired tables for possible size-based drops.
+        let now = unix_timestamp();
         let ttl_cutoff = match self.ttl_seconds {
-            Some(s) if s > 0 => Some(
+            // A clock at zero is no clock (a `no_std` build before one is
+            // registered): TTL is off then, as tables written meanwhile carry
+            // time zero too and would all look expired.
+            Some(s) if s > 0 && !now.is_zero() => Some(
                 // Clamp-to-zero: a TTL longer than the wall clock leaves no
                 // expiry cutoff rather than wrapping.
-                unix_timestamp()
-                    .as_nanos()
+                now.as_nanos()
                     .saturating_sub(u128::from(s) * 1_000_000_000u128),
             ),
             _ => None,
         };
+        // A table whose blob references cannot be read leaves the bytes it
+        // frees unknown: the round waits for one that can read them.
+        let mut blob_credit = BlobCredit::new(version);
 
         let mut ttl_dropped_bytes = 0u64;
+        // Every table not expired, held ones included: they keep their place in
+        // the age order below.
         let mut alive = Vec::new();
 
-        for table in first_level.iter().flat_map(|run| run.iter()) {
-            let expired =
-                ttl_cutoff.is_some_and(|cutoff| u128::from(table.metadata.created_at) <= cutoff);
+        for table in version.iter_tables() {
+            let held = hidden.is_hidden(table.id());
+            // A table stamped while the clock read zero has no age at all: it
+            // is never TTL-expired, though the clock has run since.
+            let age = u128::from(table.metadata.created_at);
+            let expired = !held && age != 0 && ttl_cutoff.is_some_and(|cutoff| age <= cutoff);
 
             if expired {
                 ids_to_drop.insert(table.id());
-                let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
+                let Some(freed) = blob_credit.drop_table(table.id()) else {
+                    return Choice::DoNothing;
+                };
                 // Accumulated dropped-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                ttl_dropped_bytes += table.file_size() + linked_blob_file_bytes;
+                ttl_dropped_bytes += table.file_size() + freed;
             } else {
-                alive.push(table);
+                alive.push((table, held));
             }
         }
 
@@ -133,20 +156,36 @@ impl CompactionStrategy for Strategy {
 
             let mut collected_bytes = 0u64;
 
-            // Oldest-first list by creation time from the non-expired set.
-            alive.sort_by_key(|t| t.metadata.created_at);
+            // Oldest data first, by age: a compaction output carries the
+            // newest age of the inputs its keys came from, so the order holds
+            // after a major compaction, even one that zeroed the sequence
+            // numbers. The highest sequence number orders tables of one age:
+            // FIFO admits only inserts, so it follows insertion while kept.
+            // Once a bottommost compaction has zeroed it, tables of one age
+            // fall to key order: they are equally old, which is all the
+            // order FIFO promises, so the zeroing stays (it is what keeps a
+            // bottom-level record's sequence number at one byte).
+            alive.sort_by_key(|(t, _)| (t.metadata.created_at, t.get_highest_seqno(), t.id()));
 
-            for table in alive {
+            for (table, held) in alive {
                 if collected_bytes >= overshoot {
+                    break;
+                }
+                // A held table still counts against the limit, and dropping
+                // newer tables in its place would lose recent data while the
+                // older one stays: wait for the round after its compaction.
+                if held {
                     break;
                 }
 
                 ids_to_drop.insert(table.id());
+                let Some(freed) = blob_credit.drop_table(table.id()) else {
+                    return Choice::DoNothing;
+                };
 
-                let linked_blob_file_bytes = table.referenced_blob_bytes().unwrap_or_default();
                 // Accumulated collected-byte total, bounded by the on-disk size;
                 // cannot overflow u64.
-                collected_bytes += table.file_size() + linked_blob_file_bytes;
+                collected_bytes += table.file_size() + freed;
             }
         }
 
@@ -155,6 +194,93 @@ impl CompactionStrategy for Strategy {
         } else {
             Choice::Drop(ids_to_drop)
         }
+    }
+}
+
+/// What dropping tables frees in blob files. A blob file goes only with the
+/// last table that references it, so several tables sharing one, as the
+/// outputs of a compaction do, free its bytes together and none of them
+/// alone.
+///
+/// The references are read on the first drop, so a round that drops nothing
+/// reads none.
+struct BlobCredit<'v> {
+    version: &'v Version,
+    /// Every table's references, once read.
+    refs: Option<BlobRefs>,
+}
+
+/// Every table's blob references, and how many tables reference each file.
+struct BlobRefs {
+    /// The blob files each table references.
+    files_of: HashMap<TableId, Vec<BlobFileId>>,
+    /// How many tables, dropped or not yet, still reference each blob file.
+    refs: HashMap<BlobFileId, usize>,
+}
+
+impl BlobRefs {
+    /// The references of every table in `version`, or `None` when one cannot
+    /// be read. A version without blob files reads none.
+    fn read(version: &Version) -> Option<Self> {
+        let mut files_of = HashMap::default();
+        let mut refs: HashMap<BlobFileId, usize> = HashMap::default();
+        if version.blob_files.len() > 0 {
+            for table in version.iter_tables() {
+                let files: Vec<BlobFileId> = table
+                    .list_blob_file_references()
+                    .ok()?
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|file| file.blob_file_id)
+                    .collect();
+                for &file in &files {
+                    *refs.entry(file).or_insert(0) += 1;
+                }
+                files_of.insert(table.id(), files);
+            }
+        }
+        Some(Self { files_of, refs })
+    }
+}
+
+impl<'v> BlobCredit<'v> {
+    fn new(version: &'v Version) -> Self {
+        Self {
+            version,
+            refs: None,
+        }
+    }
+
+    /// The blob bytes freed by dropping `table` after the tables dropped
+    /// before it: those of every blob file it was the last to reference.
+    /// `None` when the references cannot be read, which leaves what dropping
+    /// frees unknown.
+    fn drop_table(&mut self, table: TableId) -> Option<u64> {
+        if self.refs.is_none() {
+            self.refs = Some(BlobRefs::read(self.version)?);
+        }
+        let refs = self.refs.as_mut()?;
+        let Some(files) = refs.files_of.remove(&table) else {
+            return Some(0);
+        };
+        let mut freed = 0;
+        for file in files {
+            let Some(count) = refs.refs.get_mut(&file) else {
+                continue;
+            };
+            // Counted from the same lists, once per referencing table, and a
+            // table's list leaves `files_of` on its first drop.
+            debug_assert!(*count > 0, "blob file {file} released twice");
+            *count -= 1;
+            if *count == 0 {
+                freed += self
+                    .version
+                    .blob_files
+                    .get(file)
+                    .map_or(0, |blob_file| blob_file.meta().total_compressed_bytes);
+            }
+        }
+        Some(freed)
     }
 }
 
