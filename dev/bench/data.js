@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791317413289,
+  "lastUpdate": 1791317419775,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -34028,6 +34028,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 8819.6,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "6257c15e11fb7746fefa9ad2f225054454e33402",
+          "message": "fix(compaction): FIFO drops from every level and never panics on L0 shape (#852)\n\n## Summary\n\n- FIFO compaction no longer panics on an L0 whose tables overlap (keys\nnot strictly monotonic across flushes) or that another compaction holds,\nas when `major_compact` runs on a FIFO tree.\n- The size limit and the TTL keep applying after a major compaction\nmoved the tables below L0, with the data keeping its age through it.\n\nThe 5.x line got the same fix in #842.\n\n## Changes\n\n- A compaction output's `created_at` is the newest `created_at` among\nthe inputs whose key range meets its own, not the time it was written; a\nflush or an ingest keeps the write time. An input stamped while the\nclock read zero has no age, and an output meeting one has none either.\nThe ages are found by a sweep that advances with the outputs in key\norder, so each input is visited once whatever its width.\n- FIFO walks the tables of every level, counts all of them against the\nsize limit, and drops whole tables oldest first by that age, then by the\nhighest sequence number. Age is as fine as a table and the clock: tables\nof one age, as the outputs that split one input, go in key order once a\ncompaction has zeroed their sequence numbers.\n- The TTL counts from the data's age, so a compaction does not restart\nit; it is off while the clock reads zero, and a table stamped while it\nread zero has no age and never expires.\n- A table another compaction holds is never dropped and keeps its place\nin the age order: no newer table is dropped ahead of it.\n- A blob file is credited as freed only with the last table that\nreferences it, read from each table's cached blob links, and never while\na memtable row references it, since such a file outlives its last table;\na table whose references cannot be read makes the round wait.\n- Tests that pin the clock, and tests whose drop order follows flush\nages on the real clock, run inside a helper that holds the process-wide\noverride for the whole test.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux. The regression tests fail\nwithout the fix.\n\nCloses #824\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* FIFO compaction now considers tables across all levels, including\noverlapping tables, and counts both table and blob data toward its size\nlimit.\n* Compaction outputs retain the age of the newest applicable input data,\nkeeping age-based selection consistent after compaction.\n* TTL-based selection applies only to tables with a known creation time\nthat meets the cutoff; TTL selection is skipped when the clock is zero.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-06T22:53:57+03:00",
+          "tree_id": "4900c4f4c24ec851d0fb102981404316e28b3cba",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/6257c15e11fb7746fefa9ad2f225054454e33402"
+        },
+        "date": 1791317417033,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 523.2,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 65.9252ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 129.70000000000002,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.5119ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 702.1,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 86.9857ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 2531.9,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 8950,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
