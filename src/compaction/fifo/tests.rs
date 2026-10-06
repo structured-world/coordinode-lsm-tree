@@ -140,28 +140,32 @@ fn fifo_overlapping_l0_compacts_without_panic_and_drops_oldest_first() -> crate:
     )
     .open()?;
 
-    tree.insert("a", "old", 0);
-    tree.insert("c", "old", 1);
-    tree.flush_active_memtable(1)?;
-    tree.insert("b", "new", 2);
-    tree.flush_active_memtable(2)?;
+    // The drop order follows the flushes' ages on the real clock: holding the
+    // clock keeps another test's override out of them.
+    with_test_clock(|_| {
+        tree.insert("a", "old", 0);
+        tree.insert("c", "old", 1);
+        tree.flush_active_memtable(1)?;
+        tree.insert("b", "new", 2);
+        tree.flush_active_memtable(2)?;
 
-    // Nothing to drop: the tree is left as it is.
-    tree.compact(Arc::new(Strategy::new(u64::MAX, None)), 3)?;
-    assert_eq!(2, tree.table_count());
+        // Nothing to drop: the tree is left as it is.
+        tree.compact(Arc::new(Strategy::new(u64::MAX, None)), 3)?;
+        assert_eq!(2, tree.table_count());
 
-    // A limit just below the total keeps the newer table and drops the older.
-    let newest_size = tree
-        .current_version()
-        .iter_tables()
-        .max_by_key(|t| t.get_highest_seqno())
-        .map(crate::table::Table::file_size)
-        .unwrap_or_default();
-    tree.compact(Arc::new(Strategy::new(newest_size, None)), 3)?;
-    assert_eq!(1, tree.table_count());
-    assert!(tree.get("b", 3)?.is_some(), "the newer table must survive");
-    assert!(tree.get("a", 3)?.is_none(), "the older table goes first");
-    Ok(())
+        // A limit just below the total keeps the newer table and drops the older.
+        let newest_size = tree
+            .current_version()
+            .iter_tables()
+            .max_by_key(|t| t.get_highest_seqno())
+            .map(crate::table::Table::file_size)
+            .unwrap_or_default();
+        tree.compact(Arc::new(Strategy::new(newest_size, None)), 3)?;
+        assert_eq!(1, tree.table_count());
+        assert!(tree.get("b", 3)?.is_some(), "the newer table must survive");
+        assert!(tree.get("a", 3)?.is_none(), "the older table goes first");
+        Ok(())
+    })
 }
 
 /// After `major_compact` the tables sit in the last level, not L0. The size
@@ -250,37 +254,41 @@ fn fifo_after_major_compaction_drops_oldest_data_first_for_decreasing_keys() -> 
 
     // Seqno 0 carries key 399, the last seqno carries key 0.
     let keys = 400u32;
-    for key in (0..keys).rev() {
-        let seqno = u64::from(keys - 1 - key);
-        tree.insert(key.to_be_bytes().as_slice(), value(), seqno);
-        if key % 100 == 0 {
-            tree.flush_active_memtable(seqno)?;
+    // The outputs' ages come from the flushes' on the real clock: holding the
+    // clock keeps another test's override out of them.
+    with_test_clock(|_| {
+        for key in (0..keys).rev() {
+            let seqno = u64::from(keys - 1 - key);
+            tree.insert(key.to_be_bytes().as_slice(), value(), seqno);
+            if key % 100 == 0 {
+                tree.flush_active_memtable(seqno)?;
+            }
         }
-    }
-    let watermark = u64::from(keys);
-    tree.major_compact(16 * 1024, 0)?;
-    assert!(
-        tree.table_count() > 1,
-        "the compaction must produce several outputs"
-    );
+        let watermark = u64::from(keys);
+        tree.major_compact(16 * 1024, 0)?;
+        assert!(
+            tree.table_count() > 1,
+            "the compaction must produce several outputs"
+        );
 
-    let newest = tree
-        .current_version()
-        .iter_tables()
-        .max_by_key(|t| t.get_highest_seqno())
-        .map(crate::table::Table::file_size)
-        .unwrap_or_default();
-    tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
+        let newest = tree
+            .current_version()
+            .iter_tables()
+            .max_by_key(|t| t.get_highest_seqno())
+            .map(crate::table::Table::file_size)
+            .unwrap_or_default();
+        tree.compact(Arc::new(Strategy::new(newest, None)), watermark)?;
 
-    assert!(
-        tree.get(0u32.to_be_bytes(), watermark)?.is_some(),
-        "the newest key must survive"
-    );
-    assert!(
-        tree.get((keys - 1).to_be_bytes(), watermark)?.is_none(),
-        "the oldest key goes first"
-    );
-    Ok(())
+        assert!(
+            tree.get(0u32.to_be_bytes(), watermark)?.is_some(),
+            "the newest key must survive"
+        );
+        assert!(
+            tree.get((keys - 1).to_be_bytes(), watermark)?.is_none(),
+            "the oldest key goes first"
+        );
+        Ok(())
+    })
 }
 
 /// A table another compaction holds is not FIFO's to drop, and holding it
@@ -297,10 +305,15 @@ fn fifo_choose_skips_hidden_tables_instead_of_panicking() -> crate::Result<()> {
     )
     .open()?;
 
-    for i in 0..3u8 {
-        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
-        tree.flush_active_memtable(u64::from(i))?;
-    }
+    // FIFO orders the tables by their flushes' ages on the real clock: holding
+    // the clock keeps another test's override out of them.
+    with_test_clock(|_| {
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        crate::Result::Ok(())
+    })?;
     let version = tree.current_version();
     let Some(newest) = version
         .iter_tables()
@@ -347,10 +360,15 @@ fn fifo_choose_drops_no_newer_table_while_the_oldest_is_held() -> crate::Result<
     )
     .open()?;
 
-    for i in 0..3u8 {
-        tree.insert([b'k', i].as_slice(), "v", u64::from(i));
-        tree.flush_active_memtable(u64::from(i))?;
-    }
+    // FIFO orders the tables by their flushes' ages on the real clock: holding
+    // the clock keeps another test's override out of them.
+    with_test_clock(|_| {
+        for i in 0..3u8 {
+            tree.insert([b'k', i].as_slice(), "v", u64::from(i));
+            tree.flush_active_memtable(u64::from(i))?;
+        }
+        crate::Result::Ok(())
+    })?;
     let version = tree.current_version();
     let Some((oldest, oldest_size)) = version
         .iter_tables()
