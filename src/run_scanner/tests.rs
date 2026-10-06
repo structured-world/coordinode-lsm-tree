@@ -36,7 +36,7 @@ fn run_scanner_basic() -> crate::Result<()> {
 
     #[expect(clippy::unwrap_used)]
     {
-        let multi_reader = RunScanner::culled(level.clone(), (None, None))?;
+        let multi_reader = RunScanner::culled(level.clone(), (None, None), None)?;
 
         let mut iter = multi_reader.flatten();
 
@@ -57,7 +57,7 @@ fn run_scanner_basic() -> crate::Result<()> {
 
     #[expect(clippy::unwrap_used)]
     {
-        let multi_reader = RunScanner::culled(level, (Some(1), None))?;
+        let multi_reader = RunScanner::culled(level, (Some(1), None), None)?;
 
         let mut iter = multi_reader.flatten();
 

@@ -3035,7 +3035,7 @@ fn salvage_blocks(
         writer.own_blob_objects(derived_owned_cells);
         // The caller syncs the destination's directory: the publish after its
         // rename, or the direct path once the attempt returns.
-        writer.finish_deferring_dir_sync()?;
+        writer.finish_deferring_dir_sync(None)?;
     } else {
         drop(writer);
     }

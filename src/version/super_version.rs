@@ -772,6 +772,17 @@ impl SuperVersion {
                 .iter()
                 .any(|memtable| memtable.references_blob_file(blob_file_id))
     }
+
+    /// The blob files cell rows in the active and the sealed memtables
+    /// reference: each stays when its last table goes.
+    pub(crate) fn memtable_blob_files(&self) -> crate::HashSet<crate::vlog::BlobFileId> {
+        let mut files = crate::HashSet::default();
+        self.active_memtable.collect_blob_files(&mut files);
+        for memtable in self.sealed_memtables.iter() {
+            memtable.collect_blob_files(&mut files);
+        }
+        files
+    }
 }
 
 /// Kept out of line so the check inlined into every read stays a load and two

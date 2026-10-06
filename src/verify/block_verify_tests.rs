@@ -1844,6 +1844,334 @@ fn a_paced_file_keeps_the_bytes_read_before_an_interruption() -> crate::Result<(
     Ok(())
 }
 
+/// A file that takes `delay` to answer every read, as a congested device does,
+/// and answers with an error instead of bytes when `fails`.
+struct SlowReads {
+    inner: Box<dyn crate::fs::FsFile>,
+    delay: std::time::Duration,
+    fails: bool,
+}
+
+impl std::io::Read for SlowReads {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::thread::sleep(self.delay);
+        if self.fails {
+            return Err(std::io::ErrorKind::Other.into());
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for SlowReads {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for SlowReads {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for SlowReads {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// The reads a paced scan charges feed the limiter's latency backoff: a
+/// device slower than the ceiling lowers the rate the limiter grants, down to
+/// no lower than its floor, while a limiter without a backoff keeps its rate.
+#[test]
+fn a_paced_file_reports_its_read_latency_to_the_limiter() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use std::time::Duration;
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    let bytes = vec![7u8; 16 * 1024];
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&bytes)?;
+    }
+    let slow = || -> crate::Result<SlowReads> {
+        Ok(SlowReads {
+            inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+            delay: Duration::from_millis(5),
+            fails: false,
+        })
+    };
+
+    // Enough rate that no read waits for the budget.
+    let configured = 1 << 30;
+    let limiter = RateLimiter::new(configured);
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let mut reader =
+        std::io::BufReader::with_capacity(1024, PacedFile::new(Box::new(slow()?), Some(&limiter))?);
+    let mut read = vec![0u8; bytes.len()];
+    reader.read_exact(&mut read[..])?;
+    assert_eq!(read, bytes);
+    let granted = limiter.effective_rate();
+    assert!(granted < configured, "a slow device did not lower the rate");
+    assert!(
+        granted >= configured / 20,
+        "the rate fell below the 5% floor: {granted}"
+    );
+
+    let unmanaged = RateLimiter::new(configured);
+    let mut reader = std::io::BufReader::with_capacity(
+        1024,
+        PacedFile::new(Box::new(slow()?), Some(&unmanaged))?,
+    );
+    reader.read_exact(&mut read[..])?;
+    assert_eq!(configured, unmanaged.effective_rate());
+    Ok(())
+}
+
+/// A read the device answers slowly with an error, before any byte, still
+/// counts toward the backoff: a scan that goes on past failed sections must
+/// not keep hammering a congested device at the full rate.
+#[test]
+fn a_slow_failed_read_lowers_the_granted_rate() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use std::time::Duration;
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&[7u8; 4096])?;
+    }
+    let configured = 1 << 30;
+    let limiter = RateLimiter::new(configured);
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let failing = SlowReads {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        delay: Duration::from_millis(5),
+        fails: true,
+    };
+    let mut paced = PacedFile::new(Box::new(failing), Some(&limiter))?;
+    let mut buf = [0u8; 1024];
+    for _ in 0..4 {
+        assert!(std::io::Read::read(&mut paced, &mut buf).is_err());
+    }
+    assert!(
+        limiter.effective_rate() < configured,
+        "slow failures did not lower the rate"
+    );
+    Ok(())
+}
+
+/// A failed read hands back what it was charged afresh, so the bytes are not
+/// paid twice when read again, but not the credit it was paid from: handed
+/// back each time, one credit would pay every later failed read and none
+/// would wait, so a lowered rate would never hold back a run of failing
+/// sections. Every other failure is charged.
+#[test]
+fn a_failed_read_does_not_hand_back_the_credit_it_spent() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::RateLimiter;
+    use std::time::Duration;
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&[7u8; 4096])?;
+    }
+    let limiter = RateLimiter::new(1 << 30);
+    let failing = SlowReads {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        delay: Duration::ZERO,
+        fails: true,
+    };
+    let mut paced = PacedFile::new(Box::new(failing), Some(&limiter))?;
+    let mut buf = [0u8; 1024];
+    let mut credits = Vec::new();
+    for _ in 0..4 {
+        assert!(std::io::Read::read(&mut paced, &mut buf).is_err());
+        credits.push(paced.credit);
+    }
+    assert_eq!(credits, vec![1024, 0, 1024, 0]);
+    Ok(())
+}
+
+/// A file whose read switches its limiter's rate on, as a live retune landing
+/// while the read is in flight does, and takes `delay` to answer.
+struct RetunedDuringRead {
+    inner: Box<dyn crate::fs::FsFile>,
+    limiter: std::sync::Arc<crate::rate_limiter::RateLimiter>,
+    delay: std::time::Duration,
+}
+
+impl std::io::Read for RetunedDuringRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.limiter.set_rate(1 << 30);
+        std::thread::sleep(self.delay);
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for RetunedDuringRead {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for RetunedDuringRead {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for RetunedDuringRead {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+/// A read decided at rate zero goes whole and uncharged; a rate switched on
+/// while it is in flight must not turn it into a latency sample, which could
+/// lower the newly granted rate on a read the limiter never admitted.
+#[test]
+fn a_read_decided_without_a_rate_reports_no_latency() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use std::time::Duration;
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&[7u8; 4096])?;
+    }
+    let limiter = std::sync::Arc::new(RateLimiter::new(0));
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let retuned = RetunedDuringRead {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        limiter: std::sync::Arc::clone(&limiter),
+        delay: Duration::from_millis(5),
+    };
+    let mut paced = PacedFile::new(Box::new(retuned), Some(&limiter))?;
+    let mut buf = [0u8; 4096];
+    std::io::Read::read(&mut paced, &mut buf)?;
+    assert_eq!(
+        limiter.effective_rate(),
+        limiter.rate(),
+        "an uncharged read lowered the rate"
+    );
+    Ok(())
+}
+
+/// The index reads a restricted table's punch-offset walk makes through the
+/// block loader report how long each portion took, and a limiter's pacer
+/// hands that to the latency backoff.
+#[test]
+fn a_paced_index_read_reports_its_latency() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use crate::table::util::ReadPacer;
+    use std::time::Duration;
+
+    /// Counts the portions it is told the read time of.
+    struct Timed(std::sync::atomic::AtomicUsize);
+    impl ReadPacer for Timed {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {}
+        fn read_took(&self, _elapsed: Duration) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    let size = 2 * PACE_PORTION + 100;
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&vec![7u8; size])?;
+    }
+    let file = fs.open(path, &FsOpenOptions::new().read(true))?;
+    let timed = Timed(std::sync::atomic::AtomicUsize::new(0));
+    crate::file::read_exact_paced(file.as_ref(), 0, size, Some(&timed))?;
+    assert_eq!(
+        3,
+        timed.0.load(std::sync::atomic::Ordering::Relaxed),
+        "every portion read reports its time"
+    );
+
+    // The walk's pacer passes the time on to the limiter.
+    let dir = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.insert("k", "v", 0);
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+    let configured = 1 << 30;
+    let limiter = std::sync::Arc::new(RateLimiter::new(configured));
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let pacer = super::walk_pacer(table, Some(&limiter)).expect("a limiter attaches a pacer");
+    pacer.read_took(Duration::from_millis(10));
+    assert!(
+        limiter.effective_rate() < configured,
+        "a slow index read did not lower the rate"
+    );
+    Ok(())
+}
+
 /// A large read on a limiter shared with other work is charged in bounded
 /// portions, so a small request arriving meanwhile waits one portion, not the
 /// whole large read.

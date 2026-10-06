@@ -7749,7 +7749,7 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
     bitmap.insert(1);
     bitmap.insert(3);
     let out_checksum =
-        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?;
     let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
 
     // Point path: masked rows read absent; survivors reconstruct their sub-cells.
@@ -8675,6 +8675,43 @@ fn a_directory_length_other_than_the_indexed_one_is_refused() -> crate::Result<(
     Ok(())
 }
 
+/// A compaction scan of a columnar table walks the table's index first, to
+/// learn the groups it will check, and the blocks that walk reads from the
+/// file report to the scan's pacer as the scan's own reads do: a cold index
+/// read at length would otherwise give a latency backoff nothing to steer by.
+#[cfg(all(feature = "columnar", feature = "std"))]
+#[test]
+fn a_paced_scan_reports_the_reads_of_its_index_walk() -> crate::Result<()> {
+    use crate::table::util::{Pacer, ReadPacer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the index portions it is told about; the scan's own buffered
+    /// reads tell it only their time.
+    struct Counted(AtomicUsize);
+    impl ReadPacer for Counted {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let checksum = columnar_table_file_paged(&file, 400, 16, 100, 16 * 1_024, 1_024)?;
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    let counted = Arc::new(Counted(AtomicUsize::new(0)));
+    let pace: Pacer = counted.clone();
+    let rows = table.scan_paced(Some(&pace))?.count();
+    assert_eq!(rows, 400, "the scan reads every row");
+    assert!(
+        counted.0.load(Ordering::Relaxed) > 0,
+        "the index walk's reads were not paced"
+    );
+    Ok(())
+}
+
 /// The compaction scan refuses a group whose directory or head zone block is
 /// not the length its index entry records, as an indexed read does, rather
 /// than rewriting it: the scan streams the data without the index, so only the
@@ -8699,7 +8736,7 @@ fn a_scan_refuses_a_group_whose_lengths_disagree_with_its_index_entry() -> crate
     );
     let scanned = |groups: Vec<BlockHandle>| {
         table
-            .scan_groups(groups.len(), 0, groups)?
+            .scan_groups(groups.len(), 0, groups, None)?
             .collect::<crate::Result<Vec<_>>>()
     };
     assert_eq!(

@@ -563,6 +563,236 @@ fn a_tree_stop_wakes_its_throttled_compaction() -> crate::Result<()> {
     Ok(())
 }
 
+/// A limiter at 1 MB/s backing off above a 10 ms ceiling, stepping on every
+/// sample.
+fn backed_off_limiter() -> RateLimiter {
+    let rl = RateLimiter::new(1_000_000);
+    rl.set_latency_backoff_at(
+        Some(LatencyBackoff::new(ms(10)).with_period(Duration::ZERO)),
+        ms(0),
+    );
+    rl
+}
+
+/// Feeds `count` samples of `latency`, one millisecond apart from `*now`.
+fn feed(rl: &RateLimiter, latency: Duration, count: u32, now: &mut Duration) {
+    for _ in 0..count {
+        *now += ms(1);
+        rl.record_read_latency_at(latency, *now);
+    }
+}
+
+/// Without a backoff, latency samples change nothing.
+#[test]
+fn latency_samples_without_a_backoff_change_nothing() {
+    let rl = RateLimiter::new(1_000_000);
+    rl.record_read_latency_at(Duration::from_secs(5), ms(1));
+    assert_eq!(None, rl.latency_backoff());
+    assert_eq!(1_000_000, rl.effective_rate());
+}
+
+/// An unthrottled limiter stays unthrottled whatever its reads take.
+#[test]
+fn latency_samples_leave_an_unthrottled_limiter_unthrottled() {
+    let rl = RateLimiter::new(0);
+    rl.set_latency_backoff_at(Some(LatencyBackoff::new(ms(1))), ms(0));
+    rl.record_read_latency_at(Duration::from_secs(5), Duration::from_secs(1));
+    assert_eq!(0, rl.effective_rate());
+    assert_eq!(
+        Duration::ZERO,
+        rl.acquire_wait(1 << 30, Duration::from_secs(1))
+    );
+}
+
+/// Above the ceiling the granted rate steps down every period, never below
+/// the floor, and settles on it while the latency stays high.
+#[test]
+fn latency_above_the_ceiling_steps_down_to_the_floor() {
+    let rl = backed_off_limiter();
+    let mut now = ms(0);
+    let mut previous = rl.effective_rate();
+    for _ in 0..100 {
+        feed(&rl, ms(40), 1, &mut now);
+        let granted = rl.effective_rate();
+        assert!(granted <= previous, "the rate rose under a slow device");
+        assert!(
+            granted >= 50_000,
+            "the rate fell below the floor: {granted}"
+        );
+        previous = granted;
+    }
+    assert_eq!(50_000, rl.effective_rate(), "5% of the configured rate");
+    assert_eq!(1_000_000, rl.rate(), "the configured rate is kept");
+}
+
+/// One step follows PARDA's law: halfway to where the ceiling would put it.
+#[test]
+fn one_step_moves_the_rate_halfway_to_the_ceiling() {
+    let rl = backed_off_limiter();
+    rl.record_read_latency_at(ms(40), ms(1));
+    // 1 MB/s × (0.5 + 0.5 × 10/40)
+    assert_eq!(625_000, rl.effective_rate());
+}
+
+/// Inside the hysteresis band the rate holds; below it, it climbs back to the
+/// configured rate, and no higher.
+#[test]
+fn latency_in_the_band_holds_and_below_it_climbs_back() {
+    let rl = backed_off_limiter();
+    let mut now = ms(0);
+    feed(&rl, ms(40), 5, &mut now);
+    let backed_off = rl.effective_rate();
+    assert!(backed_off < 1_000_000);
+
+    // 9 ms is under the 10 ms ceiling and above its 8 ms band: once the
+    // estimate settles there, the rate stops moving.
+    feed(&rl, ms(9), 200, &mut now);
+    let settled = rl.effective_rate();
+    feed(&rl, ms(9), 50, &mut now);
+    assert_eq!(
+        settled,
+        rl.effective_rate(),
+        "the rate moved inside the band"
+    );
+    assert!(settled >= 50_000);
+
+    feed(&rl, ms(1), 50, &mut now);
+    assert_eq!(
+        1_000_000,
+        rl.effective_rate(),
+        "the rate climbs back in full"
+    );
+}
+
+/// The rate steps at most once per period, however many reads arrive.
+#[test]
+fn the_rate_steps_at_most_once_per_period() {
+    let rl = RateLimiter::new(1_000_000);
+    rl.set_latency_backoff_at(Some(LatencyBackoff::new(ms(10))), ms(0));
+    for t in 1..100 {
+        rl.record_read_latency_at(ms(40), ms(t));
+    }
+    assert_eq!(
+        1_000_000,
+        rl.effective_rate(),
+        "stepped inside the first period"
+    );
+    rl.record_read_latency_at(ms(40), ms(100));
+    let one_step = rl.effective_rate();
+    assert!(one_step < 1_000_000, "no step once the period passed");
+    rl.record_read_latency_at(ms(40), ms(150));
+    assert_eq!(one_step, rl.effective_rate(), "two steps in one period");
+}
+
+/// Ceiling, floor and the backoff itself change on a live limiter: a higher
+/// floor lifts the granted rate at once, removing the backoff restores the
+/// configured rate, and a rate change scales by the share held.
+#[test]
+fn the_backoff_changes_on_a_live_limiter() {
+    let rl = backed_off_limiter();
+    let mut now = ms(0);
+    feed(&rl, ms(1_000), 100, &mut now);
+    assert_eq!(50_000, rl.effective_rate());
+
+    rl.set_rate_at(2_000_000, now);
+    assert_eq!(
+        100_000,
+        rl.effective_rate(),
+        "the new rate at the held share"
+    );
+
+    let raised_floor = LatencyBackoff::new(ms(10))
+        .with_period(Duration::ZERO)
+        .with_floor(0.5);
+    rl.set_latency_backoff_at(Some(raised_floor), now);
+    assert_eq!(1_000_000, rl.effective_rate(), "lifted to the new floor");
+    assert_eq!(Some(raised_floor), rl.latency_backoff());
+
+    rl.set_latency_backoff_at(None, now);
+    assert_eq!(2_000_000, rl.effective_rate(), "the configured rate again");
+}
+
+/// The bucket repays debt at the granted rate, not the configured one.
+#[test]
+fn the_bucket_runs_at_the_granted_rate() {
+    let rl = RateLimiter::new(1_000);
+    rl.set_latency_backoff_at(
+        Some(
+            LatencyBackoff::new(ms(10))
+                .with_period(Duration::ZERO)
+                .with_floor(0.5),
+        ),
+        ms(0),
+    );
+    rl.record_read_latency_at(Duration::from_secs(10), ms(0));
+    assert_eq!(500, rl.effective_rate());
+    // A burst of one second of the granted rate, then debt repaid at it.
+    assert_eq!(Duration::ZERO, rl.acquire_wait(500, ms(0)));
+    assert_eq!(Duration::from_secs(1), rl.acquire_wait(500, ms(0)));
+}
+
+/// When only the limiter's own I/O slows the device, backing off removes the
+/// cause: the rate settles where the latency sits in the band, above the
+/// floor, instead of collapsing.
+#[test]
+fn backing_off_own_load_settles_above_the_floor() {
+    // Many reads per period, as a scrub issues them.
+    let rl = RateLimiter::new(1_000_000);
+    rl.set_latency_backoff_at(Some(LatencyBackoff::new(ms(10)).with_period(ms(20))), ms(0));
+    let mut now = ms(0);
+    let mut lowest = u64::MAX;
+    for _ in 0..4_000 {
+        // 1 ms of device time plus 30 ms at the full configured rate.
+        #[expect(clippy::cast_precision_loss, reason = "rates below 2^53")]
+        let share = rl.effective_rate() as f64 / rl.rate() as f64;
+        let latency = Duration::from_secs_f64(0.030f64.mul_add(share, 0.001));
+        feed(&rl, latency, 1, &mut now);
+        lowest = lowest.min(rl.effective_rate());
+    }
+    assert!(lowest >= 50_000, "fell below the floor: {lowest}");
+    // The band is 8..10 ms, which this device gives at 23%..30% of the rate.
+    let settled = rl.effective_rate();
+    assert!(
+        (200_000..=320_000).contains(&settled),
+        "settled at {settled}, outside the band the device allows"
+    );
+}
+
+/// Reads served in no measurable time after a congested spell climb back by
+/// bounded steps, and the rate ends at the configured one.
+#[test]
+fn a_zero_latency_sample_climbs_by_a_bounded_step() {
+    let rl = backed_off_limiter();
+    let mut now = ms(0);
+    feed(&rl, ms(1_000), 100, &mut now);
+    assert_eq!(50_000, rl.effective_rate());
+    for _ in 0..200 {
+        feed(&rl, Duration::ZERO, 1, &mut now);
+    }
+    assert_eq!(1_000_000, rl.effective_rate());
+}
+
+/// Out-of-range settings are clamped, and a value that is not a number keeps
+/// the default.
+#[test]
+#[expect(
+    clippy::float_cmp,
+    reason = "clamping returns the bound itself, exactly"
+)]
+fn latency_backoff_settings_are_clamped() {
+    let backoff = LatencyBackoff::new(ms(10))
+        .with_floor(0.0)
+        .with_hysteresis(2.0);
+    assert_eq!(0.001, backoff.floor());
+    assert_eq!(0.95, backoff.hysteresis());
+
+    let backoff = LatencyBackoff::new(ms(10))
+        .with_floor(f64::NAN)
+        .with_hysteresis(f64::NAN);
+    assert_eq!(LatencyBackoff::DEFAULT_FLOOR, backoff.floor());
+    assert_eq!(LatencyBackoff::DEFAULT_HYSTERESIS, backoff.hysteresis());
+}
+
 #[test]
 fn backwards_clock_step_does_not_underflow() {
     // A non-monotonic `now` (earlier than last_refill) must not panic

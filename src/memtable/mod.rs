@@ -224,6 +224,11 @@ impl Memtable {
         self.blob_refs.read().contains(&blob_file_id)
     }
 
+    /// Adds the blob files cell rows in this memtable reference to `files`.
+    pub(crate) fn collect_blob_files(&self, files: &mut crate::HashSet<crate::vlog::BlobFileId>) {
+        files.extend(self.blob_refs.read().iter().copied());
+    }
+
     /// Creates an iterator over all items.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = InternalValue> + '_ {
         self.items.iter().map(|entry| InternalValue {

@@ -37,6 +37,7 @@ impl Table {
     /// blocks verbatim, re-points the on-disk table id to `new_table_id`, and
     /// adds `delete_bitmap` as a positional row mask. Returns the new file's
     /// checksum (for [`Table::recover`]); the caller installs and recovers it.
+    /// `pace` is told how long each read of this segment takes.
     ///
     /// # Errors
     ///
@@ -54,6 +55,7 @@ impl Table {
         new_table_id: TableId,
         delete_bitmap: &DeleteBitmap,
         sync_mode: SyncMode,
+        pace: Option<&super::util::Pacer>,
     ) -> crate::Result<Checksum> {
         // Verbatim block reuse is sound only for a non-encrypted, non-ECC
         // columnar segment that already carries a zone map (the bitmap's
@@ -79,14 +81,22 @@ impl Table {
         // Read the source through ITS filesystem; write the output through the
         // destination level's `out_fs` (the same one that recovers and installs
         // the relocated table), so level routing stays consistent.
-        let mut src = self.fs.open(&self.path, &FsOpenOptions::new().read(true))?;
-        let reader = crate::sfa::Reader::from_reader(&mut src)?;
+        let mut timed = super::util::TimedFile::new(
+            self.fs.open(&self.path, &FsOpenOptions::new().read(true))?,
+        );
+        if let Some(pace) = pace {
+            timed.set_pace(alloc::sync::Arc::clone(pace));
+        }
+        let reader = crate::sfa::Reader::from_reader(&mut timed)?;
+        // The section reads below are positioned: each is timed as it is made.
+        let src = timed.into_inner();
+        let pace = pace.map(|pace| &**pace);
 
         // Re-encode the meta KV block with the new id AND the new delete-bitmap
         // descriptors. The block is loaded TAIL (`meta`) since MID and TAIL carry
         // identical content; the same patched payload is written to both sections
         // below.
-        let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap)?;
+        let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap, pace)?;
 
         let out = out_fs.open(new_path, &FsOpenOptions::new().write(true).create_new(true))?;
 
@@ -131,14 +141,14 @@ impl Table {
                         at,
                     )?;
                 } else if RAW_SECTIONS.contains(&name) {
-                    copy_section(&*src, &mut writer, entry.pos(), entry.len())?;
+                    copy_section(&*src, &mut writer, (entry.pos(), entry.len()), pace)?;
                 } else {
                     copy_blocks(
                         &*src,
                         &mut writer,
                         (entry.pos(), entry.len()),
-                        self.metadata.id,
-                        new_table_id,
+                        (self.metadata.id, new_table_id),
+                        pace,
                     )?;
                 }
             }
@@ -199,9 +209,10 @@ impl Table {
         src: &dyn FsFile,
         new_table_id: TableId,
         delete_bitmap: &DeleteBitmap,
+        pace: Option<&dyn super::util::ReadPacer>,
     ) -> crate::Result<Vec<u8>> {
         // Non-encrypted precondition (checked by the caller): PLAIN transform.
-        let block = Block::from_file(
+        let (block, _, _) = Block::from_file_issuing_paced(
             src,
             self.regions.metadata,
             BlockIdentity {
@@ -211,6 +222,9 @@ impl Table {
                 window_log: 0,
             },
             &BlockTransform::PLAIN,
+            || {},
+            pace,
+            &mut 0,
         )?;
         let block = DataBlock::new(block);
         // Meta keys are lexicographic, so the default comparator orders them.
@@ -338,7 +352,7 @@ const RAW_SECTIONS: [&[u8]; 3] = [b"linked_blob_files", b"table_version", b"meta
 /// Copies the blocks of the section at `(pos, len)` of `src`, a table of id
 /// `from_table`, into `writer` for table `to_table`: each block's payload is
 /// written as it is, and its stored checksum is moved from where it was to
-/// where it lands.
+/// where it lands. `pace` is told how long each read takes.
 ///
 /// The blocks are framed by their headers alone, which is exact for the
 /// segments a relocation accepts: they carry no parity trailer.
@@ -351,8 +365,8 @@ fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
     src: &dyn FsFile,
     writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     (pos, len): (u64, u64),
-    from_table: TableId,
-    to_table: TableId,
+    (from_table, to_table): (TableId, TableId),
+    pace: Option<&dyn super::util::ReadPacer>,
 ) -> crate::Result<()> {
     use super::block::{ChecksumAt, Header};
     use crate::coding::Decode;
@@ -366,10 +380,11 @@ fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
         .ok_or(crate::Error::InvalidHeader("relocate: section overflows"))?;
     let mut offset = pos;
     while offset < end {
-        let head = crate::file::read_exact(
+        let head = crate::file::read_exact_paced(
             src,
             offset,
             usize::try_from((end - offset).min(Header::MAX_LEN as u64)).unwrap_or(Header::MAX_LEN),
+            pace,
         )?;
         let header = Header::decode_from(&mut &head[..])?;
         let frame_len =
@@ -398,8 +413,8 @@ fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
         copy_section(
             src,
             writer,
-            offset + header_len as u64,
-            u64::from(header.data_length),
+            (offset + header_len as u64, u64::from(header.data_length)),
+            pace,
         )?;
         offset += frame_len;
     }
@@ -407,12 +422,14 @@ fn copy_blocks<W: crate::io::Write + crate::io::Seek>(
 }
 
 /// Copies `len` bytes from `src` at absolute offset `pos` into `writer`,
-/// in bounded chunks so a large data section is never buffered whole.
+/// in bounded chunks so a large data section is never buffered whole. An
+/// active `pace` has each chunk read a portion at a time and told how long
+/// each portion took.
 fn copy_section<W: crate::io::Write>(
     src: &dyn FsFile,
     writer: &mut W,
-    pos: u64,
-    len: u64,
+    (pos, len): (u64, u64),
+    pace: Option<&dyn super::util::ReadPacer>,
 ) -> crate::Result<()> {
     let mut offset = pos;
     let end = pos + len;
@@ -421,7 +438,7 @@ fn copy_section<W: crate::io::Write>(
         // the `min` caps each read at COPY_CHUNK, so the cast cannot truncate.
         #[expect(clippy::cast_possible_truncation, reason = "capped at COPY_CHUNK")]
         let want = (end - offset).min(COPY_CHUNK as u64) as usize;
-        let bytes = crate::file::read_exact(src, offset, want)?;
+        let bytes = crate::file::read_exact_paced(src, offset, want, pace)?;
         writer.write_all(&bytes)?;
         offset += want as u64;
     }

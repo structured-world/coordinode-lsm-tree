@@ -352,6 +352,8 @@ pub struct GroupRead<'a> {
     pub charge: ReadCharge,
     /// How much one request may ask for and how many go in flight at once.
     pub budget: crate::config::ReadBudget,
+    /// Told how long each request to the file took, when it is active then.
+    pub pace: Option<&'a dyn crate::table::util::ReadPacer>,
 }
 
 impl GroupRead<'_> {
@@ -933,7 +935,34 @@ impl GroupRead<'_> {
             .iter()
             .map(|&(at, len)| (*self.group.offset() + at as u64, len))
             .collect();
+        // A backend may serve a batch one region after another, and one sample
+        // of the whole batch would sum their times against a ceiling set for
+        // one read: while the pacer listens, each region is read and timed on
+        // its own.
+        #[cfg(feature = "std")]
+        if self.pace.is_some_and(crate::table::util::ReadPacer::active) {
+            return regions
+                .iter()
+                .map(
+                    |&(offset, len)| Ok(self.request(|| crate::file::read_exact(fd, offset, len))?),
+                )
+                .collect();
+        }
         Ok(crate::file::read_exact_many(fd, &regions)?)
+    }
+
+    /// Makes one request to the file, telling the pacer, when it is active
+    /// now, how long the request took, an error included.
+    fn request<T>(&self, op: impl FnOnce() -> T) -> T {
+        // no-std: reads are timed only with std (see `ReadPacer::read_took`)
+        #[cfg(feature = "std")]
+        if let Some(pace) = self.pace.filter(|pace| pace.active()) {
+            let started = std::time::Instant::now();
+            let out = op();
+            pace.read_took(started.elapsed());
+            return out;
+        }
+        op()
     }
 
     /// The group's bytes `[start, end)`, served from `front` as far as it
@@ -970,11 +999,7 @@ impl GroupRead<'_> {
         }
         #[cfg(not(feature = "metrics"))]
         let _ = role;
-        Ok(crate::file::read_exact(
-            fd,
-            *self.group.offset() + at as u64,
-            len,
-        )?)
+        Ok(self.request(|| crate::file::read_exact(fd, *self.group.offset() + at as u64, len))?)
     }
 
     /// Fills the empty slots of `pages` with the blocks the cache already

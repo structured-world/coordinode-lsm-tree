@@ -627,6 +627,13 @@ pub struct VerifyOptions {
     /// [`parallelism`](Self::parallelism) workers. Shared, so a caller can
     /// retune it live or draw it from the same budget as compaction. `None`
     /// (default) reads at full speed. Only a `std` build waits on it.
+    ///
+    /// The scan reports how long each charged read took, so a limiter with a
+    /// [`LatencyBackoff`](crate::rate_limiter::LatencyBackoff) backs the scan
+    /// off while the device is slow to answer. The backoff lowers what the
+    /// limiter grants to every holder: on a budget shared with compaction it
+    /// slows compaction too, so a scan that should back off alone gets a
+    /// limiter of its own.
     pub rate_limiter: Option<alloc::sync::Arc<RateLimiter>>,
 }
 
@@ -809,6 +816,12 @@ impl crate::table::util::ReadPacer for LimiterPacer {
             .file_size()
             .map_or(len, |file_size| bytes_in_file(offset, len, file_size));
         charge_in_portions(&self.limiter, charge);
+    }
+
+    // The index walk's reads steer a latency backoff as the scan's own do.
+    #[cfg(feature = "std")]
+    fn read_took(&self, elapsed: core::time::Duration) {
+        self.limiter.record_read_latency(elapsed);
     }
 }
 
@@ -2474,16 +2487,27 @@ impl PacedFile<'_> {
             buf.len()
         };
         let (head, _) = buf.split_at_mut(want);
-        let admitted = self.pace(head.len(), limiter);
-        let read = self.fill(head, admitted);
+        let (admitted, from_credit) = self.pace(head.len(), limiter);
+        let read = self.fill(head, admitted, limiter);
         if limiter.is_some() {
-            // What was charged and not read stays to the file's credit: a
-            // read that failed partway, or a file that ended early.
+            // What was charged and not read stays to the file's credit, so a
+            // read that failed partway is not charged twice for the bytes it
+            // reads again. A failed read spends the credit it was paid from,
+            // though: handed back, a run of failing sections would pass the
+            // same credit along and never wait at the rate.
+            let failed = read.is_err() || self.pending.is_some();
             let got = read.as_ref().map_or(0, |got| *got);
             // `fill` reads at most what was admitted, save past the end of the
             // file as opened, where nothing was admitted and nothing is owed.
             if let Some(unread) = admitted.checked_sub(got) {
-                self.credit += unread as u64;
+                // The credit paid at most what was admitted.
+                let charged_now = admitted - from_credit;
+                let refund = if failed {
+                    unread.min(charged_now)
+                } else {
+                    unread
+                };
+                self.credit += refund as u64;
             }
         }
         read
@@ -2491,25 +2515,39 @@ impl PacedFile<'_> {
 
     /// Waits until `limiter`, when there is one, admits a read of up to
     /// `want` bytes, counted only up to the file's end, which a read never
-    /// goes past, and returns how many it admitted. Credit left from earlier
-    /// reads is spent first.
-    fn pace(&mut self, want: usize, limiter: Option<&RateLimiter>) -> usize {
+    /// goes past, and returns how many it admitted and how many of those the
+    /// credit left from earlier reads paid, which is spent first.
+    fn pace(&mut self, want: usize, limiter: Option<&RateLimiter>) -> (usize, usize) {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
+        let mut from_credit = 0;
         if let Some(limiter) = limiter {
-            let from_credit = self.credit.min(bytes);
+            from_credit = self.credit.min(bytes);
             self.credit -= from_credit;
             charge_in_portions(limiter, bytes - from_credit);
         }
-        // At most `want`, so it fits a `usize`.
-        usize::try_from(bytes).unwrap_or(want)
+        // Both at most `want`, so they fit a `usize`.
+        (
+            usize::try_from(bytes).unwrap_or(want),
+            usize::try_from(from_credit).unwrap_or(want),
+        )
     }
 
     /// Reads into `buf` until the `charged` bytes are in or the file ends: a
     /// backend may return fewer bytes per call, and every byte charged is then
-    /// still one read, never charged again by the next call.
-    fn fill(&mut self, buf: &mut [u8], charged: usize) -> FileRead {
+    /// still one read, never charged again by the next call. `limiter` is the
+    /// one the read was decided under, which alone hears its latency.
+    fn fill(
+        &mut self,
+        buf: &mut [u8],
+        charged: usize,
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(unused_variables, reason = "latency is timed only with std")
+        )]
+        limiter: Option<&RateLimiter>,
+    ) -> FileRead {
         if charged == 0 {
             // Nothing admitted: past the end, which reads nothing, or an
             // empty buffer.
@@ -2522,7 +2560,14 @@ impl PacedFile<'_> {
         #[cfg(feature = "std")]
         use std::io::ErrorKind;
 
+        // The time the device takes to answer the charged read is what a
+        // latency backoff on the limiter steers by; the wait for the limiter
+        // itself is not part of it.
+        // no-std: a caller-provided monotonic clock passed to record_read_latency_at
+        #[cfg(feature = "std")]
+        let started = std::time::Instant::now();
         let mut read = 0;
+        let mut failed = None;
         while read < charged {
             let Some(rest) = buf.get_mut(read..charged) else {
                 break;
@@ -2539,13 +2584,26 @@ impl PacedFile<'_> {
                     self.pending = Some(e);
                     break;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
             };
             if got == 0 {
                 break;
             }
             read += got;
             self.pos += got as u64;
+        }
+        // A read the device answered with an error took its time too: a slow
+        // failure is congestion the backoff must see. A read decided without
+        // a rate went uncharged and reports nothing, whatever the rate is now.
+        #[cfg(feature = "std")]
+        if let Some(limiter) = limiter {
+            limiter.record_read_latency(started.elapsed());
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         Ok(read)
     }

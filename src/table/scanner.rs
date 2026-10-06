@@ -2,7 +2,6 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use super::{Block, DataBlock};
@@ -12,8 +11,8 @@ use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
-    fs::{FileHint, Fs, FsFile, FsOpenOptions},
-    table::{block::BlockType, iter::OwnedDataBlockIter},
+    fs::{FileHint, Fs, FsOpenOptions},
+    table::{block::BlockType, iter::OwnedDataBlockIter, util::TimedFile},
 };
 
 /// The data section read as a stream of blocks, with the offset the next one
@@ -21,7 +20,7 @@ use crate::{
 /// block of the right shape written at another block's place is refused
 /// rather than streamed out of order.
 struct BlockStream {
-    reader: BufReader<Box<dyn FsFile>>,
+    reader: BufReader<TimedFile>,
     position: u64,
 }
 
@@ -86,7 +85,7 @@ impl Scanner {
                   add an indirection without removing any per-call decision the caller \
                   makes about the values"
     )]
-    pub fn new(
+    pub(crate) fn new(
         fs: &Arc<dyn Fs>,
         path: &Path,
         block_count: usize,
@@ -103,6 +102,7 @@ impl Scanner {
         start_offset: u64,
         lower_bound: Option<crate::UserKey>,
         groups: alloc::vec::Vec<super::BlockHandle>,
+        pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
         // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
         // default and is large enough that the kernel can fold the
@@ -133,8 +133,12 @@ impl Scanner {
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(start_offset))?;
         }
+        let mut timed = TimedFile::new(file);
+        if let Some(pace) = pace {
+            timed.set_pace(pace);
+        }
         let mut reader = BlockStream {
-            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file),
+            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, timed),
             position: start_offset,
         };
         let mut groups = groups.into_iter();
