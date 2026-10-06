@@ -935,7 +935,20 @@ impl GroupRead<'_> {
             .iter()
             .map(|&(at, len)| (*self.group.offset() + at as u64, len))
             .collect();
-        Ok(self.request(|| crate::file::read_exact_many(fd, &regions))?)
+        // A backend may serve a batch one region after another, and one sample
+        // of the whole batch would sum their times against a ceiling set for
+        // one read: while the pacer listens, each region is read and timed on
+        // its own.
+        #[cfg(feature = "std")]
+        if self.pace.is_some_and(|pace| pace.active()) {
+            return regions
+                .iter()
+                .map(
+                    |&(offset, len)| Ok(self.request(|| crate::file::read_exact(fd, offset, len))?),
+                )
+                .collect();
+        }
+        Ok(crate::file::read_exact_many(fd, &regions)?)
     }
 
     /// Makes one request to the file, telling the pacer, when it is active

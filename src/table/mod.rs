@@ -8023,7 +8023,14 @@ impl Table {
         let mut groups = Vec::new();
         if self.1.is_some() || self.metadata.columnar {
             let mut started = self.1.is_none();
-            for keyed in self.maintenance_index_walk() {
+            // The index walk reads from the file too, a cold index at length:
+            // its reads report as the scan's do.
+            let walk = self.maintenance_index_walk();
+            let walk = match pace {
+                Some(pace) => walk.with_pace(alloc::sync::Arc::clone(pace)),
+                None => walk,
+            };
+            for keyed in walk {
                 let keyed = keyed?;
                 if !started {
                     if let Some(bound) = &self.1
