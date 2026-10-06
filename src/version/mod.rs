@@ -56,6 +56,41 @@ use core::ops::Deref;
 use optimize::optimize_runs;
 use run::Ranged;
 
+/// L0 runs, newest first, once an intra-L0 compaction's `output` replaces its
+/// inputs (already removed from `runs`).
+///
+/// No table ahead of the inputs overlapped them when the compaction was
+/// picked, so a table still in L0 from then that overlaps them is behind them
+/// and older: the output goes ahead of it. A table that landed while the
+/// compaction ran is newer than every input and stays ahead of the output,
+/// even where it joined an input's run. It is told apart by its recency key,
+/// which a flush or an ingest stamps with its own id: above the inputs'
+/// newest, the output's. A table without a key predates the key and so the
+/// compaction; it is never moved.
+fn place_intra_l0_output(runs: Vec<Run<Table>>, output: Run<Table>) -> Vec<Run<Table>> {
+    let output_recency = output.iter().map(Table::l0_recency).max();
+    let landed_since = |table: &Table| {
+        matches!(
+            (table.metadata.recency, output_recency),
+            (Some(recency), Some(output)) if recency > output
+        )
+    };
+
+    let mut ahead = Vec::new();
+    let mut behind = Vec::with_capacity(runs.len());
+    for mut run in runs {
+        let (newer, older): (Vec<Table>, Vec<Table>) = core::mem::take(run.inner_mut())
+            .into_iter()
+            .partition(|table| landed_since(table));
+        ahead.extend(newer.into_iter().filter_map(|table| Run::new(vec![table])));
+        behind.extend(Run::new(older));
+    }
+
+    ahead.push(output);
+    ahead.extend(behind);
+    ahead
+}
+
 /// Context threaded through [`Version`] transformation methods.
 ///
 /// Bundles the user comparator required for maintaining correct table ordering
@@ -534,6 +569,9 @@ impl Version {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
+                // L0 keeps the run order the manifest persisted: it is the only
+                // record of recency for a table written before tables carried
+                // a recency key, whose id says nothing about its age.
                 Ok(Level::from_runs(level_runs))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -829,13 +867,30 @@ impl Version {
             if level_idx == dest_level
                 && let Some(run) = Run::new(new_tables.to_vec())
             {
-                if dest_level == 0 {
-                    // NOTE: dest_level == 0 in with_merge only occurs for intra-L0
-                    // compaction (memtable flushes use with_new_l0_run, not with_merge).
-                    // Append the merged (older) run so that any concurrently flushed
-                    // (newer) runs remain at the front and are searched first during
-                    // point reads.
-                    runs.push(run);
+                // A rewrite of one L0 table (a heal) holds that table's data
+                // and nothing else, so it takes that table's place in its run.
+                let rewritten = match old_ids {
+                    [only] if dest_level == 0 => level
+                        .runs
+                        .iter()
+                        .position(|run| run.iter().any(|table| table.metadata.id == *only)),
+                    _ => None,
+                };
+                if let Some(slot) = rewritten {
+                    // Every run ahead of the table's survives; its own does
+                    // unless the table was all of it.
+                    let shared = level.runs.get(slot).is_some_and(|run| run.len() > 1);
+                    match runs.get_mut(slot) {
+                        Some(at) if shared => {
+                            for table in new_tables {
+                                at.push_cmp(table.clone(), comparator);
+                            }
+                        }
+                        _ => runs.insert(slot, run),
+                    }
+                } else if dest_level == 0 {
+                    // Intra-L0 compaction (flushes use with_new_l0_run).
+                    runs = place_intra_l0_output(runs, run);
                 } else {
                     runs.insert(0, run);
                 }
