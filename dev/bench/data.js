@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791267709301,
+  "lastUpdate": 1791305802447,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -30040,6 +30040,90 @@ window.BENCHMARK_DATA = {
             "value": 625172.1176986538,
             "unit": "ops/sec",
             "extra": "P50: 1.3us | P99: 6.6us | P99.9: 75.7us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "96a07d0b86bd28f3753d569c777dc322c763e0c8",
+          "message": "fix(version): keep newer L0 tables ahead of the runs they overlap (5.x.x) (#848)\n\n## Summary\n\n- L0 run order stays recency order: a flush, a drop, an open and an\nintra-L0 compaction never put a table behind an older one it overlaps.\n\nBackport of the fix for #827 to the 5.x line; the change to `main` is\n#857. Stacked under #849, which makes size-tiered pick only inputs this\nplacement is correct for.\n\n## Changes\n\n- `optimize_runs` places tables newest first, each into the run right\nbehind the last placed run it overlaps, instead of oldest first into the\nfirst run it does not overlap. Every run stays internally disjoint.\n- An open keeps the L0 run order the manifest persisted. On this line a\ntable written before tables carried a recency key may be a compaction\noutput whose id was allocated before a newer flush with a lower id\ninstalled, so neither its id nor any recency stands in for its position.\n- An intra-L0 output goes ahead of the L0 left behind its inputs. A\ntable that landed while the compaction ran, told apart by a recency key\nabove the output's, stays ahead of it even where it joined an input's\nrun; a table without a key is never moved. A heal's copy of one L0 table\ntakes that table's place.\n- Regression tests: the three-table case and a property test over flush\nsequences for `optimize_runs`; an open and a flush keep a recency-less\ntable where the manifest put it; an output stays behind a flush that\nlanded in an input's run and goes ahead of the older tables behind its\ninputs; a healed table keeps its place.\n\nReads resolve L0 by sequence number and were not affected; anything that\ntakes run order as recency order was. No format or public API change.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux on top of the current\n`5.x.x`.\n\nRefs #827",
+          "timestamp": "2026-10-06T19:43:45+03:00",
+          "tree_id": "5ee8355b4b9512637b5ba8fa36492800612088fd",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/96a07d0b86bd28f3753d569c777dc322c763e0c8"
+        },
+        "date": 1791305800013,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 250049.8473931635,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 13.3us | P99.9: 31.2us\nthreads: 1 | elapsed: 2.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3103618.974905689,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1164370.7216653295,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 4.8us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 724072.0654445295,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 6.5us | P99.9: 69.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2505166.906745162,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 331711.485311152,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.1us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 196768.93600936464,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 6.0us | P99.9: 12.0us\nthreads: 1 | elapsed: 1.02s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1117662.475991213,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 455472.7556693833,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 1.5us | P99.9: 3.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 623708.7280240128,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 6.6us | P99.9: 75.6us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
           }
         ]
       }
