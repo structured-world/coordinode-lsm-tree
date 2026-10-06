@@ -53,27 +53,43 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
-use optimize::{optimize_runs, order_by_age};
-
-/// Lays out the runs of level `level_idx`: L0 from its tables' ages, since its
-/// runs overlap and their order is what recency means there; a deeper level
-/// by fusing its disjoint tables.
-fn place_runs(
-    level_idx: usize,
-    runs: Vec<Run<Table>>,
-    cmp: &dyn crate::comparator::UserComparator,
-) -> Vec<Run<Table>> {
-    if level_idx == 0 {
-        order_by_age(
-            runs.into_iter()
-                .flat_map(|mut run| core::mem::take(run.inner_mut())),
-            cmp,
-        )
-    } else {
-        optimize_runs(runs, cmp)
-    }
-}
+use optimize::optimize_runs;
 use run::Ranged;
+
+/// L0 runs, newest first, once an intra-L0 compaction's `output` replaces its
+/// inputs (already removed from `runs`).
+///
+/// The inputs were a prefix of L0 when the compaction was picked, so every
+/// table still in L0 from then is behind them and, where it overlaps them,
+/// older: the output goes ahead of it. A table that landed while the
+/// compaction ran is newer than every input and stays ahead of the output,
+/// even where it joined an input's run. It is told apart by its recency key,
+/// which a flush or an ingest stamps with its own id: above the inputs'
+/// newest, the output's. A table without a key predates the key and so the
+/// compaction; it is never moved.
+fn place_intra_l0_output(runs: Vec<Run<Table>>, output: Run<Table>) -> Vec<Run<Table>> {
+    let output_recency = output.iter().map(Table::l0_recency).max();
+    let landed_since = |table: &Table| {
+        matches!(
+            (table.metadata.recency, output_recency),
+            (Some(recency), Some(output)) if recency > output
+        )
+    };
+
+    let mut ahead = Vec::new();
+    let mut behind = Vec::with_capacity(runs.len());
+    for mut run in runs {
+        let (newer, older): (Vec<Table>, Vec<Table>) = core::mem::take(run.inner_mut())
+            .into_iter()
+            .partition(|table| landed_since(table));
+        ahead.extend(newer.into_iter().filter_map(|table| Run::new(vec![table])));
+        behind.extend(Run::new(older));
+    }
+
+    ahead.push(output);
+    ahead.extend(behind);
+    ahead
+}
 
 /// Context threaded through [`Version`] transformation methods.
 ///
@@ -512,13 +528,11 @@ impl Version {
         recovery: Recovery,
         tables: &[Table],
         blob_files: &[BlobFile],
-        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Self> {
         let version_levels = recovery
             .table_ids
             .iter()
-            .enumerate()
-            .map(|(level_idx, level)| {
+            .map(|level| {
                 let level_runs = level
                     .iter()
                     .map(|run| {
@@ -555,23 +569,9 @@ impl Version {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
-                // A persisted L0 is kept as written when it is in recency order
-                // (repair, for one, writes a run per table), and laid out again
-                // from its tables' ages when it is not: a manifest an earlier
-                // placement wrote may hold a newer table behind an older one
-                // it overlaps.
-                if level_idx == 0 {
-                    let persisted: Vec<&Run<Table>> =
-                        level_runs.iter().map(Arc::as_ref).collect();
-                    if !optimize::in_recency_order(&persisted, comparator) {
-                        let tables = level_runs.iter().flat_map(|run| run.iter().cloned());
-                        let level_runs = order_by_age(tables, comparator)
-                            .into_iter()
-                            .map(Arc::new)
-                            .collect();
-                        return Ok(Level::from_runs(level_runs));
-                    }
-                }
+                // L0 keeps the run order the manifest persisted: it is the only
+                // record of recency for a table written before tables carried
+                // a recency key, whose id says nothing about its age.
                 Ok(Level::from_runs(level_runs))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -705,7 +705,7 @@ impl Version {
 
             runs.extend(prev_runs);
 
-            let runs = place_runs(0, runs, comparator);
+            let runs = optimize_runs(runs, comparator);
 
             Level::from_runs(runs.into_iter().map(Arc::new).collect())
         });
@@ -760,7 +760,7 @@ impl Version {
 
         let mut dropped_tables: Vec<Table> = vec![];
 
-        for (level_idx, level) in self.levels.iter().enumerate() {
+        for level in &self.levels {
             let runs = level
                 .runs
                 .iter()
@@ -779,7 +779,7 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            let runs = place_runs(level_idx, runs, comparator);
+            let runs = optimize_runs(runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -868,16 +868,14 @@ impl Version {
                 && let Some(run) = Run::new(new_tables.to_vec())
             {
                 if dest_level == 0 {
-                    // Intra-L0 compaction (flushes use with_new_l0_run). Where
-                    // the output goes is decided by its tables' ages below, so
-                    // a run flushed while it ran stays in front of it.
-                    runs.push(run);
+                    // Intra-L0 compaction (flushes use with_new_l0_run).
+                    runs = place_intra_l0_output(runs, run);
                 } else {
                     runs.insert(0, run);
                 }
             }
 
-            let runs = place_runs(level_idx, runs, comparator);
+            let runs = optimize_runs(runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -976,7 +974,7 @@ impl Version {
                 runs.insert(0, run);
             }
 
-            let runs = place_runs(level_idx, runs, comparator);
+            let runs = optimize_runs(runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -1114,7 +1112,7 @@ impl Version {
                 }
             }
 
-            let runs = place_runs(level_idx, runs, comparator);
+            let runs = optimize_runs(runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
