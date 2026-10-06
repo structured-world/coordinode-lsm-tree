@@ -85,7 +85,7 @@ impl Scanner {
                   add an indirection without removing any per-call decision the caller \
                   makes about the values"
     )]
-    pub fn new(
+    pub(crate) fn new(
         fs: &Arc<dyn Fs>,
         path: &Path,
         block_count: usize,
