@@ -14,7 +14,7 @@ use crate::{
         BlockHandle,
         block::ParsedItem,
         block_index::{BlockIndexIter, BlockIndexIterImpl},
-        util::{ReadCharge, load_block},
+        util::ReadCharge,
     },
 };
 use alloc::sync::Arc;
@@ -427,6 +427,10 @@ pub struct Iter {
 
     /// How the iteration's columnar reads fetch their pages.
     read_budget: crate::config::ReadBudget,
+
+    /// Told about every block this iteration reads from the file, as the
+    /// index walk inside it is.
+    pace: Option<crate::table::util::Pacer>,
 }
 
 impl Iter {
@@ -494,7 +498,21 @@ impl Iter {
             metrics,
             charge: ReadCharge::Foreground,
             read_budget: crate::config::ReadBudget::default(),
+            pace: None,
         }
+    }
+
+    /// Tells `pace` about every block this iteration, and the index walk
+    /// inside it, reads from the file.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "its compaction consumer is std-gated")
+    )]
+    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
+        self.index_iter = self.index_iter.with_pace(alloc::sync::Arc::clone(&pace));
+        self.pace = Some(pace);
+        self
     }
 
     /// Reads this iteration's columnar row groups under `budget`.
@@ -556,6 +574,7 @@ impl Iter {
                     metrics: &self.metrics,
                     charge: self.charge,
                     budget: self.read_budget,
+                    pace: self.pace.as_deref(),
                 }
                 .load(&crate::table::row_group::PageWant::ALL)?;
                 // What decoding the pages copied out of them, plus the values
@@ -602,7 +621,7 @@ impl Iter {
                 return Err(crate::Error::FeatureUnsupported("columnar"));
             }
         }
-        let raw = load_block(
+        let raw = crate::table::util::load_block_paced(
             self.table_id,
             &self.path,
             &self.file_accessor,
@@ -618,6 +637,7 @@ impl Iter {
             #[cfg(feature = "metrics")]
             &self.metrics,
             self.charge,
+            self.pace.as_deref(),
         )?;
         DataBlock::from_loaded(raw, self.has_kv_footer).map(|db| Some(BlockSource::Row(db)))
     }

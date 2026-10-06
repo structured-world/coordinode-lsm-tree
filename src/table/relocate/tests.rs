@@ -62,8 +62,14 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
     for &row in &deleted {
         bitmap.insert(row);
     }
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let out_checksum = source.relocate_columnar_with_deletes(
+        &out_path,
+        &StdFs,
+        1,
+        &bitmap,
+        SyncMode::Normal,
+        None,
+    )?;
 
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
@@ -83,6 +89,80 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
             assert_eq!(&*got.value, b"val", "live value preserved verbatim");
         }
     }
+    Ok(())
+}
+
+/// A relocation reads its whole source, section by section, as a merge would:
+/// those reads report to the compaction's pacer, or a latency backoff on the
+/// limiter it shares with a verification scan has nothing to steer by while
+/// the relocation runs.
+#[cfg(all(feature = "columnar", feature = "std"))]
+#[test]
+fn a_paced_relocation_reports_the_reads_of_its_source() -> crate::Result<()> {
+    use crate::table::util::{Pacer, ReadPacer};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Sums the bytes of the positioned reads it is told about and counts
+    /// every timed read.
+    struct Recorder {
+        bytes: AtomicU64,
+        timed: AtomicU64,
+    }
+    impl ReadPacer for Recorder {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, len: u64) {
+            self.bytes.fetch_add(len, Ordering::Relaxed);
+        }
+        fn read_took(&self, _elapsed: core::time::Duration) {
+            self.timed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let src_path = dir.path().join("src");
+    let out_path = dir.path().join("out");
+    let mut writer = Writer::new(src_path.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..2_000u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            format!("value-{i}-payload").into_bytes(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, src_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&src_path, src_checksum, 0)?;
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(3);
+
+    let recorder = Arc::new(Recorder {
+        bytes: AtomicU64::new(0),
+        timed: AtomicU64::new(0),
+    });
+    let pace: Pacer = recorder.clone();
+    source.relocate_columnar_with_deletes(
+        &out_path,
+        &StdFs,
+        1,
+        &bitmap,
+        SyncMode::Normal,
+        Some(&pace),
+    )?;
+
+    let file_len = std::fs::metadata(&src_path)?.len();
+    let paced = recorder.bytes.load(Ordering::Relaxed);
+    assert!(
+        paced * 2 > file_len,
+        "the section copy was not paced: {paced} of {file_len} bytes",
+    );
+    assert!(
+        recorder.timed.load(Ordering::Relaxed) > 0,
+        "no read was timed"
+    );
     Ok(())
 }
 
@@ -119,8 +199,14 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
     for &row in &[4u32, 7, 40, 95] {
         bitmap.insert(row);
     }
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let out_checksum = source.relocate_columnar_with_deletes(
+        &out_path,
+        &StdFs,
+        1,
+        &bitmap,
+        SyncMode::Normal,
+        None,
+    )?;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
     // The re-encoded meta describes the appended bitmap, so the forgery
@@ -164,8 +250,14 @@ fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result
 
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(4);
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out_path, &StdFs, 9, &bitmap, SyncMode::Normal)?;
+    let out_checksum = source.relocate_columnar_with_deletes(
+        &out_path,
+        &StdFs,
+        9,
+        &bitmap,
+        SyncMode::Normal,
+        None,
+    )?;
     let relocated = recover_at(&out_path, out_checksum, 9)?;
 
     assert_eq!(
@@ -220,7 +312,7 @@ fn relocate_rejects_a_restricted_view() -> crate::Result<()> {
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(0);
     let err = restricted
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)
         .unwrap_err();
     assert!(
         matches!(err, crate::Error::FeatureUnsupported(_)),
@@ -249,7 +341,7 @@ fn relocate_rejects_row_major_segment() -> crate::Result<()> {
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(0);
     let err = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)
         .unwrap_err();
     assert!(
         matches!(err, crate::Error::FeatureUnsupported(_)),
@@ -319,8 +411,14 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
     // copied accounting) still include it.
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(3);
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal)?;
+    let out_checksum = source.relocate_columnar_with_deletes(
+        &out_path,
+        &StdFs,
+        1,
+        &bitmap,
+        SyncMode::Normal,
+        None,
+    )?;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
     relocated

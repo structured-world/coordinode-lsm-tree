@@ -433,7 +433,13 @@ pub(crate) fn read_at_paced(
             )
         })?;
         pace.pace(at, portion.len() as u64);
-        let got = file.read_at(portion, at)?;
+        // no-std: a caller-provided monotonic clock to time the portion
+        #[cfg(feature = "std")]
+        let started = std::time::Instant::now();
+        let got = file.read_at(portion, at);
+        #[cfg(feature = "std")]
+        pace.read_took(started.elapsed());
+        let got = got?;
         read += got;
         if got < portion.len() {
             break;

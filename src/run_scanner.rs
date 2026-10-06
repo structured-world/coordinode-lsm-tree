@@ -14,12 +14,17 @@ pub struct RunScanner {
     lo: usize,
     hi: usize,
     lo_reader: Option<Scanner>,
+    /// Told how long each table's reads take, for every table of the run.
+    pace: Option<crate::table::util::Pacer>,
 }
 
 impl RunScanner {
+    /// Scans tables `lo..=hi` of `run`, telling `pace` how long the reads of
+    /// every one of them take.
     pub fn culled(
         run: Arc<Run<Table>>,
         (lo, hi): (Option<usize>, Option<usize>),
+        pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
         let lo = lo.unwrap_or_default();
         let hi = hi.unwrap_or(run.len() - 1);
@@ -30,14 +35,19 @@ impl RunScanner {
         )]
         let lo_table = run.get(lo).expect("should exist");
 
-        let lo_reader = lo_table.scan()?;
+        let lo_reader = Self::scan(lo_table, pace.as_ref())?;
 
         Ok(Self {
             tables: run,
             lo,
             hi,
             lo_reader: Some(lo_reader),
+            pace,
         })
+    }
+
+    fn scan(table: &Table, pace: Option<&crate::table::util::Pacer>) -> crate::Result<Scanner> {
+        table.scan_paced(pace)
     }
 }
 
@@ -60,8 +70,10 @@ impl Iterator for RunScanner {
                         clippy::expect_used,
                         reason = "hi is at most equal to the last slot; so because 0 <= lo <= hi, it must be a valid index"
                     )]
-                    let scanner =
-                        fail_iter!(self.tables.get(self.lo).expect("should exist").scan());
+                    let scanner = fail_iter!(Self::scan(
+                        self.tables.get(self.lo).expect("should exist"),
+                        self.pace.as_ref()
+                    ));
 
                     self.lo_reader = Some(scanner);
                 }

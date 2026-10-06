@@ -43,10 +43,113 @@ pub(crate) trait ReadPacer: Send + Sync {
     /// Told the file offset and length of each portion of a paced read just
     /// before that portion is read.
     fn pace(&self, offset: u64, len: u64);
+
+    /// Told how long the read of a paced portion took, whether it returned
+    /// bytes or an error. Only a `std` build times the reads.
+    fn read_took(&self, _elapsed: core::time::Duration) {}
 }
 
 /// A walk's pacer, shared with the iterators that load its blocks.
 pub(crate) type Pacer = alloc::sync::Arc<dyn ReadPacer>;
+
+/// What a read of an [`FsFile`](crate::fs::FsFile) returns in this build.
+#[cfg(feature = "std")]
+type TimedRead = std::io::Result<usize>;
+#[cfg(not(feature = "std"))]
+type TimedRead = crate::io::Result<usize>;
+
+/// A file read front to back through a buffer, telling a pacer, while it is
+/// active, how long each read takes. An active pacer has the reader take a
+/// portion at a time, as a paced verification does, so every sample is one
+/// request of comparable size; inactive, a read goes as far as its buffer asks.
+pub(crate) struct TimedFile {
+    file: alloc::boxed::Box<dyn crate::fs::FsFile>,
+    pace: Option<Pacer>,
+}
+
+impl TimedFile {
+    pub(crate) fn new(file: alloc::boxed::Box<dyn crate::fs::FsFile>) -> Self {
+        Self { file, pace: None }
+    }
+
+    /// Tells `pace` about every read from now on.
+    pub(crate) fn set_pace(&mut self, pace: Pacer) {
+        self.pace = Some(pace);
+    }
+
+    /// The file, for reads this wrapper does not time.
+    pub(crate) fn into_inner(self) -> alloc::boxed::Box<dyn crate::fs::FsFile> {
+        self.file
+    }
+
+    fn read_timed(&mut self, buf: &mut [u8]) -> TimedRead {
+        #[cfg(not(feature = "std"))]
+        use crate::io::Read;
+        #[cfg(feature = "std")]
+        use std::io::Read;
+
+        // no-std: reads are timed only with std (see `ReadPacer::read_took`)
+        #[cfg(feature = "std")]
+        if let Some(pace) = self.pace.as_ref().filter(|pace| pace.active()) {
+            let len = buf.len().min(PACE_PORTION);
+            let (portion, _) = buf.split_at_mut(len);
+            let started = std::time::Instant::now();
+            let read = self.file.read(portion);
+            pace.read_took(started.elapsed());
+            return read;
+        }
+        self.file.read(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for TimedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_timed(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl crate::io::Read for TimedFile {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        self.read_timed(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Seek for TimedFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(to)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl crate::io::Seek for TimedFile {
+    fn seek(&mut self, to: crate::io::SeekFrom) -> crate::io::Result<u64> {
+        self.file.seek(to)
+    }
+}
+
+/// Tells a limiter's latency backoff how long the reads of a walk take and
+/// charges nothing: a compaction pays its limiter for what it writes, and the
+/// reads of its inputs only steer the rate. Active while the limiter has a
+/// backoff to steer, so without one the reads go as they would unpaced.
+// no-std: reads are timed only with std (see `ReadPacer::read_took`)
+#[cfg(feature = "std")]
+pub(crate) struct LatencyPacer(pub(crate) alloc::sync::Arc<crate::rate_limiter::RateLimiter>);
+
+#[cfg(feature = "std")]
+impl ReadPacer for LatencyPacer {
+    fn active(&self) -> bool {
+        self.0.steers_by_latency()
+    }
+
+    fn pace(&self, _offset: u64, _len: u64) {}
+
+    fn read_took(&self, elapsed: core::time::Duration) {
+        self.0.record_read_latency(elapsed);
+    }
+}
 
 /// The most a paced read takes from the file in one go: a larger read is
 /// paced and made a portion at a time, so a shared limiter serves other

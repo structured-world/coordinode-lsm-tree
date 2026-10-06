@@ -633,12 +633,41 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
     Some((lo, hi))
 }
 
+/// What a compaction tells its rate limiter about the reads of its inputs:
+/// how long they take, for a latency backoff on the limiter to steer by. A
+/// limiter shared with a verification scan would otherwise keep a rate the
+/// scan lowered after the scan ends, since only reads report latency.
+#[cfg_attr(
+    feature = "std",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "a no-std build times no reads and has no pacer to give"
+    )
+)]
+fn input_pacer(
+    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+) -> Option<crate::table::util::Pacer> {
+    // no-std: reads are timed only with std (see `ReadPacer::read_took`)
+    #[cfg(feature = "std")]
+    {
+        Some(Arc::new(crate::table::util::LatencyPacer(Arc::clone(
+            limiter,
+        ))))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = limiter;
+        None
+    }
+}
+
 fn create_compaction_stream<'a>(
     version: &Version,
     to_compact: &[TableId],
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -652,13 +681,14 @@ fn create_compaction_stream<'a>(
             readers.push(Box::new(RunScanner::culled(
                 run.clone(),
                 (Some(lo), Some(hi)),
+                pace.cloned(),
             )?));
 
             found += hi - lo + 1;
         } else {
             for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
                 found += 1;
-                readers.push(Box::new(table.scan()?));
+                readers.push(Box::new(table.scan_paced(pace)?));
             }
         }
     }
@@ -688,6 +718,7 @@ fn create_bounded_compaction_stream<'a>(
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -698,6 +729,10 @@ fn create_bounded_compaction_stream<'a>(
             // Compaction input is maintenance, not a read a caller made, so
             // it stays out of the read counters like the serial scanner's.
             let reader = table.range_iter(bounds.clone()).for_maintenance();
+            let reader = match pace {
+                Some(pace) => reader.with_pace(Arc::clone(pace)),
+                None => reader,
+            };
             readers.push(Box::new(reader));
         }
     }
@@ -2174,6 +2209,7 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
+        input_pacer(&opts.rate_limiter).as_ref(),
     ) else {
         // The caller validated every input exists, so a missing table here is
         // unexpected. Fail closed: an empty output would let the install delete
@@ -2312,7 +2348,7 @@ fn run_subcompaction(
                     .iter()
                     .map(|bf| {
                         let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
-                        open_blob_scanner_at_frontier(bf, from)
+                        open_blob_scanner_at_frontier(bf, from, &opts.rate_limiter)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
                 opts.config.comparator.clone(),
@@ -2614,13 +2650,22 @@ fn pick_blob_files_for_merge(
 /// restricted with its consumed prefix punched. Reading from the data section
 /// would hit those zeros, resynchronize byte-wise and taint every surviving
 /// frame, so no later merge could relocate the file.
-fn open_blob_scanner_at_frontier(bf: &BlobFile, from: u64) -> crate::Result<BlobFileScanner> {
+fn open_blob_scanner_at_frontier(
+    bf: &BlobFile,
+    from: u64,
+    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+) -> crate::Result<BlobFileScanner> {
     let off = from.max(bf.live_data_start());
-    if off == 0 {
-        BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
-    } else {
-        BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
-    }
+    // The relocation reads the blob files of its inputs, their trailer and
+    // table of contents included: they report their latency as the table
+    // reads do.
+    BlobFileScanner::open_paced(
+        &bf.0.path,
+        &*bf.0.fs,
+        bf.id(),
+        (off != 0).then_some(off),
+        input_pacer(limiter),
+    )
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -2837,6 +2882,7 @@ fn plan_merge_on_read(
     payload: &CompactionPayload,
     tables: &[Table],
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<Option<(Table, crate::table::delete_bitmap::DeleteBitmap)>> {
     let dst_lvl: usize = payload.canonical_level.into();
     let strategy = opts.runtime_config.load_full().delete_strategy.get(dst_lvl);
@@ -2876,7 +2922,7 @@ fn plan_merge_on_read(
     // seqno per row, dropping each scanned value so planning does not retain a
     // whole segment's values in memory.
     let keys = source
-        .scan()?
+        .scan_paced(pace)?
         .map(|entry| {
             let entry = entry?;
             Ok((entry.key.user_key, entry.key.seqno))
@@ -2921,6 +2967,7 @@ fn run_merge_on_read_relocation(
     payload: &CompactionPayload,
     source: &Table,
     bitmap: &crate::table::delete_bitmap::DeleteBitmap,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<CompactionResult> {
     let dst_lvl: usize = payload.canonical_level.into();
     let new_id = opts.table_id_generator.next();
@@ -2935,6 +2982,7 @@ fn run_merge_on_read_relocation(
         new_id,
         bitmap,
         opts.config.sync_mode,
+        pace,
     )?;
     // Recorded once finished: the relocation unlinks its own file on a
     // failure before that.
@@ -3051,6 +3099,10 @@ fn merge_tables(
     let blob_rewrite =
         pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
 
+    // Every read of the inputs, on the fast path as on the merge, reports its
+    // latency to the limiter (see `input_pacer`).
+    let pace = input_pacer(&opts.rate_limiter);
+
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
     // data blocks reused verbatim plus a positional delete-bitmap) instead of
@@ -3062,8 +3114,13 @@ fn merge_tables(
     // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
     if !blob_rewrite.for_locality
-        && let Some((source, bitmap)) =
-            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
+        && let Some((source, bitmap)) = plan_merge_on_read(
+            opts,
+            payload,
+            &tables,
+            &input_range_tombstones,
+            pace.as_ref(),
+        )?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -3073,6 +3130,7 @@ fn merge_tables(
             payload,
             &source,
             &bitmap,
+            pace.as_ref(),
         );
     }
     let blob_files_to_rewrite = blob_rewrite.files;
@@ -3309,6 +3367,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
+        pace.as_ref(),
     )?
     else {
         log::warn!(
@@ -3450,7 +3509,7 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| open_blob_scanner_at_frontier(bf, 0))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, &opts.rate_limiter))
                         .collect::<crate::Result<Vec<_>>>()?,
                     opts.config.comparator.clone(),
                 );

@@ -104,6 +104,45 @@ fn blob_scanner_resume_reads_suffix_and_rejects_bad_offset() -> crate::Result<()
     Ok(())
 }
 
+/// Opening a scanner reads the file's trailer and table of contents before
+/// the first frame: a paced scanner times those reads too, so a relocation
+/// that opens many cold blob files up front tells its pacer about every one,
+/// including a file whose metadata read then fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_paced_scanner_times_the_reads_that_open_it() -> crate::Result<()> {
+    use crate::table::util::{Pacer, ReadPacer};
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    struct Timed(AtomicU64);
+    impl ReadPacer for Timed {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {}
+        fn read_took(&self, _elapsed: core::time::Duration) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let dir = tempdir()?;
+    let blob_file_path = dir.path().join("0");
+    {
+        let mut writer = BlobFileWriter::new(&blob_file_path, 0, 0, &StdFs)?;
+        writer.write(b"a", 0, &[b'v'; 100])?;
+        writer.finish()?;
+    }
+
+    let timed = alloc::sync::Arc::new(Timed(AtomicU64::new(0)));
+    let pace: Pacer = timed.clone();
+    let _scanner = Scanner::open_paced(&blob_file_path, &StdFs, 0, None, Some(pace))?;
+    assert!(
+        timed.0.load(Ordering::Relaxed) > 0,
+        "opening the scanner read its trailer and table of contents untimed",
+    );
+    Ok(())
+}
+
 /// Tamper seqno in first blob frame and verify the scanner's header
 /// CRC catches the corruption.
 #[test]

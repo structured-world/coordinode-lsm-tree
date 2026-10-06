@@ -1143,6 +1143,7 @@ impl Table {
             metrics: &self.metrics,
             charge,
             budget: self.read_budget(),
+            pace: None,
         }
     }
 
@@ -7987,6 +7988,15 @@ impl Table {
     /// Will return `Err` if an IO error occurs.
     #[doc(hidden)]
     pub fn scan(&self) -> crate::Result<Scanner> {
+        self.scan_paced(None)
+    }
+
+    /// [`Self::scan`], telling `pace` how long each read from the file takes,
+    /// from the first.
+    pub(crate) fn scan_paced(
+        &self,
+        pace: Option<&crate::table::util::Pacer>,
+    ) -> crate::Result<Scanner> {
         #[expect(
             clippy::expect_used,
             reason = "there shouldn't be 4 billion data blocks in a single table"
@@ -8013,7 +8023,14 @@ impl Table {
         let mut groups = Vec::new();
         if self.1.is_some() || self.metadata.columnar {
             let mut started = self.1.is_none();
-            for keyed in self.maintenance_index_walk() {
+            // The index walk reads from the file too, a cold index at length:
+            // its reads report as the scan's do.
+            let walk = self.maintenance_index_walk();
+            let walk = match pace {
+                Some(pace) => walk.with_pace(alloc::sync::Arc::clone(pace)),
+                None => walk,
+            };
+            for keyed in walk {
                 let keyed = keyed?;
                 if !started {
                     if let Some(bound) = &self.1
@@ -8035,16 +8052,18 @@ impl Table {
                 groups.push(*keyed.as_ref());
             }
         }
-        self.scan_groups(block_count, start_offset, groups)
+        self.scan_groups(block_count, start_offset, groups, pace)
     }
 
     /// A scanner of `block_count` blocks from `start_offset`, checking each
-    /// columnar group it streams against its index entry in `groups`.
+    /// columnar group it streams against its index entry in `groups`, and
+    /// telling `pace` how long its reads take.
     fn scan_groups(
         &self,
         block_count: usize,
         start_offset: u64,
         groups: Vec<BlockHandle>,
+        pace: Option<&crate::table::util::Pacer>,
     ) -> crate::Result<Scanner> {
         Scanner::new(
             &self.fs,
@@ -8064,6 +8083,7 @@ impl Table {
             start_offset,
             self.1.clone(),
             groups,
+            pace.cloned(),
         )
     }
 

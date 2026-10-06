@@ -39,9 +39,34 @@
 //! [`Config::compaction_rate_limiter`](crate::Config::compaction_rate_limiter)
 //! and are bounded by it together. The limiter owns the rate:
 //! [`RateLimiter::set_rate`] changes it for every holder, with no restart.
+//!
+//! # Backing off while the device is slow
+//!
+//! A byte rate alone keeps background I/O going at that rate while other load
+//! congests the device. With a [`LatencyBackoff`] set, the limiter also
+//! watches how long its own charged reads take (fed in through
+//! [`RateLimiter::record_read_latency`]) and lowers the rate it actually
+//! grants while their smoothed latency is above a ceiling, down to a floor
+//! that is never zero, then raises it back once the latency falls below the
+//! ceiling's hysteresis band. Load from anything else on the device slows
+//! these reads too, so foreign congestion shows in them with no device
+//! mapping; congestion the limiter's own I/O causes falls as it backs off.
+//!
+//! Every reader the limiter paces reports: a paced verification scan, and a
+//! compaction on the limiter, for the reads of its input tables and of the
+//! blob files it relocates. A limiter shared by both thus keeps getting samples
+//! once a scan ends, and climbs back as soon as the device answers fast again.
+//! A compaction times its reads only while a backoff is set, a portion at a
+//! time, so without one its reads go as they would unpaced.
+//!
+//! The law is the one PARDA uses to size a host's I/O window (Gulati, Ahmad,
+//! Waldspurger, FAST 2009, section 3.2): the latency is an EWMA,
+//! `L = (1 - α)·l + α·L'`, and each step moves the rate fraction `w` by
+//! `w ← w·((1 - γ) + γ·ceiling / L)`, bounded by the floor and the configured
+//! rate.
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use portable_atomic::AtomicU64;
@@ -97,6 +122,8 @@ struct Bucket {
     /// predates it is released, and its debit is gone with the old bucket,
     /// even if the rate was switched back on before it looked.
     last_off: u64,
+    /// The latency controller, when one is set.
+    backoff: Option<Backoff>,
 }
 
 #[cfg_attr(
@@ -118,6 +145,7 @@ impl Bucket {
             last_refill_nanos: 0,
             changes: 0,
             last_off: 0,
+            backoff: None,
         };
         bucket.fill(rate, now_nanos);
         bucket
@@ -236,6 +264,221 @@ impl Bucket {
     }
 }
 
+/// How a [`RateLimiter`] backs off while its reads are slow.
+///
+/// It holds the latency ceiling, the band below it the latency must fall to
+/// before the rate climbs back, the lowest share of the configured rate it
+/// goes down to, and how often the rate may step.
+///
+/// Set on a limiter with [`RateLimiter::set_latency_backoff`]; it can be
+/// replaced or removed on a live limiter.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::rate_limiter::LatencyBackoff;
+/// use std::time::Duration;
+///
+/// let backoff = LatencyBackoff::new(Duration::from_millis(10))
+///     .with_hysteresis(0.3)
+///     .with_floor(0.1);
+/// assert_eq!(backoff.ceiling(), Duration::from_millis(10));
+/// assert_eq!(backoff.floor(), 0.1);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatencyBackoff {
+    ceiling: Duration,
+    hysteresis: f64,
+    floor: f64,
+    period: Duration,
+}
+
+impl LatencyBackoff {
+    /// Default [`hysteresis`](Self::with_hysteresis): the rate climbs back
+    /// once the latency is 20% under the ceiling.
+    pub const DEFAULT_HYSTERESIS: f64 = 0.2;
+
+    /// Default [`floor`](Self::with_floor): 5% of the configured rate, the
+    /// lowest share `RocksDB`'s auto-tuned limiter goes down to.
+    pub const DEFAULT_FLOOR: f64 = 0.05;
+
+    /// Default [`period`](Self::with_period) between two rate steps.
+    pub const DEFAULT_PERIOD: Duration = Duration::from_millis(100);
+
+    /// Backs off while the smoothed read latency is above `ceiling`, with
+    /// the default hysteresis, floor and period.
+    #[must_use]
+    pub const fn new(ceiling: Duration) -> Self {
+        Self {
+            ceiling,
+            hysteresis: Self::DEFAULT_HYSTERESIS,
+            floor: Self::DEFAULT_FLOOR,
+            period: Self::DEFAULT_PERIOD,
+        }
+    }
+
+    /// Sets the band, as a fraction of the ceiling, the latency must fall
+    /// below the ceiling before the rate climbs back: with `0.2` and a 10 ms
+    /// ceiling, the rate holds between 8 and 10 ms and climbs under 8 ms.
+    ///
+    /// Clamped to `[0, 0.95]`; a value that is not a number keeps the default.
+    #[must_use]
+    pub fn with_hysteresis(mut self, fraction: f64) -> Self {
+        self.hysteresis = if fraction.is_nan() {
+            Self::DEFAULT_HYSTERESIS
+        } else {
+            fraction.clamp(0.0, 0.95)
+        };
+        self
+    }
+
+    /// Sets the lowest share of the configured rate the limiter backs off to.
+    /// It is never zero, so a periodic scrub keeps moving however slow the
+    /// device gets and keeps sampling the latency it recovers on.
+    ///
+    /// Clamped to `[0.001, 1]`; a value that is not a number keeps the
+    /// default. `1` disables the backoff in effect.
+    #[must_use]
+    pub fn with_floor(mut self, fraction: f64) -> Self {
+        self.floor = if fraction.is_nan() {
+            Self::DEFAULT_FLOOR
+        } else {
+            fraction.clamp(0.001, 1.0)
+        };
+        self
+    }
+
+    /// Sets the shortest time between two rate steps, so a burst of reads
+    /// moves the rate once per period rather than once per read.
+    #[must_use]
+    pub const fn with_period(mut self, period: Duration) -> Self {
+        self.period = period;
+        self
+    }
+
+    /// The smoothed read latency above which the rate steps down.
+    #[must_use]
+    pub const fn ceiling(&self) -> Duration {
+        self.ceiling
+    }
+
+    /// The hysteresis band, as a fraction of the ceiling.
+    #[must_use]
+    pub const fn hysteresis(&self) -> f64 {
+        self.hysteresis
+    }
+
+    /// The lowest share of the configured rate the limiter backs off to.
+    #[must_use]
+    pub const fn floor(&self) -> f64 {
+        self.floor
+    }
+
+    /// The shortest time between two rate steps.
+    #[must_use]
+    pub const fn period(&self) -> Duration {
+        self.period
+    }
+}
+
+/// Weight of the history in the latency EWMA (PARDA's `α`): 7/8, as TCP
+/// smooths its round-trip time, so one slow read moves the estimate by an
+/// eighth of the difference.
+const LATENCY_SMOOTHING: f64 = 0.875;
+
+/// How far one step moves the rate toward where the ceiling would put it
+/// (PARDA's `γ`): halfway.
+const STEP_GAIN: f64 = 0.5;
+
+/// The most one step may raise the rate fraction by, so a burst of fast reads
+/// after a congested spell climbs back over a few periods instead of at once.
+const MAX_STEP_UP: f64 = 2.0;
+
+/// The latency controller's state.
+#[derive(Debug)]
+struct Backoff {
+    config: LatencyBackoff,
+    /// Smoothed read latency in nanoseconds; `None` before the first sample.
+    smoothed_nanos: Option<f64>,
+    /// The share of the configured rate granted, in `[floor, 1]`.
+    fraction: f64,
+    /// When the rate last stepped, as nanoseconds since the limiter's origin.
+    last_step_nanos: u128,
+}
+
+impl Backoff {
+    fn new(config: LatencyBackoff, now_nanos: u128) -> Self {
+        Self {
+            config,
+            smoothed_nanos: None,
+            fraction: 1.0,
+            last_step_nanos: now_nanos,
+        }
+    }
+
+    /// Folds a read latency into the estimate and, once a period has passed
+    /// since the last step, steps the rate fraction.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "latencies in nanoseconds as f64 lose precision only past 2^53 ns, about 104 days"
+    )]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "f64::mul_add is not in core, and this module builds without std"
+    )]
+    fn observe(&mut self, latency: Duration, now_nanos: u128) {
+        let sample = latency.as_nanos() as f64;
+        let smoothed = match self.smoothed_nanos {
+            None => sample,
+            Some(previous) => (1.0 - LATENCY_SMOOTHING) * sample + LATENCY_SMOOTHING * previous,
+        };
+        self.smoothed_nanos = Some(smoothed);
+
+        if now_nanos.saturating_sub(self.last_step_nanos) < self.config.period.as_nanos() {
+            return;
+        }
+        self.last_step_nanos = now_nanos;
+
+        let ceiling = self.config.ceiling.as_nanos() as f64;
+        let climbs_below = ceiling * (1.0 - self.config.hysteresis);
+        if smoothed > ceiling {
+            // `ceiling / smoothed < 1`: the fraction shrinks.
+            let step = (1.0 - STEP_GAIN) + STEP_GAIN * (ceiling / smoothed);
+            self.fraction = (self.fraction * step).max(self.config.floor);
+        } else if smoothed < climbs_below {
+            // `ceiling / smoothed > 1` (infinite for a zero latency, which the
+            // step bound absorbs): the fraction grows.
+            let step = ((1.0 - STEP_GAIN) + STEP_GAIN * (ceiling / smoothed)).min(MAX_STEP_UP);
+            self.fraction = (self.fraction * step).min(1.0);
+        }
+    }
+
+    /// Replaces the configuration, keeping the estimate and the fraction,
+    /// lifted to the new floor.
+    fn reconfigure(&mut self, config: LatencyBackoff) {
+        self.config = config;
+        self.fraction = self.fraction.max(config.floor);
+    }
+}
+
+/// The rate actually granted: the configured rate scaled by the backoff, at
+/// least one byte per second while the configured rate is on.
+fn effective_rate(configured: u64, backoff: Option<&Backoff>) -> u64 {
+    match backoff {
+        Some(backoff) if configured != 0 && backoff.fraction < 1.0 => {
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the product is in [0, configured], a fraction of a u64"
+            )]
+            let scaled = (configured as f64 * backoff.fraction) as u64;
+            scaled.clamp(1, configured)
+        }
+        _ => configured,
+    }
+}
+
 /// A debit waiting to be repaid: its place in line and the change count it
 /// was taken at.
 #[cfg(feature = "std")]
@@ -325,10 +568,17 @@ impl Wakeup {
 /// ```
 #[derive(Debug)]
 pub struct RateLimiter {
-    /// Refill rate in bytes per second. `0` means unlimited (disabled).
-    /// Written only under the bucket lock, so a request that holds the lock
-    /// sees the rate its bucket state was settled against.
+    /// The rate set through [`set_rate`](Self::set_rate), in bytes per
+    /// second. `0` means unlimited (disabled).
+    configured_bytes_per_sec: AtomicU64,
+    /// The refill rate actually granted: the configured rate, lowered by the
+    /// latency backoff when one is set. `0` exactly when the configured rate
+    /// is. Written only under the bucket lock, so a request that holds the
+    /// lock sees the rate its bucket state was settled against.
     rate_bytes_per_sec: AtomicU64,
+    /// Whether a latency backoff is set, so a reader can skip timing its
+    /// reads without taking the bucket lock. Written under the bucket lock.
+    steers_by_latency: AtomicBool,
     bucket: Mutex<Bucket>,
     /// What waiting requests sleep on; shared with the stop signals of the
     /// trees that hold this limiter.
@@ -345,7 +595,9 @@ impl RateLimiter {
     #[must_use]
     pub fn new(rate_bytes_per_sec: u64) -> Self {
         Self {
+            configured_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
             rate_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
+            steers_by_latency: AtomicBool::new(false),
             bucket: Mutex::new(Bucket::full(rate_bytes_per_sec, 0)),
             #[cfg(feature = "std")]
             wakeup: alloc::sync::Arc::default(),
@@ -372,10 +624,145 @@ impl RateLimiter {
         self.wakeup.ring();
     }
 
-    /// The current rate in bytes per second; `0` when throttling is off.
+    /// The configured rate in bytes per second; `0` when throttling is off.
     #[must_use]
     pub fn rate(&self) -> u64 {
+        self.configured_bytes_per_sec.load(Ordering::Relaxed)
+    }
+
+    /// The rate granted now: the configured rate, or less while a
+    /// [`LatencyBackoff`] holds it down.
+    #[must_use]
+    pub fn effective_rate(&self) -> u64 {
         self.rate_bytes_per_sec.load(Ordering::Relaxed)
+    }
+
+    /// Moves the granted rate to `new` at `now_nanos`, settling the bucket as
+    /// [`set_rate_at`](Self::set_rate_at) describes. Returns whether it moved,
+    /// so the caller wakes the waiters once the lock is released.
+    fn switch_rate(&self, bucket: &mut Bucket, new: u64, now_nanos: u128) -> bool {
+        let old = self.rate_bytes_per_sec.load(Ordering::Relaxed);
+        if old == new {
+            return false;
+        }
+        if old == 0 {
+            bucket.fill(new, now_nanos);
+        } else {
+            bucket.refill(old, now_nanos);
+            // Time the old rate did not turn into a whole byte is dropped
+            // with it: it is not owed at the new rate.
+            bucket.advance_clock(now_nanos);
+            if new != 0 {
+                bucket.cap(new);
+            }
+        }
+        // One step per rate change: a u64 does not wrap.
+        bucket.changes += 1;
+        if new == 0 {
+            bucket.last_off = bucket.changes;
+        }
+        self.rate_bytes_per_sec.store(new, Ordering::Relaxed);
+        true
+    }
+
+    /// Wakes the waiters after the granted rate moved: every deadline moved,
+    /// or a wait is over.
+    fn rate_moved(&self) {
+        #[cfg(feature = "std")]
+        self.wakeup.ring();
+    }
+
+    /// Sets, replaces or (with `None`) removes the latency backoff at
+    /// monotonic time `now`, for every holder of this limiter.
+    ///
+    /// A replacement keeps the latency estimate and the share of the rate
+    /// granted, lifted to the new floor; a removal grants the configured rate
+    /// again at once. `now` is on the same clock as
+    /// [`acquire_wait`](Self::acquire_wait); with the `std` feature,
+    /// [`set_latency_backoff`](Self::set_latency_backoff) reads it.
+    pub fn set_latency_backoff_at(&self, backoff: Option<LatencyBackoff>, now: Duration) {
+        let now_nanos = now.as_nanos();
+        let mut bucket = self.bucket.lock();
+        match (backoff, bucket.backoff.as_mut()) {
+            (None, _) => bucket.backoff = None,
+            (Some(config), Some(current)) => current.reconfigure(config),
+            (Some(config), None) => bucket.backoff = Some(Backoff::new(config, now_nanos)),
+        }
+        self.steers_by_latency
+            .store(bucket.backoff.is_some(), Ordering::Relaxed);
+        let granted = effective_rate(self.rate(), bucket.backoff.as_ref());
+        let moved = self.switch_rate(&mut bucket, granted, now_nanos);
+        drop(bucket);
+        if moved {
+            self.rate_moved();
+        }
+    }
+
+    /// Sets, replaces or removes the latency backoff now; see
+    /// [`set_latency_backoff_at`](Self::set_latency_backoff_at).
+    // no-std: set_latency_backoff_at with a caller-provided monotonic clock
+    #[cfg(feature = "std")]
+    pub fn set_latency_backoff(&self, backoff: Option<LatencyBackoff>) {
+        self.set_latency_backoff_at(backoff, Self::std_now());
+    }
+
+    /// Whether reads charged to this limiter should report how long they take:
+    /// a latency backoff is set and the rate is on. Lock-free, for a reader
+    /// deciding per read whether to time it.
+    #[must_use]
+    pub(crate) fn steers_by_latency(&self) -> bool {
+        self.steers_by_latency.load(Ordering::Relaxed)
+            && self.rate_bytes_per_sec.load(Ordering::Relaxed) != 0
+    }
+
+    /// The latency backoff in force, if any.
+    #[must_use]
+    pub fn latency_backoff(&self) -> Option<LatencyBackoff> {
+        self.bucket.lock().backoff.as_ref().map(|b| b.config)
+    }
+
+    /// Records how long one read this limiter charged took, observed at
+    /// monotonic time `now`, and steps the granted rate if a period has
+    /// passed since the last step. A no-op without a latency backoff.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::rate_limiter::{LatencyBackoff, RateLimiter};
+    /// use std::time::Duration;
+    ///
+    /// let limiter = RateLimiter::new(1_000_000);
+    /// let backoff = LatencyBackoff::new(Duration::from_millis(10)).with_period(Duration::ZERO);
+    /// limiter.set_latency_backoff_at(Some(backoff), Duration::ZERO);
+    ///
+    /// // Reads four times slower than the ceiling: the granted rate drops.
+    /// limiter.record_read_latency_at(Duration::from_millis(40), Duration::from_millis(1));
+    /// assert!(limiter.effective_rate() < limiter.rate());
+    /// ```
+    pub fn record_read_latency_at(&self, latency: Duration, now: Duration) {
+        if self.rate_bytes_per_sec.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let now_nanos = now.as_nanos();
+        let mut bucket = self.bucket.lock();
+        let Some(backoff) = bucket.backoff.as_mut() else {
+            return;
+        };
+        backoff.observe(latency, now_nanos);
+        let granted = effective_rate(self.rate(), bucket.backoff.as_ref());
+        let moved = self.switch_rate(&mut bucket, granted, now_nanos);
+        drop(bucket);
+        if moved {
+            self.rate_moved();
+        }
+    }
+
+    /// Records how long one read this limiter charged took, as of now; see
+    /// [`record_read_latency_at`](Self::record_read_latency_at).
+    // no-std: record_read_latency_at with a caller-provided monotonic clock
+    #[cfg(feature = "std")]
+    pub fn record_read_latency(&self, latency: Duration) {
+        self.record_read_latency_at(latency, Self::std_now());
     }
 
     /// Changes the rate at monotonic time `now`, for every holder of this
@@ -397,35 +784,20 @@ impl RateLimiter {
     ///
     /// `now` is on the same clock as [`acquire_wait`](Self::acquire_wait);
     /// with the `std` feature, [`set_rate`](Self::set_rate) reads it.
+    ///
+    /// With a [`LatencyBackoff`] set, the granted rate is the new rate scaled
+    /// by the share the backoff holds it to.
     pub fn set_rate_at(&self, bytes_per_sec: u64, now: Duration) {
         let now_nanos = now.as_nanos();
         let mut bucket = self.bucket.lock();
-        let old = self.rate_bytes_per_sec.load(Ordering::Relaxed);
-        if old == bytes_per_sec {
-            return;
-        }
-        if old == 0 {
-            bucket.fill(bytes_per_sec, now_nanos);
-        } else {
-            bucket.refill(old, now_nanos);
-            // Time the old rate did not turn into a whole byte is dropped
-            // with it: it is not owed at the new rate.
-            bucket.advance_clock(now_nanos);
-            if bytes_per_sec != 0 {
-                bucket.cap(bytes_per_sec);
-            }
-        }
-        // One step per rate change: a u64 does not wrap.
-        bucket.changes += 1;
-        if bytes_per_sec == 0 {
-            bucket.last_off = bucket.changes;
-        }
-        self.rate_bytes_per_sec
+        self.configured_bytes_per_sec
             .store(bytes_per_sec, Ordering::Relaxed);
+        let granted = effective_rate(bytes_per_sec, bucket.backoff.as_ref());
+        let moved = self.switch_rate(&mut bucket, granted, now_nanos);
         drop(bucket);
-        // Every waiter's deadline moved, or its wait is over.
-        #[cfg(feature = "std")]
-        self.wakeup.ring();
+        if moved {
+            self.rate_moved();
+        }
     }
 
     /// Changes the rate now; see [`set_rate_at`](Self::set_rate_at) for what
@@ -457,7 +829,7 @@ impl RateLimiter {
             return Duration::ZERO;
         }
         let mut bucket = self.bucket.lock();
-        let rate = self.rate();
+        let rate = self.effective_rate();
         if rate == 0 {
             return Duration::ZERO;
         }
@@ -541,7 +913,7 @@ impl RateLimiter {
     #[cfg(feature = "std")]
     fn take_ticket(&self, bytes: u64, now: Duration) -> Option<Ticket> {
         let mut bucket = self.bucket.lock();
-        let rate = self.rate();
+        let rate = self.effective_rate();
         if rate == 0 {
             return None;
         }
@@ -562,7 +934,7 @@ impl RateLimiter {
         }
         // No switch off since the ticket, and the rate was nonzero when it
         // was taken, so it is nonzero now.
-        let rate = self.rate();
+        let rate = self.effective_rate();
         debug_assert_ne!(rate, 0);
         bucket.refill(rate, now.as_nanos());
         let wait = bucket.wait_for(ticket.position, rate);
@@ -580,7 +952,7 @@ impl RateLimiter {
             return;
         }
         bucket.withdrawn.push((ticket.position, u128::from(bytes)));
-        bucket.cap(self.rate());
+        bucket.cap(self.effective_rate());
         bucket.settle_withdrawn();
         drop(bucket);
         // The waiters behind it moved up the line.
