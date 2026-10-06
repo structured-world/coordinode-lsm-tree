@@ -2,7 +2,6 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use super::{Block, DataBlock};

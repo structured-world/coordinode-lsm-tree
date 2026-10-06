@@ -52,6 +52,12 @@ pub(crate) trait ReadPacer: Send + Sync {
 /// A walk's pacer, shared with the iterators that load its blocks.
 pub(crate) type Pacer = alloc::sync::Arc<dyn ReadPacer>;
 
+/// What a read of an [`FsFile`](crate::fs::FsFile) returns in this build.
+#[cfg(feature = "std")]
+type TimedRead = std::io::Result<usize>;
+#[cfg(not(feature = "std"))]
+type TimedRead = crate::io::Result<usize>;
+
 /// A file read front to back through a buffer, telling a pacer, while it is
 /// active, how long each read takes. An active pacer has the reader take a
 /// portion at a time, as a paced verification does, so every sample is one
@@ -71,7 +77,7 @@ impl TimedFile {
         self.pace = Some(pace);
     }
 
-    fn read_timed(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+    fn read_timed(&mut self, buf: &mut [u8]) -> TimedRead {
         #[cfg(not(feature = "std"))]
         use crate::io::Read;
         #[cfg(feature = "std")]
