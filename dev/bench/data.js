@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791323026063,
+  "lastUpdate": 1791323032311,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -35510,6 +35510,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 8950,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9c7c4ec7a7cc8b5b338e48c6d79b17fbd6fbe08f",
+          "message": "fix(version): a failed manifest rotation no longer blocks the next install (#853)\n\n## Summary\n\n- A manifest rotation that fails after creating `v{N}` no longer blocks\nevery later install with `AlreadyExists` until the process restarts.\n\nThe 5.x line got the same fix in #841.\n\n## Changes\n\n- Before writing `v{N}`, a `v{N}` that `CURRENT` does not name is\nremoved: it is the leftover of an attempt that failed before the\nrepoint, or of a crash there, and holds nothing recovery reads. A `v{N}`\nthat `CURRENT` already names is refused, never rewritten, since that is\nthe state after a failure past the repoint.\n- `rewrite_atomic` logs a temp file it cannot remove instead of\ndiscarding the error.\n- An integration test fails the `CURRENT` rename once and installs again\n(the old persist fails with `AlreadyExists`), and a unit test covers the\nnamed/unnamed rule.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #825",
+          "timestamp": "2026-10-07T00:28:38+03:00",
+          "tree_id": "fb7ad70c66a1d3cfcfa2c1b9d648505dcf6248b3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9c7c4ec7a7cc8b5b338e48c6d79b17fbd6fbe08f"
+        },
+        "date": 1791323029680,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 505.7,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 65.4688ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 137.79999999999998,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.1081ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 704.7,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 86.7427ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 2537.8,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 8872.6,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
