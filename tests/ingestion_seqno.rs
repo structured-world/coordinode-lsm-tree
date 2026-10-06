@@ -88,8 +88,10 @@ fn an_ingestion_stays_ahead_of_a_flush_it_installs_after() -> lsm_tree::Result<(
 
     {
         let tree = open()?;
-        // The sequence number the ingestion is installed at.
-        let tie = seqno.get();
+        // The sequence number the ingestion is installed at: the flush that
+        // runs in `finish` installs its own version first and takes the one
+        // before it.
+        let tie = seqno.get() + 1;
 
         let mut ingestion = tree.ingestion()?;
         ingestion.write("k", "ingested")?;
