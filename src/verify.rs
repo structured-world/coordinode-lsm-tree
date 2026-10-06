@@ -817,6 +817,12 @@ impl crate::table::util::ReadPacer for LimiterPacer {
             .map_or(len, |file_size| bytes_in_file(offset, len, file_size));
         charge_in_portions(&self.limiter, charge);
     }
+
+    // The index walk's reads steer a latency backoff as the scan's own do.
+    #[cfg(feature = "std")]
+    fn read_took(&self, elapsed: core::time::Duration) {
+        self.limiter.record_read_latency(elapsed);
+    }
 }
 
 /// The bytes a read of `len` at `offset` takes from a file of `file_size`
@@ -2536,6 +2542,7 @@ impl PacedFile<'_> {
         #[cfg(feature = "std")]
         let started = std::time::Instant::now();
         let mut read = 0;
+        let mut failed = None;
         while read < charged {
             let Some(rest) = buf.get_mut(read..charged) else {
                 break;
@@ -2552,7 +2559,10 @@ impl PacedFile<'_> {
                     self.pending = Some(e);
                     break;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
             };
             if got == 0 {
                 break;
@@ -2560,9 +2570,14 @@ impl PacedFile<'_> {
             read += got;
             self.pos += got as u64;
         }
+        // A read the device answered with an error took its time too: a slow
+        // failure is congestion the backoff must see.
         #[cfg(feature = "std")]
         if let Some(limiter) = self.limiter {
             limiter.record_read_latency(started.elapsed());
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         Ok(read)
     }

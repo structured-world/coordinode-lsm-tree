@@ -1844,15 +1844,20 @@ fn a_paced_file_keeps_the_bytes_read_before_an_interruption() -> crate::Result<(
     Ok(())
 }
 
-/// A file that takes `delay` to answer every read, as a congested device does.
+/// A file that takes `delay` to answer every read, as a congested device does,
+/// and answers with an error instead of bytes when `fails`.
 struct SlowReads {
     inner: Box<dyn crate::fs::FsFile>,
     delay: std::time::Duration,
+    fails: bool,
 }
 
 impl std::io::Read for SlowReads {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         std::thread::sleep(self.delay);
+        if self.fails {
+            return Err(std::io::ErrorKind::Other.into());
+        }
         self.inner.read(buf)
     }
 }
@@ -1913,6 +1918,7 @@ fn a_paced_file_reports_its_read_latency_to_the_limiter() -> crate::Result<()> {
         Ok(SlowReads {
             inner: fs.open(path, &FsOpenOptions::new().read(true))?,
             delay: Duration::from_millis(5),
+            fails: false,
         })
     };
 
@@ -1941,6 +1947,107 @@ fn a_paced_file_reports_its_read_latency_to_the_limiter() -> crate::Result<()> {
     );
     reader.read_exact(&mut read[..])?;
     assert_eq!(configured, unmanaged.effective_rate());
+    Ok(())
+}
+
+/// A read the device answers slowly with an error, before any byte, still
+/// counts toward the backoff: a scan that goes on past failed sections must
+/// not keep hammering a congested device at the full rate.
+#[test]
+fn a_slow_failed_read_lowers_the_granted_rate() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use std::time::Duration;
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&[7u8; 4096])?;
+    }
+    let configured = 1 << 30;
+    let limiter = RateLimiter::new(configured);
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let failing = SlowReads {
+        inner: fs.open(path, &FsOpenOptions::new().read(true))?,
+        delay: Duration::from_millis(5),
+        fails: true,
+    };
+    let mut paced = PacedFile::new(Box::new(failing), Some(&limiter))?;
+    let mut buf = [0u8; 1024];
+    for _ in 0..4 {
+        assert!(std::io::Read::read(&mut paced, &mut buf).is_err());
+    }
+    assert!(
+        limiter.effective_rate() < configured,
+        "slow failures did not lower the rate"
+    );
+    Ok(())
+}
+
+/// The index reads a restricted table's punch-offset walk makes through the
+/// block loader report how long each portion took, and a limiter's pacer
+/// hands that to the latency backoff.
+#[test]
+fn a_paced_index_read_reports_its_latency() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use crate::table::util::ReadPacer;
+    use std::time::Duration;
+
+    /// Counts the portions it is told the read time of.
+    struct Timed(std::sync::atomic::AtomicUsize);
+    impl ReadPacer for Timed {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {}
+        fn read_took(&self, _elapsed: Duration) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let fs = MemFs::new();
+    let path = std::path::Path::new("/f");
+    let size = 2 * PACE_PORTION + 100;
+    {
+        let mut f = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+        f.write_all(&vec![7u8; size])?;
+    }
+    let file = fs.open(path, &FsOpenOptions::new().read(true))?;
+    let timed = Timed(std::sync::atomic::AtomicUsize::new(0));
+    crate::file::read_exact_paced(file.as_ref(), 0, size, Some(&timed))?;
+    assert_eq!(
+        3,
+        timed.0.load(std::sync::atomic::Ordering::Relaxed),
+        "every portion read reports its time"
+    );
+
+    // The walk's pacer passes the time on to the limiter.
+    let dir = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.insert("k", "v", 0);
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+    let configured = 1 << 30;
+    let limiter = std::sync::Arc::new(RateLimiter::new(configured));
+    limiter.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_millis(1)).with_period(Duration::ZERO),
+    ));
+    let pacer = super::walk_pacer(table, Some(&limiter)).expect("a limiter attaches a pacer");
+    pacer.read_took(Duration::from_millis(10));
+    assert!(
+        limiter.effective_rate() < configured,
+        "a slow index read did not lower the rate"
+    );
     Ok(())
 }
 

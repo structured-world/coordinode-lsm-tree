@@ -43,6 +43,10 @@ pub(crate) trait ReadPacer: Send + Sync {
     /// Told the file offset and length of each portion of a paced read just
     /// before that portion is read.
     fn pace(&self, offset: u64, len: u64);
+
+    /// Told how long the read of a paced portion took, whether it returned
+    /// bytes or an error. Only a `std` build times the reads.
+    fn read_took(&self, _elapsed: core::time::Duration) {}
 }
 
 /// A walk's pacer, shared with the iterators that load its blocks.
