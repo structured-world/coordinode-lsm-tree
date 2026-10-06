@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791318351116,
+  "lastUpdate": 1791318355678,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -34948,6 +34948,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 9642.033,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8431dcbc5a97c683e240d235a7ec079a3946ca77",
+          "message": "ci(deps): bump cargo-bins/cargo-binstall from 1.23.0 to 1.25.1 (#866)\n\nBumps\n[cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall)\nfrom 1.23.0 to 1.25.1.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/releases\">cargo-bins/cargo-binstall's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v1.25.1</h2>\n<p><em>Binstall is a tool to fetch and install Rust-based executables as\nbinaries. It aims to be a drop-in replacement for <code>cargo\ninstall</code> in most cases. Install it today with <code>cargo install\ncargo-binstall</code>, from the binaries below, or if you already have\nit, upgrade with <code>cargo binstall cargo-binstall</code>.</em></p>\n<h4>In this release:</h4>\n<ul>\n<li>Fix prebuilt not used by <code>cargo binstall cargo-binstall</code>\non and Windows ARM <a\nhref=\"https://github.com/rscorer\"><code>@​rscorer</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2692\">#2692</a>)</li>\n</ul>\n<h2>v1.25.0</h2>\n<p><em>Binstall is a tool to fetch and install Rust-based executables as\nbinaries. It aims to be a drop-in replacement for <code>cargo\ninstall</code> in most cases. Install it today with <code>cargo install\ncargo-binstall</code>, from the binaries below, or if you already have\nit, upgrade with <code>cargo binstall cargo-binstall</code>.</em></p>\n<h4>In this release:</h4>\n<ul>\n<li>Add <code>--list</code> and <code>--prune</code> to inspect and\nreconcile manifests <a\nhref=\"https://github.com/rscorer\"><code>@​rscorer</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2675\">#2675</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2677\">#2677</a>)</li>\n<li>docs: add crate author guide for supporting binstall <a\nhref=\"https://github.com/saylesss88\"><code>@​saylesss88</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2682\">#2682</a>)</li>\n</ul>\n<h4>Fixed</h4>\n<ul>\n<li>Fix zip extraction to prevent absolute path (GHSA-8276-gxvh-4xr8 and\nGHSA-jrxx-5q54-fhjr <a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2685\">#2685</a>)</li>\n<li>fix msrv: 📌 vergen dep requires MSRV 1.96.0 <a\nhref=\"https://github.com/vepain\"><code>@​vepain</code></a> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2683\">#2683</a>)</li>\n</ul>\n<h4>Other changes:</h4>\n<ul>\n<li>upgrade dependencies</li>\n</ul>\n<h2>v1.24.0</h2>\n<p><em>Binstall is a tool to fetch and install Rust-based executables as\nbinaries. It aims to be a drop-in replacement for <code>cargo\ninstall</code> in most cases. Install it today with <code>cargo install\ncargo-binstall</code>, from the binaries below, or if you already have\nit, upgrade with <code>cargo binstall cargo-binstall</code>.</em></p>\n<h4>In this release:</h4>\n<ul>\n<li>Add <code>--feature</code> flag when falling back to\n<code>cargo-install</code> (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2668\">#2668</a>)</li>\n</ul>\n<h4>Other changes:</h4>\n<ul>\n<li>Upgrade dependencies</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/7bebc2e59eb8820162b7ac8f62a92bfdb2732447\"><code>7bebc2e</code></a>\nrelease: cargo-binstall v1.25.1 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2693\">#2693</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/307bd5ffcec9b16554d0e7dfc0f1a364b2ceb695\"><code>307bd5f</code></a>\nfix(manifest): add zip pkg-fmt overrides for macOS and Windows ARM\ntargets (#...</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/a29e25869a42756b3be062dc4dae3e4b01bb4f38\"><code>a29e258</code></a>\nrelease: cargo-binstall v1.25.0 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2691\">#2691</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/d17d20fa7d0088cf81f91c59c9453d81f90ee93a\"><code>d17d20f</code></a>\nchore: release (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2684\">#2684</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/391d1b8d1ed725087f1a90ec2dbca36a26fc8951\"><code>391d1b8</code></a>\nbuild(deps): bump minisign-verify from 0.2.5 to 0.3.0 in the deps group\n(<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2690\">#2690</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/218b600ec918a0d3b5e9ed7d208b61ae949fdd0d\"><code>218b600</code></a>\ndep: Upgrade transitive dependencies (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2689\">#2689</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/d5ebb4e9c17294f73b590ba85824b589533175a1\"><code>d5ebb4e</code></a>\nFix zip extraction to prevent absolute path (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2685\">#2685</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/f8162f41a8ea5ec653c5cba967cc1b2d89c867c5\"><code>f8162f4</code></a>\nfeat(cli): add --list and --prune to inspect and reconcile manifests (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2677\">#2677</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/2e63c34ec4f5daa70e042c54ef3144074821c220\"><code>2e63c34</code></a>\nfix: :pushpin: vergen dep requires MSRV 1.96.0 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2683\">#2683</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/ad9eafcdc52590fac666c1abb14d0617f093d7e7\"><code>ad9eafc</code></a>\ndocs: add crate author guide for supporting binstall (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2682\">#2682</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/compare/b874e25ea559687bec77e281e9b271aa1367b624...7bebc2e59eb8820162b7ac8f62a92bfdb2732447\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=cargo-bins/cargo-binstall&package-manager=github_actions&previous-version=1.23.0&new-version=1.25.1)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>\nCo-authored-by: Dmitry Prudnikov <mail@polaz.com>",
+          "timestamp": "2026-10-06T23:08:44+03:00",
+          "tree_id": "8df3082ca1ceed9c71b687c8123ca62f7b7d522d",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8431dcbc5a97c683e240d235a7ec079a3946ca77"
+        },
+        "date": 1791318354465,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 504.075,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 80.3281ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 125.466,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.905523ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 431.963,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.765622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3207.8689999999997,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9505.573999999999,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
