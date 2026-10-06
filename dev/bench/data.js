@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791249167810,
+  "lastUpdate": 1791250672589,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -31706,6 +31706,90 @@ window.BENCHMARK_DATA = {
             "value": 284185.6567503388,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 17.9us | P99.9: 95.6us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5c7e9e3c71442b9fc8ab473a7b7acd4f1707bd66",
+          "message": "feat(verify): rate the scrub by bytes read (#843)\n\n## Summary\n\n- The block-checksum scrub can be held to a byte rate: every read of an\nSST file is charged before it is made, through one `RateLimiter` shared\nby all workers.\n- An operator sets a disk load instead of a pause between files of any\nsize, and can retune it live or draw it from the same budget as\ncompaction.\n\nReplaces #821, squashed into one commit on the current `main`.\n\n## Changes\n\n- `VerifyOptions::rate_limiter(Arc<RateLimiter>)` and the shorthand\n`VerifyOptions::max_bytes_per_sec(n)`; no limiter, or a rate of `0`,\nreads at full speed.\n- The scan reads each SST through a file wrapper that charges every\nread, buffer refills, trailer and TOC included, up to the file's end:\nthe bytes read, never a length a header or the TOC declares, so a forged\nlength cannot stall the scan and no refill reads ahead of the budget.\n- Under a limiter with a rate set, a read takes at most 64 KiB, charged\nand then read, so other users of a shared limiter are served between\nportions and the device never sees one block-sized read; at rate zero,\nand without `std`, where the limiter never waits, reads go whole.\nWhether a read is rated is decided once, for its size and its charge\nalike. An interrupted read is retried, an error after bytes of a read\ncomes with the next read unless a seek moves away first, and bytes\ncharged but not read stay to the file's credit.\n- A restricted table's index lookup is paced by the block loader: each\nindex block it reads from the file is read a portion at a time, each\nportion charged just before it is read and cut at the file's end.\nNothing is charged for a block the cache serves or the loader refuses\nunread, and a rate set while the walk runs applies to the reads still to\ncome.\n- The out-of-band walk used by repair and `sst-dump` reads unrated.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #764\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added optional byte-rate limiting for data verification, with\nconfigurable throughput or a shared rate limiter.\n* Verification reads are paced in portions across file scans and index\nlookups, helping control disk I/O during verification. Without a\nlimiter, existing read behavior is preserved.\n* **Bug Fixes**\n* Improved handling of partial reads, interrupted reads, and reads that\nextend beyond the end of a file during verification.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-06T01:23:40Z",
+          "tree_id": "f0d2fea100a002e0c238b8adc32b67d5bb558f30",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5c7e9e3c71442b9fc8ab473a7b7acd4f1707bd66"
+        },
+        "date": 1791250671346,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 69743.65716463674,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.5us | P99.9: 50.2us\nthreads: 1 | elapsed: 7.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2607943.8726665145,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 622720.1165692204,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.0us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 488277.4210276456,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.7us | P99.9: 23.8us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2283919.0992003814,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 207910.48477282893,
+            "unit": "ops/sec",
+            "extra": "P50: 3.6us | P99: 14.8us | P99.9: 36.0us\nthreads: 1 | elapsed: 0.96s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 128054.37020551594,
+            "unit": "ops/sec",
+            "extra": "P50: 6.5us | P99: 25.9us | P99.9: 55.8us\nthreads: 1 | elapsed: 1.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 516991.34446887195,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 3.7us | P99.9: 15.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 707984.946625829,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 8.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 294538.4528469717,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 24.3us | P99.9: 101.4us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
           }
         ]
       }
