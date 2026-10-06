@@ -21,7 +21,7 @@ fn hold_without_share_delete(path: &std::path::Path) -> std::io::Result<File> {
 /// flush or compaction that asked for it.
 #[cfg(windows)]
 #[test]
-fn std_fs_remove_file_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
+fn std_fs_remove_file_brief_hold_on_windows_succeeds() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("held");
     std::fs::write(&path, b"x")?;
@@ -41,7 +41,7 @@ fn std_fs_remove_file_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
 /// share-delete succeeds once the hold ends.
 #[cfg(windows)]
 #[test]
-fn std_fs_rename_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
+fn std_fs_rename_brief_destination_hold_on_windows_succeeds() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let from = dir.path().join("new");
     let to = dir.path().join("current");
@@ -63,15 +63,25 @@ fn std_fs_rename_waits_out_a_brief_hold_on_windows() -> io::Result<()> {
 /// error, so a genuinely locked file is reported rather than waited on forever.
 #[cfg(windows)]
 #[test]
-fn std_fs_remove_file_gives_up_on_a_long_hold_on_windows() -> io::Result<()> {
+fn std_fs_remove_file_long_hold_on_windows_returns_error() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("held");
     std::fs::write(&path, b"x")?;
 
     let holder = hold_without_share_delete(&path)?;
+    // The kind a single delete of the held file fails with: the retry must
+    // hand back that hold error, not some other failure.
+    let expected_kind = match std::fs::remove_file(&path) {
+        Err(error) => io::Error::from(error).kind(),
+        Ok(()) => return Err(io::Error::other("held-file removal unexpectedly succeeded")),
+    };
     let result = StdFs.remove_file(&path);
     drop(holder);
-    assert!(result.is_err(), "a hold past the retry bound must fail");
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(expected_kind),
+        "a hold past the retry bound fails with the hold's error"
+    );
     assert!(path.exists());
     Ok(())
 }
