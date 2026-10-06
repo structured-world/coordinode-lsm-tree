@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791329553337,
+  "lastUpdate": 1791329560050,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -36278,6 +36278,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 8872.6,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f9abfc059abe73f22648d17244af8d1d327276b2",
+          "message": "fix(fs): retry a rename or delete Windows refuses for a brief hold (#854)\n\n## Summary\n\n- On Windows, a rename or delete that another process (antivirus, search\nindexer, backup agent) briefly holds open without `FILE_SHARE_DELETE` is\nretried for about half a second instead of failing the flush, compaction\nor `CURRENT` repoint that issued it.\n\nThe 5.x line got the same fix in #846.\n\n## Changes\n\n- `StdFs::rename` and `StdFs::remove_file` retry `ERROR_ACCESS_DENIED`,\n`ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION` and\n`ERROR_USER_MAPPED_FILE` with a bounded backoff (1 ms doubling to 256\nms, about half a second in all), then return the last error. Other\nplatforms run the call once, as before.\n- Windows tests hold a file without share-delete: a delete and a rename\nover it succeed once a 50 ms hold ends, and a hold past the bound still\nfails.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux; the Windows tests run in\nthe Windows CI jobs.\n\nCloses #826\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* File removal and renaming on Windows now retry briefly when another\nprocess temporarily holds a conflicting file handle, improving\nreliability in those cases. If the conflict persists, the operation\nstill fails.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T02:17:55+03:00",
+          "tree_id": "4fab2c015b55000a53520696e028040e6b137fb8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f9abfc059abe73f22648d17244af8d1d327276b2"
+        },
+        "date": 1791329557160,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 701.6,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 73.3748ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 128,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.976ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 697.8000000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 87.1085ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 2489.2999999999997,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 8870.7,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
