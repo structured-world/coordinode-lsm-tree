@@ -733,7 +733,9 @@ impl ParsedMeta {
             None => None,
         };
         // Required: L0 is ordered by it, and a table id is no stand-in for a
-        // compaction output's age.
+        // compaction output's age. No released version wrote V6 tables
+        // without it, so there is no older V6 shape to fall back for; V5
+        // stores reach V6 only through the offline converter, which stamps it.
         let recency = read_u64!(block, b"recency", &cmp);
         // Compaction lineage: consecutive little-endian input ids. A payload
         // that is not a whole number of ids is corrupt meta.

@@ -2061,6 +2061,10 @@ impl Tree {
     /// Releases the floor [`Self::reserve_ingest_floor`] gave, once the
     /// ingestion installed its tables or gave up.
     pub(crate) fn release_ingest_floor(&self, floor: TableId) {
+        #[cfg(all(test, feature = "std"))]
+        self.floor_releases_under_flush_lock
+            .lock()
+            .push(self.flush_lock.is_locked());
         let mut floors = self.ingest_floors.lock();
         if let Some(at) = floors.iter().position(|&reserved| reserved == floor) {
             floors.swap_remove(at);
@@ -5434,6 +5438,8 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             ingest_floors: Mutex::default(),
+            #[cfg(all(test, feature = "std"))]
+            floor_releases_under_flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
             _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -6544,6 +6550,9 @@ mod cache_stats_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod restricted_reclaim_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod ingest_floor_tests;
 
 #[cfg(all(test, feature = "std", zstd_any))]
 mod dict_collect_tests;

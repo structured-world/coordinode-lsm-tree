@@ -267,6 +267,10 @@ impl<'a> BlobIngestion<'a> {
         // This prevents race conditions where blob files and their index
         // entries could have mismatched sequence numbers.
         let flush_lock = index.get_flush_lock();
+        // Bound after the lock, so it drops first: the floor is released while
+        // the flush lock is still held, and no flush waiting on the lock is
+        // stamped with the floor of an ingestion that is already installed.
+        let _floor = self.table.floor;
 
         // Flush any pending index memtable writes to ensure ingestion sees
         // a consistent snapshot of the index.

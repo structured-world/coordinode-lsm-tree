@@ -33,9 +33,9 @@ pub struct Ingestion<'a> {
     /// [`WritePin`](crate::runtime_config::WritePin)). It covers the blob
     /// files of a blob ingestion too, which share the snapshot.
     pub(crate) write_pin: crate::runtime_config::WritePin,
-    /// The L0 recency floor this ingestion holds until it is dropped, after
-    /// `finish` installed its tables or once it is given up.
-    _floor: IngestFloor<'a>,
+    /// The L0 recency floor this ingestion holds until `finish` has installed
+    /// its tables, or until it is given up.
+    pub(crate) floor: IngestFloor<'a>,
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
@@ -50,7 +50,7 @@ pub struct Ingestion<'a> {
 /// the lowest floor in flight, so a table it writes while an ingestion runs,
 /// whose id is higher than the ingestion's, still lays out behind the
 /// ingestion that installs after it. Released when dropped.
-struct IngestFloor<'a> {
+pub struct IngestFloor<'a> {
     tree: &'a Tree,
     floor: crate::TableId,
 }
@@ -283,7 +283,7 @@ impl<'a> Ingestion<'a> {
             tree,
             writer,
             write_pin: crate::runtime_config::WritePin::new(rc).with_filter_sizing(filter_sizing),
-            _floor: floor,
+            floor,
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]
@@ -592,6 +592,10 @@ impl<'a> Ingestion<'a> {
         //
         // By holding the flush lock throughout, we guarantee atomicity.
         let flush_lock = self.tree.get_flush_lock();
+        // Bound after the lock, so it drops first: the floor is released while
+        // the flush lock is still held, and no flush waiting on the lock is
+        // stamped with the floor of an ingestion that is already installed.
+        let _floor = self.floor;
 
         // Flush any pending memtable writes to ensure ingestion sees a
         // consistent snapshot and lookup order remains correct.
