@@ -65,19 +65,17 @@ pub trait Aged {
     fn age(&self) -> Self::Age;
 }
 
-/// A table's age is its sequence numbers, the version every read resolves
-/// by: of two tables that overlap, the one holding the higher sequence
-/// numbers holds the newer data. The table id breaks a tie. Bounds that do
-/// not fit together (damaged metadata) cannot tell an age, and sort oldest.
+/// A table's age is its persisted L0 recency key: its own id for a flush or an
+/// ingest (ids are allocated in increasing order), its newest input's for a
+/// compaction output, so a flush landing while a compaction runs is newer
+/// than its output. Sequence numbers are no age: a caller may assign them, so
+/// two tables can hold one key at one seqno, and the newer table's must win.
+/// The id breaks a tie, the higher one being the superseding copy.
 impl Aged for crate::table::Table {
-    type Age = (Option<(crate::SeqNo, crate::SeqNo)>, crate::table::TableId);
+    type Age = (crate::table::TableId, crate::table::TableId);
 
     fn age(&self) -> Self::Age {
-        (
-            self.seqno_range()
-                .map(|(lowest, highest)| (highest, lowest)),
-            self.id(),
-        )
+        (self.l0_recency(), self.id())
     }
 }
 
