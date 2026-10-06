@@ -73,3 +73,43 @@ fn ingestion_seqno_after_regular_inserts() -> lsm_tree::Result<()> {
 
     Ok(())
 }
+
+/// An ingestion takes its table ids when it starts, while a write made during
+/// it reaches a table only at the flush that runs before the ingestion is
+/// installed, with a higher id. The ingestion is the newer of the two: with
+/// both holding one key at one sequence number, a read returns the ingested
+/// value, before and after a reopen.
+#[test]
+fn an_ingestion_stays_ahead_of_a_flush_it_installs_after() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+    let open = || Config::new(&folder, seqno.clone(), visible_seqno.clone()).open();
+
+    {
+        let tree = open()?;
+        // The sequence number the ingestion is installed at.
+        let tie = seqno.get();
+
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("k", "ingested")?;
+        // A write made while the ingestion runs, at the same sequence number.
+        tree.insert("k", "flushed", tie);
+        visible_seqno.fetch_max(tie + 1);
+        ingestion.finish()?;
+
+        assert_eq!(
+            tree.get("k", SeqNo::MAX)?.as_deref(),
+            Some(b"ingested".as_slice()),
+            "the ingestion installed after the flush is the newer write"
+        );
+    }
+
+    let tree = open()?;
+    assert_eq!(
+        tree.get("k", SeqNo::MAX)?.as_deref(),
+        Some(b"ingested".as_slice()),
+        "the order holds across a reopen"
+    );
+    Ok(())
+}

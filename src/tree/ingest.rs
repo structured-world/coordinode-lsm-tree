@@ -33,6 +33,9 @@ pub struct Ingestion<'a> {
     /// [`WritePin`](crate::runtime_config::WritePin)). It covers the blob
     /// files of a blob ingestion too, which share the snapshot.
     pub(crate) write_pin: crate::runtime_config::WritePin,
+    /// The L0 recency floor this ingestion holds until it is dropped, after
+    /// `finish` installed its tables or once it is given up.
+    _floor: IngestFloor<'a>,
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
@@ -40,6 +43,31 @@ pub struct Ingestion<'a> {
     /// the layout changes, so many small ingest batches become few large blocks.
     #[cfg(feature = "columnar")]
     pending_columnar: Option<PendingRowGroup>,
+}
+
+/// The L0 recency floor of an ingestion in flight: a table id reserved below
+/// every table the ingestion writes. A flush stamps its tables at or below
+/// the lowest floor in flight, so a table it writes while an ingestion runs,
+/// whose id is higher than the ingestion's, still lays out behind the
+/// ingestion that installs after it. Released when dropped.
+struct IngestFloor<'a> {
+    tree: &'a Tree,
+    floor: crate::TableId,
+}
+
+impl<'a> IngestFloor<'a> {
+    fn reserve(tree: &'a Tree) -> Self {
+        Self {
+            tree,
+            floor: tree.reserve_ingest_floor(),
+        }
+    }
+}
+
+impl Drop for IngestFloor<'_> {
+    fn drop(&mut self) {
+        self.tree.release_ingest_floor(self.floor);
+    }
 }
 
 /// The columnar batches an ingestion has accepted for its next row group, kept
@@ -132,6 +160,10 @@ impl<'a> Ingestion<'a> {
             crate::filter_budget::FilterCount::default(),
             rc.ecc_scheme,
         );
+
+        // Reserved before the writer takes its first table id, so every table
+        // this ingestion writes lies above it.
+        let floor = IngestFloor::reserve(tree);
 
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
@@ -251,6 +283,7 @@ impl<'a> Ingestion<'a> {
             tree,
             writer,
             write_pin: crate::runtime_config::WritePin::new(rc).with_filter_sizing(filter_sizing),
+            _floor: floor,
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]

@@ -1068,6 +1068,7 @@ impl AbstractTree for Tree {
             0,
             level_fs.clone(),
         )?
+        .use_flush_recency(self.lowest_ingest_floor())
         .set_comparator(self.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
@@ -2047,6 +2048,30 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
+    /// Reserves the L0 recency floor of an ingestion that starts now: a table
+    /// id below every table the ingestion writes. While it is registered, a
+    /// flush stamps its tables at or below it (see
+    /// [`MultiWriter::use_flush_recency`](crate::table::multi_writer::MultiWriter::use_flush_recency)).
+    pub(crate) fn reserve_ingest_floor(&self) -> TableId {
+        let floor = self.table_id_counter.next();
+        self.ingest_floors.lock().push(floor);
+        floor
+    }
+
+    /// Releases the floor [`Self::reserve_ingest_floor`] gave, once the
+    /// ingestion installed its tables or gave up.
+    pub(crate) fn release_ingest_floor(&self, floor: TableId) {
+        let mut floors = self.ingest_floors.lock();
+        if let Some(at) = floors.iter().position(|&reserved| reserved == floor) {
+            floors.swap_remove(at);
+        }
+    }
+
+    /// The lowest floor an ingestion still in flight reserved, if any.
+    pub(crate) fn lowest_ingest_floor(&self) -> Option<TableId> {
+        self.ingest_floors.lock().iter().copied().min()
+    }
+
     /// The filter plan of new data written into tables under the policies of
     /// `level`, as a flush or an ingestion writes it: at most `count` keys and
     /// filter hashes (zero when unknown) under `bloom_policy`. `None` without
@@ -5408,6 +5433,7 @@ impl Tree {
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            ingest_floors: Mutex::default(),
             #[cfg(feature = "std")]
             _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),

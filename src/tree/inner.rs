@@ -150,6 +150,12 @@ pub struct TreeInner {
     /// Serializes flush operations.
     pub(crate) flush_lock: Mutex<()>,
 
+    /// The table id each ingestion in flight reserved when it started, below
+    /// every table it writes. A flush stamps its tables at the lowest of them,
+    /// so it stays behind an ingestion that installs after it, though its
+    /// table ids were allocated later than the ingestion's.
+    pub(crate) ingest_floors: Mutex<alloc::vec::Vec<TableId>>,
+
     /// Holds the cross-process exclusive directory lock for this tree's
     /// lifetime: the locked `LOCK` file handle acquired by `Config::open` (via
     /// `acquire_directory_lock`). Dropping it on tree close releases the OS
@@ -364,6 +370,7 @@ impl TreeInner {
             stop_signal,
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
+            ingest_floors: Mutex::default(),
             #[cfg(feature = "std")]
             _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
