@@ -2487,41 +2487,51 @@ impl PacedFile<'_> {
             buf.len()
         };
         let (head, _) = buf.split_at_mut(want);
-        let admitted = self.pace(head.len(), limiter);
+        let (admitted, from_credit) = self.pace(head.len(), limiter);
         let read = self.fill(head, admitted, limiter);
-        // What was charged and not read stays to the file's credit when the
-        // file ended early. A read the device answered with an error, before
-        // or after some bytes, used the device for what it was charged, so
-        // that is not handed back: the next read of those bytes is charged
-        // again, and a run of failing sections keeps waiting at the rate.
-        if limiter.is_some()
-            && self.pending.is_none()
-            && let Ok(got) = read.as_ref()
-            // `fill` reads at most what was admitted, save past the end of
-            // the file as opened, where nothing was admitted and nothing is
-            // owed.
-            && let Some(unread) = admitted.checked_sub(*got)
-        {
-            self.credit += unread as u64;
+        if limiter.is_some() {
+            // What was charged and not read stays to the file's credit, so a
+            // read that failed partway is not charged twice for the bytes it
+            // reads again. A failed read spends the credit it was paid from,
+            // though: handed back, a run of failing sections would pass the
+            // same credit along and never wait at the rate.
+            let failed = read.is_err() || self.pending.is_some();
+            let got = read.as_ref().map_or(0, |got| *got);
+            // `fill` reads at most what was admitted, save past the end of the
+            // file as opened, where nothing was admitted and nothing is owed.
+            if let Some(unread) = admitted.checked_sub(got) {
+                // The credit paid at most what was admitted.
+                let charged_now = admitted - from_credit;
+                let refund = if failed {
+                    unread.min(charged_now)
+                } else {
+                    unread
+                };
+                self.credit += refund as u64;
+            }
         }
         read
     }
 
     /// Waits until `limiter`, when there is one, admits a read of up to
     /// `want` bytes, counted only up to the file's end, which a read never
-    /// goes past, and returns how many it admitted. Credit left from earlier
-    /// reads is spent first.
-    fn pace(&mut self, want: usize, limiter: Option<&RateLimiter>) -> usize {
+    /// goes past, and returns how many it admitted and how many of those the
+    /// credit left from earlier reads paid, which is spent first.
+    fn pace(&mut self, want: usize, limiter: Option<&RateLimiter>) -> (usize, usize) {
         // Zero past the end, where a seek may land: no byte is left to read.
         let left = self.len.saturating_sub(self.pos);
         let bytes = (want as u64).min(left);
+        let mut from_credit = 0;
         if let Some(limiter) = limiter {
-            let from_credit = self.credit.min(bytes);
+            from_credit = self.credit.min(bytes);
             self.credit -= from_credit;
             charge_in_portions(limiter, bytes - from_credit);
         }
-        // At most `want`, so it fits a `usize`.
-        usize::try_from(bytes).unwrap_or(want)
+        // Both at most `want`, so they fit a `usize`.
+        (
+            usize::try_from(bytes).unwrap_or(want),
+            usize::try_from(from_credit).unwrap_or(want),
+        )
     }
 
     /// Reads into `buf` until the `charged` bytes are in or the file ends: a

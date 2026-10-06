@@ -1987,12 +1987,13 @@ fn a_slow_failed_read_lowers_the_granted_rate() -> crate::Result<()> {
     Ok(())
 }
 
-/// A read the device answered with an error used the device as much as one
-/// that returned bytes, so what it was charged is not handed back as credit:
-/// handed back, every later failed read would spend it and none would wait,
-/// and a lowered rate would never hold back a run of failing sections.
+/// A failed read hands back what it was charged afresh, so the bytes are not
+/// paid twice when read again, but not the credit it was paid from: handed
+/// back each time, one credit would pay every later failed read and none
+/// would wait, so a lowered rate would never hold back a run of failing
+/// sections. Every other failure is charged.
 #[test]
-fn a_failed_read_leaves_no_credit() -> crate::Result<()> {
+fn a_failed_read_does_not_hand_back_the_credit_it_spent() -> crate::Result<()> {
     use crate::fs::{Fs, FsOpenOptions, MemFs};
     use crate::rate_limiter::RateLimiter;
     use std::time::Duration;
@@ -2011,10 +2012,12 @@ fn a_failed_read_leaves_no_credit() -> crate::Result<()> {
     };
     let mut paced = PacedFile::new(Box::new(failing), Some(&limiter))?;
     let mut buf = [0u8; 1024];
-    for _ in 0..3 {
+    let mut credits = Vec::new();
+    for _ in 0..4 {
         assert!(std::io::Read::read(&mut paced, &mut buf).is_err());
-        assert_eq!(paced.credit, 0, "a failed read was refunded");
+        credits.push(paced.credit);
     }
+    assert_eq!(credits, vec![1024, 0, 1024, 0]);
     Ok(())
 }
 
