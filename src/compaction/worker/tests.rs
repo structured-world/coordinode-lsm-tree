@@ -2193,7 +2193,8 @@ fn compaction_stream_run_not_found() -> crate::Result<()> {
             &[666],
             0,
             None,
-            crate::comparator::default_comparator()
+            crate::comparator::default_comparator(),
+            None,
         )?
         .is_none()
     );
@@ -4693,6 +4694,62 @@ fn a_retune_through_one_tree_binds_every_tree_sharing_the_limiter() -> crate::Re
         Duration::from_secs(1),
     );
 
+    Ok(())
+}
+
+/// A verification scan that ends while the device is congested leaves the
+/// latency backoff of a limiter it shares with compaction low, and only read
+/// latencies move it: a compaction on that limiter reports how long its input
+/// reads take, so the rate climbs back once the device answers fast again
+/// instead of staying at the floor until another scan comes.
+#[test]
+fn compaction_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use core::time::Duration;
+
+    let shared = Arc::new(RateLimiter::new(1 << 30));
+    shared.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_secs(10)).with_period(Duration::ZERO),
+    ));
+    // The scan's last reads, far over the ceiling.
+    for _ in 0..20 {
+        shared.record_read_latency(Duration::from_secs(100));
+    }
+    let left_by_the_scan = shared.effective_rate();
+    assert!(
+        left_by_the_scan < shared.rate(),
+        "the scan lowered the rate"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let tree = open_standard(dir.path(), |c| {
+        c.compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    // Values the block codec cannot shrink, so the inputs span many reads.
+    let mut noise = 0x9E37_79B9_7F4A_7C15u64;
+    for flush in 0..4u64 {
+        for key in 0..256u64 {
+            let value: Vec<u8> = (0..512)
+                .flat_map(|_| {
+                    noise = noise
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    noise.to_le_bytes()
+                })
+                .collect();
+            tree.insert(key.to_be_bytes(), value, flush * 256 + key);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, 0)?;
+
+    assert!(
+        shared.effective_rate() > left_by_the_scan,
+        "the compaction's fast reads did not lift the backoff: {} of {}",
+        shared.effective_rate(),
+        shared.rate(),
+    );
     Ok(())
 }
 

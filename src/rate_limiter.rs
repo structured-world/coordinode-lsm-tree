@@ -52,6 +52,13 @@
 //! these reads too, so foreign congestion shows in them with no device
 //! mapping; congestion the limiter's own I/O causes falls as it backs off.
 //!
+//! Every reader the limiter paces reports: a paced verification scan, and a
+//! compaction on the limiter, for the reads of its input tables and of the
+//! blob files it relocates. A limiter shared by both thus keeps getting samples
+//! once a scan ends, and climbs back as soon as the device answers fast again.
+//! A compaction times its reads only while a backoff is set, a portion at a
+//! time, so without one its reads go as they would unpaced.
+//!
 //! The law is the one PARDA uses to size a host's I/O window (Gulati, Ahmad,
 //! Waldspurger, FAST 2009, section 3.2): the latency is an EWMA,
 //! `L = (1 - α)·l + α·L'`, and each step moves the rate fraction `w` by
@@ -59,7 +66,7 @@
 //! rate.
 
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 
 use portable_atomic::AtomicU64;
@@ -569,6 +576,9 @@ pub struct RateLimiter {
     /// is. Written only under the bucket lock, so a request that holds the
     /// lock sees the rate its bucket state was settled against.
     rate_bytes_per_sec: AtomicU64,
+    /// Whether a latency backoff is set, so a reader can skip timing its
+    /// reads without taking the bucket lock. Written under the bucket lock.
+    steers_by_latency: AtomicBool,
     bucket: Mutex<Bucket>,
     /// What waiting requests sleep on; shared with the stop signals of the
     /// trees that hold this limiter.
@@ -587,6 +597,7 @@ impl RateLimiter {
         Self {
             configured_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
             rate_bytes_per_sec: AtomicU64::new(rate_bytes_per_sec),
+            steers_by_latency: AtomicBool::new(false),
             bucket: Mutex::new(Bucket::full(rate_bytes_per_sec, 0)),
             #[cfg(feature = "std")]
             wakeup: alloc::sync::Arc::default(),
@@ -677,6 +688,8 @@ impl RateLimiter {
             (Some(config), Some(current)) => current.reconfigure(config),
             (Some(config), None) => bucket.backoff = Some(Backoff::new(config, now_nanos)),
         }
+        self.steers_by_latency
+            .store(bucket.backoff.is_some(), Ordering::Relaxed);
         let granted = effective_rate(self.rate(), bucket.backoff.as_ref());
         let moved = self.switch_rate(&mut bucket, granted, now_nanos);
         drop(bucket);
@@ -691,6 +704,15 @@ impl RateLimiter {
     #[cfg(feature = "std")]
     pub fn set_latency_backoff(&self, backoff: Option<LatencyBackoff>) {
         self.set_latency_backoff_at(backoff, Self::std_now());
+    }
+
+    /// Whether reads charged to this limiter should report how long they take:
+    /// a latency backoff is set and the rate is on. Lock-free, for a reader
+    /// deciding per read whether to time it.
+    #[must_use]
+    pub(crate) fn steers_by_latency(&self) -> bool {
+        self.steers_by_latency.load(Ordering::Relaxed)
+            && self.rate_bytes_per_sec.load(Ordering::Relaxed) != 0
     }
 
     /// The latency backoff in force, if any.

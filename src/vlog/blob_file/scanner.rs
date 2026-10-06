@@ -9,15 +9,13 @@
 // without the cap the salvage walk would attempt a multi-gigabyte allocation
 // before the candidate's checksum rejection.
 use super::writer::{BLOB_HEADER_MAGIC, MAX_DECOMPRESSION_SIZE, validate_header_crc};
-use crate::fs::{Fs, FsFile, FsOpenOptions};
+use crate::fs::{Fs, FsOpenOptions};
 use crate::io::BufReader;
 use crate::io::{LittleEndian, ReadBytesExt};
 #[cfg(not(feature = "std"))]
 use crate::io::{Read, Seek, SeekFrom};
 use crate::path::Path;
 use crate::{Checksum, SeqNo, UserKey, UserValue, vlog::BlobFileId};
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use std::io::{Read, Seek, SeekFrom};
 
@@ -30,7 +28,7 @@ use std::io::{Read, Seek, SeekFrom};
 /// magic (`META`).
 pub struct Scanner {
     pub(crate) blob_file_id: BlobFileId, // TODO: remove unused?
-    inner: BufReader<Box<dyn FsFile>>,
+    inner: BufReader<crate::table::util::TimedFile>,
     is_terminated: bool,
 
     /// Byte offset where the "data" section ends (from the SFA TOC).
@@ -126,7 +124,8 @@ impl Scanner {
         };
 
         file.seek(SeekFrom::Start(seek_to))?;
-        let file_reader = BufReader::with_capacity(32_000, file);
+        let file_reader =
+            BufReader::with_capacity(32_000, crate::table::util::TimedFile::new(file));
 
         Ok(Self {
             blob_file_id,
@@ -139,6 +138,17 @@ impl Scanner {
     // No `with_reader` constructor: Scanner is crate-private (parent
     // `vlog` module is not re-exported from lib.rs), so there are no
     // external callers. All internal usage goes through `new()` / `resume()`.
+
+    /// Tells `pace` how long each read of the scan takes from the file.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "its compaction consumer is std-gated")
+    )]
+    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
+        self.inner.get_mut().set_pace(pace);
+        self
+    }
 }
 
 impl Scanner {

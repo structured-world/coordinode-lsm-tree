@@ -12,8 +12,8 @@ use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
-    fs::{FileHint, Fs, FsFile, FsOpenOptions},
-    table::{block::BlockType, iter::OwnedDataBlockIter},
+    fs::{FileHint, Fs, FsOpenOptions},
+    table::{block::BlockType, iter::OwnedDataBlockIter, util::TimedFile},
 };
 
 /// The data section read as a stream of blocks, with the offset the next one
@@ -21,7 +21,7 @@ use crate::{
 /// block of the right shape written at another block's place is refused
 /// rather than streamed out of order.
 struct BlockStream {
-    reader: BufReader<Box<dyn FsFile>>,
+    reader: BufReader<TimedFile>,
     position: u64,
 }
 
@@ -134,7 +134,7 @@ impl Scanner {
             file.seek(SeekFrom::Start(start_offset))?;
         }
         let mut reader = BlockStream {
-            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, file),
+            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, TimedFile::new(file)),
             position: start_offset,
         };
         let mut groups = groups.into_iter();
@@ -181,6 +181,18 @@ impl Scanner {
             lower_bound,
             groups,
         })
+    }
+
+    /// Tells `pace` how long each read of the rest of the scan takes from the
+    /// file (the first block is read when the scanner is made).
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "its compaction consumer is std-gated")
+    )]
+    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
+        self.reader.reader.get_mut().set_pace(pace);
+        self
     }
 
     #[expect(

@@ -633,12 +633,34 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
     Some((lo, hi))
 }
 
+/// What a compaction tells its rate limiter about the reads of its inputs:
+/// how long they take, for a latency backoff on the limiter to steer by. A
+/// limiter shared with a verification scan would otherwise keep a rate the
+/// scan lowered after the scan ends, since only reads report latency.
+fn input_pacer(
+    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+) -> Option<crate::table::util::Pacer> {
+    // no-std: reads are timed only with std (see `ReadPacer::read_took`)
+    #[cfg(feature = "std")]
+    {
+        Some(Arc::new(crate::table::util::LatencyPacer(Arc::clone(
+            limiter,
+        ))))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = limiter;
+        None
+    }
+}
+
 fn create_compaction_stream<'a>(
     version: &Version,
     to_compact: &[TableId],
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
+    pace: Option<crate::table::util::Pacer>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -649,16 +671,21 @@ fn create_compaction_stream<'a>(
                 continue;
             };
 
-            readers.push(Box::new(RunScanner::culled(
+            readers.push(Box::new(RunScanner::culled_paced(
                 run.clone(),
                 (Some(lo), Some(hi)),
+                pace.clone(),
             )?));
 
             found += hi - lo + 1;
         } else {
             for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
                 found += 1;
-                readers.push(Box::new(table.scan()?));
+                let scanner = table.scan()?;
+                readers.push(Box::new(match &pace {
+                    Some(pace) => scanner.with_pace(Arc::clone(pace)),
+                    None => scanner,
+                }));
             }
         }
     }
@@ -688,6 +715,7 @@ fn create_bounded_compaction_stream<'a>(
     gc_watermark: SeqNo,
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
+    pace: Option<crate::table::util::Pacer>,
 ) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -698,6 +726,10 @@ fn create_bounded_compaction_stream<'a>(
             // Compaction input is maintenance, not a read a caller made, so
             // it stays out of the read counters like the serial scanner's.
             let reader = table.range_iter(bounds.clone()).for_maintenance();
+            let reader = match &pace {
+                Some(pace) => reader.with_pace(Arc::clone(pace)),
+                None => reader,
+            };
             readers.push(Box::new(reader));
         }
     }
@@ -2174,6 +2206,7 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
+        input_pacer(&opts.rate_limiter),
     ) else {
         // The caller validated every input exists, so a missing table here is
         // unexpected. Fail closed: an empty output would let the install delete
@@ -2312,7 +2345,7 @@ fn run_subcompaction(
                     .iter()
                     .map(|bf| {
                         let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
-                        open_blob_scanner_at_frontier(bf, from)
+                        open_blob_scanner_at_frontier(bf, from, &opts.rate_limiter)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
                 opts.config.comparator.clone(),
@@ -2614,13 +2647,23 @@ fn pick_blob_files_for_merge(
 /// restricted with its consumed prefix punched. Reading from the data section
 /// would hit those zeros, resynchronize byte-wise and taint every surviving
 /// frame, so no later merge could relocate the file.
-fn open_blob_scanner_at_frontier(bf: &BlobFile, from: u64) -> crate::Result<BlobFileScanner> {
+fn open_blob_scanner_at_frontier(
+    bf: &BlobFile,
+    from: u64,
+    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+) -> crate::Result<BlobFileScanner> {
     let off = from.max(bf.live_data_start());
-    if off == 0 {
+    let scanner = if off == 0 {
         BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
     } else {
         BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
-    }
+    }?;
+    // The relocation reads the blob files of its inputs: they report their
+    // latency as the table reads do.
+    Ok(match input_pacer(limiter) {
+        Some(pace) => scanner.with_pace(pace),
+        None => scanner,
+    })
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -3309,6 +3352,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
+        input_pacer(&opts.rate_limiter),
     )?
     else {
         log::warn!(
@@ -3450,7 +3494,7 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| open_blob_scanner_at_frontier(bf, 0))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, &opts.rate_limiter))
                         .collect::<crate::Result<Vec<_>>>()?,
                     opts.config.comparator.clone(),
                 );

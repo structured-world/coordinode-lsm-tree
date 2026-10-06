@@ -1143,6 +1143,7 @@ impl Table {
             metrics: &self.metrics,
             charge,
             budget: self.read_budget(),
+            pace: None,
         }
     }
 
