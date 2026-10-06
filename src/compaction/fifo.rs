@@ -120,7 +120,7 @@ impl CompactionStrategy for Strategy {
         };
         // A table whose blob references cannot be read leaves the bytes it
         // frees unknown: the round waits for one that can read them.
-        let mut blob_credit = BlobCredit::new(version);
+        let mut blob_credit = BlobCredit::new(version, state);
 
         let mut ttl_dropped_bytes = 0u64;
         // Every table not expired, held ones included: they keep their place in
@@ -200,12 +200,14 @@ impl CompactionStrategy for Strategy {
 /// What dropping tables frees in blob files. A blob file goes only with the
 /// last table that references it, so several tables sharing one, as the
 /// outputs of a compaction do, free its bytes together and none of them
-/// alone.
+/// alone. A file a memtable row references stays even then, so it frees
+/// nothing.
 ///
 /// The references are read on the first drop, so a round that drops nothing
 /// reads none.
 struct BlobCredit<'v> {
     version: &'v Version,
+    state: &'v CompactionState,
     /// Every table's references, once read.
     refs: Option<BlobRefs>,
 }
@@ -243,9 +245,10 @@ impl BlobRefs {
 }
 
 impl<'v> BlobCredit<'v> {
-    fn new(version: &'v Version) -> Self {
+    fn new(version: &'v Version, state: &'v CompactionState) -> Self {
         Self {
             version,
+            state,
             refs: None,
         }
     }
@@ -271,7 +274,7 @@ impl<'v> BlobCredit<'v> {
             // table's list leaves `files_of` on its first drop.
             debug_assert!(*count > 0, "blob file {file} released twice");
             *count -= 1;
-            if *count == 0 {
+            if *count == 0 && !self.state.memtable_references_blob_file(file) {
                 freed += self
                     .version
                     .blob_files

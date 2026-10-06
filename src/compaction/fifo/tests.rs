@@ -618,6 +618,91 @@ fn fifo_counts_a_shared_blob_file_freed_only_with_its_last_table() -> crate::Res
     Ok(())
 }
 
+/// A blob file whose last table goes stays while a memtable row borrows an
+/// object in it, so dropping that table frees the table alone. Counting the
+/// file as freed stops the round with the file still on disk and the tree over
+/// its limit, though dropping the newer table would have brought it within.
+#[test]
+fn fifo_counts_no_blob_file_a_memtable_row_keeps() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
+
+    let status = FIRST_FIELD_COLUMN;
+    let body_column = FIRST_FIELD_COLUMN + 1;
+    let dir = tempfile::tempdir()?;
+    let crate::AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .blob_compression(crate::CompressionType::None)
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+
+    let body = vec![b'b'; 64 * 1024];
+    with_test_clock(|_| {
+        // The older table owns the blob file; the newer one holds no blob.
+        tree.insert_cells(
+            "doc",
+            &[
+                Field::bytes(status, b"draft"),
+                Field::bytes(body_column, &body),
+            ],
+            0,
+        )?;
+        tree.flush_active_memtable(0)?;
+        tree.insert("z", "v", 1);
+        tree.flush_active_memtable(1)?;
+        crate::Result::Ok(())
+    })?;
+    // A memtable row that borrows the body from the blob file.
+    let Some(row) = tree.get_cells("doc", 2)? else {
+        panic!("the row was flushed");
+    };
+    let Some(borrowed) = row
+        .fields()?
+        .into_iter()
+        .find(|field| field.column == body_column && matches!(field.cell, Cell::Ref(_)))
+    else {
+        panic!("the body was separated");
+    };
+    tree.insert_cells("doc", &[Field::bytes(status, b"final"), borrowed], 2)?;
+    drop(row);
+
+    let version = tree.current_version();
+    let blob_bytes = version.blob_files.on_disk_size();
+    let Some(newer) = version
+        .iter_tables()
+        .max_by_key(|table| table.get_highest_seqno())
+        .map(crate::table::Table::file_size)
+    else {
+        panic!("two tables were flushed");
+    };
+    drop(version);
+    let disk = || {
+        let version = tree.current_version();
+        version
+            .iter_tables()
+            .map(crate::table::Table::file_size)
+            .sum::<u64>()
+            + version.blob_files.on_disk_size()
+    };
+    // Within reach once both tables go, as the kept file stays either way.
+    let limit = blob_bytes + newer / 2;
+    tree.compact(Arc::new(Strategy::new(limit, None)), 3)?;
+    let after = disk();
+    assert!(
+        after <= limit,
+        "one round must bring the tree within its limit: {after} > {limit}"
+    );
+    assert_eq!(1, tree.blob_file_count(), "the borrowed file stays");
+    Ok(())
+}
+
 #[test]
 fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
