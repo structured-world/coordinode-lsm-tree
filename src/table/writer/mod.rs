@@ -413,9 +413,11 @@ impl AgeSweep {
     }
 
     /// The newest `created_at` among the inputs whose key range meets
-    /// `first..=last`, or `None` when none does. Successive calls must pass
-    /// ranges that follow one another in ascending key order, as the outputs
-    /// of one writer chain do.
+    /// `first..=last`, or `None` when none does. Zero, the age of a table
+    /// stamped while the clock read zero, is no age, and an output that meets
+    /// such an input has none either. Successive calls must pass ranges that
+    /// follow one another in ascending key order, as the outputs of one
+    /// writer chain do.
     pub(crate) fn age_of(&mut self, first: &[u8], last: &[u8]) -> Option<u128> {
         use core::cmp::Ordering::{Greater, Less};
 
@@ -457,7 +459,13 @@ impl AgeSweep {
                 }
             }
         }
-        self.ages.last_key_value().map(|(&age, _)| age)
+        // The smallest live age is zero exactly when an input without one is
+        // met: then the output's data is partly of unknown age, and dating it
+        // by the other inputs would make it expire under a TTL.
+        match self.ages.first_key_value() {
+            Some((&0, _)) => Some(0),
+            _ => self.ages.last_key_value().map(|(&age, _)| age),
+        }
     }
 }
 
