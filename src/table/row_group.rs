@@ -940,7 +940,7 @@ impl GroupRead<'_> {
         // one read: while the pacer listens, each region is read and timed on
         // its own.
         #[cfg(feature = "std")]
-        if self.pace.is_some_and(|pace| pace.active()) {
+        if self.pace.is_some_and(crate::table::util::ReadPacer::active) {
             return regions
                 .iter()
                 .map(
