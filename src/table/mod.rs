@@ -9698,10 +9698,34 @@ impl Table {
         self.punch_offset_charged(key, ReadCharge::Maintenance)
     }
 
+    /// [`Self::punch_offset_for`], every index block the walk reads from the
+    /// file paced by `pace` just before the read is made.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(dead_code, reason = "its verify consumer is std-gated")
+    )]
+    pub(crate) fn punch_offset_paced(
+        &self,
+        key: &[u8],
+        charge: ReadCharge,
+        pace: crate::table::util::Pacer,
+    ) -> crate::Result<u64> {
+        self.punch_offset_walk(key, self.index_walk_charged(charge).with_pace(pace))
+    }
+
     /// [`Self::punch_offset_for`], charging its index walk as `charge` says.
     fn punch_offset_charged(&self, key: &[u8], charge: ReadCharge) -> crate::Result<u64> {
+        self.punch_offset_walk(key, self.index_walk_charged(charge))
+    }
+
+    /// The punch offset for `key` over the index handles `walk` yields.
+    fn punch_offset_walk(
+        &self,
+        key: &[u8],
+        walk: block_index::BlockIndexIterImpl,
+    ) -> crate::Result<u64> {
         let mut data_end = 0u64;
-        for handle in self.index_walk_charged(charge) {
+        for handle in walk {
             let handle = handle?;
             if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Less {
                 return Ok(handle.offset().0);

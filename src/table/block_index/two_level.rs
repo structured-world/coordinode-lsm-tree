@@ -12,7 +12,7 @@ use crate::{
     table::{
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::{ReadCharge, load_block},
+        util::{ReadCharge, load_block_paced},
     },
 };
 use alloc::sync::Arc;
@@ -63,6 +63,7 @@ impl TwoLevelBlockIndex {
             #[cfg(feature = "metrics")]
             metrics: self.metrics.clone(),
             charge: ReadCharge::Foreground,
+            pace: None,
             poisoned: false,
         }
     }
@@ -91,6 +92,8 @@ pub struct Iter {
     metrics: Arc<Metrics>,
     /// Whose walk this is, for the partitions it loads.
     pub(crate) charge: ReadCharge,
+    /// Told the bytes of each partition the walk reads from the file.
+    pub(crate) pace: Option<crate::table::util::Pacer>,
 
     poisoned: bool,
 }
@@ -165,7 +168,7 @@ impl Iterator for Iter {
                     break;
                 };
 
-                let block = match load_block(
+                let block = match load_block_paced(
                     self.table_id,
                     &self.path,
                     &self.file_accessor,
@@ -186,6 +189,7 @@ impl Iterator for Iter {
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                     self.charge,
+                    self.pace.as_deref(),
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),
@@ -252,7 +256,7 @@ impl DoubleEndedIterator for Iter {
                     break;
                 };
 
-                let block = match load_block(
+                let block = match load_block_paced(
                     self.table_id,
                     &self.path,
                     &self.file_accessor,
@@ -273,6 +277,7 @@ impl DoubleEndedIterator for Iter {
                     #[cfg(feature = "metrics")]
                     &self.metrics,
                     self.charge,
+                    self.pace.as_deref(),
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),

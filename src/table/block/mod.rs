@@ -1470,8 +1470,23 @@ impl Block {
         on_issue: impl FnOnce(),
         produced: &mut usize,
     ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
+        Self::from_file_issuing_paced(file, handle, identity, transform, on_issue, None, produced)
+    }
+
+    /// [`Self::from_file_issuing`] with the frame read a portion at a time
+    /// under `pace`, which is told each portion's offset and length just
+    /// before it is read; without `pace`, the frame is one read.
+    pub(crate) fn from_file_issuing_paced(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        on_issue: impl FnOnce(),
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+        produced: &mut usize,
+    ) -> crate::Result<(Self, EccStatus, Option<EccRecoveryKind>)> {
         let (header, payload, ecc_status, recovery) =
-            Self::read_verified_payload(file, handle, identity, transform, on_issue)?;
+            Self::read_verified_payload_paced(file, handle, identity, transform, on_issue, pace)?;
         let data = Self::decompress_payload(&header, payload, transform, produced)?;
         Ok((Self { header, data }, ecc_status, recovery))
     }
@@ -1507,6 +1522,19 @@ impl Block {
         identity: BlockIdentity,
         transform: &BlockTransform<'_>,
         on_issue: impl FnOnce(),
+    ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
+        Self::read_verified_payload_paced(file, handle, identity, transform, on_issue, None)
+    }
+
+    /// [`Self::read_verified_payload`], with the frame read a portion at a
+    /// time under `pace` (see [`crate::file::read_at_paced`]).
+    fn read_verified_payload_paced(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        on_issue: impl FnOnce(),
+        pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<(Header, Slice, EccStatus, Option<EccRecoveryKind>)> {
         let encryption = transform.encryption();
         // `identity` (tree/table + compression context) feeds AAD
@@ -1551,7 +1579,7 @@ impl Block {
             // used here if profiling shows this as a bottleneck.
             let mut buf = vec![0u8; block_size];
             on_issue();
-            let n = file.read_at(&mut buf, *handle.offset())?;
+            let n = crate::file::read_at_paced(file, &mut buf, *handle.offset(), pace)?;
             if n != block_size {
                 return Err(crate::Error::Io(crate::io::Error::new(
                     crate::io::ErrorKind::UnexpectedEof,
@@ -1564,9 +1592,15 @@ impl Block {
 
             Self::verify_encrypted_frame(buf, handle, identity, transform, enc, enc_overhead)?
         } else {
-            // Single I/O read — header + payload in one Slice.
+            // Single I/O read — header + payload in one Slice — or a portion
+            // at a time when paced.
             on_issue();
-            let buf = crate::file::read_exact(file, *handle.offset(), handle.size() as usize)?;
+            let buf = crate::file::read_exact_paced(
+                file,
+                *handle.offset(),
+                handle.size() as usize,
+                pace,
+            )?;
             Self::verify_plain_frame(&buf, handle, identity, transform)?
         };
 

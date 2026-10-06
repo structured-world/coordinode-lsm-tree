@@ -33,6 +33,32 @@ pub fn aggregate_run_key_range(tables: &[Table]) -> KeyRange {
 #[derive(Debug)]
 pub struct SliceIndexes(pub usize, pub usize);
 
+/// Paces the block reads a walk issues, never for a block served from the
+/// cache or refused before reading.
+pub(crate) trait ReadPacer: Send + Sync {
+    /// Whether reads are paced now. Decided once per read: a read decided
+    /// unpaced is one read, uncharged.
+    fn active(&self) -> bool;
+
+    /// Told the file offset and length of each portion of a paced read just
+    /// before that portion is read.
+    fn pace(&self, offset: u64, len: u64);
+}
+
+/// A walk's pacer, shared with the iterators that load its blocks.
+pub(crate) type Pacer = alloc::sync::Arc<dyn ReadPacer>;
+
+/// The most a paced read takes from the file in one go: a larger read is
+/// paced and made a portion at a time, so a shared limiter serves other
+/// requests between the portions and the device never sees one read as large
+/// as a block.
+#[cfg(feature = "std")]
+pub(crate) const PACE_PORTION: usize = 64 * 1024;
+/// The no_std limiter never waits, so portions would only multiply backend
+/// calls: a read there goes whole.
+#[cfg(not(feature = "std"))]
+pub(crate) const PACE_PORTION: usize = usize::MAX;
+
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
@@ -68,6 +94,48 @@ pub fn load_block(
     heal_hints: Option<&crate::heal_hints::HealHints>,
     #[cfg(feature = "metrics")] metrics: &Metrics,
     charge: ReadCharge,
+) -> crate::Result<Block> {
+    load_block_paced(
+        table_id,
+        path,
+        file_accessor,
+        cache,
+        handle,
+        block_type,
+        compression,
+        encryption,
+        ecc,
+        #[cfg(zstd_any)]
+        zstd_dict,
+        heal_hints,
+        #[cfg(feature = "metrics")]
+        metrics,
+        charge,
+        None,
+    )
+}
+
+/// [`load_block`], with `pace`, when given, told the offset and length of
+/// each portion of the read just before that portion is read from the file.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and heal context"
+)]
+pub(crate) fn load_block_paced(
+    table_id: GlobalTableId,
+    path: &Path,
+    file_accessor: &FileAccessor,
+    cache: &Cache,
+    handle: &BlockHandle,
+    block_type: BlockType,
+    compression: CompressionType,
+    encryption: Option<&dyn EncryptionProvider>,
+    ecc: Option<crate::table::block::EccParams>,
+    #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+    heal_hints: Option<&crate::heal_hints::HealHints>,
+    #[cfg(feature = "metrics")] metrics: &Metrics,
+    charge: ReadCharge,
+    pace: Option<&dyn ReadPacer>,
 ) -> crate::Result<Block> {
     #[cfg(feature = "metrics")]
     use core::sync::atomic::Ordering::Relaxed;
@@ -142,7 +210,7 @@ pub fn load_block(
     // fails its checksum, decryption or decompression was still asked of the
     // filesystem, while a handle refused before reading asked nothing.
     let mut produced = 0;
-    let read = Block::from_file_issuing(
+    let read = Block::from_file_issuing_paced(
         fd.as_ref(),
         *handle,
         crate::table::block::BlockIdentity {
@@ -158,6 +226,7 @@ pub fn load_block(
                 record_block_read(metrics, block_type, handle.size().into());
             }
         },
+        pace,
         &mut produced,
     );
     // What the transform produced, counted once per block that actually ran
