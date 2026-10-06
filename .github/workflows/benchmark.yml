@@ -151,7 +151,7 @@ jobs:
     if: >
       !cancelled() &&
       (needs.split-series.result == 'success' || needs.split-series.result == 'skipped') &&
-      github.repository_owner == 'structured-world' &&
+      github.repository == 'structured-world/coordinode-lsm-tree' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # Two passes in one job: (1) the single-engine db_bench trend (regression
     # guard + dev/bench dashboard) and (2) the RocksDB head-to-head compare
