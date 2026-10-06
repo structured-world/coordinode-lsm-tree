@@ -2488,16 +2488,21 @@ impl PacedFile<'_> {
         };
         let (head, _) = buf.split_at_mut(want);
         let admitted = self.pace(head.len(), limiter);
-        let read = self.fill(head, admitted);
-        if limiter.is_some() {
-            // What was charged and not read stays to the file's credit: a
-            // read that failed partway, or a file that ended early.
-            let got = read.as_ref().map_or(0, |got| *got);
-            // `fill` reads at most what was admitted, save past the end of the
-            // file as opened, where nothing was admitted and nothing is owed.
-            if let Some(unread) = admitted.checked_sub(got) {
-                self.credit += unread as u64;
-            }
+        let read = self.fill(head, admitted, limiter);
+        // What was charged and not read stays to the file's credit when the
+        // file ended early. A read the device answered with an error, before
+        // or after some bytes, used the device for what it was charged, so
+        // that is not handed back: the next read of those bytes is charged
+        // again, and a run of failing sections keeps waiting at the rate.
+        if limiter.is_some()
+            && self.pending.is_none()
+            && let Ok(got) = read.as_ref()
+            // `fill` reads at most what was admitted, save past the end of
+            // the file as opened, where nothing was admitted and nothing is
+            // owed.
+            && let Some(unread) = admitted.checked_sub(*got)
+        {
+            self.credit += unread as u64;
         }
         read
     }
@@ -2521,8 +2526,18 @@ impl PacedFile<'_> {
 
     /// Reads into `buf` until the `charged` bytes are in or the file ends: a
     /// backend may return fewer bytes per call, and every byte charged is then
-    /// still one read, never charged again by the next call.
-    fn fill(&mut self, buf: &mut [u8], charged: usize) -> FileRead {
+    /// still one read, never charged again by the next call. `limiter` is the
+    /// one the read was decided under, which alone hears its latency.
+    fn fill(
+        &mut self,
+        buf: &mut [u8],
+        charged: usize,
+        #[cfg_attr(
+            not(feature = "std"),
+            expect(unused_variables, reason = "latency is timed only with std")
+        )]
+        limiter: Option<&RateLimiter>,
+    ) -> FileRead {
         if charged == 0 {
             // Nothing admitted: past the end, which reads nothing, or an
             // empty buffer.
@@ -2571,9 +2586,10 @@ impl PacedFile<'_> {
             self.pos += got as u64;
         }
         // A read the device answered with an error took its time too: a slow
-        // failure is congestion the backoff must see.
+        // failure is congestion the backoff must see. A read decided without
+        // a rate went uncharged and reports nothing, whatever the rate is now.
         #[cfg(feature = "std")]
-        if let Some(limiter) = self.limiter {
+        if let Some(limiter) = limiter {
             limiter.record_read_latency(started.elapsed());
         }
         if let Some(e) = failed {
