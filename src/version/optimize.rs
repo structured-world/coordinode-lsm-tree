@@ -99,6 +99,32 @@ pub fn order_by_age<T: Clone + Ranged + Aged>(
     optimize_runs(runs, cmp)
 }
 
+/// Whether `runs`, given front to back, keep every table ahead of each older
+/// table it overlaps: the order a layout from ages produces. A layout that
+/// holds it is kept as it stands, so a recovered L0 is laid out again only
+/// when a manifest holds a newer table behind an older one.
+pub fn in_recency_order<T: Ranged + Aged>(runs: &[&Run<T>], cmp: &dyn UserComparator) -> bool {
+    let placed: Vec<(usize, &T)> = runs
+        .iter()
+        .enumerate()
+        .flat_map(|(at, run)| run.iter().map(move |table| (at, table)))
+        .collect();
+    placed.iter().enumerate().all(|(i, (run_a, a))| {
+        placed.iter().skip(i + 1).all(|(run_b, b)| {
+            if run_a == run_b
+                || !a
+                    .key_range()
+                    .overlaps_with_key_range_cmp(b.key_range(), cmp)
+            {
+                return true;
+            }
+            // The one in front must be the newer.
+            let a_first = run_a < run_b;
+            a_first == (a.age() > b.age())
+        })
+    })
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests;
