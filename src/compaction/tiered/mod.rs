@@ -38,9 +38,12 @@ pub const NAME: &str = "SizeTieredCompaction";
 ///    between two others, this waits for it to land.
 /// 2. **Size-ratio merge:** walking L0 from the newest run, the first stretch
 ///    of consecutive runs where each neighbouring pair satisfies
-///    `larger / smaller <= 1.0 + size_ratio` and that is at least
+///    `larger / smaller <= 1.0 + size_ratio`, that no run ahead of it
+///    overlaps, and that is at least
 ///    [`min_merge_width`](Strategy::with_min_merge_width) long is merged (its
-///    newest [`max_merge_width`](Strategy::with_max_merge_width) runs).
+///    newest [`max_merge_width`](Strategy::with_max_merge_width) runs). A
+///    stretch a run ahead overlaps is cut short there, and the runs behind
+///    are tried as stretches of their own.
 ///
 /// # Trade-offs vs Leveled
 ///
@@ -212,31 +215,41 @@ fn similar(a: &RunInfo, b: &RunInfo, size_ratio: f64) -> bool {
     ratio <= 1.0 + size_ratio
 }
 
-/// Whether L0 runs `start..start + count` may be merged on their own: no table
-/// ahead of them overlaps one of theirs. A table ahead that overlaps a merged
-/// one is newer than the data the two share, so the output, which takes that
-/// data, would belong behind it while belonging ahead of the older tables
-/// behind its inputs, and the output's single recency cannot say both. This is
-/// Pebble's rule for intra-L0 compactions: a merge that takes an older version
-/// of a key takes every newer version of it L0 holds.
-fn nothing_ahead_overlaps(
+/// For each L0 run, the frontmost run ahead of it (L0 is newest first, so the
+/// lowest index) that holds a table overlapping one of its tables, if any.
+/// Computed once per choice: every candidate stretch is then checked against
+/// it without looking at a table again.
+fn frontmost_overlap_ahead(
     version: &Version,
-    start: usize,
-    count: usize,
     cmp: &dyn crate::comparator::UserComparator,
-) -> bool {
-    let merged = || version.l0().iter().skip(start).take(count);
-    version
-        .l0()
-        .iter()
-        .take(start)
-        .flat_map(|run| run.iter())
-        .all(|table| {
-            merged().all(|run| {
-                run.get_overlapping_cmp(&table.metadata.key_range, cmp)
-                    .is_empty()
+) -> Vec<Option<usize>> {
+    let l0 = version.l0();
+    l0.iter()
+        .enumerate()
+        .map(|(at, run)| {
+            l0.iter().take(at).position(|ahead| {
+                ahead.iter().any(|table| {
+                    !run.get_overlapping_cmp(&table.metadata.key_range, cmp)
+                        .is_empty()
+                })
             })
         })
+        .collect()
+}
+
+/// Whether L0 run `run` may be merged in a stretch that starts at run `start`:
+/// no run ahead of the stretch overlaps it. A table ahead that overlaps a
+/// merged one is newer than the data the two share, so the output, which
+/// takes that data, would belong behind it while belonging ahead of the older
+/// tables behind its inputs, and the output's single recency cannot say both.
+/// This is Pebble's rule for intra-L0 compactions: a merge that takes an older
+/// version of a key takes every newer version of it L0 holds.
+fn clear_of_runs_ahead(ahead: &[Option<usize>], run: usize, start: usize) -> bool {
+    ahead
+        .get(run)
+        .copied()
+        .flatten()
+        .is_none_or(|overlap| overlap >= start)
 }
 
 fn merge_runs<'a>(runs: impl Iterator<Item = &'a RunInfo>, target_size: u64) -> Choice {
@@ -337,17 +350,17 @@ impl CompactionStrategy for Strategy {
             return Choice::DoNothing;
         }
 
+        let ahead = frontmost_overlap_ahead(version, cmp);
+
         // The available runs can merge as one unless a busy run sits between
         // two of them, or a busy run ahead of them overlaps one.
         let first_available = all_runs.iter().position(Option::is_some);
         let last_available = all_runs.iter().rposition(Option::is_some);
         let available_contiguous = match (first_available, last_available) {
-            (Some(first), Some(last)) => {
-                all_runs
-                    .get(first..=last)
-                    .is_some_and(|span| span.iter().all(Option::is_some))
-                    && nothing_ahead_overlaps(version, first, last - first + 1, cmp)
-            }
+            (Some(first), Some(last)) => all_runs.get(first..=last).is_some_and(|span| {
+                span.iter().all(Option::is_some)
+                    && (first..=last).all(|run| clear_of_runs_ahead(&ahead, run, first))
+            }),
             _ => false,
         };
 
@@ -385,8 +398,9 @@ impl CompactionStrategy for Strategy {
         // --- Size-ratio triggered merge ---
         //
         // Walk L0 from the newest run and take the first stretch of
-        // consecutive available runs whose neighbours have similar sizes, as
-        // `RocksDB` universal compaction picks from its newest sorted run
+        // consecutive available runs whose neighbours have similar sizes and
+        // that no run ahead of it overlaps, as `RocksDB` universal compaction
+        // picks from its newest sorted run
         // (`UniversalCompactionBuilder::PickCompactionToReduceSortedRuns`).
         // Merging by size alone could join runs around a differently sized one
         // between them in age.
@@ -398,28 +412,34 @@ impl CompactionStrategy for Strategy {
         };
         let mut start = 0;
         while start < all_runs.len() {
-            let Some(Some(first)) = all_runs.get(start) else {
-                start += 1;
-                continue;
-            };
-            let mut prev = first;
-            let mut len = 1;
-            while let Some(Some(next)) = all_runs.get(start + len) {
-                if !similar(prev, next, self.size_ratio) {
-                    break;
-                }
-                prev = next;
-                len += 1;
-            }
-            if let Some(count) = merge_count_for(len)
-                && nothing_ahead_overlaps(version, start, count, cmp)
+            let mut len = 0;
+            if let Some(Some(first)) = all_runs.get(start)
+                && clear_of_runs_ahead(&ahead, start, start)
             {
-                return merge_runs(
-                    all_runs.iter().skip(start).take(count).flatten(),
-                    self.target_size,
-                );
+                // The stretch ends at the first run that is busy, differs in
+                // size from its neighbour, or is overlapped by a run ahead of
+                // `start`: a run the stretch's own runs overlap stays mergeable
+                // with them.
+                let mut prev = first;
+                len = 1;
+                while let Some(Some(next)) = all_runs.get(start + len)
+                    && similar(prev, next, self.size_ratio)
+                    && clear_of_runs_ahead(&ahead, start + len, start)
+                {
+                    prev = next;
+                    len += 1;
+                }
+                if let Some(count) = merge_count_for(len) {
+                    return merge_runs(
+                        all_runs.iter().skip(start).take(count).flatten(),
+                        self.target_size,
+                    );
+                }
             }
-            start += len;
+            // A stretch starting inside this one ends where this one ended,
+            // or sooner, so it is shorter still. A run that could not start a
+            // stretch is passed over alone: the run behind it may.
+            start += len.max(1);
         }
 
         Choice::DoNothing
