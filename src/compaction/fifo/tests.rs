@@ -629,13 +629,15 @@ fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
     .open()?;
 
-    // Create two tables; we will expire them via time override and force additional drops via limit.
-    tree.insert("a", "$", 0);
-    tree.flush_active_memtable(0)?;
-    tree.insert("b", "$", 1);
-    tree.flush_active_memtable(1)?;
-
     with_test_clock(|clock| {
+        // Two tables written at t=1000s, so the TTL below expires both and
+        // the limit is checked against what remains.
+        clock.set_secs(1_000);
+        tree.insert("a", "$", 0);
+        tree.flush_active_memtable(0)?;
+        tree.insert("b", "$", 1);
+        tree.flush_active_memtable(1)?;
+
         clock.set_secs(10_000_000);
 
         // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
