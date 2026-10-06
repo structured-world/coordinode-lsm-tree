@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791323032311,
+  "lastUpdate": 1791329546599,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -33690,6 +33690,90 @@ window.BENCHMARK_DATA = {
             "value": 646711.9386580792,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.5us | P99.9: 74.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f9abfc059abe73f22648d17244af8d1d327276b2",
+          "message": "fix(fs): retry a rename or delete Windows refuses for a brief hold (#854)\n\n## Summary\n\n- On Windows, a rename or delete that another process (antivirus, search\nindexer, backup agent) briefly holds open without `FILE_SHARE_DELETE` is\nretried for about half a second instead of failing the flush, compaction\nor `CURRENT` repoint that issued it.\n\nThe 5.x line got the same fix in #846.\n\n## Changes\n\n- `StdFs::rename` and `StdFs::remove_file` retry `ERROR_ACCESS_DENIED`,\n`ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION` and\n`ERROR_USER_MAPPED_FILE` with a bounded backoff (1 ms doubling to 256\nms, about half a second in all), then return the last error. Other\nplatforms run the call once, as before.\n- Windows tests hold a file without share-delete: a delete and a rename\nover it succeed once a 50 ms hold ends, and a hold past the bound still\nfails.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux; the Windows tests run in\nthe Windows CI jobs.\n\nCloses #826\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* File removal and renaming on Windows now retry briefly when another\nprocess temporarily holds a conflicting file handle, improving\nreliability in those cases. If the conflict persists, the operation\nstill fails.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T02:17:55+03:00",
+          "tree_id": "4fab2c015b55000a53520696e028040e6b137fb8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f9abfc059abe73f22648d17244af8d1d327276b2"
+        },
+        "date": 1791329543995,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 251148.78374149,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 12.6us | P99.9: 30.7us\nthreads: 1 | elapsed: 2.13s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2919277.595566201,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1130580.9716438986,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.4us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 753304.7479291653,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.2us | P99.9: 66.8us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2540805.3336585565,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 10.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 332950.5511829899,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 7.9us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 187738.5335405216,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 7.1us | P99.9: 12.6us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1087148.5452593528,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 425536.9851215249,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 0.8us | P99.9: 3.3us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 653988.2327897275,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.4us | P99.9: 73.7us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
