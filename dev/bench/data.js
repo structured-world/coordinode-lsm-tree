@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791310465115,
+  "lastUpdate": 1791314985494,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -33890,6 +33890,90 @@ window.BENCHMARK_DATA = {
             "value": 321657.58697795245,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 14.7us | P99.9: 80.6us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": false,
+          "id": "7ce17d09358869402ba2e542b94df9043fc4aa58",
+          "message": "fix(compaction): merge only L0 runs contiguous in age under tiered (5.x.x) (#849)\n\n## Summary\n\n- Size-tiered compaction merges only L0 runs that are contiguous in age\nand that no run ahead of them overlaps, so an output never holds data\nboth newer and older than a run it skipped or one ahead of it.\n\nBackport of the fix for #835 to the 5.x line; the change to `main` is\n#858.\n\n## Changes\n\n- Tiered walks L0 from the newest run and merges the first stretch of\nconsecutive available runs whose neighbours have similar sizes, as\nRocksDB universal compaction picks from its newest sorted run.\n- Both rules merge a stretch only when no table ahead of it overlaps one\nof its tables, Pebble's rule for intra-L0 compactions: a merge that\ntakes an older version of a key takes every newer version L0 holds. A\nstretch is cut at the first run a run ahead overlaps, and the runs\nbehind are tried as stretches of their own. The space-amplification rule\nalso waits while a busy run sits between available ones.\n- The frontmost overlapping run ahead of each L0 run is computed once\nper choice.\n\nNo format or public API change.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux on top of the current\n`5.x.x`.\n\nRefs #835\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved tiered compaction so runs are considered in recency order,\nand merges avoid skipping over busy runs or combining runs when newer\noverlapping data could make the result inconsistent.\n* Compaction now selects eligible neighboring runs while respecting\nconfigured merge limits. This helps maintain consistent data ordering\nacross mixed-size runs and repeated compactions.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-06T22:19:45+03:00",
+          "tree_id": "9c268f7a39a94f43e042e9d40caee3572892fa99",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7ce17d09358869402ba2e542b94df9043fc4aa58"
+        },
+        "date": 1791314984374,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 108162.17040518098,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 22.0us | P99.9: 38.5us\nthreads: 1 | elapsed: 4.95s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2546105.9041547966,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 748533.8094008361,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.6us | P99.9: 11.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 460302.5951008752,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 22.7us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2235356.206638071,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 258482.32128321964,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.4us | P99.9: 17.0us\nthreads: 1 | elapsed: 0.77s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 142554.20051832366,
+            "unit": "ops/sec",
+            "extra": "P50: 6.3us | P99: 16.3us | P99.9: 35.3us\nthreads: 1 | elapsed: 1.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 668279.3159876515,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.0us | P99.9: 14.1us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 749381.2649280729,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 306487.8852748296,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 17.3us | P99.9: 97.9us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
