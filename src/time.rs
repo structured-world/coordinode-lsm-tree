@@ -202,9 +202,12 @@ impl Drop for HeldClock {
 
 /// Runs `f` with exclusive use of the test clock override.
 ///
-/// The override is process-wide, so every test that sets it runs inside this
-/// call: other clock tests wait until it returns, and the override starts and
-/// ends unset, even when `f` returns early or panics.
+/// The override is process-wide, and `cargo test` runs a crate's tests as
+/// threads of one process, so every test that sets it, and every test whose
+/// result depends on the clock it reads, runs inside this call: other clock
+/// tests wait until it returns, and the override starts and ends unset, even
+/// when `f` returns early or panics. A test that only reads leaves it unset
+/// and sees the real clock.
 #[cfg(test)]
 pub fn with_test_clock<R>(f: impl FnOnce(&TestClock) -> R) -> R {
     // A test that panicked while holding the clock poisons the lock; the
