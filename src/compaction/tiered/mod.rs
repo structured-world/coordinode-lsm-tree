@@ -231,7 +231,12 @@ fn nothing_ahead_overlaps(
         .iter()
         .take(start)
         .flat_map(|run| run.iter())
-        .all(|table| merged().all(|run| run.get_overlapping_cmp(table.key_range(), cmp).is_empty()))
+        .all(|table| {
+            merged().all(|run| {
+                run.get_overlapping_cmp(&table.metadata.key_range, cmp)
+                    .is_empty()
+            })
+        })
 }
 
 fn merge_runs<'a>(runs: impl Iterator<Item = &'a RunInfo>, target_size: u64) -> Choice {
