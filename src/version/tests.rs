@@ -163,9 +163,26 @@ fn an_intra_l0_output_stays_behind_a_flush_that_landed_in_an_inputs_run() -> cra
     Ok(())
 }
 
-/// The inputs of an intra-L0 compaction are a prefix of L0, so a table left
-/// behind them that overlaps them is older and the output goes ahead of it,
-/// whether or not it carries a recency key.
+/// A heal rewrites one L0 table and its copy takes that table's place. Here
+/// none of the tables carries a recency key, so nothing but their position
+/// tells that `X` is newer than the healed `T` and `Y` older.
+#[test]
+fn a_healed_l0_table_keeps_its_place() -> crate::Result<()> {
+    let fs = memfs()?;
+    let x = l0_table(&fs, 5, b"k", None)?;
+    let t = l0_table(&fs, 3, b"k", None)?;
+    let y = l0_table(&fs, 1, b"k", None)?;
+    let version = l0_with(vec![vec![x], vec![t], vec![y]]);
+    let healed = l0_table(&fs, 9, b"k", Some(3))?;
+
+    let version = merge_into_l0(&version, &[3], healed);
+    assert_eq!(l0_ids(&version), vec![vec![5], vec![9], vec![1]]);
+    Ok(())
+}
+
+/// No table ahead of an intra-L0 compaction's inputs overlaps them, so a table
+/// left behind them that overlaps them is older and the output goes ahead of
+/// it, whether or not it carries a recency key.
 #[test]
 fn an_intra_l0_output_goes_ahead_of_the_older_tables_behind_its_inputs() -> crate::Result<()> {
     let fs = memfs()?;
