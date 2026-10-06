@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791310458728,
+  "lastUpdate": 1791310465115,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -33262,6 +33262,60 @@ window.BENCHMARK_DATA = {
             "value": 690.5,
             "unit": "us",
             "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | elapsed: 83.4471ms\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8f87346cdf4599bda625b1e12e18e90ccfe60153",
+          "message": "feat(rate_limiter): back off while the device is slow to answer (#851)\n\n## Summary\n\n- A `RateLimiter` can carry a `LatencyBackoff`: it lowers the rate it\ngrants while the device is slow to answer the reads it charges and\nraises it back once the device recovers, so background I/O yields to\nother load instead of running at a fixed byte rate through congestion.\n\n## Changes\n\n- The limiter smooths the latency of the reads it charges as an EWMA and\nsteps the granted rate by PARDA's law (Gulati, Ahmad, Waldspurger, FAST\n2009, 3.2): down while the estimate is above a ceiling, back up once it\nfalls below the ceiling's hysteresis band, never below a floor (5% of\nthe configured rate by default, as RocksDB's auto-tuned limiter) and at\nmost once per period.\n- `LatencyBackoff` (ceiling, hysteresis, floor, period) is set, replaced\nor removed on a live limiter; without one nothing changes. `rate()`\nstays the configured rate and `effective_rate()` is what the bucket\nrefills at. A step moves the bucket like a rate change and rings the\nwaiters, so a held wait stays event-driven.\n- Every read the verify scan charges reports its latency to the limiter\nit was decided under, a read the device answers slowly with an error\nincluded, and so does each paced portion of a restricted table's index\nwalk, so a scrub under a limiter with a backoff yields to a congested\ndevice. A failed read keeps the credit it was paid from, so a run of\nfailing sections still waits at the rate.\n- A compaction reports the latency of the reads of its input tables\n(serial and run scanners including the index walk that precedes them,\nsub-compaction range reads, row and columnar, each region of a columnar\nbatch on its own, the planning scan and section copy of a merge-on-read\nrelocation) and of the blob files it relocates, their trailer and table\nof contents included, to its limiter. A limiter shared by a scan and\ncompaction therefore keeps getting samples after the scan ends and\nclimbs back once the device recovers. The reads are timed, a portion at\na time, only while the limiter has a backoff; without one they go as\nbefore. Compaction is still charged per row it writes.\n- Tests drive the controller on a fake clock (step size, floor,\nhysteresis hold and recovery, one step per period, live reconfiguration,\nthe bucket running at the granted rate, own load settling inside the\nband); a slow file read through the paced scan lowers the granted rate;\nand a compaction lifts a backoff a scan left low.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #768",
+          "timestamp": "2026-10-06T20:59:28+03:00",
+          "tree_id": "cbec1fcad67d52458bbc59030eb60123c8953247",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8f87346cdf4599bda625b1e12e18e90ccfe60153"
+        },
+        "date": 1791310462568,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 567.3,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 64.8475ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 125.6,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.4779ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 709.6999999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 87.0132ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 2511,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 8819.6,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
         ]
       }
