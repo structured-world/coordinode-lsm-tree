@@ -190,9 +190,19 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
 }
 
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    let compaction_state = opts.compaction_state.lock();
+    let mut compaction_state = opts.compaction_state.lock();
 
     let version_history_lock = opts.version_history.read();
+
+    // A strategy that drops tables counts what the drop frees, and a blob file
+    // a memtable row references outlives its last table: the choice sees the
+    // memtables as of now. A tree without blob files reads none.
+    let latest = version_history_lock.latest_version_ref();
+    compaction_state.set_memtable_blob_files(if latest.version.blob_files.len() > 0 {
+        latest.memtable_blob_files()
+    } else {
+        crate::HashSet::default()
+    });
 
     let start = Instant::now();
     log::trace!(
