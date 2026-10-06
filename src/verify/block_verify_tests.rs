@@ -1671,6 +1671,52 @@ fn a_restricted_lookup_at_rate_zero_reads_no_metadata() -> crate::Result<()> {
     Ok(())
 }
 
+/// A walk that starts under an idle limiter still carries its pacer: a rate set
+/// while it runs paces the reads after it. Pacing reads the file's length on
+/// the first paced portion, and a length that cannot be read charges the
+/// portion uncut rather than failing the walk.
+#[test]
+fn a_walk_started_idle_is_paced_once_a_rate_is_set() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    use crate::table::util::ReadPacer;
+
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = crate::Config::new(
+        dir.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(std::sync::Arc::new(fs))
+    .open()?;
+    tree.insert("k", "v", 0);
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+
+    let limiter = std::sync::Arc::new(crate::rate_limiter::RateLimiter::new(0));
+    let pacer = super::walk_pacer(table, Some(&limiter)).expect("a limiter attaches a pacer");
+    assert!(!pacer.active(), "an idle limiter reads at full speed");
+    limiter.set_rate(1 << 30);
+    assert!(
+        pacer.active(),
+        "a rate set mid-walk paces the reads after it"
+    );
+
+    injector.arm(FaultRule::new(
+        FaultOp::Metadata,
+        Fault::Error(crate::io::ErrorKind::Other),
+    ));
+    pacer.pace(0, 4096);
+    injector.clear();
+    assert!(
+        super::walk_pacer(table, None).is_none(),
+        "no limiter, no pacer"
+    );
+    Ok(())
+}
+
 /// The punch-offset walk is charged what it reads, as the loader reads it:
 /// nothing for an index held in memory, the index block for one loaded per
 /// read, and for a partitioned index only the partitions the walk loads up to

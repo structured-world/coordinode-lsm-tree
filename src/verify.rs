@@ -718,35 +718,82 @@ fn merge_report(dst: &mut BlockVerifyReport, src: BlockVerifyReport) {
 /// portion just before reading it: the walk is charged what it really reads,
 /// whatever an unverified handle or top-level key claimed, nothing for a
 /// block the cache serves or the loader refuses unread, and a rate set while
-/// the walk runs applies to the reads still to come. A limiter at rate zero
-/// when the walk starts walks as none does: it reads nothing the unlimited
-/// walk does not, the file's metadata included.
+/// the walk runs applies to the reads still to come. A walk that paces nothing
+/// reads nothing the unlimited walk does not, the file's metadata included.
 fn paced_punch_offset(
     table: &crate::table::Table,
     bound: &[u8],
     limiter: Option<&alloc::sync::Arc<RateLimiter>>,
 ) -> crate::Result<u64> {
-    let Some(limiter) = limiter.filter(|limiter| limiter.rate() > 0) else {
+    let Some(pacer) = walk_pacer(table, limiter) else {
         return table.punch_offset_for(bound);
     };
-    // The length on disk, read once for the walk: the table's recorded size
-    // predates the index sections written after it.
-    let file_size = table.fs.metadata(&table.path)?.len;
     table.punch_offset_paced(
         bound,
         crate::table::util::ReadCharge::Maintenance,
-        alloc::sync::Arc::new(LimiterPacer {
-            limiter: alloc::sync::Arc::clone(limiter),
-            file_size,
-        }),
+        alloc::sync::Arc::new(pacer),
     )
 }
 
+/// The pacer a punch-offset walk of `table` reads through, `None` without a
+/// limiter. Attached whatever the limiter's rate when the walk starts, so a
+/// rate set while it runs paces the reads still to come.
+fn walk_pacer(
+    table: &crate::table::Table,
+    limiter: Option<&alloc::sync::Arc<RateLimiter>>,
+) -> Option<LimiterPacer> {
+    let limiter = limiter?;
+    Some(LimiterPacer {
+        limiter: alloc::sync::Arc::clone(limiter),
+        fs: alloc::sync::Arc::clone(&table.fs),
+        path: alloc::sync::Arc::clone(&table.path),
+        file_size: portable_atomic::AtomicU64::new(0),
+        size_state: portable_atomic::AtomicU8::new(SIZE_UNREAD),
+    })
+}
+
+/// The file length is not read yet.
+const SIZE_UNREAD: u8 = 0;
+/// The file length is in `file_size`.
+const SIZE_KNOWN: u8 = 1;
+/// The file length could not be read: portions are charged uncut.
+const SIZE_UNKNOWN: u8 = 2;
+
 /// Paces a walk's block reads through a limiter, each portion cut at the end
-/// of a file of `file_size` bytes.
+/// of the file.
 struct LimiterPacer {
     limiter: alloc::sync::Arc<RateLimiter>,
-    file_size: u64,
+    fs: alloc::sync::Arc<dyn crate::fs::Fs>,
+    path: alloc::sync::Arc<PathBuf>,
+    /// The length on disk, read on the first paced portion: the table's
+    /// recorded size predates the index sections written after it, and a walk
+    /// that paces nothing (an idle limiter, an index held in memory) reads no
+    /// metadata at all.
+    file_size: portable_atomic::AtomicU64,
+    size_state: portable_atomic::AtomicU8,
+}
+
+impl LimiterPacer {
+    /// The file's length, or `None` when it cannot be read. Read once.
+    fn file_size(&self) -> Option<u64> {
+        use core::sync::atomic::Ordering::Relaxed;
+        match self.size_state.load(Relaxed) {
+            SIZE_KNOWN => Some(self.file_size.load(Relaxed)),
+            SIZE_UNKNOWN => None,
+            _ => {
+                if let Ok(meta) = self.fs.metadata(&self.path) {
+                    self.file_size.store(meta.len, Relaxed);
+                    self.size_state.store(SIZE_KNOWN, Relaxed);
+                    Some(meta.len)
+                } else {
+                    // The cut only spares charging bytes past the end;
+                    // charging them errs toward a slower walk, never a faster.
+                    self.size_state.store(SIZE_UNKNOWN, Relaxed);
+                    None
+                }
+            }
+        }
+    }
 }
 
 impl crate::table::util::ReadPacer for LimiterPacer {
@@ -758,7 +805,10 @@ impl crate::table::util::ReadPacer for LimiterPacer {
     }
 
     fn pace(&self, offset: u64, len: u64) {
-        charge_in_portions(&self.limiter, bytes_in_file(offset, len, self.file_size));
+        let charge = self
+            .file_size()
+            .map_or(len, |file_size| bytes_in_file(offset, len, file_size));
+        charge_in_portions(&self.limiter, charge);
     }
 }
 
