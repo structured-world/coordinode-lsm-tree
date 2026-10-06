@@ -4753,6 +4753,62 @@ fn compaction_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     Ok(())
 }
 
+/// A lone columnar segment whose own range tombstone deletes rows takes the
+/// merge-on-read fast path: its planning scan and its relocation each read
+/// the whole segment, and those reads report their latency as a merge's do,
+/// so they lift a backoff a verification scan left low.
+#[cfg(feature = "columnar")]
+#[test]
+fn merge_on_read_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::config::{DeleteStrategy, DeleteStrategyPolicy};
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use core::time::Duration;
+
+    let shared = Arc::new(RateLimiter::new(1 << 30));
+    shared.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_secs(10)).with_period(Duration::ZERO),
+    ));
+    for _ in 0..20 {
+        shared.record_read_latency(Duration::from_secs(100));
+    }
+    let left_by_the_scan = shared.effective_rate();
+    assert!(
+        left_by_the_scan < shared.rate(),
+        "the scan lowered the rate"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let tree = open_standard(dir.path(), |c| {
+        c.compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    tree.update_runtime_config(|c| {
+        c.columnar = true;
+        c.zone_map = true;
+        c.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+    })?;
+    for i in 0..2_000u64 {
+        tree.insert(format!("k{i:06}"), format!("value-{i}-payload"), i);
+    }
+    tree.remove_range("k000000", "k000050", 10_000);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 20_000)?;
+
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .any(|table| !table.delete_bitmap().is_empty()),
+        "the segment was relocated with a delete bitmap",
+    );
+    assert!(
+        shared.effective_rate() > left_by_the_scan,
+        "the fast path's reads did not lift the backoff: {} of {}",
+        shared.effective_rate(),
+        shared.rate(),
+    );
+    Ok(())
+}
+
 mod locality_relocation {
     use super::RewriteOneTable;
     use crate::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};

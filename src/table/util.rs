@@ -77,6 +77,11 @@ impl TimedFile {
         self.pace = Some(pace);
     }
 
+    /// The file, for reads this wrapper does not time.
+    pub(crate) fn into_inner(self) -> alloc::boxed::Box<dyn crate::fs::FsFile> {
+        self.file
+    }
+
     fn read_timed(&mut self, buf: &mut [u8]) -> TimedRead {
         #[cfg(not(feature = "std"))]
         use crate::io::Read;

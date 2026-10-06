@@ -2656,17 +2656,16 @@ fn open_blob_scanner_at_frontier(
     limiter: &Arc<crate::rate_limiter::RateLimiter>,
 ) -> crate::Result<BlobFileScanner> {
     let off = from.max(bf.live_data_start());
-    let scanner = if off == 0 {
-        BlobFileScanner::new(&bf.0.path, &*bf.0.fs, bf.id())
-    } else {
-        BlobFileScanner::resume(&bf.0.path, &*bf.0.fs, bf.id(), off)
-    }?;
-    // The relocation reads the blob files of its inputs: they report their
-    // latency as the table reads do.
-    Ok(match input_pacer(limiter) {
-        Some(pace) => scanner.with_pace(pace),
-        None => scanner,
-    })
+    // The relocation reads the blob files of its inputs, their trailer and
+    // table of contents included: they report their latency as the table
+    // reads do.
+    BlobFileScanner::open_paced(
+        &bf.0.path,
+        &*bf.0.fs,
+        bf.id(),
+        (off != 0).then_some(off),
+        input_pacer(limiter),
+    )
 }
 
 /// Whether merging a move's tables instead would relocate blob files for
@@ -2883,6 +2882,7 @@ fn plan_merge_on_read(
     payload: &CompactionPayload,
     tables: &[Table],
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<Option<(Table, crate::table::delete_bitmap::DeleteBitmap)>> {
     let dst_lvl: usize = payload.canonical_level.into();
     let strategy = opts.runtime_config.load_full().delete_strategy.get(dst_lvl);
@@ -2922,7 +2922,7 @@ fn plan_merge_on_read(
     // seqno per row, dropping each scanned value so planning does not retain a
     // whole segment's values in memory.
     let keys = source
-        .scan()?
+        .scan_paced(pace)?
         .map(|entry| {
             let entry = entry?;
             Ok((entry.key.user_key, entry.key.seqno))
@@ -2967,6 +2967,7 @@ fn run_merge_on_read_relocation(
     payload: &CompactionPayload,
     source: &Table,
     bitmap: &crate::table::delete_bitmap::DeleteBitmap,
+    pace: Option<&crate::table::util::Pacer>,
 ) -> crate::Result<CompactionResult> {
     let dst_lvl: usize = payload.canonical_level.into();
     let new_id = opts.table_id_generator.next();
@@ -2981,6 +2982,7 @@ fn run_merge_on_read_relocation(
         new_id,
         bitmap,
         opts.config.sync_mode,
+        pace,
     )?;
     // Recorded once finished: the relocation unlinks its own file on a
     // failure before that.
@@ -3097,6 +3099,10 @@ fn merge_tables(
     let blob_rewrite =
         pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
 
+    // Every read of the inputs, on the fast path as on the merge, reports its
+    // latency to the limiter (see `input_pacer`).
+    let pace = input_pacer(&opts.rate_limiter);
+
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
     // data blocks reused verbatim plus a positional delete-bitmap) instead of
@@ -3108,8 +3114,13 @@ fn merge_tables(
     // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
     if !blob_rewrite.for_locality
-        && let Some((source, bitmap)) =
-            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones)?
+        && let Some((source, bitmap)) = plan_merge_on_read(
+            opts,
+            payload,
+            &tables,
+            &input_range_tombstones,
+            pace.as_ref(),
+        )?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -3119,6 +3130,7 @@ fn merge_tables(
             payload,
             &source,
             &bitmap,
+            pace.as_ref(),
         );
     }
     let blob_files_to_rewrite = blob_rewrite.files;
@@ -3355,7 +3367,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        input_pacer(&opts.rate_limiter).as_ref(),
+        pace.as_ref(),
     )?
     else {
         log::warn!(

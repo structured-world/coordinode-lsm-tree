@@ -64,7 +64,7 @@ impl Scanner {
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
     ) -> crate::Result<Self> {
-        Self::open(path, fs, blob_file_id, None)
+        Self::open_paced(path, fs, blob_file_id, None, None)
     }
 
     /// Re-opens a blob file mid-stream, positioning the reader at `start_offset`
@@ -83,21 +83,27 @@ impl Scanner {
         blob_file_id: BlobFileId,
         start_offset: u64,
     ) -> crate::Result<Self> {
-        Self::open(path, fs, blob_file_id, Some(start_offset))
+        Self::open_paced(path, fs, blob_file_id, Some(start_offset), None)
     }
 
     /// Reads the SFA TOC to bound the "data" section, then positions the reader
     /// at `start` if given (validated to lie within `[data_start, data_end]`) or
-    /// at the data-section start otherwise.
-    fn open<P: AsRef<Path>>(
+    /// at the data-section start otherwise. `pace` is told how long each read
+    /// from the file takes, from the trailer on.
+    pub(crate) fn open_paced<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
         start: Option<u64>,
+        pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
         let path = path.as_ref();
 
-        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        let mut file =
+            crate::table::util::TimedFile::new(fs.open(path, &FsOpenOptions::new().read(true))?);
+        if let Some(pace) = pace {
+            file.set_pace(pace);
+        }
         let sfa_reader = crate::sfa::Reader::from_reader(&mut file)?;
         let data_section = sfa_reader.toc().section(b"data").ok_or_else(|| {
             log::error!("BlobFile: SFA TOC has no \"data\" section");
@@ -124,8 +130,7 @@ impl Scanner {
         };
 
         file.seek(SeekFrom::Start(seek_to))?;
-        let file_reader =
-            BufReader::with_capacity(32_000, crate::table::util::TimedFile::new(file));
+        let file_reader = BufReader::with_capacity(32_000, file);
 
         Ok(Self {
             blob_file_id,
@@ -137,18 +142,8 @@ impl Scanner {
     }
     // No `with_reader` constructor: Scanner is crate-private (parent
     // `vlog` module is not re-exported from lib.rs), so there are no
-    // external callers. All internal usage goes through `new()` / `resume()`.
-
-    /// Tells `pace` how long each read of the scan takes from the file.
-    #[must_use]
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(dead_code, reason = "its compaction consumer is std-gated")
-    )]
-    pub(crate) fn with_pace(mut self, pace: crate::table::util::Pacer) -> Self {
-        self.inner.get_mut().set_pace(pace);
-        self
-    }
+    // external callers. All internal usage goes through `new()` / `resume()`
+    // / `open_paced()`.
 }
 
 impl Scanner {
