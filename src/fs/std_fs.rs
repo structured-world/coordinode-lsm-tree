@@ -9,6 +9,54 @@ use crate::path::{Path, PathBuf};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use std::fs::{File, OpenOptions};
 
+/// Delays between the attempts of a rename or delete that another process is
+/// briefly holding the file against, before the last error is returned: about
+/// half a second in all, longer than an antivirus or indexer scan of a fresh
+/// file usually takes.
+#[cfg(windows)]
+const TRANSIENT_HOLD_BACKOFF_MS: [u64; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+/// Runs `op`, retrying it while it fails because another process holds the
+/// file open without `FILE_SHARE_DELETE` (an antivirus, a search indexer, a
+/// backup agent). Windows refuses a rename or delete of such a file with
+/// `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32),
+/// `ERROR_LOCK_VIOLATION` (33) or `ERROR_USER_MAPPED_FILE` (1224) for as long
+/// as the hold lasts, usually milliseconds. POSIX renames and unlinks ignore
+/// open handles, so elsewhere `op` runs once.
+#[cfg(windows)]
+fn retry_transient_hold(mut op: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_USER_MAPPED_FILE: i32 = 1224;
+
+    for delay in TRANSIENT_HOLD_BACKOFF_MS {
+        match op() {
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(
+                        ERROR_ACCESS_DENIED
+                            | ERROR_SHARING_VIOLATION
+                            | ERROR_LOCK_VIOLATION
+                            | ERROR_USER_MAPPED_FILE
+                    )
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            result => return result,
+        }
+    }
+    op()
+}
+
+/// See the Windows variant: elsewhere no open handle blocks a rename or delete.
+#[cfg(not(windows))]
+fn retry_transient_hold(mut op: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    op()
+}
+
 /// Plain `fsync` (no `F_FULLFSYNC`) for [`SyncMode::Normal`].
 ///
 /// On macOS, `File::sync_all` issues `fcntl(F_FULLFSYNC)` (a full hardware
@@ -289,7 +337,7 @@ impl Fs for StdFs {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path).map_err(io::Error::from)
+        retry_transient_hold(|| std::fs::remove_file(path)).map_err(io::Error::from)
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -348,7 +396,7 @@ impl Fs for StdFs {
         // `MOVEFILE_REPLACE_EXISTING` (POSIX-semantics rename on newer
         // toolchains), so an existing destination FILE — open handles
         // included — is atomically replaced, same as on Unix.
-        std::fs::rename(from, to).map_err(io::Error::from)
+        retry_transient_hold(|| std::fs::rename(from, to)).map_err(io::Error::from)
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {

@@ -3,6 +3,89 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use test_log::test;
 
+/// Opens `path` the way an antivirus or indexer does: readable by others, but
+/// without `FILE_SHARE_DELETE`, so Windows refuses to rename or delete it
+/// while the handle is open.
+#[cfg(windows)]
+fn hold_without_share_delete(path: &std::path::Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+}
+
+/// Windows: a delete of a file another handle holds without share-delete for
+/// a few milliseconds succeeds once the hold ends, instead of failing the
+/// flush or compaction that asked for it.
+#[cfg(windows)]
+#[test]
+fn std_fs_remove_file_brief_hold_on_windows_succeeds() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("held");
+    std::fs::write(&path, b"x")?;
+
+    let holder = hold_without_share_delete(&path)?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+    });
+    StdFs.remove_file(&path)?;
+    assert!(release.join().is_ok(), "holder thread panicked");
+    assert!(!path.exists(), "the file is gone once the hold ended");
+    Ok(())
+}
+
+/// Windows: a rename over a destination another handle briefly holds without
+/// share-delete succeeds once the hold ends.
+#[cfg(windows)]
+#[test]
+fn std_fs_rename_brief_destination_hold_on_windows_succeeds() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let from = dir.path().join("new");
+    let to = dir.path().join("current");
+    std::fs::write(&from, b"new")?;
+    std::fs::write(&to, b"old")?;
+
+    let holder = hold_without_share_delete(&to)?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+    });
+    StdFs.rename(&from, &to)?;
+    assert!(release.join().is_ok(), "holder thread panicked");
+    assert_eq!(std::fs::read(&to)?, b"new");
+    Ok(())
+}
+
+/// Windows: a hold longer than the retry bound still returns the original
+/// error, so a genuinely locked file is reported rather than waited on forever.
+#[cfg(windows)]
+#[test]
+fn std_fs_remove_file_long_hold_on_windows_returns_error() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("held");
+    std::fs::write(&path, b"x")?;
+
+    let holder = hold_without_share_delete(&path)?;
+    // The kind a single delete of the held file fails with: the retry must
+    // hand back that hold error, not some other failure.
+    let expected_kind = match std::fs::remove_file(&path) {
+        Err(error) => io::Error::from(error).kind(),
+        Ok(()) => return Err(io::Error::other("held-file removal unexpectedly succeeded")),
+    };
+    let result = StdFs.remove_file(&path);
+    drop(holder);
+    assert_eq!(
+        result.err().map(|error| error.kind()),
+        Some(expected_kind),
+        "a hold past the retry bound fails with the hold's error"
+    );
+    assert!(path.exists());
+    Ok(())
+}
+
 /// Linux: `fallocate(PUNCH_HOLE)` frees a mid-file range and reads it back
 /// as zeros, leaving the logical length unchanged. Skips cleanly on a mount
 /// that does not advertise the capability (e.g. overlayfs in CI), so the
