@@ -630,21 +630,27 @@ fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
     .open()?;
 
     with_test_clock(|clock| {
-        // Two tables written at t=1000s, so the TTL below expires both and
-        // the limit is checked against what remains.
+        // The older table is written long before the newer one, so the TTL
+        // below expires it alone and the newer table is left for the limit.
         clock.set_secs(1_000);
         tree.insert("a", "$", 0);
         tree.flush_active_memtable(0)?;
+        clock.set_secs(10_000_000);
         tree.insert("b", "$", 1);
         tree.flush_active_memtable(1)?;
 
-        clock.set_secs(10_000_000);
+        // TTL=1s alone removes the older table and keeps the newer one.
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(1))), 2)?;
+        assert_eq!(1, tree.table_count(), "the TTL drops only the older table");
 
-        // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
-        let fifo = Arc::new(Strategy::new(1, Some(1)));
-        tree.compact(fifo, 2)?;
-
+        // With a one-byte limit the newer table goes too, with its blob file.
+        tree.compact(Arc::new(Strategy::new(1, Some(1))), 2)?;
         assert_eq!(0, tree.table_count());
+        assert_eq!(
+            0,
+            tree.blob_file_count(),
+            "the blob unit goes with its table"
+        );
         Ok(())
     })
 }
