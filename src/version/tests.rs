@@ -46,13 +46,13 @@ fn memfs() -> crate::Result<Arc<dyn crate::fs::Fs>> {
 }
 
 fn l0_with(runs: Vec<Vec<Table>>) -> Version {
-    let mut levels: Vec<Level> = (0..DEFAULT_LEVEL_COUNT).map(|_| Level::empty()).collect();
-    levels[0] = Level::from_runs(
+    let mut levels = vec![Level::from_runs(
         runs.into_iter()
             .filter_map(Run::new)
             .map(Arc::new)
             .collect(),
-    );
+    )];
+    levels.extend((1..DEFAULT_LEVEL_COUNT).map(|_| Level::empty()));
     Version::from_levels(
         0,
         TreeType::Standard,
@@ -88,8 +88,8 @@ fn open_keeps_the_persisted_l0_order_of_a_table_without_a_recency_key() -> crate
         checksum: table.checksum(),
         global_seqno: 0,
     };
-    let mut table_ids = vec![Vec::new(); usize::from(DEFAULT_LEVEL_COUNT)];
-    table_ids[0] = vec![vec![entry(&flush)], vec![entry(&output)]];
+    let mut table_ids = vec![vec![vec![entry(&flush)], vec![entry(&output)]]];
+    table_ids.resize(usize::from(DEFAULT_LEVEL_COUNT), Vec::new());
     let recovery = Recovery {
         tree_type: TreeType::Standard,
         snapshot_id: 0,
