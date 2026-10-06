@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791305802447,
+  "lastUpdate": 1791310452092,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -30918,6 +30918,90 @@ window.BENCHMARK_DATA = {
             "value": 650628.0349764619,
             "unit": "ops/sec",
             "extra": "P50: 1.2us | P99: 6.4us | P99.9: 74.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8f87346cdf4599bda625b1e12e18e90ccfe60153",
+          "message": "feat(rate_limiter): back off while the device is slow to answer (#851)\n\n## Summary\n\n- A `RateLimiter` can carry a `LatencyBackoff`: it lowers the rate it\ngrants while the device is slow to answer the reads it charges and\nraises it back once the device recovers, so background I/O yields to\nother load instead of running at a fixed byte rate through congestion.\n\n## Changes\n\n- The limiter smooths the latency of the reads it charges as an EWMA and\nsteps the granted rate by PARDA's law (Gulati, Ahmad, Waldspurger, FAST\n2009, 3.2): down while the estimate is above a ceiling, back up once it\nfalls below the ceiling's hysteresis band, never below a floor (5% of\nthe configured rate by default, as RocksDB's auto-tuned limiter) and at\nmost once per period.\n- `LatencyBackoff` (ceiling, hysteresis, floor, period) is set, replaced\nor removed on a live limiter; without one nothing changes. `rate()`\nstays the configured rate and `effective_rate()` is what the bucket\nrefills at. A step moves the bucket like a rate change and rings the\nwaiters, so a held wait stays event-driven.\n- Every read the verify scan charges reports its latency to the limiter\nit was decided under, a read the device answers slowly with an error\nincluded, and so does each paced portion of a restricted table's index\nwalk, so a scrub under a limiter with a backoff yields to a congested\ndevice. A failed read keeps the credit it was paid from, so a run of\nfailing sections still waits at the rate.\n- A compaction reports the latency of the reads of its input tables\n(serial and run scanners including the index walk that precedes them,\nsub-compaction range reads, row and columnar, each region of a columnar\nbatch on its own, the planning scan and section copy of a merge-on-read\nrelocation) and of the blob files it relocates, their trailer and table\nof contents included, to its limiter. A limiter shared by a scan and\ncompaction therefore keeps getting samples after the scan ends and\nclimbs back once the device recovers. The reads are timed, a portion at\na time, only while the limiter has a backoff; without one they go as\nbefore. Compaction is still charged per row it writes.\n- Tests drive the controller on a fake clock (step size, floor,\nhysteresis hold and recovery, one step per period, live reconfiguration,\nthe bucket running at the granted rate, own load settling inside the\nband); a slow file read through the paced scan lowers the granted rate;\nand a compaction lifts a backoff a scan left low.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #768",
+          "timestamp": "2026-10-06T20:59:28+03:00",
+          "tree_id": "cbec1fcad67d52458bbc59030eb60123c8953247",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8f87346cdf4599bda625b1e12e18e90ccfe60153"
+        },
+        "date": 1791310449619,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 250204.4328779769,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 12.7us | P99.9: 33.3us\nthreads: 1 | elapsed: 2.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2953629.493762673,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 3.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 1148014.0218432627,
+            "unit": "ops/sec",
+            "extra": "P50: 0.7us | P99: 1.4us | P99.9: 5.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 757215.7932497998,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 6.3us | P99.9: 71.6us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2547446.185199338,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 9.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 326430.8443199075,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 8.0us | P99.9: 14.3us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 186867.86106374528,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 7.2us | P99.9: 12.7us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 1117351.519346662,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 1.5us | P99.9: 4.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 424168.8887814328,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 1.3us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 650020.5081470321,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 6.5us | P99.9: 73.9us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
           }
         ]
       }
