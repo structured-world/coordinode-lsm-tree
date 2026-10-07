@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791372253011,
+  "lastUpdate": 1791372257474,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -39556,6 +39556,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 9762.117,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1dd9fd0598658761598d8d2fe9626e77f5e83e72",
+          "message": "ci(bench): run on a Linux bench runner by label (#867)\n\n## Summary\n\n- The benchmark job runs on a Linux runner labelled `bench` in the\n`Bench` runner group, instead of the `Default` group, which no longer\nholds a self-hosted runner.\n\n## Changes\n\n- `benchmark` job: `runs-on: { group: Bench, labels: [self-hosted,\nbench, Linux] }`. A bench host is added or replaced by its label,\nwithout editing the workflow; a `bench` runner outside the group never\ntakes the job; and the OS is named so the job stays off the Windows\nbench host, whose numbers are not comparable with the Linux trend.\n- The comments that described the runner choice and the per-host series\nfollow the new targeting.\n\nThe fork and repository gate on the job is unchanged.\n\n## Testing\n\nWorkflow change only; the job runs on the next push to `main`.",
+          "timestamp": "2026-10-07T11:07:30Z",
+          "tree_id": "8ea40f772fe6b92793df72097282184fd7a3db50",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1dd9fd0598658761598d8d2fe9626e77f5e83e72"
+        },
+        "date": 1791372256007,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 550.89,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 80.272967ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 169.792,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 91.746774ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 475.681,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.601175ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6559.515,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 21945.39,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
