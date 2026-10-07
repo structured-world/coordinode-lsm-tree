@@ -186,9 +186,17 @@ impl Table {
         let meta = &self.metadata;
         // A scheme this build cannot apply has no parity it could carry over,
         // and dropping the table's protection is not the export's decision.
-        if meta.ecc_unrecognized {
+        // A build without parity support applies none, recognized or not.
+        if meta.ecc_unrecognized || (meta.ecc_params.is_some() && !cfg!(feature = "page_ecc")) {
             return Err(crate::Error::InvalidHeader(
                 "the table's parity scheme is not one this build applies",
+            ));
+        }
+        // A build without columnar support cannot decode such a table's rows,
+        // so it cannot describe a table it could carry over either.
+        if meta.columnar && !cfg!(feature = "columnar") {
+            return Err(crate::Error::InvalidHeader(
+                "the table is columnar and this build decodes no columnar blocks",
             ));
         }
         let initial_level = match self

@@ -350,9 +350,10 @@ impl TableExport {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::InvalidHeader`] when the parity descriptor
-    /// names a scheme this build cannot apply, or the `initial_level` item is
-    /// missing or malformed.
+    /// Returns [`crate::Error::InvalidHeader`] when the table carries parity
+    /// under a scheme this build cannot apply (any scheme, without the
+    /// `page_ecc` feature), is columnar in a build without the `columnar`
+    /// feature, or its `initial_level` item is missing or malformed.
     pub fn properties(&self) -> crate::Result<TableProperties> {
         self.table.export_properties()
     }
