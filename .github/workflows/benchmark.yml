@@ -170,16 +170,11 @@ jobs:
     # the `workflow_dispatch` manual trigger above; routine PR
     # pushes do not auto-queue against this runner.)
     #
-    # Targeted by GROUP, not by a per-host label: the bench box is one
-    # physical machine that boots either Linux or Windows, and each boot
-    # registers its own runner with its own labels. A label pinned to one of
-    # them leaves the bench queued for as long as the box happens to be
-    # running the other OS. The group holds both registrations, so the job
-    # lands on whichever is up. `labels: [self-hosted]` keeps it off
-    # GitHub-hosted runners if any are ever added to the group.
-    runs-on:
-      group: Default
-      labels: [self-hosted]
+    # Targeted by role, not by host: any runner labelled `bench` takes it, so
+    # a bench host is added or replaced without touching this file. The OS
+    # is named explicitly: the bench hosts include a Windows one, and the
+    # Linux and Windows numbers differ too much to share one trend series.
+    runs-on: [self-hosted, bench, Linux]
     # The whole job, every bench in it, fits in 30 minutes on a warm cache:
     # the three builds side by side, the db_bench pass, the head-to-head
     # matrix and the publishing. Each bench step has its own limit below, so
@@ -493,10 +488,9 @@ jobs:
         run: git branch --delete --force gh-pages 2>/dev/null || true
 
       # One series per version line and host: the job lands on whichever
-      # registered runner is up (the bench box under Windows or Linux, or the
-      # CI host), and a rate measured on one machine is no baseline for
-      # another. Keyed by the runner's name as well as its OS, since two hosts
-      # can share an OS. A manual dispatch is compared against the suite of the
+      # Linux bench runner is up, and a rate measured on one machine is no
+      # baseline for another. Keyed by the runner's name as well as its OS,
+      # since two hosts can share an OS. A manual dispatch is compared against the suite of the
       # line it measures. The overlay page published below draws every host's
       # series of one line on one chart.
       - name: Store benchmark results
