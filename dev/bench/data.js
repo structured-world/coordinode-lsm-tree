@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791362326511,
+  "lastUpdate": 1791364715570,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -39350,6 +39350,90 @@ window.BENCHMARK_DATA = {
             "value": 306487.8852748296,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 17.3us | P99.9: 97.9us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "88dd1b13f44ca2be9a478ab6c1b6079adc647f1a",
+          "message": "fix(compaction): an output that takes data of no age has none either (5.x.x) (#865)\n\n## Summary\n\n- A compaction output that meets a table stamped while the clock read\nzero is dated by the clock when it is written, rather than by the newest\nof its inputs: no data it carries is newer than that, so FIFO's TTL\nexpires none of it early, and the output still expires.\n- The FIFO test of a round that applies both the TTL and the size limit\nnow reaches the TTL.\n\nBackport to the 5.x line of the follow-ups to the FIFO change in #842;\nthe change to `main` is #852. The rest of #852 is either already in #842\nor has no counterpart here: 5.x memtables hold no rows that reference\nblob files, and 5.x tables carry no cached blob links.\n\n## Changes\n\n- `AgeSweep::age_of` returns no age when any input the output meets has\n`created_at == 0`, and the writer then stamps the output with its clock.\nBefore, such an output took the newest dated input's age, which can be\nolder than undated data written by a store reopened without a clock, so\nthat data could expire early. With the clock still at zero the output\nstays undated, and an undated table no compaction has rewritten still\nnever expires.\n- `fifo_ttl_then_limit_additional_drops_blob_unit` stamps its tables on\nthe test clock, the older one long before the newer, and applies the TTL\nand the size limit in one round to both: a limit the newer table just\nfits keeps it, so the expired table's bytes must have been taken off\nbefore the limit is weighed, and a one-byte limit drops the newer table\nin the same round, with its blob file.\n\nNo format or public API change.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux on top of the current\n`5.x.x`. The regression test fails without the fix.\n\nRefs #824\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Corrected expiration timing for compacted data when an input has no\nrecorded creation time, preventing it from inheriting an incorrect age.\n* Improved TTL and size-limit handling so expired data is removed before\nthe size limit is applied, with associated stored blobs removed when\ntheir data is dropped.\n  * Added coverage for these expiration and size-limit scenarios.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T12:09:00+03:00",
+          "tree_id": "d2a90fc7757f47d6b42ae7798ce1177f6c0bf240",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/88dd1b13f44ca2be9a478ab6c1b6079adc647f1a"
+        },
+        "date": 1791364714464,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 127322.3099967002,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.4us | P99.9: 40.5us\nthreads: 1 | elapsed: 4.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2537625.9831381603,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 679607.9792827215,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.9us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 456453.1340259328,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 28.3us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2206810.2517458517,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 257809.78741806716,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.1us | P99.9: 24.6us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 143018.7492424431,
+            "unit": "ops/sec",
+            "extra": "P50: 6.3us | P99: 13.4us | P99.9: 38.4us\nthreads: 1 | elapsed: 1.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 715511.1190714107,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 756455.4413364154,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 335324.8370413925,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.5us | P99.9: 90.3us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
           }
         ]
       }
