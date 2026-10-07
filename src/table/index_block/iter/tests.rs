@@ -113,6 +113,60 @@ fn make_tagged_index_block(restart_interval: u8) -> (Vec<KeyedBlockHandle>, Inde
     (handles, index)
 }
 
+/// The end keys a walk of `index` yields after `seek(lo)` then
+/// `seek_upper(hi)`, with what `seek_upper` returned.
+fn walk_between(index: &IndexBlock, lo: &[u8], hi: &[u8]) -> (bool, Vec<Vec<u8>>) {
+    let mut iter = index.iter(default_comparator());
+    assert!(iter.seek(lo, SeqNo::MAX), "seek lands");
+    let landed = iter.seek_upper(hi, SeqNo::MAX);
+    let keys = iter
+        .map(|item| item.materialize(index.as_slice()).end_key().to_vec())
+        .collect();
+    (landed, keys)
+}
+
+/// `seek_upper` after `seek` keeps the entry `seek` landed on, when both land
+/// on the same entry: alone in its block, or inside one restart interval with
+/// others.
+#[test]
+fn seek_upper_keeps_the_entry_seek_landed_on() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let single = make_handles(1);
+        let bytes =
+            IndexBlock::encode_into_vec_with_restart_interval(&single, restart_interval).unwrap();
+        let index = IndexBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Index),
+        });
+        let key = single[0].end_key().to_vec();
+        assert_eq!(
+            (true, vec![key.clone()]),
+            walk_between(&index, &key, &key),
+            "restart interval {restart_interval}: single entry"
+        );
+
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let key = |i: usize| handles[i].end_key().to_vec();
+        // The bound keeps the entry after the needle too.
+        assert_eq!(
+            (true, vec![key(5), key(6)]),
+            walk_between(&index, &key(5), &key(5)),
+            "restart interval {restart_interval}: one entry of many"
+        );
+        assert_eq!(
+            (true, (5..=8).map(key).collect::<Vec<_>>()),
+            walk_between(&index, &key(5), &key(7)),
+            "restart interval {restart_interval}: three neighbours"
+        );
+        assert_eq!(
+            (true, vec![key(15)]),
+            walk_between(&index, &key(15), &key(15)),
+            "restart interval {restart_interval}: the last entry"
+        );
+    }
+}
+
 /// An entry naming a row group reads back with its tag and directory length,
 /// through a full walk and through a seek that probes the restart heads; an
 /// entry naming none reads back with none.
@@ -252,6 +306,56 @@ fn a_tagged_entry_with_an_impossible_directory_length_is_refused() {
     }
 }
 
+/// An upper bound below the entry `seek` landed on walks nothing, unless that
+/// entry is the first past the bound, which the bound keeps: the entry `seek`
+/// holds is kept only inside the bound.
+#[test]
+fn seek_upper_below_the_entry_seek_landed_on_keeps_only_what_the_bound_covers() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let key = |i: usize| handles[i].end_key().to_vec();
+        assert_eq!(
+            (false, Vec::<Vec<u8>>::new()),
+            walk_between(&index, &key(11), &key(3)),
+            "restart interval {restart_interval}: a bound far below"
+        );
+        assert_eq!(
+            (false, Vec::<Vec<u8>>::new()),
+            walk_between(&index, &key(6), &key(4)),
+            "restart interval {restart_interval}: a bound two entries below"
+        );
+        assert_eq!(
+            (true, vec![key(6)]),
+            walk_between(&index, &key(6), &key(5)),
+            "restart interval {restart_interval}: the entry is the first past the bound"
+        );
+    }
+}
+
+/// An upper seek below where forward iteration already got to finds nothing:
+/// it reports the range empty, and neither end yields an entry.
+#[test]
+fn seek_upper_behind_the_consumed_front_reports_an_empty_range() {
+    for restart_interval in [1, 2, 4, 16, 232] {
+        let index = make_index_block(restart_interval);
+        let handles = make_handles(16);
+        let mut iter = index.iter(default_comparator());
+        for _ in 0..8 {
+            assert!(iter.next().is_some(), "the block holds 16 entries");
+        }
+        assert!(
+            !iter.seek_upper(handles[3].end_key(), SeqNo::MAX),
+            "restart interval {restart_interval}: the range is empty"
+        );
+        assert!(
+            iter.next_back().is_none(),
+            "restart interval {restart_interval}"
+        );
+        assert!(iter.next().is_none(), "restart interval {restart_interval}");
+    }
+}
+
 #[test]
 fn seek_clears_stale_front_cache_before_reposition() {
     let index = make_index_block(8);
@@ -303,8 +407,10 @@ fn seek_upper_keeps_first_covering_handle_in_compressed_interval() {
     );
 }
 
+/// An exact match also keeps the entry after it: the needle's older versions
+/// may run on into that block.
 #[test]
-fn seek_upper_keeps_exact_match_without_restoring_next_item() {
+fn seek_upper_exact_match_keeps_the_next_item() {
     let index = make_index_block(8);
     let mut iter = index.iter(default_comparator());
 
@@ -312,7 +418,22 @@ fn seek_upper_keeps_exact_match_without_restoring_next_item() {
     let selected = iter.next_back().unwrap().materialize(index.as_slice());
     assert_eq!(
         selected.end_key().as_ref(),
-        b"adj:out:vertex-0001:edge-0003"
+        b"adj:out:vertex-0001:edge-0004"
+    );
+}
+
+/// An exact match on the last entry of a restart interval keeps the next
+/// interval's head.
+#[test]
+fn seek_upper_exact_match_at_an_interval_end_keeps_the_next_head() {
+    let index = make_index_block(8);
+    let mut iter = index.iter(default_comparator());
+
+    assert!(iter.seek_upper(b"adj:out:vertex-0001:edge-0007", SeqNo::MAX));
+    let selected = iter.next_back().unwrap().materialize(index.as_slice());
+    assert_eq!(
+        selected.end_key().as_ref(),
+        b"adj:out:vertex-0001:edge-0008"
     );
 }
 
@@ -330,7 +451,7 @@ fn seek_upper_with_small_needle_restores_first_item_when_interval_trim_empties_s
 }
 
 #[test]
-fn seek_upper_exact_match_restart_interval_one_keeps_exact_handle() {
+fn seek_upper_exact_match_restart_interval_one_keeps_the_next_item() {
     let index = make_index_block(1);
     let mut iter = index.iter(default_comparator());
 
@@ -338,8 +459,52 @@ fn seek_upper_exact_match_restart_interval_one_keeps_exact_handle() {
     let selected = iter.next_back().unwrap().materialize(index.as_slice());
     assert_eq!(
         selected.end_key().as_ref(),
-        b"adj:out:vertex-0001:edge-0003"
+        b"adj:out:vertex-0001:edge-0004"
     );
+}
+
+/// Several entries ending at one key (its versions spanning blocks) are all
+/// kept, with the entry after them, whatever the restart interval.
+#[test]
+fn seek_upper_keeps_every_entry_ending_at_the_needle_and_the_next() {
+    let handles: Vec<KeyedBlockHandle> = [("a", 9), ("k", 8), ("k", 5), ("k", 2), ("z", 1)]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (key, seqno))| {
+            KeyedBlockHandle::new(
+                key.into(),
+                seqno,
+                BlockHandle::new(BlockOffset((i as u64) * 4096), 4096),
+            )
+        })
+        .collect();
+    for restart_interval in [1, 2, 4, 8] {
+        let bytes =
+            IndexBlock::encode_into_vec_with_restart_interval(&handles, restart_interval).unwrap();
+        let index = IndexBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Index),
+        });
+        let mut iter = index.iter(default_comparator());
+        assert!(iter.seek_upper(b"k", SeqNo::MAX));
+        let walk: Vec<(Vec<u8>, SeqNo)> = iter
+            .map(|item| {
+                let handle = item.materialize(index.as_slice());
+                (handle.end_key().to_vec(), handle.seqno())
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (b"a".to_vec(), 9),
+                (b"k".to_vec(), 8),
+                (b"k".to_vec(), 5),
+                (b"k".to_vec(), 2),
+                (b"z".to_vec(), 1),
+            ],
+            walk,
+            "restart interval {restart_interval}"
+        );
+    }
 }
 
 #[test]
@@ -435,7 +600,7 @@ fn seek_reposition_clears_stale_back_cache() {
             .materialize(index.as_slice())
             .end_key()
             .as_ref(),
-        b"adj:out:vertex-0001:edge-0011"
+        b"adj:out:vertex-0001:edge-0012"
     );
 
     assert!(iter.seek(b"adj:out:vertex-0001:edge-0003", 0));
