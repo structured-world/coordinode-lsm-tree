@@ -138,6 +138,10 @@ pub struct Writer {
     /// The lifetime class this file holds, recorded in its metadata.
     pub(crate) lifetime_class: u8,
 
+    /// The age to record instead of the time the file is finished, for a file
+    /// rebuilt from another store.
+    pub(crate) created_at: Option<u128>,
+
     /// Durability level for the final blob-file fsync. Default
     /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
@@ -223,6 +227,7 @@ impl Writer {
             compression: CompressionType::None,
             metadata_compression_override: None,
             lifetime_class: 0,
+            created_at: None,
             sync_mode: SyncMode::Normal,
             writeback_bytes: 0,
             written_back: 0,
@@ -515,7 +520,9 @@ impl Writer {
         let metadata = Metadata {
             id: self.blob_file_id,
             version: META_VERSION,
-            created_at: unix_timestamp().as_nanos(),
+            created_at: self
+                .created_at
+                .unwrap_or_else(|| unix_timestamp().as_nanos()),
             item_count: self.item_count,
             total_compressed_bytes: self.written_blob_bytes,
             total_uncompressed_bytes: self.uncompressed_bytes,

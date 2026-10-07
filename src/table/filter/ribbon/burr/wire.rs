@@ -115,11 +115,54 @@ pub(crate) fn encoded_len(filter: &BurrFilter) -> usize {
             .sum::<usize>()
 }
 
+/// One layer of a solution as [`encode_layers`] writes it: its slot count,
+/// its per-block thresholds and its rows, row-major, each row's result in
+/// its low `r` bits.
+pub(crate) struct LayerParts<'a> {
+    pub(crate) m: usize,
+    pub(crate) thresholds: &'a [u8],
+    pub(crate) rows: &'a [u64],
+}
+
 /// Serialize a built [`BurrFilter`] into the wire format.
 pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
     let params = filter.params();
-    let layers = filter.layers_inner();
+    let layers: Vec<LayerParts<'_>> = filter
+        .layers_inner()
+        .iter()
+        .map(|layer| {
+            let rows = layer.ribbon.z_raw_words();
+            debug_assert_eq!(rows.len(), layer.m, "one solver row per slot");
+            LayerParts {
+                m: layer.m,
+                thresholds: &layer.thresholds,
+                rows,
+            }
+        })
+        .collect();
+    // Header. The filter_type tag distinguishes a membership payload
+    // (probe → bool) from a retrieval payload (recover → locator); both
+    // share the rest of the layout.
+    let filter_type_byte = match filter.kind() {
+        super::filter::BurrFilterKind::Membership => BURR_FILTER_TYPE_BYTE,
+        super::filter::BurrFilterKind::Retrieval => BURR_RETRIEVAL_TYPE_BYTE,
+    };
+    encode_layers(
+        filter_type_byte,
+        (params.r, params.w, params.b),
+        params.seed,
+        &layers,
+    )
+}
 
+/// Serialize a solution given as its parameters `(r, w, b)`, its root seed and
+/// its layers into the wire format, under `filter_type_byte`.
+pub(crate) fn encode_layers(
+    filter_type_byte: u8,
+    (r, w, b): (u8, u8, u8),
+    seed: u64,
+    layers: &[LayerParts<'_>],
+) -> Vec<u8> {
     // Pre-size the buffer to avoid reallocations: header + per-layer
     // (fixed header + thresholds + z) for every layer.
     let estimated_size: usize = HEADER_LEN
@@ -128,35 +171,26 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
             .map(|layer| {
                 LAYER_HEADER_LEN
                     + layer.thresholds.len()
-                    + super::packed::z_byte_len(layer.m, params.r).unwrap_or(0)
+                    + super::packed::z_byte_len(layer.m, r).unwrap_or(0)
             })
             .sum::<usize>();
     let mut buf = Vec::with_capacity(estimated_size);
 
-    // Header. The filter_type tag distinguishes a membership payload
-    // (probe → bool) from a retrieval payload (recover → locator); both
-    // share the rest of the layout. A membership filter writes tag 2
-    // verbatim, so existing on-disk output is byte-identical.
-    let filter_type_byte = match filter.kind() {
-        super::filter::BurrFilterKind::Membership => BURR_FILTER_TYPE_BYTE,
-        super::filter::BurrFilterKind::Retrieval => BURR_RETRIEVAL_TYPE_BYTE,
-    };
     buf.extend_from_slice(&MAGIC_BYTES);
     #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
     {
         buf.write_u8(filter_type_byte).expect("vec write");
         buf.write_u8(FORMAT_VERSION).expect("vec write");
-        buf.write_u8(params.r).expect("vec write");
-        buf.write_u8(params.w).expect("vec write");
-        buf.write_u8(params.b).expect("vec write");
+        buf.write_u8(r).expect("vec write");
+        buf.write_u8(w).expect("vec write");
+        buf.write_u8(b).expect("vec write");
         #[expect(
             clippy::cast_possible_truncation,
             reason = "max_layers fits u8 by construction"
         )]
         let num_layers_u8 = layers.len() as u8;
         buf.write_u8(num_layers_u8).expect("vec write");
-        buf.write_u64::<LittleEndian>(params.seed)
-            .expect("vec write");
+        buf.write_u64::<LittleEndian>(seed).expect("vec write");
     }
 
     // Per-layer payloads.
@@ -175,8 +209,8 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
                       `segments * r * 8` bytes, bounded by the partition-size \
                       policy; an overflow here means a regression slipped past it"
         )]
-        let z_byte_len: usize = super::packed::z_byte_len(m, params.r)
-            .expect("BuRR layer z payload size overflows usize");
+        let z_byte_len: usize =
+            super::packed::z_byte_len(m, r).expect("BuRR layer z payload size overflows usize");
         #[expect(
             clippy::expect_used,
             reason = "programmer invariant: m bounded by partition size; \
@@ -205,14 +239,12 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
             buf.write_u32::<LittleEndian>(z_byte_len_u32)
                 .expect("vec write");
         }
-        buf.extend_from_slice(&layer.thresholds);
+        buf.extend_from_slice(layer.thresholds);
         // The solver works row-major — back-substitution reads rows below the
         // one it is finishing — so the transpose happens here, once per layer,
         // on the way out. The builder's row-major buffer is transient; what is
         // stored, cached and probed is the bit-sliced form.
-        let z_words = layer.ribbon.z_raw_words();
-        debug_assert_eq!(z_words.len(), m, "one solver row per slot");
-        let columns = super::packed::transpose(z_words, params.r);
+        let columns = super::packed::transpose(layer.rows, r);
         debug_assert_eq!(columns.len() * 8, z_byte_len);
         for word in columns {
             buf.extend_from_slice(&word.to_le_bytes());
@@ -253,6 +285,13 @@ pub(crate) struct DecodedFilter<'a> {
 /// Parse a wire-format BuRR filter slice. Returns an error if the magic
 /// bytes don't match, the version is unrecognised, or the buffer is
 /// truncated.
+pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
+    decode_as(bytes, BURR_FILTER_TYPE_BYTE)
+}
+
+/// [`decode`] for a payload of either kind: `expected_type` is
+/// [`BURR_FILTER_TYPE_BYTE`] or [`BURR_RETRIEVAL_TYPE_BYTE`], and a payload
+/// tagged otherwise is rejected.
 #[expect(
     clippy::indexing_slicing,
     reason = "every slice in this function is preceded by an explicit length \
@@ -265,7 +304,7 @@ pub(crate) struct DecodedFilter<'a> {
               would multiply the function's error-return paths without \
               improving safety."
 )]
-pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
+pub(crate) fn decode_as(bytes: &[u8], expected_type: u8) -> crate::Result<DecodedFilter<'_>> {
     if bytes.len() < HEADER_LEN {
         return Err(crate::Error::InvalidHeader("BurrFilter"));
     }
@@ -278,7 +317,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     }
 
     let filter_type = cursor.read_u8()?;
-    if filter_type != BURR_FILTER_TYPE_BYTE {
+    if filter_type != expected_type {
         return Err(crate::Error::InvalidTag(("FilterType", filter_type)));
     }
     let version = cursor.read_u8()?;

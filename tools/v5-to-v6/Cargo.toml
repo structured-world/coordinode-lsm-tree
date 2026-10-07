@@ -1,0 +1,28 @@
+# Offline converter from a 5.x store (on-disk format V5) to the 6.0 format
+# (V6). Not part of the main coordinode-lsm-tree crate: the engine reads and
+# writes V6 only, and the V5 side is read by the 5.x crate that wrote it.
+# Build with: cd tools/v5-to-v6 && cargo build --release
+#
+# The empty `[workspace]` pins this crate as its own root, as the other tools
+# do, so no parent workspace claims it.
+[workspace]
+
+[package]
+name = "v5-to-v6"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "v5-to-v6"
+path = "src/main.rs"
+
+[dependencies]
+# The 5.x crate reads the source store through its read-only export.
+lsm5 = { package = "coordinode-lsm-tree", git = "https://github.com/structured-world/coordinode-lsm-tree", branch = "feat/#672-export-properties", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
+# The 6.0 crate writes the converted store.
+lsm6 = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

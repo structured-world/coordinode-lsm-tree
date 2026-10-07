@@ -10,7 +10,7 @@
 # single-package workspace, so they are excluded — otherwise Cargo would treat
 # them as orphan members of this root and refuse to build.
 [workspace]
-exclude = ["fuzz", "tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump"]
+exclude = ["fuzz", "tools/compare-rocksdb", "tools/db_bench", "tools/sst-dump", "tools/v5-to-v6"]
 
 [package]
 name = "coordinode-lsm-tree"
