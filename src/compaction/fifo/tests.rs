@@ -559,6 +559,47 @@ fn fifo_ttl_spares_tables_stamped_before_the_clock_started() -> crate::Result<()
     })
 }
 
+/// A compaction output that takes in a table stamped while the clock read
+/// zero is dated by the compaction that writes it: none of its data is newer
+/// than that, so a TTL counted from it expires nothing early, and the output
+/// still expires rather than staying forever.
+#[test]
+fn fifo_ttl_counts_an_undated_input_from_the_compaction() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    with_test_clock(|clock| {
+        clock.set_secs(0);
+        tree.insert("a", "v", 0);
+        tree.flush_active_memtable(0)?;
+        clock.set_secs(1_000);
+        tree.insert("b", "v", 1);
+        tree.flush_active_memtable(1)?;
+        clock.set_secs(5_000);
+        tree.major_compact(u64::MAX, 0)?;
+        assert_eq!(1, tree.table_count());
+
+        // The dated input alone would have expired the output at 1_010s.
+        clock.set_secs(5_009);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 2)?;
+        assert_eq!(1, tree.table_count(), "nothing expires before its time");
+
+        clock.set_secs(5_011);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 2)?;
+        assert_eq!(
+            0,
+            tree.table_count(),
+            "the output expires 10s after it was written"
+        );
+        Ok(())
+    })
+}
+
 /// The outputs of a major compaction of a KV-separated tree share its blob
 /// file, which goes only with the last of them. Counting its bytes as freed
 /// by the first output dropped stops the round with the file still on disk
