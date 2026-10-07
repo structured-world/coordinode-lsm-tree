@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791377470819,
+  "lastUpdate": 1791385410150,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -40358,6 +40358,90 @@ window.BENCHMARK_DATA = {
             "value": 275373.93580933596,
             "unit": "ops/sec",
             "extra": "P50: 2.6us | P99: 14.3us | P99.9: 151.2us\nthreads: 1 | elapsed: 0.73s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5bad4c9c087299c9f9c22db581e2e036d85320f3",
+          "message": "feat(blob): group separated values by expected lifetime (#868)\n\n## Summary\n\n- Blob values are split into lifetime groups, each written to its own\nblob files, so a value that lives long no longer shares a file with\nvalues that die quickly and is not copied forward every time that file\nis collected.\n- Four groups by default;\n`KvSeparationOptions::lifetime_groups(LifetimeGroups::ONE)` turns\ngrouping off, and any count from one to `LifetimeGroups::MAX` can be\nset.\n- The group decides only where a value is written: reads and blob file\ncollection are unchanged.\n\n## Changes\n\n- `KvSeparationOptions::lifetime_groups` (`LifetimeGroups`, bounded by\ntype) and `KvSeparationOptions::lifetime_hint` (`LifetimeHint`: the\ncaller's class per key, over the observed one).\n- Flush: a key the memtables hold more than one version of goes to group\n0, every other new value to group 1; observed under the flush stream,\nwhich drops the versions that would show it.\n- Relocation: a surviving value moves one group up, to the last group;\n`MultiWriter` keeps one output file per (codec, class).\n- Blob file metadata records the lifetime class\n(`BlobFile::lifetime_class`); salvage keeps it.\n- `FsFile::set_write_lifetime` passes the class to the device\n(`F_SET_RW_HINT` on Linux, also through io_uring), a no-op elsewhere.\n- `Metrics::blob_bytes_relocated`: on-disk blob bytes relocating\ncompactions copied.\n- db_bench `blobs-*-churn` scenarios: eight rounds of hot rewrites and\nlong-lived appends, each flushed and compacted, publishing relocated\nbytes per reclaimed byte beside the scan's per-row costs, against\n`*-one-group` trees.\n\n## Measurements\n\n`mixed-layout --num 10000`, engine byte counters (one group vs four):\n\n| Profile | Relocated / reclaimed | Relocated | Scan read / row | Scan\ncopied / row |\n|---|---|---|---|---|\n| well-placed, one group | 0.429 | 24.7 MB | 8295.8 B | 8262.6 B |\n| well-placed, four groups | 0.000 | 0 | 8295.8 B | 8261.6 B |\n| scattered, one group | 0.294 | 41.1 MB | 8295.8 B | 8204.6 B |\n| scattered, four groups | 0.115 | 13.3 MB | 8295.8 B | 8029.4 B |\n\nThe blob bytes left on disk at the end are lower with groups too; the\nfile count is higher (12 vs 10, 15 vs 13).\n\n## Testing\n\nfmt, clippy (all features and defaults), the full nextest suite in both\nfeature sets, doc tests, rustdoc, the no-std check, sst-dump and\ndb_bench (clippy, tests, the mixed-layout run) pass on Linux.\n\nCloses #689\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable blob lifetime groups and optional value-based\nhints, helping organize blob data by expected longevity during writes\nand compaction.\n  * Added a metric for tracking blob bytes relocated during compaction.\n* Added mixed-layout blob-churn benchmarks for well-placed and scattered\nlayouts, including single-group configurations. These scenarios require\na nonzero cache.\n* Recovered blob files now retain their source lifetime classification.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T17:49:12+03:00",
+          "tree_id": "3ca673d745bdcfc009fe8ea6942076d4e265cb66",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5bad4c9c087299c9f9c22db581e2e036d85320f3"
+        },
+        "date": 1791385408694,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 100767.53731756794,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 20.9us | P99.9: 40.8us\nthreads: 1 | elapsed: 5.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1129911.2907775522,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 3.4us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.18s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 423590.8898527587,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 7.6us | P99.9: 20.2us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 313036.94150511886,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 11.7us | P99.9: 50.0us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 1201881.1338717286,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 8.6us | P99.9: 19.2us\nthreads: 1 | elapsed: 0.17s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 214772.93189763813,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 17.7us | P99.9: 40.0us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 97795.22460666642,
+            "unit": "ops/sec",
+            "extra": "P50: 7.2us | P99: 40.3us | P99.9: 66.5us\nthreads: 1 | elapsed: 2.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 555410.7800217043,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 3.9us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 529302.9160520335,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 1.0us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 256868.30825868176,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 19.4us | P99.9: 125.6us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
           }
         ]
       }
