@@ -1036,6 +1036,24 @@ pub fn recover(
             levels.push(level);
         }
 
+        // Every byte of the section belongs to a level, a run or a record, so
+        // in strict mode, where every read above succeeded and was counted,
+        // bytes left over mean a count understated what follows it. A writer
+        // that stored a run count in one byte wrote exactly that for a level
+        // of more than 255 runs; reading on would place a prefix of the level
+        // and delete the rest as orphans. The tolerant modes accept a prefix
+        // by design and keep doing so.
+        if !tolerate_tail && tables_bytes_consumed != section_len {
+            // Only bytes read from the section are counted, and a read past
+            // its end fails, so the difference cannot underflow.
+            let trailing = section_len - tables_bytes_consumed;
+            log::error!(
+                "manifest tables section of version #{curr_version_id} holds {trailing} \
+                 byte(s) its counts do not describe; run repair to rebuild the manifest"
+            );
+            return Err(crate::Error::ManifestTablesUnaccounted { trailing });
+        }
+
         // Preserve the persisted level_count even if PIT/SkipAny/tail
         // early-exited before reading every level. Downstream code
         // (notably compaction/leveled with 'assert! version.level_count()

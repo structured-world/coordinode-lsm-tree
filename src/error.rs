@@ -497,6 +497,21 @@ pub enum Error {
         /// servable.
         oldest_retained: SeqNo,
     },
+
+    /// The manifest snapshot's `tables` section holds bytes its level and run
+    /// counts do not describe.
+    ///
+    /// Every byte of the section belongs to a level, a run or a table record,
+    /// so bytes left over mean a count understates what follows it. A writer
+    /// that stored a level's run count in one byte (5.11.1 and earlier) wrote
+    /// such a snapshot for a level of more than 255 runs: read as written, it
+    /// places only some of that level's tables, and the rest would be deleted
+    /// as orphans. Run [`Config::repair`](crate::Config::repair), which
+    /// rebuilds the manifest from the tables on disk.
+    ManifestTablesUnaccounted {
+        /// Bytes past the last record the counts describe.
+        trailing: u64,
+    },
 }
 
 impl core::fmt::Display for Error {

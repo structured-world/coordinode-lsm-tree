@@ -1628,3 +1628,55 @@ fn recover_skip_any_then_tail_accounts_blob_corruption_separately() -> crate::Re
     );
     Ok(())
 }
+
+/// Writes the `tables` section a writer that stored a level's run count in one
+/// byte produced for a level of 257 single-table runs: the count wrapped to
+/// `1`, and the other 256 runs follow it in the section.
+fn write_manifest_with_wrapped_run_count(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<()> {
+    const RUNS: u64 = 257;
+    let mut w = open_fixture_writer(folder, id, fs)?;
+    write_tree_type(&mut w)?;
+
+    w.start("tables")?;
+    w.write_u8(1)?; // 1 level
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the truncation is what is being reproduced"
+    )]
+    w.write_u8(RUNS as u8)?;
+    for run in 0..RUNS {
+        w.write_u32::<LittleEndian>(1)?;
+        write_good_table_record(&mut w, run)?;
+    }
+
+    write_empty_blob_files(&mut w)?;
+    write_empty_blob_gc_stats(&mut w)?;
+    w.finish()?;
+    Ok(())
+}
+
+/// A snapshot whose `tables` section holds more than its counts describe is
+/// refused, naming the unread bytes. Reading it as written would place one
+/// table where the level has 257, and an open would then delete the other 256
+/// as orphans.
+#[test]
+fn recover_absolute_consistency_rejects_tables_bytes_the_counts_do_not_describe()
+-> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/absolute/wrapped");
+    fs.create_dir_all(folder)?;
+    write_manifest_with_wrapped_run_count(folder, 1, &fs)?;
+    write_current(folder, 1, &fs)?;
+
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("unread tables bytes must abort under AbsoluteConsistency");
+    // Each unread run: its table count (4) and one framed record (12 + 33).
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestTablesUnaccounted { trailing } if trailing == 256 * (4 + 12 + 33)
+        ),
+        "expected ManifestTablesUnaccounted for 256 runs, got: {err:?}",
+    );
+    Ok(())
+}
