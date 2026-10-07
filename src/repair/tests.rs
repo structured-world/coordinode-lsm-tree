@@ -9263,7 +9263,7 @@ fn repair_drops_a_blob_referenced_only_by_a_lineage_excluded_output() -> crate::
     };
     {
         let mut w = crate::table::Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs_dyn))?
-            .use_recency(Some(0))
+            .use_recency(0)
             .use_lineage(Some(vec![0, 1]));
         w.link_blob_file(crate::table::writer::LinkedFile {
             blob_file_id: 7,
@@ -10625,7 +10625,7 @@ fn repair_keeps_an_output_whose_inputs_survived_only_lossily() -> crate::Result<
     // Output 1: healthy, recording input 0 as its lineage.
     {
         let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
-            .use_recency(Some(0))
+            .use_recency(0)
             .use_lineage(Some(vec![0]));
         w.write(InternalValue::from_components(
             b"k00000".to_vec(),
@@ -10684,7 +10684,7 @@ fn repair_supersedes_an_input_a_partial_output_fully_covers() -> crate::Result<(
     }
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]));
         w.write(InternalValue::from_components(
             b"k".to_vec(),
@@ -10748,7 +10748,7 @@ fn repair_supersedes_an_input_covered_by_an_unbroken_sibling_union() -> crate::R
         (3u64, [b"n".as_slice(), b"z".as_slice()], Some(2)),
     ] {
         let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]))
             .use_lineage_prev(prev);
         for key in keys {
@@ -10813,7 +10813,7 @@ fn repair_keeps_an_input_when_the_sibling_chain_is_broken() -> crate::Result<()>
         (4u64, [b"n".as_slice(), b"z".as_slice()], Some(3)),
     ] {
         let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]))
             .use_lineage_prev(prev);
         for key in keys {
@@ -10880,7 +10880,7 @@ fn a_transformed_output_without_the_run_end_fails_on_reaching_inputs() -> crate:
     }
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]))
             .use_lineage_transformed(true);
         for key in [b"a".as_slice(), b"m".as_slice()] {
@@ -12623,7 +12623,7 @@ fn repair_supersedes_ancestry_through_an_excluded_intermediate() -> crate::Resul
     // B (id 1): the untransformed fold of A (same record).
     {
         let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
-            .use_recency(Some(0))
+            .use_recency(0)
             .use_lineage(Some(vec![0]))
             .use_lineage_last(true);
         w.write(InternalValue::from_components(
@@ -12638,7 +12638,7 @@ fn repair_supersedes_ancestry_through_an_excluded_intermediate() -> crate::Resul
     // k and kept only m.
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![1]))
             .use_lineage_transformed(true)
             .use_lineage_last(true);
@@ -12698,7 +12698,7 @@ fn repair_rejects_a_transformed_output_with_a_live_history_carrier() -> crate::R
     }
     {
         let mut w = Writer::new(tables.join("1"), 1, 0, Arc::clone(&fs))?
-            .use_recency(Some(0))
+            .use_recency(0)
             .use_lineage(Some(vec![0]))
             .use_lineage_last(true);
         w.write(InternalValue::from_components(
@@ -12711,7 +12711,7 @@ fn repair_rejects_a_transformed_output_with_a_live_history_carrier() -> crate::R
     }
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![1]))
             .use_lineage_transformed(true);
         w.write(InternalValue::from_components(
@@ -12786,7 +12786,7 @@ fn repair_rejects_a_residual_overlap_under_a_merge_operator() -> crate::Result<(
     }
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]));
         for key in [b"a".as_slice(), b"m".as_slice()] {
             w.write(InternalValue::from_components(
@@ -12846,7 +12846,7 @@ fn repair_reports_the_overlap_of_a_partially_covered_input() -> crate::Result<()
     }
     {
         let mut w = Writer::new(tables.join("2"), 2, 0, Arc::clone(&fs))?
-            .use_recency(Some(1))
+            .use_recency(1)
             .use_lineage(Some(vec![0, 1]));
         for key in [b"a".as_slice(), b"m".as_slice()] {
             w.write(InternalValue::from_components(
@@ -16913,7 +16913,7 @@ fn repair_orders_l0_by_recency_key_not_table_id() -> crate::Result<()> {
     // Table 5: an intra-L0 compaction output of OLDER flushes (recency 1),
     // carrying the superseded write of `k` at the same caller-chosen seqno.
     {
-        let mut w = Writer::new(tables.join("5"), 5, 0, Arc::clone(&fs))?.use_recency(Some(1));
+        let mut w = Writer::new(tables.join("5"), 5, 0, Arc::clone(&fs))?.use_recency(1);
         w.write(InternalValue::from_components(
             b"k",
             b"old",
@@ -16944,28 +16944,19 @@ fn repair_orders_l0_by_recency_key_not_table_id() -> crate::Result<()> {
     Ok(())
 }
 
-/// Two L0 tables with OVERLAPPING key ranges and INTERSECTING seqno ranges
-/// where at least one lacks the recency meta cannot be ordered reliably: the
-/// id fallback restores ALLOCATION order, but a legacy compaction output
-/// allocated its high id before a concurrent newer flush installed, and a
-/// missing key cannot tell the two apart. Repair still commits the
-/// deterministic id order — an openable tree, always — but must REPORT the
-/// overlap so a reconciling deployment replays the range and its WAL's
-/// authoritative order settles the ties (the replayed memtable copy is the
-/// newest source and wins them).
+/// Two overlapping tables holding one key at one caller-chosen seqno are
+/// ordered by their recency keys, which every table carries, so the repair
+/// rebuilds the order the live tree kept and reports nothing to replay.
 #[test]
-fn repair_reports_ambiguous_order_of_legacy_overlapping_tables() -> crate::Result<()> {
+fn repair_orders_tied_overlapping_tables_by_their_recency_keys() -> crate::Result<()> {
     use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use crate::{AbstractTree, Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir()?;
     let tables = dir.path().join("tables");
     std::fs::create_dir_all(&tables)?;
     let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-    // The same key at the same caller-chosen seqno with DIFFERENT payloads,
-    // in two tables WITHOUT the recency meta: the tied read's winner depends
-    // entirely on the L0 order the repair guesses.
     for (id, payload) in [(0u64, b"old".as_slice()), (1u64, b"new".as_slice())] {
         let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
         w.write(InternalValue::from_components(
@@ -16977,135 +16968,35 @@ fn repair_reports_ambiguous_order_of_legacy_overlapping_tables() -> crate::Resul
         assert!(w.finish()?.is_some(), "the table is non-empty");
     }
 
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
-    assert_eq!(report.recovered, 2, "both tables are still recovered");
-    assert!(
-        !report.lost_coverage.is_empty(),
-        "the ambiguous overlap must be reported: {report:?}",
-    );
-    assert!(
-        !matches!(
-            report.wal_replay_scope(),
-            crate::repair::WalReplayScope::TailOnly
-        ),
-        "an unorderable tied history must widen the replay obligation: {report:?}",
-    );
-    Ok(())
-}
-
-/// Under a configured MERGE OPERATOR the same ambiguous legacy overlap is
-/// not reportable-and-publishable: the pair may be a pre-lineage compaction
-/// output beside its surviving input, and publishing both applies the
-/// input's merge operands twice on every read — a multiplicity the
-/// documented WAL reconciliation cannot remove (it sees both physical
-/// copies as survivors, or the operand as folded into the output's value).
-/// Without lineage neither side can be proven redundant, so the repair
-/// fails closed instead of committing a corrupting tree. Value-only
-/// deployments (no operator) keep the report-and-publish path above:
-/// duplicate records are byte-identical there and reads dedupe them.
-#[test]
-fn repair_rejects_ambiguous_legacy_overlap_under_a_merge_operator() -> crate::Result<()> {
-    use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
-    use std::sync::Arc;
-
-    struct SumMerge;
-    impl crate::MergeOperator for SumMerge {
-        fn merge(
-            &self,
-            _key: &[u8],
-            _base_value: Option<&[u8]>,
-            _operands: &[&[u8]],
-        ) -> crate::Result<crate::UserValue> {
-            Ok(b"sum".to_vec().into())
-        }
-    }
-
-    let dir = tempfile::tempdir()?;
-    let tables = dir.path().join("tables");
-    std::fs::create_dir_all(&tables)?;
-    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-    for id in [0u64, 1] {
-        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
-        w.write(InternalValue::from_components(
-            b"k5".to_vec(),
-            b"v".to_vec(),
-            7,
-            ValueType::Value,
-        ))?;
-        assert!(w.finish()?.is_some(), "the table is non-empty");
-    }
-
-    let result = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_merge_operator(Some(Arc::new(SumMerge)))
-    .repair();
-    assert!(
-        matches!(result, Err(crate::Error::Unrecoverable)),
-        "an unorderable legacy overlap under a merge operator must fail the \
-         repair, not publish a double-applying pair: {:?}",
-        result.map(|r| r.recovered),
-    );
-    Ok(())
-}
-
-/// The narrowing contract for the ambiguity report: two recency-less tables
-/// whose seqno ranges are DISJOINT — the normal serialized-flush shape, where
-/// ties are impossible and id order is install order — stay unreported, so an
-/// ordinary manifest-loss repair keeps its `TailOnly` answer.
-#[test]
-fn repair_stays_tail_only_for_disjoint_seqno_legacy_tables() -> crate::Result<()> {
-    use crate::table::Writer;
-    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
-    use std::sync::Arc;
-
-    let dir = tempfile::tempdir()?;
-    let tables = dir.path().join("tables");
-    std::fs::create_dir_all(&tables)?;
-    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
-    // Overlapping KEY ranges but disjoint seqno ranges: two serialized
-    // flushes of the same hot key.
-    for (id, seqno) in [(0u64, 3u64), (1u64, 8u64)] {
-        let mut w = Writer::new(tables.join(id.to_string()), id, 0, Arc::clone(&fs))?;
-        w.write(InternalValue::from_components(
-            b"k5".to_vec(),
-            b"v".to_vec(),
-            seqno,
-            ValueType::Value,
-        ))?;
-        assert!(w.finish()?.is_some(), "the table is non-empty");
-    }
-
-    let report = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .repair()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    let report = config().repair()?;
     assert_eq!(report.recovered, 2, "both tables are recovered");
     assert!(
         matches!(
             report.wal_replay_scope(),
             crate::repair::WalReplayScope::TailOnly
         ),
-        "disjoint seqno ranges leave nothing tied — no report: {report:?}",
+        "an order the recency keys settle leaves nothing to replay: {report:?}",
+    );
+    let crate::AnyTree::Standard(tree) = config().open()? else {
+        panic!("expected a standard tree");
+    };
+    assert_eq!(
+        tree.get(b"k5", u64::MAX)?.as_deref(),
+        Some(b"new".as_ref()),
+        "the table with the higher recency key wins the tie",
     );
     Ok(())
 }
 
-/// New flush outputs PERSIST their own id as the recency key — the same
-/// value the repair-side fallback would derive, but present on disk, so a
-/// MISSING key positively identifies a legacy table and the ambiguity report
-/// above stays confined to pre-key history instead of firing on every new
-/// tied flush pair.
+/// A flush persists its own id as its recency key, as every table carries
+/// one.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
@@ -17128,7 +17019,7 @@ fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
     let table = version.iter_tables().next().expect("one flushed table");
     assert_eq!(
         table.metadata.recency,
-        Some(table.id()),
+        table.id(),
         "a flush stamps its own id as its recency",
     );
     Ok(())

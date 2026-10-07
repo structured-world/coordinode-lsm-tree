@@ -642,17 +642,44 @@ fn blob_file_dictionary(
         .for_compression(compression)
 }
 
+/// What only the manifest knows of a table's place in the tree: its bulk-ingest
+/// sequence offset and its L0 recency. Both come from the ingestion's install,
+/// after its file was written, so neither can be read back from the file.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug)]
+struct ManifestPosition {
+    global_seqno: SeqNo,
+    recency: TableId,
+}
+
+#[cfg(feature = "std")]
+impl ManifestPosition {
+    fn of_record(record: &crate::version::recovery::RecoveredTable) -> Self {
+        Self {
+            global_seqno: record.global_seqno,
+            recency: record.recency,
+        }
+    }
+
+    fn of_table(table: &Table) -> Self {
+        Self {
+            global_seqno: table.global_seqno(),
+            recency: table.l0_recency(),
+        }
+    }
+}
+
 /// Recover params for a repair's TRANSIENT table open: the tree's configured
 /// comparator / crypto / dictionary context (so the table decodes consistently
 /// with how it was written), and everything else neutral — tree id 0 and no
 /// descriptor table keep the open from polluting shared caches keyed by the
 /// real tree id.
 ///
-/// `global_seqno` is EXPLICIT, never defaulted: a bulk-ingested SST keeps its
-/// entries at local seqno 0 and relies on this manifest-only offset for its
+/// `position` is EXPLICIT, never defaulted: a bulk-ingested SST keeps its
+/// entries at local seqno 0 and relies on the manifest-only offset for its
 /// effective MVCC ordering, so silently opening at 0 would mis-order and
-/// over-expose them. `None` means "no offset is recoverable here" — which is
-/// correct only for a manifest-loss rebuild, and `0` is a genuine offset (the
+/// over-expose them. `None` means "no position is recoverable here", which is
+/// correct only for a manifest-loss rebuild; a zero offset is genuine (the
 /// first ingestion on a fresh counter commits it), not a stand-in for absence.
 #[cfg(feature = "std")]
 fn repair_recover_params(
@@ -661,7 +688,7 @@ fn repair_recover_params(
     checksum: crate::Checksum,
     table_id: TableId,
     fs: Arc<dyn crate::fs::Fs>,
-    global_seqno: Option<SeqNo>,
+    position: Option<ManifestPosition>,
 ) -> crate::table::RecoverParams {
     let mut params = crate::table::RecoverParams::new(
         file_path,
@@ -671,8 +698,9 @@ fn repair_recover_params(
         config.comparator.clone(),
         config.cache.clone(),
     );
-    if let Some(g) = global_seqno {
-        params.global_seqno = g;
+    if let Some(position) = position {
+        params.global_seqno = position.global_seqno;
+        params.recency = Some(position.recency);
     }
     params.encryption.clone_from(&config.encryption);
     #[cfg(zstd_any)]
@@ -694,9 +722,9 @@ fn held_recover_params(
     checksum: crate::Checksum,
     table_id: TableId,
     fs: Arc<dyn crate::fs::Fs>,
-    global_seqno: Option<SeqNo>,
+    position: Option<ManifestPosition>,
 ) -> crate::table::RecoverParams {
-    let mut params = repair_recover_params(config, file_path, checksum, table_id, fs, global_seqno);
+    let mut params = repair_recover_params(config, file_path, checksum, table_id, fs, position);
     if let Some((cache, tree_id)) = held_descriptors(config) {
         params.descriptor_table = Some(cache);
         params.tree_id = tree_id;
@@ -1598,16 +1626,16 @@ struct TableSalvage<'a> {
     /// Cell rows of the table to make the owners of objects whose owning row
     /// the rebuild lost; `None` everywhere but the ownership pass.
     owner_promotions: Option<Arc<crate::salvage::OwnerPromotions>>,
-    /// The source's RECOVERED bulk-ingest sequence offset, when it is known:
-    /// from a clean manifest record, or from a source the scan already
-    /// admitted (the blob-handle rewrite). A salvaged copy preserves local
-    /// seqnos, so the offset applies to it unchanged, and its presence also
-    /// says the offset need not be reconstructed from the SST — so the
-    /// fail-closed bulk-ingest rejection does not apply.
+    /// The source's RECOVERED manifest position, when it is known: from a
+    /// clean manifest record, or from a source the scan already admitted (the
+    /// blob-handle rewrite). A salvaged copy preserves local seqnos and holds
+    /// the source's content, so the position applies to it unchanged, and its
+    /// presence also says the offset need not be reconstructed from the SST,
+    /// so the fail-closed bulk-ingest rejection does not apply.
     ///
-    /// `Some(0)` is a genuine offset, NOT a sentinel: the first ingestion on
-    /// a fresh counter commits offset 0. Only `None` means "unknown".
-    recovered_global_seqno: Option<SeqNo>,
+    /// A zero offset is genuine, NOT a sentinel: the first ingestion on a
+    /// fresh counter commits offset 0. Only `None` means "unknown".
+    recovered_position: Option<ManifestPosition>,
 }
 
 fn try_salvage_table(
@@ -1623,7 +1651,7 @@ fn try_salvage_table(
         reject_punched_without_bound,
         blob_rewrite,
         owner_promotions,
-        recovered_global_seqno,
+        recovered_position,
     } = salvage;
     // Salvage under the tree's configured comparator + crypto/dictionary context
     // so the rewritten SST opens, orders, and decrypts / decompresses consistently
@@ -1710,7 +1738,7 @@ fn try_salvage_table(
         checksum,
         table_id,
         Arc::clone(fs),
-        recovered_global_seqno,
+        recovered_position,
     )) {
         Ok(table) => table,
         Err(e) => {
@@ -1735,7 +1763,7 @@ fn try_salvage_table(
     // and over-expose them. Without a recovered offset to reuse, treat it as
     // unsalvageable — remove the freshly-written copy and let the caller record
     // the table unreadable.
-    if recovered_global_seqno.is_none()
+    if recovered_position.is_none()
         && has_unrecoverable_ingest_offset(
             table.metadata.bulk_ingested,
             table.metadata.item_count,
@@ -4684,16 +4712,16 @@ fn scan_table_folders(
             }
 
             // A CLEAN manifest record for this id carries the table's
-            // `global_seqno`: table files are immutable once published and
-            // ids are never reused, so the record's offset describes THIS
+            // `global_seqno` and L0 recency: table files are immutable once
+            // published and ids are never reused, so the record describes THIS
             // logical table even when its bytes have since been damaged.
             // Reusing it keeps a healthy bulk-ingested SST (and its real
-            // sequence position) where the manifest-loss rule would have to
-            // fail closed.
-            let manifest_global_seqno: Option<SeqNo> = manifest_referenced
+            // sequence and L0 position) where the manifest-loss rule would have
+            // to fail closed.
+            let manifest_position: Option<ManifestPosition> = manifest_referenced
                 .as_ref()
                 .and_then(|m| m.tables.get(&table_id))
-                .map(|t| t.global_seqno);
+                .map(ManifestPosition::of_record);
             // What the committed manifest says about this id's restriction —
             // authoritative in both directions (see `ManifestRestriction`).
             let manifest_restriction = manifest_referenced
@@ -4783,7 +4811,7 @@ fn scan_table_folders(
                         digest,
                         table_id,
                         folder_fs.clone(),
-                        manifest_global_seqno,
+                        manifest_position,
                     ))
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
@@ -4889,7 +4917,7 @@ fn scan_table_folders(
                     digest,
                     table_id,
                     folder_fs.clone(),
-                    manifest_global_seqno,
+                    manifest_position,
                 )),
                 Err(e) => Err(e),
             };
@@ -4908,7 +4936,7 @@ fn scan_table_folders(
                 // the affected history by it would stop far below the truth.
                 // With a clean manifest record the offset was reused above,
                 // so the bound is honest again.
-                let seqno = (manifest_global_seqno.is_some()
+                let seqno = (manifest_position.is_some()
                     || !has_unrecoverable_ingest_offset(
                         t.metadata.bulk_ingested,
                         t.metadata.item_count,
@@ -4931,7 +4959,7 @@ fn scan_table_folders(
             // silently corrupting MVCC (see `has_unrecoverable_ingest_offset`).
             // ONLY without a clean manifest record: with one, the offset was
             // recovered above and the table keeps its real sequence position.
-            if manifest_global_seqno.is_none()
+            if manifest_position.is_none()
                 && matches!(&recovered, Ok(t) if has_unrecoverable_ingest_offset(
                     t.metadata.bulk_ingested,
                     t.metadata.item_count,
@@ -5198,7 +5226,7 @@ fn scan_table_folders(
                                     reject_punched_without_bound: false,
                                     blob_rewrite: None,
                                     owner_promotions: None,
-                                    recovered_global_seqno: manifest_global_seqno,
+                                    recovered_position: manifest_position,
                                 },
                             ) {
                                 Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -5395,7 +5423,7 @@ fn scan_table_folders(
                             reject_punched_without_bound: reject_punched,
                             blob_rewrite: None,
                             owner_promotions: None,
-                            recovered_global_seqno: manifest_global_seqno,
+                            recovered_position: manifest_position,
                         },
                     ) {
                         Ok(SalvageOutcome::Salvaged(salvaged)) => {
@@ -5848,16 +5876,16 @@ fn rebuild_from_scan(
             // rewrite re-emits the straddling block's sub-bound rows, which the
             // restriction hides, so an unrestricted copy would resurrect them.
             let restrict_bound = table.restrict_lower_bound().cloned();
-            // The source already carries its recovered ingest offset (from a
-            // clean manifest record, or the scan's own admission); the rewrite
-            // preserves local seqnos, so the copy reopens under the same
-            // offset. ZERO is a VALID allocated offset — the first ingestion
-            // on a fresh counter commits offset 0 — not a sentinel for
-            // absence, so it is forwarded unconditionally: a table that
-            // reached this point was already admitted by the scan, and
-            // re-entering the fail-closed offset exclusion here would reject
-            // (and delete) its healthy replacement.
-            let source_global_seqno = table.global_seqno();
+            // The source already carries its recovered ingest offset and L0
+            // recency (from a clean manifest record, or the scan's own
+            // admission); the rewrite preserves local seqnos and content, so
+            // the copy reopens at the same position. ZERO is a VALID allocated
+            // offset — the first ingestion on a fresh counter commits offset
+            // 0 — not a sentinel for absence, so it is forwarded
+            // unconditionally: a table that reached this point was already
+            // admitted by the scan, and re-entering the fail-closed offset
+            // exclusion here would reject (and delete) its healthy replacement.
+            let source_position = ManifestPosition::of_table(&table);
             let fs = table.fs.clone();
             // A table rewritten only to hand ownership loses nothing: it stays
             // as it was, its owners unchanged, if the rewrite cannot be made.
@@ -5885,7 +5913,7 @@ fn rebuild_from_scan(
                     reject_punched_without_bound: false,
                     blob_rewrite: Some(Arc::clone(&blob_rewrites)),
                     owner_promotions: promote.map(Arc::new),
-                    recovered_global_seqno: Some(source_global_seqno),
+                    recovered_position: Some(source_position),
                 },
             ) {
                 Ok(SalvageOutcome::Salvaged(rewritten)) => {
@@ -5923,7 +5951,7 @@ fn rebuild_from_scan(
                             checksum,
                             source_id,
                             Arc::clone(&fs),
-                            Some(source_global_seqno),
+                            Some(source_position),
                         ))?;
                         let published = match bound {
                             Some(bound) => {
@@ -6455,107 +6483,9 @@ fn rebuild_from_scan(
             }
         })
         .collect();
-    // A pair of L0 tables whose KEY ranges overlap and whose SEQNO ranges
-    // intersect can hold tied entries, and a tied read is settled by run
-    // order. The persisted recency key makes that order trustworthy; when
-    // EITHER table lacks it, the id fallback restores ALLOCATION order,
-    // which a legacy compaction output does not follow (its high id predates
-    // a concurrent newer flush's install) — and a missing key cannot tell
-    // such an output from a flush. The tree still commits the deterministic
-    // id order (an openable tree, always), and the overlap is REPORTED: the
-    // key-range intersection under a seqno ceiling of the intersection's top
-    // (ties need the seqno present in BOTH tables). A reconciling deployment
-    // replays the range and its WAL's authoritative order settles the ties —
-    // the replayed memtable copy is the newest source and wins them.
-    // Serialized flushes have DISJOINT seqno ranges, so an ordinary tree
-    // reports nothing; only caller-assigned-seqno deployments (which have a
-    // WAL to heal from) can intersect.
-    //
-    // An INTERVAL SWEEP, not an all-pairs scan: probes sort by key-range MIN
-    // and walk in that order against an active list pruned of every probe
-    // whose MAX fell below the incoming MIN — each remaining active overlaps
-    // the incoming probe by construction, so the pair work is bounded by the
-    // overlapping pairs actually inspected instead of `n²` (50k recovered
-    // tables would otherwise cost ~1.25 billion pair visits on top of the
-    // full-file verification). A store where every table carries the recency
-    // key skips the sweep entirely.
-    struct RecencyProbe {
-        min: UserKey,
-        max: UserKey,
-        lo_seqno: SeqNo,
-        hi_seqno: SeqNo,
-        modern: bool,
-        path: PathBuf,
-    }
-    let mut ambiguous_order_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
-    if recovered_tables
-        .iter()
-        .any(|(t, ..)| t.metadata.recency.is_none())
-    {
-        let cmp = config.comparator.as_ref();
-        let mut probes: Vec<RecencyProbe> = recovered_tables
-            .iter()
-            .map(|(t, _, path, _)| RecencyProbe {
-                min: t.metadata.key_range.min().clone(),
-                max: t.metadata.key_range.max().clone(),
-                lo_seqno: t.get_lowest_seqno(),
-                hi_seqno: t.get_highest_seqno(),
-                modern: t.metadata.recency.is_some(),
-                path: path.clone(),
-            })
-            .collect();
-        probes.sort_by(|a, b| cmp.compare(&a.min, &b.min));
-        let mut active: Vec<&RecencyProbe> = Vec::new();
-        for probe in &probes {
-            active.retain(|other| cmp.compare(&other.max, &probe.min) != core::cmp::Ordering::Less);
-            for other in &active {
-                if probe.modern && other.modern {
-                    continue;
-                }
-                if probe.lo_seqno > other.hi_seqno || other.lo_seqno > probe.hi_seqno {
-                    continue;
-                }
-                // Under a configured MERGE OPERATOR the pair is not
-                // publishable at all: it may be a pre-lineage compaction
-                // output beside its surviving input, and publishing both
-                // applies the input's merge operands twice on every read —
-                // a multiplicity the reported replay cannot remove (the
-                // reconciliation sees both physical copies as survivors, or
-                // the operand as folded into the output's value). Without
-                // lineage neither side can be proven redundant, so the
-                // repair fails closed. Value-only deployments proceed to
-                // the report below: their duplicate records are
-                // byte-identical and reads dedupe them, so ties are the
-                // only hazard and the WAL replay settles those.
-                if config.merge_operator.is_some() {
-                    log::error!(
-                        "repair: tables {} and {} overlap with intersecting seqno \
-                         ranges and no trustworthy order or lineage; under a merge \
-                         operator publishing both would double-apply operands, and \
-                         no replay can undo that",
-                        probe.path.display(),
-                        other.path.display(),
-                    );
-                    return Err(crate::Error::Unrecoverable);
-                }
-                // `other.min <= probe.min` (sort order) and
-                // `other.max >= probe.min` (retained above), so the key
-                // intersection is `[probe.min, min(maxes)]`.
-                let hi = if cmp.compare(&probe.max, &other.max) == core::cmp::Ordering::Less {
-                    &probe.max
-                } else {
-                    &other.max
-                };
-                ambiguous_order_coverage.push((
-                    probe.path.clone(),
-                    probe.min.clone(),
-                    hi.clone(),
-                    Some(probe.hi_seqno.min(other.hi_seqno)),
-                ));
-            }
-            active.push(probe);
-        }
-    }
+    // Every table carries its L0 recency key (a table without one is refused
+    // as it is read), so the order rebuilt from it is the order the live tree
+    // kept and ties in it need no report.
     let recovered_tables: Vec<Table> = recovered_tables.into_iter().map(|(t, ..)| t).collect();
     publish_repaired_manifest(
         config,
@@ -6568,12 +6498,7 @@ fn rebuild_from_scan(
             unreadable_files,
             redundant_unreadable,
             excluded_files,
-            lost_coverage_scoped: (
-                salvaged_coverage,
-                ambiguous_order_coverage,
-                lineage_partial,
-                salvaged_unknowable,
-            ),
+            lost_coverage_scoped: (salvaged_coverage, lineage_partial, salvaged_unknowable),
             coverage_by_path,
             manifest_referenced,
             scanned_table_ids,
@@ -6603,9 +6528,8 @@ struct RepairPublication<'a> {
     /// as corruption, but contributing no lost coverage.
     redundant_unreadable: crate::HashSet<PathBuf>,
     excluded_files: Vec<(PathBuf, String)>,
-    #[expect(clippy::type_complexity, reason = "the four coverage channels")]
+    #[expect(clippy::type_complexity, reason = "the three coverage channels")]
     lost_coverage_scoped: (
-        Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
         Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)>,
         Vec<(TableId, PathBuf, UserKey, UserKey, Option<SeqNo>, bool)>,
         Vec<PathBuf>,
@@ -6649,8 +6573,7 @@ fn publish_repaired_manifest(
         unreadable_files,
         redundant_unreadable,
         excluded_files,
-        lost_coverage_scoped:
-            (salvaged_coverage, ambiguous_order_coverage, lineage_partial, salvaged_unknowable),
+        lost_coverage_scoped: (salvaged_coverage, lineage_partial, salvaged_unknowable),
         coverage_by_path,
         manifest_referenced,
         scanned_table_ids,
@@ -7136,7 +7059,6 @@ fn publish_repaired_manifest(
         }
     }
     lost_coverage.extend(salvaged_coverage);
-    lost_coverage.extend(ambiguous_order_coverage);
     lost_coverage.extend(
         lineage_partial
             .into_iter()

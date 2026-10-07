@@ -5357,9 +5357,13 @@ impl Tree {
             }
         }
 
+        // Table ids and L0 recency keys share one counter, and an ingested
+        // table's recency is an id taken at its install that no table carries:
+        // the next id has to be above both, or a flush after the reopen would
+        // lay out behind an ingestion it is newer than.
         let highest_table_id = version
             .iter_tables()
-            .map(Table::id)
+            .map(|table| table.id().max(table.l0_recency()))
             .max()
             .unwrap_or_default();
 
@@ -5604,8 +5608,15 @@ impl Tree {
         let snapshot_id = recovery.snapshot_id;
 
         let mut table_map = {
-            let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =
-                crate::HashMap::default();
+            let mut result: crate::HashMap<
+                TableId,
+                (
+                    u8, /* Level index */
+                    Checksum,
+                    SeqNo,
+                    TableId, /* L0 recency */
+                ),
+            > = crate::HashMap::default();
 
             for (level_idx, table_ids) in recovery.table_ids.iter().enumerate() {
                 for run in table_ids {
@@ -5622,6 +5633,7 @@ impl Tree {
                                     .expect("there are less than 256 levels"),
                                 table.checksum,
                                 table.global_seqno,
+                                table.recency,
                             ),
                         );
                     }
@@ -5840,7 +5852,7 @@ impl Tree {
                         #[cfg(feature = "std")]
                         {
                             let published = match table_map.get(&tmp_id) {
-                                Some(&(_, manifest_checksum, _)) => {
+                                Some(&(_, manifest_checksum, _, _)) => {
                                     match crate::repair::repair_tmp_is_published(
                                         config,
                                         folder_fs,
@@ -5975,7 +5987,7 @@ impl Tree {
                 // Remove from map to prevent duplicate recovery if the same
                 // table file exists in multiple scanned folders.
                 if let Some(entry) = table_map.remove(&table_id) {
-                    let (level_idx, checksum, global_seqno) = entry;
+                    let (level_idx, checksum, global_seqno, recency) = entry;
                     let pin_filter = config.filter_block_pinning_policy.get(level_idx.into());
                     let pin_index = config.index_block_pinning_policy.get(level_idx.into());
 
@@ -5989,6 +6001,7 @@ impl Tree {
                             config.cache.clone(),
                         );
                         params.global_seqno = global_seqno;
+                        params.recency = Some(recency);
                         params.tree_id = tree_id;
                         params.descriptor_table.clone_from(&config.descriptor_table);
                         params.pin_filter = pin_filter;
@@ -6184,7 +6197,7 @@ impl Tree {
             if let Some(routes) = &config.level_routes {
                 let all_missing_uncovered = table_map
                     .values()
-                    .all(|(level, _, _)| !routes.iter().any(|r| r.levels.contains(level)));
+                    .all(|(level, ..)| !routes.iter().any(|r| r.levels.contains(level)));
 
                 if all_missing_uncovered {
                     let found = tables.len();
@@ -6235,7 +6248,8 @@ impl Tree {
             &config.current_zstd_dictionaries(),
         )?;
 
-        let version = Version::from_recovery(recovery, &tables, &blob_files)?;
+        let version =
+            Version::from_recovery(recovery, &tables, &blob_files, config.comparator.as_ref())?;
 
         // Registered ids the tree no longer holds are dropped. One a recovered
         // file names cannot be among them, since that file would have refused

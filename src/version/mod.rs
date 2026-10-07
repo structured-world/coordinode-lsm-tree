@@ -53,8 +53,38 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Deref;
 
-use optimize::optimize_runs;
+#[doc(hidden)]
+pub use optimize::optimize_key_ranges;
+use optimize::{optimize_runs, order_by_age};
+
+/// Lays out the runs of level `level_idx`: L0 from its tables' ages, since its
+/// runs overlap and their order is what recency means there; a deeper level
+/// by fusing its disjoint tables.
+fn place_runs(
+    level_idx: usize,
+    runs: Vec<Run<Table>>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Vec<Run<Table>> {
+    if level_idx == 0 {
+        order_by_age(
+            runs.into_iter()
+                .flat_map(|mut run| core::mem::take(run.inner_mut())),
+            cmp,
+        )
+    } else {
+        optimize_runs(runs, cmp)
+    }
+}
 use run::Ranged;
+
+/// Whether `level` holds a table `named` picks: a level that holds none is
+/// left as it stands by a change, its layout neither rebuilt nor copied.
+fn level_holds_any(level: &Level, named: impl Fn(TableId) -> bool) -> bool {
+    level
+        .iter()
+        .flat_map(|run| run.iter())
+        .any(|table| named(table.id()))
+}
 
 /// Context threaded through [`Version`] transformation methods.
 ///
@@ -493,11 +523,13 @@ impl Version {
         recovery: Recovery,
         tables: &[Table],
         blob_files: &[BlobFile],
+        comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Self> {
         let version_levels = recovery
             .table_ids
             .iter()
-            .map(|level| {
+            .enumerate()
+            .map(|(level_idx, level)| {
                 let level_runs = level
                     .iter()
                     .map(|run| {
@@ -534,6 +566,23 @@ impl Version {
                     })
                     .collect::<crate::Result<Vec<_>>>()?;
 
+                // A persisted L0 is kept as written when it is in recency order
+                // (repair, for one, writes a run per table), and laid out again
+                // from its tables' ages when it is not: a manifest an earlier
+                // placement wrote may hold a newer table behind an older one
+                // it overlaps.
+                if level_idx == 0 {
+                    let persisted: Vec<&Run<Table>> =
+                        level_runs.iter().map(Arc::as_ref).collect();
+                    if !optimize::in_recency_order(&persisted, comparator) {
+                        let tables = level_runs.iter().flat_map(|run| run.iter().cloned());
+                        let level_runs = order_by_age(tables, comparator)
+                            .into_iter()
+                            .map(Arc::new)
+                            .collect();
+                        return Ok(Level::from_runs(level_runs));
+                    }
+                }
                 Ok(Level::from_runs(level_runs))
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -667,7 +716,7 @@ impl Version {
 
             runs.extend(prev_runs);
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(0, runs, comparator);
 
             Level::from_runs(runs.into_iter().map(Arc::new).collect())
         });
@@ -726,12 +775,16 @@ impl Version {
 
         let mut dropped_tables: Vec<Table> = vec![];
 
-        for level in &self.levels {
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the drop takes nothing from keeps its layout as it is.
+            if !level_holds_any(level, |id| ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
 
                     let removed_tables = run
@@ -745,7 +798,7 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -842,11 +895,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the merge neither takes from nor writes to keeps its
+            // layout as it is.
+            if level_idx != dest_level && !level_holds_any(level, |id| old_ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
                     run.retain(|x| !old_ids.contains(&x.metadata.id));
                     run
@@ -858,18 +916,16 @@ impl Version {
                 && let Some(run) = Run::new(new_tables.to_vec())
             {
                 if dest_level == 0 {
-                    // NOTE: dest_level == 0 in with_merge only occurs for intra-L0
-                    // compaction (memtable flushes use with_new_l0_run, not with_merge).
-                    // Append the merged (older) run so that any concurrently flushed
-                    // (newer) runs remain at the front and are searched first during
-                    // point reads.
+                    // Intra-L0 compaction (flushes use with_new_l0_run). Where
+                    // the output goes is decided by its tables' ages below, so
+                    // a run flushed while it ran stays in front of it.
                     runs.push(run);
                 } else {
                     runs.insert(0, run);
                 }
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -950,11 +1006,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the move neither takes from nor moves to keeps its
+            // layout as it is.
+            if level_idx != dest_level && !level_holds_any(level, |id| ids.contains(&id)) {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
                 .map(|run| {
-                    // TODO: don't clone Arc inner if we don't need to modify
                     let mut run: Run<_> = run.deref().clone();
                     run.retain(|x| !ids.contains(&x.metadata.id));
                     run
@@ -968,7 +1029,7 @@ impl Version {
                 runs.insert(0, run);
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -1078,6 +1139,16 @@ impl Version {
         let mut levels = vec![];
 
         for (level_idx, level) in self.levels.iter().enumerate() {
+            // A level the slice neither consumes, restricts nor writes to
+            // keeps its layout as it is.
+            if level_idx != dest_level
+                && !level_holds_any(level, |id| {
+                    removed_ids.contains(&id) || restricted.iter().any(|(rid, _)| *rid == id)
+                })
+            {
+                levels.push(level.clone());
+                continue;
+            }
             let mut runs = level
                 .runs
                 .iter()
@@ -1106,7 +1177,7 @@ impl Version {
                 }
             }
 
-            let runs = optimize_runs(runs, comparator);
+            let runs = place_runs(level_idx, runs, comparator);
 
             levels.push(Level::from_runs(runs.into_iter().map(Arc::new).collect()));
         }
@@ -1223,6 +1294,7 @@ impl Version {
                             table.id(),
                             table.checksum(),
                             table.global_seqno(),
+                            table.l0_recency(),
                         )
                     })?;
                 }

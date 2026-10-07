@@ -300,6 +300,10 @@ impl<'a> BlobIngestion<'a> {
         // by all ingested tables, blob files, and the version that registers
         // them, ensuring consistent MVCC snapshots across the value log.
         let global_seqno = index.config.seqno.next();
+        // L0 recency from the install, as for a table ingestion (see
+        // `Ingestion::finish`): the ids the tables were written under predate
+        // every table installed while this ingestion ran.
+        let recency = index.table_id_counter.next();
 
         // Recover all created index tables, assigning them the global_seqno
         // we just allocated. These tables contain indirections to the blob
@@ -323,6 +327,7 @@ impl<'a> BlobIngestion<'a> {
                     index.config.cache.clone(),
                 );
                 params.global_seqno = global_seqno;
+                params.recency = Some(recency);
                 params.tree_id = index.id;
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;

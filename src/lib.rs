@@ -467,6 +467,10 @@ pub use storage_stats::{
 mod version;
 mod vlog;
 
+// L0 run placement, exposed for the `optimize_runs` fuzz target.
+#[doc(hidden)]
+pub use version::optimize_key_ranges;
+
 // Reproducible single-byte-bitrot heal/read fuzzer. `#[ignore]`d, so it is
 // excluded from the normal suite and run as its own CI step; needs crate-internal
 // `Table` / `Writer` access, so it lives here rather than in `tests/`.

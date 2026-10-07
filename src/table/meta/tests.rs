@@ -71,6 +71,7 @@ fn valid_meta_items() -> Vec<InternalValue> {
         meta("prefix_truncation#data", &[1]),
         meta("prefix_truncation#index", &[1]),
         meta("range_tombstone_count", &0u64.to_le_bytes()),
+        meta("recency", &42u64.to_le_bytes()),
         meta("restart_interval#data", &[16]),
         meta("restart_interval#index", &[4]),
         meta("seqno#kv_max", &5u64.to_le_bytes()),
@@ -211,6 +212,21 @@ fn load_with_handle_wrong_table_version_returns_err() {
     {
         *item = meta("table_version", &[99u8]);
     }
+    let result = load_meta_from_items(&items);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// Every table carries its L0 recency key, so one without it is refused:
+/// ordering it by its id would let a compaction output pass a newer flush.
+#[test]
+fn load_with_handle_missing_recency_returns_err() {
+    let items: Vec<_> = valid_meta_items()
+        .into_iter()
+        .filter(|iv| &*iv.key.user_key != b"recency")
+        .collect();
     let result = load_meta_from_items(&items);
     assert!(
         matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),

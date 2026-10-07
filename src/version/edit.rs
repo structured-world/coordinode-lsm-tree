@@ -43,7 +43,7 @@
 //!     run_count : u32 LE
 //!       repeat (run):
 //!         table_count : u32 LE
-//!           repeat (table): id u64 LE | checksum_type u8 | checksum u128 LE | global_seqno u64 LE
+//!           repeat (table): id u64 LE | checksum_type u8 | checksum u128 LE | global_seqno u64 LE | recency u64 LE
 //! added_blob_count    : u32 LE
 //!   repeat: id u64 LE | checksum_type u8 | checksum u128 LE
 //! removed_blob_count  : u32 LE
@@ -99,6 +99,8 @@ pub struct TableDesc {
     pub checksum: u128,
     /// Global sequence number stamped on the table.
     pub global_seqno: u64,
+    /// The table's L0 recency key (see [`crate::table::Table::l0_recency`]).
+    pub recency: u64,
 }
 
 /// The full new run layout of one LSM level that an edit replaces wholesale.
@@ -203,6 +205,7 @@ impl VersionEdit {
                     out.write_u8(CHECKSUM_TYPE_XXH3)?;
                     out.write_u128::<LittleEndian>(t.checksum)?;
                     out.write_u64::<LittleEndian>(t.global_seqno)?;
+                    out.write_u64::<LittleEndian>(t.recency)?;
                 }
             }
         }
@@ -345,10 +348,12 @@ impl VersionEdit {
                     }
                     let checksum = r.read_u128::<LittleEndian>().map_err(|_| ERR)?;
                     let global_seqno = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
+                    let recency = r.read_u64::<LittleEndian>().map_err(|_| ERR)?;
                     run.push(TableDesc {
                         id,
                         checksum,
                         global_seqno,
+                        recency,
                     });
                 }
                 runs.push(run);

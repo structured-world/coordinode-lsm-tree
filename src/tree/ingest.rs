@@ -587,6 +587,13 @@ impl<'a> Ingestion<'a> {
         // by all ingested tables and the version that registers them, ensuring
         // consistent MVCC snapshots.
         let global_seqno = self.tree.config.seqno.next();
+        // The tables' L0 recency is taken now, at the install, not from the
+        // ids they were written under: those were allocated when the
+        // ingestion started, and every flush or ingestion installed since,
+        // the flush just above included, holds newer data. Flushes and
+        // installs are serialized by the flush lock, so this id is above
+        // every table already installed and below every one installed later.
+        let recency = self.tree.table_id_counter.next();
 
         // Recover all created tables, assigning them the global_seqno we just
         // allocated. This ensures all ingested tables share the same sequence
@@ -608,6 +615,7 @@ impl<'a> Ingestion<'a> {
                     self.tree.config.cache.clone(),
                 );
                 params.global_seqno = global_seqno;
+                params.recency = Some(recency);
                 params.tree_id = self.tree.id;
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;

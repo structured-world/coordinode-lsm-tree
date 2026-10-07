@@ -3008,6 +3008,9 @@ fn run_merge_on_read_relocation(
             opts.config.comparator.clone(),
             opts.config.cache.clone(),
         );
+        // The copy keeps the source's place in L0: the manifest's recency,
+        // which for an ingested source is not the one its file carries.
+        params.recency = Some(source.l0_recency());
         params.tree_id = opts.tree_id;
         params
             .descriptor_table

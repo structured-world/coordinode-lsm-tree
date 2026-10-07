@@ -115,6 +115,16 @@ impl<T: Ranged> Run<T> {
         self.sort_by_cmp(cmp);
     }
 
+    /// Inserts a table at its place by min key in a run already sorted so,
+    /// after the tables with an equal min key: the run a [`Self::push_cmp`]
+    /// would leave, without sorting it again.
+    pub fn insert_sorted_cmp<C: UserComparator + ?Sized>(&mut self, item: T, cmp: &C) {
+        let at = self.0.partition_point(|x| {
+            cmp.compare(x.key_range().min(), item.key_range().min()) != core::cmp::Ordering::Greater
+        });
+        self.0.insert(at, item);
+    }
+
     /// Sorts the run by min key using the provided user comparator.
     ///
     /// Use after [`Self::extend`] to re-establish ordering in a single pass.

@@ -274,8 +274,7 @@ fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result
         "the single output closes its run",
     );
     assert_eq!(
-        relocated.metadata.recency,
-        Some(7),
+        relocated.metadata.recency, 7,
         "the copy's content position is its source's, not its own newer id",
     );
     Ok(())
