@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.17](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.16...v5.11.17) - 2026-10-07
+
+### Fixed
+
+- *(compaction)* an output that takes data of no age has none either (5.x.x) ([#865](https://github.com/structured-world/coordinode-lsm-tree/pull/865))
+- *(compaction)* merge only L0 runs contiguous in age under tiered (5.x.x) ([#849](https://github.com/structured-world/coordinode-lsm-tree/pull/849))
+- *(version)* keep newer L0 tables ahead of the runs they overlap (5.x.x) ([#848](https://github.com/structured-world/coordinode-lsm-tree/pull/848))
+- *(ingest)* pin ingested L0 tables by the L0 pinning policy (5.x.x) ([#847](https://github.com/structured-world/coordinode-lsm-tree/pull/847))
+- *(fs)* retry a rename or delete Windows refuses for a brief hold (5.x.x) ([#846](https://github.com/structured-world/coordinode-lsm-tree/pull/846))
+- *(compaction)* FIFO drops from every level and never panics on L0 shape (5.x.x) ([#842](https://github.com/structured-world/coordinode-lsm-tree/pull/842))
+
 ## [5.11.16](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.15...v5.11.16) - 2026-10-05
 
 ### Fixed
