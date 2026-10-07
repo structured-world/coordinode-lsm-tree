@@ -34,7 +34,9 @@ impl<'a> Arbitrary<'a> for FuzzyValue {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         let key = Vec::<u8>::arbitrary(u)?;
         let value = Vec::<u8>::arbitrary(u)?;
-        let seqno = u64::arbitrary(u)?;
+        // A stored seqno is below MAX_SEQNO: the top bit is reserved, and
+        // MAX_SEQNO itself is the snapshot boundary no entry may sit at.
+        let seqno = u64::arbitrary(u)? % lsm_tree::MAX_SEQNO;
         let vtype = FuzzyValueType::arbitrary(u)?;
 
         let key = if key.is_empty() { vec![0] } else { key };
@@ -139,10 +141,6 @@ fn main() {
         }
 
         for needle in &items {
-            if needle.key.seqno == SeqNo::MAX {
-                continue;
-            }
-
             let at_own_seqno = data_block
                 .point_read(&needle.key.user_key, needle.key.seqno + 1, &comparator)
                 .expect("point read");
@@ -154,9 +152,7 @@ fn main() {
                 .expect("key is present");
             let expected = items
                 .iter()
-                .find(|item| {
-                    item.key.user_key == needle.key.user_key && item.key.seqno < SeqNo::MAX
-                })
+                .find(|item| item.key.user_key == needle.key.user_key)
                 .expect("needle itself qualifies");
             assert_eq!(parts(expected), parts(&newest));
         }
