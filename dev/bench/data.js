@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791377465685,
+  "lastUpdate": 1791377470819,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -41092,6 +41092,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 17280.233,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa750c3a29956810eadacc8d474104eb5e506254",
+          "message": "fix(fuzz): port the AFL targets to the current API and type-check them in CI (#859)\n\n## Summary\n\n- The four AFL targets under `fuzz/` compile against the current API\nagain, and CI type-checks every fuzz crate so an API change that breaks\none fails the PR that makes it.\n\nStacked on the fix for #835 (and through it #827, which adds `fuzz` to\n`workspace.exclude` so the fuzz crates build at all). The `index_block`\nmodel follows the `seek_upper` bound fixed in #838; with that fix the\ntarget runs without a crash.\n\n## Changes\n\n- Ported targets: `compare_prefixed_slice` also drives the materialising\npath through a non-lexicographic and a reversed comparator;\n`index_block` lays blocks out back to back, fuzzes the restart interval\nand walks with the bounds both ways round; `table_read` writes to a\n`MemFs` and recovers with the checksum the writer returned.\n- The `data_block` and `table_read` models generate tombstones without a\nvalue, as blocks and tables store them.\n- `ParsedItem` is re-exported doc-hidden from `table::block`, so code\noutside the crate can turn the items the public block iterators yield\ninto values.\n- The lint job runs `clippy -D warnings` over every crate under `fuzz/`,\nsharing one target dir.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations (the crate and every fuzz crate), doc tests, the doc\nbuild, the no-std check, the sst-dump suite and the db_bench checks pass\non Linux.\n\nCloses #836\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Tests**\n* Expanded fuzz coverage for block encoding, table recovery, reads,\nscans, iteration, and range boundaries, including alternate key\nordering.\n* Fuzz tests now handle incomplete or invalid generated inputs safely\nand verify results across more cases.\n* **Chores**\n* Added a CI check that compiles fuzz targets and reports lint warnings\nas errors.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T15:23:54+03:00",
+          "tree_id": "ad749d47856ea1bef5eccdd5d6ffb8340e889589",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aa750c3a29956810eadacc8d474104eb5e506254"
+        },
+        "date": 1791377469326,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 535.432,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 85.624104ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 140.567,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 57.400055ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 431.648,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 164.132226ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6226.579000000001,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 19980.923000000003,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
