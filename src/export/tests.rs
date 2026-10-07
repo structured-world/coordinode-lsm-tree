@@ -552,6 +552,61 @@ fn table_export_columnar_batches_keep_deleted_rows_and_their_positions() -> crat
     Ok(())
 }
 
+/// An encrypted tree exports through the same reads: the manifest, the meta
+/// block, the rows and every verified frame all decrypt under the tree's
+/// provider. Without the provider the table does not open.
+#[cfg(feature = "encryption")]
+#[test]
+fn table_export_reads_an_encrypted_tree() -> crate::Result<()> {
+    let provider: Arc<dyn crate::EncryptionProvider> =
+        Arc::new(crate::Aes256GcmProvider::new(&[7; 32]));
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(provider.clone()))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..200u32 {
+        tree.insert(format!("k{i:03}"), format!("v{i}"), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, Some(provider.clone()))?;
+    let record = *state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    let context = TableContext {
+        encryption: Some(provider),
+        ..table_context()
+    };
+    let export = TableExport::open(&path, &record, None, &context)?;
+    assert!(!export.meta()?.is_empty());
+    let mut keys = Vec::new();
+    for block in export.data_blocks()? {
+        let frame = export.frame(
+            block.offset,
+            block.size,
+            crate::table::block::BlockType::Data,
+        )?;
+        assert!(!frame.payload.is_empty());
+        keys.extend(export.rows(&block)?.into_iter().map(|r| r.key.user_key));
+    }
+    assert_eq!(keys.len(), 200);
+
+    let plain = TableExport::open(&path, &record, None, &table_context());
+    assert!(
+        plain.is_err(),
+        "the table does not open without its provider"
+    );
+    Ok(())
+}
+
 /// A table's range tombstones come back as written, bounds and seqno.
 #[test]
 fn table_export_carries_range_tombstones() -> crate::Result<()> {
