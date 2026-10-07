@@ -13,7 +13,7 @@ use super::{
 };
 use crate::deletion_pause::DeletionPause;
 use crate::{
-    Checksum, GlobalTableId, SeqNo,
+    Checksum, GlobalTableId, SeqNo, TableId,
     cache::Cache,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
@@ -86,6 +86,10 @@ pub struct Inner {
     pub(super) checksum: Checksum,
 
     pub(super) global_seqno: SeqNo,
+
+    /// L0 recency key (see [`super::Table::l0_recency`]): the manifest's, or
+    /// the file's own when opened without one.
+    pub(super) l0_recency: TableId,
 
     pub(crate) comparator: SharedComparator,
 

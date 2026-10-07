@@ -1611,7 +1611,6 @@ impl AbstractTree for BlobTree {
             0,
             level_fs.clone(),
         )?
-        .use_flush_recency(self.index.lowest_ingest_floor())
         .set_comparator(self.index.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)

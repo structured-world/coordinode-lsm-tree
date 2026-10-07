@@ -12,6 +12,7 @@ fn edit(id: u64) -> VersionEdit {
                 id,
                 checksum: u128::from(id) * 7,
                 global_seqno: id * 10,
+                recency: id * 3,
             }]],
         }],
         ..Default::default()
@@ -113,6 +114,7 @@ fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
         id,
         checksum: 0,
         global_seqno: 0,
+        recency: id,
     };
     let wide = VersionEdit {
         new_version_id: 1,

@@ -950,21 +950,6 @@ impl MultiWriter {
         self
     }
 
-    /// Stamps a flush's L0 recency key on this and every rotated successor
-    /// writer: the id of its first table, or `floor` when that is lower. One
-    /// key for the whole flush keeps a table it rotates into after an
-    /// ingestion started from passing that ingestion, and `floor`, the lowest
-    /// id an ingestion still in flight reserved, keeps a flush that starts
-    /// while one runs behind it: an ingestion is newer than every flush its
-    /// install follows.
-    #[must_use]
-    pub(crate) fn use_flush_recency(self, floor: Option<TableId>) -> Self {
-        let recency = floor.map_or(self.current_writer_id, |floor| {
-            floor.min(self.current_writer_id)
-        });
-        self.use_recency(Some(recency))
-    }
-
     /// Stamps the compaction lineage on this and every rotated successor
     /// writer (see [`Writer::use_lineage`]).
     #[must_use]

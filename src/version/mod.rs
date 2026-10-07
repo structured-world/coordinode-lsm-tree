@@ -1294,6 +1294,7 @@ impl Version {
                             table.id(),
                             table.checksum(),
                             table.global_seqno(),
+                            table.l0_recency(),
                         )
                     })?;
                 }

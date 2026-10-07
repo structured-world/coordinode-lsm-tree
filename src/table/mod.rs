@@ -153,6 +153,10 @@ pub struct RecoverParams {
     /// Bulk-ingest sequence offset from the manifest; `0` for a table whose
     /// intrinsic seqnos are authoritative.
     pub global_seqno: SeqNo,
+    /// L0 recency key from the manifest; `None` takes the one the table's
+    /// file was written with. An ingested table's comes from its install,
+    /// which happens after its file is written.
+    pub recency: Option<TableId>,
     /// Owning tree, keying shared caches; `0` for a transient open that must
     /// not pollute them.
     pub tree_id: TreeId,
@@ -200,6 +204,7 @@ impl RecoverParams {
             file_path,
             checksum,
             global_seqno: 0,
+            recency: None,
             tree_id: 0,
             table_id,
             cache,
@@ -941,14 +946,14 @@ impl Table {
         self.metadata.id
     }
 
-    /// The table's L0 recency key, the persisted `recency` meta: a flush or
-    /// ingest table's own id, a compaction output's highest INPUT recency.
-    /// Higher = newer content; L0 is ordered by it because a compaction
-    /// output's own id is allocated at write start and says nothing about
-    /// where its content belongs.
+    /// The table's L0 recency key, as the manifest records it: a flush
+    /// table's first table id, an ingested table's id taken when it is
+    /// installed, a compaction output's highest INPUT recency. Higher = newer
+    /// content; L0 is ordered by it because a table's own id is allocated at
+    /// write start and says nothing about where its content belongs.
     #[must_use]
     pub(crate) fn l0_recency(&self) -> TableId {
-        self.metadata.recency
+        self.0.l0_recency
     }
 
     /// This segment's positional delete-bitmap (rows deleted by position),
@@ -8560,6 +8565,7 @@ impl Table {
             file_path,
             checksum,
             global_seqno,
+            recency,
             tree_id,
             table_id,
             cache,
@@ -9450,12 +9456,15 @@ impl Table {
             file_path.display(),
         );
 
+        let l0_recency = recency.unwrap_or(metadata.recency);
+
         Ok(Self(
             Arc::new(Inner {
                 path: file_path,
                 tree_id,
 
                 metadata,
+                l0_recency,
                 regions,
 
                 cache,
@@ -9616,6 +9625,7 @@ impl Table {
                 self.cache.clone(),
             );
             params.global_seqno = self.global_seqno;
+            params.recency = Some(self.l0_recency);
             params.tree_id = self.tree_id;
             if let Some((cache, tree_id)) = descriptors {
                 params.descriptor_table = Some(cache);

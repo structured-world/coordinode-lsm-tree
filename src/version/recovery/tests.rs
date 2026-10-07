@@ -110,6 +110,7 @@ fn rtable(id: u64, seqno: u64) -> RecoveredTable {
         id,
         checksum: Checksum::from_raw(u128::from(id) * 31),
         global_seqno: seqno,
+        recency: id + 1_000,
     }
 }
 
@@ -118,6 +119,7 @@ fn tdesc(id: u64, seqno: u64) -> TableDesc {
         id,
         checksum: u128::from(id) * 31,
         global_seqno: seqno,
+        recency: id + 1_000,
     }
 }
 
@@ -561,6 +563,7 @@ fn table_payload(level: u8, run: u32, id: u64, checksum_type: u8) -> crate::Resu
     payload.write_u8(checksum_type)?;
     payload.write_u128::<LittleEndian>(0)?;
     payload.write_u64::<LittleEndian>(0)?;
+    payload.write_u64::<LittleEndian>(id)?;
     Ok(payload)
 }
 
@@ -641,12 +644,14 @@ fn recover_groups_table_records_by_the_place_they_name() -> crate::Result<()> {
     Ok(())
 }
 
-/// A table as the fixtures here write it: zero checksum and seqno.
+/// A table as the fixtures here write it: zero checksum and seqno, its own id
+/// as its recency.
 fn rtable_zero(id: u64) -> RecoveredTable {
     RecoveredTable {
         id,
         checksum: Checksum::from_raw(0),
         global_seqno: 0,
+        recency: id,
     }
 }
 

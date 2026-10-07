@@ -1068,7 +1068,6 @@ impl AbstractTree for Tree {
             0,
             level_fs.clone(),
         )?
-        .use_flush_recency(self.lowest_ingest_floor())
         .set_comparator(self.config.comparator.clone())
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
@@ -2048,34 +2047,6 @@ impl AbstractTree for Tree {
 }
 
 impl Tree {
-    /// Reserves the L0 recency floor of an ingestion that starts now: a table
-    /// id below every table the ingestion writes. While it is registered, a
-    /// flush stamps its tables at or below it (see
-    /// [`MultiWriter::use_flush_recency`](crate::table::multi_writer::MultiWriter::use_flush_recency)).
-    pub(crate) fn reserve_ingest_floor(&self) -> TableId {
-        let floor = self.table_id_counter.next();
-        self.ingest_floors.lock().push(floor);
-        floor
-    }
-
-    /// Releases the floor [`Self::reserve_ingest_floor`] gave, once the
-    /// ingestion installed its tables or gave up.
-    pub(crate) fn release_ingest_floor(&self, floor: TableId) {
-        #[cfg(all(test, feature = "std"))]
-        self.floor_releases_under_flush_lock
-            .lock()
-            .push(self.flush_lock.is_locked());
-        let mut floors = self.ingest_floors.lock();
-        if let Some(at) = floors.iter().position(|&reserved| reserved == floor) {
-            floors.swap_remove(at);
-        }
-    }
-
-    /// The lowest floor an ingestion still in flight reserved, if any.
-    pub(crate) fn lowest_ingest_floor(&self) -> Option<TableId> {
-        self.ingest_floors.lock().iter().copied().min()
-    }
-
     /// The filter plan of new data written into tables under the policies of
     /// `level`, as a flush or an ingestion writes it: at most `count` keys and
     /// filter hashes (zero when unknown) under `bloom_policy`. `None` without
@@ -5437,9 +5408,6 @@ impl Tree {
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
-            ingest_floors: Mutex::default(),
-            #[cfg(all(test, feature = "std"))]
-            floor_releases_under_flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
             _directory_lock: directory_lock,
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
@@ -5636,8 +5604,15 @@ impl Tree {
         let snapshot_id = recovery.snapshot_id;
 
         let mut table_map = {
-            let mut result: crate::HashMap<TableId, (u8 /* Level index */, Checksum, SeqNo)> =
-                crate::HashMap::default();
+            let mut result: crate::HashMap<
+                TableId,
+                (
+                    u8, /* Level index */
+                    Checksum,
+                    SeqNo,
+                    TableId, /* L0 recency */
+                ),
+            > = crate::HashMap::default();
 
             for (level_idx, table_ids) in recovery.table_ids.iter().enumerate() {
                 for run in table_ids {
@@ -5654,6 +5629,7 @@ impl Tree {
                                     .expect("there are less than 256 levels"),
                                 table.checksum,
                                 table.global_seqno,
+                                table.recency,
                             ),
                         );
                     }
@@ -5872,7 +5848,7 @@ impl Tree {
                         #[cfg(feature = "std")]
                         {
                             let published = match table_map.get(&tmp_id) {
-                                Some(&(_, manifest_checksum, _)) => {
+                                Some(&(_, manifest_checksum, _, _)) => {
                                     match crate::repair::repair_tmp_is_published(
                                         config,
                                         folder_fs,
@@ -6007,7 +5983,7 @@ impl Tree {
                 // Remove from map to prevent duplicate recovery if the same
                 // table file exists in multiple scanned folders.
                 if let Some(entry) = table_map.remove(&table_id) {
-                    let (level_idx, checksum, global_seqno) = entry;
+                    let (level_idx, checksum, global_seqno, recency) = entry;
                     let pin_filter = config.filter_block_pinning_policy.get(level_idx.into());
                     let pin_index = config.index_block_pinning_policy.get(level_idx.into());
 
@@ -6021,6 +5997,7 @@ impl Tree {
                             config.cache.clone(),
                         );
                         params.global_seqno = global_seqno;
+                        params.recency = Some(recency);
                         params.tree_id = tree_id;
                         params.descriptor_table.clone_from(&config.descriptor_table);
                         params.pin_filter = pin_filter;
@@ -6216,7 +6193,7 @@ impl Tree {
             if let Some(routes) = &config.level_routes {
                 let all_missing_uncovered = table_map
                     .values()
-                    .all(|(level, _, _)| !routes.iter().any(|r| r.levels.contains(level)));
+                    .all(|(level, ..)| !routes.iter().any(|r| r.levels.contains(level)));
 
                 if all_missing_uncovered {
                     let found = tables.len();
@@ -6550,9 +6527,6 @@ mod cache_stats_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod restricted_reclaim_tests;
-
-#[cfg(all(test, feature = "std"))]
-mod ingest_floor_tests;
 
 #[cfg(all(test, feature = "std", zstd_any))]
 mod dict_collect_tests;

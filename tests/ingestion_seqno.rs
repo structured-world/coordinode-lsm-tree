@@ -115,3 +115,98 @@ fn an_ingestion_stays_ahead_of_a_flush_it_installs_after() -> lsm_tree::Result<(
     );
     Ok(())
 }
+
+/// The global sequence numbers of the L0 runs, front to back, one per run.
+fn l0_run_seqnos(tree: &lsm_tree::AnyTree) -> Vec<SeqNo> {
+    tree.current_version()
+        .l0()
+        .iter()
+        .filter_map(|run| run.iter().next().map(lsm_tree::Table::global_seqno))
+        .collect()
+}
+
+/// Two ingestions in flight at once: the one that started first but is
+/// installed last holds the newer data, so its run lays out in front of the
+/// other's in L0, though its tables were written under the lower ids. The
+/// order holds across a reopen.
+#[test]
+fn ingestion_installed_last_lays_out_in_front() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+    let open = || Config::new(&folder, seqno.clone(), visible_seqno.clone()).open();
+
+    {
+        let tree = open()?;
+        let mut first = tree.ingestion()?;
+        first.write("k", "first")?;
+        let mut second = tree.ingestion()?;
+        second.write("k", "second")?;
+        second.finish()?;
+        first.finish()?;
+
+        let runs = l0_run_seqnos(&tree);
+        assert_eq!(2, runs.len(), "the two ingestions overlap: two runs");
+        assert!(
+            runs.windows(2).all(|pair| pair[0] > pair[1]),
+            "the ingestion installed last is in front: {runs:?}"
+        );
+        assert_eq!(
+            tree.get("k", SeqNo::MAX)?.as_deref(),
+            Some(b"first".as_slice())
+        );
+    }
+
+    let tree = open()?;
+    let runs = l0_run_seqnos(&tree);
+    assert!(
+        runs.windows(2).all(|pair| pair[0] > pair[1]),
+        "the order holds across a reopen: {runs:?}"
+    );
+    Ok(())
+}
+
+/// A flush made after an ingestion was installed, while another started
+/// earlier is still in flight, holds newer data than the installed one: with
+/// both holding one key at one sequence number, a read returns the flushed
+/// value, before and after a reopen.
+#[test]
+fn flush_after_an_ingestion_with_another_in_flight_reads_newest() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+    let open = || Config::new(&folder, seqno.clone(), visible_seqno.clone()).open();
+
+    {
+        let tree = open()?;
+        let mut in_flight = tree.ingestion()?;
+        in_flight.write("other", "v")?;
+
+        let mut installed = tree.ingestion()?;
+        installed.write("k", "ingested")?;
+        installed.finish()?;
+        // The sequence number the installed ingestion holds "k" at.
+        let tie = tree
+            .get_highest_persisted_seqno()
+            .expect("the ingestion is persisted");
+
+        tree.insert("k", "flushed", tie);
+        visible_seqno.fetch_max(tie + 1);
+        tree.flush_active_memtable(0)?;
+        in_flight.finish()?;
+
+        assert_eq!(
+            tree.get("k", SeqNo::MAX)?.as_deref(),
+            Some(b"flushed".as_slice()),
+            "the flush made after the installed ingestion is the newer write"
+        );
+    }
+
+    let tree = open()?;
+    assert_eq!(
+        tree.get("k", SeqNo::MAX)?.as_deref(),
+        Some(b"flushed".as_slice()),
+        "the order holds across a reopen"
+    );
+    Ok(())
+}

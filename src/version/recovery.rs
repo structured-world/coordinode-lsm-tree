@@ -19,7 +19,7 @@ use crate::path::Path;
 
 /// Exact on-disk size of a `tables`-section record payload (post-framing):
 /// `level: u8 (1) | run: u32 (4) | id: u64 (8) | checksum_type: u8 (1) |
-/// checksum: u128 (16) | global_seqno: u64 (8)`.
+/// checksum: u128 (16) | global_seqno: u64 (8) | recency: u64 (8)`.
 ///
 /// Each record says which level and run it belongs to, and the section holds
 /// no run or table counts. The section arrives whole or not at all (it is one checksummed
@@ -30,7 +30,7 @@ use crate::path::Path;
 /// same reason.
 ///
 /// Stored as `u32` because the framing layer's `len` field is `u32`.
-const TABLE_ENTRY_PAYLOAD_LEN: u32 = 1 + 4 + 8 + 1 + 16 + 8;
+const TABLE_ENTRY_PAYLOAD_LEN: u32 = 1 + 4 + 8 + 1 + 16 + 8 + 8;
 
 /// Where a table sits in the version: its level, and the ordinal of its run
 /// within that level. Runs are numbered from 0 in the order the level holds
@@ -49,6 +49,7 @@ pub fn encode_table_entry_payload(
     id: TableId,
     checksum: Checksum,
     global_seqno: SeqNo,
+    recency: TableId,
 ) -> crate::Result<()> {
     use crate::io::WriteBytesExt;
 
@@ -58,6 +59,7 @@ pub fn encode_table_entry_payload(
     payload.write_u8(0)?; // Checksum type, 0 = XXH3
     payload.write_u128::<LittleEndian>(checksum.into_u128())?;
     payload.write_u64::<LittleEndian>(global_seqno)?;
+    payload.write_u64::<LittleEndian>(recency)?;
     Ok(())
 }
 
@@ -89,12 +91,14 @@ fn decode_table_entry_payload(payload: &[u8]) -> crate::Result<(TablePlace, Reco
     }
     let checksum = Checksum::from_raw(cursor.read_u128::<LittleEndian>()?);
     let global_seqno = cursor.read_u64::<LittleEndian>()?;
+    let recency = cursor.read_u64::<LittleEndian>()?;
     Ok((
         TablePlace { level, run },
         RecoveredTable {
             id,
             checksum,
             global_seqno,
+            recency,
         },
     ))
 }
@@ -497,6 +501,9 @@ pub struct RecoveredTable {
     pub id: TableId,
     pub checksum: Checksum,
     pub global_seqno: SeqNo,
+    /// The table's L0 recency key. The manifest holds it because an ingested
+    /// table's comes from its install, after its file was written.
+    pub recency: TableId,
 }
 
 #[derive(Debug)]
@@ -575,6 +582,7 @@ impl Recovery {
                             id: t.id,
                             checksum: Checksum::from_raw(t.checksum),
                             global_seqno: t.global_seqno,
+                            recency: t.recency,
                         })
                         .collect()
                 })

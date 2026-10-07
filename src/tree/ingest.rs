@@ -33,9 +33,6 @@ pub struct Ingestion<'a> {
     /// [`WritePin`](crate::runtime_config::WritePin)). It covers the blob
     /// files of a blob ingestion too, which share the snapshot.
     pub(crate) write_pin: crate::runtime_config::WritePin,
-    /// The L0 recency floor this ingestion holds until `finish` has installed
-    /// its tables, or until it is given up.
-    pub(crate) floor: IngestFloor<'a>,
     seqno: SeqNo,
     last_key: Option<UserKey>,
     /// Successive columnar batches with the same layout accumulate here into one
@@ -43,31 +40,6 @@ pub struct Ingestion<'a> {
     /// the layout changes, so many small ingest batches become few large blocks.
     #[cfg(feature = "columnar")]
     pending_columnar: Option<PendingRowGroup>,
-}
-
-/// The L0 recency floor of an ingestion in flight: a table id reserved below
-/// every table the ingestion writes. A flush stamps its tables at or below
-/// the lowest floor in flight, so a table it writes while an ingestion runs,
-/// whose id is higher than the ingestion's, still lays out behind the
-/// ingestion that installs after it. Released when dropped.
-pub struct IngestFloor<'a> {
-    tree: &'a Tree,
-    floor: crate::TableId,
-}
-
-impl<'a> IngestFloor<'a> {
-    fn reserve(tree: &'a Tree) -> Self {
-        Self {
-            tree,
-            floor: tree.reserve_ingest_floor(),
-        }
-    }
-}
-
-impl Drop for IngestFloor<'_> {
-    fn drop(&mut self) {
-        self.tree.release_ingest_floor(self.floor);
-    }
 }
 
 /// The columnar batches an ingestion has accepted for its next row group, kept
@@ -160,10 +132,6 @@ impl<'a> Ingestion<'a> {
             crate::filter_budget::FilterCount::default(),
             rc.ecc_scheme,
         );
-
-        // Reserved before the writer takes its first table id, so every table
-        // this ingestion writes lies above it.
-        let floor = IngestFloor::reserve(tree);
 
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
         let mut writer = MultiWriter::new(
@@ -283,7 +251,6 @@ impl<'a> Ingestion<'a> {
             tree,
             writer,
             write_pin: crate::runtime_config::WritePin::new(rc).with_filter_sizing(filter_sizing),
-            floor,
             seqno: 0,
             last_key: None,
             #[cfg(feature = "columnar")]
@@ -592,10 +559,6 @@ impl<'a> Ingestion<'a> {
         //
         // By holding the flush lock throughout, we guarantee atomicity.
         let flush_lock = self.tree.get_flush_lock();
-        // Bound after the lock, so it drops first: the floor is released while
-        // the flush lock is still held, and no flush waiting on the lock is
-        // stamped with the floor of an ingestion that is already installed.
-        let _floor = self.floor;
 
         // Flush any pending memtable writes to ensure ingestion sees a
         // consistent snapshot and lookup order remains correct.
@@ -624,6 +587,13 @@ impl<'a> Ingestion<'a> {
         // by all ingested tables and the version that registers them, ensuring
         // consistent MVCC snapshots.
         let global_seqno = self.tree.config.seqno.next();
+        // The tables' L0 recency is taken now, at the install, not from the
+        // ids they were written under: those were allocated when the
+        // ingestion started, and every flush or ingestion installed since,
+        // the flush just above included, holds newer data. Flushes and
+        // installs are serialized by the flush lock, so this id is above
+        // every table already installed and below every one installed later.
+        let recency = self.tree.table_id_counter.next();
 
         // Recover all created tables, assigning them the global_seqno we just
         // allocated. This ensures all ingested tables share the same sequence
@@ -645,6 +615,7 @@ impl<'a> Ingestion<'a> {
                     self.tree.config.cache.clone(),
                 );
                 params.global_seqno = global_seqno;
+                params.recency = Some(recency);
                 params.tree_id = self.tree.id;
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;

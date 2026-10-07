@@ -134,6 +134,7 @@ fn level_runs(level: Option<&super::Level>) -> Vec<Vec<TableDesc>> {
                         id: t.id(),
                         checksum: t.checksum().into_u128(),
                         global_seqno: t.global_seqno(),
+                        recency: t.l0_recency(),
                     })
                     .collect()
             })
