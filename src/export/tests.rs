@@ -654,6 +654,7 @@ fn blob_file_export_frames_cover_every_value() -> crate::Result<()> {
         folder.path(),
         Some(KvSeparationOptions::default().separation_threshold(16)),
     )?;
+    let before = crate::time::unix_timestamp().as_nanos();
     let seqno = SequenceNumberCounter::default();
     let mut written = Vec::new();
     for i in 0..50u32 {
@@ -687,6 +688,11 @@ fn blob_file_export_frames_cover_every_value() -> crate::Result<()> {
         .find(|(k, _)| &**k == b"item_count")
         .map(|(_, v)| v.to_vec());
     assert_eq!(item_count, Some(50u64.to_le_bytes().to_vec()));
+    assert!(blob.created_at() >= before);
+    assert_eq!(
+        blob.compression(),
+        crate::runtime_config::RuntimeConfig::default().blob_compression
+    );
 
     let exports = export_tables(folder.path())?;
     let linked = exports[0].linked_blob_files()?.unwrap();

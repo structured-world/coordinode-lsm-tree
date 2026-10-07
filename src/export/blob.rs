@@ -40,6 +40,8 @@ pub struct BlobFileExport {
     fs: Arc<dyn Fs>,
     meta: Vec<(UserKey, UserValue)>,
     sections: Vec<Section>,
+    created_at: u128,
+    compression: crate::CompressionType,
 }
 
 impl BlobFileExport {
@@ -120,7 +122,21 @@ impl BlobFileExport {
             fs,
             meta,
             sections,
+            created_at: parsed.created_at,
+            compression: parsed.compression,
         })
+    }
+
+    /// When the file was written: nanoseconds since the Unix epoch.
+    #[must_use]
+    pub fn created_at(&self) -> u128 {
+        self.created_at
+    }
+
+    /// The codec every stored value of the file is compressed with.
+    #[must_use]
+    pub fn compression(&self) -> crate::CompressionType {
+        self.compression
     }
 
     /// The blob file's id.
