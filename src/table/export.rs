@@ -52,28 +52,30 @@ impl Table {
     /// meta block its own parity flag, every other section only encryption
     /// and the table's parity scheme.
     fn export_transform(&self, block_type: BlockType) -> crate::Result<BlockTransform<'_>> {
-        let with_ecc = |t: BlockTransform<'_>| match self.metadata.ecc_params {
-            Some(ecc) => t.with_ecc(ecc),
-            None => t,
-        };
-        Ok(match block_type {
-            BlockType::Data | BlockType::Columnar => with_ecc(BlockTransform::from_parts(
+        let coded = match block_type {
+            BlockType::Data | BlockType::Columnar => BlockTransform::from_parts(
                 self.metadata.data_block_compression,
                 self.encryption.as_deref(),
                 #[cfg(zstd_any)]
                 self.zstd_dictionary.as_deref(),
-            )?),
-            BlockType::Index => with_ecc(BlockTransform::from_parts(
+            )?,
+            BlockType::Index => BlockTransform::from_parts(
                 self.metadata.index_block_compression,
                 self.encryption.as_deref(),
                 #[cfg(zstd_any)]
                 None,
-            )?),
-            BlockType::Meta => match self.encryption.as_deref() {
-                Some(enc) => BlockTransform::Encrypted(enc),
-                None => BlockTransform::PLAIN,
-            },
-            _ => self.section_transform(),
+            )?,
+            BlockType::Meta => {
+                return Ok(match self.encryption.as_deref() {
+                    Some(enc) => BlockTransform::Encrypted(enc),
+                    None => BlockTransform::PLAIN,
+                });
+            }
+            _ => return Ok(self.section_transform()),
+        };
+        Ok(match self.metadata.ecc_params {
+            Some(ecc) => coded.with_ecc(ecc),
+            None => coded,
         })
     }
 
