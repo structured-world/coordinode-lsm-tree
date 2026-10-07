@@ -364,8 +364,16 @@ impl TableExport {
         self.table.export_range_tombstones()
     }
 
-    /// The blob files the table's values point into, with the bytes they
-    /// reference in each, or `None` when the table records none.
+    /// The table's `linked_blob_files` section as stored: the blob files the
+    /// table was written pointing into, with the bytes it referenced in each,
+    /// or `None` when it records none.
+    ///
+    /// The section is written once for the whole table and a restriction does
+    /// not rewrite it, so for a restricted table it also counts the references
+    /// of the punched prefix: a superset of what the live suffix points at,
+    /// which is how the table keeps it. The live references are those of the
+    /// [`rows`](Self::rows) of the blocks from [`live_from`](Self::live_from)
+    /// on.
     ///
     /// # Errors
     ///
