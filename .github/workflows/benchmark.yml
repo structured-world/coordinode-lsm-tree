@@ -170,11 +170,14 @@ jobs:
     # the `workflow_dispatch` manual trigger above; routine PR
     # pushes do not auto-queue against this runner.)
     #
-    # Targeted by role, not by host: any runner labelled `bench` takes it, so
-    # a bench host is added or replaced without touching this file. The OS
+    # Targeted by role, not by host: any runner of the Bench group labelled
+    # `bench` takes it, so a bench host is added or replaced without touching
+    # this file, and a `bench` runner outside that group never does. The OS
     # is named explicitly: the bench hosts include a Windows one, and the
     # Linux and Windows numbers differ too much to share one trend series.
-    runs-on: [self-hosted, bench, Linux]
+    runs-on:
+      group: Bench
+      labels: [self-hosted, bench, Linux]
     # The whole job, every bench in it, fits in 30 minutes on a warm cache:
     # the three builds side by side, the db_bench pass, the head-to-head
     # matrix and the publishing. Each bench step has its own limit below, so
