@@ -1,5 +1,6 @@
 use super::*;
 use crate::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};
+use alloc::sync::Arc;
 use std::collections::BTreeMap;
 use test_log::test;
 
@@ -146,6 +147,329 @@ fn read_manifest_carries_blob_files_and_their_gc_stats() -> crate::Result<()> {
     Ok(())
 }
 
+fn table_context() -> TableContext {
+    TableContext {
+        fs: Arc::new(crate::fs::StdFs),
+        encryption: None,
+        #[cfg(zstd_any)]
+        dictionaries: crate::compression::ZstdDictionaries::new(),
+        comparator: crate::comparator::default_comparator(),
+    }
+}
+
+/// Every table the manifest of `folder` names, opened for export.
+fn export_tables(folder: &std::path::Path) -> crate::Result<Vec<TableExport>> {
+    let state = read_manifest(folder, &crate::fs::StdFs, None)?;
+    let context = table_context();
+    state
+        .levels
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|record| {
+            let path = folder
+                .join(crate::file::TABLES_FOLDER)
+                .join(record.id.to_string());
+            TableExport::open(&path, record, None, &context)
+        })
+        .collect()
+}
+
+/// The decoded payload of the unencrypted block at `offset`.
+fn block_payload(
+    path: &std::path::Path,
+    table_id: TableId,
+    offset: u64,
+    size: u32,
+    block_type: crate::table::block::BlockType,
+) -> crate::Result<Vec<u8>> {
+    use crate::fs::Fs as _;
+    let file = crate::fs::StdFs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+    let block = crate::table::Block::from_file(
+        &*file,
+        crate::table::BlockHandle::new(crate::table::BlockOffset(offset), size),
+        crate::table::block::BlockIdentity {
+            table_id,
+            block_type,
+            dict_id: 0,
+            window_log: 0,
+        },
+        &crate::table::block::BlockTransform::PLAIN,
+    )?;
+    Ok(block.data.to_vec())
+}
+
+/// `solution` written back in the layout it was read from, so a lossless
+/// decode reproduces the stored payload byte for byte.
+fn encode_burr(solution: &BurrSolution) -> Vec<u8> {
+    let mut out = crate::file::MAGIC_BYTES.to_vec();
+    out.push(match solution.kind {
+        BurrKind::Membership => 2,
+        BurrKind::Retrieval => 3,
+    });
+    out.push(1);
+    out.extend([
+        solution.r,
+        solution.w,
+        solution.b,
+        u8::try_from(solution.layers.len()).unwrap(),
+    ]);
+    out.extend(solution.root_seed.to_le_bytes());
+    for layer in &solution.layers {
+        out.extend(layer.m.to_le_bytes());
+        out.extend(u32::try_from(layer.thresholds.len()).unwrap().to_le_bytes());
+        out.extend((layer.m * 8).to_le_bytes());
+        out.extend(&layer.thresholds);
+        for row in &layer.rows {
+            out.extend(row.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn section<'a>(sections: &'a [Section], name: &[u8]) -> Option<&'a Section> {
+    sections.iter().find(|s| s.name == name)
+}
+
+/// The rows the export reads, block by block, are every entry the table
+/// holds, versions and tombstones included, in the order the table's own
+/// iterator yields them; the meta block's items include the format markers
+/// the read path checks.
+#[test]
+fn table_export_rows_and_meta_match_the_table() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(512))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..300u32 {
+        tree.insert(format!("k{i:04}"), format!("v1-{i}"), seqno.next());
+        if i % 3 == 0 {
+            tree.insert(format!("k{i:04}"), format!("v2-{i}"), seqno.next());
+        }
+        if i % 7 == 0 {
+            tree.remove(format!("k{i:04}"), seqno.next());
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().unwrap().clone();
+    let expected: Vec<crate::InternalValue> = table.iter().collect::<crate::Result<_>>()?;
+    drop(version);
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    assert_eq!(exports.len(), 1);
+    let export = &exports[0];
+    let blocks = export.data_blocks()?;
+    assert!(blocks.len() > 1, "the fixture spans several data blocks");
+    let mut rows = Vec::new();
+    for block in &blocks {
+        rows.extend(export.rows(block)?);
+    }
+    assert_eq!(rows, expected);
+
+    let meta = export.meta()?;
+    let get = |key: &[u8]| {
+        meta.iter()
+            .find(|(k, _)| &**k == key)
+            .map(|(_, v)| v.to_vec())
+    };
+    assert_eq!(get(b"table_version"), Some(vec![3]));
+    assert_eq!(
+        get(b"item_count"),
+        Some(
+            u64::try_from(expected.len())
+                .unwrap()
+                .to_le_bytes()
+                .to_vec()
+        )
+    );
+    assert!(
+        meta.windows(2).all(|w| w[0].0 < w[1].0),
+        "meta items come back in key order"
+    );
+    Ok(())
+}
+
+/// A full filter decodes losslessly: written back in the layout it came from,
+/// it is the stored payload byte for byte. Read as a retrieval solution, the
+/// same payload is refused.
+#[test]
+fn table_export_full_filter_round_trips() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..2_000u32 {
+        tree.insert(format!("k{i:05}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let export = &exports[0];
+    let Some(Filter::Full(solution)) = export.filter()? else {
+        panic!("the default policy writes a full filter");
+    };
+    assert!(
+        solution.layers.len() > 1,
+        "the build bumped keys into a later layer"
+    );
+    let sections = export.sections()?;
+    let filter = section(&sections, b"filter").unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(export.id().to_string());
+    let stored = block_payload(
+        &path,
+        export.id(),
+        filter.offset,
+        u32::try_from(filter.len).unwrap(),
+        crate::table::block::BlockType::Filter,
+    )?;
+    assert_eq!(encode_burr(&solution), stored);
+    assert!(decode_burr(&stored, BurrKind::Retrieval).is_err());
+    Ok(())
+}
+
+/// A partitioned filter comes back as every partition its index lists, in
+/// key order, each decoding losslessly from the block its entry addresses.
+#[test]
+fn table_export_partitioned_filter_round_trips() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .filter_block_partitioning_policy(crate::config::PinningPolicy::all(true))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..20_000u32 {
+        tree.insert(format!("k{i:06}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let export = &exports[0];
+    let Some(Filter::Partitioned(partitions)) = export.filter()? else {
+        panic!("the partitioning policy writes a partitioned filter");
+    };
+    assert!(partitions.len() > 1, "the fixture fills several partitions");
+    assert!(
+        partitions
+            .windows(2)
+            .all(|w| w[0].entry.end_key < w[1].entry.end_key),
+        "partitions come back in key order"
+    );
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(export.id().to_string());
+    for partition in &partitions {
+        let stored = block_payload(
+            &path,
+            export.id(),
+            partition.entry.offset,
+            partition.entry.size,
+            crate::table::block::BlockType::Filter,
+        )?;
+        assert_eq!(encode_burr(&partition.solution), stored);
+    }
+    Ok(())
+}
+
+/// The locator section decodes losslessly, header fields included.
+#[test]
+fn table_export_locator_round_trips() -> crate::Result<()> {
+    use crate::config::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .locator_policy(LocatorPolicy::all(LocatorPolicyEntry::Enabled {
+        precision: LocatorPrecision::Entry,
+        block_id_bits: None,
+        slot_bits: None,
+    }))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..3_000u32 {
+        tree.insert(format!("k{i:05}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let export = &exports[0];
+    let locator = export.locator()?.expect("the policy writes a locator");
+    assert_eq!(locator.precision, 1);
+    assert_eq!(locator.solution.kind, BurrKind::Retrieval);
+    let sections = export.sections()?;
+    let stored_section = section(&sections, b"locator").unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(export.id().to_string());
+    let stored = block_payload(
+        &path,
+        export.id(),
+        stored_section.offset,
+        u32::try_from(stored_section.len).unwrap(),
+        crate::table::block::BlockType::Locator,
+    )?;
+    let mut rebuilt = vec![
+        1,
+        locator.precision,
+        locator.block_id_bits,
+        locator.slot_bits,
+    ];
+    rebuilt.extend(encode_burr(&locator.solution));
+    assert_eq!(rebuilt, stored);
+    Ok(())
+}
+
+/// A table whose bytes no longer hash to the manifest's checksum is refused
+/// at open, before any of its parts is read.
+#[test]
+fn table_export_refuses_a_file_the_manifest_checksum_does_not_match() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..100u32 {
+        tree.insert(format!("k{i:03}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    let record = state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    let tampered = TableRecord {
+        checksum: record.checksum ^ 1,
+        ..*record
+    };
+    let result = TableExport::open(&path, &tampered, None, &table_context());
+    assert!(
+        matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
+        "a digest mismatch is refused"
+    );
+    Ok(())
+}
+
 /// Reading the manifest changes no byte of the tree's directory, edit log
 /// included: the export is for a store the converter has not decided to touch.
 #[test]
@@ -161,6 +485,15 @@ fn read_manifest_leaves_the_directory_byte_identical() -> crate::Result<()> {
 
     let before = snapshot(folder.path())?;
     read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    for export in export_tables(folder.path())? {
+        export.sections()?;
+        export.meta()?;
+        for block in export.data_blocks()? {
+            export.rows(&block)?;
+        }
+        export.filter()?;
+        export.locator()?;
+    }
     assert_eq!(snapshot(folder.path())?, before);
     Ok(())
 }

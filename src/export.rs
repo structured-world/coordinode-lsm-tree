@@ -20,7 +20,20 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+mod table;
+
+pub use table::{
+    BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, Section,
+    TableContext, TableExport, decode_burr,
+};
+
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test code"
+)]
 mod tests;
 
 /// One table as the manifest places it.

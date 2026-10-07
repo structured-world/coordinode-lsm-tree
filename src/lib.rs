@@ -275,6 +275,7 @@ mod error;
 /// A read-only view of a tree's on-disk state for the offline converter to
 /// the next major format.
 #[doc(hidden)]
+#[cfg(feature = "std")]
 pub mod export;
 
 #[doc(hidden)]
