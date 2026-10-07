@@ -24,7 +24,7 @@ mod table;
 
 pub use table::{
     BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, Section,
-    TableContext, TableExport, decode_burr,
+    TableContext, TableExport, VerifiedFrame, decode_burr,
 };
 
 #[cfg(test)]

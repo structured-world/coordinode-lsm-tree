@@ -439,6 +439,70 @@ fn table_export_locator_round_trips() -> crate::Result<()> {
     Ok(())
 }
 
+/// A data block whose stored payload took a bit flip comes back through the
+/// export repaired by its parity trailer: the same payload it had before the
+/// flip, reported as corrected, while the file keeps its damaged byte (the
+/// export writes nothing). Damage past what the parity covers is refused.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn table_export_frame_repairs_damage_through_the_parity_trailer() -> crate::Result<()> {
+    use crate::table::block::{BlockType, EccStatus, Header};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..500u32 {
+        tree.insert(format!("k{i:04}"), format!("value-{i}"), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let export = &exports[0];
+    let block = export.data_blocks()?.into_iter().nth(1).unwrap();
+    let clean = export.frame(block.offset, block.size, BlockType::Data)?;
+    assert_eq!(clean.ecc_status, EccStatus::Ok);
+
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(export.id().to_string());
+    let original = std::fs::read(&path)?;
+    let at = usize::try_from(block.offset).unwrap() + Header::header_len(BlockType::Data) + 5;
+    let mut damaged = original.clone();
+    damaged[at] ^= 0x10;
+    std::fs::write(&path, &damaged)?;
+
+    let healed = export.frame(block.offset, block.size, BlockType::Data)?;
+    assert_eq!(healed.payload, clean.payload);
+    assert_eq!(healed.ecc_status, EccStatus::Corrected);
+    assert!(healed.ecc_recovery.is_some());
+    assert_eq!(
+        std::fs::read(&path)?,
+        damaged,
+        "the export heals nothing on disk"
+    );
+
+    let end = at + usize::try_from(block.size).unwrap() / 2;
+    for byte in &mut damaged[at..end] {
+        *byte = !*byte;
+    }
+    std::fs::write(&path, &damaged)?;
+    assert!(
+        export
+            .frame(block.offset, block.size, BlockType::Data)
+            .is_err()
+    );
+    Ok(())
+}
+
 /// A table whose bytes no longer hash to the manifest's checksum is refused
 /// at open, before any of its parts is read.
 #[test]

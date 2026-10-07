@@ -38,6 +38,25 @@ pub struct BlockRef {
     pub size: u32,
 }
 
+/// One block as the read path verifies it: checksum checked, damage the
+/// parity trailer covers repaired, decrypted, and still compressed exactly as
+/// the writer compressed it. A converter frames this payload anew, so a block
+/// healed here is carried forward healed and a block the parity cannot
+/// repair stops the conversion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedFrame {
+    /// The block's role.
+    pub block_type: crate::table::block::BlockType,
+    /// The payload's length once decompressed.
+    pub uncompressed_length: u32,
+    /// The verified payload, compressed as stored.
+    pub payload: Vec<u8>,
+    /// What the parity trailer found.
+    pub ecc_status: crate::table::block::EccStatus,
+    /// How the payload was repaired, when it was.
+    pub ecc_recovery: Option<crate::table::block::EccRecoveryKind>,
+}
+
 /// What a `BuRR` solution stores per key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BurrKind {
@@ -239,6 +258,23 @@ impl TableExport {
     /// Propagates the block read, its verification and decode.
     pub fn rows(&self, block: &BlockRef) -> crate::Result<Vec<InternalValue>> {
         self.table.export_rows(block)
+    }
+
+    /// The block of `block_type` whose frame spans `size` bytes at `offset`,
+    /// verified, repaired and decrypted by the read path's own block read, and
+    /// still compressed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the read, a checksum failure the parity cannot repair, a
+    /// decrypt failure, and rejects a block that carries another role.
+    pub fn frame(
+        &self,
+        offset: u64,
+        size: u32,
+        block_type: crate::table::block::BlockType,
+    ) -> crate::Result<VerifiedFrame> {
+        self.table.export_frame(offset, size, block_type)
     }
 
     /// The membership filter, or `None` when the table has none.

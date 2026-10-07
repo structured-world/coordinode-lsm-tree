@@ -47,6 +47,74 @@ impl Table {
         Ok(block)
     }
 
+    /// The transform a block of `block_type` was written under: data blocks
+    /// carry the data codec and dictionary, index blocks the index codec, a
+    /// meta block its own parity flag, every other section only encryption
+    /// and the table's parity scheme.
+    fn export_transform(&self, block_type: BlockType) -> crate::Result<BlockTransform<'_>> {
+        let with_ecc = |t: BlockTransform<'_>| match self.metadata.ecc_params {
+            Some(ecc) => t.with_ecc(ecc),
+            None => t,
+        };
+        Ok(match block_type {
+            BlockType::Data | BlockType::Columnar => with_ecc(BlockTransform::from_parts(
+                self.metadata.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?),
+            BlockType::Index => with_ecc(BlockTransform::from_parts(
+                self.metadata.index_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                None,
+            )?),
+            BlockType::Meta => match self.encryption.as_deref() {
+                Some(enc) => BlockTransform::Encrypted(enc),
+                None => BlockTransform::PLAIN,
+            },
+            _ => self.section_transform(),
+        })
+    }
+
+    pub(crate) fn export_frame(
+        &self,
+        offset: u64,
+        size: u32,
+        block_type: BlockType,
+    ) -> crate::Result<crate::export::VerifiedFrame> {
+        let file = self.export_file()?;
+        let transform = self.export_transform(block_type)?;
+        let dict_id = match block_type {
+            BlockType::Data | BlockType::Columnar => self.metadata.data_block_compression.dict_id(),
+            _ => 0,
+        };
+        let (header, payload, status, recovery) = Block::read_verified_payload(
+            &*file,
+            BlockHandle::new(BlockOffset(offset), size),
+            BlockIdentity {
+                table_id: self.metadata.id,
+                block_type,
+                dict_id,
+                window_log: 0,
+            },
+            &transform,
+        )?;
+        if header.block_type != block_type {
+            return Err(crate::Error::InvalidTag((
+                "BlockType",
+                header.block_type.into(),
+            )));
+        }
+        Ok(crate::export::VerifiedFrame {
+            block_type,
+            uncompressed_length: header.uncompressed_length,
+            payload: payload.to_vec(),
+            ecc_status: status,
+            ecc_recovery: recovery,
+        })
+    }
+
     pub(crate) fn export_sections(&self) -> crate::Result<Vec<Section>> {
         let mut file = self.export_file()?;
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
