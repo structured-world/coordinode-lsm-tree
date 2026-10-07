@@ -96,13 +96,16 @@ fn a_failed_finish_leaves_no_file_behind() -> crate::Result<()> {
 
     // A dictionary nothing can resolve, parked behind a plain writer that
     // finishes first and succeeds.
-    writer.record_source_compression(CompressionType::ZstdDict {
-        level: 3,
-        dict_id: 0xDEAD_BEEF,
-    })?;
+    writer.select_output(
+        CompressionType::ZstdDict {
+            level: 3,
+            dict_id: 0xDEAD_BEEF,
+        },
+        0,
+    )?;
     writer.write_raw(b"a", 0, b"encoded-under-a-dictionary", 26)?;
     let dict_path = writer.active_writer.path.clone();
-    writer.record_source_compression(CompressionType::None)?;
+    writer.select_output(CompressionType::None, 0)?;
     writer.write_raw(b"b", 0, b"plain", 5)?;
     let plain_id = writer.active_writer.blob_file_id();
     let plain_path = writer.active_writer.path.clone();
@@ -122,6 +125,78 @@ fn a_failed_finish_leaves_no_file_behind() -> crate::Result<()> {
             .is_none(),
         "its descriptor is not left in the shared table",
     );
+    Ok(())
+}
+
+/// Values of interleaved lifetime classes fill one file per class, each file
+/// records its class, and a class past the configured groups goes to the last
+/// group rather than opening another file: the open files stay bounded by the
+/// group count.
+#[test_log::test]
+#[expect(clippy::expect_used, reason = "3 is within the group bound")]
+fn interleaved_lifetime_classes_fill_one_file_per_group() -> crate::Result<()> {
+    use super::*;
+    use crate::{config::LifetimeGroups, fs::StdFs};
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let groups = LifetimeGroups::new(3).expect("within the bound");
+
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(u64::MAX)
+            .use_lifetime_groups(groups);
+
+    let mut handles = Vec::new();
+    for i in 0u8..120 {
+        // Classes 0..=5 against three groups: 3, 4 and 5 belong to group 2.
+        let class = i % 6;
+        writer.select_lifetime_class(class)?;
+        let key = format!("key-{i:05}");
+        let handle = writer.write(key.as_bytes(), 0, b"value")?;
+        handles.push((class.min(2), handle));
+    }
+    let files = writer.finish()?;
+
+    assert_eq!(
+        files.len(),
+        3,
+        "one file per group, however many classes asked"
+    );
+    for (class, handle) in &handles {
+        let Some(file) = files.iter().find(|f| f.id() == handle.blob_file_id) else {
+            panic!("handle {handle:?} points at a file the writer did not produce");
+        };
+        assert_eq!(
+            file.lifetime_class(),
+            *class,
+            "every value lands in a file of its own group",
+        );
+    }
+    Ok(())
+}
+
+/// With a single group every value shares one file of class 0, exactly as
+/// without lifetime grouping.
+#[test_log::test]
+fn a_single_lifetime_group_writes_one_class() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(u64::MAX);
+    for i in 0u8..10 {
+        writer.select_lifetime_class(i)?;
+        writer.write(format!("key-{i:03}").as_bytes(), 0, b"value")?;
+    }
+    let files = writer.finish()?;
+
+    assert_eq!(files.len(), 1);
+    assert!(files.iter().all(|file| file.lifetime_class() == 0));
     Ok(())
 }
 
@@ -151,7 +226,7 @@ fn interleaved_source_codecs_fill_one_file_each() -> crate::Result<()> {
         } else {
             CompressionType::Zstd(3)
         };
-        writer.record_source_compression(codec)?;
+        writer.select_output(codec, 0)?;
         let key = format!("key-{i:05}");
         let handle = writer.write_raw(key.as_bytes(), 0, b"frame-bytes", 11)?;
         handles.push((codec, handle));

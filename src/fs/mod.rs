@@ -363,6 +363,26 @@ pub enum FileHint {
     WriteOnce,
 }
 
+/// How long the data written through a file is expected to live before it is
+/// overwritten or deleted.
+///
+/// Passed to [`FsFile::set_write_lifetime`] so a device that groups data by
+/// lifetime (`NVMe` streams or flexible data placement) keeps data that dies
+/// together in the same erase units. Advisory: it changes where a device
+/// places data, never what a read returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteLifetime {
+    /// Expected to be overwritten soon.
+    Short,
+    /// Between short and long.
+    Medium,
+    /// Expected to outlive most other data.
+    Long,
+    /// Expected to be kept for the life of the store.
+    Extreme,
+}
+
 /// Durability level for a sync (fsync) operation.
 ///
 /// The distinction is only observable on macOS, where Rust's
@@ -641,6 +661,21 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns the error of the system call.
     fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
         let _ = (offset, len);
+        Ok(())
+    }
+
+    /// Tells the device how long the data written through this handle is
+    /// expected to live (see [`WriteLifetime`]).
+    ///
+    /// The default is a no-op; the std backend issues
+    /// `fcntl(F_SET_RW_HINT)` on Linux.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the system call. The hint is advisory, so a
+    /// caller treats a refusal as "no hint", never as a failed write.
+    fn set_write_lifetime(&self, lifetime: WriteLifetime) -> io::Result<()> {
+        let _ = lifetime;
         Ok(())
     }
 }

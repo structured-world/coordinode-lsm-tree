@@ -31,16 +31,23 @@ pub struct MultiWriter {
 
     active_writer: Writer,
 
-    /// Writers for the other source codecs a relocation has met, each still
-    /// filling its own file while the active one takes frames of its codec.
+    /// The lifetime class the active writer's file holds.
+    active_class: u8,
+
+    /// Writers for the other outputs a write has met, each still filling its
+    /// own file while the active one takes frames of its codec and class.
     ///
     /// A relocation merges its sources by key, so two compression generations
-    /// over the same keys alternate on nearly every frame. A file records one
-    /// codec, and closing it on every switch would produce a file per value;
-    /// keeping one open per codec leaves every file as full as the size target
-    /// allows. Empty outside relocation, and at most one entry per codec the
-    /// sources carry.
-    parked: Vec<(CompressionType, Writer)>,
+    /// over the same keys alternate on nearly every frame, and values of
+    /// different lifetime classes interleave the same way in any write. A file
+    /// records one codec and one class, and closing it on every switch would
+    /// produce a file per value; keeping one open per pair leaves every file
+    /// as full as the size target allows. At most one entry per codec the
+    /// sources carry times [`Self::lifetime_groups`].
+    parked: Vec<(CompressionType, u8, Writer)>,
+
+    /// How many lifetime classes the files are split into.
+    lifetime_groups: crate::config::LifetimeGroups,
 
     results: Vec<BlobFile>,
 
@@ -109,7 +116,9 @@ impl MultiWriter {
             target_size: 64 * 1_024 * 1_024,
 
             active_writer: Writer::new(blob_file_path, blob_file_id, tree_id, &*fs)?,
+            active_class: 0,
             parked: Vec::new(),
+            lifetime_groups: crate::config::LifetimeGroups::ONE,
 
             results: Vec::new(),
 
@@ -187,44 +196,89 @@ impl MultiWriter {
         self
     }
 
-    /// Directs the next frames to a file that records `compression`.
+    /// Splits the files this writer produces into `groups` lifetime classes,
+    /// the files written so far taking the class of a fresh value.
+    #[must_use]
+    pub(crate) fn use_lifetime_groups(mut self, groups: crate::config::LifetimeGroups) -> Self {
+        self.lifetime_groups = groups;
+        let class = groups.fresh();
+        self.active_class = class;
+        self.active_writer
+            .set_lifetime_class(class, groups.write_lifetime(class));
+        self
+    }
+
+    /// The lifetime classes this writer splits its files into.
+    pub(crate) fn lifetime_groups(&self) -> crate::config::LifetimeGroups {
+        self.lifetime_groups
+    }
+
+    /// Directs the next frames to a file of lifetime `class` that records the
+    /// codec of the frames written so far. `class` past the last group goes to
+    /// the last group.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the creation of the first file for a class not met before.
+    pub(crate) fn select_lifetime_class(&mut self, class: u8) -> crate::Result<()> {
+        self.select_output(self.passthrough_compression, class)
+    }
+
+    /// Directs the next frames to a file that records `compression` and holds
+    /// lifetime `class`.
     ///
     /// The relocation counterpart of [`Self::use_passthrough_compression`],
     /// which fixes one codec for the whole pass. A relocation copies frames
     /// VERBATIM out of sources that need not share a codec (the blob policy may
     /// have moved since they were written), while a blob file records exactly
-    /// one. Each codec therefore gets its own output file, and switching parks
-    /// the current one rather than closing it (see [`Self::parked`]).
+    /// one. Each codec therefore gets its own output file, and so does each
+    /// lifetime class; switching parks the current one rather than closing it
+    /// (see [`Self::parked`]).
     ///
     /// # Errors
     ///
-    /// Propagates the creation of the first file for a codec not met before.
-    pub(crate) fn record_source_compression(
+    /// Propagates the creation of the first file for a pair not met before.
+    pub(crate) fn select_output(
         &mut self,
         compression: CompressionType,
+        class: u8,
     ) -> crate::Result<()> {
-        if self.passthrough_compression == compression {
+        let class = self.lifetime_groups.cap(class);
+        if self.passthrough_compression == compression && self.active_class == class {
             return Ok(());
         }
-        let next = if let Some(at) = self.parked.iter().position(|(c, _)| *c == compression) {
-            self.parked.swap_remove(at).1
+        let next = if let Some(at) = self
+            .parked
+            .iter()
+            .position(|(c, k, _)| *c == compression && *k == class)
+        {
+            self.parked.swap_remove(at).2
         } else if self.active_writer.item_count == 0 {
             // Nothing written constrains an untouched writer: restamp it.
-            self.active_writer.metadata_compression_override = Some(compression);
+            // Only a codec switch restamps the codec: a class switch keeps what
+            // the writer records, which for a compressing writer is its own.
+            if compression != self.passthrough_compression {
+                self.active_writer.metadata_compression_override = Some(compression);
+            }
+            self.active_writer
+                .set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
             self.passthrough_compression = compression;
+            self.active_class = class;
             return Ok(());
         } else {
-            self.fresh_writer(compression)?
+            self.fresh_writer(compression, class)?
         };
         let previous = core::mem::replace(&mut self.active_writer, next);
-        self.parked.push((self.passthrough_compression, previous));
+        self.parked
+            .push((self.passthrough_compression, self.active_class, previous));
         self.passthrough_compression = compression;
+        self.active_class = class;
         Ok(())
     }
 
-    /// A new writer for the next blob file, recording `passthrough` when this
-    /// writer copies already-encoded frames.
-    fn fresh_writer(&self, passthrough: CompressionType) -> crate::Result<Writer> {
+    /// A new writer for the next blob file of lifetime `class`, recording
+    /// `passthrough` when this writer copies already-encoded frames.
+    fn fresh_writer(&self, passthrough: CompressionType, class: u8) -> crate::Result<Writer> {
         let id = self.id_generator.next();
         let path = self.folder.join(id.to_string());
         let w = Writer::new(path, id, self.tree_id, &*self.fs)?;
@@ -241,6 +295,7 @@ impl MultiWriter {
         if passthrough != CompressionType::None {
             w.metadata_compression_override = Some(passthrough);
         }
+        w.set_lifetime_class(class, self.lifetime_groups.write_lifetime(class));
         #[cfg(zstd_any)]
         let w = w
             .use_zstd_dictionary(self.zstd_dictionary.clone())
@@ -302,7 +357,7 @@ impl MultiWriter {
     fn rotate(&mut self) -> crate::Result<()> {
         log::debug!("Rotating blob file writer");
 
-        let new_writer = self.fresh_writer(self.passthrough_compression)?;
+        let new_writer = self.fresh_writer(self.passthrough_compression, self.active_class)?;
 
         let old_writer = core::mem::replace(&mut self.active_writer, new_writer);
         let blob_file = Self::consume_writer(
@@ -417,6 +472,7 @@ impl MultiWriter {
                     key_range: metadata.key_range,
 
                     compression: recorded_compression,
+                    lifetime_class: metadata.lifetime_class,
                 },
                 fs: fs.clone(),
                 deletion_pause: once_cell::race::OnceBox::new(),
@@ -503,8 +559,12 @@ impl MultiWriter {
     }
 
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
-        let mut writers =
-            core::iter::once((self.passthrough_compression, self.active_writer)).chain(self.parked);
+        let mut writers = core::iter::once((self.passthrough_compression, self.active_writer))
+            .chain(
+                self.parked
+                    .into_iter()
+                    .map(|(codec, _, writer)| (codec, writer)),
+            );
         while let Some((passthrough, writer)) = writers.next() {
             match Self::consume_writer(
                 writer,

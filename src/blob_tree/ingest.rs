@@ -25,6 +25,8 @@ pub struct BlobIngestion<'a> {
     /// Separation thresholds of a cell row's fields, by column; see
     /// [`KvSeparationOptions::cell_separation_threshold`](crate::KvSeparationOptions::cell_separation_threshold).
     cell_thresholds: Vec<(u16, u32)>,
+    /// Picks the lifetime class of each separated value.
+    lifetime: crate::config::blob_lifetime::LifetimeClassifier<'a>,
     last_key: Option<UserKey>,
 }
 
@@ -66,7 +68,8 @@ impl<'a> BlobIngestion<'a> {
         .use_target_size(blob_file_size)
         .use_compression(blob_compression)
         .use_sync_mode(tree.index.config.sync_mode)
-        .use_writeback_bytes(tree.index.config.writeback_bytes);
+        .use_writeback_bytes(tree.index.config.writeback_bytes)
+        .use_lifetime_groups(kv.lifetime_groups);
 
         // Ingestion writes blob files under the tree's own blob policy, so it
         // needs the dictionary to compress with and the set to pin on what it
@@ -89,6 +92,7 @@ impl<'a> BlobIngestion<'a> {
             seqno: 0,
             separation_threshold,
             cell_thresholds,
+            lifetime: kv.lifetime_classifier(),
             last_key: None,
         })
     }
@@ -111,6 +115,9 @@ impl<'a> BlobIngestion<'a> {
         let value_size = value.len() as u32;
 
         if value_size >= self.separation_threshold {
+            // An ingested key has a single version: nothing overwrote it.
+            self.blob
+                .select_lifetime_class(self.lifetime.class_of(&key, false))?;
             let vhandle = self.blob.write(&key, self.seqno, &value)?;
 
             let indirection = BlobIndirection {
@@ -180,10 +187,16 @@ impl<'a> BlobIngestion<'a> {
         let row = encode_row(&row)?;
         let (thresholds, default) = (&self.cell_thresholds, self.separation_threshold);
         let (blob, seqno) = (&mut self.blob, self.seqno);
+        let class = self.lifetime.class_of(&key, false);
         let row = separate_row(
             &row,
             |column| crate::config::cell_threshold(thresholds, default, column),
-            |bytes| blob.write(&key, seqno, bytes),
+            |bytes| {
+                // Selected per separated field, so a row that separates
+                // nothing opens no file for its class.
+                blob.select_lifetime_class(class)?;
+                blob.write(&key, seqno, bytes)
+            },
         )?
         .unwrap_or(row);
 

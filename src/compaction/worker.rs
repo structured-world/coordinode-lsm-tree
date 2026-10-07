@@ -2383,7 +2383,8 @@ fn run_subcompaction(
             .use_target_size(blob_opts.file_target_size)
             .use_passthrough_compression(rc.blob_compression)
             .use_sync_mode(opts.config.sync_mode)
-            .use_writeback_bytes(opts.config.writeback_bytes);
+            .use_writeback_bytes(opts.config.writeback_bytes)
+            .use_lifetime_groups(blob_opts.lifetime_groups);
             // The policy here is only the OPENING value. Relocation copies
             // frames verbatim out of files that may predate a policy change, so
             // `RelocatingCompaction` records each output file's codec from the
@@ -3546,7 +3547,8 @@ fn merge_tables(
                 .use_target_size(blob_opts.file_target_size)
                 .use_passthrough_compression(rc.blob_compression)
                 .use_sync_mode(opts.config.sync_mode)
-                .use_writeback_bytes(opts.config.writeback_bytes);
+                .use_writeback_bytes(opts.config.writeback_bytes)
+                .use_lifetime_groups(blob_opts.lifetime_groups);
                 // Same as the tight-space relocation above, through the same
                 // `RelocatingCompaction`: the policy is only the opening value,
                 // each output file records the codec of the source its frames

@@ -73,6 +73,12 @@ pub struct Metadata {
 
     /// Compression type used for all blobs in this file
     pub compression: CompressionType,
+
+    /// The lifetime class of the values this file holds: `0` for values a
+    /// flush wrote, higher for values that outlived more collections or that
+    /// a hint placed there. Values of one class share files, so a file holds
+    /// values expected to die together.
+    pub lifetime_class: u8,
 }
 
 impl Metadata {
@@ -96,6 +102,7 @@ impl Metadata {
             meta("item_count", &self.item_count.to_le_bytes()),
             meta("key#max", self.key_range.max()),
             meta("key#min", self.key_range.min()),
+            meta("lifetime_class", &[self.lifetime_class]),
             meta("uncompressed_size", &self.total_uncompressed_bytes.to_le_bytes()),
         ];
 
@@ -221,6 +228,16 @@ impl Metadata {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        let lifetime_class = {
+            let bytes = block
+                .point_read(b"lifetime_class", SeqNo::MAX, &cmp)?
+                .ok_or(crate::Error::InvalidHeader("BlobFileMeta"))?;
+            match *bytes.value {
+                [class] => class,
+                _ => return Err(crate::Error::InvalidHeader("BlobFileMeta")),
+            }
+        };
+
         let key_range = KeyRange::new((
             block
                 .point_read(b"key#min", SeqNo::MAX, &cmp)?
@@ -241,6 +258,7 @@ impl Metadata {
             total_compressed_bytes: file_size,
             total_uncompressed_bytes,
             key_range,
+            lifetime_class,
         })
     }
 }

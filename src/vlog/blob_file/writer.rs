@@ -135,6 +135,9 @@ pub struct Writer {
     /// decompresses correctly. `None` here means "record `compression`".
     pub(crate) metadata_compression_override: Option<CompressionType>,
 
+    /// The lifetime class this file holds, recorded in its metadata.
+    pub(crate) lifetime_class: u8,
+
     /// Durability level for the final blob-file fsync. Default
     /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
@@ -219,6 +222,7 @@ impl Writer {
 
             compression: CompressionType::None,
             metadata_compression_override: None,
+            lifetime_class: 0,
             sync_mode: SyncMode::Normal,
             writeback_bytes: 0,
             written_back: 0,
@@ -249,6 +253,28 @@ impl Writer {
     pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self
+    }
+
+    /// Records `class` as the lifetime class of this file and tells the device
+    /// how long its data is expected to live, when `lifetime` says.
+    ///
+    /// The device hint is advisory: a filesystem or kernel that refuses it
+    /// leaves the file written exactly as without it.
+    pub(crate) fn set_lifetime_class(
+        &mut self,
+        class: u8,
+        lifetime: Option<crate::fs::WriteLifetime>,
+    ) {
+        self.lifetime_class = class;
+        if let Some(lifetime) = lifetime {
+            let file = self.writer.get_mut().inner_mut().get_ref();
+            if let Err(error) = file.set_write_lifetime(lifetime) {
+                log::debug!(
+                    "write lifetime hint refused for {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
     }
 
     /// Starts writing back what the file wrote since the last writeback, once
@@ -508,6 +534,7 @@ impl Writer {
             compression: self
                 .metadata_compression_override
                 .unwrap_or(self.compression),
+            lifetime_class: self.lifetime_class,
         };
         metadata.encode_into(&mut self.writer)?;
 

@@ -857,6 +857,10 @@ impl FsFile for FaultFile {
         self.inner.hint(hint)
     }
 
+    fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> io::Result<()> {
+        self.inner.set_write_lifetime(lifetime)
+    }
+
     fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
         self.injector
             .writeback_log

@@ -320,7 +320,8 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             .use_target_size(blob_opts.file_target_size)
             .use_compression(rc.blob_compression)
             .use_sync_mode(self.shared.opts.config.sync_mode)
-            .use_writeback_bytes(self.shared.opts.config.writeback_bytes);
+            .use_writeback_bytes(self.shared.opts.config.writeback_bytes)
+            .use_lifetime_groups(blob_opts.lifetime_groups);
 
             // A filter that rewrites a separated value writes a NEW blob file
             // under the tree's blob policy, so it needs both halves: the
@@ -338,6 +339,12 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             self.blob_writer.insert(writer)
         };
 
+        // A value the filter writes is new: it has outlived nothing yet.
+        writer.select_lifetime_class(
+            blob_opts
+                .lifetime_classifier()
+                .class_of(&prev_key.user_key, false),
+        )?;
         let vhandle = writer.write(&prev_key.user_key, prev_key.seqno, &new_value)?;
 
         let indirection = BlobIndirection {

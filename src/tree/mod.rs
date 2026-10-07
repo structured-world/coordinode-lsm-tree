@@ -1020,6 +1020,8 @@ impl AbstractTree for Tree {
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
         hashes: u64,
+        // A standard tree separates no values, so it has nothing to place.
+        _overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
