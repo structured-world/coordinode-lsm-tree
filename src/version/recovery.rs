@@ -689,6 +689,10 @@ pub fn recover(
         // only when a real corruption produces a Version whose
         // count disagrees with the Config the compactor receives.
 
+        // Set by every exit that stops before the counts are exhausted: a torn
+        // tail, or a record a lossy mode drops along with what follows it.
+        let mut stopped_early = false;
+
         'levels: for _ in 0..level_count {
             let mut level = vec![];
             let run_count = match reader.read_u8() {
@@ -706,6 +710,7 @@ pub fn recover(
                     // so count separately from record-drops.
                     tables_truncated_headers += 1;
                     levels.push(level);
+                    stopped_early = true;
                     break 'levels;
                 }
                 Err(e) => return Err(e.into()),
@@ -736,6 +741,7 @@ pub fn recover(
                         // push for it. HEADER truncation.
                         tables_truncated_headers += 1;
                         levels.push(level);
+                        stopped_early = true;
                         break 'levels;
                     }
                     Err(e) => return Err(e.into()),
@@ -838,6 +844,7 @@ pub fn recover(
                                     if !level.is_empty() {
                                         levels.push(level);
                                     }
+                                    stopped_early = true;
                                     break 'levels;
                                 }
                                 Err(e) => return Err(e),
@@ -864,6 +871,7 @@ pub fn recover(
                             if !level.is_empty() {
                                 levels.push(level);
                             }
+                            stopped_early = true;
                             break 'levels;
                         }
                         FramedRecordOutcome::ChecksumMismatch { bytes_consumed, .. }
@@ -924,6 +932,7 @@ pub fn recover(
                             if !level.is_empty() {
                                 levels.push(level);
                             }
+                            stopped_early = true;
                             break 'levels;
                         }
                         FramedRecordOutcome::ChecksumMismatch { expected, got, .. } => {
@@ -963,6 +972,7 @@ pub fn recover(
                             if !level.is_empty() {
                                 levels.push(level);
                             }
+                            stopped_early = true;
                             break 'levels;
                         }
                         // Strict mode: distinguish "writer crashed
@@ -1034,6 +1044,25 @@ pub fn recover(
             }
 
             levels.push(level);
+        }
+
+        // Every byte of the section belongs to a level, a run or a record, so
+        // once the counts are exhausted without a stop, bytes left over mean a
+        // count understated what follows it. A writer that stored a run count
+        // in one byte wrote exactly that for a level of more than 255 runs;
+        // reading on would place a prefix of the level and delete the rest as
+        // orphans. That is no torn tail, so the tail-tolerant mode refuses it
+        // as the strict one does; the modes that drop records by design keep
+        // accepting the prefix.
+        if !(pit_prefix || skip_any || stopped_early) && tables_bytes_consumed != section_len {
+            // Only bytes read from the section are counted, and a read past
+            // its end fails, so the difference cannot underflow.
+            let trailing = section_len - tables_bytes_consumed;
+            log::error!(
+                "manifest tables section of version #{curr_version_id} holds {trailing} \
+                 byte(s) its counts do not describe; run repair to rebuild the manifest"
+            );
+            return Err(crate::Error::ManifestTablesUnaccounted { trailing });
         }
 
         // Preserve the persisted level_count even if PIT/SkipAny/tail

@@ -261,6 +261,8 @@ pub(crate) struct LayerView<'a> {
 /// per-layer descriptors are eagerly parsed.
 #[derive(Debug)]
 pub(crate) struct DecodedFilter<'a> {
+    /// The seed every layer's seed derives from, as stored.
+    pub(crate) root_seed: u64,
     pub(crate) r: u8,
     pub(crate) w: u8,
     pub(crate) b: u8,
@@ -271,6 +273,13 @@ pub(crate) struct DecodedFilter<'a> {
 /// Parse a wire-format BuRR filter slice. Returns an error if the magic
 /// bytes don't match, the version is unrecognised, or the buffer is
 /// truncated.
+pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
+    decode_as(bytes, BURR_FILTER_TYPE_BYTE)
+}
+
+/// [`decode`] for a payload of either kind: `expected_type` is
+/// [`BURR_FILTER_TYPE_BYTE`] or [`BURR_RETRIEVAL_TYPE_BYTE`], and a payload
+/// tagged otherwise is rejected.
 #[expect(
     clippy::indexing_slicing,
     reason = "every slice in this function is preceded by an explicit length \
@@ -283,7 +292,7 @@ pub(crate) struct DecodedFilter<'a> {
               would multiply the function's error-return paths without \
               improving safety."
 )]
-pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
+pub(crate) fn decode_as(bytes: &[u8], expected_type: u8) -> crate::Result<DecodedFilter<'_>> {
     if bytes.len() < HEADER_LEN {
         return Err(crate::Error::InvalidHeader("BurrFilter"));
     }
@@ -296,7 +305,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     }
 
     let filter_type = cursor.read_u8()?;
-    if filter_type != BURR_FILTER_TYPE_BYTE {
+    if filter_type != expected_type {
         return Err(crate::Error::InvalidTag(("FilterType", filter_type)));
     }
     let version = cursor.read_u8()?;
@@ -403,6 +412,7 @@ pub(crate) fn decode(bytes: &[u8]) -> crate::Result<DecodedFilter<'_>> {
     }
 
     Ok(DecodedFilter {
+        root_seed,
         r,
         w,
         b,

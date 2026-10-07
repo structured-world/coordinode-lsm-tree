@@ -1867,6 +1867,62 @@ impl Block {
         Ok(Some((frame, kind)))
     }
 
+    /// The frame the block at `handle` holds once everything its parity covers
+    /// is repaired: the payload as [`Self::heal_frame`] recovers it, or, over
+    /// an intact payload, a trailer recomputed where the stored one rotted.
+    /// `Ok(None)` when the block is already that frame or carries no parity;
+    /// `Err` when the payload fails and the parity cannot recover it.
+    #[cfg(feature = "page_ecc")]
+    pub(crate) fn repaired_frame(
+        file: &dyn FsFile,
+        handle: BlockHandle,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<Option<alloc::vec::Vec<u8>>> {
+        if let Some((frame, _)) = Self::heal_frame(file, handle, transform)? {
+            return Ok(Some(frame));
+        }
+        // `heal_frame` verified the payload when the block has parity, so only
+        // the trailer can still differ from what the writer produced.
+        let block_size = handle.size() as usize;
+        let mut buf = alloc::vec![0u8; block_size];
+        let n = file.read_at(&mut buf, *handle.offset())?;
+        if n != block_size {
+            return Err(crate::Error::Io(crate::io::Error::new(
+                crate::io::ErrorKind::UnexpectedEof,
+                "repaired_frame: short block read",
+            )));
+        }
+        let header = Header::decode_from(&mut &buf[..])?;
+        if !block_has_parity(&header, transform) {
+            return Ok(None);
+        }
+        let payload_end = Header::header_len(header.block_type)
+            .checked_add(header.data_length as usize)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+        let (Some(payload), Some(trailer)) = (
+            buf.get(Header::header_len(header.block_type)..payload_end),
+            buf.get(payload_end..),
+        ) else {
+            return Err(crate::Error::InvalidHeader("Block"));
+        };
+        let params = block_ecc_params(&header, transform);
+        let fresh = if matches!(params, EccParams::Secded) {
+            crate::secded::encode_block_parity(payload)
+        } else {
+            let (data_shards, parity_shards) = params.as_shards();
+            crate::ecc::encode_parity(payload, data_shards, parity_shards)?
+        };
+        if fresh.len() != trailer.len() {
+            return Err(crate::Error::InvalidHeader("Block"));
+        }
+        if fresh == trailer {
+            return Ok(None);
+        }
+        buf.truncate(payload_end);
+        buf.extend_from_slice(&fresh);
+        Ok(Some(buf))
+    }
+
     /// Reads a data block's verified COMPRESSED payload (the zstd frame)
     /// WITHOUT decompressing it, for partial / lazy decode and the
     /// block-layout cross-check.

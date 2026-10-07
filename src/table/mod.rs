@@ -11,6 +11,8 @@ pub mod columnar;
 pub mod columnar_predicate;
 pub mod data_block;
 pub mod delete_bitmap;
+#[cfg(feature = "std")]
+mod export;
 pub mod filter;
 mod id;
 mod index_block;
