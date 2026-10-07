@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791364715570,
+  "lastUpdate": 1791372247448,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -38216,6 +38216,90 @@ window.BENCHMARK_DATA = {
             "value": 334503.48506219074,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 12.7us | P99.9: 91.1us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1dd9fd0598658761598d8d2fe9626e77f5e83e72",
+          "message": "ci(bench): run on a Linux bench runner by label (#867)\n\n## Summary\n\n- The benchmark job runs on a Linux runner labelled `bench` in the\n`Bench` runner group, instead of the `Default` group, which no longer\nholds a self-hosted runner.\n\n## Changes\n\n- `benchmark` job: `runs-on: { group: Bench, labels: [self-hosted,\nbench, Linux] }`. A bench host is added or replaced by its label,\nwithout editing the workflow; a `bench` runner outside the group never\ntakes the job; and the OS is named so the job stays off the Windows\nbench host, whose numbers are not comparable with the Linux trend.\n- The comments that described the runner choice and the per-host series\nfollow the new targeting.\n\nThe fork and repository gate on the job is unchanged.\n\n## Testing\n\nWorkflow change only; the job runs on the next push to `main`.",
+          "timestamp": "2026-10-07T11:07:30Z",
+          "tree_id": "8ea40f772fe6b92793df72097282184fd7a3db50",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1dd9fd0598658761598d8d2fe9626e77f5e83e72"
+        },
+        "date": 1791372245989,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 79468.12137803063,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 16.6us | P99.9: 51.7us\nthreads: 1 | elapsed: 6.74s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1891411.958887135,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 2.4us | P99.9: 4.3us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 498826.81295980094,
+            "unit": "ops/sec",
+            "extra": "P50: 1.7us | P99: 4.7us | P99.9: 18.6us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 396971.5650637497,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.1us | P99.9: 32.5us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2299776.353648937,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 5.0us | P99.9: 7.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 181494.17478746775,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 18.9us | P99.9: 34.2us\nthreads: 1 | elapsed: 1.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 114003.35325587152,
+            "unit": "ops/sec",
+            "extra": "P50: 6.9us | P99: 36.0us | P99.9: 60.6us\nthreads: 1 | elapsed: 1.75s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 527275.4529992145,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 5.4us | P99.9: 19.5us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 632122.0020495987,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 2.1us | P99.9: 9.9us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 277234.9851760305,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 18.8us | P99.9: 101.6us\nthreads: 1 | elapsed: 0.72s | num: 200000 | iterations: 3"
           }
         ]
       }
