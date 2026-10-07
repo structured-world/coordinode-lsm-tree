@@ -474,9 +474,8 @@ fn table_export_frame_repairs_damage_through_the_parity_trailer() -> crate::Resu
         .path()
         .join(crate::file::TABLES_FOLDER)
         .join(export.id().to_string());
-    let original = std::fs::read(&path)?;
+    let mut damaged = std::fs::read(&path)?;
     let at = usize::try_from(block.offset).unwrap() + Header::header_len(BlockType::Data) + 5;
-    let mut damaged = original.clone();
     damaged[at] ^= 0x10;
     std::fs::write(&path, &damaged)?;
 

@@ -38,9 +38,10 @@ pub struct BlockRef {
     pub size: u32,
 }
 
-/// One block as the read path verifies it: checksum checked, damage the
-/// parity trailer covers repaired, decrypted, and still compressed exactly as
-/// the writer compressed it. A converter frames this payload anew, so a block
+/// One block as the read path verifies it, still compressed.
+///
+/// The checksum is checked, damage the parity trailer covers is repaired and
+/// the payload is decrypted. A converter frames this payload anew, so a block
 /// healed here is carried forward healed and a block the parity cannot
 /// repair stops the conversion.
 #[derive(Clone, Debug, PartialEq, Eq)]
