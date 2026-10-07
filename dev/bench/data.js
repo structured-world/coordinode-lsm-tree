@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791332094088,
+  "lastUpdate": 1791332097719,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -37252,6 +37252,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 9505.573999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8718e584e7b2388f223a08f002a9fe661c4131ac",
+          "message": "ci(bench): run the self-hosted bench only in this repository (#863)\n\n## Summary\n- The self-hosted bench job runs only in\n`structured-world/coordinode-lsm-tree` and never on the code of a pull\nrequest from a fork. A self-hosted runner executes whatever the job\nchecks out, so fork code must not reach it.\n- In a fork the job is skipped instead of waiting in a queue that no\nrunner serves.\n\n## Changes\n- `.github/workflows/benchmark.yml`: the benchmark job's `if:`\nadditionally requires `github.repository ==\n'structured-world/coordinode-lsm-tree'` (the owner alone would admit a\ncopy of the workflow in any sibling repository) and, for `pull_request`\nevents, a head repository equal to this repository.\n\n## Testing\n- actionlint passes on the workflow. The bench job is the only\nself-hosted job in the repository.\n\nBackport to 5.x.x: #864",
+          "timestamp": "2026-10-07T00:00:28Z",
+          "tree_id": "e3a412cb93cc56ed57e691a49efa6bb641ce7f10",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8718e584e7b2388f223a08f002a9fe661c4131ac"
+        },
+        "date": 1791332096561,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 496.42999999999995,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 77.938611ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 133.61100000000002,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.99146ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 433.45599999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.1882ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3813.7940000000003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 14802.863,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
