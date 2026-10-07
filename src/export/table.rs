@@ -58,6 +58,17 @@ pub struct VerifiedFrame {
     pub ecc_recovery: Option<crate::table::block::EccRecoveryKind>,
 }
 
+/// A range tombstone: every key in `[start, end)` deleted at `seqno`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeDelete {
+    /// The first key deleted.
+    pub start: UserKey,
+    /// The first key past the deleted range.
+    pub end: UserKey,
+    /// The tombstone's local seqno.
+    pub seqno: SeqNo,
+}
+
 /// What a `BuRR` solution stores per key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BurrKind {
@@ -259,6 +270,45 @@ impl TableExport {
     /// Propagates the block read, its verification and decode.
     pub fn rows(&self, block: &BlockRef) -> crate::Result<Vec<InternalValue>> {
         self.table.export_rows(block)
+    }
+
+    /// The decoded column batch of the columnar data block `block`, every row
+    /// included whether or not the delete bitmap marks it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the block read and decode, and refuses a row table.
+    #[cfg(feature = "columnar")]
+    pub fn columnar_batch(
+        &self,
+        block: &BlockRef,
+    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        self.table.export_columnar_batch(block)
+    }
+
+    /// The positions the delete bitmap marks deleted, ascending. A position
+    /// counts rows across the data blocks in index order.
+    #[must_use]
+    pub fn deleted_rows(&self) -> Vec<u32> {
+        self.table.export_deleted_rows()
+    }
+
+    /// The table's range tombstones, as stored (not clamped to a restriction).
+    #[must_use]
+    pub fn range_tombstones(&self) -> Vec<RangeDelete> {
+        self.table.export_range_tombstones()
+    }
+
+    /// The blob files the table's values point into, with the bytes they
+    /// reference in each, or `None` when the table records none.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the section read and rejects a malformed section.
+    pub fn linked_blob_files(
+        &self,
+    ) -> crate::Result<Option<Vec<crate::table::writer::LinkedFile>>> {
+        self.table.list_blob_file_references()
     }
 
     /// The block of `block_type` whose frame spans `size` bytes at `offset`,

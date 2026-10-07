@@ -207,6 +207,38 @@ impl Table {
             .collect())
     }
 
+    #[cfg(feature = "columnar")]
+    pub(crate) fn export_columnar_batch(
+        &self,
+        block: &BlockRef,
+    ) -> crate::Result<crate::table::columnar::ColumnBatch> {
+        if !self.metadata.columnar {
+            return Err(crate::Error::InvalidHeader(
+                "columnar batch requested from a row table",
+            ));
+        }
+        let handle = BlockHandle::new(BlockOffset(block.offset), block.size);
+        let (loaded, _) = self.load_block_from_disk(&handle, BlockType::Columnar)?;
+        crate::table::columnar::ColumnBatch::decode(&loaded.data)
+    }
+
+    pub(crate) fn export_deleted_rows(&self) -> Vec<u32> {
+        // A normal open fails on a damaged bitmap rather than degrading it, so
+        // the decoded bitmap is the stored one.
+        self.delete_bitmap.iter().collect()
+    }
+
+    pub(crate) fn export_range_tombstones(&self) -> Vec<crate::export::RangeDelete> {
+        self.range_tombstones()
+            .iter()
+            .map(|rt| crate::export::RangeDelete {
+                start: rt.start.clone(),
+                end: rt.end.clone(),
+                seqno: rt.seqno,
+            })
+            .collect()
+    }
+
     pub(crate) fn export_filter(&self) -> crate::Result<Option<Filter>> {
         let file = self.export_file()?;
         let transform = self.section_transform();

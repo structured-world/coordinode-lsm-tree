@@ -502,6 +502,138 @@ fn table_export_frame_repairs_damage_through_the_parity_trailer() -> crate::Resu
     Ok(())
 }
 
+/// A columnar table carrying positional deletes: the batches hold every row,
+/// the deleted ones included, the rows the export reads are those same rows,
+/// and the deleted positions are exactly the rows the range tombstone
+/// relocated into the bitmap.
+#[cfg(feature = "columnar")]
+#[test]
+fn table_export_columnar_batches_keep_deleted_rows_and_their_positions() -> crate::Result<()> {
+    use crate::config::{DeleteStrategy, DeleteStrategyPolicy};
+
+    let key = |i: u32| format!("k{i:04}").into_bytes();
+    let folder = crate::get_tmp_folder();
+    let any = open(folder.path(), None)?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::Adaptive {
+            purge_threshold_percent: 90,
+        });
+    })?;
+    for i in 0..10u32 {
+        tree.insert(key(i), vec![b'v'; 16], u64::from(i) + 1);
+    }
+    tree.remove_range(UserKey::from(key(0)), UserKey::from(key(4)), 1_000);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 5_000)?;
+    drop(any);
+
+    let exports = export_tables(folder.path())?;
+    assert_eq!(exports.len(), 1);
+    let export = &exports[0];
+    assert!(export.is_columnar());
+
+    let mut rows = Vec::new();
+    let mut batch_rows = 0u32;
+    for block in export.data_blocks()? {
+        batch_rows += export.columnar_batch(&block)?.row_count;
+        rows.extend(export.rows(&block)?);
+    }
+    assert_eq!(batch_rows, 10, "the batches keep the deleted rows");
+    let keys: Vec<Vec<u8>> = rows.iter().map(|r| r.key.user_key.to_vec()).collect();
+    assert_eq!(keys, (0..10).map(key).collect::<Vec<_>>());
+
+    let deleted = export.deleted_rows();
+    assert_eq!(deleted, vec![0, 1, 2, 3]);
+    Ok(())
+}
+
+/// A table's range tombstones come back as written, bounds and seqno.
+#[test]
+fn table_export_carries_range_tombstones() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    for i in 0..20u32 {
+        tree.insert(format!("k{i:03}"), "v", u64::from(i) + 1);
+    }
+    tree.remove_range(UserKey::from("k005"), UserKey::from("k010"), 100);
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    assert_eq!(
+        exports[0].range_tombstones(),
+        vec![RangeDelete {
+            start: UserKey::from("k005"),
+            end: UserKey::from("k010"),
+            seqno: 100,
+        }]
+    );
+    Ok(())
+}
+
+/// A blob file's frames come back in file order, one per value written,
+/// keyed and sequenced as written, covering the data section end to end;
+/// the table that points into it lists it. A frame damaged after the open is
+/// refused rather than handed on.
+#[test]
+fn blob_file_export_frames_cover_every_value() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(
+        folder.path(),
+        Some(KvSeparationOptions::default().separation_threshold(16)),
+    )?;
+    let seqno = SequenceNumberCounter::default();
+    let mut written = Vec::new();
+    for i in 0..50u32 {
+        let s = seqno.next();
+        tree.insert(format!("k{i:03}"), format!("{i}").repeat(40), s);
+        written.push((format!("k{i:03}").into_bytes(), s));
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    assert_eq!(state.blob_files.len(), 1);
+    let record = state.blob_files[0];
+    let path = folder
+        .path()
+        .join(crate::file::BLOBS_FOLDER)
+        .join(record.id.to_string());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let blob = BlobFileExport::open(&path, &record, 0, fs)?;
+
+    let frames = blob.frames()?;
+    let got: Vec<(Vec<u8>, u64)> = frames.iter().map(|f| (f.key.to_vec(), f.seqno)).collect();
+    assert_eq!(got, written);
+    assert!(frames.windows(2).all(|w| w[0].frame_end == w[1].offset));
+    let data = section(blob.sections(), b"data").unwrap();
+    assert_eq!(frames[0].offset, data.offset);
+    assert_eq!(frames.last().unwrap().frame_end, data.offset + data.len);
+    let item_count = blob
+        .meta()
+        .iter()
+        .find(|(k, _)| &**k == b"item_count")
+        .map(|(_, v)| v.to_vec());
+    assert_eq!(item_count, Some(50u64.to_le_bytes().to_vec()));
+
+    let exports = export_tables(folder.path())?;
+    let linked = exports[0].linked_blob_files()?.unwrap();
+    assert_eq!(linked.len(), 1);
+    assert_eq!(linked[0].blob_file_id, record.id);
+
+    let mut bytes = std::fs::read(&path)?;
+    let at = usize::try_from(frames[3].frame_end).unwrap() - 2;
+    bytes[at] ^= 0x01;
+    std::fs::write(&path, &bytes)?;
+    assert!(blob.frames().is_err(), "a damaged frame is refused");
+    Ok(())
+}
+
 /// A table whose bytes no longer hash to the manifest's checksum is refused
 /// at open, before any of its parts is read.
 #[test]

@@ -20,11 +20,13 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+mod blob;
 mod table;
 
+pub use blob::{BlobFileExport, BlobFrame};
 pub use table::{
-    BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, Section,
-    TableContext, TableExport, VerifiedFrame, decode_burr,
+    BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, RangeDelete,
+    Section, TableContext, TableExport, VerifiedFrame, decode_burr,
 };
 
 #[cfg(test)]
@@ -96,6 +98,23 @@ pub struct ManifestState {
     pub retention_floor: SeqNo,
     /// The compression dictionaries the tree registers, by id.
     pub dicts: Vec<u32>,
+}
+
+/// Reads every compression dictionary stored in the tree in `folder`.
+/// Dictionaries a tree was opened with but never stored are not on disk and
+/// have to be supplied by the caller.
+///
+/// # Errors
+///
+/// Propagates the folder scan and fails on a dictionary whose bytes no longer
+/// hash to its name.
+#[cfg(zstd_any)]
+pub fn read_dictionaries(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> crate::Result<crate::compression::ZstdDictionaries> {
+    crate::dicts::read_all(fs, &folder.join(crate::file::DICTS_FOLDER), encryption)
 }
 
 /// Reads the current manifest state of the tree in `folder`.
