@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791385416198,
+  "lastUpdate": 1791385420381,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -41956,6 +41956,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 19980.923000000003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5bad4c9c087299c9f9c22db581e2e036d85320f3",
+          "message": "feat(blob): group separated values by expected lifetime (#868)\n\n## Summary\n\n- Blob values are split into lifetime groups, each written to its own\nblob files, so a value that lives long no longer shares a file with\nvalues that die quickly and is not copied forward every time that file\nis collected.\n- Four groups by default;\n`KvSeparationOptions::lifetime_groups(LifetimeGroups::ONE)` turns\ngrouping off, and any count from one to `LifetimeGroups::MAX` can be\nset.\n- The group decides only where a value is written: reads and blob file\ncollection are unchanged.\n\n## Changes\n\n- `KvSeparationOptions::lifetime_groups` (`LifetimeGroups`, bounded by\ntype) and `KvSeparationOptions::lifetime_hint` (`LifetimeHint`: the\ncaller's class per key, over the observed one).\n- Flush: a key the memtables hold more than one version of goes to group\n0, every other new value to group 1; observed under the flush stream,\nwhich drops the versions that would show it.\n- Relocation: a surviving value moves one group up, to the last group;\n`MultiWriter` keeps one output file per (codec, class).\n- Blob file metadata records the lifetime class\n(`BlobFile::lifetime_class`); salvage keeps it.\n- `FsFile::set_write_lifetime` passes the class to the device\n(`F_SET_RW_HINT` on Linux, also through io_uring), a no-op elsewhere.\n- `Metrics::blob_bytes_relocated`: on-disk blob bytes relocating\ncompactions copied.\n- db_bench `blobs-*-churn` scenarios: eight rounds of hot rewrites and\nlong-lived appends, each flushed and compacted, publishing relocated\nbytes per reclaimed byte beside the scan's per-row costs, against\n`*-one-group` trees.\n\n## Measurements\n\n`mixed-layout --num 10000`, engine byte counters (one group vs four):\n\n| Profile | Relocated / reclaimed | Relocated | Scan read / row | Scan\ncopied / row |\n|---|---|---|---|---|\n| well-placed, one group | 0.429 | 24.7 MB | 8295.8 B | 8262.6 B |\n| well-placed, four groups | 0.000 | 0 | 8295.8 B | 8261.6 B |\n| scattered, one group | 0.294 | 41.1 MB | 8295.8 B | 8204.6 B |\n| scattered, four groups | 0.115 | 13.3 MB | 8295.8 B | 8029.4 B |\n\nThe blob bytes left on disk at the end are lower with groups too; the\nfile count is higher (12 vs 10, 15 vs 13).\n\n## Testing\n\nfmt, clippy (all features and defaults), the full nextest suite in both\nfeature sets, doc tests, rustdoc, the no-std check, sst-dump and\ndb_bench (clippy, tests, the mixed-layout run) pass on Linux.\n\nCloses #689\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable blob lifetime groups and optional value-based\nhints, helping organize blob data by expected longevity during writes\nand compaction.\n  * Added a metric for tracking blob bytes relocated during compaction.\n* Added mixed-layout blob-churn benchmarks for well-placed and scattered\nlayouts, including single-group configurations. These scenarios require\na nonzero cache.\n* Recovered blob files now retain their source lifetime classification.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T17:49:12+03:00",
+          "tree_id": "3ca673d745bdcfc009fe8ea6942076d4e265cb66",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5bad4c9c087299c9f9c22db581e2e036d85320f3"
+        },
+        "date": 1791385419049,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 552.497,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 84.209053ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 138.156,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.715619ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 463.781,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 101.163265ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5346.6140000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22321.214,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
