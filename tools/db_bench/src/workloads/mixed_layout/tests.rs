@@ -45,7 +45,7 @@ fn config() -> BenchConfig {
 /// Every fixture, including those of the unsupported scenarios. The tests that
 /// cover all of them read this one list, so a new fixture cannot be added to
 /// one of them and silently missed by another.
-const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 14] = [
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 16] = [
     ("narrow", fixtures::narrow),
     ("wide", fixtures::wide),
     ("mixed-sizes", fixtures::mixed_sizes),
@@ -62,6 +62,11 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 14] = [
     ("columnar-overlap", fixtures::columnar_overlap),
     ("blobs-well-placed", fixtures::blobs_well_placed),
     ("blobs-scattered", fixtures::blobs_scattered),
+    (
+        "blobs-well-placed-grouped",
+        fixtures::blobs_well_placed_grouped,
+    ),
+    ("blobs-scattered-grouped", fixtures::blobs_scattered_grouped),
     ("cells-inline", fixtures::cells_inline),
     ("cells-wide", fixtures::cells_wide),
     ("cells-scattered", fixtures::cells_scattered),
@@ -114,6 +119,50 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
     // Every repetition under the compacting thread returns the same rows.
     let pass = super::cells_scan_under_compaction(&scattered)?;
     assert_eq!(pass.rows, kept * pass.latencies.len() as u64);
+    Ok(())
+}
+
+/// The churn rounds rewrite the hot and warm keys, the compactions collect
+/// what they left stale, every value still reads as the write history says,
+/// and the grouped tree splits its values into more than one class.
+#[test]
+fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
+    for (what, f) in [
+        (
+            "blobs-well-placed",
+            fixtures::blobs_well_placed as fixtures::FixtureFn,
+        ),
+        ("blobs-scattered-grouped", fixtures::blobs_scattered_grouped),
+    ] {
+        let seqno = AtomicU64::new(1);
+        let mut fixture = f(&config(), &seqno, &std::env::temp_dir())?;
+        let churned = fixtures::churn(&mut fixture, &seqno)?;
+        assert!(
+            churned.reclaimed > 0,
+            "{what}: the compactions removed stale files"
+        );
+        assert_eq!(
+            super::scan_all(&fixture)?,
+            N,
+            "{what}: every key reads back"
+        );
+        assert_ordinary_read_agrees(&fixture, what);
+    }
+    let seqno = AtomicU64::new(1);
+    let mut grouped =
+        fixtures::blobs_well_placed_grouped(&config(), &seqno, &std::env::temp_dir())?;
+    fixtures::churn(&mut grouped, &seqno)?;
+    let classes: std::collections::BTreeSet<u8> = grouped
+        .tree
+        .current_version()
+        .blob_files
+        .iter()
+        .map(lsm_tree::BlobFile::lifetime_class)
+        .collect();
+    assert!(
+        classes.contains(&0),
+        "the hot keys went to the short-lived group: {classes:?}"
+    );
     Ok(())
 }
 

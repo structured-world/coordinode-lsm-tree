@@ -309,6 +309,8 @@ struct Opening {
     zone_map: bool,
     /// A cell column whose fields go to a blob file however small.
     separated_column: Option<u16>,
+    /// Blob values split into this many lifetime groups; one when `None`.
+    lifetime_groups: Option<lsm_tree::config::LifetimeGroups>,
 }
 
 fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Result<AnyTree> {
@@ -322,6 +324,9 @@ fn open(dir: &TempDir, config: &BenchConfig, opening: Opening) -> lsm_tree::Resu
         let mut opts = lsm_tree::KvSeparationOptions::default();
         if let Some(column) = opening.separated_column {
             opts = opts.cell_separation_threshold(column, 0);
+        }
+        if let Some(groups) = opening.lifetime_groups {
+            opts = opts.lifetime_groups(groups);
         }
         builder = builder.with_kv_separation(Some(opts));
     }
@@ -733,12 +738,37 @@ pub fn blobs_well_placed(
     seqno: &AtomicU64,
     base: &Path,
 ) -> lsm_tree::Result<Fixture> {
+    well_placed_blobs(config, seqno, base, None)
+}
+
+/// [`blobs_well_placed`] in a tree that splits its values into every lifetime
+/// group, the other side of the churn comparison.
+pub fn blobs_well_placed_grouped(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    well_placed_blobs(
+        config,
+        seqno,
+        base,
+        Some(lsm_tree::config::LifetimeGroups::MAX),
+    )
+}
+
+fn well_placed_blobs(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+    lifetime_groups: Option<lsm_tree::config::LifetimeGroups>,
+) -> lsm_tree::Result<Fixture> {
     let dir = fixture_dir(base)?;
     let tree = open(
         &dir,
         config,
         Opening {
             kv_separation: true,
+            lifetime_groups,
             ..Opening::default()
         },
     )?;
@@ -802,6 +832,7 @@ fn cell_rows(
             kv_separation: true,
             zone_map: true,
             separated_column: layout.referenced_cluster.then_some(CELL_CLUSTER),
+            lifetime_groups: None,
         },
     )?;
     let AnyTree::Blob(blob) = &tree else {
@@ -971,14 +1002,38 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// profile where a scan that fetches a blob before deciding it wants the row
 /// pays the most, which is what makes it the fixture the late-materialization
 /// scenario waits for.
-#[expect(
-    clippy::expect_used,
-    reason = "some prime above 7919 and n exists and is coprime with n, so the stride search ends"
-)]
 pub fn blobs_scattered(
     config: &BenchConfig,
     seqno: &AtomicU64,
     base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    scattered_blobs(config, seqno, base, None)
+}
+
+/// [`blobs_scattered`] in a tree that splits its values into every lifetime
+/// group, the other side of the churn comparison.
+pub fn blobs_scattered_grouped(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+) -> lsm_tree::Result<Fixture> {
+    scattered_blobs(
+        config,
+        seqno,
+        base,
+        Some(lsm_tree::config::LifetimeGroups::MAX),
+    )
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "some prime above 7919 and n exists and is coprime with n, so the stride search ends"
+)]
+fn scattered_blobs(
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    base: &Path,
+    lifetime_groups: Option<lsm_tree::config::LifetimeGroups>,
 ) -> lsm_tree::Result<Fixture> {
     let dir = fixture_dir(base)?;
     let tree = open(
@@ -986,6 +1041,7 @@ pub fn blobs_scattered(
         config,
         Opening {
             kv_separation: true,
+            lifetime_groups,
             ..Opening::default()
         },
     )?;
@@ -1042,5 +1098,68 @@ pub fn blobs_scattered(
         oracle: Oracle { rows },
         shape: Shape::Opaque,
         _dir: dir,
+    })
+}
+
+/// What [`churn`] cost the blob files.
+pub struct Churn {
+    /// On-disk blob bytes the relocating compactions copied.
+    pub relocated: u64,
+    /// On-disk blob bytes the compactions removed: the drop in blob bytes
+    /// plus what they wrote back. Signed because a file's framing is not
+    /// counted as relocated, so a compaction that drops nothing reads as
+    /// slightly negative rather than wrapping.
+    pub reclaimed: i128,
+}
+
+/// Rounds of rewrites a blob tree sees in use, each flushed and compacted.
+///
+/// One key in ten is hot: rewritten three times a round, so the flush finds
+/// it overwritten. One in ten is warm: rewritten once every other round. The
+/// rest keep the value the fixture wrote. Each round's compaction collects
+/// what the rewrites left stale, relocating the live values of the files it
+/// picks, and that relocation is the cost lifetime grouping is meant to cut:
+/// a file holding only hot values dies whole and is dropped, one mixing them
+/// with stable values has to be copied.
+///
+/// The oracle follows every rewrite, so the scan after it still checks every
+/// value.
+pub fn churn(fixture: &mut Fixture, seqno: &AtomicU64) -> lsm_tree::Result<Churn> {
+    const ROUNDS: u64 = 8;
+    let tree = &fixture.tree;
+    let metrics = tree.metrics();
+    let blob_bytes = || i128::from(tree.current_version().blob_files.on_disk_size());
+    let (mut relocated, mut reclaimed) = (0, 0);
+    for round in 1..=ROUNDS {
+        for rep in 0..3_u64 {
+            for (i, row) in (0_u64..).zip(fixture.oracle.rows.iter_mut()) {
+                let warm = i % 10 == 1 && rep == 0 && round % 2 == 0;
+                if i % 10 != 0 && !warm {
+                    continue;
+                }
+                let value = Value {
+                    seed: i + round * 1_000_000 + rep * 100_000_000,
+                    len: HEADER_LEN + 8_192,
+                };
+                tree.insert(
+                    &*row.key,
+                    value.bytes(),
+                    seqno.fetch_add(1, Ordering::Relaxed),
+                );
+                row.expect = Some(value);
+            }
+        }
+        // No snapshot is open, so nothing below the newest version is read.
+        let watermark = seqno.load(Ordering::Relaxed);
+        tree.flush_active_memtable(watermark)?;
+        let (before, moved_before) = (blob_bytes(), metrics.blob_bytes_relocated());
+        tree.major_compact(64 * 1_024 * 1_024, watermark)?;
+        let moved = metrics.blob_bytes_relocated() - moved_before;
+        relocated += moved;
+        reclaimed += before + i128::from(moved) - blob_bytes();
+    }
+    Ok(Churn {
+        relocated,
+        reclaimed,
     })
 }
