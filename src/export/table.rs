@@ -202,7 +202,13 @@ impl TableExport {
         let digest = crate::repair::compute_table_checksum_from(&*context.fs, path, live_from)?;
         // A digest that differs only by damage the data blocks' parity
         // repairs is accounted for: `frame` hands those blocks back repaired.
-        if digest != record.checksum && table.export_repaired_digest()? != Some(record.checksum) {
+        // Without the parity codec no damage can be.
+        #[cfg(feature = "page_ecc")]
+        let accounted =
+            digest == record.checksum || table.export_repaired_digest()? == Some(record.checksum);
+        #[cfg(not(feature = "page_ecc"))]
+        let accounted = digest == record.checksum;
+        if !accounted {
             return Err(crate::Error::ChecksumMismatch {
                 got: Checksum::from_raw(digest),
                 expected: Checksum::from_raw(record.checksum),

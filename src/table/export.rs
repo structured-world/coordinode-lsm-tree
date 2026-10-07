@@ -132,12 +132,6 @@ impl Table {
         Ok(Some(digest))
     }
 
-    /// Without the parity codec no damage can be accounted for.
-    #[cfg(not(feature = "page_ecc"))]
-    pub(crate) fn export_repaired_digest(&self) -> crate::Result<Option<u128>> {
-        Ok(None)
-    }
-
     pub(crate) fn export_sections(&self) -> crate::Result<Vec<Section>> {
         let mut file = self.export_file()?;
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
