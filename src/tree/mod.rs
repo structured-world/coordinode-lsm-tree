@@ -5357,9 +5357,13 @@ impl Tree {
             }
         }
 
+        // Table ids and L0 recency keys share one counter, and an ingested
+        // table's recency is an id taken at its install that no table carries:
+        // the next id has to be above both, or a flush after the reopen would
+        // lay out behind an ingestion it is newer than.
         let highest_table_id = version
             .iter_tables()
-            .map(Table::id)
+            .map(|table| table.id().max(table.l0_recency()))
             .max()
             .unwrap_or_default();
 

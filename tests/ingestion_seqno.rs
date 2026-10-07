@@ -116,6 +116,42 @@ fn an_ingestion_stays_ahead_of_a_flush_it_installs_after() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// An ingestion's L0 recency is an id taken at its install, which no table
+/// carries, and ids an abandoned ingestion took are never kept either. A
+/// flush after a reopen is newer than the ingestion all the same: with both
+/// holding one key at one sequence number, a read returns the flushed value.
+#[test]
+fn flush_after_a_reopen_lays_out_in_front_of_an_ingestion() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let visible_seqno = SequenceNumberCounter::default();
+    let open = || Config::new(&folder, seqno.clone(), visible_seqno.clone()).open();
+
+    let tie = {
+        let tree = open()?;
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write("k", "ingested")?;
+        // Takes table ids and is given up: no table keeps them.
+        let mut abandoned = tree.ingestion()?;
+        abandoned.write("x", "v")?;
+        drop(abandoned);
+        ingestion.finish()?;
+        tree.get_highest_persisted_seqno()
+            .expect("the ingestion is persisted")
+    };
+
+    let tree = open()?;
+    tree.insert("k", "flushed", tie);
+    visible_seqno.fetch_max(tie + 1);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(
+        tree.get("k", SeqNo::MAX)?.as_deref(),
+        Some(b"flushed".as_slice()),
+        "the flush made after the reopen is the newer write"
+    );
+    Ok(())
+}
+
 /// The global sequence numbers of the L0 runs, front to back, one per run.
 fn l0_run_seqnos(tree: &lsm_tree::AnyTree) -> Vec<SeqNo> {
     tree.current_version()
