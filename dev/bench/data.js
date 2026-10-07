@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791359473851,
+  "lastUpdate": 1791362317917,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -37502,6 +37502,90 @@ window.BENCHMARK_DATA = {
             "value": 337785.84734655655,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 14.2us | P99.9: 90.8us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b1e67d5a16af5cfadbcb47fa70a7aba41e6ec9c6",
+          "message": "fix(index_block): an upper bound keeps the block after the last one ending at it (#856)\n\n## Summary\n\n- An index upper bound covers every block that may hold a key up to it,\nfor every index restart interval: each block ending at or before the\nbound and the block after it. Snapshot ranges ending at a key whose\nversions span blocks no longer lose them.\n- The public `table::index_block::Iter::seek_upper` keeps the entry a\npreceding `seek` landed on and reports an empty range when the bound\nends before what is left.\n\nThe 5.x line got the same fix in #840.\n\n## Changes\n\n- `seek_upper`, `seek_upper_bound_cursor` and the table's index walk\nshare one bound, the one upstream fjall uses: every entry ending at or\nbefore the needle plus the first past it. The restart-interval trim\nalways keeps that next entry.\n- `seek_upper` keeps the front cache while its entry ends inside the\nbound and drops it otherwise; it answers whether either end still holds\nan entry, and `OwnedIndexBlockIter::seek_upper` goes through the same\ncheck.\n- Regression tests: snapshot ranges (forward and reverse) ending at a\nkey whose versions span blocks, over pinned, volatile and partitioned\nindexes with restart intervals 1 and 4; entries sharing one end key;\nexact matches keep the next entry; `seek` then `seek_upper` on one entry\nfor restart intervals 1 to 232; an upper bound below the seeked entry,\nand one behind the consumed front, walk nothing.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #838",
+          "timestamp": "2026-10-07T11:21:09+03:00",
+          "tree_id": "3d47a43d675e9b9ffc409a99facc9a887f00bbd9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b1e67d5a16af5cfadbcb47fa70a7aba41e6ec9c6"
+        },
+        "date": 1791362316700,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 85076.16942454118,
+            "unit": "ops/sec",
+            "extra": "P50: 0.8us | P99: 16.0us | P99.9: 42.4us\nthreads: 1 | elapsed: 6.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2462058.781678033,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 2.4us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 597477.3425164963,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 4.1us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 412379.18519279297,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 8.8us | P99.9: 32.2us\nthreads: 1 | elapsed: 0.48s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2289094.2707507056,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 203899.31649533796,
+            "unit": "ops/sec",
+            "extra": "P50: 3.6us | P99: 17.4us | P99.9: 42.3us\nthreads: 1 | elapsed: 0.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 109013.47028215944,
+            "unit": "ops/sec",
+            "extra": "P50: 6.9us | P99: 38.4us | P99.9: 55.3us\nthreads: 1 | elapsed: 1.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 631924.3505666055,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.4us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 698784.0022836261,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.9us | P99.9: 8.4us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 334503.48506219074,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 12.7us | P99.9: 91.1us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
           }
         ]
       }
