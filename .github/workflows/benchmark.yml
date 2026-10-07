@@ -146,9 +146,13 @@ jobs:
     # After the split, so the first store of a push lands in a data file that
     # already has its versioned suites; a dispatch skips the split and runs.
     needs: split-series
+    # Runs only in this repository and never on the code of a pull request
+    # from a fork: a self-hosted runner executes whatever the job checks out.
     if: >
       !cancelled() &&
-      (needs.split-series.result == 'success' || needs.split-series.result == 'skipped')
+      (needs.split-series.result == 'success' || needs.split-series.result == 'skipped') &&
+      github.repository == 'structured-world/coordinode-lsm-tree' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # Two passes in one job: (1) the single-engine db_bench trend (regression
     # guard + dev/bench dashboard) and (2) the RocksDB head-to-head compare
     # (public dev/compare overlay dashboard). The name reflects both so it does
