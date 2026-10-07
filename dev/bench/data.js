@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791375254040,
+  "lastUpdate": 1791377460193,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -39644,6 +39644,90 @@ window.BENCHMARK_DATA = {
             "value": 301818.9139485528,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 19.7us | P99.9: 100.7us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aa750c3a29956810eadacc8d474104eb5e506254",
+          "message": "fix(fuzz): port the AFL targets to the current API and type-check them in CI (#859)\n\n## Summary\n\n- The four AFL targets under `fuzz/` compile against the current API\nagain, and CI type-checks every fuzz crate so an API change that breaks\none fails the PR that makes it.\n\nStacked on the fix for #835 (and through it #827, which adds `fuzz` to\n`workspace.exclude` so the fuzz crates build at all). The `index_block`\nmodel follows the `seek_upper` bound fixed in #838; with that fix the\ntarget runs without a crash.\n\n## Changes\n\n- Ported targets: `compare_prefixed_slice` also drives the materialising\npath through a non-lexicographic and a reversed comparator;\n`index_block` lays blocks out back to back, fuzzes the restart interval\nand walks with the bounds both ways round; `table_read` writes to a\n`MemFs` and recovers with the checksum the writer returned.\n- The `data_block` and `table_read` models generate tombstones without a\nvalue, as blocks and tables store them.\n- `ParsedItem` is re-exported doc-hidden from `table::block`, so code\noutside the crate can turn the items the public block iterators yield\ninto values.\n- The lint job runs `clippy -D warnings` over every crate under `fuzz/`,\nsharing one target dir.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations (the crate and every fuzz crate), doc tests, the doc\nbuild, the no-std check, the sst-dump suite and the db_bench checks pass\non Linux.\n\nCloses #836\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Tests**\n* Expanded fuzz coverage for block encoding, table recovery, reads,\nscans, iteration, and range boundaries, including alternate key\nordering.\n* Fuzz tests now handle incomplete or invalid generated inputs safely\nand verify results across more cases.\n* **Chores**\n* Added a CI check that compiles fuzz targets and reports lint warnings\nas errors.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T15:23:54+03:00",
+          "tree_id": "ad749d47856ea1bef5eccdd5d6ffb8340e889589",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aa750c3a29956810eadacc8d474104eb5e506254"
+        },
+        "date": 1791377458276,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 74261.44107503093,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.4us | P99.9: 27.8us\nthreads: 1 | elapsed: 7.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2167001.275139395,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 610533.1834523211,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.2us | P99.9: 14.0us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 448004.6507900405,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.0us | P99.9: 38.7us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2278709.324910373,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 223305.4112693693,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 12.6us | P99.9: 44.7us\nthreads: 1 | elapsed: 0.90s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 125617.4614833718,
+            "unit": "ops/sec",
+            "extra": "P50: 6.7us | P99: 16.4us | P99.9: 85.4us\nthreads: 1 | elapsed: 1.59s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 571608.3977973516,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.4us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 613044.0772315871,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 10.1us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 275373.93580933596,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 14.3us | P99.9: 151.2us\nthreads: 1 | elapsed: 0.73s | num: 200000 | iterations: 3"
           }
         ]
       }
