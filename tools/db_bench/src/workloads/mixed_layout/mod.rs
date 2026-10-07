@@ -1090,6 +1090,9 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             fixture: fixtures::blobs_scattered,
             support: placement_support(config),
         },
+        // The pairs below compare engine byte counters, not time, and each
+        // builds its own tree in its own directory with its own cache, so the
+        // order they run in moves none of their figures.
         Scenario {
             name: "blobs-well-placed-churn",
             fixture: fixtures::blobs_well_placed,

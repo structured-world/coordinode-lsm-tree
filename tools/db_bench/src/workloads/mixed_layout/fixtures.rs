@@ -309,7 +309,8 @@ struct Opening {
     zone_map: bool,
     /// A cell column whose fields go to a blob file however small.
     separated_column: Option<u16>,
-    /// Blob values split into this many lifetime groups; one when `None`.
+    /// Blob values split into this many lifetime groups; the
+    /// `KvSeparationOptions` default (four) when `None`.
     lifetime_groups: Option<lsm_tree::config::LifetimeGroups>,
 }
 

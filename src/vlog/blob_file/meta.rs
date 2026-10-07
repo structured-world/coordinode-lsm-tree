@@ -228,6 +228,10 @@ impl Metadata {
             CompressionType::decode_from(&mut bytes)?
         };
 
+        // Required, with no default for an absent item: the engine reads only
+        // the current format, and a store from an earlier one is converted
+        // offline (its blob files get class 0 there), never read through a
+        // fallback here.
         let lifetime_class = {
             let bytes = block
                 .point_read(b"lifetime_class", SeqNo::MAX, &cmp)?

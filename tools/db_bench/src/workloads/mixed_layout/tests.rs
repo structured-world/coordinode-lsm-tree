@@ -127,7 +127,8 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
 
 /// The churn rounds rewrite the hot and warm keys, the compactions collect
 /// what they left stale, every value still reads as the write history says,
-/// and the default tree splits its values into more than one class.
+/// and the default tree splits its values into more than one class while
+/// reading exactly as a one-group tree given the same history.
 #[test]
 fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
     for (what, f) in [
@@ -166,9 +167,28 @@ fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
         .map(lsm_tree::BlobFile::lifetime_class)
         .collect();
     assert!(
-        classes.contains(&0),
-        "the hot keys went to the short-lived group: {classes:?}"
+        classes.contains(&0) && classes.len() > 1,
+        "the hot keys went to the short-lived group, the rest elsewhere: {classes:?}"
     );
+
+    // The same history in one group: grouping decides placement only, so
+    // every key and value reads back identically.
+    use lsm_tree::Guard as _;
+    let seqno = AtomicU64::new(1);
+    let mut one_group =
+        fixtures::blobs_well_placed_one_group(&config(), &seqno, &std::env::temp_dir())?;
+    fixtures::churn(&mut one_group, &seqno)?;
+    let contents = |fixture: &Fixture| -> lsm_tree::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        fixture
+            .tree
+            .iter(SeqNo::MAX, None)
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect()
+    };
+    assert_eq!(contents(&grouped)?, contents(&one_group)?);
     Ok(())
 }
 

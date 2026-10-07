@@ -22,11 +22,10 @@ fn open(
     folder: &std::path::Path,
     seqno: &SequenceNumberCounter,
     kv: KvSeparationOptions,
-) -> AnyTree {
+) -> lsm_tree::Result<AnyTree> {
     Config::new(folder, seqno.clone(), SequenceNumberCounter::default())
         .with_kv_separation(Some(kv.separation_threshold(64)))
         .open()
-        .expect("open")
 }
 
 fn groups(count: u8) -> LifetimeGroups {
@@ -63,7 +62,7 @@ fn flush_puts_overwritten_keys_in_the_short_lived_group() -> lsm_tree::Result<()
         folder.path(),
         &seqno,
         KvSeparationOptions::default().lifetime_groups(groups(3)),
-    );
+    )?;
 
     for key in ["hot-a", "hot-b", "hot-c"] {
         for version in 0..3 {
@@ -90,7 +89,7 @@ fn flush_puts_overwritten_keys_in_the_short_lived_group() -> lsm_tree::Result<()
 fn the_default_options_group_by_lifetime() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
-    let tree = open(folder.path(), &seqno, KvSeparationOptions::default());
+    let tree = open(folder.path(), &seqno, KvSeparationOptions::default())?;
 
     for version in 0..3 {
         tree.insert("hot", value("hot", version), seqno.next());
@@ -112,7 +111,7 @@ fn a_single_group_keeps_every_value_in_class_zero() -> lsm_tree::Result<()> {
         folder.path(),
         &seqno,
         KvSeparationOptions::default().lifetime_groups(LifetimeGroups::ONE),
-    );
+    )?;
 
     for version in 0..3 {
         tree.insert("hot", value("hot", version), seqno.next());
@@ -146,7 +145,7 @@ fn the_hint_overrides_the_observed_group() -> lsm_tree::Result<()> {
         KvSeparationOptions::default()
             .lifetime_groups(groups(3))
             .lifetime_hint(hint),
-    );
+    )?;
 
     // Overwritten, but hinted long-lived: group 1.
     for version in 0..3 {
@@ -183,7 +182,7 @@ fn relocation_moves_survivors_one_group_up() -> lsm_tree::Result<()> {
             .lifetime_groups(groups(3))
             .staleness_threshold(0.01)
             .age_cutoff(1.0),
-    );
+    )?;
 
     for i in 0..20 {
         tree.insert(format!("k{i:02}"), value("first", i), seqno.next());
@@ -247,13 +246,13 @@ fn a_hint_never_changes_reads_or_collection() -> lsm_tree::Result<()> {
         plain_folder.path(),
         &plain_seqno,
         gc().lifetime_groups(LifetimeGroups::ONE),
-    );
+    )?;
     let grouped = open(
         grouped_folder.path(),
         &grouped_seqno,
         gc().lifetime_groups(LifetimeGroups::MAX)
             .lifetime_hint(hint),
-    );
+    )?;
 
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     for round in 0..6u64 {
