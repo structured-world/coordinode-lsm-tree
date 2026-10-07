@@ -559,6 +559,47 @@ fn fifo_ttl_spares_tables_stamped_before_the_clock_started() -> crate::Result<()
     })
 }
 
+/// A compaction output that takes in a table stamped while the clock read
+/// zero is dated by the compaction that writes it: none of its data is newer
+/// than that, so a TTL counted from it expires nothing early, and the output
+/// still expires rather than staying forever.
+#[test]
+fn fifo_ttl_counts_an_undated_input_from_the_compaction() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    with_test_clock(|clock| {
+        clock.set_secs(0);
+        tree.insert("a", "v", 0);
+        tree.flush_active_memtable(0)?;
+        clock.set_secs(1_000);
+        tree.insert("b", "v", 1);
+        tree.flush_active_memtable(1)?;
+        clock.set_secs(5_000);
+        tree.major_compact(u64::MAX, 0)?;
+        assert_eq!(1, tree.table_count());
+
+        // The dated input alone would have expired the output at 1_010s.
+        clock.set_secs(5_009);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 2)?;
+        assert_eq!(1, tree.table_count(), "nothing expires before its time");
+
+        clock.set_secs(5_011);
+        tree.compact(Arc::new(Strategy::new(u64::MAX, Some(10))), 2)?;
+        assert_eq!(
+            0,
+            tree.table_count(),
+            "the output expires 10s after it was written"
+        );
+        Ok(())
+    })
+}
+
 /// The outputs of a major compaction of a KV-separated tree share its blob
 /// file, which goes only with the last of them. Counting its bytes as freed
 /// by the first output dropped stops the round with the file still on disk
@@ -620,29 +661,57 @@ fn fifo_counts_a_shared_blob_file_freed_only_with_its_last_table() -> crate::Res
 
 #[test]
 fn fifo_ttl_then_limit_additional_drops_blob_unit() -> crate::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let tree = Config::new(
-        dir.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
-    .open()?;
-
-    // Create two tables; we will expire them via time override and force additional drops via limit.
-    tree.insert("a", "$", 0);
-    tree.flush_active_memtable(0)?;
-    tree.insert("b", "$", 1);
-    tree.flush_active_memtable(1)?;
-
     with_test_clock(|clock| {
-        clock.set_secs(10_000_000);
+        // Two tables, each with its own blob file: the older one written long
+        // before the newer one, so a one-second TTL expires the older alone.
+        // Returns the tree and the on-disk size of the newer table's unit.
+        let two_tables = |dir: &std::path::Path| -> crate::Result<(crate::AnyTree, u64)> {
+            let tree = Config::new(
+                dir,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+            .open()?;
+            let disk = |tree: &crate::AnyTree| {
+                let version = tree.current_version();
+                version
+                    .iter_tables()
+                    .map(crate::table::Table::file_size)
+                    .sum::<u64>()
+                    + version.blob_files.on_disk_size()
+            };
+            clock.set_secs(1_000);
+            tree.insert("a", "$", 0);
+            tree.flush_active_memtable(0)?;
+            let older = disk(&tree);
+            clock.set_secs(10_000_000);
+            tree.insert("b", "$", 1);
+            tree.flush_active_memtable(1)?;
+            let newer = disk(&tree) - older;
+            Ok((tree, newer))
+        };
 
-        // TTL=1s will mark both expired; very small limit ensures size-based collection path is also exercised.
-        let fifo = Arc::new(Strategy::new(1, Some(1)));
-        tree.compact(fifo, 2)?;
+        // A limit the newer unit just fits: the TTL drop brings the tree
+        // within it, so the newer table stays. Counting the expired table's
+        // bytes against the limit as well would drop the newer one too.
+        let dir = tempfile::tempdir()?;
+        let (tree, newer) = two_tables(dir.path())?;
+        tree.compact(Arc::new(Strategy::new(newer, Some(1))), 2)?;
+        assert_eq!(1, tree.table_count(), "the TTL drop alone fits the limit");
+        assert_eq!(1, tree.blob_file_count());
 
+        // A one-byte limit: after the TTL drop the tree is still over it, so
+        // the same round drops the newer table too, with its blob file.
+        let dir = tempfile::tempdir()?;
+        let (tree, _) = two_tables(dir.path())?;
+        tree.compact(Arc::new(Strategy::new(1, Some(1))), 2)?;
         assert_eq!(0, tree.table_count());
+        assert_eq!(
+            0,
+            tree.blob_file_count(),
+            "the blob unit goes with its table"
+        );
         Ok(())
     })
 }

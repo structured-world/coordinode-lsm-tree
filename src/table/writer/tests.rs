@@ -2,6 +2,33 @@ use super::*;
 use crate::fs::StdFs;
 use test_log::test;
 
+/// An input stamped while the clock read zero has no age, so an output that
+/// meets it takes none from the inputs (the writer dates it by its clock): the
+/// newest age of the other inputs could be older than that input's data.
+#[test]
+fn an_input_with_no_age_leaves_the_output_to_the_clock() {
+    let key = |n: u32| UserKey::from(n.to_be_bytes().as_slice());
+    let inputs = vec![
+        InputAge {
+            min: key(0),
+            max: key(10),
+            created_at: 0,
+        },
+        InputAge {
+            min: key(5),
+            max: key(20),
+            created_at: 1_000,
+        },
+    ];
+    let mut sweep = AgeSweep::new(inputs, crate::comparator::default_comparator());
+    assert_eq!(sweep.age_of(&key(0), &key(8)), None, "both inputs met");
+    assert_eq!(
+        sweep.age_of(&key(15), &key(20)),
+        Some(1_000),
+        "only the dated input met"
+    );
+}
+
 /// The swept age of each output in an ascending chain must be what checking
 /// every input gives, for disjoint inputs, overlapping ones (an L0 table
 /// spanning many others), and outputs before, between and after them.
@@ -27,15 +54,21 @@ fn swept_ages_match_every_input_checked() {
         created_at: 100,
     });
     let comparator = crate::comparator::default_comparator();
+    // The newest age of the inputs met, or none when one of them has none.
     let naive = |first: &[u8], last: &[u8]| {
-        inputs
+        let met: Vec<u128> = inputs
             .iter()
             .filter(|input| {
                 comparator.compare(&input.min, last) != core::cmp::Ordering::Greater
                     && comparator.compare(&input.max, first) != core::cmp::Ordering::Less
             })
             .map(|input| input.created_at)
-            .max()
+            .collect();
+        if met.contains(&0) {
+            None
+        } else {
+            met.into_iter().max()
+        }
     };
     // One chain per output width, each output starting after the last ended.
     for width in [0u32, 1, 4, 9, 30, 200] {
