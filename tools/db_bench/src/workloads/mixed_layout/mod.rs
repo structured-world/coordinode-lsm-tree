@@ -1096,8 +1096,8 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             support: churn_support(config),
         },
         Scenario {
-            name: "blobs-well-placed-churn-grouped",
-            fixture: fixtures::blobs_well_placed_grouped,
+            name: "blobs-well-placed-churn-one-group",
+            fixture: fixtures::blobs_well_placed_one_group,
             support: churn_support(config),
         },
         Scenario {
@@ -1106,8 +1106,8 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             support: churn_support(config),
         },
         Scenario {
-            name: "blobs-scattered-churn-grouped",
-            fixture: fixtures::blobs_scattered_grouped,
+            name: "blobs-scattered-churn-one-group",
+            fixture: fixtures::blobs_scattered_one_group,
             support: churn_support(config),
         },
         Scenario {

@@ -84,12 +84,35 @@ fn flush_puts_overwritten_keys_in_the_short_lived_group() -> lsm_tree::Result<()
     Ok(())
 }
 
-/// Without grouping, the same writes produce class 0 only, in one file.
+/// The default options group values: the same writes split into the
+/// short-lived and the fresh group without any setting.
+#[test]
+fn the_default_options_group_by_lifetime() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let seqno = SequenceNumberCounter::default();
+    let tree = open(folder.path(), &seqno, KvSeparationOptions::default());
+
+    for version in 0..3 {
+        tree.insert("hot", value("hot", version), seqno.next());
+    }
+    tree.insert("still", value("still", 0), seqno.next());
+    tree.flush_active_memtable(seqno.get())?;
+
+    assert_eq!(classes(&tree), BTreeSet::from([0, 1]));
+    Ok(())
+}
+
+/// With grouping turned off, the same writes produce class 0 only, in one
+/// file.
 #[test]
 fn a_single_group_keeps_every_value_in_class_zero() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
-    let tree = open(folder.path(), &seqno, KvSeparationOptions::default());
+    let tree = open(
+        folder.path(),
+        &seqno,
+        KvSeparationOptions::default().lifetime_groups(LifetimeGroups::ONE),
+    );
 
     for version in 0..3 {
         tree.insert("hot", value("hot", version), seqno.next());
@@ -220,7 +243,11 @@ fn a_hint_never_changes_reads_or_collection() -> lsm_tree::Result<()> {
     };
     // Arbitrary on purpose: a wrong hint may only cost relocation work.
     let hint = LifetimeHint::new(|key: &[u8]| key.last().map(|b| b % 7));
-    let plain = open(plain_folder.path(), &plain_seqno, gc());
+    let plain = open(
+        plain_folder.path(),
+        &plain_seqno,
+        gc().lifetime_groups(LifetimeGroups::ONE),
+    );
     let grouped = open(
         grouped_folder.path(),
         &grouped_seqno,

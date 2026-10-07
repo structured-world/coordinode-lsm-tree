@@ -63,10 +63,13 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 16] = [
     ("blobs-well-placed", fixtures::blobs_well_placed),
     ("blobs-scattered", fixtures::blobs_scattered),
     (
-        "blobs-well-placed-grouped",
-        fixtures::blobs_well_placed_grouped,
+        "blobs-well-placed-one-group",
+        fixtures::blobs_well_placed_one_group,
     ),
-    ("blobs-scattered-grouped", fixtures::blobs_scattered_grouped),
+    (
+        "blobs-scattered-one-group",
+        fixtures::blobs_scattered_one_group,
+    ),
     ("cells-inline", fixtures::cells_inline),
     ("cells-wide", fixtures::cells_wide),
     ("cells-scattered", fixtures::cells_scattered),
@@ -124,15 +127,15 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
 
 /// The churn rounds rewrite the hot and warm keys, the compactions collect
 /// what they left stale, every value still reads as the write history says,
-/// and the grouped tree splits its values into more than one class.
+/// and the default tree splits its values into more than one class.
 #[test]
 fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
     for (what, f) in [
         (
-            "blobs-well-placed",
-            fixtures::blobs_well_placed as fixtures::FixtureFn,
+            "blobs-well-placed-one-group",
+            fixtures::blobs_well_placed_one_group as fixtures::FixtureFn,
         ),
-        ("blobs-scattered-grouped", fixtures::blobs_scattered_grouped),
+        ("blobs-scattered", fixtures::blobs_scattered),
     ] {
         let seqno = AtomicU64::new(1);
         let mut fixture = f(&config(), &seqno, &std::env::temp_dir())?;
@@ -153,8 +156,7 @@ fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
         assert_ordinary_read_agrees(&fixture, what);
     }
     let seqno = AtomicU64::new(1);
-    let mut grouped =
-        fixtures::blobs_well_placed_grouped(&config(), &seqno, &std::env::temp_dir())?;
+    let mut grouped = fixtures::blobs_well_placed(&config(), &seqno, &std::env::temp_dir())?;
     fixtures::churn(&mut grouped, &seqno)?;
     let classes: std::collections::BTreeSet<u8> = grouped
         .tree

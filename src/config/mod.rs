@@ -356,7 +356,7 @@ impl Default for KvSeparationOptions {
 
             locality_relocation: None,
 
-            lifetime_groups: LifetimeGroups::ONE,
+            lifetime_groups: LifetimeGroups::MAX,
             lifetime_hint: None,
 
             #[cfg(zstd_any)]
@@ -541,16 +541,33 @@ impl KvSeparationOptions {
     /// spreads keys that a range scan reads together over more files, so it
     /// trades scan locality for less relocation work.
     ///
-    /// Defaults to [`LifetimeGroups::ONE`]: no grouping.
+    /// Defaults to [`LifetimeGroups::MAX`], four groups. [`LifetimeGroups::ONE`]
+    /// turns grouping off: every value then shares the same files and no
+    /// device hint is given. Any count from one to [`LifetimeGroups::MAX`] is
+    /// accepted ([`LifetimeGroups::new`] refuses the rest), and a flush or a
+    /// relocation keeps at most that many files open per blob codec.
+    ///
+    /// The setting applies to the files written from now on and may change
+    /// between opens: a file keeps the class it was written with, and a class
+    /// above the configured groups counts as the last group.
     ///
     /// # Examples
     ///
     /// ```
     /// use lsm_tree::{KvSeparationOptions, config::LifetimeGroups};
     ///
-    /// let groups = LifetimeGroups::new(3).expect("within the bound");
-    /// let opts = KvSeparationOptions::default().lifetime_groups(groups);
-    /// assert_eq!(opts.lifetime_groups.get(), 3);
+    /// // Grouped by default.
+    /// assert_eq!(
+    ///     KvSeparationOptions::default().lifetime_groups,
+    ///     LifetimeGroups::MAX,
+    /// );
+    ///
+    /// // Fewer groups, or none at all.
+    /// let groups = LifetimeGroups::new(2).expect("within the bound");
+    /// let two = KvSeparationOptions::default().lifetime_groups(groups);
+    /// assert_eq!(two.lifetime_groups.get(), 2);
+    /// let off = KvSeparationOptions::default().lifetime_groups(LifetimeGroups::ONE);
+    /// assert_eq!(off.lifetime_groups.get(), 1);
     /// ```
     #[must_use]
     pub fn lifetime_groups(mut self, groups: LifetimeGroups) -> Self {

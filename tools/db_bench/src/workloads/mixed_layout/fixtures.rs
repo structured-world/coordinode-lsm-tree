@@ -741,9 +741,9 @@ pub fn blobs_well_placed(
     well_placed_blobs(config, seqno, base, None)
 }
 
-/// [`blobs_well_placed`] in a tree that splits its values into every lifetime
+/// [`blobs_well_placed`] in a tree that keeps every value in one lifetime
 /// group, the other side of the churn comparison.
-pub fn blobs_well_placed_grouped(
+pub fn blobs_well_placed_one_group(
     config: &BenchConfig,
     seqno: &AtomicU64,
     base: &Path,
@@ -752,7 +752,7 @@ pub fn blobs_well_placed_grouped(
         config,
         seqno,
         base,
-        Some(lsm_tree::config::LifetimeGroups::MAX),
+        Some(lsm_tree::config::LifetimeGroups::ONE),
     )
 }
 
@@ -1010,9 +1010,9 @@ pub fn blobs_scattered(
     scattered_blobs(config, seqno, base, None)
 }
 
-/// [`blobs_scattered`] in a tree that splits its values into every lifetime
+/// [`blobs_scattered`] in a tree that keeps every value in one lifetime
 /// group, the other side of the churn comparison.
-pub fn blobs_scattered_grouped(
+pub fn blobs_scattered_one_group(
     config: &BenchConfig,
     seqno: &AtomicU64,
     base: &Path,
@@ -1021,7 +1021,7 @@ pub fn blobs_scattered_grouped(
         config,
         seqno,
         base,
-        Some(lsm_tree::config::LifetimeGroups::MAX),
+        Some(lsm_tree::config::LifetimeGroups::ONE),
     )
 }
 

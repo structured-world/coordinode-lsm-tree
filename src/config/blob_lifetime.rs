@@ -15,11 +15,11 @@ pub struct LifetimeGroups(u8);
 
 impl LifetimeGroups {
     /// One group: every value shares the same files, as without lifetime
-    /// grouping. The default.
+    /// grouping.
     pub const ONE: Self = Self(1);
 
     /// The largest number of groups, one per [`WriteLifetime`] a device can be
-    /// told about.
+    /// told about. The default.
     pub const MAX: Self = Self(4);
 
     /// `count` groups, or `None` when `count` is zero or above [`Self::MAX`].
@@ -88,7 +88,7 @@ impl LifetimeGroups {
 
 impl Default for LifetimeGroups {
     fn default() -> Self {
-        Self::ONE
+        Self::MAX
     }
 }
 
