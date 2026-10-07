@@ -1116,11 +1116,13 @@ pub struct Churn {
 ///
 /// One key in ten is hot: rewritten three times a round, so the flush finds
 /// it overwritten. One in ten is warm: rewritten once every other round. The
-/// rest keep the value the fixture wrote. Each round's compaction collects
-/// what the rewrites left stale, relocating the live values of the files it
-/// picks, and that relocation is the cost lifetime grouping is meant to cut:
-/// a file holding only hot values dies whole and is dropped, one mixing them
-/// with stable values has to be copied.
+/// rest keep the value the fixture wrote. Each round also appends new keys
+/// that are never rewritten, so a flush mixes values that die by the next
+/// round with values that live on, as an ingesting workload does. Each
+/// round's compaction collects what the rewrites left stale, relocating the
+/// live values of the files it picks, and that relocation is the cost
+/// lifetime grouping is meant to cut: a file holding only hot values dies
+/// whole and is dropped, one mixing them with stable values has to be copied.
 ///
 /// The oracle follows every rewrite, so the scan after it still checks every
 /// value.
@@ -1130,9 +1132,28 @@ pub fn churn(fixture: &mut Fixture, seqno: &AtomicU64) -> lsm_tree::Result<Churn
     let metrics = tree.metrics();
     let blob_bytes = || i128::from(tree.current_version().blob_files.on_disk_size());
     let (mut relocated, mut reclaimed) = (0, 0);
+    // As many new keys a round as there are hot ones: half of what a flush
+    // writes lives on, half dies at the next round.
+    let base = fixture.oracle.rows.len() as u64;
+    let appended = base.div_ceil(10);
     for round in 1..=ROUNDS {
+        // Appended after every existing key, so the oracle stays in key order.
+        let first = base + (round - 1) * appended;
+        for i in first..first + appended {
+            let value = Value {
+                seed: i + round * 1_000_000,
+                len: HEADER_LEN + 8_192,
+            };
+            tree.insert(key(i), value.bytes(), seqno.fetch_add(1, Ordering::Relaxed));
+            fixture.oracle.rows.push(Row {
+                key: key(i),
+                expect: Some(value),
+                selected: group_of(i) == 0,
+            });
+        }
         for rep in 0..3_u64 {
-            for (i, row) in (0_u64..).zip(fixture.oracle.rows.iter_mut()) {
+            // Only the fixture's own keys churn; the appended ones stay put.
+            for (i, row) in (0_u64..base).zip(fixture.oracle.rows.iter_mut()) {
                 let warm = i % 10 == 1 && rep == 0 && round % 2 == 0;
                 if i % 10 != 0 && !warm {
                     continue;

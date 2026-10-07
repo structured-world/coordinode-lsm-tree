@@ -141,9 +141,13 @@ fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
             churned.reclaimed > 0,
             "{what}: the compactions removed stale files"
         );
+        assert!(
+            fixture.oracle.rows.len() as u64 > N,
+            "{what}: churn appends keys"
+        );
         assert_eq!(
             super::scan_all(&fixture)?,
-            N,
+            fixture.oracle.visible(),
             "{what}: every key reads back"
         );
         assert_ordinary_read_agrees(&fixture, what);
@@ -356,19 +360,16 @@ fn blob_placement_scenarios_zero_cache_report_unsupported() {
         super::scenarios(config)
             .into_iter()
             .filter(|s| s.name.starts_with("blobs-") && s.name != "blobs-filtered-before-fetch")
-            .map(|s| matches!(s.support, super::Support::Native(_)))
+            .map(|s| matches!(s.support, super::Support::Native(_) | super::Support::Churn))
             .collect::<Vec<_>>()
     };
     let cold = BenchConfig {
         cache_mb: 0,
         ..config()
     };
-    assert_eq!(placement(&cold), vec![false, false], "zero cache");
-    assert_eq!(
-        placement(&config()),
-        vec![true, true],
-        "a cache enables them"
-    );
+    // The two placement scans and the four churn passes, which end in one.
+    assert_eq!(placement(&cold), vec![false; 6], "zero cache");
+    assert_eq!(placement(&config()), vec![true; 6], "a cache enables them");
 }
 
 #[test]
