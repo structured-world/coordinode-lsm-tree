@@ -294,7 +294,7 @@ impl FsFile for File {
 /// which `libc` does not export. The argument is a pointer to a `u64`, as that
 /// header declares.
 #[cfg(target_os = "linux")]
-pub(crate) fn set_write_lifetime_fd(fd: i32, lifetime: super::WriteLifetime) -> io::Result<()> {
+fn set_write_lifetime_fd(fd: i32, lifetime: super::WriteLifetime) -> io::Result<()> {
     const F_SET_RW_HINT: libc::c_int = 1024 + 12;
     let hint: u64 = match lifetime {
         super::WriteLifetime::Short => 2,
