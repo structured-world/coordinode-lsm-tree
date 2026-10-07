@@ -540,6 +540,17 @@ impl BlobFile {
         self.0.meta.compression
     }
 
+    /// The lifetime class this file's values were written under; `0` is the
+    /// shortest-lived. See
+    /// [`KvSeparationOptions::lifetime_groups`](crate::KvSeparationOptions::lifetime_groups).
+    ///
+    /// It decides only where a relocation writes the values, never whether
+    /// the file may be collected.
+    #[must_use]
+    pub fn lifetime_class(&self) -> u8 {
+        self.0.meta.lifetime_class
+    }
+
     /// The file's decoded metadata block (counters, key range, compression).
     #[must_use]
     pub(crate) fn meta(&self) -> &Metadata {

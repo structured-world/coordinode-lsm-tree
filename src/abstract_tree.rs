@@ -673,6 +673,17 @@ pub trait AbstractTree: sealed::Sealed {
                 .collect::<Vec<_>>(),
             self.tree_config().comparator.clone(),
         );
+        // Observed under the stream, which drops the versions that show a key
+        // was overwritten; only a blob tree that groups values by lifetime
+        // asks.
+        let overwritten = crate::blob_tree::overwritten::OverwrittenKeys::default();
+        let marks = self
+            .tree_config()
+            .kv_separation_opts
+            .as_ref()
+            .is_some_and(|kv| kv.lifetime_classifier().is_grouping())
+            .then_some(&overwritten);
+        let merger = crate::blob_tree::overwritten::MarkOverwritten::new(merger, marks);
         // RT suppression is not needed here: flush writes both entries and RTs
         // to the output tables. Suppression happens at read time, not write time.
         let stream = CompactionStream::new(merger, gc_watermark)
@@ -686,9 +697,13 @@ pub trait AbstractTree: sealed::Sealed {
         drop(version_history);
 
         let has_range_tombstones = !range_tombstones.is_empty();
-        if let Some((tables, blob_files, write_pin)) =
-            self.flush_to_tables_with_rt(stream, range_tombstones, flushed.keys, flushed.hashes)?
-        {
+        if let Some((tables, blob_files, write_pin)) = self.flush_to_tables_with_rt(
+            stream,
+            range_tombstones,
+            flushed.keys,
+            flushed.hashes,
+            marks,
+        )? {
             // A writer given range tombstones and no key writes a table around
             // them, so a flush that acknowledges a deletion has put it on disk.
             debug_assert!(
@@ -977,13 +992,14 @@ pub trait AbstractTree: sealed::Sealed {
             .size_hint()
             .1
             .map_or(0, |upper| u64::try_from(upper).unwrap_or(u64::MAX));
-        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys)
+        self.flush_to_tables_with_rt(stream, Vec::new(), keys, keys, None)
     }
 
     /// Like [`AbstractTree::flush_to_tables`], but also writes range tombstones.
     /// `keys` bounds the distinct keys of `stream` from above and `hashes` the
     /// filter hashes over them, zero when unknown: a filter advisor keeps room
-    /// for every table the flush writes by them.
+    /// for every table the flush writes by them. `overwritten`, when given,
+    /// names the keys of `stream` its source held more than one version of.
     ///
     /// This is an internal extension hook on the crate's sealed tree types and
     /// is hidden from generated documentation.
@@ -998,6 +1014,7 @@ pub trait AbstractTree: sealed::Sealed {
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
         hashes: u64,
+        overwritten: Option<&crate::blob_tree::overwritten::OverwrittenKeys>,
     ) -> crate::Result<Option<FlushToTablesResult>>;
 
     /// Atomically registers flushed tables into the tree, removing their associated sealed memtables.

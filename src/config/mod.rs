@@ -2,6 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+pub(crate) mod blob_lifetime;
 mod block_size;
 mod column_encoding;
 mod compression;
@@ -12,6 +13,7 @@ mod locator;
 mod pinning;
 mod restart_interval;
 
+pub use blob_lifetime::{LifetimeGroups, LifetimeHint, LifetimeHintFn};
 pub use block_size::{BlockSizePolicy, MAX_BLOCK_SIZE};
 pub use column_encoding::{ColumnEncoding, ColumnEncodingPolicy};
 pub use compression::CompressionPolicy;
@@ -302,6 +304,16 @@ pub struct KvSeparationOptions {
     #[doc(hidden)]
     pub locality_relocation: Option<BlobLocalityRelocation>,
 
+    /// How many lifetime groups values are split into. See
+    /// [`Self::lifetime_groups`].
+    #[doc(hidden)]
+    pub lifetime_groups: LifetimeGroups,
+
+    /// The caller's lifetime class per key, over the observed one. See
+    /// [`Self::lifetime_hint`].
+    #[doc(hidden)]
+    pub lifetime_hint: Option<LifetimeHint>,
+
     /// A zstd dictionary to register with the tree at open, for the blob
     /// compression to name. See [`Self::dict`].
     #[cfg(zstd_any)]
@@ -343,6 +355,9 @@ impl Default for KvSeparationOptions {
             scan_prefetch: 64,
 
             locality_relocation: None,
+
+            lifetime_groups: LifetimeGroups::MAX,
+            lifetime_hint: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -409,6 +424,15 @@ impl KvSeparationOptions {
             None => self.cell_separation_thresholds.push((column, bytes)),
         }
         self
+    }
+
+    /// What picks the lifetime class of a value written now.
+    #[must_use]
+    pub(crate) fn lifetime_classifier(&self) -> blob_lifetime::LifetimeClassifier<'_> {
+        blob_lifetime::LifetimeClassifier {
+            groups: self.lifetime_groups,
+            hint: self.lifetime_hint.as_ref(),
+        }
     }
 
     /// The separation threshold of the fields of `column`.
@@ -490,6 +514,102 @@ impl KvSeparationOptions {
     #[must_use]
     pub fn relocate_for_locality(mut self, max_depth: core::num::NonZeroU64, budget: f32) -> Self {
         self.locality_relocation = Some(BlobLocalityRelocation { max_depth, budget });
+        self
+    }
+
+    /// Splits blob values into `groups` by how long they are expected to
+    /// live, each group written to its own blob files.
+    ///
+    /// A blob file is reclaimed as a whole, so a value that lives long and
+    /// shares a file with values that are overwritten quickly is copied
+    /// forward every time that file is collected. Grouping keeps the two apart:
+    ///
+    /// - group `0` takes values a flush finds overwritten within the memtable
+    ///   it writes, which are likely to be overwritten again soon;
+    /// - group `1` takes every other value written for the first time;
+    /// - a value relocated out of a file moves one group up, having outlived
+    ///   it, up to the last group.
+    ///
+    /// [`Self::lifetime_hint`] overrides the observed group per key. On Linux
+    /// the device is also told each file's expected lifetime
+    /// (`F_SET_RW_HINT`), which a flash device uses to keep data that dies
+    /// together in the same erase blocks.
+    ///
+    /// The group only decides where a value is written. Which values are
+    /// visible, and when a blob file may be removed, follows references and
+    /// retention exactly as without grouping. Separating values by lifetime
+    /// spreads keys that a range scan reads together over more files, so it
+    /// trades scan locality for less relocation work.
+    ///
+    /// Defaults to [`LifetimeGroups::MAX`], four groups. [`LifetimeGroups::ONE`]
+    /// turns grouping off: every value then shares the same files and no
+    /// device hint is given. Any count from one to [`LifetimeGroups::MAX`] is
+    /// accepted ([`LifetimeGroups::new`] refuses the rest), and a flush or a
+    /// relocation keeps at most that many files open per blob codec.
+    ///
+    /// The setting applies to the files written from now on and may change
+    /// between opens: a file keeps the class it was written with, and a class
+    /// above the configured groups counts as the last group.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{KvSeparationOptions, config::LifetimeGroups};
+    ///
+    /// // Grouped by default.
+    /// assert_eq!(
+    ///     KvSeparationOptions::default().lifetime_groups,
+    ///     LifetimeGroups::MAX,
+    /// );
+    ///
+    /// // Fewer groups, or none at all.
+    /// let groups = LifetimeGroups::new(2).expect("within the bound");
+    /// let two = KvSeparationOptions::default().lifetime_groups(groups);
+    /// assert_eq!(two.lifetime_groups.get(), 2);
+    /// let off = KvSeparationOptions::default().lifetime_groups(LifetimeGroups::ONE);
+    /// assert_eq!(off.lifetime_groups.get(), 1);
+    /// ```
+    #[must_use]
+    pub fn lifetime_groups(mut self, groups: LifetimeGroups) -> Self {
+        self.lifetime_groups = groups;
+        self
+    }
+
+    /// Sets the caller's estimate of each key's lifetime class, used over
+    /// the observed one wherever it answers (see [`Self::lifetime_groups`]).
+    ///
+    /// `hint` returns the class for a key, `0` for the shortest-lived; a class
+    /// past the last group goes to the last group, and `None` leaves the key
+    /// to the observed estimate. The hint is advisory: a wrong one costs
+    /// relocation work and never changes what a read returns. It has no effect
+    /// with a single group.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{
+    ///     KvSeparationOptions,
+    ///     config::{LifetimeGroups, LifetimeHint},
+    /// };
+    ///
+    /// // Session payloads churn, archived objects stay.
+    /// let hint = LifetimeHint::new(|key: &[u8]| {
+    ///     if key.starts_with(b"session/") {
+    ///         Some(0)
+    ///     } else if key.starts_with(b"archive/") {
+    ///         Some(3)
+    ///     } else {
+    ///         None
+    ///     }
+    /// });
+    /// let opts = KvSeparationOptions::default()
+    ///     .lifetime_groups(LifetimeGroups::MAX)
+    ///     .lifetime_hint(hint);
+    /// assert!(opts.lifetime_hint.is_some());
+    /// ```
+    #[must_use]
+    pub fn lifetime_hint(mut self, hint: LifetimeHint) -> Self {
+        self.lifetime_hint = Some(hint);
         self
     }
 

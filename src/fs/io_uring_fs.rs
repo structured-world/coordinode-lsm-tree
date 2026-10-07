@@ -568,6 +568,10 @@ impl FsFile for IoUringFile {
         FsFile::start_writeback(&self.file, offset, len)
     }
 
+    fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
+        FsFile::set_write_lifetime(&self.file, lifetime)
+    }
+
     fn lock_exclusive(&self) -> crate::io::Result<()> {
         // Delegate to the platform-specific FsFile impl for std::fs::File.
         FsFile::lock_exclusive(&self.file)

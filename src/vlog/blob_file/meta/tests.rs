@@ -24,6 +24,7 @@ fn test_blob_file_meta_retired_version_rejected() {
         total_uncompressed_bytes: 8,
         key_range: KeyRange::new((b"a"[..].into(), b"z"[..].into())),
         compression: CompressionType::None,
+        lifetime_class: 0,
     };
     let mut buf = Vec::new();
     metadata.encode_into(&mut buf).unwrap();
@@ -61,6 +62,7 @@ fn test_blob_file_meta_missing_field_returns_err() {
         meta("item_count", &100u64.to_le_bytes()),
         meta("key#max", b"z"),
         meta("key#min", b"a"),
+        meta("lifetime_class", &[0u8]),
         meta("uncompressed_size", &2048u64.to_le_bytes()),
     ];
 
@@ -102,6 +104,7 @@ fn test_blob_file_meta_corrupted_trailer_returns_err() {
         total_compressed_bytes: 1024,
         total_uncompressed_bytes: 2048,
         key_range: KeyRange::new((b"a".into(), b"z".into())),
+        lifetime_class: 0,
     };
 
     let mut buf = Vec::new();
@@ -140,6 +143,8 @@ fn test_blob_file_meta_roundtrip() {
         total_compressed_bytes: 1024,
         total_uncompressed_bytes: 2048,
         key_range: KeyRange::new((b"a".into(), b"z".into())),
+        // Non-zero so the roundtrip proves the class is encoded, not defaulted.
+        lifetime_class: 2,
     };
 
     let mut buf = Vec::new();

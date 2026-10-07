@@ -276,6 +276,7 @@ fn blob_scanner_rejects_retired_blob_magic_frame() -> crate::Result<()> {
             total_uncompressed_bytes: value.len() as u64,
             key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
             compression: crate::CompressionType::None,
+            lifetime_class: 0,
         };
         metadata.encode_into(&mut sfa_writer)?;
         let inner = sfa_writer.into_inner()?;
@@ -340,6 +341,7 @@ fn blob_scanner_rejects_oversized_on_disk_len() -> crate::Result<()> {
             total_uncompressed_bytes: 2,
             key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
             compression: crate::CompressionType::None,
+            lifetime_class: 0,
         };
         metadata.encode_into(&mut sfa_writer)?;
         sfa_writer.into_inner()?.sync_all()?;
@@ -395,6 +397,7 @@ fn blob_scanner_rejects_a_partial_header_at_the_section_boundary() -> crate::Res
             total_uncompressed_bytes: 0,
             key_range: crate::KeyRange::new((b"a"[..].into(), b"a"[..].into())),
             compression: crate::CompressionType::None,
+            lifetime_class: 0,
         };
         metadata.encode_into(&mut sfa_writer)?;
         sfa_writer.into_inner()?.sync_all()?;

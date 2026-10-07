@@ -96,6 +96,49 @@ fn blob_tree_major_compact_relocation_simple() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The bytes a relocating compaction copies forward are counted once the
+/// rewrite is installed, and a compaction that relocates nothing counts none.
+#[cfg(feature = "metrics")]
+#[test]
+fn blob_relocation_counts_the_bytes_it_moves() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let big_value = b"neptune!".repeat(128_000);
+    let new_big_value = b"winter!".repeat(128_000);
+
+    let tree = lsm_tree::Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(KvSeparationOptions::default().age_cutoff(1.0)))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?;
+
+    tree.insert("big", &big_value, 0);
+    tree.insert("big2", &big_value, 0);
+    tree.flush_active_memtable(0)?;
+    tree.insert("big", &new_big_value, 1);
+    tree.flush_active_memtable(0)?;
+
+    // Records the stale value; the file is not rewritten yet.
+    tree.major_compact(64_000_000, 1_000)?;
+    assert_eq!(0, tree.metrics().blob_bytes_relocated());
+
+    // Rewrites the first file: `big2` is copied forward, the stale `big` is not.
+    tree.major_compact(64_000_000, 1_000)?;
+    let moved = tree.metrics().blob_bytes_relocated();
+    assert!(
+        moved >= big_value.len() as u64,
+        "the live value was copied: {moved}"
+    );
+    assert!(
+        moved < 2 * big_value.len() as u64,
+        "the stale value was not copied: {moved}"
+    );
+    assert_eq!(&*tree.get("big2", SeqNo::MAX)?.expect("kept"), big_value);
+    Ok(())
+}
+
 #[test]
 fn blob_tree_major_compact_relocation_repeated_key() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

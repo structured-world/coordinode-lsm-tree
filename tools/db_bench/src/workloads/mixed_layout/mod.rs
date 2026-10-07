@@ -101,6 +101,10 @@ enum Support {
     /// Runs, through this repeated pass, which also reports the P50 and P99
     /// of its repetitions.
     Latency(LatencyFn),
+    /// Rewrites the fixture in rounds of flushes and compactions, reports what
+    /// collecting the stale blobs cost, then measures a full scan of what is
+    /// left, so placement's two costs come from one run.
+    Churn,
     /// The capability it measures has not landed. Carries the reason, which
     /// names the missing piece rather than saying "skipped". There is no read
     /// pass to hold, which is the point of pairing the two in one enum: a
@@ -952,6 +956,65 @@ fn placement_support(config: &BenchConfig) -> Support {
     }
 }
 
+/// The churn pass, under the same condition as the placement scans: the scan
+/// it ends with shows placement only through the blob prefetch.
+fn churn_support(config: &BenchConfig) -> Support {
+    if config.cache_mb == 0 {
+        Support::Missing(PLACEMENT_NEEDS_CACHE)
+    } else {
+        Support::Churn
+    }
+}
+
+/// Builds a churn scenario's fixture, rewrites it with [`fixtures::churn`],
+/// reports the relocated bytes per reclaimed byte, and measures a verified
+/// full scan of the result.
+fn run_churn(
+    name: &str,
+    fixture: FixtureFn,
+    config: &BenchConfig,
+    seqno: &AtomicU64,
+    dir: &Path,
+    reporter: &mut Reporter,
+) -> lsm_tree::Result<()> {
+    let mut fixture = fixture(config, seqno, dir)?;
+    let t = Instant::now();
+    let churned = fixtures::churn(&mut fixture, seqno)?;
+    let keys = fixture.oracle.rows.len() as u64;
+    let readings = Readings::measure(&fixture.tree, keys, || scan_all(&fixture))?;
+    reporter.record_duration(t.elapsed());
+    readings.report(name);
+    readings.publish(name, reporter);
+
+    let blob_files = fixture.tree.current_version().blob_files.len();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts far below f64's exact range"
+    )]
+    let per_reclaimed =
+        (churned.reclaimed > 0).then(|| churned.relocated as f64 / churned.reclaimed as f64);
+    eprintln!(
+        "  {:<34} relocated={} B reclaimed={} B relocated/reclaimed={} blob files={blob_files}",
+        "",
+        churned.relocated,
+        churned.reclaimed,
+        fmt_ratio(per_reclaimed, 3),
+    );
+    if let Some(value) = per_reclaimed {
+        reporter.publish_series(
+            format!("{name} relocated bytes per reclaimed byte"),
+            value,
+            "B/B",
+            format!(
+                "keys: {keys} | relocated: {} B | reclaimed: {} B | blob files: {blob_files}",
+                churned.relocated, churned.reclaimed,
+            ),
+            Suite::Costs,
+        );
+    }
+    Ok(())
+}
+
 /// Every scenario, in the order the report prints them.
 ///
 /// The unsupported verdicts are the honest statement of where the engine is.
@@ -1026,6 +1089,29 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             name: "blobs-scattered",
             fixture: fixtures::blobs_scattered,
             support: placement_support(config),
+        },
+        // The pairs below compare engine byte counters, not time, and each
+        // builds its own tree in its own directory with its own cache, so the
+        // order they run in moves none of their figures.
+        Scenario {
+            name: "blobs-well-placed-churn",
+            fixture: fixtures::blobs_well_placed,
+            support: churn_support(config),
+        },
+        Scenario {
+            name: "blobs-well-placed-churn-one-group",
+            fixture: fixtures::blobs_well_placed_one_group,
+            support: churn_support(config),
+        },
+        Scenario {
+            name: "blobs-scattered-churn",
+            fixture: fixtures::blobs_scattered,
+            support: churn_support(config),
+        },
+        Scenario {
+            name: "blobs-scattered-churn-one-group",
+            fixture: fixtures::blobs_scattered_one_group,
+            support: churn_support(config),
         },
         Scenario {
             name: "blobs-filtered-before-fetch",
@@ -1220,6 +1306,9 @@ impl Workload for MixedLayout {
                             Suite::Timings,
                         );
                     }
+                }
+                Support::Churn => {
+                    run_churn(name, scenario.fixture, config, seqno, fixtures_in, reporter)?;
                 }
                 Support::Missing(reason) => {
                     // The fixture is NOT built here. It exists, and the tests

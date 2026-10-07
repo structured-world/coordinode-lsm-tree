@@ -6,6 +6,7 @@ pub mod field_row;
 mod gc;
 pub mod handle;
 pub mod ingest;
+pub(crate) mod overwritten;
 pub(crate) mod released;
 
 #[doc(hidden)]
@@ -1564,6 +1565,7 @@ impl AbstractTree for BlobTree {
         range_tombstones: Vec<crate::range_tombstone::RangeTombstone>,
         keys: u64,
         hashes: u64,
+        overwritten: Option<&overwritten::OverwrittenKeys>,
     ) -> crate::Result<
         Option<(
             Vec<Table>,
@@ -1720,7 +1722,8 @@ impl AbstractTree for BlobTree {
             .use_target_size(kv_opts.file_target_size)
             .use_compression(rc.blob_compression)
             .use_sync_mode(self.index.config.sync_mode)
-            .use_writeback_bytes(self.index.config.writeback_bytes);
+            .use_writeback_bytes(self.index.config.writeback_bytes)
+            .use_lifetime_groups(kv_opts.lifetime_groups);
             #[cfg(zstd_any)]
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)
@@ -1730,6 +1733,8 @@ impl AbstractTree for BlobTree {
         };
 
         let separation_threshold = kv_opts.separation_threshold;
+        let lifetime = kv_opts.lifetime_classifier();
+        let comparator = &self.index.config.comparator;
 
         // Set range tombstones BEFORE writing KV items so that if MultiWriter
         // rotates to a new table during the write loop, earlier tables already
@@ -1738,6 +1743,11 @@ impl AbstractTree for BlobTree {
 
         for item in stream {
             let item = item?;
+
+            // Asked for every key, separated or not, so the queue forgets each
+            // key once the flush has passed it.
+            let overwritten = overwritten
+                .is_some_and(|keys| keys.take_before_and_check(&item.key.user_key, comparator));
 
             if item.is_tombstone() {
                 // NOTE: Still need to add tombstone to index tree
@@ -1749,12 +1759,16 @@ impl AbstractTree for BlobTree {
             let value = item.value;
 
             if item.key.value_type.is_cell_row() {
+                let class = lifetime.class_of(&item.key.user_key, overwritten);
                 // Each cell is weighed on its own: the large ones go to the
                 // blob file and the row keeps owning references to them.
                 let row = field_row::separate_row(
                     &value,
                     |column| kv_opts.cell_threshold(column),
-                    |bytes| blob_writer.write(&item.key.user_key, item.key.seqno, bytes),
+                    |bytes| {
+                        blob_writer.select_lifetime_class(class)?;
+                        blob_writer.write(&item.key.user_key, item.key.seqno, bytes)
+                    },
                 )?
                 .map_or(value, UserValue::from);
                 table_writer.write(InternalValue::new(item.key, row.clone()))?;
@@ -1769,6 +1783,8 @@ impl AbstractTree for BlobTree {
             // operand stored as one would stop merging onto its base.
             if item.key.value_type == crate::ValueType::Value && value_size >= separation_threshold
             {
+                blob_writer
+                    .select_lifetime_class(lifetime.class_of(&item.key.user_key, overwritten))?;
                 let vhandle = blob_writer.write(&item.key.user_key, item.key.seqno, &value)?;
 
                 let indirection = BlobIndirection {

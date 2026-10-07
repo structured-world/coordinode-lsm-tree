@@ -456,6 +456,9 @@ pub(super) struct ProducedOutput {
     /// install for the references read before it (see
     /// [`crate::blob_tree::released`]).
     released_objects: Vec<crate::vlog::ValueHandle>,
+    /// On-disk blob bytes this output's relocation copied into new blob
+    /// files, charged to the tree's metrics once the output is installed.
+    relocated_bytes: u64,
 }
 
 #[cfg_attr(
@@ -490,6 +493,12 @@ impl ProducedOutput {
     /// tight-space loop punches and resumes each stale file at these offsets.
     pub(super) fn consumed_through(&self) -> &crate::HashMap<BlobFileId, u64> {
         &self.consumed_through
+    }
+
+    /// The on-disk blob bytes this output's relocation copied, for the
+    /// tight-space loop, which installs its slices itself.
+    pub(super) fn relocated_bytes(&self) -> u64 {
+        self.relocated_bytes
     }
 
     /// Records that the user compaction filter transformed at least one row of
@@ -541,6 +550,7 @@ impl ProducedOutput {
             // The source's filter is reused verbatim, not sized again.
             filter_sizing: None,
             released_objects: Vec::new(),
+            relocated_bytes: 0,
         }
     }
 }
@@ -583,6 +593,7 @@ pub(super) fn install_merge(
     let mut blob_frag_map = FragmentationMap::default();
     let mut filter_transformed = false;
     let mut collected_below_watermark = false;
+    let mut relocated_bytes = 0;
     // Held to the end of the install, success or failure: the filter budget
     // keeps the outputs' room until then.
     let mut filter_sizings = Vec::new();
@@ -590,6 +601,7 @@ pub(super) fn install_merge(
     let mut released_objects = Vec::new();
     for out in outputs {
         released_objects.extend(out.released_objects);
+        relocated_bytes += out.relocated_bytes;
         filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
@@ -762,6 +774,12 @@ pub(super) fn install_merge(
             .released()
             .record(published, released_objects, []);
     }
+    #[cfg(feature = "metrics")]
+    opts.metrics
+        .blob_bytes_relocated
+        .fetch_add(relocated_bytes, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "metrics"))]
+    let _ = relocated_bytes;
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -822,11 +840,12 @@ pub struct RelocatingCompaction {
     inner: StandardCompaction,
     blob_scanner: Peekable<BlobFileMergeScanner>,
     blob_writer: BlobFileWriter,
-    /// Codec of each file being rewritten, by id. Relocation copies frames
-    /// VERBATIM, so the output file must record the codec of the SOURCE those
-    /// frames came from; the current blob policy describes what would be
-    /// written fresh, which is a different question and need not agree.
-    rewriting_blob_file_codecs: crate::HashMap<BlobFileId, crate::CompressionType>,
+    /// Codec of each file being rewritten, by id, and the lifetime class its
+    /// relocated values go to. Relocation copies frames VERBATIM, so the
+    /// output file must record the codec of the SOURCE those frames came from;
+    /// the current blob policy describes what would be written fresh, which is
+    /// a different question and need not agree.
+    rewriting_blob_file_outputs: crate::HashMap<BlobFileId, (crate::CompressionType, u8)>,
     rewriting_blob_files: Vec<BlobFile>,
     /// Paces relocated-blob I/O. The merge loop's limiter only sees the
     /// encoded handle in `item.value`; the real payload moved here is
@@ -861,6 +880,9 @@ pub struct RelocatingCompaction {
     cell_copies: crate::HashMap<crate::vlog::ValueHandle, BlobIndirection>,
     /// The key `cell_copies` belongs to.
     cell_copies_key: Option<crate::UserKey>,
+    /// On-disk bytes of the frames copied into the new blob file so far,
+    /// whole values and cell-row objects alike.
+    relocated_bytes: u64,
 }
 
 impl RelocatingCompaction {
@@ -878,13 +900,19 @@ impl RelocatingCompaction {
         comparator: crate::comparator::SharedComparator,
         tree_id: crate::TreeId,
     ) -> Self {
+        let groups = blob_writer.lifetime_groups();
         Self {
             inner,
             blob_scanner,
             blob_writer,
-            rewriting_blob_file_codecs: rewriting_blob_files
+            rewriting_blob_file_outputs: rewriting_blob_files
                 .iter()
-                .map(|bf| (bf.id(), bf.compression()))
+                .map(|bf| {
+                    (
+                        bf.id(),
+                        (bf.compression(), groups.relocated(bf.lifetime_class())),
+                    )
+                })
                 .collect(),
             rewriting_blob_files,
             rate_limiter,
@@ -895,6 +923,7 @@ impl RelocatingCompaction {
             tree_id,
             cell_copies: crate::HashMap::default(),
             cell_copies_key: None,
+            relocated_bytes: 0,
         }
     }
 
@@ -934,7 +963,7 @@ impl RelocatingCompaction {
                 continue;
             };
             if !self
-                .rewriting_blob_file_codecs
+                .rewriting_blob_file_outputs
                 .contains_key(&indirection.vhandle.blob_file_id)
             {
                 continue;
@@ -996,8 +1025,12 @@ impl RelocatingCompaction {
             .rate_limiter
             .request_interruptible(stored.len() as u64, || self.stop_signal.is_stopped());
 
-        self.blob_writer
-            .record_source_compression(blob_file.compression())?;
+        self.blob_writer.select_output(
+            blob_file.compression(),
+            self.blob_writer
+                .lifetime_groups()
+                .relocated(blob_file.lifetime_class()),
+        )?;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a frame's decoded length is bounded by the 256 MiB value cap"
@@ -1005,6 +1038,7 @@ impl RelocatingCompaction {
         let vhandle = self
             .blob_writer
             .write_raw(key, seqno, &stored, uncompressed_len as u32)?;
+        self.relocated_bytes += u64::from(vhandle.on_disk_size);
         Ok(BlobIndirection {
             vhandle,
             size: indirection.size,
@@ -1102,7 +1136,7 @@ impl CompactionFlavour for RelocatingCompaction {
             );
 
             let indirection = if self
-                .rewriting_blob_file_codecs
+                .rewriting_blob_file_outputs
                 .contains_key(&indirection.vhandle.blob_file_id)
             {
                 self.drain_blobs(&item.key.user_key, &indirection)?;
@@ -1176,13 +1210,13 @@ impl CompactionFlavour for RelocatingCompaction {
                 // fail to decode.
                 #[expect(
                     clippy::expect_used,
-                    reason = "the id came from `rewriting_blob_file_codecs`'s own key set"
+                    reason = "the id came from `rewriting_blob_file_outputs`'s own key set"
                 )]
-                let source_codec = *self
-                    .rewriting_blob_file_codecs
+                let (source_codec, class) = *self
+                    .rewriting_blob_file_outputs
                     .get(&blob_file_id)
                     .expect("relocated frame comes from a file being rewritten");
-                self.blob_writer.record_source_compression(source_codec)?;
+                self.blob_writer.select_output(source_codec, class)?;
 
                 let new_indirection = BlobIndirection {
                     vhandle: self.blob_writer.write_raw(
@@ -1198,6 +1232,7 @@ impl CompactionFlavour for RelocatingCompaction {
                     new_indirection.vhandle.on_disk_size, indirection.vhandle.on_disk_size,
                     "redirecting blob should not change its size",
                 );
+                self.relocated_bytes += u64::from(new_indirection.vhandle.on_disk_size);
 
                 self.inner
                     .table_writer
@@ -1262,6 +1297,7 @@ impl CompactionFlavour for RelocatingCompaction {
             filter_sizing,
             // The producer owns the ownership ledger and sets this after.
             released_objects: Vec::new(),
+            relocated_bytes: self.relocated_bytes,
         })
     }
 }
@@ -1384,6 +1420,7 @@ impl CompactionFlavour for StandardCompaction {
             filter_sizing,
             // The producer owns the ownership ledger and sets this after.
             released_objects: Vec::new(),
+            relocated_bytes: 0,
         })
     }
 }

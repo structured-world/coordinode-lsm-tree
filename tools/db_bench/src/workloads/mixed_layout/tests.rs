@@ -45,7 +45,7 @@ fn config() -> BenchConfig {
 /// Every fixture, including those of the unsupported scenarios. The tests that
 /// cover all of them read this one list, so a new fixture cannot be added to
 /// one of them and silently missed by another.
-const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 14] = [
+const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 16] = [
     ("narrow", fixtures::narrow),
     ("wide", fixtures::wide),
     ("mixed-sizes", fixtures::mixed_sizes),
@@ -62,6 +62,14 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 14] = [
     ("columnar-overlap", fixtures::columnar_overlap),
     ("blobs-well-placed", fixtures::blobs_well_placed),
     ("blobs-scattered", fixtures::blobs_scattered),
+    (
+        "blobs-well-placed-one-group",
+        fixtures::blobs_well_placed_one_group,
+    ),
+    (
+        "blobs-scattered-one-group",
+        fixtures::blobs_scattered_one_group,
+    ),
     ("cells-inline", fixtures::cells_inline),
     ("cells-wide", fixtures::cells_wide),
     ("cells-scattered", fixtures::cells_scattered),
@@ -114,6 +122,73 @@ fn cell_row_scans_verify_their_rows_and_read_late() -> lsm_tree::Result<()> {
     // Every repetition under the compacting thread returns the same rows.
     let pass = super::cells_scan_under_compaction(&scattered)?;
     assert_eq!(pass.rows, kept * pass.latencies.len() as u64);
+    Ok(())
+}
+
+/// The churn rounds rewrite the hot and warm keys, the compactions collect
+/// what they left stale, every value still reads as the write history says,
+/// and the default tree splits its values into more than one class while
+/// reading exactly as a one-group tree given the same history.
+#[test]
+fn churn_rewrites_and_collects_and_keeps_every_value() -> lsm_tree::Result<()> {
+    for (what, f) in [
+        (
+            "blobs-well-placed-one-group",
+            fixtures::blobs_well_placed_one_group as fixtures::FixtureFn,
+        ),
+        ("blobs-scattered", fixtures::blobs_scattered),
+    ] {
+        let seqno = AtomicU64::new(1);
+        let mut fixture = f(&config(), &seqno, &std::env::temp_dir())?;
+        let churned = fixtures::churn(&mut fixture, &seqno)?;
+        assert!(
+            churned.reclaimed > 0,
+            "{what}: the compactions removed stale files"
+        );
+        assert!(
+            fixture.oracle.rows.len() as u64 > N,
+            "{what}: churn appends keys"
+        );
+        assert_eq!(
+            super::scan_all(&fixture)?,
+            fixture.oracle.visible(),
+            "{what}: every key reads back"
+        );
+        assert_ordinary_read_agrees(&fixture, what);
+    }
+    let seqno = AtomicU64::new(1);
+    let mut grouped = fixtures::blobs_well_placed(&config(), &seqno, &std::env::temp_dir())?;
+    fixtures::churn(&mut grouped, &seqno)?;
+    let classes: std::collections::BTreeSet<u8> = grouped
+        .tree
+        .current_version()
+        .blob_files
+        .iter()
+        .map(lsm_tree::BlobFile::lifetime_class)
+        .collect();
+    assert!(
+        classes.contains(&0) && classes.len() > 1,
+        "the hot keys went to the short-lived group, the rest elsewhere: {classes:?}"
+    );
+
+    // The same history in one group: grouping decides placement only, so
+    // every key and value reads back identically.
+    use lsm_tree::Guard as _;
+    let seqno = AtomicU64::new(1);
+    let mut one_group =
+        fixtures::blobs_well_placed_one_group(&config(), &seqno, &std::env::temp_dir())?;
+    fixtures::churn(&mut one_group, &seqno)?;
+    let contents = |fixture: &Fixture| -> lsm_tree::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        fixture
+            .tree
+            .iter(SeqNo::MAX, None)
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect()
+    };
+    assert_eq!(contents(&grouped)?, contents(&one_group)?);
     Ok(())
 }
 
@@ -307,19 +382,16 @@ fn blob_placement_scenarios_zero_cache_report_unsupported() {
         super::scenarios(config)
             .into_iter()
             .filter(|s| s.name.starts_with("blobs-") && s.name != "blobs-filtered-before-fetch")
-            .map(|s| matches!(s.support, super::Support::Native(_)))
+            .map(|s| matches!(s.support, super::Support::Native(_) | super::Support::Churn))
             .collect::<Vec<_>>()
     };
     let cold = BenchConfig {
         cache_mb: 0,
         ..config()
     };
-    assert_eq!(placement(&cold), vec![false, false], "zero cache");
-    assert_eq!(
-        placement(&config()),
-        vec![true, true],
-        "a cache enables them"
-    );
+    // The two placement scans and the four churn passes, which end in one.
+    assert_eq!(placement(&cold), vec![false; 6], "zero cache");
+    assert_eq!(placement(&config()), vec![true; 6], "a cache enables them");
 }
 
 #[test]

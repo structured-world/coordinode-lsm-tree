@@ -623,6 +623,35 @@ pub fn start_writeback_raw(fd: i32, offset: u64, len: u64) -> Result<(), Error> 
     Ok(())
 }
 
+/// `fcntl(fd, F_SET_RW_HINT, &hint)`: tells the device how long the data
+/// written through `fd` is expected to live. The constants are Linux uapi
+/// `include/uapi/linux/fcntl.h`; the argument is a pointer to a `u64`.
+///
+/// # Errors
+/// Returns an [`Error`] if the `fcntl` syscall fails.
+pub fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result<(), Error> {
+    /// `F_LINUX_SPECIFIC_BASE + 12`.
+    const F_SET_RW_HINT: usize = 1024 + 12;
+    let hint: u64 = match lifetime {
+        super::WriteLifetime::Short => 2,
+        super::WriteLifetime::Medium => 3,
+        super::WriteLifetime::Long => 4,
+        super::WriteLifetime::Extreme => 5,
+    };
+    // SAFETY: `fd` is an owned descriptor and `hint` outlives the call; the
+    // kernel only reads the `u64` the pointer names.
+    unsafe {
+        syscall3(
+            Sysno::fcntl,
+            fd as usize,
+            F_SET_RW_HINT,
+            (&raw const hint) as usize,
+        )
+    }
+    .map_err(|e| err("fcntl(F_SET_RW_HINT)", e))?;
+    Ok(())
+}
+
 /// `lseek(fd, offset, whence)` — reposition; returns the resulting absolute
 /// offset. Used to resolve the file size (`SEEK_END`) for append / `Seek::End`.
 ///
@@ -1082,6 +1111,10 @@ impl FsFile for IoUringRawFile {
     #[cfg(target_pointer_width = "64")]
     fn start_writeback(&self, offset: u64, len: u64) -> crate::io::Result<()> {
         start_writeback_raw(self.fd, offset, len)
+    }
+
+    fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
+        set_write_lifetime_raw(self.fd, lifetime)
     }
 }
 

@@ -732,6 +732,7 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
             total_uncompressed_bytes: value.len() as u64,
             key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
             compression: CompressionType::None,
+            lifetime_class: 0,
         };
         metadata.encode_into(&mut sfa_writer)?;
         let inner = sfa_writer.into_inner()?;
@@ -755,6 +756,7 @@ fn blob_reader_rejects_retired_blob_magic_frame() -> crate::Result<()> {
             total_uncompressed_bytes: value.len() as u64,
             key_range: crate::KeyRange::new((key[..].into(), key[..].into())),
             compression: CompressionType::None,
+            lifetime_class: 0,
         },
         is_deleted: AtomicBool::new(false),
         punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),

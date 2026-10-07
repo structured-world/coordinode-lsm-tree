@@ -1048,6 +1048,10 @@ impl FsFile for CrashFile {
     fn hint(&self, hint: FileHint) -> io::Result<()> {
         self.inner.hint(hint)
     }
+
+    fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> io::Result<()> {
+        self.inner.set_write_lifetime(lifetime)
+    }
 }
 
 #[cfg(test)]

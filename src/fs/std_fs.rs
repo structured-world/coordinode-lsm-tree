@@ -271,6 +271,45 @@ impl FsFile for File {
             Ok(())
         }
     }
+
+    fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            set_write_lifetime_fd(self.as_raw_fd(), lifetime)
+        }
+        // Linux is the only platform with a per-file write lifetime hint.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = lifetime;
+            Ok(())
+        }
+    }
+}
+
+/// `fcntl(fd, F_SET_RW_HINT, &hint)` with the hint `lifetime` maps to.
+///
+/// The constants are Linux uapi `include/uapi/linux/fcntl.h` (`F_SET_RW_HINT`
+/// is `F_LINUX_SPECIFIC_BASE + 12`, the `RWH_WRITE_LIFE_*` values follow),
+/// which `libc` does not export. The argument is a pointer to a `u64`, as that
+/// header declares.
+#[cfg(target_os = "linux")]
+fn set_write_lifetime_fd(fd: i32, lifetime: super::WriteLifetime) -> io::Result<()> {
+    const F_SET_RW_HINT: libc::c_int = 1024 + 12;
+    let hint: u64 = match lifetime {
+        super::WriteLifetime::Short => 2,
+        super::WriteLifetime::Medium => 3,
+        super::WriteLifetime::Long => 4,
+        super::WriteLifetime::Extreme => 5,
+    };
+    // SAFETY: `fd` is a valid open descriptor for the duration of the call,
+    // and `hint` outlives it; the kernel only reads the `u64` it points to.
+    let rc = unsafe { libc::fcntl(fd, F_SET_RW_HINT, &raw const hint) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
