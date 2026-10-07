@@ -301,7 +301,7 @@ pub fn write(
 /// non-completed kind), safe to clear. [`AttestResult::Inconclusive`] means
 /// the sidecar could not be read (I/O / AEAD / malformed): the caller must keep
 /// the marker, since it may be a transiently-unreadable valid one.
-pub(crate) fn attests(
+pub fn attests(
     fs: &dyn Fs,
     table_path: &Path,
     encryption: Option<&dyn EncryptionProvider>,
