@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791359470115,
+  "lastUpdate": 1791359473851,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -38020,6 +38020,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 14802.863,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d405c45335cdc974db75b2778bb5e2a529f06580",
+          "message": "fix(ingest): pin ingested L0 tables by the L0 pinning policy (#855)\n\n## Summary\n\n- Ingested tables pin their filter and index blocks by the level-0\npinning policy, as a flushed table does, instead of never pinning them.\n\nThe 5.x line gets the same fix in #847.\n\n## Changes\n\n- The standard and the blob tree's ingestion install their tables as a\nnew L0 run and now recover them with `pin_filter` and `pin_index` taken\nfrom `filter_block_pinning_policy.get(0)` and\n`index_block_pinning_policy.get(0)`. Under the default policy an\ningested table no longer loads its filter and index through the block\ncache on every point read until the tree reopens.\n- Regression tests: an ingested table pins its filter and index like a\nflushed one (standard and blob tree), and a policy that pins nothing in\nL0 leaves it unpinned.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #831",
+          "timestamp": "2026-10-07T10:38:12+03:00",
+          "tree_id": "142f632f12cf6eb410d9d9a36d1fda5a0cfe0fbb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d405c45335cdc974db75b2778bb5e2a529f06580"
+        },
+        "date": 1791359472617,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 495.328,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.717268ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 158.43,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 53.48948ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 447.214,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.246339ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3454.433,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9690.722,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
