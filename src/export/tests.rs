@@ -756,8 +756,8 @@ fn table_export_opens_a_table_whose_damage_the_parity_repairs() -> crate::Result
     std::fs::write(&path, &bytes)?;
     let refused = TableExport::open(&path, &record, None, &table_context()).err();
     assert!(
-        matches!(refused, Some(crate::Error::ChecksumMismatch { .. })),
-        "damage the parity cannot repair is refused at open, got {refused:?}"
+        matches!(refused, Some(crate::Error::PageEccUnrecoverable { .. })),
+        "damage the parity cannot repair is refused at open, naming it, got {refused:?}"
     );
     Ok(())
 }

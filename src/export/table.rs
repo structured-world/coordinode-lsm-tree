@@ -202,7 +202,9 @@ impl TableExport {
     /// [`crate::Error::ChecksumMismatch`] when the file (its live suffix, for
     /// a restricted table) does not hash to the manifest's checksum, even
     /// with every repair its blocks' parity can make applied, and no heal
-    /// attestation binds what it does hash to to that checksum.
+    /// attestation binds what it does hash to to that checksum; and
+    /// [`crate::Error::PageEccUnrecoverable`] for a mismatching file holding a
+    /// block its parity cannot repair.
     pub fn open(
         path: &Path,
         record: &TableRecord,
