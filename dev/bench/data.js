@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791332097719,
+  "lastUpdate": 1791359466349,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -36788,6 +36788,90 @@ window.BENCHMARK_DATA = {
             "value": 266743.4827435112,
             "unit": "ops/sec",
             "extra": "P50: 2.8us | P99: 19.1us | P99.9: 100.7us\nthreads: 1 | elapsed: 0.75s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d405c45335cdc974db75b2778bb5e2a529f06580",
+          "message": "fix(ingest): pin ingested L0 tables by the L0 pinning policy (#855)\n\n## Summary\n\n- Ingested tables pin their filter and index blocks by the level-0\npinning policy, as a flushed table does, instead of never pinning them.\n\nThe 5.x line gets the same fix in #847.\n\n## Changes\n\n- The standard and the blob tree's ingestion install their tables as a\nnew L0 run and now recover them with `pin_filter` and `pin_index` taken\nfrom `filter_block_pinning_policy.get(0)` and\n`index_block_pinning_policy.get(0)`. Under the default policy an\ningested table no longer loads its filter and index through the block\ncache on every point read until the tree reopens.\n- Regression tests: an ingested table pins its filter and index like a\nflushed one (standard and blob tree), and a policy that pins nothing in\nL0 leaves it unpinned.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #831",
+          "timestamp": "2026-10-07T10:38:12+03:00",
+          "tree_id": "142f632f12cf6eb410d9d9a36d1fda5a0cfe0fbb",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/d405c45335cdc974db75b2778bb5e2a529f06580"
+        },
+        "date": 1791359465141,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 117982.27553535484,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.0us | P99.9: 20.3us\nthreads: 1 | elapsed: 4.54s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2583780.236882006,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 753050.3074580152,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.6us | P99.9: 11.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 494146.3228931548,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 25.7us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2259742.484265978,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.7us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 256979.54220171305,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.3us | P99.9: 15.9us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 138574.13823132103,
+            "unit": "ops/sec",
+            "extra": "P50: 6.4us | P99: 14.3us | P99.9: 37.5us\nthreads: 1 | elapsed: 1.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 717099.4743252107,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 724856.0151447937,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 5.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 337785.84734655655,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 14.2us | P99.9: 90.8us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
           }
         ]
       }
