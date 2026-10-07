@@ -117,19 +117,55 @@ impl Table {
         })
     }
 
-    /// The digest the live region would have once every data block the parity
-    /// trailers can repair is repaired, computed the way the in-place heal
-    /// predicts it and without writing; `None` for a table without parity.
+    /// The digest the live region would have once every block whose parity
+    /// covers the damage is repaired: every section's blocks, data and side
+    /// sections and both meta copies, each replaced by
+    /// [`Block::repaired_frame`] in the hashed stream. Nothing is written.
+    /// Sections that are not block frames (and the trailer) are hashed as
+    /// they are, so damage there stays unexplained.
     #[cfg(feature = "page_ecc")]
-    pub(crate) fn export_repaired_digest(&self) -> crate::Result<Option<u128>> {
-        if self.metadata.ecc_params.is_none() {
-            return Ok(None);
+    pub(crate) fn export_repaired_digest(&self) -> crate::Result<u128> {
+        // Raw sections: no block header, no parity.
+        const UNFRAMED: [&[u8]; 3] = [b"linked_blob_files", b"table_version", b"meta_separator"];
+
+        let mut file = self.export_file()?;
+        let trailer = crate::sfa::Reader::from_reader(&mut file)?;
+        let live_from = self.punch_offset()?;
+        // Only the parity scheme and the encryption overhead are read from it.
+        let transform = self.section_transform();
+        let mut repairs = Vec::new();
+        for entry in trailer.toc().iter() {
+            if UNFRAMED.contains(&entry.name()) {
+                continue;
+            }
+            let end = entry
+                .pos()
+                .checked_add(entry.len())
+                .ok_or(crate::Error::InvalidHeader("Toc"))?;
+            if matches!(entry.name(), b"meta" | b"meta_mid") {
+                // One self-describing block per copy, sized by the section.
+                let size =
+                    u32::try_from(entry.len()).map_err(|_| crate::Error::InvalidHeader("Toc"))?;
+                let handle = BlockHandle::new(BlockOffset(entry.pos()), size);
+                if let Some(frame) = Block::repaired_frame(&*file, handle, &transform)? {
+                    repairs.push((entry.pos(), frame));
+                }
+                continue;
+            }
+            // A restricted table's punched prefix reads as zeros and is not
+            // part of the digest the manifest holds.
+            let mut offset = entry.pos().max(live_from);
+            while offset < end {
+                let handle = self.probe_block_handle_in(&*file, offset, end)?;
+                if let Some(frame) = Block::repaired_frame(&*file, handle, &transform)? {
+                    repairs.push((offset, frame));
+                }
+                offset += u64::from(handle.size());
+            }
         }
-        let file = self.export_file()?;
-        let transform = self.export_transform(self.data_block_role())?;
-        let (digest, _) =
-            self.predict_heal_digest_and_offsets(&*file, &transform, self.punch_offset()?)?;
-        Ok(Some(digest))
+        crate::repair::compute_table_checksum_with_overrides(
+            &*self.fs, &self.path, live_from, &repairs,
+        )
     }
 
     pub(crate) fn export_sections(&self) -> crate::Result<Vec<Section>> {

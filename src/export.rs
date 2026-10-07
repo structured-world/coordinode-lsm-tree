@@ -76,6 +76,11 @@ pub struct BlobGcStats {
 /// `CURRENT` pointer names, with every edit of its log applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestState {
+    /// The name of the comparator the tree was written under; tables are read
+    /// only under a comparator of that name (see [`TableContext::new`]).
+    pub comparator_name: String,
+    /// The number of levels the tree was created with.
+    pub level_count: u8,
     /// Whether the tree separates values into blob files.
     pub tree_type: TreeType,
     /// The version the state describes: the snapshot's id advanced by every
@@ -129,6 +134,24 @@ pub fn read_manifest(
     fs: &dyn Fs,
     encryption: Option<Arc<dyn EncryptionProvider>>,
 ) -> crate::Result<ManifestState> {
+    // The snapshot's header first, as an open reads it: the format version,
+    // level count and filter hash this build reads, and the comparator the
+    // tree was written under.
+    let header = {
+        let snapshot_id =
+            crate::version::recovery::get_current_version(folder, fs, encryption.clone())?;
+        let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+            &folder.join(format!("v{snapshot_id}")),
+            fs,
+            Arc::new(crate::runtime_config::RuntimeConfig::default()),
+            encryption.clone(),
+        )?;
+        crate::manifest::Manifest::decode_from(&mut archive)?
+    };
+    match header.version {
+        crate::FormatVersion::V5 => {}
+    }
+
     let recovery = crate::version::recovery::recover(
         folder,
         fs,
@@ -185,6 +208,8 @@ pub fn read_manifest(
     blob_restrictions.sort_unstable_by_key(|(id, _)| *id);
 
     Ok(ManifestState {
+        comparator_name: header.comparator_name,
+        level_count: header.level_count,
         tree_type: recovery.tree_type,
         version_id: recovery.curr_version_id,
         levels,

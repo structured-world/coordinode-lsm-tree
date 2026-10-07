@@ -762,6 +762,191 @@ fn table_export_opens_a_table_whose_damage_the_parity_repairs() -> crate::Result
     Ok(())
 }
 
+/// Keys in descending byte order, under a name of its own.
+struct Reverse;
+
+impl crate::comparator::UserComparator for Reverse {
+    fn name(&self) -> &'static str {
+        "reverse"
+    }
+
+    fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+        b.cmp(a)
+    }
+}
+
+/// The manifest's header comes back with the state: the comparator name the
+/// tree was written under and its level count. A table context is built only
+/// for that comparator, so a tree is never read in another key order.
+#[test]
+fn table_context_requires_the_comparator_the_tree_was_written_under() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let reverse: crate::comparator::SharedComparator = Arc::new(Reverse);
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .comparator(reverse.clone())
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..50u32 {
+        tree.insert(format!("k{i:03}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    assert_eq!(state.comparator_name, "reverse");
+    assert_eq!(state.level_count, 7);
+
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(crate::fs::StdFs);
+    let wrong = TableContext::new(
+        &state,
+        fs.clone(),
+        None,
+        #[cfg(zstd_any)]
+        crate::compression::ZstdDictionaries::new(),
+        crate::comparator::default_comparator(),
+    );
+    assert!(matches!(
+        wrong,
+        Err(crate::Error::ComparatorMismatch { ref stored, supplied: "default" }) if stored == "reverse"
+    ));
+
+    let context = TableContext::new(
+        &state,
+        fs,
+        None,
+        #[cfg(zstd_any)]
+        crate::compression::ZstdDictionaries::new(),
+        reverse,
+    )?;
+    let record = *state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    let export = TableExport::open(&path, &record, None, &context)?;
+    let mut keys = Vec::new();
+    for block in export.data_blocks()? {
+        keys.extend(
+            export
+                .rows(&block)?
+                .into_iter()
+                .map(|r| r.key.user_key.to_vec()),
+        );
+    }
+    let expected: Vec<Vec<u8>> = (0..50u32)
+        .rev()
+        .map(|i| format!("k{i:03}").into_bytes())
+        .collect();
+    assert_eq!(keys, expected);
+    Ok(())
+}
+
+/// A table an in-place heal rewrote before it could refresh the manifest
+/// opens: the attestation the heal left binds the bytes on disk to the digest
+/// the manifest still holds. The same bytes without the attestation are
+/// refused.
+#[test]
+fn table_export_accepts_bytes_a_heal_attestation_binds_to_the_manifest() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..200u32 {
+        tree.insert(format!("k{i:03}"), "v", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    let record = *state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    // Stand-in for the healed bytes, in a data block the open does not read:
+    // the manifest no longer describes them.
+    let block = TableExport::open(&path, &record, None, &table_context())?
+        .data_blocks()?
+        .remove(0);
+    let mut bytes = std::fs::read(&path)?;
+    let at = usize::try_from(block.offset).unwrap() + usize::try_from(block.size).unwrap() - 1;
+    bytes[at] ^= 0x01;
+    std::fs::write(&path, &bytes)?;
+    let current = crate::repair::compute_table_checksum(&crate::fs::StdFs, &path)?;
+
+    assert!(matches!(
+        TableExport::open(&path, &record, None, &table_context()),
+        Err(crate::Error::ChecksumMismatch { .. })
+    ));
+
+    crate::scrub::heal_attest::write(
+        &crate::fs::StdFs,
+        &path,
+        None,
+        record.id,
+        crate::Checksum::from_raw(record.checksum),
+        crate::Checksum::from_raw(current),
+    )?;
+    TableExport::open(&path, &record, None, &table_context())?;
+    Ok(())
+}
+
+/// Damage the parity covers in the side sections and the meta block is
+/// accounted for at open like damage in a data block: both copies of the
+/// top-level index and the tail meta block are repaired in the digest the
+/// open checks, and the table opens.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn table_export_opens_a_table_whose_side_section_damage_the_parity_repairs() -> crate::Result<()> {
+    use crate::table::block::{BlockType, Header};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..500u32 {
+        tree.insert(format!("k{i:04}"), format!("value-{i}"), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    let record = *state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    let sections = TableExport::open(&path, &record, None, &table_context())?.sections()?;
+
+    let mut bytes = std::fs::read(&path)?;
+    for (name, block_type) in [
+        (&b"tli"[..], BlockType::Index),
+        (&b"tli_tail"[..], BlockType::Index),
+        (&b"meta"[..], BlockType::Meta),
+    ] {
+        let at = section(&sections, name).unwrap().offset;
+        let at = usize::try_from(at).unwrap() + Header::header_len(block_type) + 3;
+        bytes[at] ^= 0x20;
+    }
+    std::fs::write(&path, &bytes)?;
+
+    let export = TableExport::open(&path, &record, None, &table_context())?;
+    let mut rows = 0;
+    for block in export.data_blocks()? {
+        rows += export.rows(&block)?.len();
+    }
+    assert_eq!(rows, 500);
+    Ok(())
+}
+
 /// A table whose bytes no longer hash to the manifest's checksum is refused
 /// at open, before any of its parts is read.
 #[test]

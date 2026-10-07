@@ -144,15 +144,45 @@ pub struct Locator {
 
 /// What every table of one tree is read with.
 pub struct TableContext {
-    /// The filesystem the tables are reachable through.
-    pub fs: Arc<dyn Fs>,
-    /// The tree's at-rest encryption provider.
-    pub encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// Every dictionary the tree's tables may name.
+    pub(crate) fs: Arc<dyn Fs>,
+    pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
     #[cfg(zstd_any)]
-    pub dictionaries: crate::compression::ZstdDictionaries,
-    /// The tree's key ordering.
-    pub comparator: SharedComparator,
+    pub(crate) dictionaries: crate::compression::ZstdDictionaries,
+    pub(crate) comparator: SharedComparator,
+}
+
+impl TableContext {
+    /// The context for reading the tables of the tree whose manifest `state`
+    /// describes, through `fs`, decrypting with `encryption`, decompressing
+    /// with `dictionaries`, ordering keys with `comparator`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::ComparatorMismatch`] when `comparator` is not the
+    /// one the tree was written under: its indexes and blocks would be read in
+    /// the wrong order.
+    pub fn new(
+        state: &super::ManifestState,
+        fs: Arc<dyn Fs>,
+        encryption: Option<Arc<dyn EncryptionProvider>>,
+        #[cfg(zstd_any)] dictionaries: crate::compression::ZstdDictionaries,
+        comparator: SharedComparator,
+    ) -> crate::Result<Self> {
+        let supplied = comparator.name();
+        if state.comparator_name != supplied {
+            return Err(crate::Error::ComparatorMismatch {
+                stored: state.comparator_name.clone(),
+                supplied,
+            });
+        }
+        Ok(Self {
+            fs,
+            encryption,
+            #[cfg(zstd_any)]
+            dictionaries,
+            comparator,
+        })
+    }
 }
 
 /// A table opened for export: nothing is cached, pinned or written, and the
@@ -171,7 +201,8 @@ impl TableExport {
     /// Returns any error opening the table would, and
     /// [`crate::Error::ChecksumMismatch`] when the file (its live suffix, for
     /// a restricted table) does not hash to the manifest's checksum, even
-    /// with every repair its data blocks' parity can make applied.
+    /// with every repair its blocks' parity can make applied, and no heal
+    /// attestation binds what it does hash to to that checksum.
     pub fn open(
         path: &Path,
         record: &TableRecord,
@@ -200,14 +231,30 @@ impl TableExport {
 
         let live_from = table.punch_offset()?;
         let digest = crate::repair::compute_table_checksum_from(&*context.fs, path, live_from)?;
-        // A digest that differs only by damage the data blocks' parity
-        // repairs is accounted for: `frame` hands those blocks back repaired.
-        // Without the parity codec no damage can be.
+        // The bytes the manifest describes, or the bytes an in-place heal that
+        // crashed before its manifest refresh left behind, which its
+        // attestation binds to the manifest's digest.
+        let describes = |candidate: u128| {
+            candidate == record.checksum
+                || matches!(
+                    crate::scrub::heal_attest::attests(
+                        &*context.fs,
+                        path,
+                        context.encryption.as_deref(),
+                        record.id,
+                        Checksum::from_raw(candidate),
+                        Checksum::from_raw(record.checksum),
+                    ),
+                    crate::scrub::heal_attest::AttestResult::Attests
+                )
+        };
+        // Damage the blocks' parity repairs is accounted for too: every read
+        // here hands those blocks back repaired. Without the parity codec no
+        // damage can be.
         #[cfg(feature = "page_ecc")]
-        let accounted =
-            digest == record.checksum || table.export_repaired_digest()? == Some(record.checksum);
+        let accounted = describes(digest) || describes(table.export_repaired_digest()?);
         #[cfg(not(feature = "page_ecc"))]
-        let accounted = digest == record.checksum;
+        let accounted = describes(digest);
         if !accounted {
             return Err(crate::Error::ChecksumMismatch {
                 got: Checksum::from_raw(digest),
