@@ -170,7 +170,8 @@ impl TableExport {
     ///
     /// Returns any error opening the table would, and
     /// [`crate::Error::ChecksumMismatch`] when the file (its live suffix, for
-    /// a restricted table) does not hash to the manifest's checksum.
+    /// a restricted table) does not hash to the manifest's checksum, even
+    /// with every repair its data blocks' parity can make applied.
     pub fn open(
         path: &Path,
         record: &TableRecord,
@@ -199,7 +200,9 @@ impl TableExport {
 
         let live_from = table.punch_offset()?;
         let digest = crate::repair::compute_table_checksum_from(&*context.fs, path, live_from)?;
-        if digest != record.checksum {
+        // A digest that differs only by damage the data blocks' parity
+        // repairs is accounted for: `frame` hands those blocks back repaired.
+        if digest != record.checksum && table.export_repaired_digest()? != Some(record.checksum) {
             return Err(crate::Error::ChecksumMismatch {
                 got: Checksum::from_raw(digest),
                 expected: Checksum::from_raw(record.checksum),
@@ -286,11 +289,18 @@ impl TableExport {
         self.table.export_columnar_batch(block)
     }
 
-    /// The positions the delete bitmap marks deleted, ascending. A position
-    /// counts rows across the data blocks in index order.
-    #[must_use]
-    pub fn deleted_rows(&self) -> Vec<u32> {
-        self.table.export_deleted_rows()
+    /// The rows of the columnar data block `block` the delete bitmap marks
+    /// deleted, as indexes into the block's batch, ascending. Local to the
+    /// block, so they stay valid for a restricted table whose blocks before
+    /// [`live_from`](Self::live_from) cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the block read, and fails when the table has deletes but no
+    /// first row recorded for the block.
+    #[cfg(feature = "columnar")]
+    pub fn deleted_rows_in(&self, block: &BlockRef) -> crate::Result<Vec<u32>> {
+        self.table.export_deleted_rows_in(block)
     }
 
     /// The table's range tombstones, as stored (not clamped to a restriction).

@@ -117,6 +117,27 @@ impl Table {
         })
     }
 
+    /// The digest the live region would have once every data block the parity
+    /// trailers can repair is repaired, computed the way the in-place heal
+    /// predicts it and without writing; `None` for a table without parity.
+    #[cfg(feature = "page_ecc")]
+    pub(crate) fn export_repaired_digest(&self) -> crate::Result<Option<u128>> {
+        if self.metadata.ecc_params.is_none() {
+            return Ok(None);
+        }
+        let file = self.export_file()?;
+        let transform = self.export_transform(self.data_block_role())?;
+        let (digest, _) =
+            self.predict_heal_digest_and_offsets(&*file, &transform, self.punch_offset()?)?;
+        Ok(Some(digest))
+    }
+
+    /// Without the parity codec no damage can be accounted for.
+    #[cfg(not(feature = "page_ecc"))]
+    pub(crate) fn export_repaired_digest(&self) -> crate::Result<Option<u128>> {
+        Ok(None)
+    }
+
     pub(crate) fn export_sections(&self) -> crate::Result<Vec<Section>> {
         let mut file = self.export_file()?;
         let trailer = crate::sfa::Reader::from_reader(&mut file)?;
@@ -222,10 +243,36 @@ impl Table {
         crate::table::columnar::ColumnBatch::decode(&loaded.data)
     }
 
-    pub(crate) fn export_deleted_rows(&self) -> Vec<u32> {
+    #[cfg(feature = "columnar")]
+    pub(crate) fn export_deleted_rows_in(&self, block: &BlockRef) -> crate::Result<Vec<u32>> {
         // A normal open fails on a damaged bitmap rather than degrading it, so
         // the decoded bitmap is the stored one.
-        self.delete_bitmap.iter().collect()
+        if self.delete_bitmap.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The bitmap numbers rows across every block of the table, punched
+        // prefix included; the open maps each block to its first row from the
+        // zone map, which is what makes a live block's rows addressable
+        // without reading the blocks before it.
+        let start = self
+            .delete_block_starts
+            .as_ref()
+            .and_then(|starts| starts.get(&block.offset))
+            .copied()
+            .ok_or(crate::Error::InvalidHeader(
+                "delete bitmap: no first row recorded for the block",
+            ))?;
+        let rows = self.export_columnar_batch(block)?.row_count;
+        let mut deleted = Vec::new();
+        for local in 0..rows {
+            let position = start.checked_add(local).ok_or(crate::Error::InvalidHeader(
+                "columnar: row position exceeds u32::MAX",
+            ))?;
+            if self.delete_bitmap.contains(position) {
+                deleted.push(local);
+            }
+        }
+        Ok(deleted)
     }
 
     pub(crate) fn export_range_tombstones(&self) -> Vec<crate::export::RangeDelete> {

@@ -502,18 +502,26 @@ fn table_export_frame_repairs_damage_through_the_parity_trailer() -> crate::Resu
     Ok(())
 }
 
-/// A columnar table carrying positional deletes: the batches hold every row,
-/// the deleted ones included, the rows the export reads are those same rows,
-/// and the deleted positions are exactly the rows the range tombstone
-/// relocated into the bitmap.
+/// A columnar table carrying positional deletes over several blocks: the
+/// batches hold every row, the deleted ones included, the rows the export
+/// reads are those same rows, and each block's deleted rows, indexed within
+/// the block, are exactly its rows the range tombstone relocated into the
+/// bitmap.
 #[cfg(feature = "columnar")]
 #[test]
 fn table_export_columnar_batches_keep_deleted_rows_and_their_positions() -> crate::Result<()> {
     use crate::config::{DeleteStrategy, DeleteStrategyPolicy};
 
+    const ROWS: u32 = 2_000;
     let key = |i: u32| format!("k{i:04}").into_bytes();
     let folder = crate::get_tmp_folder();
-    let any = open(folder.path(), None)?;
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .open()?;
     let AnyTree::Standard(tree) = &any else {
         panic!("a standard tree");
     };
@@ -524,12 +532,12 @@ fn table_export_columnar_batches_keep_deleted_rows_and_their_positions() -> crat
             purge_threshold_percent: 90,
         });
     })?;
-    for i in 0..10u32 {
+    for i in 0..ROWS {
         tree.insert(key(i), vec![b'v'; 16], u64::from(i) + 1);
     }
-    tree.remove_range(UserKey::from(key(0)), UserKey::from(key(4)), 1_000);
+    tree.remove_range(UserKey::from(key(150)), UserKey::from(key(1_150)), 10_000);
     tree.flush_active_memtable(0)?;
-    tree.major_compact(64 * 1024 * 1024, 5_000)?;
+    tree.major_compact(64 * 1024 * 1024, 20_000)?;
     drop(any);
 
     let exports = export_tables(folder.path())?;
@@ -537,18 +545,22 @@ fn table_export_columnar_batches_keep_deleted_rows_and_their_positions() -> crat
     let export = &exports[0];
     assert!(export.is_columnar());
 
-    let mut rows = Vec::new();
+    let blocks = export.data_blocks()?;
+    assert!(blocks.len() > 2, "the deletes span several blocks");
+    let mut keys = Vec::new();
     let mut batch_rows = 0u32;
-    for block in export.data_blocks()? {
-        batch_rows += export.columnar_batch(&block)?.row_count;
-        rows.extend(export.rows(&block)?);
+    let mut deleted_keys = Vec::new();
+    for block in &blocks {
+        batch_rows += export.columnar_batch(block)?.row_count;
+        let rows = export.rows(block)?;
+        for local in export.deleted_rows_in(block)? {
+            deleted_keys.push(rows[local as usize].key.user_key.to_vec());
+        }
+        keys.extend(rows.into_iter().map(|r| r.key.user_key.to_vec()));
     }
-    assert_eq!(batch_rows, 10, "the batches keep the deleted rows");
-    let keys: Vec<Vec<u8>> = rows.iter().map(|r| r.key.user_key.to_vec()).collect();
-    assert_eq!(keys, (0..10).map(key).collect::<Vec<_>>());
-
-    let deleted = export.deleted_rows();
-    assert_eq!(deleted, vec![0, 1, 2, 3]);
+    assert_eq!(batch_rows, ROWS, "the batches keep the deleted rows");
+    assert_eq!(keys, (0..ROWS).map(key).collect::<Vec<_>>());
+    assert_eq!(deleted_keys, (150..1_150).map(key).collect::<Vec<_>>());
     Ok(())
 }
 
@@ -686,6 +698,67 @@ fn blob_file_export_frames_cover_every_value() -> crate::Result<()> {
     bytes[at] ^= 0x01;
     std::fs::write(&path, &bytes)?;
     assert!(blob.frames().is_err(), "a damaged frame is refused");
+    Ok(())
+}
+
+/// A table that took parity-repairable damage before the export opened it
+/// still opens: the digest the repairs would restore is the manifest's, so the
+/// damage is accounted for, and the damaged block comes back repaired. Damage
+/// the parity cannot repair leaves the digest unexplained and the table is
+/// refused.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn table_export_opens_a_table_whose_damage_the_parity_repairs() -> crate::Result<()> {
+    use crate::table::block::{BlockType, EccStatus, Header};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .open()?;
+    let seqno = SequenceNumberCounter::default();
+    for i in 0..500u32 {
+        tree.insert(format!("k{i:04}"), format!("value-{i}"), seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let clean = export_tables(folder.path())?;
+    let block = clean[0].data_blocks()?.into_iter().nth(1).unwrap();
+    let expected = clean[0].frame(block.offset, block.size, BlockType::Data)?;
+    drop(clean);
+
+    let state = read_manifest(folder.path(), &crate::fs::StdFs, None)?;
+    let record = *state.levels.iter().flatten().flatten().next().unwrap();
+    let path = folder
+        .path()
+        .join(crate::file::TABLES_FOLDER)
+        .join(record.id.to_string());
+    let mut bytes = std::fs::read(&path)?;
+    let at = usize::try_from(block.offset).unwrap() + Header::header_len(BlockType::Data) + 5;
+    bytes[at] ^= 0x10;
+    std::fs::write(&path, &bytes)?;
+
+    let export = TableExport::open(&path, &record, None, &table_context())?;
+    let healed = export.frame(block.offset, block.size, BlockType::Data)?;
+    assert_eq!(healed.payload, expected.payload);
+    assert_eq!(healed.ecc_status, EccStatus::Corrected);
+    drop(export);
+
+    let end = at + usize::try_from(block.size).unwrap() / 2;
+    for byte in &mut bytes[at..end] {
+        *byte = !*byte;
+    }
+    std::fs::write(&path, &bytes)?;
+    let refused = TableExport::open(&path, &record, None, &table_context());
+    assert!(
+        matches!(refused, Err(crate::Error::ChecksumMismatch { .. })),
+        "damage the parity cannot repair is refused at open"
+    );
     Ok(())
 }
 

@@ -1680,3 +1680,53 @@ fn recover_absolute_consistency_rejects_tables_bytes_the_counts_do_not_describe(
     );
     Ok(())
 }
+
+/// The tail-tolerant mode accepts a snapshot cut short at its end, not one
+/// whose counts stop before its last complete record: the wrapped snapshot is
+/// refused there too, since installing its counted prefix would delete the
+/// other 256 tables as orphans.
+#[test]
+fn recover_tail_tolerant_rejects_tables_bytes_the_counts_do_not_describe() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/tail/wrapped");
+    fs.create_dir_all(folder)?;
+    write_manifest_with_wrapped_run_count(folder, 1, &fs)?;
+    write_current(folder, 1, &fs)?;
+
+    let err = recover(
+        folder,
+        &fs,
+        ManifestRecoveryMode::TolerateCorruptedTailRecords,
+        None,
+    )
+    .expect_err("unread complete records are not a torn tail");
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestTablesUnaccounted { trailing } if trailing == 256 * (4 + 12 + 33)
+        ),
+        "expected ManifestTablesUnaccounted for 256 runs, got: {err:?}",
+    );
+    Ok(())
+}
+
+/// The modes that accept losing records by design still accept the counted
+/// prefix of a wrapped snapshot.
+#[test]
+fn recover_lossy_modes_accept_the_counted_prefix_of_a_wrapped_snapshot() -> crate::Result<()> {
+    for mode in [
+        ManifestRecoveryMode::PointInTimeRecovery,
+        ManifestRecoveryMode::SkipAnyCorruptedRecords,
+    ] {
+        let fs = MemFs::new();
+        let folder = Path::new("/lossy/wrapped");
+        fs.create_dir_all(folder)?;
+        write_manifest_with_wrapped_run_count(folder, 1, &fs)?;
+        write_current(folder, 1, &fs)?;
+
+        let recovery = recover(folder, &fs, mode, None)?;
+        let tables: usize = recovery.table_ids.iter().flatten().map(Vec::len).sum();
+        assert_eq!(tables, 1, "{mode:?} keeps the counted prefix");
+    }
+    Ok(())
+}
