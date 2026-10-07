@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791375250271,
+  "lastUpdate": 1791375254040,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -40324,6 +40324,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 21945.39,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "aaf596f21c6c9123ecfd0631b6205cd1cd0a4ed1",
+          "message": "fix(compaction): merge only L0 runs contiguous in age under tiered (#858)\n\n## Summary\n\n- Size-tiered compaction merges only L0 runs that are contiguous in age\nand that no run ahead of them overlaps, so an output never holds data\nboth newer and older than a run it skipped or one ahead of it.\n\nStacked on the fix for #827, which lays L0 out from its tables' ages: an\noutput's recency, its newest input's, is its age only for inputs picked\nthis way. The 5.x line gets the same fix in #849.\n\n## Changes\n\n- Tiered walks L0 from the newest run and merges the first stretch of\nconsecutive available runs whose neighbours have similar sizes, as\nRocksDB universal compaction picks from its newest sorted run.\n- Both rules merge a stretch only when no table ahead of it overlaps one\nof its tables, Pebble's rule for intra-L0 compactions: a merge that\ntakes an older version of a key takes every newer version L0 holds. L0\nfuses disjoint tables of different ages into one run, so contiguity\nalone does not keep a newer overlapping run out of the way. A stretch is\ncut at the first run a run ahead overlaps, and the runs behind are tried\nas stretches of their own. The space-amplification rule also waits while\na busy run sits between available ones.\n- The frontmost overlapping run ahead of each L0 run is computed once\nper choice.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #835\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved background compaction to preserve the recency order of stored\ndata, including when some runs are temporarily unavailable.\n* Compaction now avoids merging runs when doing so could interfere with\nnewer data. It selects eligible consecutive runs based on their sizes\nand respects configured merge-width limits.\n* Added coverage for compaction across size gaps and mixed flush and\ncompaction cycles.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-07T14:57:56+03:00",
+          "tree_id": "0ee0246a74d9d504a0cb9b389ecd0cf71c5f8d4a",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/aaf596f21c6c9123ecfd0631b6205cd1cd0a4ed1"
+        },
+        "date": 1791375252840,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 526.8929999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 107.689978ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 117.877,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.677921ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 440.239,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.223865ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4777.5830000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 17280.233,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
