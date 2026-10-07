@@ -174,11 +174,11 @@ fn linked_blob_files_reject_a_count_the_section_cannot_hold() {
     ));
 }
 
-/// An input stamped while the clock read zero has no age, and an output that
-/// takes any of its data has none either: the newest age of the other inputs
-/// would make data that never expires eligible for a TTL.
+/// An input stamped while the clock read zero has no age, so an output that
+/// meets it takes none from the inputs (the writer dates it by its clock): the
+/// newest age of the other inputs could be older than that input's data.
 #[test]
-fn an_input_with_no_age_leaves_the_output_without_one() {
+fn an_input_with_no_age_leaves_the_output_to_the_clock() {
     let key = |n: u32| UserKey::from(n.to_be_bytes().as_slice());
     let inputs = vec![
         InputAge {
@@ -193,7 +193,7 @@ fn an_input_with_no_age_leaves_the_output_without_one() {
         },
     ];
     let mut sweep = AgeSweep::new(inputs, crate::comparator::default_comparator());
-    assert_eq!(sweep.age_of(&key(0), &key(8)), Some(0), "both inputs met");
+    assert_eq!(sweep.age_of(&key(0), &key(8)), None, "both inputs met");
     assert_eq!(
         sweep.age_of(&key(15), &key(20)),
         Some(1_000),
@@ -226,7 +226,7 @@ fn swept_ages_match_every_input_checked() {
         created_at: 100,
     });
     let comparator = crate::comparator::default_comparator();
-    // The newest age of the inputs met, or none (zero) when one of them has none.
+    // The newest age of the inputs met, or none when one of them has none.
     let naive = |first: &[u8], last: &[u8]| {
         let met: Vec<u128> = inputs
             .iter()
@@ -237,7 +237,7 @@ fn swept_ages_match_every_input_checked() {
             .map(|input| input.created_at)
             .collect();
         if met.contains(&0) {
-            Some(0)
+            None
         } else {
             met.into_iter().max()
         }

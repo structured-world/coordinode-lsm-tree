@@ -413,11 +413,12 @@ impl AgeSweep {
     }
 
     /// The newest `created_at` among the inputs whose key range meets
-    /// `first..=last`, or `None` when none does. Zero, the age of a table
-    /// stamped while the clock read zero, is no age, and an output that meets
-    /// such an input has none either. Successive calls must pass ranges that
-    /// follow one another in ascending key order, as the outputs of one
-    /// writer chain do.
+    /// `first..=last`, or `None` when none does or when one of them has no
+    /// age (zero, a table stamped while the clock read zero). The writer then
+    /// dates the output by its own clock: nothing it carries is newer than
+    /// that, so a TTL expires none of it early. Successive calls must pass
+    /// ranges that follow one another in ascending key order, as the outputs
+    /// of one writer chain do.
     pub(crate) fn age_of(&mut self, first: &[u8], last: &[u8]) -> Option<u128> {
         use core::cmp::Ordering::{Greater, Less};
 
@@ -460,10 +461,12 @@ impl AgeSweep {
             }
         }
         // The smallest live age is zero exactly when an input without one is
-        // met: then the output's data is partly of unknown age, and dating it
-        // by the other inputs would make it expire under a TTL.
+        // met: then the output's data is partly of unknown age, which may be
+        // newer than the other inputs' (a store reopened without a clock), so
+        // their age would expire it early. The time of this write is an upper
+        // bound on all of it instead.
         match self.ages.first_key_value() {
-            Some((&0, _)) => Some(0),
+            Some((&0, _)) => None,
             _ => self.ages.last_key_value().map(|(&age, _)| age),
         }
     }
@@ -4417,7 +4420,8 @@ impl Writer {
         // Decided once — both MID and TAIL copies must report the SAME
         // created_at so MID-fallback recovery produces the same timestamp as
         // a clean TAIL recovery. A compaction output inherits the age of the
-        // inputs it carries data from; anything else reads the clock.
+        // inputs it carries data from unless one has none (see
+        // `AgeSweep::age_of`); anything else reads the clock.
         let created_at_nanos = ages
             .and_then(|ages| ages.age_of(first_key, last_key))
             .unwrap_or_else(|| unix_timestamp().as_nanos());
