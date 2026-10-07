@@ -26,7 +26,7 @@ mod table;
 pub use blob::{BlobFileExport, BlobFrame};
 pub use table::{
     BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, RangeDelete,
-    Section, TableContext, TableExport, VerifiedFrame, decode_burr,
+    Section, TableContext, TableExport, TableProperties, VerifiedFrame, decode_burr,
 };
 
 #[cfg(test)]

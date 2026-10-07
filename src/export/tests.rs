@@ -947,6 +947,85 @@ fn table_export_opens_a_table_whose_side_section_damage_the_parity_repairs() -> 
     Ok(())
 }
 
+/// A flushed table's properties are those it was written with: written now,
+/// for level 0, without a checksum footer, parity, columnar blocks, a split
+/// index or the lineage of a compaction output.
+#[test]
+fn table_export_properties_describe_a_flushed_table() -> crate::Result<()> {
+    let before = crate::time::unix_timestamp().as_nanos();
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    for i in 0..50u32 {
+        tree.insert(format!("k{i:03}"), "v", u64::from(i) + 1);
+    }
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let properties = exports[0].properties()?;
+    assert!(properties.created_at >= before);
+    assert_eq!(properties.initial_level, 0);
+    assert_eq!(properties.kv_checksum, None);
+    assert_eq!(properties.ecc, None);
+    assert!(!properties.columnar);
+    assert!(!properties.partitioned_index);
+    assert_eq!(properties.lineage, None);
+    assert!(!properties.lineage_last);
+    Ok(())
+}
+
+/// A compaction output carries its lineage and a recency key, and a table
+/// written with a partitioned index and parity says so.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn table_export_properties_carry_lineage_parity_and_index_layout() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .page_ecc(true)
+    .index_block_partitioning_policy(crate::config::PinningPolicy::all(true))
+    .data_block_size_policy(crate::config::BlockSizePolicy::all(256))
+    .open()?;
+    // The adaptive index stays whole below its spill threshold; zero splits it.
+    let crate::AnyTree::Standard(standard) = &tree else {
+        unreachable!("no kv separation was configured");
+    };
+    standard.update_runtime_config(|c| c.index_partition_spill_threshold = 0)?;
+    let seqno = SequenceNumberCounter::default();
+    for round in 0..2u32 {
+        for i in 0..2_000u32 {
+            tree.insert(format!("k{i:05}"), format!("{round}"), seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, seqno.get())?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let properties = exports
+        .iter()
+        .map(TableExport::properties)
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(
+        properties.iter().all(|p| p.ecc.is_some()),
+        "every table carries parity"
+    );
+    assert!(
+        properties
+            .iter()
+            .any(|p| p.lineage.as_ref().is_some_and(|l| l.len() == 2)),
+        "the compaction output names both inputs"
+    );
+    assert!(
+        properties.iter().any(|p| p.partitioned_index),
+        "a large enough table splits its index"
+    );
+    Ok(())
+}
+
 /// A table whose bytes no longer hash to the manifest's checksum is refused
 /// at open, before any of its parts is read.
 #[test]

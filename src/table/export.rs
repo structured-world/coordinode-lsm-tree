@@ -182,6 +182,47 @@ impl Table {
             .collect())
     }
 
+    pub(crate) fn export_properties(&self) -> crate::Result<crate::export::TableProperties> {
+        let meta = &self.metadata;
+        // A scheme this build cannot apply has no parity it could carry over,
+        // and dropping the table's protection is not the export's decision.
+        if meta.ecc_unrecognized {
+            return Err(crate::Error::InvalidHeader(
+                "the table's parity scheme is not one this build applies",
+            ));
+        }
+        let initial_level = match self
+            .export_meta()?
+            .into_iter()
+            .find(|(key, _)| &**key == b"initial_level")
+            .map(|(_, value)| value)
+            .as_deref()
+        {
+            Some([level]) => *level,
+            _ => return Err(crate::Error::InvalidHeader("TableMeta initial_level")),
+        };
+        Ok(crate::export::TableProperties {
+            created_at: meta.created_at.into(),
+            initial_level,
+            data_compression: meta.data_block_compression,
+            index_compression: meta.index_block_compression,
+            data_restart_interval: meta.data_block_restart_interval,
+            index_restart_interval: meta.index_block_restart_interval,
+            kv_checksum: meta.kv_checksum_algo,
+            ecc: meta.ecc_params,
+            columnar: meta.columnar,
+            bulk_ingested: meta.bulk_ingested,
+            recency: meta.recency,
+            lineage: meta.lineage.clone(),
+            lineage_prev: meta.lineage_prev,
+            lineage_transformed: meta.lineage_transformed,
+            lineage_last: meta.lineage_last,
+            partitioned_index: self.regions.index.is_some(),
+            seqno_bounds: self.regions.seqno_bounds.is_some(),
+            zone_map: self.regions.zone_map.is_some(),
+        })
+    }
+
     pub(crate) fn export_meta(&self) -> crate::Result<Vec<(UserKey, UserValue)>> {
         let file = self.export_file()?;
         let mut failure = None;
