@@ -8,7 +8,7 @@
 //! and touches nothing: no write, no delete, no manifest rotation, no orphan
 //! sweep. That is why it exists beside [`Tree::open`](crate::Tree), which
 //! repairs and cleans the directory it opens. The manifest is read under
-//! [`ManifestRecoveryMode::AbsoluteConsistency`]: a converter must refuse a
+//! [`crate::config::ManifestRecoveryMode::AbsoluteConsistency`]: a converter must refuse a
 //! store it cannot read exactly, not carry a guess forward.
 
 use crate::config::ManifestRecoveryMode;
