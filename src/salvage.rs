@@ -3305,13 +3305,13 @@ pub fn salvage_blob_file(
     // way SST salvage fails closed on range tombstones.
     //
     // A placeholder checksum is passed on purpose: `recover_blob_file` only STORES
-    // it (it never verifies the source against it), and only `compression()` is
-    // read from the handle. Computing the real whole-file digest here would stream
+    // it (it never verifies the source against it), and only `compression()` and
+    // `lifetime_class()` are read from the handle. Computing the real whole-file digest here would stream
     // every byte — including a persistently unreadable later frame or truncated
     // tail sector — and abort before the scanner and writer are even created,
     // making the valid-prefix recovery below unreachable. The salvaged dest gets
     // its own digest on finish.
-    // The handle is a probe for `compression()`; nothing is read THROUGH it
+    // The handle is a probe for its metadata; nothing is read THROUGH it
     // here (the scanner below reads the frames). It still gets the caller's
     // dictionary, so a handle that names one is never built without it.
     #[cfg(zstd_any)]
@@ -3330,6 +3330,8 @@ pub fn salvage_blob_file(
         &source_dicts,
     )?;
     let compression = source_handle.compression();
+    // The salvaged file holds the source's values, so it keeps their class.
+    let lifetime_class = source_handle.lifetime_class();
     #[cfg(zstd_any)]
     if let crate::CompressionType::ZstdDict { dict_id, .. } = compression {
         let Some(dict) = zstd_dictionary else {
@@ -3375,6 +3377,9 @@ pub fn salvage_blob_file(
     let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?
         .use_sync_mode(sync_mode)
         .use_compression(compression);
+    // No device hint: salvage does not know the tree's groups, and the hint
+    // only steers where the device places the bytes.
+    writer.set_lifetime_class(lifetime_class, None);
     #[cfg(zstd_any)]
     {
         // The re-emit re-compresses under the source's descriptor; a

@@ -9688,6 +9688,47 @@ fn salvage_blob_file_drops_a_frame_with_a_forged_value_length() -> crate::Result
     Ok(())
 }
 
+/// The salvaged copy holds the source's values and keeps their lifetime class,
+/// so a later relocation still knows how long they have lived.
+#[test]
+fn salvage_blob_file_keeps_the_lifetime_class() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("blob_source");
+    let dest = dir.path().join("blob_salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    {
+        let mut writer = BlobWriter::new(&source, 0, 0, &*fs)?;
+        writer.set_lifetime_class(2, None);
+        writer.write(b"k0", 0, b"a value that has lived a while")?;
+        writer.finish()?;
+    }
+
+    let report = salvage_blob_file(
+        &source,
+        dest.clone(),
+        &fs,
+        0,
+        &default_comparator(),
+        0,
+        #[cfg(zstd_any)]
+        None,
+    )?;
+    assert_eq!(report.records_salvaged, 1);
+
+    let handle = crate::vlog::recover_blob_file(
+        &dest,
+        0,
+        crate::Checksum::from_raw(crate::repair::compute_table_checksum(&*fs, &dest)?),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
+    )?;
+    assert_eq!(handle.lifetime_class(), 2);
+    Ok(())
+}
+
 /// A compressed blob source is rejected (fail-closed): the scanner yields on-disk
 /// compressed bytes that this path cannot faithfully re-emit yet.
 #[cfg(feature = "lz4")]
