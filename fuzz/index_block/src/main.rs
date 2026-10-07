@@ -71,7 +71,9 @@ fn main() {
             .into_iter()
             .map(|(key, seqno, size)| {
                 let key = if key.is_empty() { vec![0] } else { key };
-                (key, seqno & 0x7FFF_FFFF_FFFF_FFFF, size)
+                // A stored seqno is below MAX_SEQNO: the top bit is reserved,
+                // and MAX_SEQNO itself is the boundary a seek skips.
+                (key, seqno % lsm_tree::MAX_SEQNO, size)
             })
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
