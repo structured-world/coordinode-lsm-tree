@@ -1054,7 +1054,7 @@ pub fn recover(
         // orphans. That is no torn tail, so the tail-tolerant mode refuses it
         // as the strict one does; the modes that drop records by design keep
         // accepting the prefix.
-        if !(pit_prefix || skip_any) && !stopped_early && tables_bytes_consumed != section_len {
+        if !(pit_prefix || skip_any || stopped_early) && tables_bytes_consumed != section_len {
             // Only bytes read from the section are counted, and a read past
             // its end fails, so the difference cannot underflow.
             let trailing = section_len - tables_bytes_consumed;
