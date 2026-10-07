@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791362322850,
+  "lastUpdate": 1791362326511,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -38788,6 +38788,60 @@ window.BENCHMARK_DATA = {
           {
             "name": "mixed-layout / cells-scan-under-compaction scan P99",
             "value": 9690.722,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b1e67d5a16af5cfadbcb47fa70a7aba41e6ec9c6",
+          "message": "fix(index_block): an upper bound keeps the block after the last one ending at it (#856)\n\n## Summary\n\n- An index upper bound covers every block that may hold a key up to it,\nfor every index restart interval: each block ending at or before the\nbound and the block after it. Snapshot ranges ending at a key whose\nversions span blocks no longer lose them.\n- The public `table::index_block::Iter::seek_upper` keeps the entry a\npreceding `seek` landed on and reports an empty range when the bound\nends before what is left.\n\nThe 5.x line got the same fix in #840.\n\n## Changes\n\n- `seek_upper`, `seek_upper_bound_cursor` and the table's index walk\nshare one bound, the one upstream fjall uses: every entry ending at or\nbefore the needle plus the first past it. The restart-interval trim\nalways keeps that next entry.\n- `seek_upper` keeps the front cache while its entry ends inside the\nbound and drops it otherwise; it answers whether either end still holds\nan entry, and `OwnedIndexBlockIter::seek_upper` goes through the same\ncheck.\n- Regression tests: snapshot ranges (forward and reverse) ending at a\nkey whose versions span blocks, over pinned, volatile and partitioned\nindexes with restart intervals 1 and 4; entries sharing one end key;\nexact matches keep the next entry; `seek` then `seek_upper` on one entry\nfor restart intervals 1 to 232; an upper bound below the seeked entry,\nand one behind the consumed front, walk nothing.\n\n## Testing\n\nFormatting, tests with default and all features, clippy in both\nconfigurations, doc tests, the doc build, the no-std check, the sst-dump\nsuite and the db_bench checks pass on Linux.\n\nCloses #838",
+          "timestamp": "2026-10-07T11:21:09+03:00",
+          "tree_id": "3d47a43d675e9b9ffc409a99facc9a887f00bbd9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b1e67d5a16af5cfadbcb47fa70a7aba41e6ec9c6"
+        },
+        "date": 1791362325418,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 503.96900000000005,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 80.067308ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 132.996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.225371ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 453.936,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.461004ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3382.725,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9762.117,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
           }
