@@ -592,9 +592,10 @@ impl<'a> Ingestion<'a> {
         // allocated. This ensures all ingested tables share the same sequence
         // number, which is critical for MVCC correctness.
         //
-        // We intentionally do NOT pin filter/index blocks here. Large ingests
-        // are typically placed in level 1, and pinning would increase memory
-        // pressure unnecessarily.
+        // The tables are installed as a new L0 run below, so they pin their
+        // filter and index blocks by the L0 policy, as a flushed table does.
+        let pin_filter = self.tree.config.filter_block_pinning_policy.get(0);
+        let pin_index = self.tree.config.index_block_pinning_policy.get(0);
         let created_tables = results
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
@@ -608,6 +609,8 @@ impl<'a> Ingestion<'a> {
                 );
                 params.global_seqno = global_seqno;
                 params.tree_id = self.tree.id;
+                params.pin_filter = pin_filter;
+                params.pin_index = pin_index;
                 params
                     .descriptor_table
                     .clone_from(&self.tree.config.descriptor_table);
