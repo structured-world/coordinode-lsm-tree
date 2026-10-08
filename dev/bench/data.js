@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791385420381,
+  "lastUpdate": 1791491319321,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -41168,6 +41168,90 @@ window.BENCHMARK_DATA = {
             "value": 256868.30825868176,
             "unit": "ops/sec",
             "extra": "P50: 2.7us | P99: 19.4us | P99.9: 125.6us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "165e985a5e821d233b10b2b53e6d99a8ddf3f9b2",
+          "message": "feat(import): offline converter from the 5.x on-disk format (#872)\n\n## Summary\n- `tools/v5-to-v6` converts a store written by 5.x into the 6.0 on-disk\nformat, offline and in place. The 5.x crate reads the source through its\nread-only export, so every V5 byte is decoded, verified and, where its\nparity allows, repaired by the code that wrote it; every V6 byte is\nwritten by the 6.0 engine's own writers through a new hidden `import`\nmodule.\n- The converted store is read back and checked against the source before\nthe source is touched, and the switch into place survives an\ninterruption at any step.\n\n## Changes\n- `import`: `TableImport` writes a table from a source's verified, still\ncompressed data blocks, framed under this table's encryption, place\nbinding and parity, or for a columnar table from its rows encoded again,\nor from its batches as stored when an ingest split its values into\nfields. Its key range covers its range tombstones as well as its\nentries. Filters and locators are carried as solved, re-packed in the\n6.0 layout; a locator over blocks that are not the source's is built\nagain. Table properties (age, initial level, per-KV checksum footer,\nparity scheme, split index, seqno bounds, zone map, bulk-ingest\nprovenance, compaction lineage, delete bitmap) are carried. Blob links\nare derived from the rows.\n- `import`: `BlobFileImport` writes a blob file value by value at the\nsource offsets, so every value handle still resolves, a file a\ntight-space relocation reclaimed below a frontier behind the same\nfrontier with its prefix left unwritten and the totals its source\ncounted over the whole file, which its garbage statistics are charged\nagainst; `store_dictionary` keeps compression dictionaries;\n`install_manifest` writes the manifest through the engine's persist,\neach level's tables read from the folder the caller names for it, a\nrestricted table under its live-suffix digest, and returns what each\ntable records as an open reads it, its seqno bounds included. A source\ntable holding only range tombstones carries the entry its writer\nsynthesized for them, which counts as no KV, as the engine's own writer\ncounts it.\n- `Writer`: an age and a key range to record instead of the computed\nones, a prebuilt filter or locator, compressed data blocks appended as\nthey are, and rows and column batches counted against a prebuilt\npartitioned filter. A carried zstd block gets the inner-block layout a\nfresh compression records, read back from its frame, so a range read\nstill decodes part of a large block. The blob-link derivation salvage\nused moves to `blob_tree::links` so both share it.\n- The tool takes the store's directory lock for the whole run, so a\nstore a tree still has open is refused. It reads 5.x through one pinned\nrevision. It converts standard and blob trees, encryption, dictionaries\n(kept or supplied), columnar tables, tables and blob files a tight-space\ncompaction restricted (a restricted table's blob links are derived from\nthe rows it serves; a blob file with no live value left is not carried,\nand no table may reference it). A field id of an ingested batch that 6.0\nreserves for its own columns is renumbered store-wide to a free field\nid, and the report names each change. A store opened with level routes\nis converted with the same routes (`--level-route`): each routed level's\ntables are read from and written back to its route folder, on that\nfolder's volume; route folders are compared as the filesystem resolves\nthem (a route naming the store's folder is the store's own), and a route\nfolder inside a folder the switch moves, or whose path is not UTF-8 or\nholds a line break, is refused. Both crates carry every codec, parity\nscheme and per-entry checksum, CRC32C included. Before switching, every\nconverted table must record what its source recorded, its seqno bounds\nand inner-block layout included. The switch sets the source aside in\n`<store>/v5-backup`, and each route folder's tables in its own\n`v5-backup`, behind two markers that record the resolved route folders,\nthe source's state and the renumbering, and a guard manifest file keeps\nany tree from starting fresh in the folder while it holds no pointer; a\nrerun finishes it and reports the renumbering, a rerun with other routes\nis refused, and one finding a source a tree wrote to since starts over\nfrom it. A store with a custom comparator or an earlier backup in the\nway is refused.\n- CI lints and tests the tool on Linux, macOS and Windows, and counts\nthe library coverage its tests give; the README lists it.\n\n## Testing\nfmt, clippy (default and all features), full nextest, doc tests, doc\nbuild, no-std check and the tool builds pass on Linux; the tool's tests\nalso pass on Windows. The tool's tests write stores with the 5.x crate\n(row, partitioned filters, locator, every table property, CRC32C\nfooters, large zstd blocks, blob trees, encryption, dictionaries,\ncolumnar, an ingested field batch, one using a reserved field id, a\ntombstone-only table, a restricted table, a restricted blob file,\nparity-repaired damage), convert them and compare every read at every\nsnapshot, a snapshot below the retention floor included; a converted\nrestricted blob file is as stale as its source; the switch, with and\nwithout a level route, is interrupted at each step and finished by a\nrerun, a source written between two runs is converted again, and a store\na 5.x tree holds open is refused.\n\nDepends on #871 (the 5.x export of table and blob file properties,\ntotals and seqno bounds).\n\nCloses #672\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an offline tool to convert 5.x stores to the 6.0 format in\nplace, with optional encryption keys, compression dictionaries, and\nlevel-folder routing.\n* Conversion verifies the source and converted store, retains the\noriginal files in a backup folder, and can resume an interrupted switch\nwhen rerun.\n* Conversion reports progress counts and any remapped column field IDs.\n* **Bug Fixes**\n* Improved preservation and validation of table data, blob files,\ncompression details, and metadata during conversion.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-08T19:30:30Z",
+          "tree_id": "72391f5b80079bf06979652a6a7a0003c98ba788",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/165e985a5e821d233b10b2b53e6d99a8ddf3f9b2"
+        },
+        "date": 1791491318028,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 73386.9826170508,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 21.7us | P99.9: 65.6us\nthreads: 1 | elapsed: 7.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2330849.2501687096,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 456556.43518635246,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.4us | P99.9: 38.5us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 424373.54666648107,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.2us | P99.9: 40.7us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 1922860.675207142,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.0us | P99.9: 11.4us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 228634.69531913009,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 12.3us | P99.9: 68.1us\nthreads: 1 | elapsed: 0.87s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 128368.57307936378,
+            "unit": "ops/sec",
+            "extra": "P50: 6.5us | P99: 21.7us | P99.9: 70.0us\nthreads: 1 | elapsed: 1.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 636419.4815945831,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 15.3us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 645879.1203769676,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.8us | P99.9: 19.8us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 235499.13931894055,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 20.6us | P99.9: 225.3us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
           }
         ]
       }
