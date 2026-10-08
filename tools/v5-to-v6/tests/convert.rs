@@ -1126,6 +1126,111 @@ fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// A batch ingested with one nullable bytes field under the id rows keep their
+/// whole value in is a field batch, not rows: the converted table keeps the
+/// field with its null rows, which a projected scan reads as the source's did.
+#[test]
+fn a_converted_nullable_field_under_the_value_id_keeps_its_nulls()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::table::columnar::{COL_VALUE, Column, TypeTag, entries_to_column_batch};
+    let rows = 50u32;
+    let folder = tempfile::tempdir()?;
+    let tree = lsm5::Config::new(
+        folder.path(),
+        lsm5::SequenceNumberCounter::default(),
+        lsm5::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    {
+        let lsm5::AnyTree::Standard(standard) = &tree else {
+            return Err("a standard tree was opened".into());
+        };
+        standard.update_runtime_config(|c| c.columnar = true)?;
+        let entries: Vec<_> = (0..rows)
+            .map(|i| {
+                lsm5::InternalValue::from_components(
+                    format!("k{i:05}"),
+                    "x",
+                    0,
+                    lsm5::ValueType::Value,
+                )
+            })
+            .collect();
+        let mut batch = entries_to_column_batch(&entries)?;
+        batch.columns.pop();
+        // Every third row null, the rest a name.
+        let valid = |i: u32| i % 3 != 0;
+        let mut validity = vec![0u8; usize::try_from(rows.div_ceil(8))?];
+        let mut offsets = vec![0u32];
+        let mut names = Vec::new();
+        for i in 0..rows {
+            if valid(i) {
+                validity[usize::try_from(i / 8)?] |= 1 << (i % 8);
+                names.extend(format!("name-{i}").into_bytes());
+            }
+            offsets.push(u32::try_from(names.len())?);
+        }
+        let mut bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+        bytes.extend(names);
+        batch.columns.push(Column {
+            column_id: COL_VALUE,
+            type_tag: TypeTag::Bytes,
+            validity: Some(validity),
+            data: bytes.into(),
+        });
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write_columnar_batch(&batch)?;
+        ingestion.finish()?;
+    }
+    drop(tree);
+
+    let scan_v5 = || -> lsm5::Result<Vec<_>> {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.columnar_scan(&[COL_VALUE], None, u64::MAX, ..)?
+            .map(|batch| {
+                Ok(batch?
+                    .columns
+                    .into_iter()
+                    .map(|c| (c.column_id, c.validity, c.data.to_vec()))
+                    .collect::<Vec<_>>())
+            })
+            .collect()
+    };
+    let expected = scan_v5()?;
+    assert!(
+        expected
+            .iter()
+            .flatten()
+            .any(|(_, validity, _)| validity.is_some()),
+        "the source scan reads the field's nulls"
+    );
+
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    let tree = lsm6::Config::new(
+        folder.path(),
+        lsm6::SequenceNumberCounter::default(),
+        lsm6::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let converted: Vec<_> = tree
+        .columnar_scan(&[COL_VALUE], None, u64::MAX, ..)?
+        .map(|batch| {
+            Ok(batch?
+                .columns
+                .into_iter()
+                .map(|c| (c.column_id, c.validity, c.data.to_vec()))
+                .collect::<Vec<_>>())
+        })
+        .collect::<lsm6::Result<_>>()?;
+    assert_eq!(converted, expected);
+    Ok(())
+}
+
 /// A field id 6.0 keeps for itself is renumbered, once for the store, to an id
 /// no field uses: the field reads back under its new id with the bytes it had,
 /// every row reads back the same value, and the report names the change.

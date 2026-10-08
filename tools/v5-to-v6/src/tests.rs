@@ -296,6 +296,50 @@ fn a_switch_resumes_only_with_the_routes_it_started_with() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// A switch stopped with only its last marker left resumes only with the
+/// routes it started with, as one stopped earlier does: the run that would
+/// report a finished switch with other routes is refused.
+#[test]
+fn a_switch_left_with_its_last_marker_resumes_only_with_its_routes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let routes = vec![LevelRoute {
+        levels: 1..7,
+        path: cold.path().to_path_buf(),
+    }];
+    let options = Options {
+        level_routes: routes.clone(),
+        ..Options::default()
+    };
+    let expected = small_store(folder.path(), &routes)?;
+    let report = prepare(folder.path(), &options)?;
+    let ready = folder.path().join(READY);
+    let swapping = folder.path().join(SWAPPING);
+    let stopped = switch(
+        folder.path(),
+        &routes,
+        &report.renumbered_fields,
+        &mut || {
+            if swapping.exists() && !ready.exists() {
+                Err(std::io::Error::other("interrupted"))
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(stopped.is_err() && swapping.exists() && !ready.exists());
+
+    assert!(matches!(
+        convert(folder.path(), &Options::default()),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(convert(folder.path(), &options)?.resumed);
+    assert_eq!(read_v6(folder.path(), &routes)?, expected);
+    assert!(!swapping.exists());
+    Ok(())
+}
+
 /// A switch resumes only with routes that put every level in the folder it
 /// started with: the same folder over other levels is refused before anything
 /// moves, the same levels split into several routes to that folder resume.
@@ -440,6 +484,33 @@ fn a_route_path_with_a_line_break_is_refused() -> Result<(), Box<dyn std::error:
         level_routes: vec![LevelRoute {
             levels: 1..7,
             path: cold.path().join("a\nb"),
+        }],
+        ..Options::default()
+    };
+    assert!(matches!(
+        convert(folder.path(), &options),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(!folder.path().join(STAGING).exists() && !folder.path().join(READY).exists());
+    Ok(())
+}
+
+/// A route spelled cleanly but resolving, through a link, to a folder whose
+/// path holds a line break is refused before anything is built: the markers
+/// record the resolved folder.
+#[cfg(unix)]
+#[test]
+fn a_route_resolving_to_a_path_with_a_line_break_is_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    std::fs::create_dir(cold.path().join("a\nb"))?;
+    std::os::unix::fs::symlink(cold.path().join("a\nb"), cold.path().join("link"))?;
+    let options = Options {
+        level_routes: vec![LevelRoute {
+            levels: 1..7,
+            path: cold.path().join("link"),
         }],
         ..Options::default()
     };

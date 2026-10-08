@@ -910,6 +910,12 @@ pub fn install_manifest(
     #[cfg(zstd_any)] dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<Vec<RecordedTable>> {
     let cache = Arc::new(crate::cache::Cache::with_capacity_bytes(0));
+    // Looked up once per table: a store can hold hundreds of thousands.
+    let restrictions: std::collections::BTreeMap<TableId, &UserKey> = image
+        .restrictions
+        .iter()
+        .map(|(id, bound)| (*id, bound))
+        .collect();
     let mut tables = Vec::new();
     let placements = image.levels.iter().enumerate().flat_map(|(level, runs)| {
         runs.iter()
@@ -936,12 +942,8 @@ pub fn install_manifest(
         // A restricted table's manifest entry digests its live suffix, from
         // the block that holds its first served key on, as every reader of a
         // restricted entry checks it.
-        let table = match image
-            .restrictions
-            .iter()
-            .find(|(id, _)| *id == placement.id)
-        {
-            Some((_, bound)) => {
+        let table = match restrictions.get(&placement.id).copied() {
+            Some(bound) => {
                 let suffix = table.suffix_checksum_for(Some(bound))?;
                 table.with_refreshed_checksum(suffix)
             }
@@ -978,32 +980,32 @@ pub fn install_manifest(
         }
     }
 
+    // `tables` holds one table per placement, in placement order; a restricted
+    // one carries the checksum of its live suffix.
+    let mut recovered = tables.iter();
+    let mut table_ids = Vec::with_capacity(image.levels.len());
+    for level in &image.levels {
+        let mut runs = Vec::with_capacity(level.len());
+        for run in level {
+            let mut ids = Vec::with_capacity(run.len());
+            for t in run {
+                let table = recovered.next().ok_or(crate::Error::Unrecoverable)?;
+                ids.push(crate::version::recovery::RecoveredTable {
+                    id: t.id,
+                    checksum: table.checksum(),
+                    global_seqno: t.global_seqno,
+                    recency: t.recency,
+                });
+            }
+            runs.push(ids);
+        }
+        table_ids.push(runs);
+    }
     let recovery = crate::version::recovery::Recovery {
         tree_type: image.tree_type,
         snapshot_id: image.version_id,
         curr_version_id: image.version_id,
-        table_ids: image
-            .levels
-            .iter()
-            .map(|level| {
-                level
-                    .iter()
-                    .map(|run| {
-                        run.iter()
-                            .map(|t| crate::version::recovery::RecoveredTable {
-                                id: t.id,
-                                checksum: tables
-                                    .iter()
-                                    .find(|table| table.id() == t.id)
-                                    .map_or(t.checksum, crate::table::Table::checksum),
-                                global_seqno: t.global_seqno,
-                                recency: t.recency,
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect(),
+        table_ids,
         blob_file_ids: image
             .blob_files
             .iter()
@@ -1028,15 +1030,19 @@ pub fn install_manifest(
     )?;
     // Read from the version, where each table carries the restriction it is
     // installed under.
+    let installed: std::collections::BTreeMap<TableId, &crate::table::Table> = version
+        .iter_tables()
+        .map(|table| (table.id(), table))
+        .collect();
     let recorded = image
         .levels
         .iter()
         .flatten()
         .flatten()
         .map(|placement| {
-            version
-                .iter_tables()
-                .find(|table| table.id() == placement.id)
+            installed
+                .get(&placement.id)
+                .copied()
                 .ok_or(crate::Error::Unrecoverable)
                 .and_then(RecordedTable::of)
         })

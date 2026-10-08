@@ -151,9 +151,14 @@ fn check_route_folders(folder: &Path, sites: &[&Path]) -> Result<(), Error> {
 
 /// Refuses routes a tree refuses: an empty range, or two that overlap. A
 /// route folder whose path the line-oriented switch markers cannot hold, one
-/// that is not UTF-8 or holds a line break, is refused too, before anything is
-/// built, so a stopped switch can always be resumed.
-fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
+/// that is not UTF-8 or holds a line break, as given or as the filesystem
+/// resolves it, which is what the markers record, is refused too, before
+/// anything is built, so a stopped switch can always be resumed. Returns the
+/// [`route_map`] the markers record.
+fn check_routes(
+    folder: &Path,
+    routes: &[LevelRoute],
+) -> Result<Vec<(std::ops::Range<u8>, PathBuf)>, Error> {
     let overlap = routes.iter().enumerate().any(|(i, a)| {
         routes
             .iter()
@@ -163,18 +168,16 @@ fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
     if routes.iter().any(|r| r.levels.is_empty()) || overlap {
         return Err(Error::Unsupported("empty or overlapping level routes"));
     }
-    let unrecordable = |route: &LevelRoute| {
-        route
-            .path
-            .to_str()
-            .is_none_or(|path| path.contains(['\n', '\r']))
-    };
-    if routes.iter().any(unrecordable) {
+    let unrecordable = |path: &Path| path.to_str().is_none_or(|path| path.contains(['\n', '\r']));
+    let map = route_map(folder, routes);
+    if routes.iter().any(|route| unrecordable(&route.path))
+        || map.iter().any(|(_, path)| unrecordable(path))
+    {
         return Err(Error::Unsupported(
             "a level route folder whose path is not UTF-8 or holds a line break",
         ));
     }
-    Ok(())
+    Ok(map)
 }
 
 /// One key, as the 5.x and the 6.0 crate each take it.
@@ -306,21 +309,21 @@ const GUARD: &str = "v18446744073709551615";
 /// read back. A run resuming a switch with level routes other than the ones it
 /// started with is refused, before it moves anything.
 pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
-    check_routes(&options.level_routes)?;
+    let routes = check_routes(folder, &options.level_routes)?;
     let sites = route_sites(folder, &options.level_routes);
     check_route_folders(folder, &sites)?;
     // Held to the end: a tree open on the store, or another conversion, would
     // change what this one read or move files from under it.
     let _lock = lock_store(folder)?;
+    // Every level must be in the folder it was built in. Compared as
+    // resolved: a relative route names another folder from another working
+    // directory, however the option is spelled.
+    let other_routes =
+        || Error::Unsupported("level routes other than the interrupted conversion's");
     if folder.join(READY).exists() {
         let ready = Ready::read(&folder.join(READY))?;
-        // Every level must be in the folder it was built in. Compared as
-        // resolved: a relative route names another folder from another
-        // working directory, however the option is spelled.
-        if ready.routes != route_map(folder, &options.level_routes) {
-            return Err(Error::Unsupported(
-                "level routes other than the interrupted conversion's",
-            ));
+        if ready.routes != routes {
+            return Err(other_routes());
         }
         if folder.join(SWAPPING).exists()
             || source_state(folder, &ready.entries, &sites)? == ready.source
@@ -341,7 +344,11 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         // would lose that, so it is built again from the source as it is.
         set_back(folder, &ready, &sites)?;
     } else if folder.join(SWAPPING).exists() {
-        let renumbered = Ready::read(&folder.join(SWAPPING))?.renumbered;
+        let swapping = Ready::read(&folder.join(SWAPPING))?;
+        if swapping.routes != routes {
+            return Err(other_routes());
+        }
+        let renumbered = swapping.renumbered;
         switch(folder, &options.level_routes, &renumbered, &mut || Ok(()))?;
         return Ok(Report {
             resumed: true,
@@ -957,16 +964,18 @@ struct Converted {
 
 /// Whether a 5.x columnar batch stores its values split into the caller's
 /// fields. Rows, written or ingested, store each value whole in the one value
-/// column the row path names (`COL_VALUE`, variable-width); any other shape
-/// carries the fields an ingested batch gave. A batch that ingested exactly
-/// that one column reads back the same either way. These are the only two
-/// layouts 5.x has: rows written as cells, the third 6.0 layout, came after.
+/// column the row path names (`COL_VALUE`, variable-width, never null); any
+/// other shape carries the fields an ingested batch gave, a nullable field
+/// under that id included. A batch that ingested exactly that one non-null
+/// column reads back the same either way. These are the only two layouts 5.x
+/// has: rows written as cells, the third 6.0 layout, came after.
 fn splits_fields(batch: &lsm5::table::columnar::ColumnBatch) -> bool {
     let values = batch.columns.get(3..).unwrap_or_default();
     !matches!(
         values,
         [only] if only.column_id == lsm5::table::columnar::COL_VALUE
             && only.type_tag == lsm5::table::columnar::TypeTag::Bytes
+            && only.validity.is_none()
     )
 }
 
@@ -1208,8 +1217,9 @@ fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
 /// What [`READY`] records: the source entries the switch sets aside, the
 /// [`route_map`] the converted tables were built under, the source's state
 /// when it was read, and the field ids the converted store renumbered, which a
-/// run that only finishes the switch reports. [`SWAPPING`] carries the
-/// renumbering alone.
+/// run that only finishes the switch reports. [`SWAPPING`] carries the route
+/// map and the renumbering, so a run finding it alone is held to the same
+/// routes.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Ready {
     entries: Vec<String>,
@@ -1470,6 +1480,7 @@ fn switch(
         }
         step()?;
         let carried = Ready {
+            routes: marker.routes.clone(),
             renumbered: marker.renumbered.clone(),
             ..Ready::default()
         };
