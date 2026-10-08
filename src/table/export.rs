@@ -199,6 +199,14 @@ impl Table {
                 "the table is columnar and this build decodes no columnar blocks",
             ));
         }
+        // A per-entry checksum this build cannot compute cannot be written
+        // again either; the same error the read path gives for it.
+        if meta
+            .kv_checksum_algo
+            .is_some_and(|algo| !algo.is_available())
+        {
+            return Err(crate::Error::FeatureUnsupported("kv-checksum-algorithm"));
+        }
         let initial_level = match self
             .export_meta()?
             .into_iter()

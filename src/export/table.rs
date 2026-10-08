@@ -354,6 +354,9 @@ impl TableExport {
     /// under a scheme this build cannot apply (any scheme, without the
     /// `page_ecc` feature), is columnar in a build without the `columnar`
     /// feature, or its `initial_level` item is missing or malformed.
+    /// Returns [`crate::Error::FeatureUnsupported`] when its per-entry
+    /// checksum algorithm is not compiled into this build (CRC32C without
+    /// the `crc32c` feature).
     pub fn properties(&self) -> crate::Result<TableProperties> {
         self.table.export_properties()
     }
