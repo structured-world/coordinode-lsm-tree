@@ -58,6 +58,59 @@ pub struct VerifiedFrame {
     pub ecc_recovery: Option<crate::table::block::EccRecoveryKind>,
 }
 
+/// How a table was written, as its meta block records it, decoded the way
+/// the open decodes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent property the table records, not a state"
+)]
+pub struct TableProperties {
+    /// When the table was written, or the age it inherited from its inputs:
+    /// nanoseconds since the Unix epoch.
+    pub created_at: u128,
+    /// The level the table was written for.
+    pub initial_level: u8,
+    /// The codec the data blocks are compressed with.
+    pub data_compression: crate::CompressionType,
+    /// The codec the index blocks are compressed with.
+    pub index_compression: crate::CompressionType,
+    /// The restart interval of the data blocks.
+    pub data_restart_interval: u8,
+    /// The restart interval of the index blocks.
+    pub index_restart_interval: u8,
+    /// The per-KV checksum footer every data block carries, if any.
+    pub kv_checksum: Option<crate::runtime_config::ChecksumAlgorithm>,
+    /// The parity scheme every block carries, if any.
+    pub ecc: Option<crate::table::block::EccParams>,
+    /// Whether the data blocks are columnar.
+    pub columnar: bool,
+    /// Whether the table was bulk-ingested, when recorded.
+    pub bulk_ingested: Option<bool>,
+    /// The L0 recency key the table records, when it records one.
+    pub recency: Option<TableId>,
+    /// The compaction inputs the table was merged from, when recorded.
+    pub lineage: Option<Vec<TableId>>,
+    /// The previous output of the same compaction run, when recorded.
+    pub lineage_prev: Option<TableId>,
+    /// Whether a compaction filter transformed the table's window.
+    pub lineage_transformed: bool,
+    /// Whether the table closed its compaction run.
+    pub lineage_last: bool,
+    /// Whether the index is split into a top-level index and index blocks.
+    pub partitioned_index: bool,
+    /// Whether the table keeps per-block seqno bounds.
+    pub seqno_bounds: bool,
+    /// Whether the table keeps a zone map.
+    pub zone_map: bool,
+    /// The lowest and highest local seqno over its entries and range
+    /// tombstones, as its meta records them.
+    pub seqnos: (SeqNo, SeqNo),
+    /// The highest local seqno over its entries alone, which a covering range
+    /// tombstone must exceed for a read to skip the table.
+    pub highest_kv_seqno: SeqNo,
+}
+
 /// A range tombstone: every key in `[start, end)` deleted at `seqno`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeDelete {
@@ -296,6 +349,22 @@ impl TableExport {
     /// Propagates the read and decode of the trailer.
     pub fn sections(&self) -> crate::Result<Vec<Section>> {
         self.table.export_sections()
+    }
+
+    /// How the table was written, from the meta the open decoded and the
+    /// sections the table holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] when the table carries parity
+    /// under a scheme this build cannot apply (any scheme, without the
+    /// `page_ecc` feature), is columnar in a build without the `columnar`
+    /// feature, or its `initial_level` item is missing or malformed.
+    /// Returns [`crate::Error::FeatureUnsupported`] when its per-entry
+    /// checksum algorithm is not compiled into this build (CRC32C without
+    /// the `crc32c` feature).
+    pub fn properties(&self) -> crate::Result<TableProperties> {
+        self.table.export_properties()
     }
 
     /// Every key and value of the meta block, in key order, from the copy the
