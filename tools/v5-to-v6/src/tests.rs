@@ -295,6 +295,84 @@ fn a_route_inside_a_folder_the_switch_moves_is_refused() -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// A route naming the store's own folder, spelled otherwise, is the store's
+/// folder: its levels convert in place like the rest, not as a route folder
+/// whose staging is the store's own.
+#[test]
+fn a_route_naming_the_store_folder_converts_in_place() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    // Through a folder the switch does not move, so the alias resolves to the
+    // store's folder all along.
+    std::fs::create_dir(folder.path().join("alias"))?;
+    let routes = vec![LevelRoute {
+        levels: 1..7,
+        path: folder.path().join("alias").join(".."),
+    }];
+    // Written under the route, so a compaction places tables at a routed level.
+    let expected = small_store(folder.path(), &routes)?;
+    let options = Options {
+        level_routes: routes,
+        ..Options::default()
+    };
+    convert(folder.path(), &options)?;
+    assert_eq!(read_v6(folder.path(), &[])?, expected);
+    assert_eq!(read_v5(&folder.path().join(BACKUP), &[])?, expected);
+    Ok(())
+}
+
+/// A route folder whose path the line-oriented markers cannot hold is refused
+/// before anything is built, rather than once a marker no run can read again
+/// is durable.
+#[test]
+fn a_route_path_with_a_line_break_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    let options = Options {
+        level_routes: vec![LevelRoute {
+            levels: 1..7,
+            path: cold.path().join("a\nb"),
+        }],
+        ..Options::default()
+    };
+    assert!(matches!(
+        convert(folder.path(), &options),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(!folder.path().join(STAGING).exists() && !folder.path().join(READY).exists());
+    Ok(())
+}
+
+/// A converted table may record an inner-block layout its source lacked, read
+/// from its frames as the source's writer did not yet; a layout the source
+/// had must arrive. A restricted table's carried suffix may hold no split
+/// frame of the source's, so its layout is not compared.
+#[test]
+fn records_compare_the_inner_layout_one_way() {
+    let table = |block_layout| lsm6::import::RecordedTable {
+        id: 1,
+        columnar: false,
+        split_fields: false,
+        created_at: 1,
+        kv_checksum: None,
+        ecc: None,
+        partitioned_index: false,
+        seqno_bounds: false,
+        zone_map: false,
+        bulk_ingested: None,
+        lineage: lsm6::import::TableLineage::default(),
+        blob_links: Vec::new(),
+        restriction: None,
+        seqnos: (1, 2),
+        highest_kv_seqno: 2,
+        block_layout,
+    };
+    assert!(records_match(&table(false), &table(true), false), "derived");
+    assert!(!records_match(&table(true), &table(false), false), "lost");
+    assert!(records_match(&table(false), &table(true), true));
+    assert!(records_match(&table(true), &table(false), true));
+}
+
 /// A store whose folder holds the backup of an earlier conversion is not
 /// converted over it: the switch would mix two sources in one backup.
 #[test]

@@ -47,13 +47,37 @@ fn level_base<'a>(folder: &'a Path, routes: &'a [LevelRoute], level: usize) -> &
         .map_or(folder, |route| &route.path)
 }
 
-/// The route folders other than the store's own, each once: each holds only
-/// its `tables`, which the switch sets aside and replaces there, on its own
-/// volume.
+/// A folder as the filesystem resolves it, links and `.`/`..` included: its
+/// nearest existing ancestor resolved, the rest of the path appended.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            return rest.iter().rev().fold(real, |at, part| at.join(part));
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                base = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The route folders other than the store's own, each once, told apart as
+/// the filesystem resolves them: a route spelled differently from the store's
+/// folder but naming it is the store's own. Each holds only its `tables`,
+/// which the switch sets aside and replaces there, on its own volume.
 fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
+    let store = resolved(folder);
+    let mut seen = Vec::new();
     let mut sites: Vec<&Path> = Vec::new();
     for route in routes {
-        if route.path != folder && !sites.contains(&route.path.as_path()) {
+        let real = resolved(&route.path);
+        if real != store && !seen.contains(&real) {
+            seen.push(real);
             sites.push(&route.path);
         }
     }
@@ -66,26 +90,8 @@ fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
 /// store inside one of a route's. A route nested that way would move with
 /// its ancestor, its own tables left behind for the converted store to miss.
 fn check_route_folders(folder: &Path, sites: &[&Path]) -> Result<(), Error> {
-    // A folder as the filesystem resolves it, links included: its nearest
-    // existing ancestor resolved, the rest of the path appended.
-    let real = |path: &Path| {
-        let mut rest = Vec::new();
-        let mut base = path;
-        loop {
-            if let Ok(resolved) = std::fs::canonicalize(base) {
-                return rest.iter().rev().fold(resolved, |at, part| at.join(part));
-            }
-            match (base.parent(), base.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_owned());
-                    base = parent;
-                }
-                _ => return path.to_path_buf(),
-            }
-        }
-    };
-    let store = real(folder);
-    let sites: Vec<PathBuf> = sites.iter().map(|site| real(site)).collect();
+    let store = resolved(folder);
+    let sites: Vec<PathBuf> = sites.iter().map(|site| resolved(site)).collect();
     let moved_by_store = |path: &Path| {
         path.strip_prefix(&store)
             .ok()
@@ -116,7 +122,10 @@ fn check_route_folders(folder: &Path, sites: &[&Path]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Refuses routes a tree refuses: an empty range, or two that overlap.
+/// Refuses routes a tree refuses: an empty range, or two that overlap. A
+/// route folder whose path the line-oriented switch markers cannot hold, one
+/// that is not UTF-8 or holds a line break, is refused too, before anything is
+/// built, so a stopped switch can always be resumed.
 fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
     let overlap = routes.iter().enumerate().any(|(i, a)| {
         routes
@@ -126,6 +135,17 @@ fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
     });
     if routes.iter().any(|r| r.levels.is_empty()) || overlap {
         return Err(Error::Unsupported("empty or overlapping level routes"));
+    }
+    let unrecordable = |route: &LevelRoute| {
+        route
+            .path
+            .to_str()
+            .is_none_or(|path| path.contains(['\n', '\r']))
+    };
+    if routes.iter().any(unrecordable) {
+        return Err(Error::Unsupported(
+            "a level route folder whose path is not UTF-8 or holds a line break",
+        ));
     }
     Ok(())
 }
@@ -799,8 +819,17 @@ fn records_match(
     recorded: &lsm6::import::RecordedTable,
     restricted: bool,
 ) -> bool {
+    // The inner-block layout of a converted table is read from its carried
+    // frames, so it is there whenever a frame splits; a source written before
+    // the layout was recorded lacks one it now gets. One the source had must
+    // arrive; a carried suffix may hold no split frame of the source's.
+    let without_layout = |table: &lsm6::import::RecordedTable| lsm6::import::RecordedTable {
+        block_layout: false,
+        ..table.clone()
+    };
     if !restricted {
-        return expected == recorded;
+        return (!expected.block_layout || recorded.block_layout)
+            && without_layout(expected) == without_layout(recorded);
     }
     let links_fit = recorded.blob_links.iter().all(|link| {
         expected.blob_links.iter().any(|source| {
@@ -813,17 +842,13 @@ fn records_match(
     let seqnos_fit = expected.seqnos.0 <= recorded.seqnos.0
         && recorded.seqnos.1 <= expected.seqnos.1
         && recorded.highest_kv_seqno <= expected.highest_kv_seqno;
-    // The carried blocks are a suffix of the source's: an inner-block layout
-    // only where the source recorded one.
-    let layouts_fit = !recorded.block_layout || expected.block_layout;
     let without_derived = |table: &lsm6::import::RecordedTable| lsm6::import::RecordedTable {
         blob_links: Vec::new(),
         seqnos: (0, 0),
         highest_kv_seqno: 0,
-        block_layout: false,
-        ..table.clone()
+        ..without_layout(table)
     };
-    links_fit && seqnos_fit && layouts_fit && without_derived(expected) == without_derived(recorded)
+    links_fit && seqnos_fit && without_derived(expected) == without_derived(recorded)
 }
 
 /// Writes one blob file through the 6.0 import from the frames its 5.x export
