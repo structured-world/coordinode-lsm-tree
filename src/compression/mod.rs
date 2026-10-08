@@ -86,6 +86,9 @@ pub trait CompressionProvider {
 #[cfg(feature = "zstd")]
 pub type ZstdBackend = zstd_backend::ZstdProvider;
 
+#[cfg(all(feature = "zstd", feature = "std"))]
+pub(crate) use zstd_backend::inner_block_layout_of;
+
 /// A zstd dictionary to compress small blocks against.
 ///
 /// Zstd dictionaries significantly improve compression ratios for blocks

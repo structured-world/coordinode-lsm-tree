@@ -3802,6 +3802,7 @@ impl Writer {
     /// Returns an error if the entries are out of internal-key order
     /// ([`Self::validate_direct_block_order`]), the payload disagrees with its
     /// uncompressed length, or the write fails.
+    #[cfg(feature = "std")]
     pub(crate) fn append_compressed_data_block(
         &mut self,
         payload: &[u8],
@@ -3847,11 +3848,21 @@ impl Writer {
             &transform,
             kv_flags,
         )?;
+        // The inner-block layout a compression here would have recorded, read
+        // from the frame: a range read partial-decodes the carried block as it
+        // would one this writer compressed.
+        #[cfg(zstd_any)]
+        let layout = match self.data_block_compression {
+            CompressionType::Zstd(_) => crate::compression::inner_block_layout_of(payload)?,
+            _ => Vec::new(),
+        };
+        #[cfg(not(zstd_any))]
+        let layout = Vec::new();
         let at = next_block_at(self.table_id, &self.file_writer);
         let header = prepared.write_to(&mut self.file_writer, at)?;
         self.register_written_block(
             header,
-            Vec::new(),
+            layout,
             inputs.last_key.clone(),
             inputs.last_seqno,
             inputs.seqno_bounds,

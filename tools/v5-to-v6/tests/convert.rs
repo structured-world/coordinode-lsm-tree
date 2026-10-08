@@ -315,6 +315,103 @@ fn a_converted_store_keeps_every_table_property() -> Result<(), Box<dyn std::err
     )
 }
 
+/// Data blocks large enough for zstd to split into several inner blocks: the
+/// source records their inner layout, which lets a range read decode part of
+/// a block, and the converted table records it too.
+#[test]
+fn a_converted_store_keeps_the_inner_layout_of_large_zstd_blocks()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::{AbstractTree as _, Guard as _};
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(lsm5::config::BlockSizePolicy::all(1 << 20))
+        .data_block_compression_policy(lsm5::config::CompressionPolicy::all(
+            lsm5::CompressionType::Zstd(3),
+        ))
+        .open()?;
+        for i in 0..2_000u32 {
+            let value: String = format!("{i:08}-").repeat(56);
+            tree.insert(format!("k{i:05}"), value, u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let with_layout = source_tables(folder.path())?
+        .iter()
+        .map(lsm5::export::TableExport::sections)
+        .collect::<lsm5::Result<Vec<_>>>()?
+        .iter()
+        .filter(|sections| sections.iter().any(|s| s.name == b"block_layout"))
+        .count();
+    assert!(with_layout > 0, "a source table records an inner layout");
+
+    let scan_v5 = || -> lsm5::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.range::<&[u8], _>(.., u64::MAX, None)
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect()
+    };
+    let expected = scan_v5()?;
+
+    // The conversion refuses a table that records no layout where its source
+    // did, so a clean run proves the layout arrived.
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    let tree = lsm6::Config::new(
+        folder.path(),
+        lsm6::SequenceNumberCounter::default(),
+        lsm6::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let got = {
+        use lsm6::{AbstractTree as _, Guard as _};
+        tree.range::<&[u8], _>(.., u64::MAX, None)
+            .map(|guard| {
+                let (key, value) = guard.into_inner()?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect::<lsm6::Result<Vec<_>>>()?
+    };
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// A store whose per-KV checksum footers are CRC32C: the export verifies every
+/// footer as it decodes the rows, and the converted table carries them.
+#[test]
+fn a_converted_store_with_crc32c_footers_answers_as_the_source_did()
+-> Result<(), Box<dyn std::error::Error>> {
+    round_trip_tuned(
+        500,
+        None,
+        |config| config,
+        |runtime| {
+            runtime.kv_checksums = lsm5::runtime_config::KvChecksumPolicy::AllLevels;
+            runtime.kv_checksum_algo = lsm5::runtime_config::ChecksumAlgorithm::Crc32c;
+        },
+        |folder| {
+            let properties = source_tables(folder)?
+                .iter()
+                .map(lsm5::export::TableExport::properties)
+                .collect::<lsm5::Result<Vec<_>>>()?;
+            assert!(properties.iter().all(|p| p.kv_checksum
+                == Some(lsm5::runtime_config::ChecksumAlgorithm::Crc32c)));
+            Ok(())
+        },
+    )
+}
+
 /// A tree that separates values: its blob files are carried value by value at
 /// their offsets, so every handle in the tables still resolves, and each
 /// table's links to them arrive with the same counts.

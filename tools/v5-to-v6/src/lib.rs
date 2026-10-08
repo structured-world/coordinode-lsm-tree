@@ -60,6 +60,62 @@ fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
     sites
 }
 
+/// Refuses route folders that overlap a folder the switch moves whole: a
+/// route inside one of the store's own entries or its staging or backup
+/// folder, inside another route's `tables`, staging or backup folder, or a
+/// store inside one of a route's. A route nested that way would move with
+/// its ancestor, its own tables left behind for the converted store to miss.
+fn check_route_folders(folder: &Path, sites: &[&Path]) -> Result<(), Error> {
+    // A folder as the filesystem resolves it, links included: its nearest
+    // existing ancestor resolved, the rest of the path appended.
+    let real = |path: &Path| {
+        let mut rest = Vec::new();
+        let mut base = path;
+        loop {
+            if let Ok(resolved) = std::fs::canonicalize(base) {
+                return rest.iter().rev().fold(resolved, |at, part| at.join(part));
+            }
+            match (base.parent(), base.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    base = parent;
+                }
+                _ => return path.to_path_buf(),
+            }
+        }
+    };
+    let store = real(folder);
+    let sites: Vec<PathBuf> = sites.iter().map(|site| real(site)).collect();
+    let moved_by_store = |path: &Path| {
+        path.strip_prefix(&store)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .is_some_and(|first| {
+                let name = first.as_os_str().to_string_lossy();
+                is_store_entry(&name) || name == STAGING || name == BACKUP
+            })
+    };
+    let moved_by_site = |site: &Path, path: &Path| {
+        [lsm5::file::TABLES_FOLDER, STAGING, BACKUP]
+            .iter()
+            .any(|moved| path.starts_with(site.join(moved)))
+    };
+    for (i, site) in sites.iter().enumerate() {
+        let nested = moved_by_store(site)
+            || moved_by_site(site, &store)
+            || sites
+                .iter()
+                .enumerate()
+                .any(|(j, other)| i != j && moved_by_site(other, site));
+        if nested {
+            return Err(Error::Unsupported(
+                "a level route folder inside a folder the switch moves",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Refuses routes a tree refuses: an empty range, or two that overlap.
 fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
     let overlap = routes.iter().enumerate().any(|(i, a)| {
@@ -199,6 +255,7 @@ const SWAPPING: &str = "convert-to-v6.swapping";
 pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
     check_routes(&options.level_routes)?;
     let sites = route_sites(folder, &options.level_routes);
+    check_route_folders(folder, &sites)?;
     // Held to the end: a tree open on the store, or another conversion, would
     // change what this one read or move files from under it.
     let _lock = lock_store(folder)?;
@@ -217,9 +274,10 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         if folder.join(SWAPPING).exists()
             || source_state(folder, &ready.entries, &sites)? == ready.source
         {
-            switch(folder, &sites, &mut || Ok(()))?;
+            switch(folder, &sites, &ready.renumbered, &mut || Ok(()))?;
             return Ok(Report {
                 resumed: true,
+                renumbered_fields: ready.renumbered,
                 ..Report::default()
             });
         }
@@ -227,14 +285,16 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         // would lose that, so it is built again from the source as it is.
         set_back(folder, &ready, &sites)?;
     } else if folder.join(SWAPPING).exists() {
-        switch(folder, &sites, &mut || Ok(()))?;
+        let renumbered = Ready::read(&folder.join(SWAPPING))?.renumbered;
+        switch(folder, &sites, &renumbered, &mut || Ok(()))?;
         return Ok(Report {
             resumed: true,
+            renumbered_fields: renumbered,
             ..Report::default()
         });
     }
     let report = prepare(folder, options)?;
-    switch(folder, &sites, &mut || Ok(()))?;
+    switch(folder, &sites, &report.renumbered_fields, &mut || Ok(()))?;
     Ok(report)
 }
 
@@ -620,6 +680,10 @@ fn convert_table(
         restriction: restriction.map(|key| lsm6::UserKey::from(&**key)),
         seqnos: properties.seqnos,
         highest_kv_seqno: properties.highest_kv_seqno,
+        block_layout: export
+            .sections()?
+            .iter()
+            .any(|section| section.name == b"block_layout"),
     };
     let blocks: Vec<_> = export
         .data_blocks()?
@@ -749,13 +813,17 @@ fn records_match(
     let seqnos_fit = expected.seqnos.0 <= recorded.seqnos.0
         && recorded.seqnos.1 <= expected.seqnos.1
         && recorded.highest_kv_seqno <= expected.highest_kv_seqno;
+    // The carried blocks are a suffix of the source's: an inner-block layout
+    // only where the source recorded one.
+    let layouts_fit = !recorded.block_layout || expected.block_layout;
     let without_derived = |table: &lsm6::import::RecordedTable| lsm6::import::RecordedTable {
         blob_links: Vec::new(),
         seqnos: (0, 0),
         highest_kv_seqno: 0,
+        block_layout: false,
         ..table.clone()
     };
-    links_fit && seqnos_fit && without_derived(expected) == without_derived(recorded)
+    links_fit && seqnos_fit && layouts_fit && without_derived(expected) == without_derived(recorded)
 }
 
 /// Writes one blob file through the 6.0 import from the frames its 5.x export
@@ -1072,17 +1140,20 @@ fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// What [`READY`] records: the source entries the switch sets aside, the route
-/// folders it switches with them, and the source's state when it was read.
-#[derive(Debug, PartialEq, Eq)]
+/// folders it switches with them, the source's state when it was read, and
+/// the field ids the converted store renumbered, which a run that only
+/// finishes the switch reports. [`SWAPPING`] carries the renumbering alone.
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Ready {
     entries: Vec<String>,
     sites: Vec<PathBuf>,
     source: Vec<String>,
+    renumbered: Vec<(u16, u16)>,
 }
 
 impl Ready {
     /// One line per item, each tagged: `entry <name>`, `site <path>`,
-    /// `state <line>`.
+    /// `state <line>`, `renumber <from> <to>`.
     fn encode(&self) -> Result<String, Error> {
         let mut out = String::new();
         for name in &self.entries {
@@ -1097,26 +1168,33 @@ impl Ready {
         for line in &self.source {
             out += &format!("state {line}\n");
         }
+        for (from, to) in &self.renumbered {
+            out += &format!("renumber {from} {to}\n");
+        }
         Ok(out)
     }
 
     fn read(path: &Path) -> Result<Self, Error> {
-        let mut ready = Self {
-            entries: Vec::new(),
-            sites: Vec::new(),
-            source: Vec::new(),
-        };
+        let mut ready = Self::default();
         for line in std::fs::read_to_string(path)?.lines() {
+            let unreadable = || {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: unreadable line {line:?}", path.display()),
+                ))
+            };
             match line.split_once(' ') {
                 Some(("entry", name)) => ready.entries.push(name.to_owned()),
                 Some(("site", site)) => ready.sites.push(site.into()),
                 Some(("state", state)) => ready.source.push(state.to_owned()),
-                _ => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("{}: unreadable line {line:?}", path.display()),
-                    )));
+                Some(("renumber", ids)) => {
+                    let (from, to) = ids.split_once(' ').ok_or_else(unreadable)?;
+                    ready.renumbered.push((
+                        from.parse().map_err(|_| unreadable())?,
+                        to.parse().map_err(|_| unreadable())?,
+                    ));
                 }
+                _ => return Err(unreadable()),
             }
         }
         Ok(ready)
@@ -1236,6 +1314,7 @@ fn set_back(folder: &Path, ready: &Ready, sites: &[&Path]) -> Result<(), Error> 
 fn switch(
     folder: &Path,
     sites: &[&Path],
+    renumbered: &[(u16, u16)],
     step: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> Result<(), Error> {
     let staging = folder.join(STAGING);
@@ -1256,17 +1335,19 @@ fn switch(
                 source: source_state(folder, &entries, sites)?,
                 entries,
                 sites: sites.iter().map(|site| site.to_path_buf()).collect(),
+                renumbered: renumbered.to_vec(),
             };
             step()?;
             write_marker(&ready, &marker.encode()?)?;
         }
-        let listed = Ready::read(&ready)?.entries;
+        let marker = Ready::read(&ready)?;
+        let listed = &marker.entries;
         if !backup.exists() {
             step()?;
             std::fs::create_dir(&backup)?;
             sync_dir(folder)?;
         }
-        for name in &listed {
+        for name in listed {
             let from = folder.join(name);
             if !from.exists() {
                 continue;
@@ -1301,7 +1382,11 @@ fn switch(
             sync_dir(site)?;
         }
         step()?;
-        write_marker(&swapping, "")?;
+        let carried = Ready {
+            renumbered: marker.renumbered.clone(),
+            ..Ready::default()
+        };
+        write_marker(&swapping, &carried.encode()?)?;
     }
 
     for site in sites {

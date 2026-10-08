@@ -830,6 +830,9 @@ pub struct RecordedTable {
     pub seqnos: (SeqNo, SeqNo),
     /// The highest local seqno over its entries alone.
     pub highest_kv_seqno: SeqNo,
+    /// Whether it records the inner zstd-block layout of a data block, which
+    /// lets a range read decode part of one.
+    pub block_layout: bool,
 }
 
 /// What a table's entries hold of one blob file.
@@ -881,6 +884,7 @@ impl RecordedTable {
             restriction: table.restrict_lower_bound().cloned(),
             seqnos,
             highest_kv_seqno,
+            block_layout: table.regions.block_layout.is_some(),
         })
     }
 }

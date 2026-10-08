@@ -119,6 +119,7 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
             restriction: None,
             seqnos: (1, 20),
             highest_kv_seqno: 20,
+            block_layout: false,
         }]
     );
 

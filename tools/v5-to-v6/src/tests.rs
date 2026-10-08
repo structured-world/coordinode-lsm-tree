@@ -127,7 +127,10 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
 
             let mut steps = 0;
             let sites = route_sites(folder.path(), &routes);
-            let interrupted = switch(folder.path(), &sites, &mut || {
+            // A renumbering the switch stands for, which a run that only
+            // finishes it must still report.
+            let renumbered = [(u16::MAX, 65_000)];
+            let interrupted = switch(folder.path(), &sites, &renumbered, &mut || {
                 steps += 1;
                 if steps > stop_at {
                     Err(std::io::Error::other("interrupted"))
@@ -144,6 +147,12 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
                     stop_at > 0,
                     "a run after the ready marker resumes the switch (stopped at {stop_at})"
                 );
+                if report.resumed {
+                    assert_eq!(
+                        report.renumbered_fields, renumbered,
+                        "a resumed switch reports the renumbering (stopped at {stop_at})"
+                    );
+                }
             }
             let at = format!("stopped at {stop_at}, routed {routed}");
             assert_eq!(read_v6(folder.path(), &routes)?, expected, "{at}");
@@ -180,10 +189,10 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
 /// Runs `prepare` and the switch up to its ready marker, as a run stopped
 /// right after it does.
 fn stop_after_ready(folder: &Path, options: &Options) -> Result<(), Box<dyn std::error::Error>> {
-    prepare(folder, options)?;
+    let report = prepare(folder, options)?;
     let sites = route_sites(folder, &options.level_routes);
     let mut steps = 0;
-    let stopped = switch(folder, &sites, &mut || {
+    let stopped = switch(folder, &sites, &report.renumbered_fields, &mut || {
         steps += 1;
         if steps > 1 {
             Err(std::io::Error::other("interrupted"))
@@ -256,6 +265,33 @@ fn a_switch_resumes_only_with_the_routes_it_started_with() -> Result<(), Box<dyn
 
     assert!(convert(folder.path(), &options)?.resumed);
     assert_eq!(read_v6(folder.path(), &routes)?, expected);
+    Ok(())
+}
+
+/// A route folder inside a folder the switch moves whole is refused before
+/// anything is built: it would move with its ancestor, and the converted
+/// store would miss its tables.
+#[test]
+fn a_route_inside_a_folder_the_switch_moves_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    for nested in [lsm5::file::TABLES_FOLDER, BACKUP] {
+        let options = Options {
+            level_routes: vec![LevelRoute {
+                levels: 1..7,
+                path: folder.path().join(nested).join("cold"),
+            }],
+            ..Options::default()
+        };
+        assert!(
+            matches!(convert(folder.path(), &options), Err(Error::Unsupported(_))),
+            "a route in {nested}"
+        );
+        assert!(
+            !folder.path().join(STAGING).exists() && !folder.path().join(READY).exists(),
+            "nothing was built for a route in {nested}"
+        );
+    }
     Ok(())
 }
 

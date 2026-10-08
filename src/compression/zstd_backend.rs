@@ -325,6 +325,72 @@ fn inner_block_layout(
     ends
 }
 
+/// The inner-block layout of an already compressed frame: what
+/// [`inner_block_layout`] records for it at compression, read back by
+/// decoding the frame one inner block at a time, the way a partial decode
+/// walks it. Empty for a frame of one inner block, or one whose offsets do
+/// not fit `u32`, as the encoder leaves it.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidHeader`] for bytes that do not decode as one
+/// zstd frame.
+pub fn inner_block_layout_of(frame: &[u8]) -> crate::Result<Vec<u32>> {
+    use structured_zstd::decoding::{FrameDecoder, ResumeInput};
+    let invalid = || crate::Error::InvalidHeader("zstd frame inner blocks");
+    let mut src = std::io::Cursor::new(frame);
+    let mut decoder = FrameDecoder::new();
+    // Every inner block decoded so far: a resume's back-references reach
+    // into it.
+    let mut window: Vec<u8> = Vec::new();
+    let mut resume: Option<structured_zstd::decoding::ResumeState> = None;
+    let mut cursor = 0u64;
+    let mut ends = Vec::new();
+    for end_block in 1u32.. {
+        src.set_position(0);
+        decoder.reset(&mut src).map_err(|_| invalid())?;
+        let decoded = match resume.as_ref() {
+            Some(state) => {
+                src.set_position(cursor);
+                decoder.decode_blocks_partial(
+                    &mut src,
+                    state.block_index(),
+                    end_block,
+                    Some(ResumeInput {
+                        window_prime: &window,
+                        state,
+                    }),
+                    true,
+                )
+            }
+            None => decoder.decode_blocks_partial(&mut src, 0, end_block, None, true),
+        }
+        .map_err(|_| invalid())?;
+        if decoded.stopped_at.is_some() || decoded.start_block + decoded.blocks_decoded != end_block
+        {
+            return Err(invalid());
+        }
+        if resume.is_some() {
+            cursor += decoder.bytes_read_from_source();
+        } else {
+            cursor = decoder.bytes_read_from_source();
+        }
+        window.extend_from_slice(&decoded.data);
+        let Ok(end) = u32::try_from(window.len()) else {
+            return Ok(Vec::new());
+        };
+        ends.push(end);
+        if decoded.frame_finished {
+            break;
+        }
+        resume = Some(decoded.resume_state.ok_or_else(invalid)?);
+    }
+    if ends.len() < 2 {
+        ends.clear();
+    }
+    Ok(ends)
+}
+
 /// Runs `f` with a thread-local `FrameCompressor` cached by `level` (rebuilt
 /// only on a level change). Shared by [`ZstdProvider::compress`] and
 /// `compress_with_layout` so interleaving them at the same level reuses one

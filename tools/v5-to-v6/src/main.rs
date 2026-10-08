@@ -72,19 +72,19 @@ fn main() -> std::process::ExitCode {
     let result = options(&args)
         .and_then(|options| v5_to_v6::convert(&args.store, &options).map_err(|e| e.to_string()));
     match result {
-        Ok(report) if report.resumed => {
-            println!("finished the switch an earlier run started");
-            std::process::ExitCode::SUCCESS
-        }
         Ok(report) => {
-            println!(
-                "converted {} tables, {} data blocks, {} blob files: {} bytes, {} before",
-                report.tables,
-                report.data_blocks,
-                report.blob_files,
-                report.converted_bytes,
-                report.source_bytes,
-            );
+            if report.resumed {
+                println!("finished the switch an earlier run started");
+            } else {
+                println!(
+                    "converted {} tables, {} data blocks, {} blob files: {} bytes, {} before",
+                    report.tables,
+                    report.data_blocks,
+                    report.blob_files,
+                    report.converted_bytes,
+                    report.source_bytes,
+                );
+            }
             for (from, to) in &report.renumbered_fields {
                 println!("field {from} is a column id 6.0 keeps for itself: it is now field {to}");
             }
