@@ -31,6 +31,24 @@ pub struct BlobFrame {
     pub uncompressed_len: u32,
 }
 
+/// What a blob file's meta block counts over the whole file as written.
+///
+/// A file whose consumed prefix was reclaimed keeps these: its garbage
+/// statistics are charged against them, the reclaimed values included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobFileTotals {
+    /// Values written to the file.
+    pub item_count: u64,
+    /// Their bytes as stored, compressed under the file's codec.
+    pub compressed_bytes: u64,
+    /// Their bytes once decompressed.
+    pub uncompressed_bytes: u64,
+    /// The first key written.
+    pub first_key: UserKey,
+    /// The last key written.
+    pub last_key: UserKey,
+}
+
 /// A blob file opened for export: its digest has been checked against the
 /// manifest's and its meta block decoded; nothing is written.
 pub struct BlobFileExport {
@@ -42,6 +60,7 @@ pub struct BlobFileExport {
     sections: Vec<Section>,
     created_at: u128,
     compression: crate::CompressionType,
+    totals: BlobFileTotals,
 }
 
 impl BlobFileExport {
@@ -124,7 +143,21 @@ impl BlobFileExport {
             sections,
             created_at: parsed.created_at,
             compression: parsed.compression,
+            totals: BlobFileTotals {
+                item_count: parsed.item_count,
+                compressed_bytes: parsed.total_compressed_bytes,
+                uncompressed_bytes: parsed.total_uncompressed_bytes,
+                first_key: parsed.key_range.min().clone(),
+                last_key: parsed.key_range.max().clone(),
+            },
         })
+    }
+
+    /// What the meta block counts over the whole file, a reclaimed prefix
+    /// included.
+    #[must_use]
+    pub fn totals(&self) -> &BlobFileTotals {
+        &self.totals
     }
 
     /// When the file was written: nanoseconds since the Unix epoch.

@@ -688,6 +688,16 @@ fn blob_file_export_frames_cover_every_value() -> crate::Result<()> {
         .find(|(k, _)| &**k == b"item_count")
         .map(|(_, v)| v.to_vec());
     assert_eq!(item_count, Some(50u64.to_le_bytes().to_vec()));
+    assert_eq!(
+        blob.totals(),
+        &BlobFileTotals {
+            item_count: 50,
+            compressed_bytes: frames.iter().map(|f| f.stored.len() as u64).sum(),
+            uncompressed_bytes: frames.iter().map(|f| u64::from(f.uncompressed_len)).sum(),
+            first_key: frames[0].key.clone(),
+            last_key: frames.last().unwrap().key.clone(),
+        }
+    );
     assert!(blob.created_at() >= before);
     assert_eq!(
         blob.compression(),
@@ -977,6 +987,29 @@ fn table_export_properties_describe_a_flushed_table() -> crate::Result<()> {
     assert!(!properties.partitioned_index);
     assert_eq!(properties.lineage, None);
     assert!(!properties.lineage_last);
+    assert_eq!(properties.seqnos, (1, 50));
+    assert_eq!(properties.highest_kv_seqno, 50);
+    Ok(())
+}
+
+/// A table holding only a range tombstone records the tombstone's seqno as
+/// its bounds and no KV seqno: the entry its writer synthesizes for the
+/// tombstone counts as no KV.
+#[test]
+fn table_export_properties_of_a_tombstone_only_table_record_no_kv_seqno() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open(folder.path(), None)?;
+    let crate::AnyTree::Standard(standard) = &tree else {
+        panic!("a standard tree was opened");
+    };
+    standard.remove_range("a", "m", 7);
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let exports = export_tables(folder.path())?;
+    let properties = exports[0].properties()?;
+    assert_eq!(properties.seqnos, (7, 7));
+    assert_eq!(properties.highest_kv_seqno, 0);
     Ok(())
 }
 

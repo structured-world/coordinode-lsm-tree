@@ -236,6 +236,8 @@ impl Table {
             partitioned_index: self.regions.index.is_some(),
             seqno_bounds: self.regions.seqno_bounds.is_some(),
             zone_map: self.regions.zone_map.is_some(),
+            seqnos: meta.seqnos,
+            highest_kv_seqno: meta.highest_kv_seqno,
         })
     }
 

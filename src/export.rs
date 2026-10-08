@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 mod blob;
 mod table;
 
-pub use blob::{BlobFileExport, BlobFrame};
+pub use blob::{BlobFileExport, BlobFileTotals, BlobFrame};
 pub use table::{
     BlockRef, BurrKind, BurrLayer, BurrSolution, Filter, FilterPartition, Locator, RangeDelete,
     Section, TableContext, TableExport, TableProperties, VerifiedFrame, decode_burr,

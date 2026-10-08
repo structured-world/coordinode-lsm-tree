@@ -103,6 +103,12 @@ pub struct TableProperties {
     pub seqno_bounds: bool,
     /// Whether the table keeps a zone map.
     pub zone_map: bool,
+    /// The lowest and highest local seqno over its entries and range
+    /// tombstones, as its meta records them.
+    pub seqnos: (SeqNo, SeqNo),
+    /// The highest local seqno over its entries alone, which a covering range
+    /// tombstone must exceed for a read to skip the table.
+    pub highest_kv_seqno: SeqNo,
 }
 
 /// A range tombstone: every key in `[start, end)` deleted at `seqno`.
