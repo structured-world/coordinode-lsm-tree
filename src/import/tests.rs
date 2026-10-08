@@ -23,6 +23,7 @@ fn plain_settings(created_at: u128) -> TableSettings {
         columnar: false,
         filter: None,
         locator: None,
+        restriction: None,
     }
 }
 

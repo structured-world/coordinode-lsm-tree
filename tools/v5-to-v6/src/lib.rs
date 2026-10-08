@@ -169,11 +169,6 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         lsm5::TreeType::Standard => lsm6::TreeType::Standard,
         lsm5::TreeType::Blob => lsm6::TreeType::Blob,
     };
-    if !state.blob_restrictions.is_empty() {
-        return Err(Error::Unsupported(
-            "a blob file whose consumed prefix was reclaimed",
-        ));
-    }
     if state.comparator_name != "default" {
         return Err(Error::Unsupported("a tree with a custom comparator"));
     }
@@ -216,15 +211,26 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         let staging_blobs = staging.join(lsm6::file::BLOBS_FOLDER);
         std::fs::create_dir_all(&staging_blobs)?;
         for record in &state.blob_files {
-            let checksum = convert_blob_file(
+            // A file a tight-space relocation reclaimed below a frontier keeps
+            // it: its live values stay at their offsets past it.
+            let live_from = state
+                .blob_restrictions
+                .iter()
+                .find(|(id, _)| *id == record.id)
+                .map_or(0, |(_, from)| *from);
+            let Some(checksum) = convert_blob_file(
                 &folder
                     .join(lsm5::file::BLOBS_FOLDER)
                     .join(record.id.to_string()),
                 record,
+                live_from,
                 &staging_blobs.join(record.id.to_string()),
                 &v5_fs,
                 &v6_fs,
-            )?;
+            )?
+            else {
+                continue;
+            };
             report.blob_files += 1;
             let stale = state
                 .blob_gc_stats
@@ -237,6 +243,7 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
                 id: record.id,
                 checksum,
                 stale,
+                live_from,
             });
         }
     }
@@ -328,6 +335,17 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     )?;
     // Every converted table, read back as an open reads it, records what its
     // source recorded; the source is not touched until it does.
+    // A blob file left out for holding no live value is referenced by no row.
+    if recorded.iter().flat_map(|t| &t.blob_links).any(|link| {
+        !image
+            .blob_files
+            .iter()
+            .any(|file| file.id == link.blob_file_id)
+    }) {
+        return Err(Error::Unsupported(
+            "a table referencing a blob file with no live value",
+        ));
+    }
     // The import reads back one record per placement, in placement order.
     debug_assert_eq!(expected.len(), recorded.len());
     for ((expected, restricted), recorded) in expected.into_iter().zip(recorded) {
@@ -451,6 +469,7 @@ fn convert_table(
         columnar: expected.columnar,
         filter,
         locator,
+        restriction: expected.restriction.clone(),
     };
     let comparator: lsm6::SharedComparator = Arc::new(lsm6::DefaultUserComparator);
     let mut table = lsm6::import::TableImport::create(
@@ -538,24 +557,32 @@ fn records_match(
 }
 
 /// Writes one blob file through the 6.0 import from the frames its 5.x export
-/// reads, each verified, as stored and at its source offset. Returns the
-/// converted file's checksum.
+/// reads from `live_from` on, each verified, as stored and at its source
+/// offset. Returns the checksum the converted file's manifest entry records,
+/// or `None` for a file whose relocation consumed every value: nothing reads
+/// it, so it is not carried.
 fn convert_blob_file(
     source: &Path,
     record: &lsm5::export::BlobFileRecord,
+    live_from: u64,
     path: &Path,
     v5_fs: &Arc<dyn lsm5::fs::Fs>,
     v6_fs: &Arc<dyn lsm6::fs::Fs>,
-) -> Result<lsm6::Checksum, Error> {
-    let export = lsm5::export::BlobFileExport::open(source, record, 0, v5_fs.clone())?;
+) -> Result<Option<lsm6::Checksum>, Error> {
+    let export = lsm5::export::BlobFileExport::open(source, record, live_from, v5_fs.clone())?;
+    let frames = export.frames()?;
+    if frames.is_empty() {
+        return Ok(None);
+    }
     let mut file = lsm6::import::BlobFileImport::create(
         path,
         record.id,
         v6_fs.clone(),
         compression(export.compression())?,
         export.created_at(),
+        live_from,
     )?;
-    for frame in export.frames()? {
+    for frame in frames {
         file.append(
             frame.offset,
             &frame.key,
@@ -564,7 +591,7 @@ fn convert_blob_file(
             frame.uncompressed_len,
         )?;
     }
-    Ok(file.finish()?)
+    Ok(Some(file.finish()?))
 }
 
 /// One table as [`convert_table`] wrote it.

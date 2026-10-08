@@ -11,6 +11,45 @@ struct Answers {
     gets: Vec<Option<Vec<u8>>>,
 }
 
+/// What one snapshot read returns: its answers, or the oldest snapshot the
+/// tree still serves when this one is below its retention floor, which the
+/// converted store must keep refusing the same way.
+#[derive(Debug, PartialEq, Eq)]
+enum Snapshot {
+    Read(Answers),
+    BelowRetention(u64),
+}
+
+impl Snapshot {
+    /// [`Answers`] for the reads `read` makes at one snapshot, as a 5.x tree
+    /// answers them.
+    fn v5(read: impl FnOnce() -> lsm5::Result<Answers>) -> lsm5::Result<Self> {
+        match read() {
+            Ok(answers) => Ok(Self::Read(answers)),
+            Err(lsm5::Error::SnapshotBelowRetention {
+                oldest_retained, ..
+            }) => Ok(Self::BelowRetention(oldest_retained)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::v5`] for a 6.0 tree.
+    fn v6(read: impl FnOnce() -> lsm6::Result<Answers>) -> lsm6::Result<Self> {
+        match read() {
+            Ok(answers) => Ok(Self::Read(answers)),
+            Err(lsm6::Error::SnapshotBelowRetention {
+                oldest_retained, ..
+            }) => Ok(Self::BelowRetention(oldest_retained)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether this snapshot read data.
+    fn holds_data(&self) -> bool {
+        matches!(self, Self::Read(answers) if !answers.scan.is_empty())
+    }
+}
+
 /// Seqnos the comparison reads at: every snapshot the fixture's history
 /// distinguishes, the newest included.
 const READ_AT: [u64; 6] = [1, 40, 80, 120, 160, u64::MAX];
@@ -30,7 +69,7 @@ struct OpenWith {
     encryption: Option<v5_to_v6::EncryptionPair>,
 }
 
-fn read_v5(folder: &Path, keys: u32, open: &OpenWith) -> lsm5::Result<Vec<Answers>> {
+fn read_v5(folder: &Path, keys: u32, open: &OpenWith) -> lsm5::Result<Vec<Snapshot>> {
     use lsm5::{AbstractTree as _, Guard as _};
     let tree = lsm5::Config::new(
         folder,
@@ -43,23 +82,25 @@ fn read_v5(folder: &Path, keys: u32, open: &OpenWith) -> lsm5::Result<Vec<Answer
     READ_AT
         .iter()
         .map(|&seqno| {
-            Ok(Answers {
-                scan: tree
-                    .range::<&[u8], _>(.., seqno, None)
-                    .map(|guard| {
-                        let (key, value) = guard.into_inner()?;
-                        Ok((key.to_vec(), value.to_vec()))
-                    })
-                    .collect::<lsm5::Result<_>>()?,
-                gets: probes(keys)
-                    .map(|key| Ok(tree.get(key, seqno)?.map(|v| v.to_vec())))
-                    .collect::<lsm5::Result<_>>()?,
+            Snapshot::v5(|| {
+                Ok(Answers {
+                    scan: tree
+                        .range::<&[u8], _>(.., seqno, None)
+                        .map(|guard| {
+                            let (key, value) = guard.into_inner()?;
+                            Ok((key.to_vec(), value.to_vec()))
+                        })
+                        .collect::<lsm5::Result<_>>()?,
+                    gets: probes(keys)
+                        .map(|key| Ok(tree.get(key, seqno)?.map(|v| v.to_vec())))
+                        .collect::<lsm5::Result<_>>()?,
+                })
             })
         })
         .collect()
 }
 
-fn read_v6(folder: &Path, keys: u32, open: &OpenWith) -> lsm6::Result<Vec<Answers>> {
+fn read_v6(folder: &Path, keys: u32, open: &OpenWith) -> lsm6::Result<Vec<Snapshot>> {
     use lsm6::{AbstractTree as _, Guard as _};
     let tree = lsm6::Config::new(
         folder,
@@ -72,17 +113,19 @@ fn read_v6(folder: &Path, keys: u32, open: &OpenWith) -> lsm6::Result<Vec<Answer
     READ_AT
         .iter()
         .map(|&seqno| {
-            Ok(Answers {
-                scan: tree
-                    .range::<&[u8], _>(.., seqno, None)
-                    .map(|guard| {
-                        let (key, value) = guard.into_inner()?;
-                        Ok((key.to_vec(), value.to_vec()))
-                    })
-                    .collect::<lsm6::Result<_>>()?,
-                gets: probes(keys)
-                    .map(|key| Ok(tree.get(key, seqno)?.map(|v| v.to_vec())))
-                    .collect::<lsm6::Result<_>>()?,
+            Snapshot::v6(|| {
+                Ok(Answers {
+                    scan: tree
+                        .range::<&[u8], _>(.., seqno, None)
+                        .map(|guard| {
+                            let (key, value) = guard.into_inner()?;
+                            Ok((key.to_vec(), value.to_vec()))
+                        })
+                        .collect::<lsm6::Result<_>>()?,
+                    gets: probes(keys)
+                        .map(|key| Ok(tree.get(key, seqno)?.map(|v| v.to_vec())))
+                        .collect::<lsm6::Result<_>>()?,
+                })
             })
         })
         .collect()
@@ -186,7 +229,7 @@ fn round_trip_tuned(
     };
     let expected = read_v5(folder.path(), keys, &open)?;
     assert!(
-        expected.iter().any(|a| !a.scan.is_empty()),
+        expected.iter().any(Snapshot::holds_data),
         "the fixture holds data at the snapshots read"
     );
 
@@ -475,6 +518,167 @@ fn write_restricted_store(to: &Path, keys: u32) -> Result<(), Box<dyn std::error
         }
     }
     Err(format!("no stop left a restricted table ({last})").into())
+}
+
+/// A 5.x blob tree whose tight-space defragmentation stopped after its first
+/// relocation slice: the stale blob file it consumed a prefix of stays in the
+/// manifest behind a frontier. Built, stopped and copied out as
+/// [`write_restricted_store`] does.
+fn write_restricted_blob_store(to: &Path, keys: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::AbstractTree as _;
+    // Values that do not compress, so the relocation's transient space is real.
+    let value = |i: u32, generation: u64| -> Vec<u8> {
+        let mut s = (u64::from(i) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (generation << 1);
+        (0..200)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s.to_le_bytes()[3]
+            })
+            .collect()
+    };
+    let named = tempfile::tempdir()?;
+    let root = named.path();
+    let mut last = String::new();
+    for skip in 0..16 {
+        let mem = lsm5::fs::MemFs::with_capacity(u64::MAX);
+        let crash = lsm5::fs::CrashFs::new(mem.clone());
+        let fs = lsm5::fs::FaultFs::new(crash.clone());
+        let injector = fs.injector();
+        let shared: std::sync::Arc<dyn lsm5::fs::Fs> = std::sync::Arc::new(fs);
+        let tree = match lsm5::Config::new(
+            root,
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(shared.clone())
+        .with_kv_separation(Some(
+            lsm5::KvSeparationOptions::default()
+                .separation_threshold(64)
+                // Every half-dead file is stale, and there are several of them.
+                .age_cutoff(1.0)
+                .staleness_threshold(0.1)
+                .file_target_size(48 * 1024),
+        ))
+        .open()
+        .map_err(|e| format!("opening the in-memory store: {e:?}"))?
+        {
+            lsm5::AnyTree::Blob(tree) => tree,
+            lsm5::AnyTree::Standard(_) => return Err("a blob tree was opened".into()),
+        };
+        let keys64 = u64::from(keys);
+        for i in 0..keys {
+            tree.insert(format!("k{i:05}"), value(i, 1), u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        // Every other key overwritten: each first-generation file is half dead.
+        for i in (0..keys).step_by(2) {
+            tree.insert(format!("k{i:05}"), value(i, 2), keys64 + u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        let watermark = 4 * keys64;
+        tree.index.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.storage_limit_bytes = None;
+        })?;
+        // A merge with room learns which blobs are dead.
+        tree.major_compact(64 * 1024 * 1024, watermark)?;
+        let used = tree.storage_stats()?.used_bytes;
+        mem.set_capacity(used + used / 4);
+        tree.index
+            .update_runtime_config(|c| c.tight_space_compaction = true)?;
+        injector.arm(
+            lsm5::fs::FaultRule::new(
+                lsm5::fs::FaultOp::SyncAll,
+                lsm5::fs::Fault::Error(lsm5::io::ErrorKind::Other),
+            )
+            .on_path("edits-")
+            .skip(skip)
+            .once(),
+        );
+        let stopped = tree.major_compact(64 * 1024 * 1024, watermark).is_err();
+        drop(tree);
+        injector.clear();
+        if !stopped {
+            last = format!("skip {skip}: the compaction was not stopped");
+            continue;
+        }
+        crash.crash();
+        let durable = crash.inner();
+        match lsm5::export::read_manifest(root, &*durable, None) {
+            Ok(state) if !state.blob_restrictions.is_empty() => {
+                let present = |folder: &str, id: u64| {
+                    durable
+                        .exists(&root.join(folder).join(id.to_string()))
+                        .unwrap_or(false)
+                };
+                let all_present = state
+                    .levels
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .all(|t| present("tables", t.id))
+                    && state.blob_files.iter().all(|b| present("blobs", b.id));
+                if all_present {
+                    copy_out(&*durable, root, to)?;
+                    return Ok(());
+                }
+                last = format!("skip {skip}: a file the manifest names is gone");
+            }
+            Ok(_) => last = format!("skip {skip}: no blob file is restricted"),
+            Err(e) => last = format!("skip {skip}: {e}"),
+        }
+    }
+    Err(format!("no stop left a restricted blob file ({last})").into())
+}
+
+/// A blob file a tight-space relocation reclaimed below a frontier: its live
+/// values are carried at their offsets past it, and the converted file is
+/// restricted to them, as every value handle of the tables expects.
+#[test]
+fn a_converted_store_with_a_restricted_blob_file_answers_as_the_source_did()
+-> Result<(), Box<dyn std::error::Error>> {
+    let keys = 2_000;
+    let folder = tempfile::tempdir()?;
+    write_restricted_blob_store(folder.path(), keys)?;
+    let open = OpenWith {
+        separated: true,
+        ..OpenWith::default()
+    };
+    let expected = read_v5(folder.path(), keys, &open)
+        .map_err(|e| format!("reading the copied store: {e:?}"))?;
+    let state = lsm5::export::read_manifest(folder.path(), &lsm5::fs::StdFs, None)?;
+    let mut live_past_frontier = 0;
+    for (id, from) in &state.blob_restrictions {
+        let record = state
+            .blob_files
+            .iter()
+            .find(|b| b.id == *id)
+            .ok_or("a restricted blob file is recorded")?;
+        let blob = lsm5::export::BlobFileExport::open(
+            &folder.path().join("blobs").join(id.to_string()),
+            record,
+            *from,
+            std::sync::Arc::new(lsm5::fs::StdFs),
+        )?;
+        if *from > 0 && !blob.frames()?.is_empty() {
+            live_past_frontier += 1;
+        }
+    }
+    assert!(
+        live_past_frontier > 0,
+        "the copied store holds a blob file restricted past its start that still serves values"
+    );
+
+    assert!(
+        expected.iter().any(Snapshot::holds_data),
+        "the fixture holds data at the snapshots read"
+    );
+
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    assert_eq!(read_v6(folder.path(), keys, &open)?, expected);
+    Ok(())
 }
 
 /// A table a tight-space compaction restricted: its live blocks are carried,

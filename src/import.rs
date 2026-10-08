@@ -72,6 +72,10 @@ pub struct TableSettings {
     pub filter: Option<FilterImage>,
     /// The retrieval locator; `None` writes none.
     pub locator: Option<LocatorImport>,
+    /// The first key the table serves when a tight-space compaction
+    /// restricted it. Rows below it are hidden by the restriction, so the
+    /// blob links are derived from the rows at and past it only.
+    pub restriction: Option<UserKey>,
 }
 
 /// How a table's retrieval locator is imported.
@@ -246,6 +250,8 @@ pub struct TableImport {
     /// Rows written through [`Self::append_rows`]: the position the next one
     /// takes.
     rows_written: u32,
+    /// See [`TableSettings::restriction`].
+    restriction: Option<UserKey>,
 }
 
 impl TableImport {
@@ -351,7 +357,23 @@ impl TableImport {
             owned_cells: Vec::new(),
             columnar: settings.columnar,
             rows_written: 0,
+            restriction: settings.restriction,
         })
+    }
+
+    /// The blob references of the rows the table serves: all of them, or for
+    /// a restricted table those at or past its bound.
+    fn served_refs(
+        &self,
+        rows: &[InternalValue],
+    ) -> crate::Result<Vec<crate::blob_tree::links::RecoveredRef>> {
+        let mut refs = crate::blob_tree::links::collect_indirections(rows)?;
+        if let Some(bound) = &self.restriction {
+            refs.retain(|(key, _, _)| {
+                self.comparator.compare(key, bound) != core::cmp::Ordering::Less
+            });
+        }
+        Ok(refs)
     }
 
     /// Appends rows to a columnar table, in key order after every row
@@ -373,7 +395,7 @@ impl TableImport {
         {
             return Err(invalid());
         }
-        let refs = crate::blob_tree::links::collect_indirections(&rows)?;
+        let refs = self.served_refs(&rows)?;
         let first = self.rows_written;
         for row in rows {
             self.writer.write_counted(row, &self.comparator)?;
@@ -411,7 +433,7 @@ impl TableImport {
                 "a columnar table takes its rows, not its source's blocks",
             ));
         }
-        let refs = crate::blob_tree::links::collect_indirections(rows)?;
+        let refs = self.served_refs(rows)?;
         self.writer.append_compressed_data_block(
             payload,
             uncompressed_length,
@@ -462,11 +484,14 @@ impl TableImport {
 pub struct BlobFileImport {
     writer: crate::vlog::blob_file::writer::Writer,
     fs: Arc<dyn Fs>,
+    live_from: u64,
 }
 
 impl BlobFileImport {
     /// Starts blob file `id` at `path`, holding values compressed with
-    /// `compression` and recording `created_at` as its age.
+    /// `compression` and recording `created_at` as its age. A source whose
+    /// values below `live_from` were reclaimed gets the same frontier: its
+    /// first value lands there, and the file is restricted to what follows.
     ///
     /// # Errors
     ///
@@ -477,13 +502,19 @@ impl BlobFileImport {
         fs: Arc<dyn Fs>,
         compression: CompressionType,
         created_at: u128,
+        live_from: u64,
     ) -> crate::Result<Self> {
         let mut writer = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs)?;
         // The values arrive compressed: the writer stores them as they are and
         // records their codec.
         writer.metadata_compression_override = Some(compression);
         writer.created_at = Some(created_at);
-        Ok(Self { writer, fs })
+        writer.write_filler(live_from)?;
+        Ok(Self {
+            writer,
+            fs,
+            live_from,
+        })
     }
 
     /// Appends one value as stored, which must land at `offset`.
@@ -509,12 +540,14 @@ impl BlobFileImport {
         Ok(())
     }
 
-    /// Finishes the file and returns its checksum.
+    /// Finishes the file and returns the checksum its manifest entry records:
+    /// of the whole file, or of what follows the frontier for a restricted
+    /// one, whose prefix is then punched where the filesystem can.
     ///
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidHeader`] for a file that received no
-    /// value, and any error writing its metadata.
+    /// value, and any error writing its metadata or hashing its suffix.
     pub fn finish(self) -> crate::Result<Checksum> {
         if self.writer.item_count == 0 {
             return Err(crate::Error::InvalidHeader(
@@ -523,6 +556,21 @@ impl BlobFileImport {
         }
         let path = self.writer.path.clone();
         let (_, checksum) = self.writer.finish()?;
+        let checksum = if self.live_from == 0 {
+            checksum
+        } else {
+            // The digest every reader of a restricted entry checks; taken
+            // before the punch, which leaves the suffix as it is.
+            let suffix = Checksum::from_raw(crate::repair::compute_table_checksum_from(
+                &*self.fs,
+                &path,
+                self.live_from,
+            )?);
+            if self.fs.capabilities(&path).punch_hole {
+                self.fs.punch_hole(&path, 0, self.live_from)?;
+            }
+            suffix
+        };
         crate::file::fsync_directory(
             crate::file::entry_directory(&path),
             &*self.fs,
@@ -572,11 +620,14 @@ pub fn store_dictionary(
 pub struct BlobFilePlacement {
     /// The blob file's id, also its file name in the blobs folder.
     pub id: crate::vlog::BlobFileId,
-    /// The checksum its writer returned.
+    /// The checksum [`BlobFileImport::finish`] returned.
     pub checksum: Checksum,
     /// What it holds that no table references any more: objects, bytes as
     /// counted, bytes as stored.
     pub stale: (usize, u64, u64),
+    /// The offset of its first live value: `0`, or the frontier below which a
+    /// tight-space relocation reclaimed the source file.
+    pub live_from: u64,
 }
 
 /// The state an imported manifest records.
@@ -742,12 +793,13 @@ pub fn install_manifest(
         .blob_files
         .iter()
         .map(|file| {
-            crate::vlog::recover_blob_file(
+            crate::vlog::recover_blob_file_from(
                 &blobs_folder.join(file.id.to_string()),
                 file.id,
                 file.checksum,
                 0,
                 fs,
+                file.live_from,
                 #[cfg(zstd_any)]
                 dictionaries,
             )
@@ -797,7 +849,12 @@ pub fn install_manifest(
             .collect(),
         gc_stats,
         restrictions: image.restrictions.iter().cloned().collect(),
-        blob_restrictions: crate::HashMap::default(),
+        blob_restrictions: image
+            .blob_files
+            .iter()
+            .filter(|file| file.live_from > 0)
+            .map(|file| (file.id, file.live_from))
+            .collect(),
         retention_floor: image.retention_floor,
         dicts: image.dicts.clone(),
     };
