@@ -68,6 +68,10 @@ pub struct TableSettings {
     /// Whether the table is columnar. Its rows are then encoded again in this
     /// format's layout through [`TableImport::append_rows`].
     pub columnar: bool,
+    /// Whether a columnar table stores each value split into the caller's
+    /// fields, one column each, as an ingested batch does. Its batches then
+    /// come through [`TableImport::append_column_batch`].
+    pub split_fields: bool,
     /// The membership filter, carried over as solved; `None` writes none.
     pub filter: Option<FilterImage>,
     /// The retrieval locator; `None` writes none.
@@ -247,11 +251,16 @@ pub struct TableImport {
     owned_cells: Vec<(crate::vlog::BlobFileId, u64)>,
     /// Whether rows are encoded again rather than carried in their blocks.
     columnar: bool,
+    /// See [`TableSettings::split_fields`].
+    split_fields: bool,
     /// Rows written through [`Self::append_rows`]: the position the next one
     /// takes.
     rows_written: u32,
     /// See [`TableSettings::restriction`].
     restriction: Option<UserKey>,
+    /// The first and last keys of the entries received, and the range every
+    /// range tombstone recorded so far covers, under the comparator.
+    key_range: Option<(UserKey, UserKey)>,
 }
 
 impl TableImport {
@@ -350,15 +359,42 @@ impl TableImport {
             None => writer,
         };
         let writer = writer.use_columnar(settings.columnar);
+        let writer = if settings.split_fields {
+            writer.use_value_layout(crate::table::meta::ValueLayout::Split)
+        } else {
+            writer
+        };
         Ok(Self {
             writer,
             comparator,
             blob_links: crate::HashMap::default(),
             owned_cells: Vec::new(),
             columnar: settings.columnar,
+            split_fields: settings.split_fields,
             rows_written: 0,
             restriction: settings.restriction,
+            key_range: None,
         })
+    }
+
+    /// Widens the table's key range to `[start, end]`.
+    fn widen_key_range(&mut self, start: &UserKey, end: &UserKey) {
+        let cmp = &self.comparator;
+        self.key_range = Some(match self.key_range.take() {
+            None => (start.clone(), end.clone()),
+            Some((lo, hi)) => (
+                if cmp.compare(start, &lo) == core::cmp::Ordering::Less {
+                    start.clone()
+                } else {
+                    lo
+                },
+                if cmp.compare(end, &hi) == core::cmp::Ordering::Greater {
+                    end.clone()
+                } else {
+                    hi
+                },
+            ),
+        });
     }
 
     /// The blob references of the rows the table serves: all of them, or for
@@ -389,6 +425,7 @@ impl TableImport {
     pub fn append_rows(&mut self, rows: Vec<InternalValue>, deleted: &[u32]) -> crate::Result<()> {
         let invalid = || crate::Error::InvalidHeader("imported columnar rows");
         if !self.columnar
+            || self.split_fields
             || deleted
                 .iter()
                 .any(|&i| usize::try_from(i).map_or(true, |i| i >= rows.len()))
@@ -396,12 +433,61 @@ impl TableImport {
             return Err(invalid());
         }
         let refs = self.served_refs(&rows)?;
+        if let (Some(lo), Some(hi)) = (rows.first(), rows.last()) {
+            self.widen_key_range(&lo.key.user_key, &hi.key.user_key);
+        }
         let first = self.rows_written;
         for row in rows {
             self.writer.write_counted(row, &self.comparator)?;
             // A position is a u32: a table past it cannot record its deletes.
             self.rows_written = self.rows_written.checked_add(1).ok_or_else(invalid)?;
         }
+        for &index in deleted {
+            let position = first.checked_add(index).ok_or_else(invalid)?;
+            self.writer.delete_bitmap_mut().insert(position);
+        }
+        crate::blob_tree::links::fold_blob_links(
+            &mut self.blob_links,
+            &mut self.owned_cells,
+            &refs,
+        );
+        Ok(())
+    }
+
+    /// Appends a column batch to a table whose values are split into fields,
+    /// in key order after every row appended before it, its field columns and
+    /// per-row seqnos stored as they are. `deleted` are the indexes of the
+    /// batch's rows the source's delete bitmap marks, ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] on a table whose values are not
+    /// split into fields or a deleted index past the rows, and the errors of
+    /// [`Self::append_rows`] otherwise.
+    #[cfg(feature = "columnar")]
+    pub fn append_column_batch(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        deleted: &[u32],
+    ) -> crate::Result<()> {
+        let invalid = || crate::Error::InvalidHeader("imported column batch");
+        if !self.split_fields || deleted.iter().any(|&i| i >= batch.row_count) {
+            return Err(invalid());
+        }
+        let entries = crate::table::columnar::column_batch_to_entries(batch)?;
+        let refs = self.served_refs(&entries)?;
+        self.writer
+            .count_prebuilt_keys(&entries, &self.comparator)?;
+        self.writer
+            .write_columnar_block_verbatim(batch, &self.comparator)?;
+        if let (Some(lo), Some(hi)) = (entries.first(), entries.last()) {
+            self.widen_key_range(&lo.key.user_key, &hi.key.user_key);
+        }
+        let first = self.rows_written;
+        self.rows_written = self
+            .rows_written
+            .checked_add(batch.row_count)
+            .ok_or_else(invalid)?;
         for &index in deleted {
             let position = first.checked_add(index).ok_or_else(invalid)?;
             self.writer.delete_bitmap_mut().insert(position);
@@ -440,6 +526,9 @@ impl TableImport {
             rows,
             &self.comparator,
         )?;
+        if let (Some(lo), Some(hi)) = (rows.first(), rows.last()) {
+            self.widen_key_range(&lo.key.user_key, &hi.key.user_key);
+        }
         crate::blob_tree::links::fold_blob_links(
             &mut self.blob_links,
             &mut self.owned_cells,
@@ -448,8 +537,11 @@ impl TableImport {
         Ok(())
     }
 
-    /// Records a range tombstone deleting `[start, end)` at `seqno`.
+    /// Records a range tombstone deleting `[start, end)` at `seqno`. The
+    /// table's key range grows to cover it, as a read checks a tombstone only
+    /// in a table whose range holds the key.
     pub fn range_tombstone(&mut self, start: UserKey, end: UserKey, seqno: SeqNo) {
+        self.widen_key_range(&start, &end);
         self.writer
             .write_range_tombstone(crate::range_tombstone::RangeTombstone::new(
                 start, end, seqno,
@@ -469,6 +561,9 @@ impl TableImport {
             self.writer.link_blob_file(link);
         }
         self.writer.own_blob_objects(self.owned_cells);
+        if let Some((start, end)) = self.key_range.take() {
+            self.writer.cover_key_range(start, end);
+        }
         self.writer
             .finish()?
             .map(|(_, checksum)| checksum)
@@ -509,6 +604,8 @@ impl BlobFileImport {
         // records their codec.
         writer.metadata_compression_override = Some(compression);
         writer.created_at = Some(created_at);
+        // The previous format records no lifetime class: every value it holds
+        // is of class 0, the writer's own.
         writer.write_filler(live_from)?;
         Ok(Self {
             writer,
@@ -662,6 +759,8 @@ pub struct RecordedTable {
     pub id: TableId,
     /// Whether its data blocks are columnar.
     pub columnar: bool,
+    /// Whether its columnar values are split into the caller's fields.
+    pub split_fields: bool,
     /// The table's age, nanoseconds since the Unix epoch.
     pub created_at: u128,
     /// The per-KV checksum footer its data blocks carry, if any.
@@ -714,6 +813,7 @@ impl RecordedTable {
         Ok(Self {
             id: table.id(),
             columnar: meta.columnar,
+            split_fields: meta.value_layout == crate::table::meta::ValueLayout::Split,
             created_at: meta.created_at.into(),
             kv_checksum: meta.kv_checksum_algo,
             ecc: meta.ecc_params,

@@ -833,6 +833,184 @@ fn a_dictionary_the_store_does_not_keep_is_supplied_by_the_caller()
     Ok(())
 }
 
+/// A store a 5.x process still has open is not converted: the conversion
+/// would miss what that process writes after it read the manifest, and its
+/// switch would move the files out from under it.
+#[test]
+fn a_store_another_process_holds_open_is_not_converted() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    write_row_store(folder.path(), 100, |config| config, |_| {})?;
+    let open = lsm5::Config::new(
+        folder.path(),
+        lsm5::SequenceNumberCounter::default(),
+        lsm5::SequenceNumberCounter::default(),
+    )
+    .open()?;
+
+    assert!(
+        v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default()).is_err(),
+        "a store held open by a 5.x tree is refused"
+    );
+    assert!(
+        !folder.path().join("v6-convert").exists() && !folder.path().join("v5-backup").exists(),
+        "nothing was built or moved"
+    );
+    drop(open);
+    Ok(())
+}
+
+/// One column of a columnar scan: its id and bytes.
+type ScannedColumn = (u16, Vec<u8>);
+
+/// Every column of a columnar scan projecting `fields`, batch by batch.
+fn scan_v5(folder: &Path, fields: &[u16]) -> lsm5::Result<Vec<Vec<ScannedColumn>>> {
+    let tree = lsm5::Config::new(
+        folder,
+        lsm5::SequenceNumberCounter::default(),
+        lsm5::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.columnar_scan(fields, None, u64::MAX, ..)?
+        .map(|batch| {
+            Ok(batch?
+                .columns
+                .into_iter()
+                .map(|c| (c.column_id, c.data.to_vec()))
+                .collect())
+        })
+        .collect()
+}
+
+/// [`scan_v5`] over a 6.0 store.
+fn scan_v6(folder: &Path, fields: &[u16]) -> lsm6::Result<Vec<Vec<ScannedColumn>>> {
+    let tree = lsm6::Config::new(
+        folder,
+        lsm6::SequenceNumberCounter::default(),
+        lsm6::SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.columnar_scan(fields, None, u64::MAX, ..)?
+        .map(|batch| {
+            Ok(batch?
+                .columns
+                .into_iter()
+                .map(|c| (c.column_id, c.data.to_vec()))
+                .collect())
+        })
+        .collect()
+}
+
+/// A columnar batch ingested with its value split into fields keeps them:
+/// the converted table stores the same field columns, which a projected scan
+/// reads as the source's did, and every row reads back the same value.
+#[test]
+fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::table::columnar::{Column, TypeTag, entries_to_column_batch};
+    let rows = 50u32;
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        let lsm5::AnyTree::Standard(standard) = &tree else {
+            return Err("a standard tree was opened".into());
+        };
+        standard.update_runtime_config(|c| c.columnar = true)?;
+        let entries: Vec<_> = (0..rows)
+            .map(|i| {
+                lsm5::InternalValue::from_components(
+                    format!("k{i:05}"),
+                    "x",
+                    0,
+                    lsm5::ValueType::Value,
+                )
+            })
+            .collect();
+        let mut batch = entries_to_column_batch(&entries)?;
+        batch.columns.pop();
+        // Field 10: a fixed-width number per row; field 11: a name per row.
+        let fixed: Vec<u8> = (0..rows).flat_map(u32::to_le_bytes).collect();
+        let names: Vec<String> = (0..rows).map(|i| format!("name-{i}")).collect();
+        let mut bytes = Vec::new();
+        let mut at = 0u32;
+        bytes.extend(at.to_le_bytes());
+        for name in &names {
+            at += u32::try_from(name.len())?;
+            bytes.extend(at.to_le_bytes());
+        }
+        for name in &names {
+            bytes.extend(name.as_bytes());
+        }
+        batch.columns.push(Column {
+            column_id: 10,
+            type_tag: TypeTag::Fixed(4),
+            validity: None,
+            data: fixed.into(),
+        });
+        batch.columns.push(Column {
+            column_id: 11,
+            type_tag: TypeTag::Bytes,
+            validity: None,
+            data: bytes.into(),
+        });
+        let mut ingestion = tree.ingestion()?;
+        ingestion.write_columnar_batch(&batch)?;
+        ingestion.finish()?;
+    }
+    let open = OpenWith::default();
+    let expected_reads = read_v5(folder.path(), rows, &open)?;
+    let expected_scan = scan_v5(folder.path(), &[10, 11])?;
+    assert!(
+        expected_scan.iter().flatten().any(|(id, _)| *id == 10),
+        "the source scan reads the field"
+    );
+
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    assert_eq!(read_v6(folder.path(), rows, &open)?, expected_reads);
+    assert_eq!(scan_v6(folder.path(), &[10, 11])?, expected_scan);
+    Ok(())
+}
+
+/// A table holding only a range tombstone keeps deleting what it covers: its
+/// key range must still cover the whole tombstone after conversion, though
+/// the table carries an entry at the tombstone's start only.
+#[test]
+fn a_converted_tombstone_only_table_still_deletes_its_range()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::AbstractTree as _;
+    let keys = 200u32;
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..keys {
+            tree.insert(format!("k{i:05}"), "v", u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(u64::MAX, 0)?;
+        // Nothing but the range tombstone in the next flush.
+        tree.remove_range(
+            lsm5::UserKey::from("k00020"),
+            lsm5::UserKey::from("k00150"),
+            u64::from(keys) + 1,
+        );
+        tree.flush_active_memtable(0)?;
+    }
+    let open = OpenWith::default();
+    let expected = read_v5(folder.path(), keys, &open)?;
+
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    assert_eq!(read_v6(folder.path(), keys, &open)?, expected);
+    Ok(())
+}
+
 /// Every table of the source store, opened through the 5.x export.
 fn source_tables(folder: &Path) -> lsm5::Result<Vec<lsm5::export::TableExport>> {
     let state = lsm5::export::read_manifest(folder, &lsm5::fs::StdFs, None)?;

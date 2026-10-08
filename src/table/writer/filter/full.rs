@@ -288,6 +288,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
                 &self.transform(),
                 at,
             )?;
+            // The source of a carried filter records no hash count, and under
+            // a prefix extractor its hashes outnumber its keys, so no count is
+            // known: the table records none, and its key count stands in for
+            // it, as for any table without one.
             return Ok(super::FilterOutput {
                 blocks: 1,
                 hashes: 0,

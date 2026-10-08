@@ -839,6 +839,11 @@ pub struct Writer {
     /// every table the engine writes itself.
     created_at: Option<u128>,
 
+    /// The key range to record instead of the rows' own, set by a caller that
+    /// ordered it under the tree's comparator; `None` for every table the
+    /// engine writes itself.
+    key_range_cover: Option<(UserKey, UserKey)>,
+
     /// Tag of the last columnar row group written, `None` before the first.
     /// Tags strictly increase so they stay unique within the table, which is
     /// what makes a page's stamp name exactly one group.
@@ -1151,6 +1156,7 @@ impl Writer {
             lineage_transformed: false,
             lineage_last: false,
             created_at: None,
+            key_range_cover: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -2481,6 +2487,14 @@ impl Writer {
         self.range_tombstone_coverage = Some((start, end));
     }
 
+    /// Records `[start, end]` as the table's key range, whatever entries it
+    /// holds: for a table rebuilt from another store, whose range tombstones
+    /// reach past its entries. The caller orders the range under the tree's
+    /// comparator, and it covers every entry the table receives.
+    pub(crate) fn cover_key_range(&mut self, start: UserKey, end: UserKey) {
+        self.key_range_cover = Some((start, end));
+    }
+
     /// Writes an item.
     ///
     /// # Note
@@ -3733,6 +3747,28 @@ impl Writer {
         )
     }
 
+    /// Counts each new key of `entries`, in order, against the partition of a
+    /// prebuilt filter that covers it, and refuses a key none of them covers,
+    /// before anything is written. Without a prebuilt filter it does nothing.
+    pub(crate) fn count_prebuilt_keys(
+        &mut self,
+        entries: &[InternalValue],
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        if let Some(prebuilt) = self.prebuilt_filter.as_mut() {
+            let mut previous = self.current_key.as_deref();
+            for entry in entries {
+                let key = &*entry.key.user_key;
+                if previous.is_some_and(|p| crate::comparator::same_user_key(p, key)) {
+                    continue;
+                }
+                prebuilt.count_key(key, &mut self.prebuilt_partition, comparator.as_ref())?;
+                previous = Some(key);
+            }
+        }
+        Ok(())
+    }
+
     /// Appends a row data block from its compressed payload, as another store
     /// wrote it and its reader verified it, framed under this writer: this
     /// table's encryption, place binding and parity, no decompression and no
@@ -3757,19 +3793,7 @@ impl Writer {
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
         self.validate_direct_block_order(entries, comparator)?;
-        // A prebuilt partitioned filter counts the keys each partition covers,
-        // and refuses a key none of them covers, before anything is written.
-        if let Some(prebuilt) = self.prebuilt_filter.as_mut() {
-            let mut previous = self.current_key.as_deref();
-            for entry in entries {
-                let key = &*entry.key.user_key;
-                if previous.is_some_and(|p| crate::comparator::same_user_key(p, key)) {
-                    continue;
-                }
-                prebuilt.count_key(key, &mut self.prebuilt_partition, comparator.as_ref())?;
-                previous = Some(key);
-            }
-        }
+        self.count_prebuilt_keys(entries, comparator)?;
         let Some(inputs) = self.account_direct_block(entries)? else {
             return Ok(None);
         };
@@ -4260,6 +4284,12 @@ impl Writer {
                 self.meta.first_key = Some(start);
                 self.meta.last_key = Some(end);
             }
+        }
+        // Reads skip a table by its key range before they look at its range
+        // tombstones, so the range has to reach as far as they do.
+        if let Some((start, end)) = self.key_range_cover.take() {
+            self.meta.first_key = Some(start);
+            self.meta.last_key = Some(end);
         }
 
         // Drain any block submitted to the parallel pipeline after the initial

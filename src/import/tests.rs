@@ -21,6 +21,7 @@ fn plain_settings(created_at: u128) -> TableSettings {
         bulk_ingested: Some(false),
         lineage: TableLineage::default(),
         columnar: false,
+        split_fields: false,
         filter: None,
         locator: None,
         restriction: None,
@@ -104,6 +105,7 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
         vec![RecordedTable {
             id: 1,
             columnar: false,
+            split_fields: false,
             created_at: 1_234_567_890,
             kv_checksum: None,
             ecc: None,

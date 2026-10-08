@@ -18,8 +18,9 @@ name = "v5-to-v6"
 path = "src/main.rs"
 
 [dependencies]
-# The 5.x crate reads the source store through its read-only export.
-lsm5 = { package = "coordinode-lsm-tree", git = "https://github.com/structured-world/coordinode-lsm-tree", branch = "feat/#672-export-properties", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
+# The 5.x crate reads the source store through its read-only export, pinned
+# to one revision so the reader the converter was tested with is the one built.
+lsm5 = { package = "coordinode-lsm-tree", git = "https://github.com/structured-world/coordinode-lsm-tree", rev = "a2c6aa219a1e4039401146177e415e7c72d3b62b", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
 # The 6.0 crate writes the converted store.
 lsm6 = { package = "coordinode-lsm-tree", path = "../..", features = ["lz4", "zstd", "encryption", "page_ecc", "columnar"] }
 clap = { version = "4", features = ["derive"] }

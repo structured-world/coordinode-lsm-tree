@@ -138,6 +138,9 @@ const SWAPPING: &str = "v6-convert.swapping";
 /// the source is left untouched until the converted store has been built and
 /// read back.
 pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
+    // Held to the end: a tree open on the store, or another conversion, would
+    // change what this one read or move files from under it.
+    let _lock = lock_store(folder)?;
     if folder.join(READY).exists() || folder.join(SWAPPING).exists() {
         switch(folder, &mut || Ok(()))?;
         return Ok(Report {
@@ -148,6 +151,33 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
     let report = prepare(folder, options)?;
     switch(folder, &mut || Ok(()))?;
     Ok(report)
+}
+
+/// The directory lock every open of the store takes, in both formats: a
+/// tree's `LOCK` file, locked exclusively. It is not a store entry, so it
+/// stays in the folder through the switch.
+const LOCK: &str = "LOCK";
+
+/// Takes the store's directory lock, as an open does, or refuses the store
+/// another process holds.
+fn lock_store(folder: &Path) -> Result<Box<dyn lsm5::fs::FsFile>, Error> {
+    let file = lsm5::fs::Fs::open(
+        &lsm5::fs::StdFs,
+        &folder.join(LOCK),
+        &lsm5::fs::FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true),
+    )
+    .map_err(|e| Error::Io(e.into()))?;
+    if lsm5::fs::FsFile::try_lock_exclusive(&*file).map_err(|e| Error::Io(e.into()))? {
+        Ok(file)
+    } else {
+        Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "the store is open in another process",
+        )))
+    }
 }
 
 /// Builds the converted store in the staging folder and verifies it, leaving
@@ -416,9 +446,11 @@ fn convert_table(
     });
     // What the converted table must record: everything the source recorded
     // that 6.0 keeps.
-    let expected = lsm6::import::RecordedTable {
+    let mut expected = lsm6::import::RecordedTable {
         id: export.id(),
         columnar: properties.columnar,
+        // Set below, from the stored shape of the table's batches.
+        split_fields: false,
         created_at: properties.created_at,
         kv_checksum: properties.kv_checksum.map(checksum_algorithm),
         ecc: properties.ecc.map(ecc_params).transpose()?,
@@ -449,6 +481,22 @@ fn convert_table(
         },
         restriction: restriction.map(|key| lsm6::UserKey::from(&**key)),
     };
+    let blocks: Vec<_> = export
+        .data_blocks()?
+        .into_iter()
+        .filter(|block| block.offset >= live_from)
+        .collect();
+    // A columnar table written as rows keeps each value whole in one value
+    // column; an ingested batch keeps the caller's fields, which the 6.0
+    // table stores split. The stored shape says which, block by block.
+    // The first block's batch is decoded once: it decides the table's layout
+    // and is the block the loop below converts first.
+    let mut first_batch = match (properties.columnar, blocks.first()) {
+        (true, Some(first)) => Some(export.columnar_batch(first)?),
+        _ => None,
+    };
+    let split_fields = first_batch.as_ref().is_some_and(splits_fields);
+    expected.split_fields = split_fields;
     let data_compression = compression(properties.data_compression)?;
     let settings = lsm6::import::TableSettings {
         data_compression,
@@ -467,6 +515,7 @@ fn convert_table(
         bulk_ingested: expected.bulk_ingested,
         lineage: expected.lineage.clone(),
         columnar: expected.columnar,
+        split_fields,
         filter,
         locator,
         restriction: expected.restriction.clone(),
@@ -480,22 +529,33 @@ fn convert_table(
         comparator,
         settings,
     )?;
-    let blocks: Vec<_> = export
-        .data_blocks()?
-        .into_iter()
-        .filter(|block| block.offset >= live_from)
-        .collect();
     for block in &blocks {
         if expected.columnar {
-            // The 6.0 columnar layout is not the 5.x one: the rows, deleted
-            // ones included, are encoded again in it, and the delete bitmap
-            // marks the same rows.
-            let rows: Vec<lsm6::InternalValue> = export
-                .rows(block)?
-                .into_iter()
-                .map(internal_value)
-                .collect::<Result<_, _>>()?;
-            table.append_rows(rows, &export.deleted_rows_in(block)?)?;
+            let batch = match first_batch.take() {
+                Some(batch) => batch,
+                None => export.columnar_batch(block)?,
+            };
+            if splits_fields(&batch) != split_fields {
+                return Err(Error::Unsupported(
+                    "a columnar table mixing whole values and fields",
+                ));
+            }
+            let deleted = export.deleted_rows_in(block)?;
+            if split_fields {
+                // The batch's field columns and seqnos, as the source stored
+                // them.
+                table.append_column_batch(&column_batch(batch), &deleted)?;
+            } else {
+                // The 6.0 columnar layout is not the 5.x one: the rows,
+                // deleted ones included, are encoded again in it, and the
+                // delete bitmap marks the same rows.
+                let rows: Vec<lsm6::InternalValue> =
+                    lsm5::table::columnar::column_batch_into_entries(batch)?
+                        .into_iter()
+                        .map(internal_value)
+                        .collect::<Result<_, _>>()?;
+                table.append_rows(rows, &deleted)?;
+            }
             continue;
         }
         let frame = export.frame(
@@ -604,6 +664,45 @@ struct Converted {
     expected: lsm6::import::RecordedTable,
     /// Whether its source was restricted, so only its live suffix was carried.
     restricted: bool,
+}
+
+/// Whether a 5.x columnar batch stores its values split into the caller's
+/// fields. Rows, written or ingested, store each value whole in the one value
+/// column the row path names (`COL_VALUE`, variable-width); any other shape
+/// carries the fields an ingested batch gave. A batch that ingested exactly
+/// that one column reads back the same either way.
+fn splits_fields(batch: &lsm5::table::columnar::ColumnBatch) -> bool {
+    let values = batch.columns.get(3..).unwrap_or_default();
+    !matches!(
+        values,
+        [only] if only.column_id == lsm5::table::columnar::COL_VALUE
+            && only.type_tag == lsm5::table::columnar::TypeTag::Bytes
+    )
+}
+
+/// A 5.x column batch as the 6.0 crate holds it: the same columns, ids,
+/// validity and bytes, and the same types but the seqno column's, which 5.x
+/// stores as opaque 8-byte values and 6.0 as the little-endian `u64` they are.
+fn column_batch(v5: lsm5::table::columnar::ColumnBatch) -> lsm6::table::columnar::ColumnBatch {
+    use lsm5::table::columnar::{COL_SEQNO, TypeTag as V5};
+    use lsm6::table::columnar::{Number, TypeTag as V6};
+    lsm6::table::columnar::ColumnBatch {
+        row_count: v5.row_count,
+        columns: v5
+            .columns
+            .into_iter()
+            .map(|column| lsm6::table::columnar::Column {
+                column_id: column.column_id,
+                type_tag: match column.type_tag {
+                    V5::Fixed(8) if column.column_id == COL_SEQNO => V6::Number(Number::U64_LE),
+                    V5::Fixed(width) => V6::Fixed(width),
+                    V5::Bytes => V6::Bytes,
+                },
+                validity: column.validity,
+                data: lsm6::Slice::from(&*column.data),
+            })
+            .collect(),
+    }
 }
 
 /// A 5.x solution as the 6.0 import takes it: the same parameters, seed and
@@ -826,6 +925,9 @@ fn switch(folder: &Path, step: &mut dyn FnMut() -> std::io::Result<()>) -> Resul
     if ready.exists() {
         step()?;
         std::fs::remove_file(&ready)?;
+        // Durable before SWAPPING goes: a power loss must never keep READY
+        // alone, which a rerun would read as a source still to set aside.
+        sync_dir(folder)?;
     }
     step()?;
     std::fs::remove_file(&swapping)?;
