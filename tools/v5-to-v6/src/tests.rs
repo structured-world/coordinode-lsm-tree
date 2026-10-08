@@ -140,6 +140,31 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
             });
             let finished_unbroken = interrupted.is_ok();
 
+            // A switch stopped with neither pointer in the folder: a tree
+            // opened there is refused rather than started fresh over it.
+            if !folder
+                .path()
+                .join(lsm5::file::CURRENT_VERSION_FILE)
+                .exists()
+            {
+                let v6 = lsm6::Config::new(
+                    folder.path(),
+                    lsm6::SequenceNumberCounter::default(),
+                    lsm6::SequenceNumberCounter::default(),
+                )
+                .open();
+                let v5 = lsm5::Config::new(
+                    folder.path(),
+                    lsm5::SequenceNumberCounter::default(),
+                    lsm5::SequenceNumberCounter::default(),
+                )
+                .open();
+                assert!(
+                    v6.is_err() && v5.is_err(),
+                    "no tree is created mid-switch (stopped at {stop_at})"
+                );
+            }
+
             if !finished_unbroken {
                 let report = convert(folder.path(), &options)?;
                 assert_eq!(
@@ -171,7 +196,7 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
                 "{at}"
             );
             for base in [folder.path(), cold.path()] {
-                for leftover in [STAGING, READY, SWAPPING] {
+                for leftover in [STAGING, READY, SWAPPING, GUARD] {
                     assert!(!base.join(leftover).exists(), "{leftover} is gone ({at})");
                 }
             }
@@ -317,6 +342,44 @@ fn a_route_naming_the_store_folder_converts_in_place() -> Result<(), Box<dyn std
     convert(folder.path(), &options)?;
     assert_eq!(read_v6(folder.path(), &[])?, expected);
     assert_eq!(read_v5(&folder.path().join(BACKUP), &[])?, expected);
+    Ok(())
+}
+
+/// A relative route names its folder from the working directory: a stopped
+/// switch resumes with the same folder only, however the option is spelled,
+/// and a rerun from elsewhere with the same text is refused before it moves
+/// anything. The working directory is the process's: each test runs alone in
+/// its own process under nextest.
+#[test]
+fn a_switch_resumes_with_a_relative_route_only_from_its_folder()
+-> Result<(), Box<dyn std::error::Error>> {
+    let base = tempfile::tempdir()?;
+    let folder = base.path().join("store");
+    for cwd in ["one", "two"] {
+        std::fs::create_dir_all(base.path().join(cwd).join("cold"))?;
+    }
+    std::env::set_current_dir(base.path().join("one"))?;
+    let routes = vec![LevelRoute {
+        levels: 1..7,
+        path: PathBuf::from("cold"),
+    }];
+    let options = Options {
+        level_routes: routes.clone(),
+        ..Options::default()
+    };
+    let expected = small_store(&folder, &routes)?;
+    stop_after_ready(&folder, &options)?;
+
+    std::env::set_current_dir(base.path().join("two"))?;
+    assert!(matches!(
+        convert(&folder, &options),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(folder.join(READY).exists(), "nothing was moved");
+
+    std::env::set_current_dir(base.path().join("one"))?;
+    assert!(convert(&folder, &options)?.resumed);
+    assert_eq!(read_v6(&folder, &routes)?, expected);
     Ok(())
 }
 

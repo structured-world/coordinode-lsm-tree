@@ -257,6 +257,12 @@ const READY: &str = "convert-to-v6.ready";
 /// Marks a switch whose source entries are all set aside.
 const SWAPPING: &str = "convert-to-v6.swapping";
 
+/// Keeps a tree from being created in the store's folder while the switch has
+/// set the source aside and not yet put the converted pointer in place: an
+/// open of either format refuses to start a new tree over a folder without a
+/// pointer that holds a manifest file. No version takes this number.
+const GUARD: &str = "v18446744073709551615";
+
 /// Converts the store in `folder` in place, leaving the source's entries in
 /// [`BACKUP`] inside it.
 ///
@@ -281,11 +287,13 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
     let _lock = lock_store(folder)?;
     if folder.join(READY).exists() {
         let ready = Ready::read(&folder.join(READY))?;
-        if ready
-            .sites
+        // Compared as resolved: a relative route names another folder from
+        // another working directory, however the option is spelled.
+        if ready.sites.iter().ne(sites
             .iter()
-            .map(PathBuf::as_path)
-            .ne(sites.iter().copied())
+            .map(|site| resolved(site))
+            .collect::<Vec<_>>()
+            .iter())
         {
             return Err(Error::Unsupported(
                 "level routes other than the interrupted conversion's",
@@ -1307,6 +1315,10 @@ fn set_back(folder: &Path, ready: &Ready, sites: &[&Path]) -> Result<(), Error> 
         restore(site, lsm5::file::TABLES_FOLDER)?;
         sync_dir(site)?;
     }
+    // The source's pointer is back: the folder opens as the source again.
+    if folder.join(GUARD).exists() {
+        std::fs::remove_file(folder.join(GUARD))?;
+    }
     sync_dir(folder)?;
     for base in std::iter::once(folder).chain(sites.iter().copied()) {
         let staging = base.join(STAGING);
@@ -1359,7 +1371,9 @@ fn switch(
             let marker = Ready {
                 source: source_state(folder, &entries, sites)?,
                 entries,
-                sites: sites.iter().map(|site| site.to_path_buf()).collect(),
+                // As resolved, so a rerun from another working directory is
+                // held to the same folders.
+                sites: sites.iter().map(|site| resolved(site)).collect(),
                 renumbered: renumbered.to_vec(),
             };
             step()?;
@@ -1367,6 +1381,12 @@ fn switch(
         }
         let marker = Ready::read(&ready)?;
         let listed = &marker.entries;
+        // Before the source's pointer leaves. An open of the source removes
+        // it, so a rerun puts it back.
+        if !folder.join(GUARD).exists() {
+            step()?;
+            write_marker(&folder.join(GUARD), "")?;
+        }
         if !backup.exists() {
             step()?;
             std::fs::create_dir(&backup)?;
@@ -1414,6 +1434,12 @@ fn switch(
         write_marker(&swapping, &carried.encode()?)?;
     }
 
+    // Until the converted pointer is in place, the folder holds none.
+    if staging.exists() && !folder.join(GUARD).exists() {
+        step()?;
+        write_marker(&folder.join(GUARD), "")?;
+    }
+
     for site in sites {
         let site_staging = site.join(STAGING);
         if !site_staging.exists() {
@@ -1452,6 +1478,11 @@ fn switch(
         sync_dir(folder)?;
         step()?;
         std::fs::remove_dir(&staging)?;
+    }
+    if folder.join(GUARD).exists() {
+        step()?;
+        std::fs::remove_file(folder.join(GUARD))?;
+        sync_dir(folder)?;
     }
     if ready.exists() {
         step()?;
