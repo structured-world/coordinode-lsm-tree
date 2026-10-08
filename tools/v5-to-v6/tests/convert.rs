@@ -1159,7 +1159,7 @@ fn a_converted_nullable_field_under_the_value_id_keeps_its_nulls()
         let mut batch = entries_to_column_batch(&entries)?;
         batch.columns.pop();
         // Every third row null, the rest a name.
-        let valid = |i: u32| i % 3 != 0;
+        let valid = |i: u32| !i.is_multiple_of(3);
         let mut validity = vec![0u8; usize::try_from(rows.div_ceil(8))?];
         let mut offsets = vec![0u32];
         let mut names = Vec::new();
