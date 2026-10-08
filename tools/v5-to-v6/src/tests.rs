@@ -353,7 +353,18 @@ fn a_route_naming_the_store_folder_converts_in_place() -> Result<(), Box<dyn std
 #[test]
 fn a_switch_resumes_with_a_relative_route_only_from_its_folder()
 -> Result<(), Box<dyn std::error::Error>> {
+    /// Puts the working directory back when the test ends, a panic included,
+    /// and before the temporary folder it was moved into is removed.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Err(e) = std::env::set_current_dir(&self.0) {
+                eprintln!("restoring {}: {e}", self.0.display());
+            }
+        }
+    }
     let base = tempfile::tempdir()?;
+    let _restore = Restore(std::env::current_dir()?);
     let folder = base.path().join("store");
     for cwd in ["one", "two"] {
         std::fs::create_dir_all(base.path().join(cwd).join("cold"))?;
