@@ -221,3 +221,39 @@ fn locator_section_refuses_a_solution_it_cannot_address_with() {
     };
     assert!(refused(&wrong_split), "block and slot bits other than r");
 }
+
+/// A restricted blob file's reclaimed prefix is skipped, not written: on a
+/// filesystem with sparse files it takes no space while the import runs, so
+/// a large frontier needs no room for it.
+#[cfg(unix)]
+#[test]
+fn restricted_blob_file_import_leaves_its_prefix_unwritten() -> crate::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let folder = crate::get_tmp_folder();
+    let path = folder.path().join("1");
+    let live_from = 64 * 1024 * 1024;
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    let mut file = BlobFileImport::create(
+        &path,
+        1,
+        fs,
+        CompressionType::None,
+        1,
+        Some(BlobFileRestriction {
+            live_from,
+            item_count: 2,
+            compressed_bytes: 10,
+            uncompressed_bytes: 10,
+            first_key: UserKey::from("a"),
+            last_key: UserKey::from("b"),
+        }),
+    )?;
+    file.append(live_from, b"b", 1, b"value", 5)?;
+    let allocated = std::fs::metadata(&path)?.blocks() * 512;
+    assert!(
+        allocated < live_from / 16,
+        "{allocated} bytes allocated for a {live_from}-byte prefix"
+    );
+    file.finish()?;
+    Ok(())
+}

@@ -344,21 +344,20 @@ impl Writer {
         self.blob_file_id
     }
 
-    /// Writes `len` zero bytes into the data section, so the next value lands
-    /// `len` bytes later: for a file rebuilt from one whose consumed prefix was
+    /// Skips `len` bytes of the data section, so the next value lands `len`
+    /// bytes later: for a file rebuilt from one whose consumed prefix was
     /// reclaimed, whose live values keep the offsets their handles name. The
-    /// bytes hold no frame; the file is restricted past them.
+    /// gap is never written: a filesystem with sparse files leaves it
+    /// unallocated, and the file is restricted past it. Its bytes are not part
+    /// of the writer's checksum, which a restricted file does not use.
+    #[cfg(feature = "std")]
     pub(crate) fn write_filler(&mut self, len: u64) -> crate::Result<()> {
-        const ZEROS: [u8; 4_096] = [0; 4_096];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(ZEROS.len() as u64);
-            // `n` is at most the buffer's length.
-            #[expect(clippy::cast_possible_truncation, reason = "n <= 4096")]
-            let (chunk, _) = ZEROS.split_at(n as usize);
-            self.writer.write_all(chunk)?;
-            left -= n;
-        }
+        use std::io::Seek as _;
+        let skip =
+            i64::try_from(len).map_err(|_| crate::Error::InvalidHeader("blob file frontier"))?;
+        self.writer
+            .get_mut()
+            .seek(std::io::SeekFrom::Current(skip))?;
         self.offset += len;
         Ok(())
     }

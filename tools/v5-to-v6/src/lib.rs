@@ -172,30 +172,61 @@ pub const BACKUP: &str = "v5-backup";
 
 /// Marks a converted store that is complete and verified: from the moment it
 /// exists the switch only rolls forward. Lists the source entries to set aside.
-const READY: &str = "v6-convert.ready";
+///
+/// The markers are files in the store's folder that a tree opened on it must
+/// leave alone: an open of either format removes every file there whose name
+/// starts with `v` other than its own manifest snapshot, so theirs do not.
+const READY: &str = "convert-to-v6.ready";
 
 /// Marks a switch whose source entries are all set aside.
-const SWAPPING: &str = "v6-convert.swapping";
+const SWAPPING: &str = "convert-to-v6.swapping";
 
 /// Converts the store in `folder` in place, leaving the source's entries in
 /// [`BACKUP`] inside it.
 ///
 /// A conversion interrupted at any point is finished by running it again: one
 /// stopped before the converted store was complete and verified starts over
-/// from the untouched source, one stopped during the switch completes it.
+/// from the untouched source, one stopped during the switch completes it. A
+/// switch interrupted before the source was wholly set aside, whose source a
+/// tree changed since, starts over too: what it built no longer matches.
 ///
 /// # Errors
 ///
 /// Returns the first error reading the source or writing the converted store;
 /// the source is left untouched until the converted store has been built and
-/// read back.
+/// read back. A run resuming a switch with level routes other than the ones it
+/// started with is refused, before it moves anything.
 pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
     check_routes(&options.level_routes)?;
     let sites = route_sites(folder, &options.level_routes);
     // Held to the end: a tree open on the store, or another conversion, would
     // change what this one read or move files from under it.
     let _lock = lock_store(folder)?;
-    if folder.join(READY).exists() || folder.join(SWAPPING).exists() {
+    if folder.join(READY).exists() {
+        let ready = Ready::read(&folder.join(READY))?;
+        if ready
+            .sites
+            .iter()
+            .map(PathBuf::as_path)
+            .ne(sites.iter().copied())
+        {
+            return Err(Error::Unsupported(
+                "level routes other than the interrupted conversion's",
+            ));
+        }
+        if folder.join(SWAPPING).exists()
+            || source_state(folder, &ready.entries, &sites)? == ready.source
+        {
+            switch(folder, &sites, &mut || Ok(()))?;
+            return Ok(Report {
+                resumed: true,
+                ..Report::default()
+            });
+        }
+        // A tree wrote to the source after it was read: the converted store
+        // would lose that, so it is built again from the source as it is.
+        set_back(folder, &ready, &sites)?;
+    } else if folder.join(SWAPPING).exists() {
         switch(folder, &sites, &mut || Ok(()))?;
         return Ok(Report {
             resumed: true,
@@ -470,6 +501,14 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
             report.source_bytes += bytes_under(&tables)?;
         }
         report.converted_bytes += bytes_under(&site.join(STAGING))?;
+    }
+    // Every staged folder's entry durable in its parent before READY can be:
+    // a power loss must not keep the marker and lose a folder it moves.
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        let staging = base.join(STAGING);
+        sync_dir(&staging.join(lsm6::file::TABLES_FOLDER))?;
+        sync_dir(&staging)?;
+        sync_dir(base)?;
     }
     Ok(report)
 }
@@ -1032,6 +1071,151 @@ fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 
+/// What [`READY`] records: the source entries the switch sets aside, the route
+/// folders it switches with them, and the source's state when it was read.
+#[derive(Debug, PartialEq, Eq)]
+struct Ready {
+    entries: Vec<String>,
+    sites: Vec<PathBuf>,
+    source: Vec<String>,
+}
+
+impl Ready {
+    /// One line per item, each tagged: `entry <name>`, `site <path>`,
+    /// `state <line>`.
+    fn encode(&self) -> Result<String, Error> {
+        let mut out = String::new();
+        for name in &self.entries {
+            out += &format!("entry {name}\n");
+        }
+        for site in &self.sites {
+            let site = site.to_str().ok_or(Error::Unsupported(
+                "a level route folder whose path is not UTF-8",
+            ))?;
+            out += &format!("site {site}\n");
+        }
+        for line in &self.source {
+            out += &format!("state {line}\n");
+        }
+        Ok(out)
+    }
+
+    fn read(path: &Path) -> Result<Self, Error> {
+        let mut ready = Self {
+            entries: Vec::new(),
+            sites: Vec::new(),
+            source: Vec::new(),
+        };
+        for line in std::fs::read_to_string(path)?.lines() {
+            match line.split_once(' ') {
+                Some(("entry", name)) => ready.entries.push(name.to_owned()),
+                Some(("site", site)) => ready.sites.push(site.into()),
+                Some(("state", state)) => ready.source.push(state.to_owned()),
+                _ => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{}: unreadable line {line:?}", path.display()),
+                    )));
+                }
+            }
+        }
+        Ok(ready)
+    }
+}
+
+/// The source's state, wherever the switch has moved it: every file under
+/// each of `entries` and each site's `tables`, in the folder or in its backup,
+/// with its length, and the version pointer's contents. A tree that writes to
+/// the store changes it: a flush or a compaction adds or removes a table and
+/// lengthens the edit log, a new version changes the pointer.
+fn source_state(
+    folder: &Path,
+    entries: &[String],
+    sites: &[&Path],
+) -> std::io::Result<Vec<String>> {
+    fn walk(path: &Path, name: &str, out: &mut Vec<String>) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.is_dir() {
+            out.push(format!("{name} {}", meta.len()));
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let child = format!("{name}/{}", entry.file_name().to_string_lossy());
+            walk(&entry.path(), &child, out)?;
+        }
+        Ok(())
+    }
+    let located = |base: &Path, name: &str| {
+        [base.join(name), base.join(BACKUP).join(name)]
+            .into_iter()
+            .find(|path| path.exists())
+    };
+    let mut state = Vec::new();
+    for name in entries {
+        let Some(path) = located(folder, name) else {
+            continue;
+        };
+        walk(&path, name, &mut state)?;
+        if name == lsm5::file::CURRENT_VERSION_FILE {
+            let pointer: String = std::fs::read(&path)?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            state.push(format!("{name}={pointer}"));
+        }
+    }
+    for (i, site) in sites.iter().enumerate() {
+        if let Some(path) = located(site, lsm5::file::TABLES_FOLDER) {
+            walk(&path, &format!("site{i}"), &mut state)?;
+        }
+    }
+    state.sort_unstable();
+    Ok(state)
+}
+
+/// Undoes a switch that had not yet set the whole source aside: every entry
+/// it moved goes back, and what it built goes, so the conversion starts over
+/// from the source as it now is.
+fn set_back(folder: &Path, ready: &Ready, sites: &[&Path]) -> Result<(), Error> {
+    let restore = |base: &Path, name: &str| -> Result<(), Error> {
+        let from = base.join(BACKUP).join(name);
+        if !from.exists() {
+            return Ok(());
+        }
+        let to = base.join(name);
+        if to.exists() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} was written while {} held the source",
+                    to.display(),
+                    base.join(BACKUP).display()
+                ),
+            )));
+        }
+        std::fs::rename(from, to)?;
+        Ok(())
+    };
+    for name in &ready.entries {
+        restore(folder, name)?;
+    }
+    for site in sites {
+        restore(site, lsm5::file::TABLES_FOLDER)?;
+        sync_dir(site)?;
+    }
+    sync_dir(folder)?;
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        let staging = base.join(STAGING);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+    }
+    std::fs::remove_file(folder.join(READY))?;
+    sync_dir(folder)?;
+    Ok(())
+}
+
 /// Puts the converted store in the staging folder in place of the source,
 /// whose entries are set aside in [`BACKUP`]. `step` runs before every change
 /// to the folder, and an error it returns stops the switch there.
@@ -1068,16 +1252,21 @@ fn switch(
     if !swapping.exists() {
         if !ready.exists() {
             let entries = source_entries(folder)?;
+            let marker = Ready {
+                source: source_state(folder, &entries, sites)?,
+                entries,
+                sites: sites.iter().map(|site| site.to_path_buf()).collect(),
+            };
             step()?;
-            write_marker(&ready, &entries.join("\n"))?;
+            write_marker(&ready, &marker.encode()?)?;
         }
-        let listed = std::fs::read_to_string(&ready)?;
+        let listed = Ready::read(&ready)?.entries;
         if !backup.exists() {
             step()?;
             std::fs::create_dir(&backup)?;
             sync_dir(folder)?;
         }
-        for name in listed.lines().filter(|n| !n.is_empty()) {
+        for name in &listed {
             let from = folder.join(name);
             if !from.exists() {
                 continue;

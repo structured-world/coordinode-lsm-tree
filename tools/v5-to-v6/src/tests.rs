@@ -177,6 +177,88 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// Runs `prepare` and the switch up to its ready marker, as a run stopped
+/// right after it does.
+fn stop_after_ready(folder: &Path, options: &Options) -> Result<(), Box<dyn std::error::Error>> {
+    prepare(folder, options)?;
+    let sites = route_sites(folder, &options.level_routes);
+    let mut steps = 0;
+    let stopped = switch(folder, &sites, &mut || {
+        steps += 1;
+        if steps > 1 {
+            Err(std::io::Error::other("interrupted"))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(stopped.is_err() && folder.join(READY).exists());
+    Ok(())
+}
+
+/// A tree that writes to the source between a stopped switch and the run
+/// that would resume it: the converted store is built again from the source
+/// as it now is, instead of switching in one that lacks the write.
+#[test]
+fn a_source_written_after_the_ready_marker_is_converted_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::AbstractTree as _;
+    let folder = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    stop_after_ready(folder.path(), &Options::default())?;
+    {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        tree.insert("late", "write", 1_000);
+        tree.flush_active_memtable(0)?;
+    }
+    let expected = read_v5(folder.path(), &[])?;
+    assert!(expected.iter().any(|(k, _)| k == b"late"));
+    assert!(
+        folder.path().join(READY).exists(),
+        "the 5.x tree kept the stopped switch's marker"
+    );
+
+    let report = convert(folder.path(), &Options::default())?;
+    assert!(!report.resumed, "the stale switch is not resumed");
+    assert_eq!(read_v6(folder.path(), &[])?, expected);
+    assert_eq!(read_v5(&folder.path().join(BACKUP), &[])?, expected);
+    Ok(())
+}
+
+/// A switch stopped with a level route resumes only with that route: a run
+/// that omits it is refused before it moves anything, and the run that names
+/// it again finishes the switch, the routed tables in place.
+#[test]
+fn a_switch_resumes_only_with_the_routes_it_started_with() -> Result<(), Box<dyn std::error::Error>>
+{
+    let folder = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let routes = vec![LevelRoute {
+        levels: 1..7,
+        path: cold.path().to_path_buf(),
+    }];
+    let options = Options {
+        level_routes: routes.clone(),
+        ..Options::default()
+    };
+    let expected = small_store(folder.path(), &routes)?;
+    stop_after_ready(folder.path(), &options)?;
+
+    assert!(matches!(
+        convert(folder.path(), &Options::default()),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(folder.path().join(READY).exists(), "nothing was moved");
+
+    assert!(convert(folder.path(), &options)?.resumed);
+    assert_eq!(read_v6(folder.path(), &routes)?, expected);
+    Ok(())
+}
+
 /// A store whose folder holds the backup of an earlier conversion is not
 /// converted over it: the switch would mix two sources in one backup.
 #[test]
@@ -206,14 +288,19 @@ fn store_entries_are_the_pointer_the_manifest_and_the_file_folders() {
         "LOCK",
         "v",
         "edits-",
-        "v6-convert",
-        "v5-backup",
-        "v6-convert.ready",
-        "v6-convert.swapping",
+        STAGING,
+        BACKUP,
+        READY,
+        SWAPPING,
         "v1.tmp",
         "notes.txt",
     ] {
         assert!(!is_store_entry(name), "{name}");
+    }
+    // The markers are files an open of the store keeps: it removes each file
+    // whose name starts with `v` other than its snapshot.
+    for marker in [READY, SWAPPING] {
+        assert!(!marker.starts_with('v'), "{marker}");
     }
 }
 
