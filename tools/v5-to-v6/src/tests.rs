@@ -195,7 +195,7 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
                 "{at}"
             );
             for base in [folder.path(), cold.path()] {
-                for leftover in [STAGING, READY, SWAPPING, GUARD, STAGED] {
+                for leftover in [STAGING, READY, SWAPPING, GUARD, OWNED] {
                     assert!(!base.join(leftover).exists(), "{leftover} is gone ({at})");
                 }
             }
@@ -400,6 +400,29 @@ fn a_staging_folder_the_conversion_did_not_create_is_left_alone()
             "kept (in route {in_route})"
         );
     }
+    Ok(())
+}
+
+/// A file in the store's folder that names other folders gives no right to
+/// remove their staging folders: only a staging folder that says itself it is
+/// the conversion's is removed.
+#[test]
+fn a_file_naming_other_folders_does_not_claim_their_staging()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let other = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    std::fs::create_dir(other.path().join(STAGING))?;
+    std::fs::write(
+        other.path().join(STAGING).join("keep"),
+        b"not the conversion's",
+    )?;
+    std::fs::write(
+        folder.path().join("convert-to-v6.staging"),
+        format!("{}\n", other.path().display()),
+    )?;
+    convert(folder.path(), &Options::default())?;
+    assert!(other.path().join(STAGING).join("keep").exists());
     Ok(())
 }
 

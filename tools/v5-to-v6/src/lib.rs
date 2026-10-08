@@ -288,11 +288,10 @@ const READY: &str = "convert-to-v6.ready";
 /// Marks a switch whose source entries are all set aside.
 const SWAPPING: &str = "convert-to-v6.swapping";
 
-/// Claims the staging folders a conversion created, written before it
-/// creates them: the store's own and, one resolved path per line, each route
-/// folder's. A run removes a leftover staging folder only when this lists it;
-/// a folder of that name it did not create is not its to remove.
-const STAGED: &str = "convert-to-v6.staging";
+/// Marks a staging folder as the conversion's, inside it: a run removes a
+/// leftover staging folder only when it holds this, or nothing at all. The
+/// switch leaves the mark behind when it moves the staged files.
+const OWNED: &str = "convert-to-v6.owned";
 
 /// Keeps a tree from being created in the store's folder while the switch has
 /// set the source aside and not yet put the converted pointer in place: an
@@ -444,36 +443,33 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     let mut report = Report::default();
     // Each level's tables are built beside its source tables, on their
     // volume, so the switch moves them by rename. What an earlier run staged
-    // goes first; a staging folder it did not claim is refused, not removed.
-    let staged = folder.join(STAGED);
-    if staged.exists() {
-        let claimed = std::fs::read_to_string(&staged)?;
-        let bases = std::iter::once(folder.to_path_buf()).chain(claimed.lines().map(PathBuf::from));
-        for base in bases {
-            let staging = base.join(STAGING);
-            if staging.exists() {
-                std::fs::remove_dir_all(&staging)?;
-            }
-        }
-    }
+    // goes first: a staging folder holding the conversion's mark, or an empty
+    // one, which a run stopped before marking it leaves and whose removal
+    // loses nothing. Any other folder of that name is refused, not removed.
     for base in std::iter::once(folder).chain(sites.iter().copied()) {
-        if base.join(STAGING).exists() {
+        let staging = base.join(STAGING);
+        if !staging.exists() {
+            continue;
+        }
+        if staging.join(OWNED).exists() {
+            std::fs::remove_dir_all(&staging)?;
+        } else if std::fs::read_dir(&staging)?.next().is_none() {
+            std::fs::remove_dir(&staging)?;
+        } else {
             return Err(Error::Unsupported(
                 "a folder named like the staging folder that the conversion did not create",
             ));
         }
     }
-    let mut claim = String::new();
-    for site in &sites {
-        let site = resolved(site);
-        let site = site.to_str().ok_or(Error::Unsupported(
-            "a level route folder whose path is not UTF-8",
-        ))?;
-        claim += &format!("{site}\n");
-    }
-    write_marker(&staged, &claim)?;
     for base in std::iter::once(folder).chain(sites.iter().copied()) {
-        std::fs::create_dir_all(base.join(STAGING).join(lsm6::file::TABLES_FOLDER))?;
+        let staging = base.join(STAGING);
+        std::fs::create_dir(&staging)?;
+        // Marked before anything else goes in, so a folder holding more than
+        // the mark is always marked.
+        std::fs::File::create(staging.join(OWNED))?.sync_all()?;
+        sync_dir(&staging)?;
+        sync_dir(base)?;
+        std::fs::create_dir(staging.join(lsm6::file::TABLES_FOLDER))?;
     }
     let staging = folder.join(STAGING);
     let source_tables =
@@ -1415,6 +1411,19 @@ fn set_back(folder: &Path, ready: &Ready, sites: &[&Path]) -> Result<(), Error> 
     Ok(())
 }
 
+/// Removes a staging folder the switch has emptied of everything but its mark.
+fn remove_staging(
+    staging: &Path,
+    step: &mut dyn FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    if staging.join(OWNED).exists() {
+        step()?;
+        std::fs::remove_file(staging.join(OWNED))?;
+    }
+    step()?;
+    std::fs::remove_dir(staging)
+}
+
 /// Puts the converted store in the staging folder in place of the source,
 /// whose entries are set aside in [`BACKUP`]. `step` runs before every change
 /// to the folder, and an error it returns stops the switch there.
@@ -1539,14 +1548,14 @@ fn switch(
             std::fs::rename(&from, &to)?;
             sync_dir(site)?;
         }
-        step()?;
-        std::fs::remove_dir(&site_staging)?;
+        remove_staging(&site_staging, step)?;
         sync_dir(site)?;
     }
 
     if staging.exists() {
         let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(&staging)?
             .map(|entry| entry.map(|e| e.file_name()))
+            .filter(|name| !matches!(name, Ok(name) if name == OWNED))
             .collect::<std::io::Result<_>>()?;
         // The version pointer last: until it is in place the folder opens as
         // nothing, never as part of the converted store.
@@ -1560,18 +1569,11 @@ fn switch(
             std::fs::rename(staging.join(&name), &to)?;
         }
         sync_dir(folder)?;
-        step()?;
-        std::fs::remove_dir(&staging)?;
+        remove_staging(&staging, step)?;
     }
     if folder.join(GUARD).exists() {
         step()?;
         std::fs::remove_file(folder.join(GUARD))?;
-        sync_dir(folder)?;
-    }
-    // Every staging folder it claimed is gone.
-    if folder.join(STAGED).exists() {
-        step()?;
-        std::fs::remove_file(folder.join(STAGED))?;
         sync_dir(folder)?;
     }
     if ready.exists() {
