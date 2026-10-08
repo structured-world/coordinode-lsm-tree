@@ -670,6 +670,10 @@ pub struct Writer {
     /// one built from the keys; while it is set no key is registered.
     prebuilt_filter: Option<PrebuiltFilter>,
 
+    /// Whether the filter is one built elsewhere, whose policy this writer
+    /// does not know, so the table records no width for it.
+    carries_filter: bool,
+
     /// The prebuilt partition the table's keys have reached.
     prebuilt_partition: usize,
 
@@ -1097,6 +1101,7 @@ impl Writer {
             locator_block_id: 0,
             locator_max_slot: 0,
             prebuilt_filter: None,
+            carries_filter: false,
             prebuilt_partition: 0,
             prebuilt_locator: None,
             held_state_bytes: 0,
@@ -1405,7 +1410,11 @@ impl Writer {
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
             filter_hashes: self.meta.filter_hashes,
-            filter_bits: crate::filter_budget::bits_of(self.bloom_policy),
+            // A carried filter was built under its source's policy, not this
+            // writer's: the table records none, and the width the filter
+            // itself has stands for it.
+            filter_bits: (!self.carries_filter)
+                .then(|| crate::filter_budget::bits_of(self.bloom_policy)),
             filter_partition_hashes: self.meta.filter_partition_hashes,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
@@ -2413,6 +2422,7 @@ impl Writer {
     pub(crate) fn use_prebuilt_filter(mut self, filter: PrebuiltFilter) -> Self {
         self.assert_not_started("use_prebuilt_filter");
         self.prebuilt_filter = Some(filter);
+        self.carries_filter = true;
         self
     }
 
@@ -5027,8 +5037,9 @@ struct MetaSectionParams<'a> {
     /// filter) omits it.
     filter_hashes: u64,
     /// Width in bits per key of the static filter policy the table was
-    /// written under, written with `filter_hashes`.
-    filter_bits: u8,
+    /// written under, written with `filter_hashes`; `None` for a filter built
+    /// elsewhere.
+    filter_bits: Option<u8>,
     /// Hashes of the largest filter partition, zero for a full filter.
     filter_partition_hashes: u64,
     sum_user_key_bytes: u64,
@@ -5354,7 +5365,9 @@ fn encode_meta_payload(
         // by: the width of the static policy it was written under, and the
         // hashes of a full partition when it is partitioned. The level it lies
         // in does not tell either: a table keeps its filter through a move.
-        meta_items.push(meta("filter_bits", &[p.filter_bits]));
+        if let Some(bits) = p.filter_bits {
+            meta_items.push(meta("filter_bits", &[bits]));
+        }
         if p.filter_partition_hashes > 0 {
             meta_items.push(meta(
                 "filter_partition_hashes",

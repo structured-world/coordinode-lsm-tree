@@ -779,6 +779,8 @@ fn convert_table(
             .sections()?
             .iter()
             .any(|section| section.name == b"block_layout"),
+        // 5.x records no policy width: the filter's own width stands for it.
+        filter_bits: None,
     };
     let blocks: Vec<_> = export
         .data_blocks()?
@@ -1269,12 +1271,17 @@ struct Ready {
     renumbered: Vec<(u16, u16)>,
 }
 
+/// The first line of every marker the conversion writes: a file under a
+/// marker's name that lacks it is not one, and is refused rather than read as
+/// a switch to finish.
+const MARKER_HEADER: &str = "convert-to-v6 marker 1";
+
 impl Ready {
-    /// One line per item, each tagged: `entry <name>`,
-    /// `route <first level> <end level> <path>`, `state <line>`,
-    /// `renumber <from> <to>`.
+    /// [`MARKER_HEADER`], then one line per item, each tagged:
+    /// `entry <name>`, `route <first level> <end level> <path>`,
+    /// `state <line>`, `renumber <from> <to>`.
     fn encode(&self) -> Result<String, Error> {
-        let mut out = String::new();
+        let mut out = format!("{MARKER_HEADER}\n");
         for name in &self.entries {
             out += &format!("entry {name}\n");
         }
@@ -1295,7 +1302,14 @@ impl Ready {
 
     fn read(path: &Path) -> Result<Self, Error> {
         let mut ready = Self::default();
-        for line in std::fs::read_to_string(path)?.lines() {
+        let contents = std::fs::read_to_string(path)?;
+        let mut lines = contents.lines();
+        if lines.next() != Some(MARKER_HEADER) {
+            return Err(Error::Unsupported(
+                "a file under a switch marker's name that the conversion did not write",
+            ));
+        }
+        for line in lines {
             let unreadable = || {
                 Error::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1346,7 +1360,12 @@ fn source_state(
         }
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            let child = format!("{name}/{}", entry.file_name().to_string_lossy());
+            // Escaped: a name may hold a line break, which the line-oriented
+            // marker this state is written to would read as another record.
+            let child = format!(
+                "{name}/{}",
+                entry.file_name().to_string_lossy().escape_debug()
+            );
             walk(&entry.path(), &child, out)?;
         }
         Ok(())

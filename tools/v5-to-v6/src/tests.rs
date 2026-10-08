@@ -403,6 +403,47 @@ fn a_staging_folder_the_conversion_did_not_create_is_left_alone()
     Ok(())
 }
 
+/// A file in the store's folder under a marker's name that the conversion did
+/// not write is refused rather than read as a switch to finish: the store
+/// stays the source it is.
+#[test]
+fn a_marker_the_conversion_did_not_write_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    for marker in [READY, SWAPPING] {
+        let folder = tempfile::tempdir()?;
+        let expected = small_store(folder.path(), &[])?;
+        std::fs::write(folder.path().join(marker), b"")?;
+        assert!(
+            matches!(
+                convert(folder.path(), &Options::default()),
+                Err(Error::Unsupported(_))
+            ),
+            "{marker}"
+        );
+        assert_eq!(read_v5(folder.path(), &[])?, expected, "{marker}");
+    }
+    Ok(())
+}
+
+/// A file with a line break in its name, under a folder of the source, is
+/// recorded in the ready marker as one line, so the switch reads it back.
+#[cfg(unix)]
+#[test]
+fn a_source_file_with_a_line_break_in_its_name_converts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let folder = tempfile::tempdir()?;
+    let expected = small_store(folder.path(), &[])?;
+    std::fs::write(
+        folder
+            .path()
+            .join(lsm5::file::TABLES_FOLDER)
+            .join("foreign\nname"),
+        b"",
+    )?;
+    convert(folder.path(), &Options::default())?;
+    assert_eq!(read_v6(folder.path(), &[])?, expected);
+    Ok(())
+}
+
 /// A file in the store's folder under a name a marker's temporary copy could
 /// take is left as it is: markers are written through temporary files the
 /// conversion creates anew.
@@ -645,6 +686,7 @@ fn records_compare_the_inner_layout_one_way() {
         seqnos: (1, 2),
         highest_kv_seqno: 2,
         block_layout,
+        filter_bits: None,
     };
     assert!(records_match(&table(false), &table(true), false), "derived");
     assert!(!records_match(&table(true), &table(false), false), "lost");

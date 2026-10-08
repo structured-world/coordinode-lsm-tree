@@ -842,6 +842,9 @@ pub struct RecordedTable {
     /// Whether it records the inner zstd-block layout of a data block, which
     /// lets a range read decode part of one.
     pub block_layout: bool,
+    /// The width in bits per key of the policy its filter was built under,
+    /// when it records one.
+    pub filter_bits: Option<u8>,
 }
 
 /// What a table's entries hold of one blob file.
@@ -894,6 +897,7 @@ impl RecordedTable {
             seqnos,
             highest_kv_seqno,
             block_layout: table.regions.block_layout.is_some(),
+            filter_bits: meta.filter_bits,
         })
     }
 }
