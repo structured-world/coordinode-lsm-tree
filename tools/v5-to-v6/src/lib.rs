@@ -818,6 +818,9 @@ fn convert_table(
         filter,
         locator,
         restriction: expected.restriction.clone(),
+        // A restricted table carries a suffix of its source's entries, whose
+        // bound is no higher, so the source's stays a bound for it.
+        highest_kv_seqno: Some(properties.highest_kv_seqno),
     };
     let comparator: lsm6::SharedComparator = Arc::new(lsm6::DefaultUserComparator);
     let mut table = lsm6::import::TableImport::create(
@@ -1232,8 +1235,19 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// no file or the whole one.
 fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
+    // A name no file in the folder has, created anew: a file of the store's
+    // owner that happens to share a fixed name is never written over.
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    name.push(format!(".{}-{nanos}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);

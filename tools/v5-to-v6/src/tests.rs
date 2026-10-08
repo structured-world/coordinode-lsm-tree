@@ -403,6 +403,20 @@ fn a_staging_folder_the_conversion_did_not_create_is_left_alone()
     Ok(())
 }
 
+/// A file in the store's folder under a name a marker's temporary copy could
+/// take is left as it is: markers are written through temporary files the
+/// conversion creates anew.
+#[test]
+fn a_file_named_like_a_marker_temporary_is_left_alone() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    let foreign = folder.path().join("convert-to-v6.tmp");
+    std::fs::write(&foreign, b"not the conversion's")?;
+    convert(folder.path(), &Options::default())?;
+    assert_eq!(std::fs::read(&foreign)?, b"not the conversion's");
+    Ok(())
+}
+
 /// A file in the store's folder that names other folders gives no right to
 /// remove their staging folders: only a staging folder that says itself it is
 /// the conversion's is removed.

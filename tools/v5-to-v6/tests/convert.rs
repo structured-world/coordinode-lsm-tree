@@ -864,6 +864,18 @@ fn a_converted_store_with_a_restricted_table_answers_as_the_source_did()
     );
 
     v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    // Before any open, which would write a missing one: a manifest repair
+    // finds each restriction only in the sidecar beside its table.
+    for (id, _) in &state.restrictions {
+        let sidecar = folder
+            .path()
+            .join("tables")
+            .join(format!("{id}.restrict-bound"));
+        assert!(
+            sidecar.exists(),
+            "table {id} carries its restriction sidecar"
+        );
+    }
     assert_eq!(read_v6(folder.path(), keys, &open)?, expected);
     Ok(())
 }
@@ -1263,6 +1275,45 @@ fn a_field_id_6_0_keeps_for_itself_is_renumbered() -> Result<(), Box<dyn std::er
         })
         .collect();
     assert_eq!(scan_v6(folder.path(), &[10, *to])?, renamed);
+    Ok(())
+}
+
+/// A table whose one entry is a weak tombstone written at the start and seqno
+/// of its range tombstone holds a real entry, not the one a writer
+/// synthesizes for a table of range tombstones alone: the converted table
+/// records the KV seqno bound its source recorded.
+#[test]
+fn a_converted_weak_tombstone_at_its_range_tombstone_start_is_a_kv()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm5::AbstractTree as _;
+    let keys = 200u32;
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = lsm5::Config::new(
+            folder.path(),
+            lsm5::SequenceNumberCounter::default(),
+            lsm5::SequenceNumberCounter::default(),
+        )
+        .open()?;
+        for i in 0..keys {
+            tree.insert(format!("k{i:05}"), "v", u64::from(i) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(u64::MAX, 0)?;
+        let seqno = u64::from(keys) + 1;
+        tree.remove_range(
+            lsm5::UserKey::from("k00020"),
+            lsm5::UserKey::from("k00150"),
+            seqno,
+        );
+        tree.remove_weak("k00020", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    let open = OpenWith::default();
+    let expected = read_v5(folder.path(), keys, &open)?;
+
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    assert_eq!(read_v6(folder.path(), keys, &open)?, expected);
     Ok(())
 }
 

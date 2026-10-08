@@ -80,6 +80,12 @@ pub struct TableSettings {
     /// restricted it. Rows below it are hidden by the restriction, so the
     /// blob links are derived from the rows at and past it only.
     pub restriction: Option<UserKey>,
+    /// The highest seqno of a KV the source recorded, which the table records
+    /// as is rather than computing it from its entries: a source holding only
+    /// range tombstones carries the entry its writer synthesized for them,
+    /// which counted as no KV, and nothing in that entry tells it from a real
+    /// one. `None` computes it.
+    pub highest_kv_seqno: Option<SeqNo>,
 }
 
 /// How a table's retrieval locator is imported.
@@ -261,6 +267,8 @@ pub struct TableImport {
     /// The first and last keys of the entries received, and the range every
     /// range tombstone recorded so far covers, under the comparator.
     key_range: Option<(UserKey, UserKey)>,
+    /// See [`TableSettings::highest_kv_seqno`].
+    highest_kv_seqno: Option<SeqNo>,
 }
 
 impl TableImport {
@@ -374,6 +382,7 @@ impl TableImport {
             rows_written: 0,
             restriction: settings.restriction,
             key_range: None,
+            highest_kv_seqno: settings.highest_kv_seqno,
         })
     }
 
@@ -561,9 +570,9 @@ impl TableImport {
             self.writer.link_blob_file(link);
         }
         self.writer.own_blob_objects(self.owned_cells);
-        // A source holding only range tombstones carries the entry its writer
-        // synthesized for them, which counts as no KV.
-        self.writer.exclude_carried_sentinel();
+        if let Some(seqno) = self.highest_kv_seqno {
+            self.writer.record_highest_kv_seqno(seqno);
+        }
         if let Some((start, end)) = self.key_range.take() {
             self.writer.cover_key_range(start, end);
         }
@@ -894,8 +903,9 @@ impl RecordedTable {
 /// and points `CURRENT` at it.
 ///
 /// Every table is opened the way an open opens it before the manifest is
-/// written, so a manifest is never written over a table that does not read.
-/// Returns what each table records, in the order `image` places them.
+/// written, so a manifest is never written over a table that does not read,
+/// and a restricted table gets the sidecar holding its bound. Returns what
+/// each table records, in the order `image` places them.
 ///
 /// # Errors
 ///
@@ -923,8 +933,9 @@ pub fn install_manifest(
             .map(move |placement| (level, placement))
     });
     for (level, placement) in placements {
+        let path = tables_folder(level).join(placement.id.to_string());
         let mut params = crate::table::RecoverParams::new(
-            tables_folder(level).join(placement.id.to_string()),
+            path.clone(),
             placement.checksum,
             placement.id,
             fs.clone(),
@@ -942,8 +953,18 @@ pub fn install_manifest(
         // A restricted table's manifest entry digests its live suffix, from
         // the block that holds its first served key on, as every reader of a
         // restricted entry checks it.
+        // Its bound also goes in the sidecar beside it, durable before the
+        // manifest is: a manifest repair finds a restriction only there.
         let table = match restrictions.get(&placement.id).copied() {
             Some(bound) => {
+                crate::restrict_bound::write(
+                    &**fs,
+                    &path,
+                    encryption.as_deref(),
+                    placement.id,
+                    bound,
+                    crate::fs::SyncMode::default(),
+                )?;
                 let suffix = table.suffix_checksum_for(Some(bound))?;
                 table.with_refreshed_checksum(suffix)
             }

@@ -25,6 +25,7 @@ fn plain_settings(created_at: u128) -> TableSettings {
         filter: None,
         locator: None,
         restriction: None,
+        highest_kv_seqno: None,
     }
 }
 
