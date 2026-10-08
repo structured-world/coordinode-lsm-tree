@@ -613,6 +613,28 @@ fn a_switch_resumes_with_a_relative_route_only_from_its_folder()
     Ok(())
 }
 
+/// A route with an empty path names no folder: it is refused before anything
+/// is built, rather than recorded as one that each working directory reads
+/// as its own.
+#[test]
+fn a_route_with_an_empty_path_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    small_store(folder.path(), &[])?;
+    let options = Options {
+        level_routes: vec![LevelRoute {
+            levels: 1..7,
+            path: PathBuf::new(),
+        }],
+        ..Options::default()
+    };
+    assert!(matches!(
+        convert(folder.path(), &options),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(!folder.path().join(STAGING).exists() && !folder.path().join(READY).exists());
+    Ok(())
+}
+
 /// A route folder whose path the line-oriented markers cannot hold is refused
 /// before anything is built, rather than once a marker no run can read again
 /// is durable.

@@ -50,6 +50,10 @@ fn level_base<'a>(folder: &'a Path, routes: &'a [LevelRoute], level: usize) -> &
 /// A folder as the filesystem resolves it, links and `.`/`..` included: its
 /// nearest existing ancestor resolved, the rest of the path appended.
 fn resolved(path: &Path) -> PathBuf {
+    // From the working directory first, so a relative path none of whose
+    // folders exists yet still resolves to the folder it names from here.
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = absolute.as_path();
     let mut rest = Vec::new();
     let mut base = path;
     loop {
@@ -168,6 +172,9 @@ fn check_routes(
     });
     if routes.iter().any(|r| r.levels.is_empty()) || overlap {
         return Err(Error::Unsupported("empty or overlapping level routes"));
+    }
+    if routes.iter().any(|r| r.path.as_os_str().is_empty()) {
+        return Err(Error::Unsupported("a level route that names no folder"));
     }
     let unrecordable = |path: &Path| path.to_str().is_none_or(|path| path.contains(['\n', '\r']));
     let map = route_map(folder, routes);
