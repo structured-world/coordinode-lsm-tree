@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.17...v5.12.0) - 2026-10-08
+
+### Added
+
+- *(export)* a table's properties, decoded as the open decodes them ([#871](https://github.com/structured-world/coordinode-lsm-tree/pull/871))
+- *(export)* read-only export of a 5.x store for the 6.0 converter ([#869](https://github.com/structured-world/coordinode-lsm-tree/pull/869))
+
 ## [5.11.17](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.16...v5.11.17) - 2026-10-07
 
 ### Fixed
