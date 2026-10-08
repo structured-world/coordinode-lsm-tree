@@ -43,6 +43,10 @@ pub struct FullFilterWriter {
 
     /// Keys registered, fewer than the hashes under a prefix extractor.
     keys: usize,
+
+    /// A filter built elsewhere, written as it is in place of one built from
+    /// registered keys.
+    prebuilt: Option<Vec<u8>>,
 }
 
 impl FullFilterWriter {
@@ -58,6 +62,33 @@ impl FullFilterWriter {
             sizing: None,
             key_range: None,
             keys: 0,
+            prebuilt: None,
+        }
+    }
+
+    /// A writer that writes `filter`, the wire bytes of a filter, instead of
+    /// building one. How many hashes it holds is not known here: a prefix
+    /// extractor may have added some, so the output reports none and the
+    /// table records no count.
+    pub fn prebuilt(filter: Vec<u8>) -> Self {
+        Self {
+            prebuilt: Some(filter),
+            ..Self::new(BloomConstructionPolicy::default())
+        }
+    }
+
+    /// What the filter block is framed under: filter blocks are always
+    /// written uncompressed; Plain or Encrypted by the configured provider,
+    /// with parity when the tree was opened with `Config::page_ecc(true)`.
+    fn transform(&self) -> crate::table::block::BlockTransform<'_> {
+        let t = match self.encryption.as_deref() {
+            Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
+            None => crate::table::block::BlockTransform::PLAIN,
+        };
+        if let Some(ecc) = self.ecc {
+            t.with_ecc(ecc)
+        } else {
+            t
         }
     }
 
@@ -180,8 +211,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
 
     fn held_bytes(&self) -> u64 {
         // The previous key's prefix hashes stay allocated until `finish`.
+        let prebuilt = self.prebuilt.as_ref().map_or(0, Vec::capacity);
         ((self.bloom_hash_buffer.capacity() + self.previous_prefixes.capacity())
-            * core::mem::size_of::<u64>()) as u64
+            * core::mem::size_of::<u64>()
+            + prebuilt) as u64
     }
 
     fn finish_scratch_bytes(&self) -> u64 {
@@ -212,6 +245,15 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn finish_output_bytes(&self) -> u64 {
+        if let Some(filter) = &self.prebuilt {
+            return crate::table::block::framed_len_bound(
+                filter.len() as u64,
+                crate::table::block::BlockType::Filter,
+                CompressionType::None,
+                self.encryption.as_deref(),
+                self.ecc,
+            );
+        }
         if self.bloom_hash_buffer.is_empty() {
             return 0;
         }
@@ -228,9 +270,34 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     }
 
     fn finish(
-        self: Box<Self>,
+        mut self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
     ) -> crate::Result<super::FilterOutput> {
+        if let Some(filter_bytes) = &self.prebuilt {
+            file_writer.start("filter")?;
+            let at = super::super::next_block_at(self.table_id, file_writer);
+            Block::write_into(
+                file_writer,
+                filter_bytes,
+                crate::table::block::BlockIdentity {
+                    table_id: self.table_id,
+                    block_type: crate::table::block::BlockType::Filter,
+                    dict_id: 0,
+                    window_log: 0,
+                },
+                &self.transform(),
+                at,
+            )?;
+            // The source of a carried filter records no hash count, and under
+            // a prefix extractor its hashes outnumber its keys, so no count is
+            // known: the table records none, and its key count stands in for
+            // it, as for any table without one.
+            return Ok(super::FilterOutput {
+                blocks: 1,
+                hashes: 0,
+                partition_hashes: 0,
+            });
+        }
         if self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has no buffered hashes - not building filter");
             return Ok(super::FilterOutput::default());
@@ -248,7 +315,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         // unique, so a duplicate needs a 64-bit hash collision — the sort
         // would be pure cost on the write path.
         let has_prefix_tokens = self.prefix_extractor.is_some();
-        let mut hashes = self.bloom_hash_buffer;
+        let mut hashes = core::mem::take(&mut self.bloom_hash_buffer);
         let raw = hashes.len();
         if has_prefix_tokens {
             hashes.sort_unstable();
@@ -317,21 +384,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
                 dict_id: 0,
                 window_log: 0,
             },
-            // Filter blocks are always written uncompressed; the
-            // transform is Plain or Encrypted depending on the
-            // configured provider, plus `with_ecc` when the tree
-            // was opened with `Config::page_ecc(true)`.
-            &{
-                let t = match self.encryption.as_deref() {
-                    Some(enc) => crate::table::block::BlockTransform::Encrypted(enc),
-                    None => crate::table::block::BlockTransform::PLAIN,
-                };
-                if let Some(ecc) = self.ecc {
-                    t.with_ecc(ecc)
-                } else {
-                    t
-                }
-            },
+            &self.transform(),
             at,
         )?;
 

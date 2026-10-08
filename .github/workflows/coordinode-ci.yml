@@ -276,6 +276,11 @@ jobs:
         # that feature is only seen here.
         working-directory: tools/db_bench
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (v5-to-v6)
+        # The offline converter carries its own `[workspace]` too, so the
+        # workspace gates above never lint it.
+        working-directory: tools/v5-to-v6
+        run: cargo clippy --all-targets -- -D warnings
       - name: Docs
         # Broken and private intra-doc links fail the docs.rs build of a
         # release and nothing else catches them. Linux, with every feature,
@@ -366,6 +371,7 @@ jobs:
           workspaces: |
             tools/db_bench -> target
             tools/sst-dump -> target
+            tools/v5-to-v6 -> target
       # Same fallback as in `test`: the prebuilt installer's CDN can be down.
       - uses: taiki-e/install-action@1ef5c5f58e85d25baaaa1704478fdd6c2921f2b5  # nextest
         id: install-nextest
@@ -394,6 +400,12 @@ jobs:
         # parent crate's profile config is not visible from a
         # non-workspace child.
         working-directory: tools/sst-dump
+        run: cargo nextest run
+      - name: Build + test v5-to-v6 crate
+        # Standalone crate (not in workspace). Its tests write stores with the
+        # 5.x crate and convert them, so every change to the 6.0 format that
+        # the converter does not carry yet fails here.
+        working-directory: tools/v5-to-v6
         run: cargo nextest run
 
   fuzz-heal:
@@ -616,9 +628,20 @@ jobs:
         run: cargo +nightly llvm-cov --no-report nextest --no-default-features --features zstd,lz4
       - run: cargo +nightly llvm-cov --no-report --doc --features lz4
       - run: cargo +nightly llvm-cov report --doctests --lcov --output-path lcov.info --ignore-filename-regex='registry'
+      # The import module is driven by the v5-to-v6 converter's tests, a
+      # separate crate that builds this one as a path dependency. Its report
+      # keeps only this crate's sources: the 5.x crate it reads through
+      # comes from a git checkout, and the tool's own files are not part of
+      # the library. --no-rustc-wrapper instruments through RUSTFLAGS, so a
+      # dependency built earlier without coverage is rebuilt, not reused.
+      - name: Run the v5-to-v6 converter's tests with coverage of this crate
+        working-directory: tools/v5-to-v6
+        run: cargo +nightly llvm-cov --no-report nextest --no-rustc-wrapper
+      - working-directory: tools/v5-to-v6
+        run: cargo +nightly llvm-cov report --lcov --output-path ../../lcov-v5-to-v6.info --ignore-filename-regex='registry|git/checkouts|tools/v5-to-v6'
       - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
-          files: lcov.info
+          files: lcov.info,lcov-v5-to-v6.info
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 

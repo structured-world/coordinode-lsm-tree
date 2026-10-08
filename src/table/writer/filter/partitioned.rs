@@ -133,6 +133,33 @@ impl PartitionedFilterWriter {
         }
     }
 
+    /// A writer for table `table_id` that writes `partitions`, each the wire
+    /// bytes of a filter over the keys up to and including its key and the
+    /// hashes it holds, in key order, instead of building them. Framed under
+    /// `encryption` and `ecc`, its top-level index compressed with
+    /// `tli_compression`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when framing a partition fails.
+    pub fn prebuilt(
+        partitions: Vec<(UserKey, Vec<u8>, u64)>,
+        table_id: crate::TableId,
+        encryption: Option<Arc<dyn EncryptionProvider>>,
+        ecc: Option<crate::table::block::EccParams>,
+        tli_compression: CompressionType,
+    ) -> crate::Result<Self> {
+        let mut writer = Self::new(BloomConstructionPolicy::default());
+        writer.table_id = table_id;
+        writer.encryption = encryption;
+        writer.ecc = ecc;
+        writer.compression = tli_compression;
+        for (end_key, filter, hashes) in partitions {
+            writer.push_prebuilt_partition(&end_key, &filter, hashes)?;
+        }
+        Ok(writer)
+    }
+
     /// The widest partition a build may produce, which the size estimates
     /// bound.
     fn bound_policy(&self) -> BloomConstructionPolicy {
@@ -250,6 +277,40 @@ impl PartitionedFilterWriter {
             &mut self.final_filter_buffer,
         )?;
         self.record_partition(key, bytes_written);
+        Ok(())
+    }
+
+    /// Appends a partition built elsewhere: `filter`, the wire bytes of a
+    /// filter over the keys up to and including `end_key` that holds `hashes`
+    /// hashes, after every partition appended before it. A writer fed this
+    /// way registers no keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when framing the partition fails, and
+    /// [`crate::Error::InvalidHeader`] when the writer holds registered keys.
+    fn push_prebuilt_partition(
+        &mut self,
+        end_key: &UserKey,
+        filter: &[u8],
+        hashes: u64,
+    ) -> crate::Result<()> {
+        if !self.bloom_hash_buffer.is_empty() || self.pending_count() > 0 {
+            return Err(crate::Error::InvalidHeader(
+                "a prebuilt filter partition follows registered keys",
+            ));
+        }
+        let bytes = frame_partition(
+            &self.partition_settings(),
+            filter,
+            &mut self.final_filter_buffer,
+        )?;
+        self.record_partition(end_key, bytes);
+        let hashes = usize::try_from(hashes)
+            .map_err(|_| crate::Error::InvalidHeader("filter partition hash count"))?;
+        self.table_hashes += hashes;
+        self.largest_partition = self.largest_partition.max(hashes);
+        self.last_key = Some(end_key.clone());
         Ok(())
     }
 
@@ -448,10 +509,19 @@ fn build_partition(
         );
         return Err(crate::Error::Unrecoverable);
     }
+    frame_partition(settings, &filter_bytes, out)
+}
 
+/// Frames the partition filter `filter_bytes` onto `out` and returns the
+/// framed length, its checksum left unbound until `finish` places it.
+fn frame_partition(
+    settings: &PartitionSettings,
+    filter_bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> crate::Result<u32> {
     let header = Block::write_into(
         out,
-        &filter_bytes,
+        filter_bytes,
         crate::table::block::BlockIdentity {
             table_id: settings.table_id,
             block_type: crate::table::block::BlockType::Filter,

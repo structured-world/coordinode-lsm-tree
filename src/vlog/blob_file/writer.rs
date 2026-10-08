@@ -138,6 +138,10 @@ pub struct Writer {
     /// The lifetime class this file holds, recorded in its metadata.
     pub(crate) lifetime_class: u8,
 
+    /// The age to record instead of the time the file is finished, for a file
+    /// rebuilt from another store.
+    pub(crate) created_at: Option<u128>,
+
     /// Durability level for the final blob-file fsync. Default
     /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
@@ -223,6 +227,7 @@ impl Writer {
             compression: CompressionType::None,
             metadata_compression_override: None,
             lifetime_class: 0,
+            created_at: None,
             sync_mode: SyncMode::Normal,
             writeback_bytes: 0,
             written_back: 0,
@@ -337,6 +342,24 @@ impl Writer {
     #[must_use]
     pub(crate) fn blob_file_id(&self) -> BlobFileId {
         self.blob_file_id
+    }
+
+    /// Skips `len` bytes of the data section, so the next value lands `len`
+    /// bytes later: for a file rebuilt from one whose consumed prefix was
+    /// reclaimed, whose live values keep the offsets their handles name. The
+    /// gap is never written: a filesystem with sparse files leaves it
+    /// unallocated, and the file is restricted past it. Its bytes are not part
+    /// of the writer's checksum, which a restricted file does not use.
+    #[cfg(feature = "std")]
+    pub(crate) fn write_filler(&mut self, len: u64) -> crate::Result<()> {
+        use std::io::Seek as _;
+        let skip =
+            i64::try_from(len).map_err(|_| crate::Error::InvalidHeader("blob file frontier"))?;
+        self.writer
+            .get_mut()
+            .seek(std::io::SeekFrom::Current(skip))?;
+        self.offset += len;
+        Ok(())
     }
 
     pub(crate) fn write_raw(
@@ -515,7 +538,9 @@ impl Writer {
         let metadata = Metadata {
             id: self.blob_file_id,
             version: META_VERSION,
-            created_at: unix_timestamp().as_nanos(),
+            created_at: self
+                .created_at
+                .unwrap_or_else(|| unix_timestamp().as_nanos()),
             item_count: self.item_count,
             total_compressed_bytes: self.written_blob_bytes,
             total_uncompressed_bytes: self.uncompressed_bytes,

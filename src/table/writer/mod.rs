@@ -666,6 +666,21 @@ pub struct Writer {
     /// Largest locator slot recorded so far, which sizes the section's width.
     locator_max_slot: u64,
 
+    /// A membership filter built elsewhere, written at `finish` in place of
+    /// one built from the keys; while it is set no key is registered.
+    prebuilt_filter: Option<PrebuiltFilter>,
+
+    /// Whether the filter is one built elsewhere, whose policy this writer
+    /// does not know, so the table records no width for it.
+    carries_filter: bool,
+
+    /// The prebuilt partition the table's keys have reached.
+    prebuilt_partition: usize,
+
+    /// A `locator` section built elsewhere, written at `finish` in place of
+    /// one built from the keys.
+    prebuilt_locator: Option<Vec<u8>>,
+
     /// Heap bytes the per-key and per-block state holds for `finish`, and the
     /// bytes `finish` will append, as of the last data block. Refreshed once
     /// per block rather than per key: a table rotates on them at a key
@@ -824,6 +839,15 @@ pub struct Writer {
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
 
+    /// The age to record instead of the clock or the inputs' age; `None` for
+    /// every table the engine writes itself.
+    created_at: Option<u128>,
+
+    /// The key range to record instead of the rows' own, set by a caller that
+    /// ordered it under the tree's comparator; `None` for every table the
+    /// engine writes itself.
+    key_range_cover: Option<(UserKey, UserKey)>,
+
     /// Tag of the last columnar row group written, `None` before the first.
     /// Tags strictly increase so they stay unique within the table, which is
     /// what makes a page's stamp name exactly one group.
@@ -907,6 +931,50 @@ pub(crate) struct VerbatimSource {
     pub table_id: TableId,
     /// The source offset of the extent's first block.
     pub offset: u64,
+}
+
+/// A membership filter built elsewhere, as the wire bytes it is written as.
+pub(crate) enum PrebuiltFilter {
+    /// One filter over the whole table.
+    Full(Vec<u8>),
+    /// Filters over key ranges, in key order: the last key each covers, its
+    /// bytes, and the distinct keys of the table that fall in it, which the
+    /// writer counts as they arrive (a partition holds no prefix hashes, so
+    /// that is the hashes it holds).
+    Partitioned(Vec<(UserKey, Vec<u8>, u64)>),
+}
+
+impl PrebuiltFilter {
+    /// Counts `key`, the table's next distinct key, against the partition
+    /// that covers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] for a key past the last
+    /// partition: no filter would answer for it, so a read would miss it.
+    fn count_key(
+        &mut self,
+        key: &[u8],
+        cursor: &mut usize,
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> crate::Result<()> {
+        let Self::Partitioned(partitions) = self else {
+            return Ok(());
+        };
+        while partitions
+            .get(*cursor)
+            .is_some_and(|(end, _, _)| comparator.compare(key, end) == core::cmp::Ordering::Greater)
+        {
+            *cursor += 1;
+        }
+        let (_, _, keys) = partitions
+            .get_mut(*cursor)
+            .ok_or(crate::Error::InvalidHeader(
+                "a key past the last prebuilt filter partition",
+            ))?;
+        *keys += 1;
+        Ok(())
+    }
 }
 
 /// Where the next block `file_writer` receives lands in table `table_id`'s
@@ -1032,6 +1100,10 @@ impl Writer {
             locators: Vec::new(),
             locator_block_id: 0,
             locator_max_slot: 0,
+            prebuilt_filter: None,
+            carries_filter: false,
+            prebuilt_partition: 0,
+            prebuilt_locator: None,
             held_state_bytes: 0,
             finish_metadata_bytes: 0,
             layout_bytes: 0,
@@ -1088,6 +1160,8 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
+            created_at: None,
+            key_range_cover: None,
 
             #[cfg(zstd_any)]
             zstd_dictionary: None,
@@ -1336,7 +1410,11 @@ impl Writer {
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
             filter_hashes: self.meta.filter_hashes,
-            filter_bits: crate::filter_budget::bits_of(self.bloom_policy),
+            // A carried filter was built under its source's policy, not this
+            // writer's: the table records none, and the width the filter
+            // itself has stands for it.
+            filter_bits: (!self.carries_filter)
+                .then(|| crate::filter_budget::bits_of(self.bloom_policy)),
             filter_partition_hashes: self.meta.filter_partition_hashes,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
@@ -2302,6 +2380,16 @@ impl Writer {
         self
     }
 
+    /// Sets the age the table records, in nanoseconds since the Unix epoch,
+    /// instead of the time it is finished: a table rebuilt from another store
+    /// keeps the age of the data it carries.
+    #[must_use]
+    pub(crate) fn use_created_at(mut self, created_at: u128) -> Self {
+        self.assert_not_started("use_created_at");
+        self.created_at = Some(created_at);
+        self
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
@@ -2324,6 +2412,28 @@ impl Writer {
                 slot_bits,
             }),
         };
+        self
+    }
+
+    /// Writes `filter`, built elsewhere for exactly the keys this table will
+    /// hold, as the table's membership filter instead of building one from
+    /// them. Must be set before the first key.
+    #[must_use]
+    pub(crate) fn use_prebuilt_filter(mut self, filter: PrebuiltFilter) -> Self {
+        self.assert_not_started("use_prebuilt_filter");
+        self.prebuilt_filter = Some(filter);
+        self.carries_filter = true;
+        self
+    }
+
+    /// Writes `section`, a `locator` section built elsewhere for exactly the
+    /// keys and blocks this table will hold, instead of building one from
+    /// them. Must be set before the first key.
+    #[must_use]
+    pub(crate) fn use_prebuilt_locator(mut self, section: Vec<u8>) -> Self {
+        self.assert_not_started("use_prebuilt_locator");
+        self.locator = None;
+        self.prebuilt_locator = Some(section);
         self
     }
 
@@ -2373,6 +2483,14 @@ impl Writer {
         self
     }
 
+    /// Records `seqno` as the table's KV seqno bound instead of the one its
+    /// entries give: for a table rebuilt from another store, whose writer
+    /// counted an entry it synthesized for range tombstones alone as no KV.
+    #[cfg(feature = "std")]
+    pub(crate) fn record_highest_kv_seqno(&mut self, seqno: crate::SeqNo) {
+        self.meta.highest_kv_seqno = seqno;
+    }
+
     /// Adds a range tombstone to be written into this table's RT block.
     pub(crate) fn write_range_tombstone(&mut self, rt: RangeTombstone) {
         self.meta.lowest_seqno = self.meta.lowest_seqno.min(rt.seqno);
@@ -2387,6 +2505,14 @@ impl Writer {
         self.range_tombstone_coverage = Some((start, end));
     }
 
+    /// Records `[start, end]` as the table's key range, whatever entries it
+    /// holds: for a table rebuilt from another store, whose range tombstones
+    /// reach past its entries. The caller orders the range under the tree's
+    /// comparator, and it covers every entry the table receives.
+    pub(crate) fn cover_key_range(&mut self, start: UserKey, end: UserKey) {
+        self.key_range_cover = Some((start, end));
+    }
+
     /// Writes an item.
     ///
     /// # Note
@@ -2395,6 +2521,45 @@ impl Writer {
     /// sorted as described by the [`UserKey`], otherwise the block layout will
     /// be non-sense.
     pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+        // A prebuilt partitioned filter counts the keys each partition covers,
+        // which needs the comparator; an entry written here would escape that.
+        if matches!(self.prebuilt_filter, Some(PrebuiltFilter::Partitioned(_))) {
+            return Err(crate::Error::InvalidHeader(
+                "a table with a prebuilt partitioned filter takes its entries with a comparator",
+            ));
+        }
+        self.write_entry(item)
+    }
+
+    /// [`Self::write`] into a table with a prebuilt filter of any shape: a new
+    /// key is counted against the partition that covers it, and a key none
+    /// covers is refused before it is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`], plus the refusal of an uncovered key.
+    pub(crate) fn write_counted(
+        &mut self,
+        item: InternalValue,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        if let Some(prebuilt) = self.prebuilt_filter.as_mut()
+            && !self
+                .current_key
+                .as_deref()
+                .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key))
+        {
+            prebuilt.count_key(
+                &item.key.user_key,
+                &mut self.prebuilt_partition,
+                comparator.as_ref(),
+            )?;
+        }
+        self.write_entry(item)
+    }
+
+    /// The body of [`Self::write`], past the prebuilt-filter guard.
+    fn write_entry(&mut self, item: InternalValue) -> crate::Result<()> {
         let value_type = item.key.value_type;
         let seqno = item.key.seqno;
         // Borrow the key for the bookkeeping below; `item` moves into the
@@ -2445,7 +2610,7 @@ impl Writer {
             // because there may be multiple versions
             // of the same key
 
-            if self.bloom_policy.is_active() {
+            if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
                 self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
             }
 
@@ -3492,7 +3657,7 @@ impl Writer {
             {
                 self.meta.key_count += 1;
                 self.current_key = Some(user_key.clone());
-                if self.bloom_policy.is_active() {
+                if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
                     self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
                 }
                 if let Some(spec) = self.locator {
@@ -3598,6 +3763,116 @@ impl Writer {
             None,
             comparator,
         )
+    }
+
+    /// Counts each new key of `entries`, in order, against the partition of a
+    /// prebuilt filter that covers it, and refuses a key none of them covers,
+    /// before anything is written. Without a prebuilt filter it does nothing.
+    pub(crate) fn count_prebuilt_keys(
+        &mut self,
+        entries: &[InternalValue],
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<()> {
+        if let Some(prebuilt) = self.prebuilt_filter.as_mut() {
+            let mut previous = self.current_key.as_deref();
+            for entry in entries {
+                let key = &*entry.key.user_key;
+                if previous.is_some_and(|p| crate::comparator::same_user_key(p, key)) {
+                    continue;
+                }
+                prebuilt.count_key(key, &mut self.prebuilt_partition, comparator.as_ref())?;
+                previous = Some(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends a row data block from its compressed payload, as another store
+    /// wrote it and its reader verified it, framed under this writer: this
+    /// table's encryption, place binding and parity, no decompression and no
+    /// recompression. The payload must be compressed with this writer's data
+    /// codec (and dictionary), and carry a per-KV checksum footer exactly when
+    /// this writer emits one for the table. `entries` are the block's rows, used
+    /// for the index, filter, locator, zone and seqno accounting a freshly
+    /// encoded block gets; they are not re-serialized.
+    ///
+    /// Returns the block's last user key, or `None` for an empty entry set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entries are out of internal-key order
+    /// ([`Self::validate_direct_block_order`]), the payload disagrees with its
+    /// uncompressed length, or the write fails.
+    #[cfg(feature = "std")]
+    pub(crate) fn append_compressed_data_block(
+        &mut self,
+        payload: &[u8],
+        uncompressed_length: u32,
+        entries: &[InternalValue],
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        self.validate_direct_block_order(entries, comparator)?;
+        self.count_prebuilt_keys(entries, comparator)?;
+        let Some(inputs) = self.account_direct_block(entries)? else {
+            return Ok(None);
+        };
+        let kv_flags = if self
+            .kv_checksum
+            .is_some_and(|(policy, _)| policy.applies(self.initial_level, self.table_id))
+        {
+            crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
+        } else {
+            0
+        };
+        let transform = {
+            let t = crate::table::block::BlockTransform::from_parts(
+                self.data_block_compression,
+                self.encryption.as_deref(),
+                #[cfg(zstd_any)]
+                self.zstd_dictionary.as_deref(),
+            )?;
+            if let Some(ecc) = self.ecc {
+                t.with_ecc(ecc)
+            } else {
+                t
+            }
+        };
+        let prepared = Block::prepare_compressed(
+            payload,
+            uncompressed_length,
+            super::block::BlockIdentity {
+                table_id: self.table_id,
+                block_type: super::block::BlockType::Data,
+                dict_id: self.data_block_compression.dict_id(),
+                window_log: 0,
+            },
+            &transform,
+            kv_flags,
+        )?;
+        // The inner-block layout a compression here would have recorded, read
+        // from the frame: a range read partial-decodes the carried block as it
+        // would one this writer compressed.
+        #[cfg(zstd_any)]
+        let layout = match self.data_block_compression {
+            CompressionType::Zstd(_) => crate::compression::inner_block_layout_of(payload)?,
+            _ => Vec::new(),
+        };
+        #[cfg(not(zstd_any))]
+        let layout = Vec::new();
+        let at = next_block_at(self.table_id, &self.file_writer);
+        let header = prepared.write_to(&mut self.file_writer, at)?;
+        self.register_written_block(
+            header,
+            layout,
+            inputs.last_key.clone(),
+            inputs.last_seqno,
+            inputs.seqno_bounds,
+            inputs.item_count,
+            inputs.zone_block_min,
+            None,
+        )?;
+        self.locator_block_done();
+        Ok(Some(inputs.last_key))
     }
 
     /// Appends a columnar row group by copying its raw on-disk bytes
@@ -4039,6 +4314,12 @@ impl Writer {
                 self.meta.last_key = Some(end);
             }
         }
+        // Reads skip a table by its key range before they look at its range
+        // tombstones, so the range has to reach as far as they do.
+        if let Some((start, end)) = self.key_range_cover.take() {
+            self.meta.first_key = Some(start);
+            self.meta.last_key = Some(end);
+        }
 
         // Drain any block submitted to the parallel pipeline after the initial
         // drain above — notably the RT-only sentinel spill — so the index sees
@@ -4056,6 +4337,25 @@ impl Writer {
         let (index_block_count, tli_bytes) = index_writer.finish(&mut self.file_writer)?;
 
         log::trace!("Finishing filter writer");
+        // A filter built elsewhere is framed now, under the settings this
+        // table finished with.
+        if let Some(prebuilt) = self.prebuilt_filter.take() {
+            self.filter_writer = match prebuilt {
+                PrebuiltFilter::Full(filter) => Box::new(FullFilterWriter::prebuilt(filter))
+                    .use_table_id(self.table_id)
+                    .use_encryption(self.encryption.clone())
+                    .use_ecc(self.ecc),
+                PrebuiltFilter::Partitioned(partitions) => {
+                    Box::new(filter::PartitionedFilterWriter::prebuilt(
+                        partitions,
+                        self.table_id,
+                        self.encryption.clone(),
+                        self.ecc,
+                        self.index_block_compression,
+                    )?)
+                }
+            };
+        }
         let mut filter_writer = core::mem::replace(
             &mut self.filter_writer,
             Box::new(FullFilterWriter::new(self.bloom_policy)),
@@ -4292,10 +4592,13 @@ impl Writer {
         // the level's locator policy is enabled AND the per-SST widths fit the
         // actual layout (`build_locator_section` returns `None` to skip
         // gracefully otherwise). Absent for a default table, so no bytes added.
-        if let Some(spec) = self.locator
-            && let Some(section) =
+        let locator_section = match self.prebuilt_locator.take() {
+            Some(section) => Some(section),
+            None => self.locator.and_then(|spec| {
                 crate::table::locator::build_locator_section(&self.locators, spec)
-        {
+            }),
+        };
+        if let Some(section) = locator_section {
             start_section(
                 &mut self.file_writer,
                 &mut self.written_back,
@@ -4413,9 +4716,11 @@ impl Writer {
         // Decided once — both MID and TAIL copies must report the SAME
         // created_at so MID-fallback recovery produces the same timestamp as
         // a clean TAIL recovery. A compaction output inherits the age of the
-        // inputs it carries data from; anything else reads the clock.
-        let created_at_nanos = ages
-            .and_then(|ages| ages.age_of(first_key, last_key))
+        // inputs it carries data from, an imported table the age it was given;
+        // anything else reads the clock.
+        let created_at_nanos = self
+            .created_at
+            .or_else(|| ages.and_then(|ages| ages.age_of(first_key, last_key)))
             .unwrap_or_else(|| unix_timestamp().as_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
@@ -4732,8 +5037,9 @@ struct MetaSectionParams<'a> {
     /// filter) omits it.
     filter_hashes: u64,
     /// Width in bits per key of the static filter policy the table was
-    /// written under, written with `filter_hashes`.
-    filter_bits: u8,
+    /// written under, written with `filter_hashes`; `None` for a filter built
+    /// elsewhere.
+    filter_bits: Option<u8>,
     /// Hashes of the largest filter partition, zero for a full filter.
     filter_partition_hashes: u64,
     sum_user_key_bytes: u64,
@@ -5059,7 +5365,9 @@ fn encode_meta_payload(
         // by: the width of the static policy it was written under, and the
         // hashes of a full partition when it is partitioned. The level it lies
         // in does not tell either: a table keeps its filter through a move.
-        meta_items.push(meta("filter_bits", &[p.filter_bits]));
+        if let Some(bits) = p.filter_bits {
+            meta_items.push(meta("filter_bits", &[bits]));
+        }
         if p.filter_partition_hashes > 0 {
             meta_items.push(meta(
                 "filter_partition_hashes",

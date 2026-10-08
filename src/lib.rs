@@ -277,6 +277,12 @@ pub(crate) mod dicts;
 mod double_ended_peekable;
 mod error;
 
+/// Building a tree's files from parts another store holds, for the offline
+/// converter from the previous major format.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub mod import;
+
 #[doc(hidden)]
 pub mod file;
 

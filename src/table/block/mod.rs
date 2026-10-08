@@ -860,12 +860,6 @@ impl Block {
     /// [`PreparedBlock::write_to`]. Pure CPU work, no I/O — safe to run on a
     /// worker thread for parallel compaction. See [`Self::write_into_with_flags`]
     /// for the `extra_flags` contract.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear transform pipeline: compress → encrypt → checksum → ecc; \
-                  each step is small but they share state (header, payload, owned buffers) \
-                  so factoring would just hide the data flow"
-    )]
     pub(crate) fn prepare_with_flags<'a>(
         data: &'a [u8],
         identity: BlockIdentity,
@@ -878,7 +872,6 @@ impl Block {
         // pattern-match cost; the rest of the function keeps the same
         // shape as before the API collapse.
         let compression = transform.compression();
-        let encryption = transform.encryption();
         #[cfg(zstd_any)]
         let zstd_dict = transform.zstd_dict();
         // Pull block_type out of identity so the rest of the
@@ -925,7 +918,7 @@ impl Block {
             f
         };
 
-        let mut header = Header {
+        let header = Header {
             block_type,
             block_flags,
             stored_checksum: Checksum::from_raw(0), // <-- NOTE: bound by the write
@@ -999,50 +992,104 @@ impl Block {
             }
         }
 
+        #[cfg(any(feature = "lz4", zstd_any))]
+        let compressed = compressed_buf;
+        #[cfg(not(any(feature = "lz4", zstd_any)))]
+        let compressed: Option<Vec<u8>> = None;
+
+        Self::seal(header, data, compressed, layout, &identity, transform)
+    }
+
+    /// Runs the stages after compression (encrypt → checksum → ecc) over a
+    /// payload that is already compressed as `transform` compresses, and
+    /// returns a [`PreparedBlock`] framed like any other: a block carried from
+    /// another store keeps its compressed bytes and gets this store's
+    /// encryption, place binding and parity. `uncompressed_length` is the
+    /// payload's length once decompressed; `extra_flags` as in
+    /// [`Self::write_into_with_flags`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidHeader`] for an uncompressed payload
+    /// whose length is not `uncompressed_length`, and the encryption and size
+    /// errors [`Self::write_into`] returns.
+    pub(crate) fn prepare_compressed<'a>(
+        payload: &'a [u8],
+        uncompressed_length: u32,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        extra_flags: u8,
+    ) -> crate::Result<PreparedBlock<'a>> {
+        use crate::table::block::header::block_flags;
+
+        debug_assert_eq!(
+            extra_flags & !block_flags::KNOWN,
+            0,
+            "extra_flags must contain only defined block_flags bits",
+        );
+        if uncompressed_length > MAX_DECOMPRESSION_SIZE {
+            return Err(crate::Error::DecompressedSizeTooLarge {
+                declared: u64::from(uncompressed_length),
+                limit: u64::from(MAX_DECOMPRESSION_SIZE),
+            });
+        }
+        let compressed = transform.compression() != CompressionType::None;
+        if !compressed && payload.len() != uncompressed_length as usize {
+            return Err(crate::Error::InvalidHeader(
+                "uncompressed block payload is not its uncompressed length",
+            ));
+        }
+        let mut flags = extra_flags;
+        if compressed {
+            flags |= block_flags::COMPRESSED;
+        }
+        if transform.encryption().is_some() {
+            flags |= block_flags::ENCRYPTED;
+        }
+        let header = Header {
+            block_type: identity.block_type,
+            block_flags: flags,
+            stored_checksum: Checksum::from_raw(0), // bound by the write
+            data_length: 0,                         // set by the seal
+            uncompressed_length,
+        };
+        // No layout here: the payload was not compressed by this call. The
+        // writer that carries it reads its inner-block layout back from the
+        // frame and registers that with the block.
+        Self::seal(header, payload, None, Vec::new(), &identity, transform)
+    }
+
+    /// The stages after compression: encrypt `owned` (or `data` when nothing
+    /// owns a transformed copy), then checksum, then the parity trailer.
+    fn seal<'a>(
+        mut header: Header,
+        data: &'a [u8],
+        owned: Option<Vec<u8>>,
+        layout: Vec<u32>,
+        identity: &BlockIdentity,
+        transform: &BlockTransform<'_>,
+    ) -> crate::Result<PreparedBlock<'a>> {
+        let compression = transform.compression();
+        let encryption = transform.encryption();
+        let block_flags = header.block_flags;
+
         // Encryption step — under zstd this seals the AAD-bound envelope
         // binding the block identity + transform context; otherwise the opaque
         // form, reusing the owned compression buffer when present.
-        let encrypted_buf: Option<Vec<u8>>;
-
-        #[cfg(any(feature = "lz4", zstd_any))]
-        {
-            encrypted_buf = encryption
-                .map(|enc| {
-                    encrypt_block_payload(
-                        enc,
-                        compressed_buf.take(),
-                        data,
-                        &identity,
-                        compression,
-                        block_flags,
-                    )
-                })
-                .transpose()?;
-        }
-
-        #[cfg(not(any(feature = "lz4", zstd_any)))]
-        {
-            encrypted_buf = encryption
-                .map(|enc| {
-                    encrypt_block_payload(enc, None, data, &identity, compression, block_flags)
-                })
-                .transpose()?;
-        }
+        let mut owned = owned;
+        let encrypted_buf: Option<Vec<u8>> = encryption
+            .map(|enc| {
+                encrypt_block_payload(enc, owned.take(), data, identity, compression, block_flags)
+            })
+            .transpose()?;
 
         // Determine the final on-disk payload. Owns a fresh buffer when a
         // transform produced one; borrows the caller's `data` otherwise, so the
         // serial uncompressed/unencrypted path stays zero-copy.
-        let payload: Cow<'a, [u8]> = if let Some(enc) = encrypted_buf {
-            Cow::Owned(enc)
-        } else {
-            #[cfg(any(feature = "lz4", zstd_any))]
-            {
-                compressed_buf.map_or(Cow::Borrowed(data), Cow::Owned)
-            }
-            #[cfg(not(any(feature = "lz4", zstd_any)))]
-            {
-                Cow::Borrowed(data)
-            }
+        let payload: Cow<'a, [u8]> = match (encrypted_buf, owned) {
+            (Some(enc), _) => Cow::Owned(enc),
+            (None, Some(buf)) => Cow::Owned(buf),
+            (None, None) => Cow::Borrowed(data),
         };
 
         // Validate the final on-disk payload against the same size limit

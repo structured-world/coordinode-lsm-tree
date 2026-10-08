@@ -248,6 +248,7 @@ cargo run --release --features flamegraph -- \
 |------|-----|
 | [`tools/db_bench`](tools/db_bench) | RocksDB-compatible benchmark suite, also drives the CI perf dashboard. |
 | [`tools/sst-dump`](tools/sst-dump) | Inspect, verify and rescue SSTs out-of-band, without ever opening a `Tree`. The inspection commands read one SST and need no manifest; `repair` is the exception, taking a whole database directory and rebuilding its `MANIFEST`. See its [subcommands](#sst-dump-subcommands) below. |
+| [`tools/v5-to-v6`](tools/v5-to-v6) | Converts a store written by 5.x to this release's on-disk format, offline and in place: `v5-to-v6 <store>`, with `--aes256-key-file` for an encrypted store and `--dictionary` for a compression dictionary the store does not keep. The 5.x code reads the source, verifying and repairing it as 5.x reads it, and the converted store is checked against it before the switch. The source is kept in `<store>/v5-backup`; a run stopped anywhere is finished by running it again. |
 
 <a id="sst-dump-subcommands"></a>
 

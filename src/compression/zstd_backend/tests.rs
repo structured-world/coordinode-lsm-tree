@@ -553,6 +553,24 @@ fn compress_with_layout_multi_inner_block_offsets_are_monotonic_and_total() {
     );
 }
 
+/// The layout read back from a compressed frame is the one its compression
+/// recorded, a single-block frame's included (empty), so a block carried
+/// without recompressing gets the partial-decode table a fresh one gets.
+#[test]
+fn inner_block_layout_of_a_frame_is_the_one_its_compression_recorded() {
+    for (len, level) in [(4 * 1024, 3), (256 * 1024, 19), (1024 * 1024, 3)] {
+        let payload = sorted_kv_payload(len);
+        let (frame, layout) =
+            ZstdProvider::compress_with_layout(&payload, level, true).expect("compress");
+        assert_eq!(
+            super::inner_block_layout_of(&frame).expect("layout"),
+            layout,
+            "{len} bytes at level {level}"
+        );
+    }
+    assert!(super::inner_block_layout_of(b"not a frame").is_err());
+}
+
 #[test]
 fn compress_with_layout_subrange_partial_decode_matches_full_slice() {
     // The persisted layout must let a reader decode exactly the inner-block

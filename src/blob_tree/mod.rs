@@ -6,6 +6,8 @@ pub mod field_row;
 mod gc;
 pub mod handle;
 pub mod ingest;
+#[cfg(feature = "std")]
+pub(crate) mod links;
 pub(crate) mod overwritten;
 pub(crate) mod released;
 
