@@ -126,11 +126,10 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
             prepare(folder.path(), &options)?;
 
             let mut steps = 0;
-            let sites = route_sites(folder.path(), &routes);
             // A renumbering the switch stands for, which a run that only
             // finishes it must still report.
             let renumbered = [(u16::MAX, 65_000)];
-            let interrupted = switch(folder.path(), &sites, &renumbered, &mut || {
+            let interrupted = switch(folder.path(), &routes, &renumbered, &mut || {
                 steps += 1;
                 if steps > stop_at {
                     Err(std::io::Error::other("interrupted"))
@@ -215,16 +214,20 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
 /// right after it does.
 fn stop_after_ready(folder: &Path, options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let report = prepare(folder, options)?;
-    let sites = route_sites(folder, &options.level_routes);
     let mut steps = 0;
-    let stopped = switch(folder, &sites, &report.renumbered_fields, &mut || {
-        steps += 1;
-        if steps > 1 {
-            Err(std::io::Error::other("interrupted"))
-        } else {
-            Ok(())
-        }
-    });
+    let stopped = switch(
+        folder,
+        &options.level_routes,
+        &report.renumbered_fields,
+        &mut || {
+            steps += 1;
+            if steps > 1 {
+                Err(std::io::Error::other("interrupted"))
+            } else {
+                Ok(())
+            }
+        },
+    );
     assert!(stopped.is_err() && folder.join(READY).exists());
     Ok(())
 }
@@ -289,6 +292,37 @@ fn a_switch_resumes_only_with_the_routes_it_started_with() -> Result<(), Box<dyn
     assert!(folder.path().join(READY).exists(), "nothing was moved");
 
     assert!(convert(folder.path(), &options)?.resumed);
+    assert_eq!(read_v6(folder.path(), &routes)?, expected);
+    Ok(())
+}
+
+/// A switch resumes only with routes that put every level in the folder it
+/// started with: the same folder over other levels is refused before anything
+/// moves, the same levels split into several routes to that folder resume.
+#[test]
+fn a_switch_resumes_only_with_the_levels_its_routes_started_with()
+-> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let route = |levels| LevelRoute {
+        levels,
+        path: cold.path().to_path_buf(),
+    };
+    let options = |routes| Options {
+        level_routes: routes,
+        ..Options::default()
+    };
+    let routes = vec![route(1..7)];
+    let expected = small_store(folder.path(), &routes)?;
+    stop_after_ready(folder.path(), &options(routes.clone()))?;
+
+    assert!(matches!(
+        convert(folder.path(), &options(vec![route(1..6)])),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(folder.path().join(READY).exists(), "nothing was moved");
+
+    assert!(convert(folder.path(), &options(vec![route(1..3), route(3..7)]))?.resumed);
     assert_eq!(read_v6(folder.path(), &routes)?, expected);
     Ok(())
 }

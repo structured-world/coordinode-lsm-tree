@@ -84,6 +84,33 @@ fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
     sites
 }
 
+/// Which folder holds each routed level's tables, as the filesystem resolves
+/// it: consecutive levels in one folder merged, levels in the store's own
+/// folder left out. Routes that put every level in the same folder give the
+/// same map, however they are split or spelled.
+fn route_map(folder: &Path, routes: &[LevelRoute]) -> Vec<(std::ops::Range<u8>, PathBuf)> {
+    let store = resolved(folder);
+    let bases: Vec<(&std::ops::Range<u8>, PathBuf)> = routes
+        .iter()
+        .map(|route| (&route.levels, resolved(&route.path)))
+        .collect();
+    let mut map: Vec<(std::ops::Range<u8>, PathBuf)> = Vec::new();
+    // A route's range ends at most at `u8::MAX`, so no route covers it.
+    for level in 0..u8::MAX {
+        let Some((_, base)) = bases.iter().find(|(levels, _)| levels.contains(&level)) else {
+            continue;
+        };
+        if *base == store {
+            continue;
+        }
+        match map.last_mut() {
+            Some((levels, last)) if levels.end == level && last == base => levels.end = level + 1,
+            _ => map.push((level..level + 1, base.clone())),
+        }
+    }
+    map
+}
+
 /// Refuses route folders that overlap a folder the switch moves whole: a
 /// route inside one of the store's own entries or its staging or backup
 /// folder, inside another route's `tables`, staging or backup folder, or a
@@ -287,14 +314,10 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
     let _lock = lock_store(folder)?;
     if folder.join(READY).exists() {
         let ready = Ready::read(&folder.join(READY))?;
-        // Compared as resolved: a relative route names another folder from
-        // another working directory, however the option is spelled.
-        if ready.sites.iter().ne(sites
-            .iter()
-            .map(|site| resolved(site))
-            .collect::<Vec<_>>()
-            .iter())
-        {
+        // Every level must be in the folder it was built in. Compared as
+        // resolved: a relative route names another folder from another
+        // working directory, however the option is spelled.
+        if ready.routes != route_map(folder, &options.level_routes) {
             return Err(Error::Unsupported(
                 "level routes other than the interrupted conversion's",
             ));
@@ -302,7 +325,12 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         if folder.join(SWAPPING).exists()
             || source_state(folder, &ready.entries, &sites)? == ready.source
         {
-            switch(folder, &sites, &ready.renumbered, &mut || Ok(()))?;
+            switch(
+                folder,
+                &options.level_routes,
+                &ready.renumbered,
+                &mut || Ok(()),
+            )?;
             return Ok(Report {
                 resumed: true,
                 renumbered_fields: ready.renumbered,
@@ -314,7 +342,7 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         set_back(folder, &ready, &sites)?;
     } else if folder.join(SWAPPING).exists() {
         let renumbered = Ready::read(&folder.join(SWAPPING))?.renumbered;
-        switch(folder, &sites, &renumbered, &mut || Ok(()))?;
+        switch(folder, &options.level_routes, &renumbered, &mut || Ok(()))?;
         return Ok(Report {
             resumed: true,
             renumbered_fields: renumbered,
@@ -322,7 +350,12 @@ pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
         });
     }
     let report = prepare(folder, options)?;
-    switch(folder, &sites, &report.renumbered_fields, &mut || Ok(()))?;
+    switch(
+        folder,
+        &options.level_routes,
+        &report.renumbered_fields,
+        &mut || Ok(()),
+    )?;
     Ok(report)
 }
 
@@ -1172,31 +1205,33 @@ fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 
-/// What [`READY`] records: the source entries the switch sets aside, the route
-/// folders it switches with them, the source's state when it was read, and
-/// the field ids the converted store renumbered, which a run that only
-/// finishes the switch reports. [`SWAPPING`] carries the renumbering alone.
+/// What [`READY`] records: the source entries the switch sets aside, the
+/// [`route_map`] the converted tables were built under, the source's state
+/// when it was read, and the field ids the converted store renumbered, which a
+/// run that only finishes the switch reports. [`SWAPPING`] carries the
+/// renumbering alone.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Ready {
     entries: Vec<String>,
-    sites: Vec<PathBuf>,
+    routes: Vec<(std::ops::Range<u8>, PathBuf)>,
     source: Vec<String>,
     renumbered: Vec<(u16, u16)>,
 }
 
 impl Ready {
-    /// One line per item, each tagged: `entry <name>`, `site <path>`,
-    /// `state <line>`, `renumber <from> <to>`.
+    /// One line per item, each tagged: `entry <name>`,
+    /// `route <first level> <end level> <path>`, `state <line>`,
+    /// `renumber <from> <to>`.
     fn encode(&self) -> Result<String, Error> {
         let mut out = String::new();
         for name in &self.entries {
             out += &format!("entry {name}\n");
         }
-        for site in &self.sites {
-            let site = site.to_str().ok_or(Error::Unsupported(
+        for (levels, path) in &self.routes {
+            let path = path.to_str().ok_or(Error::Unsupported(
                 "a level route folder whose path is not UTF-8",
             ))?;
-            out += &format!("site {site}\n");
+            out += &format!("route {} {} {path}\n", levels.start, levels.end);
         }
         for line in &self.source {
             out += &format!("state {line}\n");
@@ -1218,7 +1253,15 @@ impl Ready {
             };
             match line.split_once(' ') {
                 Some(("entry", name)) => ready.entries.push(name.to_owned()),
-                Some(("site", site)) => ready.sites.push(site.into()),
+                Some(("route", route)) => {
+                    let (start, rest) = route.split_once(' ').ok_or_else(unreadable)?;
+                    let (end, path) = rest.split_once(' ').ok_or_else(unreadable)?;
+                    ready.routes.push((
+                        start.parse().map_err(|_| unreadable())?
+                            ..end.parse().map_err(|_| unreadable())?,
+                        path.into(),
+                    ));
+                }
                 Some(("state", state)) => ready.source.push(state.to_owned()),
                 Some(("renumber", ids)) => {
                     let (from, to) = ids.split_once(' ').ok_or_else(unreadable)?;
@@ -1350,10 +1393,11 @@ fn set_back(folder: &Path, ready: &Ready, sites: &[&Path]) -> Result<(), Error> 
 ///    [`SWAPPING`] left, a rerun has nothing to set aside.
 fn switch(
     folder: &Path,
-    sites: &[&Path],
+    routes: &[LevelRoute],
     renumbered: &[(u16, u16)],
     step: &mut dyn FnMut() -> std::io::Result<()>,
 ) -> Result<(), Error> {
+    let sites = &route_sites(folder, routes);
     let staging = folder.join(STAGING);
     let backup = folder.join(BACKUP);
     let ready = folder.join(READY);
@@ -1371,9 +1415,7 @@ fn switch(
             let marker = Ready {
                 source: source_state(folder, &entries, sites)?,
                 entries,
-                // As resolved, so a rerun from another working directory is
-                // held to the same folders.
-                sites: sites.iter().map(|site| resolved(site)).collect(),
+                routes: route_map(folder, routes),
                 renumbered: renumbered.to_vec(),
             };
             step()?;
