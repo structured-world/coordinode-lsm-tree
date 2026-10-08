@@ -195,7 +195,7 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
                 "{at}"
             );
             for base in [folder.path(), cold.path()] {
-                for leftover in [STAGING, READY, SWAPPING, GUARD] {
+                for leftover in [STAGING, READY, SWAPPING, GUARD, STAGED] {
                     assert!(!base.join(leftover).exists(), "{leftover} is gone ({at})");
                 }
             }
@@ -337,6 +337,69 @@ fn a_switch_left_with_its_last_marker_resumes_only_with_its_routes()
     assert!(convert(folder.path(), &options)?.resumed);
     assert_eq!(read_v6(folder.path(), &routes)?, expected);
     assert!(!swapping.exists());
+    Ok(())
+}
+
+/// A stopped switch resumes with its routes given in another order: the
+/// source reads as unchanged, so what was built is switched in rather than
+/// built again.
+#[test]
+fn a_switch_resumes_with_its_routes_in_another_order() -> Result<(), Box<dyn std::error::Error>> {
+    let folder = tempfile::tempdir()?;
+    let near = tempfile::tempdir()?;
+    let far = tempfile::tempdir()?;
+    let route = |levels, path: &Path| LevelRoute {
+        levels,
+        path: path.to_path_buf(),
+    };
+    let routes = vec![route(1..2, near.path()), route(2..7, far.path())];
+    let expected = small_store(folder.path(), &routes)?;
+    stop_after_ready(
+        folder.path(),
+        &Options {
+            level_routes: routes.clone(),
+            ..Options::default()
+        },
+    )?;
+
+    let reordered = Options {
+        level_routes: vec![route(2..7, far.path()), route(1..2, near.path())],
+        ..Options::default()
+    };
+    assert!(convert(folder.path(), &reordered)?.resumed);
+    assert_eq!(read_v6(folder.path(), &routes)?, expected);
+    Ok(())
+}
+
+/// A folder named like the staging folder that the conversion did not create,
+/// in the store's folder or a route's, is refused and left as it is.
+#[test]
+fn a_staging_folder_the_conversion_did_not_create_is_left_alone()
+-> Result<(), Box<dyn std::error::Error>> {
+    for in_route in [false, true] {
+        let folder = tempfile::tempdir()?;
+        let cold = tempfile::tempdir()?;
+        let routes = vec![LevelRoute {
+            levels: 1..7,
+            path: cold.path().to_path_buf(),
+        }];
+        small_store(folder.path(), &routes)?;
+        let base = if in_route { cold.path() } else { folder.path() };
+        std::fs::create_dir(base.join(STAGING))?;
+        std::fs::write(base.join(STAGING).join("keep"), b"not the conversion's")?;
+        let options = Options {
+            level_routes: routes,
+            ..Options::default()
+        };
+        assert!(
+            matches!(convert(folder.path(), &options), Err(Error::Unsupported(_))),
+            "in route {in_route}"
+        );
+        assert!(
+            base.join(STAGING).join("keep").exists(),
+            "kept (in route {in_route})"
+        );
+    }
     Ok(())
 }
 

@@ -69,19 +69,20 @@ fn resolved(path: &Path) -> PathBuf {
 /// The route folders other than the store's own, each once, told apart as
 /// the filesystem resolves them: a route spelled differently from the store's
 /// folder but naming it is the store's own. Each holds only its `tables`,
-/// which the switch sets aside and replaces there, on its own volume.
+/// which the switch sets aside and replaces there, on its own volume. Ordered
+/// by resolved path, so the same folders come in the same order however the
+/// routes are listed: the source's recorded state names each by its place.
 fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
     let store = resolved(folder);
-    let mut seen = Vec::new();
-    let mut sites: Vec<&Path> = Vec::new();
+    let mut sites: Vec<(PathBuf, &Path)> = Vec::new();
     for route in routes {
         let real = resolved(&route.path);
-        if real != store && !seen.contains(&real) {
-            seen.push(real);
-            sites.push(&route.path);
+        if real != store && !sites.iter().any(|(seen, _)| *seen == real) {
+            sites.push((real, &route.path));
         }
     }
-    sites
+    sites.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    sites.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Which folder holds each routed level's tables, as the filesystem resolves
@@ -287,6 +288,12 @@ const READY: &str = "convert-to-v6.ready";
 /// Marks a switch whose source entries are all set aside.
 const SWAPPING: &str = "convert-to-v6.swapping";
 
+/// Claims the staging folders a conversion created, written before it
+/// creates them: the store's own and, one resolved path per line, each route
+/// folder's. A run removes a leftover staging folder only when this lists it;
+/// a folder of that name it did not create is not its to remove.
+const STAGED: &str = "convert-to-v6.staging";
+
 /// Keeps a tree from being created in the store's folder while the switch has
 /// set the source aside and not yet put the converted pointer in place: an
 /// open of either format refuses to start a new tree over a folder without a
@@ -436,13 +443,37 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
 
     let mut report = Report::default();
     // Each level's tables are built beside its source tables, on their
-    // volume, so the switch moves them by rename.
-    for base in std::iter::once(folder).chain(sites.iter().copied()) {
-        let staging = base.join(STAGING);
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
+    // volume, so the switch moves them by rename. What an earlier run staged
+    // goes first; a staging folder it did not claim is refused, not removed.
+    let staged = folder.join(STAGED);
+    if staged.exists() {
+        let claimed = std::fs::read_to_string(&staged)?;
+        let bases = std::iter::once(folder.to_path_buf()).chain(claimed.lines().map(PathBuf::from));
+        for base in bases {
+            let staging = base.join(STAGING);
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging)?;
+            }
         }
-        std::fs::create_dir_all(staging.join(lsm6::file::TABLES_FOLDER))?;
+    }
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        if base.join(STAGING).exists() {
+            return Err(Error::Unsupported(
+                "a folder named like the staging folder that the conversion did not create",
+            ));
+        }
+    }
+    let mut claim = String::new();
+    for site in &sites {
+        let site = resolved(site);
+        let site = site.to_str().ok_or(Error::Unsupported(
+            "a level route folder whose path is not UTF-8",
+        ))?;
+        claim += &format!("{site}\n");
+    }
+    write_marker(&staged, &claim)?;
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        std::fs::create_dir_all(base.join(STAGING).join(lsm6::file::TABLES_FOLDER))?;
     }
     let staging = folder.join(STAGING);
     let source_tables =
@@ -1535,6 +1566,12 @@ fn switch(
     if folder.join(GUARD).exists() {
         step()?;
         std::fs::remove_file(folder.join(GUARD))?;
+        sync_dir(folder)?;
+    }
+    // Every staging folder it claimed is gone.
+    if folder.join(STAGED).exists() {
+        step()?;
+        std::fs::remove_file(folder.join(STAGED))?;
         sync_dir(folder)?;
     }
     if ready.exists() {
