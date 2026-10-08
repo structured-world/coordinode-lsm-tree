@@ -1053,6 +1053,9 @@ impl Block {
             data_length: 0,                         // set by the seal
             uncompressed_length,
         };
+        // No layout here: the payload was not compressed by this call. The
+        // writer that carries it reads its inner-block layout back from the
+        // frame and registers that with the block.
         Self::seal(header, payload, None, Vec::new(), &identity, transform)
     }
 
