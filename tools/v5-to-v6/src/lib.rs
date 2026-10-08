@@ -47,6 +47,9 @@ pub struct Report {
     pub source_bytes: u64,
     /// Bytes the converted store's files take.
     pub converted_bytes: u64,
+    /// Field ids an ingested column batch used that 6.0 keeps for itself, each
+    /// with the id the converted store holds that field under instead.
+    pub renumbered_fields: Vec<(u16, u16)>,
     /// Whether this run finished the switch of an earlier interrupted run
     /// rather than converting; the counts are then zero.
     pub resumed: bool,
@@ -289,6 +292,15 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     let restrictions: std::collections::HashMap<u64, lsm5::UserKey> =
         state.restrictions.iter().cloned().collect();
 
+    let renumbering = field_renumbering(folder, &state, &context, &restrictions)?;
+    report.renumbered_fields.clone_from(&renumbering);
+    let target = Target {
+        fs: v6_fs.clone(),
+        encryption: v6_encryption.clone(),
+        dictionaries: &dictionaries,
+        renumbering: &renumbering,
+    };
+
     let mut expected = Vec::new();
     let mut levels = Vec::with_capacity(state.levels.len());
     for (level_idx, level) in state.levels.iter().enumerate() {
@@ -321,10 +333,8 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
                     &export,
                     staging_tables.join(record.id.to_string()),
                     recency,
-                    v6_fs.clone(),
-                    v6_encryption.clone(),
-                    &dictionaries,
                     restrictions.get(&record.id),
+                    &target,
                 )?;
                 report.tables += 1;
                 report.data_blocks += converted.data_blocks;
@@ -392,6 +402,18 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     Ok(report)
 }
 
+/// What every converted table is written with, the same for the whole store.
+struct Target<'a> {
+    /// The 6.0 filesystem the tables are written through.
+    fs: Arc<dyn lsm6::fs::Fs>,
+    /// Encryption at rest, as the store is opened with.
+    encryption: Option<Arc<dyn lsm6::EncryptionProvider>>,
+    /// The compression dictionaries the converted store keeps.
+    dictionaries: &'a lsm6::ZstdDictionaries,
+    /// See [`field_renumbering`].
+    renumbering: &'a [(u16, u16)],
+}
+
 /// Writes one table through the 6.0 import from what its 5.x export reads:
 /// each data block's verified, still compressed payload with its rows, and
 /// the table's range tombstones, under the properties the source recorded.
@@ -399,11 +421,16 @@ fn convert_table(
     export: &lsm5::export::TableExport,
     path: PathBuf,
     recency: u64,
-    fs: Arc<dyn lsm6::fs::Fs>,
-    encryption: Option<Arc<dyn lsm6::EncryptionProvider>>,
-    dictionaries: &lsm6::ZstdDictionaries,
     restriction: Option<&lsm5::UserKey>,
+    target: &Target<'_>,
 ) -> Result<Converted, Error> {
+    let Target {
+        fs,
+        encryption,
+        dictionaries,
+        renumbering,
+    } = target;
+    let (fs, encryption) = (fs.clone(), encryption.clone());
     // A table a tight-space compaction restricted holds nothing below its
     // live offset: those blocks were reclaimed. The ones from it on are
     // carried, and the manifest keeps the restriction, which hides the keys
@@ -544,7 +571,7 @@ fn convert_table(
             if split_fields {
                 // The batch's field columns and seqnos, as the source stored
                 // them.
-                table.append_column_batch(&column_batch(batch), &deleted)?;
+                table.append_column_batch(&column_batch(batch, renumbering), &deleted)?;
             } else {
                 // The 6.0 columnar layout is not the 5.x one: the rows,
                 // deleted ones included, are encoded again in it, and the
@@ -670,7 +697,8 @@ struct Converted {
 /// fields. Rows, written or ingested, store each value whole in the one value
 /// column the row path names (`COL_VALUE`, variable-width); any other shape
 /// carries the fields an ingested batch gave. A batch that ingested exactly
-/// that one column reads back the same either way.
+/// that one column reads back the same either way. These are the only two
+/// layouts 5.x has: rows written as cells, the third 6.0 layout, came after.
 fn splits_fields(batch: &lsm5::table::columnar::ColumnBatch) -> bool {
     let values = batch.columns.get(3..).unwrap_or_default();
     !matches!(
@@ -680,29 +708,86 @@ fn splits_fields(batch: &lsm5::table::columnar::ColumnBatch) -> bool {
     )
 }
 
-/// A 5.x column batch as the 6.0 crate holds it: the same columns, ids,
-/// validity and bytes, and the same types but the seqno column's, which 5.x
-/// stores as opaque 8-byte values and 6.0 as the little-endian `u64` they are.
-fn column_batch(v5: lsm5::table::columnar::ColumnBatch) -> lsm6::table::columnar::ColumnBatch {
-    use lsm5::table::columnar::{COL_SEQNO, TypeTag as V5};
+/// A 5.x column batch as the 6.0 crate holds it: the same columns, validity
+/// and bytes. The seqno column, which 5.x stores as opaque 8-byte values, is
+/// typed as the little-endian `u64` it is, and a field id 6.0 keeps for
+/// itself takes the id `renumbering` gives it.
+fn column_batch(
+    v5: lsm5::table::columnar::ColumnBatch,
+    renumbering: &[(u16, u16)],
+) -> lsm6::table::columnar::ColumnBatch {
+    use lsm5::table::columnar::TypeTag as V5;
     use lsm6::table::columnar::{Number, TypeTag as V6};
     lsm6::table::columnar::ColumnBatch {
         row_count: v5.row_count,
         columns: v5
             .columns
             .into_iter()
-            .map(|column| lsm6::table::columnar::Column {
-                column_id: column.column_id,
-                type_tag: match column.type_tag {
-                    V5::Fixed(8) if column.column_id == COL_SEQNO => V6::Number(Number::U64_LE),
-                    V5::Fixed(width) => V6::Fixed(width),
-                    V5::Bytes => V6::Bytes,
-                },
-                validity: column.validity,
-                data: lsm6::Slice::from(&*column.data),
+            .enumerate()
+            .map(|(index, column)| {
+                // The intrinsic columns come first: key, seqno, value type.
+                let field = index >= 3;
+                lsm6::table::columnar::Column {
+                    column_id: renumbering
+                        .iter()
+                        .find(|(from, _)| field && *from == column.column_id)
+                        .map_or(column.column_id, |(_, to)| *to),
+                    type_tag: match column.type_tag {
+                        V5::Fixed(8) if index == 1 => V6::Number(Number::U64_LE),
+                        V5::Fixed(width) => V6::Fixed(width),
+                        V5::Bytes => V6::Bytes,
+                    },
+                    validity: column.validity,
+                    data: lsm6::Slice::from(&*column.data),
+                }
             })
             .collect(),
     }
+}
+
+/// The ids 6.0 keeps for itself that an ingested batch of the store uses as
+/// a field id, each with the id the converted store holds that field under:
+/// the highest ones no field of the store uses, taken once for the whole
+/// store so a field keeps one id across its tables.
+fn field_renumbering(
+    folder: &Path,
+    state: &lsm5::export::ManifestState,
+    context: &lsm5::export::TableContext,
+    restrictions: &std::collections::HashMap<u64, lsm5::UserKey>,
+) -> Result<Vec<(u16, u16)>, Error> {
+    let mut used = std::collections::BTreeSet::new();
+    for record in state.levels.iter().flatten().flatten() {
+        let export = lsm5::export::TableExport::open(
+            &folder
+                .join(lsm5::file::TABLES_FOLDER)
+                .join(record.id.to_string()),
+            record,
+            restrictions.get(&record.id),
+            context,
+        )?;
+        if !export.is_columnar() {
+            continue;
+        }
+        let live_from = export.live_from()?;
+        for block in export.data_blocks()? {
+            if block.offset < live_from {
+                continue;
+            }
+            let batch = export.columnar_batch(&block)?;
+            if splits_fields(&batch) {
+                used.extend(batch.columns.iter().skip(3).map(|c| c.column_id));
+            }
+        }
+    }
+    let reserved = lsm6::blob_tree::field_row::RESERVED_COLUMNS;
+    let mut free = (0..reserved).rev().filter(|id| !used.contains(id));
+    used.range(reserved..)
+        .map(|&from| {
+            free.next().map(|to| (from, to)).ok_or(Error::Unsupported(
+                "an ingested batch whose field ids leave none free",
+            ))
+        })
+        .collect()
 }
 
 /// A 5.x solution as the 6.0 import takes it: the same parameters, seed and

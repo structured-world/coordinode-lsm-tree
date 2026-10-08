@@ -68,6 +68,9 @@ fn main() -> std::process::ExitCode {
                 report.converted_bytes,
                 report.source_bytes,
             );
+            for (from, to) in &report.renumbered_fields {
+                println!("field {from} is a column id 6.0 keeps for itself: it is now field {to}");
+            }
             println!(
                 "the source is kept in {}",
                 args.store.join(v5_to_v6::BACKUP).display()

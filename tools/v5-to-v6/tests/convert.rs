@@ -366,14 +366,21 @@ fn a_converted_store_carries_data_its_parity_repaired() -> Result<(), Box<dyn st
     let open = OpenWith::default();
     let expected = read_v5(folder.path(), 300, &open)?;
 
-    let tables = source_tables(folder.path())?;
-    let table = tables.first().ok_or("the fixture holds a table")?;
-    let block = table
-        .data_blocks()?
-        .into_iter()
-        .nth(1)
-        .ok_or("the table holds several data blocks")?;
-    let path = folder.path().join("tables").join(table.id().to_string());
+    // The exports hold the table files open, and Windows refuses to move a
+    // folder holding an open file: they are closed before the conversion.
+    let (path, block) = {
+        let tables = source_tables(folder.path())?;
+        let table = tables.first().ok_or("the fixture holds a table")?;
+        let block = table
+            .data_blocks()?
+            .into_iter()
+            .nth(1)
+            .ok_or("the table holds several data blocks")?;
+        (
+            folder.path().join("tables").join(table.id().to_string()),
+            block,
+        )
+    };
     let mut bytes = std::fs::read(&path)?;
     let at = usize::try_from(block.offset + u64::from(block.size) / 4)?;
     bytes[at] ^= 0x10;
@@ -900,21 +907,22 @@ fn scan_v6(folder: &Path, fields: &[u16]) -> lsm6::Result<Vec<Vec<ScannedColumn>
         .collect()
 }
 
-/// A columnar batch ingested with its value split into fields keeps them:
-/// the converted table stores the same field columns, which a projected scan
-/// reads as the source's did, and every row reads back the same value.
-#[test]
-fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+/// Ingests into a 5.x store at `folder` one columnar batch of `rows` rows whose
+/// value is split into two fields under `ids`: a fixed-width number and a
+/// name per row.
+fn ingest_field_batch(
+    folder: &Path,
+    rows: u32,
+    ids: [u16; 2],
+) -> Result<(), Box<dyn std::error::Error>> {
     use lsm5::table::columnar::{Column, TypeTag, entries_to_column_batch};
-    let rows = 50u32;
-    let folder = tempfile::tempdir()?;
+    let tree = lsm5::Config::new(
+        folder,
+        lsm5::SequenceNumberCounter::default(),
+        lsm5::SequenceNumberCounter::default(),
+    )
+    .open()?;
     {
-        let tree = lsm5::Config::new(
-            folder.path(),
-            lsm5::SequenceNumberCounter::default(),
-            lsm5::SequenceNumberCounter::default(),
-        )
-        .open()?;
         let lsm5::AnyTree::Standard(standard) = &tree else {
             return Err("a standard tree was opened".into());
         };
@@ -945,13 +953,13 @@ fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn st
             bytes.extend(name.as_bytes());
         }
         batch.columns.push(Column {
-            column_id: 10,
+            column_id: ids[0],
             type_tag: TypeTag::Fixed(4),
             validity: None,
             data: fixed.into(),
         });
         batch.columns.push(Column {
-            column_id: 11,
+            column_id: ids[1],
             type_tag: TypeTag::Bytes,
             validity: None,
             data: bytes.into(),
@@ -960,6 +968,17 @@ fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn st
         ingestion.write_columnar_batch(&batch)?;
         ingestion.finish()?;
     }
+    Ok(())
+}
+
+/// A columnar batch ingested with its value split into fields keeps them:
+/// the converted table stores the same field columns, which a projected scan
+/// reads as the source's did, and every row reads back the same value.
+#[test]
+fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = 50u32;
+    let folder = tempfile::tempdir()?;
+    ingest_field_batch(folder.path(), rows, [10, 11])?;
     let open = OpenWith::default();
     let expected_reads = read_v5(folder.path(), rows, &open)?;
     let expected_scan = scan_v5(folder.path(), &[10, 11])?;
@@ -971,6 +990,41 @@ fn a_converted_ingested_column_batch_keeps_its_fields() -> Result<(), Box<dyn st
     v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
     assert_eq!(read_v6(folder.path(), rows, &open)?, expected_reads);
     assert_eq!(scan_v6(folder.path(), &[10, 11])?, expected_scan);
+    Ok(())
+}
+
+/// A field id 6.0 keeps for itself is renumbered, once for the store, to an id
+/// no field uses: the field reads back under its new id with the bytes it had,
+/// every row reads back the same value, and the report names the change.
+#[test]
+fn a_field_id_6_0_keeps_for_itself_is_renumbered() -> Result<(), Box<dyn std::error::Error>> {
+    let rows = 50u32;
+    let folder = tempfile::tempdir()?;
+    ingest_field_batch(folder.path(), rows, [10, u16::MAX])?;
+    let open = OpenWith::default();
+    let expected_reads = read_v5(folder.path(), rows, &open)?;
+    let expected_scan = scan_v5(folder.path(), &[10, u16::MAX])?;
+
+    let report = v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+    let [(from, to)] = report.renumbered_fields.as_slice() else {
+        return Err(format!("one field renumbered, got {:?}", report.renumbered_fields).into());
+    };
+    assert_eq!(*from, u16::MAX);
+    assert!(
+        *to < lsm6::blob_tree::field_row::RESERVED_COLUMNS && *to != 10,
+        "the new id is free and not reserved"
+    );
+    assert_eq!(read_v6(folder.path(), rows, &open)?, expected_reads);
+    let renamed: Vec<Vec<_>> = expected_scan
+        .into_iter()
+        .map(|batch| {
+            batch
+                .into_iter()
+                .map(|(id, bytes)| (if id == u16::MAX { *to } else { id }, bytes))
+                .collect()
+        })
+        .collect();
+    assert_eq!(scan_v6(folder.path(), &[10, *to])?, renamed);
     Ok(())
 }
 
