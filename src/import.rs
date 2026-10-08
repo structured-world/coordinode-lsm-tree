@@ -561,6 +561,9 @@ impl TableImport {
             self.writer.link_blob_file(link);
         }
         self.writer.own_blob_objects(self.owned_cells);
+        // A source holding only range tombstones carries the entry its writer
+        // synthesized for them, which counts as no KV.
+        self.writer.exclude_carried_sentinel();
         if let Some((start, end)) = self.key_range.take() {
             self.writer.cover_key_range(start, end);
         }
@@ -579,14 +582,38 @@ impl TableImport {
 pub struct BlobFileImport {
     writer: crate::vlog::blob_file::writer::Writer,
     fs: Arc<dyn Fs>,
-    live_from: u64,
+    restriction: Option<BlobFileRestriction>,
+}
+
+/// A source blob file whose values below a frontier were reclaimed.
+///
+/// The imported file is restricted the same way: its first live value's
+/// offset, and what the source's metadata counts over the whole file as
+/// written. The garbage a file is charged with includes its reclaimed values,
+/// so it is measured against these totals and not against the values the
+/// import carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlobFileRestriction {
+    /// The offset of the first live value.
+    pub live_from: u64,
+    /// Values the source file was written with.
+    pub item_count: u64,
+    /// Their bytes as stored.
+    pub compressed_bytes: u64,
+    /// Their bytes once decompressed.
+    pub uncompressed_bytes: u64,
+    /// The first key the source file was written with.
+    pub first_key: crate::UserKey,
+    /// The last key the source file was written with.
+    pub last_key: crate::UserKey,
 }
 
 impl BlobFileImport {
     /// Starts blob file `id` at `path`, holding values compressed with
     /// `compression` and recording `created_at` as its age. A source whose
-    /// values below `live_from` were reclaimed gets the same frontier: its
-    /// first value lands there, and the file is restricted to what follows.
+    /// values below a frontier were reclaimed gets the same `restriction`: its
+    /// first value lands at the frontier, the file is restricted to what
+    /// follows, and its metadata records the source's totals.
     ///
     /// # Errors
     ///
@@ -597,7 +624,7 @@ impl BlobFileImport {
         fs: Arc<dyn Fs>,
         compression: CompressionType,
         created_at: u128,
-        live_from: u64,
+        restriction: Option<BlobFileRestriction>,
     ) -> crate::Result<Self> {
         let mut writer = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs)?;
         // The values arrive compressed: the writer stores them as they are and
@@ -606,11 +633,11 @@ impl BlobFileImport {
         writer.created_at = Some(created_at);
         // The previous format records no lifetime class: every value it holds
         // is of class 0, the writer's own.
-        writer.write_filler(live_from)?;
+        writer.write_filler(restriction.as_ref().map_or(0, |r| r.live_from))?;
         Ok(Self {
             writer,
             fs,
-            live_from,
+            restriction,
         })
     }
 
@@ -644,27 +671,44 @@ impl BlobFileImport {
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidHeader`] for a file that received no
-    /// value, and any error writing its metadata or hashing its suffix.
-    pub fn finish(self) -> crate::Result<Checksum> {
+    /// value, or for a restricted one that received more than its source's
+    /// totals count, and any error writing its metadata or hashing its suffix.
+    pub fn finish(mut self) -> crate::Result<Checksum> {
         if self.writer.item_count == 0 {
             return Err(crate::Error::InvalidHeader(
                 "imported blob file holds no values",
             ));
         }
+        let live_from = match self.restriction.take() {
+            None => 0,
+            Some(source) => {
+                // The live suffix is part of what the source counted.
+                if self.writer.item_count > source.item_count
+                    || self.writer.written_blob_bytes > source.compressed_bytes
+                    || self.writer.uncompressed_bytes > source.uncompressed_bytes
+                {
+                    return Err(crate::Error::InvalidHeader("imported blob file totals"));
+                }
+                self.writer.item_count = source.item_count;
+                self.writer.written_blob_bytes = source.compressed_bytes;
+                self.writer.uncompressed_bytes = source.uncompressed_bytes;
+                self.writer.first_key = Some(source.first_key);
+                self.writer.last_key = Some(source.last_key);
+                source.live_from
+            }
+        };
         let path = self.writer.path.clone();
         let (_, checksum) = self.writer.finish()?;
-        let checksum = if self.live_from == 0 {
+        let checksum = if live_from == 0 {
             checksum
         } else {
             // The digest every reader of a restricted entry checks; taken
             // before the punch, which leaves the suffix as it is.
             let suffix = Checksum::from_raw(crate::repair::compute_table_checksum_from(
-                &*self.fs,
-                &path,
-                self.live_from,
+                &*self.fs, &path, live_from,
             )?);
             if self.fs.capabilities(&path).punch_hole {
-                self.fs.punch_hole(&path, 0, self.live_from)?;
+                self.fs.punch_hole(&path, 0, live_from)?;
             }
             suffix
         };
@@ -781,6 +825,11 @@ pub struct RecordedTable {
     pub blob_links: Vec<BlobLink>,
     /// The first key it serves when a tight-space compaction restricted it.
     pub restriction: Option<UserKey>,
+    /// The lowest and highest local seqno over its entries and range
+    /// tombstones.
+    pub seqnos: (SeqNo, SeqNo),
+    /// The highest local seqno over its entries alone.
+    pub highest_kv_seqno: SeqNo,
 }
 
 /// What a table's entries hold of one blob file.
@@ -810,6 +859,7 @@ impl RecordedTable {
             })
             .collect();
         blob_links.sort_unstable_by_key(|link| link.blob_file_id);
+        let (seqnos, highest_kv_seqno) = table.local_seqno_bounds();
         Ok(Self {
             id: table.id(),
             columnar: meta.columnar,
@@ -829,12 +879,15 @@ impl RecordedTable {
             },
             blob_links,
             restriction: table.restrict_lower_bound().cloned(),
+            seqnos,
+            highest_kv_seqno,
         })
     }
 }
 
 /// Writes the manifest of the tree in `folder` from `image`, whose tables are
-/// already written to the tables folder, and points `CURRENT` at it.
+/// already written, each level's to the folder `tables_folder` names for it,
+/// and points `CURRENT` at it.
 ///
 /// Every table is opened the way an open opens it before the manifest is
 /// written, so a manifest is never written over a table that does not read.
@@ -845,18 +898,23 @@ impl RecordedTable {
 /// Returns any error opening a table or writing the manifest.
 pub fn install_manifest(
     folder: &Path,
+    tables_folder: &dyn Fn(usize) -> PathBuf,
     image: &ManifestImage,
     fs: &Arc<dyn Fs>,
     comparator: &SharedComparator,
     encryption: Option<Arc<dyn EncryptionProvider>>,
     #[cfg(zstd_any)] dictionaries: &crate::compression::ZstdDictionaries,
 ) -> crate::Result<Vec<RecordedTable>> {
-    let tables_folder = folder.join(crate::file::TABLES_FOLDER);
     let cache = Arc::new(crate::cache::Cache::with_capacity_bytes(0));
     let mut tables = Vec::new();
-    for placement in image.levels.iter().flatten().flatten() {
+    let placements = image.levels.iter().enumerate().flat_map(|(level, runs)| {
+        runs.iter()
+            .flatten()
+            .map(move |placement| (level, placement))
+    });
+    for (level, placement) in placements {
         let mut params = crate::table::RecoverParams::new(
-            tables_folder.join(placement.id.to_string()),
+            tables_folder(level).join(placement.id.to_string()),
             placement.checksum,
             placement.id,
             fs.clone(),

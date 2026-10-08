@@ -688,6 +688,42 @@ fn a_converted_store_with_a_restricted_blob_file_answers_as_the_source_did()
     Ok(())
 }
 
+/// A restricted blob file keeps the totals its source counted over the whole
+/// file, the reclaimed prefix included, which its garbage statistics are
+/// charged against: it is exactly as stale as the source. The fixture's
+/// files are about half stale, so under a 0.9 threshold none is relocated,
+/// and a merge that drops no version leaves every charge where it was.
+#[test]
+fn a_converted_restricted_blob_file_is_as_stale_as_its_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    use lsm6::AbstractTree as _;
+    let keys = 2_000;
+    let folder = tempfile::tempdir()?;
+    write_restricted_blob_store(folder.path(), keys)?;
+    v5_to_v6::convert(folder.path(), &v5_to_v6::Options::default())?;
+
+    let tree = lsm6::Config::new(
+        folder.path(),
+        lsm6::SequenceNumberCounter::default(),
+        lsm6::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        lsm6::KvSeparationOptions::default()
+            .age_cutoff(1.0)
+            .staleness_threshold(0.9),
+    ))
+    .open()?;
+    let stale = tree.stale_blob_bytes();
+    assert!(stale > 0, "the converted store carries its garbage charges");
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert_eq!(
+        tree.stale_blob_bytes(),
+        stale,
+        "no blob file under the threshold is relocated"
+    );
+    Ok(())
+}
+
 /// A table a tight-space compaction restricted: its live blocks are carried,
 /// the reclaimed ones are not read, and the restriction keeps hiding the keys
 /// below its bound that the first carried block still holds.

@@ -23,6 +23,55 @@ pub struct Options {
     /// Compression dictionaries the store was opened with but does not keep in
     /// its dictionary folder, as raw bytes. The converted store keeps them.
     pub dictionaries: Vec<Vec<u8>>,
+    /// The level routes the store was opened with: the folders that hold some
+    /// levels' tables, which the store does not record. The converted tables
+    /// stay in them, so the converted store opens with the same routes.
+    pub level_routes: Vec<LevelRoute>,
+}
+
+/// Levels whose tables a tree keeps in another folder's `tables`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelRoute {
+    /// The levels the route covers.
+    pub levels: std::ops::Range<u8>,
+    /// The folder whose `tables` holds them.
+    pub path: PathBuf,
+}
+
+/// The folder whose `tables` holds level `level`'s tables: a route's, or the
+/// store's own.
+fn level_base<'a>(folder: &'a Path, routes: &'a [LevelRoute], level: usize) -> &'a Path {
+    u8::try_from(level)
+        .ok()
+        .and_then(|level| routes.iter().find(|route| route.levels.contains(&level)))
+        .map_or(folder, |route| &route.path)
+}
+
+/// The route folders other than the store's own, each once: each holds only
+/// its `tables`, which the switch sets aside and replaces there, on its own
+/// volume.
+fn route_sites<'a>(folder: &Path, routes: &'a [LevelRoute]) -> Vec<&'a Path> {
+    let mut sites: Vec<&Path> = Vec::new();
+    for route in routes {
+        if route.path != folder && !sites.contains(&route.path.as_path()) {
+            sites.push(&route.path);
+        }
+    }
+    sites
+}
+
+/// Refuses routes a tree refuses: an empty range, or two that overlap.
+fn check_routes(routes: &[LevelRoute]) -> Result<(), Error> {
+    let overlap = routes.iter().enumerate().any(|(i, a)| {
+        routes
+            .iter()
+            .skip(i + 1)
+            .any(|b| a.levels.start < b.levels.end && b.levels.start < a.levels.end)
+    });
+    if routes.iter().any(|r| r.levels.is_empty()) || overlap {
+        return Err(Error::Unsupported("empty or overlapping level routes"));
+    }
+    Ok(())
 }
 
 /// One key, as the 5.x and the 6.0 crate each take it.
@@ -141,18 +190,20 @@ const SWAPPING: &str = "v6-convert.swapping";
 /// the source is left untouched until the converted store has been built and
 /// read back.
 pub fn convert(folder: &Path, options: &Options) -> Result<Report, Error> {
+    check_routes(&options.level_routes)?;
+    let sites = route_sites(folder, &options.level_routes);
     // Held to the end: a tree open on the store, or another conversion, would
     // change what this one read or move files from under it.
     let _lock = lock_store(folder)?;
     if folder.join(READY).exists() || folder.join(SWAPPING).exists() {
-        switch(folder, &mut || Ok(()))?;
+        switch(folder, &sites, &mut || Ok(()))?;
         return Ok(Report {
             resumed: true,
             ..Report::default()
         });
     }
     let report = prepare(folder, options)?;
-    switch(folder, &mut || Ok(()))?;
+    switch(folder, &sites, &mut || Ok(()))?;
     Ok(report)
 }
 
@@ -186,11 +237,15 @@ fn lock_store(folder: &Path) -> Result<Box<dyn lsm5::fs::FsFile>, Error> {
 /// Builds the converted store in the staging folder and verifies it, leaving
 /// the source untouched.
 fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
-    let backup = folder.join(BACKUP);
-    if backup.exists() && std::fs::read_dir(&backup)?.next().is_some() {
-        return Err(Error::Unsupported(
-            "a store that holds the backup of an earlier conversion",
-        ));
+    let routes = &options.level_routes;
+    let sites = route_sites(folder, routes);
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        let backup = base.join(BACKUP);
+        if backup.exists() && std::fs::read_dir(&backup)?.next().is_some() {
+            return Err(Error::Unsupported(
+                "a store that holds the backup of an earlier conversion",
+            ));
+        }
     }
     let v5_fs: Arc<dyn lsm5::fs::Fs> = Arc::new(lsm5::fs::StdFs);
     let v6_fs: Arc<dyn lsm6::fs::Fs> = Arc::new(lsm6::fs::StdFs);
@@ -221,12 +276,23 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     )?;
 
     let mut report = Report::default();
-    let staging = folder.join(STAGING);
-    if staging.exists() {
-        std::fs::remove_dir_all(&staging)?;
+    // Each level's tables are built beside its source tables, on their
+    // volume, so the switch moves them by rename.
+    for base in std::iter::once(folder).chain(sites.iter().copied()) {
+        let staging = base.join(STAGING);
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(staging.join(lsm6::file::TABLES_FOLDER))?;
     }
-    let staging_tables = staging.join(lsm6::file::TABLES_FOLDER);
-    std::fs::create_dir_all(&staging_tables)?;
+    let staging = folder.join(STAGING);
+    let source_tables =
+        |level: usize| level_base(folder, routes, level).join(lsm5::file::TABLES_FOLDER);
+    let staging_tables = |level: usize| {
+        level_base(folder, routes, level)
+            .join(STAGING)
+            .join(lsm6::file::TABLES_FOLDER)
+    };
 
     // Every dictionary goes to the converted store's folder, so the tables
     // and blob files compressed against one still resolve it after a reopen.
@@ -292,7 +358,7 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     let restrictions: std::collections::HashMap<u64, lsm5::UserKey> =
         state.restrictions.iter().cloned().collect();
 
-    let renumbering = field_renumbering(folder, &state, &context, &restrictions)?;
+    let renumbering = field_renumbering(&source_tables, &state, &context, &restrictions)?;
     report.renumbered_fields.clone_from(&renumbering);
     let target = Target {
         fs: v6_fs.clone(),
@@ -322,16 +388,14 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
             for record in run {
                 let recency = recency_of(record.id)?;
                 let export = lsm5::export::TableExport::open(
-                    &folder
-                        .join(lsm5::file::TABLES_FOLDER)
-                        .join(record.id.to_string()),
+                    &source_tables(level_idx).join(record.id.to_string()),
                     record,
                     restrictions.get(&record.id),
                     &context,
                 )?;
                 let converted = convert_table(
                     &export,
-                    staging_tables.join(record.id.to_string()),
+                    staging_tables(level_idx).join(record.id.to_string()),
                     recency,
                     restrictions.get(&record.id),
                     &target,
@@ -367,6 +431,7 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
     };
     let recorded = lsm6::import::install_manifest(
         &staging,
+        &staging_tables,
         &image,
         &v6_fs,
         &(Arc::new(lsm6::DefaultUserComparator) as lsm6::SharedComparator),
@@ -399,6 +464,13 @@ fn prepare(folder: &Path, options: &Options) -> Result<Report, Error> {
         .map(|name| bytes_under(&folder.join(name)))
         .sum::<std::io::Result<u64>>()?;
     report.converted_bytes = bytes_under(&staging)?;
+    for site in &sites {
+        let tables = site.join(lsm5::file::TABLES_FOLDER);
+        if tables.exists() {
+            report.source_bytes += bytes_under(&tables)?;
+        }
+        report.converted_bytes += bytes_under(&site.join(STAGING))?;
+    }
     Ok(report)
 }
 
@@ -507,6 +579,8 @@ fn convert_table(
             links
         },
         restriction: restriction.map(|key| lsm6::UserKey::from(&**key)),
+        seqnos: properties.seqnos,
+        highest_kv_seqno: properties.highest_kv_seqno,
     };
     let blocks: Vec<_> = export
         .data_blocks()?
@@ -614,8 +688,8 @@ fn convert_table(
 
 /// Whether `recorded`, what a converted table reads back as, is what its
 /// source recorded in `expected`. A restricted source lists its blob links
-/// over every row it ever held, the reclaimed ones included, so the
-/// converted table's links, derived from the rows it holds, need only fit
+/// and seqno bounds over every row it ever held, the reclaimed ones included,
+/// so the converted table's, derived from the rows it holds, need only fit
 /// inside them.
 fn records_match(
     expected: &lsm6::import::RecordedTable,
@@ -633,14 +707,16 @@ fn records_match(
                 && link.on_disk_bytes <= source.on_disk_bytes
         })
     });
-    let rest_equal = lsm6::import::RecordedTable {
+    let seqnos_fit = expected.seqnos.0 <= recorded.seqnos.0
+        && recorded.seqnos.1 <= expected.seqnos.1
+        && recorded.highest_kv_seqno <= expected.highest_kv_seqno;
+    let without_derived = |table: &lsm6::import::RecordedTable| lsm6::import::RecordedTable {
         blob_links: Vec::new(),
-        ..expected.clone()
-    } == lsm6::import::RecordedTable {
-        blob_links: Vec::new(),
-        ..recorded.clone()
+        seqnos: (0, 0),
+        highest_kv_seqno: 0,
+        ..table.clone()
     };
-    links_fit && rest_equal
+    links_fit && seqnos_fit && without_derived(expected) == without_derived(recorded)
 }
 
 /// Writes one blob file through the 6.0 import from the frames its 5.x export
@@ -661,13 +737,26 @@ fn convert_blob_file(
     if frames.is_empty() {
         return Ok(None);
     }
+    // A restricted file is charged its garbage, the reclaimed values
+    // included, against the totals its source counted: it keeps them.
+    let restriction = (live_from > 0).then(|| {
+        let totals = export.totals();
+        lsm6::import::BlobFileRestriction {
+            live_from,
+            item_count: totals.item_count,
+            compressed_bytes: totals.compressed_bytes,
+            uncompressed_bytes: totals.uncompressed_bytes,
+            first_key: lsm6::UserKey::from(&*totals.first_key),
+            last_key: lsm6::UserKey::from(&*totals.last_key),
+        }
+    });
     let mut file = lsm6::import::BlobFileImport::create(
         path,
         record.id,
         v6_fs.clone(),
         compression(export.compression())?,
         export.created_at(),
-        live_from,
+        restriction,
     )?;
     for frame in frames {
         file.append(
@@ -750,17 +839,20 @@ fn column_batch(
 /// the highest ones no field of the store uses, taken once for the whole
 /// store so a field keeps one id across its tables.
 fn field_renumbering(
-    folder: &Path,
+    source_tables: &dyn Fn(usize) -> PathBuf,
     state: &lsm5::export::ManifestState,
     context: &lsm5::export::TableContext,
     restrictions: &std::collections::HashMap<u64, lsm5::UserKey>,
 ) -> Result<Vec<(u16, u16)>, Error> {
     let mut used = std::collections::BTreeSet::new();
-    for record in state.levels.iter().flatten().flatten() {
+    let records = state
+        .levels
+        .iter()
+        .enumerate()
+        .flat_map(|(level, runs)| runs.iter().flatten().map(move |record| (level, record)));
+    for (level, record) in records {
         let export = lsm5::export::TableExport::open(
-            &folder
-                .join(lsm5::file::TABLES_FOLDER)
-                .join(record.id.to_string()),
+            &source_tables(level).join(record.id.to_string()),
             record,
             restrictions.get(&record.id),
             context,
@@ -779,9 +871,18 @@ fn field_renumbering(
             }
         }
     }
-    let reserved = lsm6::blob_tree::field_row::RESERVED_COLUMNS;
-    let mut free = (0..reserved).rev().filter(|id| !used.contains(id));
-    used.range(reserved..)
+    renumber_into_free(&used)
+}
+
+/// Gives each of the `used` field ids that 6.0 keeps for itself the highest
+/// field id none of `used` takes. The ids below the first field column are
+/// the intrinsic key, seqno and value-type columns, never a field's.
+fn renumber_into_free(used: &std::collections::BTreeSet<u16>) -> Result<Vec<(u16, u16)>, Error> {
+    use lsm6::blob_tree::field_row::{FIRST_FIELD_COLUMN, RESERVED_COLUMNS};
+    let mut free = (FIRST_FIELD_COLUMN..RESERVED_COLUMNS)
+        .rev()
+        .filter(|id| !used.contains(id));
+    used.range(RESERVED_COLUMNS..)
         .map(|&from| {
             free.next().map(|to| (from, to)).ok_or(Error::Unsupported(
                 "an ingested batch whose field ids leave none free",
@@ -940,17 +1041,29 @@ fn write_marker(path: &Path, contents: &str) -> std::io::Result<()> {
 ///
 /// 1. [`READY`] is written with the source's entries: the converted store is
 ///    complete, and the source is no longer what a rerun reads.
-/// 2. Each listed entry moves into the backup; one already gone was moved.
+/// 2. Each listed entry moves into the backup, and each route folder's
+///    `tables` into that folder's backup; one already gone was moved.
 /// 3. [`SWAPPING`] is written: the source is wholly set aside.
-/// 4. Each staged entry moves into the folder, the version pointer last, so
-///    the folder opens as the converted store only once all of it is there.
-/// 5. The staging folder and the markers go, [`READY`] first: with only
+/// 4. Each route folder's staged `tables` moves into it, then each staged
+///    entry into the store's folder, the version pointer last, so the store
+///    opens as the converted one only once all of it is there.
+/// 5. The staging folders and the markers go, [`READY`] first: with only
 ///    [`SWAPPING`] left, a rerun has nothing to set aside.
-fn switch(folder: &Path, step: &mut dyn FnMut() -> std::io::Result<()>) -> Result<(), Error> {
+fn switch(
+    folder: &Path,
+    sites: &[&Path],
+    step: &mut dyn FnMut() -> std::io::Result<()>,
+) -> Result<(), Error> {
     let staging = folder.join(STAGING);
     let backup = folder.join(BACKUP);
     let ready = folder.join(READY);
     let swapping = folder.join(SWAPPING);
+    let in_the_way = |path: &Path, what: &str| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is {what}", path.display()),
+        ))
+    };
 
     if !swapping.exists() {
         if !ready.exists() {
@@ -971,18 +1084,55 @@ fn switch(folder: &Path, step: &mut dyn FnMut() -> std::io::Result<()>) -> Resul
             }
             let to = backup.join(name);
             if to.exists() {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("{} is already in the backup", to.display()),
-                )));
+                return Err(in_the_way(&to, "already in the backup"));
             }
             step()?;
             std::fs::rename(&from, &to)?;
         }
         sync_dir(&backup)?;
         sync_dir(folder)?;
+        for site in sites {
+            let from = site.join(lsm5::file::TABLES_FOLDER);
+            if !from.exists() {
+                continue;
+            }
+            let site_backup = site.join(BACKUP);
+            if !site_backup.exists() {
+                step()?;
+                std::fs::create_dir(&site_backup)?;
+                sync_dir(site)?;
+            }
+            let to = site_backup.join(lsm5::file::TABLES_FOLDER);
+            if to.exists() {
+                return Err(in_the_way(&to, "already in the backup"));
+            }
+            step()?;
+            std::fs::rename(&from, &to)?;
+            sync_dir(&site_backup)?;
+            sync_dir(site)?;
+        }
         step()?;
         write_marker(&swapping, "")?;
+    }
+
+    for site in sites {
+        let site_staging = site.join(STAGING);
+        if !site_staging.exists() {
+            continue;
+        }
+        let from = site_staging.join(lsm6::file::TABLES_FOLDER);
+        if from.exists() {
+            let to = site.join(lsm6::file::TABLES_FOLDER);
+            if to.exists() {
+                return Err(in_the_way(&to, "in the way of the converted store"));
+            }
+            step()?;
+            std::fs::rename(&from, &to)?;
+            sync_dir(site)?;
+        }
+        step()?;
+        std::fs::remove_dir(&site_staging)?;
+        sync_dir(site)?;
     }
 
     if staging.exists() {
@@ -995,10 +1145,7 @@ fn switch(folder: &Path, step: &mut dyn FnMut() -> std::io::Result<()>) -> Resul
         for name in names {
             let to = folder.join(&name);
             if to.exists() {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    format!("{} is in the way of the converted store", to.display()),
-                )));
+                return Err(in_the_way(&to, "in the way of the converted store"));
             }
             step()?;
             std::fs::rename(staging.join(&name), &to)?;

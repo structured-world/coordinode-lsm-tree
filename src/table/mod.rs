@@ -10599,6 +10599,14 @@ impl Table {
         self.metadata.seqnos.1
     }
 
+    /// The local seqno bounds the meta records: the lowest and highest over
+    /// every entry and range tombstone, and the highest over the entries
+    /// alone.
+    #[cfg(feature = "std")]
+    pub(crate) fn local_seqno_bounds(&self) -> ((SeqNo, SeqNo), SeqNo) {
+        (self.metadata.seqnos, self.metadata.highest_kv_seqno)
+    }
+
     /// Returns the highest sequence number from KV entries only,
     /// excluding range tombstone seqnos.
     ///

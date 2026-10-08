@@ -19,6 +19,22 @@ struct Args {
     /// in its dictionary folder, as a file of its raw bytes. Repeatable.
     #[arg(long = "dictionary")]
     dictionaries: Vec<std::path::PathBuf>,
+
+    /// A level route the store was opened with, as `<first>..<end>=<folder>`:
+    /// the levels from `first` up to, not including, `end` keep their tables
+    /// in `<folder>/tables`. Repeatable.
+    #[arg(long = "level-route", value_parser = level_route)]
+    level_routes: Vec<v5_to_v6::LevelRoute>,
+}
+
+fn level_route(arg: &str) -> Result<v5_to_v6::LevelRoute, String> {
+    let malformed = || format!("{arg}: expected <first>..<end>=<folder>");
+    let (levels, path) = arg.split_once('=').ok_or_else(malformed)?;
+    let (first, end) = levels.split_once("..").ok_or_else(malformed)?;
+    Ok(v5_to_v6::LevelRoute {
+        levels: first.parse().map_err(|_| malformed())?..end.parse().map_err(|_| malformed())?,
+        path: path.into(),
+    })
 }
 
 fn options(args: &Args) -> Result<v5_to_v6::Options, String> {
@@ -47,6 +63,7 @@ fn options(args: &Args) -> Result<v5_to_v6::Options, String> {
     Ok(v5_to_v6::Options {
         encryption,
         dictionaries,
+        level_routes: args.level_routes.clone(),
     })
 }
 
@@ -75,6 +92,14 @@ fn main() -> std::process::ExitCode {
                 "the source is kept in {}",
                 args.store.join(v5_to_v6::BACKUP).display()
             );
+            for route in &args.level_routes {
+                println!(
+                    "the source's tables of levels {}..{} are kept in {}",
+                    route.levels.start,
+                    route.levels.end,
+                    route.path.join(v5_to_v6::BACKUP).display()
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {

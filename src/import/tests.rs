@@ -84,6 +84,7 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
     }]];
     let recorded = install_manifest(
         folder.path(),
+        &|_| tables.clone(),
         &ManifestImage {
             tree_type: TreeType::Standard,
             version_id: 0,
@@ -116,6 +117,8 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
             lineage,
             blob_links: Vec::new(),
             restriction: None,
+            seqnos: (1, 20),
+            highest_kv_seqno: 20,
         }]
     );
 

@@ -2473,6 +2473,23 @@ impl Writer {
         self
     }
 
+    /// For a table whose only entry is the weak tombstone a writer synthesizes
+    /// for one holding only range tombstones, drops it from the KV seqno bound
+    /// as [`Self::finish`] does for the one it writes itself: a covering
+    /// tombstone of the table then still lets a read skip it.
+    #[cfg(feature = "std")]
+    pub(crate) fn exclude_carried_sentinel(&mut self) {
+        let carried = self.meta.item_count == 1
+            && self.previous_type == Some(ValueType::WeakTombstone)
+            && RangeTombstone::sentinel(&self.range_tombstones).is_some_and(|(start, seqno)| {
+                self.previous_weak_tombstone_key.as_ref() == Some(start)
+                    && self.current_key_seqno == Some(seqno)
+            });
+        if carried {
+            self.meta.highest_kv_seqno = 0;
+        }
+    }
+
     /// Adds a range tombstone to be written into this table's RT block.
     pub(crate) fn write_range_tombstone(&mut self, rt: RangeTombstone) {
         self.meta.lowest_seqno = self.meta.lowest_seqno.min(rt.seqno);
