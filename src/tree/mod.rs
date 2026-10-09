@@ -4368,6 +4368,25 @@ impl Tree {
     ///
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
     /// when `0 < seqno <= floor`.
+    #[cfg(feature = "std")]
+    pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> crate::Result<SuperVersion> {
+        let current = self.latest_super_version.load();
+        current.check_serves(seqno)?;
+        Ok(SuperVersion::clone(&current))
+    }
+
+    /// Resolves the super-version serving snapshot `seqno`; see the `std`
+    /// build's twin. Without the mirror it clones out of the locked history.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
+    /// when `0 < seqno <= floor`.
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> crate::Result<SuperVersion> {
+        self.version_history.read().get_version_for_snapshot(seqno)
+    }
+
     /// Unflushed memtable bytes the memtable backpressure axis compares: the
     /// total of the shared write-buffer budget when the tree joined one, else
     /// the tree's own active and sealed memtables.
@@ -4386,25 +4405,6 @@ impl Tree {
             .read()
             .latest_version_ref()
             .unflushed_bytes()
-    }
-
-    #[cfg(feature = "std")]
-    pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> crate::Result<SuperVersion> {
-        let current = self.latest_super_version.load();
-        current.check_serves(seqno)?;
-        Ok(SuperVersion::clone(&current))
-    }
-
-    /// Resolves the super-version serving snapshot `seqno`; see the `std`
-    /// build's twin. Without the mirror it clones out of the locked history.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention)
-    /// when `0 < seqno <= floor`.
-    #[cfg(not(feature = "std"))]
-    pub(crate) fn get_version_for_snapshot(&self, seqno: SeqNo) -> crate::Result<SuperVersion> {
-        self.version_history.read().get_version_for_snapshot(seqno)
     }
 
     /// The snapshot for one point read, without a clone.

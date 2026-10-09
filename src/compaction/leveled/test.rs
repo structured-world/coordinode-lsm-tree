@@ -1252,3 +1252,59 @@ fn multi_table_runs_reach_the_trigger_and_go_to_l1() -> crate::Result<()> {
     assert!(version.iter_levels().skip(1).any(|level| !level.is_empty()));
     Ok(())
 }
+
+/// A file-count guard below the run threshold trips before the runs do, and
+/// L0 then goes down to L1: the intra-L0 merge, which would rewrite the
+/// tables into one run and clear the guard's debt without moving anything
+/// down, must not take an L0 that is already triggered.
+#[test]
+fn a_triggered_file_guard_sends_l0_down_not_into_an_intra_l0_merge() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    // Two overlapping single-table runs: below the run threshold (4) and
+    // below the old intra-L0 table bound (4), at a file guard of 2.
+    for flush in 0..2u64 {
+        tree.insert("a", "v", flush);
+        tree.insert("z", "v", flush);
+        tree.flush_active_memtable(0)?;
+    }
+    assert_eq!(tree.current_version().l0().run_count(), 2);
+
+    tree.compact(
+        Arc::new(Strategy::default().with_l0_file_threshold(2)),
+        MAX_SEQNO,
+    )?;
+
+    let version = tree.current_version();
+    assert!(version.l0().is_empty(), "the guard sent L0 down");
+    assert!(version.iter_levels().skip(1).any(|level| !level.is_empty()));
+    Ok(())
+}
+
+/// A zero threshold means nothing, so it is taken as 1: an empty L0 is not
+/// triggered and its score is finite, so no compaction runs on nothing.
+#[test]
+fn zero_l0_thresholds_do_not_trigger_an_empty_l0() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let version = tree.current_version();
+    for strategy in [
+        Strategy::default().with_l0_file_threshold(0),
+        Strategy::default().with_l0_threshold(0),
+    ] {
+        assert!(!strategy.l0_triggered(version.l0()));
+        assert!(strategy.l0_score(version.l0()).is_finite());
+        assert_eq!(strategy.pending_compaction_bytes(&version), 0);
+    }
+    Ok(())
+}

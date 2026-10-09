@@ -156,19 +156,29 @@ fn a_raised_rate_releases_a_waiting_compaction() -> lsm_tree::Result<()> {
     fill(&tree, "a", 4, 256, 1_000);
 
     let start = Instant::now();
-    std::thread::scope(|s| -> lsm_tree::Result<()> {
+    let released = std::thread::scope(|s| -> lsm_tree::Result<bool> {
         let compaction = s.spawn(|| tree.major_compact(64 * 1_024 * 1_024, u64::MAX));
         std::thread::sleep(Duration::from_millis(300));
         assert!(!compaction.is_finished(), "the low rate holds it back");
         tree.compaction_rate_limiter().set_rate(64 * 1_024 * 1_024);
+        // Bounded: a retune that never reaches the waiter must fail the test,
+        // not hold it for the quarter hour the old rate owes.
+        while !compaction.is_finished() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let released = compaction.is_finished();
+        if !released {
+            // Rate 0 turns throttling off and wakes the waiter, so the join
+            // below returns promptly before the test fails.
+            tree.compaction_rate_limiter().set_rate(0);
+        }
         compaction.join().expect("compaction")?;
-        Ok(())
+        Ok(released)
     })?;
-    let took = start.elapsed();
 
     assert!(
-        took < Duration::from_secs(10),
-        "the raised rate did not reach the waiting compaction: {took:?}",
+        released,
+        "the raised rate did not reach the waiting compaction within 10 s",
     );
     assert_eq!(tree.len(lsm_tree::MAX_SEQNO, None)?, 4 * 256);
     Ok(())
