@@ -101,6 +101,7 @@
     "columnar-scan-overlap-8": "The same rows in eight overlapping segments, merged by the scan.",
     "blobs-well-placed": "Large values stored as blobs, written in key order.",
     "blobs-scattered": "The same blobs scattered across files by strided rewrites.",
+    "metadata-only-update": "Every wide cell row rewritten with a new header field, its 4 KiB payload kept by reference: payload bytes written per row, expected zero.",
   };
 
   const data = window.BENCHMARK_DATA;

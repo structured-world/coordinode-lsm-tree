@@ -76,6 +76,52 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 16] = [
     ("cells-ref-filter", fixtures::cells_ref_filter),
 ];
 
+/// The metadata-only update rewrites every visible row and its flush writes
+/// no payload bytes, each row reading back with the new field (the pass
+/// checks that itself and panics otherwise).
+#[test]
+fn a_metadata_only_update_writes_no_payload_bytes() -> lsm_tree::Result<()> {
+    let fixture = build(fixtures::cells_wide)?;
+    let pass = super::cells_metadata_update(&fixture)?;
+    assert_eq!(pass.rows, fixture.oracle.visible());
+    assert_eq!(pass.payload_written, 0);
+    Ok(())
+}
+
+/// The other direction: the same measure over rows rewritten with their
+/// payload by value counts every payload byte again, so the zero above is
+/// what the update did, not what the measure can see.
+#[test]
+fn rewriting_the_payload_by_value_is_counted() -> lsm_tree::Result<()> {
+    use lsm_tree::blob_tree::field_row::Field;
+
+    let fixture = build(fixtures::cells_wide)?;
+    let lsm_tree::AnyTree::Blob(blob) = &fixture.tree else {
+        panic!("a cell-row fixture is a blob tree");
+    };
+    let before = blob.current_version().blob_files.on_disk_size();
+    let mut seqno = blob.get_highest_seqno().map_or(0, |s| s + 1);
+    let mut payload = 0_u64;
+    for row in &fixture.oracle.rows {
+        let Some(value) = row.expect else { continue };
+        let bytes = value.bytes();
+        payload += bytes.len() as u64;
+        blob.insert_cells(
+            row.key.clone(),
+            &[Field::bytes(fixtures::CELL_PAYLOAD, &bytes)],
+            seqno,
+        )?;
+        seqno += 1;
+    }
+    blob.flush_active_memtable(0)?;
+    let written = blob.current_version().blob_files.on_disk_size() - before;
+    assert!(
+        written >= payload,
+        "{payload} B of payload rewritten by value, {written} B of blob files written"
+    );
+    Ok(())
+}
+
 /// The cell-row scans return exactly the rows their predicate selects, and a
 /// sparse one materialises far less than one that keeps nearly every row,
 /// while every scan's payload useful bytes are those of the rows it kept.
