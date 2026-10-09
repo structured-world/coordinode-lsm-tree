@@ -325,6 +325,14 @@ impl Strategy {
     /// manifest entry and per-table metadata in memory, however few runs
     /// hold them.
     ///
+    /// Keep it above the run threshold times the tables one flush writes
+    /// (memtable size over
+    /// [`Config::table_target_size`](crate::Config::table_target_size)):
+    /// below that it fires before the run trigger, on every few flushes,
+    /// and L0 merges into L1 as often as a file-count trigger would make it.
+    /// The default, with the default run threshold of 4, leaves room for a
+    /// memtable of 125 tables of the target (about 8 GiB at 64 MiB).
+    ///
     /// Default = 500
     ///
     /// # Examples
