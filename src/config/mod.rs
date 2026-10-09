@@ -2404,6 +2404,13 @@ impl Config {
     /// an ingestion cuts its stream the same way, at whatever level it writes
     /// to. Compaction output is sized by its strategy, not by this value.
     ///
+    /// The leveled L0 trigger counts runs, so the cut does not change how
+    /// often L0 merges into L1; it bounds how much per-key state a flush's
+    /// writer holds. A flush of fewer, larger tables writes less in the
+    /// merges that follow, so with a memtable much larger than the default a
+    /// matching target is the cheaper shape, as far as the writer's memory
+    /// allows.
+    ///
     /// # Examples
     ///
     /// ```

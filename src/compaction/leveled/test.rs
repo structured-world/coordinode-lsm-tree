@@ -1200,26 +1200,55 @@ fn the_l0_file_threshold_trips_on_one_run_of_that_many_tables() -> crate::Result
     Ok(())
 }
 
-/// Below the trigger, several L0 runs are merged into one within L0 whatever
-/// their table count, so a run of many tables does not by itself push L0 into
-/// an L0→L1 merge.
+/// An intra-L0 merge rewrites the whole of L0, so it is taken only while L0 is
+/// a few tables. Runs of many tables below the run trigger are left for the
+/// L0→L1 merge the trigger starts: rewriting them into one run on every flush
+/// would keep the run count under the trigger forever, so L0 would grow to
+/// hold everything and be rewritten each time.
 #[test]
-fn runs_below_the_trigger_merge_within_l0() -> crate::Result<()> {
+fn multi_table_runs_below_the_trigger_are_not_rewritten_within_l0() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let tree = small_tables_tree(dir.path())?;
     // Two overlapping multi-table runs: far more tables than the run
     // threshold, two runs.
     flush_one_run(&tree, b'a', 200, 0)?;
     flush_one_run(&tree, b'a', 200, 1)?;
-    assert_eq!(tree.current_version().l0().run_count(), 2);
+    let before = tree.current_version();
+    assert_eq!(before.l0().run_count(), 2);
 
-    tree.compact(Arc::new(Strategy::default()), MAX_SEQNO)?;
+    let result = tree.compact(Arc::new(Strategy::default()), MAX_SEQNO)?;
+
+    assert!(matches!(
+        result.action,
+        crate::compaction::CompactionAction::Nothing
+    ));
+    assert_eq!(tree.current_version().l0().run_count(), 2);
+    assert_eq!(
+        tree.current_version().l0().table_count(),
+        before.l0().table_count()
+    );
+    Ok(())
+}
+
+/// The run trigger still fires on such runs: as many multi-table flushes as
+/// the threshold move L0 into L1.
+#[test]
+fn multi_table_runs_reach_the_trigger_and_go_to_l1() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = small_tables_tree(dir.path())?;
+    let strategy = Strategy::default();
+    for flush in 0..u64::from(strategy.l0_threshold) {
+        flush_one_run(&tree, b'a', 200, flush)?;
+    }
+    assert_eq!(
+        tree.current_version().l0().run_count(),
+        usize::from(strategy.l0_threshold)
+    );
+
+    tree.compact(Arc::new(strategy), MAX_SEQNO)?;
 
     let version = tree.current_version();
-    assert_eq!(version.l0().run_count(), 1, "merged into one run in L0");
-    assert!(
-        version.iter_levels().skip(1).all(|level| level.is_empty()),
-        "nothing went to L1",
-    );
+    assert!(version.l0().is_empty(), "L0 went down");
+    assert!(version.iter_levels().skip(1).any(|level| !level.is_empty()));
     Ok(())
 }
