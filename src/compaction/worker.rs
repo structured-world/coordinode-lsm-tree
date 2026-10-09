@@ -743,13 +743,20 @@ fn create_compaction_stream<'a>(
 /// [`crate::Table::range`] (a raw, all-seqno, key-bounded scan that seeks within
 /// the table), so a sub-compaction only touches the blocks overlapping its
 /// slice. The bounds must partition the key space across sub-compactions
-/// (`Included(lo)..Excluded(hi)`) so every entry lands in exactly one.
+/// (`Excluded(lo)..=Included(hi)`) so every entry lands in exactly one.
 #[cfg(feature = "std")]
 #[cfg_attr(
     feature = "columnar",
     expect(
         clippy::too_many_arguments,
         reason = "the serial stream's inputs plus the range and the carry plan"
+    )
+)]
+#[cfg_attr(
+    not(feature = "columnar"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only the columnar build's carrying scan can fail to open"
     )
 )]
 fn create_bounded_compaction_stream<'a>(
