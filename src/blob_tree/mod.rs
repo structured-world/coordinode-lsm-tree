@@ -1999,6 +1999,11 @@ impl AbstractTree for BlobTree {
         self.index.compaction_rate_limiter()
     }
 
+    fn write_rate_limiter(&self) -> alloc::sync::Arc<crate::rate_limiter::RateLimiter> {
+        // Writes land in the index tree's memtables, so its limiter is the one.
+        self.index.write_rate_limiter()
+    }
+
     fn apply_batch(&self, batch: crate::WriteBatch, seqno: SeqNo) -> crate::Result<(u64, u64)> {
         self.index.apply_batch(batch, seqno)
     }

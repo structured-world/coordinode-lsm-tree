@@ -759,6 +759,19 @@ impl SuperVersion {
         }
     }
 
+    /// Bytes held by the active and the sealed memtables: the memory flushes
+    /// have not yet released.
+    pub(crate) fn unflushed_bytes(&self) -> u64 {
+        // Each memtable's size is bytes in memory, so the sum is bounded by the
+        // process's memory and cannot overflow u64.
+        self.active_memtable.size()
+            + self
+                .sealed_memtables
+                .iter()
+                .map(|memtable| memtable.size())
+                .sum::<u64>()
+    }
+
     /// Whether a cell row in the active or a sealed memtable references
     /// `blob_file_id`: such a row links the file from no table until its
     /// flush, so the file must stay.

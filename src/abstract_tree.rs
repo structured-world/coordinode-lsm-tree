@@ -288,8 +288,9 @@ pub trait AbstractTree: sealed::Sealed {
         strategy.pending_compaction_bytes(&self.current_version())
     }
 
-    /// Computed write-backpressure verdict from the live L0 run count and the
-    /// strategy's pending-compaction bytes, against the configured
+    /// Computed write-backpressure verdict from the live L0 run count, the
+    /// strategy's pending-compaction bytes and the unflushed memtable bytes,
+    /// against the configured
     /// [`RuntimeConfig::backpressure`](crate::runtime_config::RuntimeConfig)
     /// thresholds.
     ///
@@ -310,6 +311,64 @@ pub trait AbstractTree: sealed::Sealed {
     ) -> crate::Backpressure {
         crate::Backpressure::None
     }
+
+    /// The verdict for one write of `bytes`: [`write_backpressure`](Self::write_backpressure),
+    /// except that a slowdown on a tree with a write rate limit (see
+    /// [`Config::write_rate_limit`](crate::Config::write_rate_limit)) debits
+    /// `bytes` from the tree's write limiter and suggests waiting until they,
+    /// and every byte debited before them, are paid off at its rate. Writes
+    /// honouring it are then bounded by the rate in bytes per second, large
+    /// and small alike, however many writers share the limiter. Outside the
+    /// slowdown tier nothing is debited.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Backpressure, Config, compaction::Leveled};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(&folder, Default::default(), Default::default())
+    ///     .write_rate_limit(1_024 * 1_024)
+    ///     .open()?;
+    /// // No threshold set: full speed, nothing debited.
+    /// assert_eq!(tree.write_backpressure_for(&Leveled::default(), 4_096), Backpressure::None);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn write_backpressure_for(
+        &self,
+        strategy: &dyn crate::compaction::CompactionStrategy,
+        bytes: u64,
+    ) -> crate::Backpressure {
+        let verdict = self.write_backpressure(strategy);
+        if !matches!(verdict, crate::Backpressure::Slowdown { .. }) {
+            return verdict;
+        }
+        let limiter = self.write_rate_limiter();
+        if limiter.rate() == 0 {
+            return verdict;
+        }
+        #[cfg(feature = "std")]
+        {
+            crate::Backpressure::Slowdown {
+                suggested_delay: limiter.reserve(bytes),
+            }
+        }
+        // no-std: acquire_wait with a caller-provided monotonic clock; without
+        // one there is no rate to pace against and the slowdown keeps its ramp.
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = bytes;
+            verdict
+        }
+    }
+
+    /// The limiter writes are paced with under backpressure slowdown: shared
+    /// with other trees if one was supplied through
+    /// [`Config::write_rate_limiter`](crate::Config::write_rate_limiter), else
+    /// the tree's own. Retune it live with
+    /// [`RateLimiter::set_rate`](crate::rate_limiter::RateLimiter::set_rate);
+    /// `0` turns byte pacing off.
+    fn write_rate_limiter(&self) -> alloc::sync::Arc<crate::rate_limiter::RateLimiter>;
 
     /// Storage admission gate: `Ok(())` if a write may proceed, or
     /// [`Error::StorageFull`](crate::Error::StorageFull) if the tree is

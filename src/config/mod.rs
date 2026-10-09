@@ -936,6 +936,23 @@ pub struct Config {
     /// holds. Set via [`Config::compaction_rate_limiter`].
     pub(crate) compaction_rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
 
+    /// Bytes per second writes are paced to while the backpressure verdict is
+    /// in its slowdown tier; `0` (the default) leaves the slowdown delay to
+    /// the ramp. Set via [`Config::write_rate_limit`].
+    pub(crate) write_rate_limit: u64,
+
+    /// Optional write rate limiter shared with other trees, used in place of
+    /// the per-tree one built from [`Self::write_rate_limit`]. Set via
+    /// [`Config::write_rate_limiter`].
+    pub(crate) write_rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
+
+    /// Optional write-buffer budget shared with other trees, which the
+    /// memtable axis of the backpressure verdict compares in place of this
+    /// tree's own unflushed bytes. Set via [`Config::write_buffer_budget`].
+    // no-std: the budget reads members through their std-only arc-swap mirror
+    #[cfg(feature = "std")]
+    pub(crate) write_buffer_budget: Option<Arc<crate::backpressure::WriteBufferBudget>>,
+
     /// Worker-thread count for compaction parallelism (`std` only), used two
     /// ways: it sizes the per-tree pool built at open when
     /// [`Self::compaction_pool`] is `None`, which prepares data blocks and
@@ -1157,6 +1174,10 @@ impl Default for Config {
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
             compaction_rate_limiter: None,
+            write_rate_limit: 0,
+            write_rate_limiter: None,
+            #[cfg(feature = "std")]
+            write_buffer_budget: None,
 
             #[cfg(feature = "std")]
             compaction_threads: std::thread::available_parallelism()
@@ -2495,6 +2516,72 @@ impl Config {
     ) -> Self {
         self.compaction_rate_limiter = Some(limiter);
         self
+    }
+
+    /// Sets the byte rate writes are paced to while the tree's backpressure
+    /// verdict is in its slowdown tier (default `0`: no byte pacing).
+    ///
+    /// With a rate set,
+    /// [`AbstractTree::write_backpressure_for`](crate::AbstractTree::write_backpressure_for)
+    /// answers a slowdown with what the write's bytes owe at this rate, so a
+    /// caller honouring it writes no faster than the rate however large or
+    /// small its writes are; below the slowdown thresholds nothing is debited
+    /// and writes run at full speed. The tree builds its own limiter from
+    /// this figure at open; change it later through
+    /// [`AbstractTree::write_rate_limiter`](crate::AbstractTree::write_rate_limiter).
+    /// Ignored when a shared limiter is supplied through
+    /// [`Self::write_rate_limiter`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .write_rate_limit(16 * 1_024 * 1_024)
+    /// .open()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn write_rate_limit(mut self, bytes_per_sec: u64) -> Self {
+        self.write_rate_limit = bytes_per_sec;
+        self
+    }
+
+    /// Supplies a write rate limiter shared with other trees, used in place of
+    /// the per-tree one built from [`Self::write_rate_limit`]: writes paced
+    /// under slowdown by any of them draw on one budget, at the rate it holds.
+    #[must_use]
+    pub fn write_rate_limiter(mut self, limiter: Arc<crate::rate_limiter::RateLimiter>) -> Self {
+        self.write_rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Joins the tree to a [`WriteBufferBudget`](crate::WriteBufferBudget)
+    /// shared with other trees: the memtable axis of its backpressure verdict
+    /// then compares the unflushed memtable bytes of every member together.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn write_buffer_budget(
+        mut self,
+        budget: Arc<crate::backpressure::WriteBufferBudget>,
+    ) -> Self {
+        self.write_buffer_budget = Some(budget);
+        self
+    }
+
+    /// The limiter a tree opened with this configuration paces slowed-down
+    /// writes with: the shared one if supplied, else its own built from
+    /// [`Self::write_rate_limit`].
+    pub(crate) fn tree_write_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
+        self.write_rate_limiter.clone().unwrap_or_else(|| {
+            Arc::new(crate::rate_limiter::RateLimiter::new(self.write_rate_limit))
+        })
     }
 
     /// The limiter a tree opened with this configuration throttles its
