@@ -134,6 +134,28 @@ fn rewriting_the_payload_by_value_is_counted() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A compaction of one segment copies its groups and reads back every row; one
+/// of eight interleaved segments lands every input's rows among the others'
+/// and copies none, the two ends the compaction scenarios report between.
+#[test]
+fn compaction_scenarios_copy_what_the_merge_left_as_it_was() -> lsm_tree::Result<()> {
+    let one = build(fixtures::columnar_segment)?;
+    let pass = super::compact_keeping_versions(&one)?;
+    assert_eq!(pass.rows, one.oracle.visible());
+    assert!(
+        pass.carried_bytes * 10 > pass.output_bytes * 9,
+        "{} of {} B copied",
+        pass.carried_bytes,
+        pass.output_bytes,
+    );
+
+    let overlap = build(fixtures::columnar_overlap)?;
+    let pass = super::compact_keeping_versions(&overlap)?;
+    assert_eq!(pass.rows, overlap.oracle.visible());
+    assert_eq!(pass.carried_bytes, 0);
+    Ok(())
+}
+
 /// The cell-row scans return exactly the rows their predicate selects, and a
 /// sparse one materialises far less than one that keeps nearly every row,
 /// while every scan's payload useful bytes are those of the rows it kept.
