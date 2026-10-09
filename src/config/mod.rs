@@ -47,6 +47,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// The default of [`Config::table_target_size`]: 64 MiB, the size the leveled
+/// and tiered strategies cut compaction output at.
+pub const DEFAULT_TABLE_TARGET_SIZE: u64 = 64 * 1_024 * 1_024;
+
 /// Per-level filesystem routing entry for tiered storage.
 ///
 /// Maps a range of LSM levels to a base directory and filesystem backend.
@@ -610,6 +614,10 @@ pub struct Config {
     /// [`Config::compaction_rate_limit`].
     pub(crate) compaction_rate_limit: u64,
 
+    /// Size a flush or an ingestion cuts its output tables at. Set via
+    /// [`Config::table_target_size`].
+    pub(crate) table_target_size: u64,
+
     /// Worker-thread count for compaction parallelism (`std` only), used two
     /// ways: it sizes the per-tree block-compression pool built at open when
     /// [`Self::compaction_pool`] is `None`, and it caps how many range-parallel
@@ -808,6 +816,7 @@ impl Default for Config {
             manifest_log_rotate_bytes: 1024 * 1024,
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
+            table_target_size: DEFAULT_TABLE_TARGET_SIZE,
 
             #[cfg(feature = "std")]
             compaction_threads: std::thread::available_parallelism()
@@ -1789,6 +1798,36 @@ impl Config {
     #[must_use]
     pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_rate_limit = bytes_per_sec;
+        self
+    }
+
+    /// Sets the size a flush or an ingestion cuts its output tables at
+    /// (default [`DEFAULT_TABLE_TARGET_SIZE`], 64 MiB).
+    ///
+    /// A memtable larger than this flushes into several tables; an ingestion
+    /// cuts its stream the same way, at whatever level it writes to.
+    /// Compaction output is sized by its strategy, not by this value. The
+    /// leveled L0 trigger counts tables, so each table a flush is cut into
+    /// counts towards it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .table_target_size(8 * 1_024 * 1_024)
+    /// .open()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn table_target_size(mut self, bytes: u64) -> Self {
+        self.table_target_size = bytes;
         self
     }
 

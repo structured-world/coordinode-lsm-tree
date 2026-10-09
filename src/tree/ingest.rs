@@ -107,7 +107,7 @@ impl<'a> Ingestion<'a> {
         let mut writer = MultiWriter::new(
             folder.clone(),
             tree.table_id_counter.clone(),
-            64 * 1_024 * 1_024,
+            tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),
         )?
