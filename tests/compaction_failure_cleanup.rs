@@ -172,6 +172,46 @@ fn a_merge_failing_to_read_an_input_leaves_none_of_its_tables() -> lsm_tree::Res
     )
 }
 
+/// The same read error in a merge that copies its inputs' row groups: the
+/// scan that records them and the raw read of a group fail the merge as a
+/// row read does, and leave nothing behind.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_merge_copying_groups_failing_to_read_leaves_none_of_its_tables() -> lsm_tree::Result<()> {
+    let f = open(|c| c)?;
+    let AnyTree::Standard(tree) = &f.tree else {
+        panic!("expected standard tree");
+    };
+    // Columnar tables written as the output level writes them, so their
+    // groups are copied.
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    for i in 0..KEYS / 2 {
+        f.tree.insert(key(i), value(i, 0), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    for i in KEYS / 2..KEYS {
+        f.tree.insert(key(i), value(i, 0), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+
+    for skip in [2, 6, 12] {
+        assert_fails_cleanly(
+            &f,
+            [
+                io_error(FaultOp::ReadAt, "tables", skip),
+                io_error(FaultOp::Read, "tables", skip),
+            ],
+            16 * 1024,
+            |i| value(i, 0),
+        )?;
+    }
+    Ok(())
+}
+
 /// One failed sub-compaction aborts the install: the outputs its siblings
 /// finished go as well as its own.
 #[test]

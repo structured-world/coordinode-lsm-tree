@@ -31,11 +31,28 @@ use crate::{InternalValue, UserKey};
 pub struct CarryCandidate {
     /// The table the group was read from.
     pub(crate) table: Table,
-    /// The group's index entry: where it lies and the tag and lengths its
-    /// directory carries.
+    /// The group's index entry: where it lies.
     pub(crate) group: BlockHandle,
-    /// The rows of the group, in the order the scanner handed them out.
+    /// The tag and lengths the group's directory carries, as its index entry
+    /// names them.
+    pub(crate) row_group: super::index_block::RowGroupRef,
+    /// The rows of the group, in the order the scanner handed them out; never
+    /// empty.
     pub(crate) rows: Arc<[InternalValue]>,
+    /// The first and the last of `rows`' keys.
+    keys: (UserKey, UserKey),
+}
+
+impl CarryCandidate {
+    /// The key of the group's first row.
+    pub(crate) fn first_key(&self) -> &UserKey {
+        &self.keys.0
+    }
+
+    /// The key of the group's last row.
+    pub(crate) fn last_key(&self) -> &UserKey {
+        &self.keys.1
+    }
 }
 
 /// The candidates the scanners of one compaction recorded, in the order each
@@ -114,13 +131,16 @@ impl GroupCarry {
         self.next = 0;
         if whole
             && let Some(group) = group
-            && group.row_group().is_some()
-            && !self.rows.is_empty()
+            && let Some(row_group) = group.row_group()
+            && let (Some(first), Some(last)) = (self.rows.first(), self.rows.last())
         {
+            let keys = (first.key.user_key.clone(), last.key.user_key.clone());
             self.queue.lock().push_back(CarryCandidate {
                 table: self.table.clone(),
                 group,
+                row_group,
                 rows: Arc::clone(&self.rows),
+                keys,
             });
         }
     }
@@ -229,3 +249,6 @@ impl Table {
         )?)
     }
 }
+
+#[cfg(test)]
+mod tests;

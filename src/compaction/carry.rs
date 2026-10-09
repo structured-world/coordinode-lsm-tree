@@ -152,11 +152,10 @@ impl CarryMatcher {
         sink: &mut dyn CarrySink,
     ) -> crate::Result<()> {
         if let Some(mut open) = self.open.take() {
-            let within = open.candidate.rows.last().is_some_and(|last| {
-                self.comparator
-                    .compare(&row.key.user_key, &last.key.user_key)
-                    != core::cmp::Ordering::Greater
-            });
+            let within = self
+                .comparator
+                .compare(&row.key.user_key, open.candidate.last_key())
+                != core::cmp::Ordering::Greater;
             if within {
                 open.emitted.push(row);
                 // A range the merge filled far past the group's rows is no
@@ -238,25 +237,11 @@ impl CarryMatcher {
 
         let key = &row.key.user_key;
         let mut queue = self.queue.lock();
-        let mut found = None;
-        queue.retain(|candidate| {
-            let (Some(first), Some(last)) = (candidate.rows.first(), candidate.rows.last()) else {
-                return false;
-            };
-            if self.comparator.compare(&last.key.user_key, key) == Less {
-                return false;
-            }
-            if found.is_none() && self.comparator.compare(&first.key.user_key, key) != Greater {
-                found = Some(CarryCandidate {
-                    table: candidate.table.clone(),
-                    group: candidate.group,
-                    rows: alloc::sync::Arc::clone(&candidate.rows),
-                });
-                return false;
-            }
-            true
-        });
-        found
+        queue.retain(|candidate| self.comparator.compare(candidate.last_key(), key) != Less);
+        let at = queue
+            .iter()
+            .position(|candidate| self.comparator.compare(candidate.first_key(), key) != Greater)?;
+        queue.remove(at)
     }
 
     /// Writes `rows` one by one: rows the merge emitted that are not copied.

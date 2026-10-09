@@ -1482,9 +1482,7 @@ impl CompactionFlavour for StandardCompaction {
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<bool> {
         let table = &candidate.table;
-        let Some(group) = candidate.group.row_group() else {
-            return Ok(false);
-        };
+        let group = candidate.row_group;
         let columns = table
             .zone_map
             .columns_for(candidate.group.offset().0)
@@ -1523,9 +1521,7 @@ impl CompactionFlavour for StandardCompaction {
         let table = &candidate.table;
         // Pages of values stored whole only: a group of cells has the columns
         // its rows' fields make, which a rebuilt group need not repeat.
-        let Some(group) = candidate.group.row_group() else {
-            return Ok(None);
-        };
+        let group = candidate.row_group;
         if table.metadata.value_layout != crate::table::meta::ValueLayout::Whole {
             return Ok(None);
         }
