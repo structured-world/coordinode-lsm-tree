@@ -880,7 +880,11 @@ fn cells_metadata_update(fixture: &Fixture) -> lsm_tree::Result<UpdatePass> {
     );
     Ok(UpdatePass {
         rows,
-        payload_written: after.blob_files.on_disk_size() - bytes_before,
+        payload_written: after
+            .blob_files
+            .on_disk_size()
+            .checked_sub(bytes_before)
+            .expect("blob files shrank during the update, so the difference is not what it wrote"),
     })
 }
 
