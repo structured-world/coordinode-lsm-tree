@@ -999,13 +999,15 @@ fn range_tombstone_disjoint_survives_multiple_compactions() -> lsm_tree::Result<
     Ok(())
 }
 
+/// A range tombstone in a flush that rotates must not widen the key range of
+/// the table it lands in, or a newer value past it reads as deleted.
 #[test]
-#[ignore = "heavy: allocates ~68 MiB to force MultiWriter rotation; run with `cargo nextest run --run-ignored only`"]
 fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree::Result<()> {
     use lsm_tree::CompressionType;
     use lsm_tree::config::CompressionPolicy;
 
     let folder = get_tmp_folder();
+    let kib: usize = 1_024;
     // Disable compression: large repetitive payloads compress to almost nothing
     // under lz4/zstd, preventing MultiWriter rotation and making the test flaky.
     let tree = Config::new(
@@ -1014,16 +1016,13 @@ fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree:
         SequenceNumberCounter::default(),
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+    .table_target_size(64 * 1_024)
     .open()
     .expect("should open");
 
-    // Standard-tree flush uses a fixed 64 MiB MultiWriter target. Multiple
-    // large early values force rotation before the later "y" write, reproducing
-    // the widened-key-range bug on the actual flush path instead of a synthetic
-    // test-only configuration. Reuse one large buffer to keep the test lighter
-    // on CI memory.
-    let mi = 1_024 * 1_024;
-    let large_value = "a".repeat(17 * mi);
+    // Large early values force the flush to rotate before the later "y"
+    // write, reproducing the widened-key-range bug on the actual flush path.
+    let large_value = "a".repeat(17 * kib);
 
     tree.insert("a0", &large_value, 1);
     tree.insert("a1", &large_value, 2);

@@ -207,7 +207,7 @@ fn compaction_debt_flags_l0_over_threshold_then_clears() -> crate::Result<()> {
     }
     assert!(
         tree.compaction_debt(&*strategy) > 0,
-        "L0 at the file threshold should report pending compaction debt",
+        "L0 at the run threshold should report pending compaction debt",
     );
 
     // After compaction the runs collapse into a single L1 table below target,
@@ -542,6 +542,10 @@ fn leveled_get_config_includes_new_fields() {
     assert!(
         keys.iter().any(|k| k == b"leveled_l0_threshold"),
         "should have leveled_l0_threshold key",
+    );
+    assert!(
+        keys.iter().any(|k| k == b"leveled_l0_file_threshold"),
+        "should have leveled_l0_file_threshold key",
     );
     assert!(
         keys.iter().any(|k| k == b"leveled_target_size"),
@@ -1084,6 +1088,138 @@ fn the_picker_chooses_the_merge_with_the_least_rewriting_per_promoted_byte() -> 
         chosen,
         [sparse_l2, large_l1].into_iter().collect::<HashSet<_>>(),
         "the large table over the sparse region is the cheaper merge per promoted byte",
+    );
+    Ok(())
+}
+
+/// Flushes `keys` incompressible rows under `prefix` as one memtable into a
+/// tree whose flushes rotate at 4 KiB, so the flush is one run of many tables.
+fn flush_one_run(tree: &crate::AnyTree, prefix: u8, keys: u16, seqno: u64) -> crate::Result<()> {
+    let mut state = u64::from(prefix) << 32;
+    for i in 0..keys {
+        let value: Vec<u8> = (0..32)
+            .flat_map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state.to_le_bytes()
+            })
+            .collect();
+        let [hi, lo] = i.to_be_bytes();
+        tree.insert([prefix, hi, lo].as_slice(), value, seqno);
+    }
+    tree.flush_active_memtable(0)
+}
+
+fn small_tables_tree(dir: &std::path::Path) -> crate::Result<crate::AnyTree> {
+    Config::new(
+        dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .table_target_size(4 * 1_024)
+    .open()
+}
+
+/// One flush that rotates into many tables is one run, and a read pays one
+/// table of it per key: it must not trip the L0 trigger on its own, however
+/// many tables it holds.
+#[test]
+fn one_l0_run_of_many_tables_does_not_trip_the_l0_trigger() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = small_tables_tree(dir.path())?;
+    flush_one_run(&tree, b'a', 200, 0)?;
+
+    let version = tree.current_version();
+    let l0 = version.l0();
+    assert_eq!(l0.run_count(), 1, "one flush is one run");
+    assert!(
+        l0.table_count() >= 2 * usize::from(Strategy::default().l0_threshold),
+        "the fixture needs a run of more tables than the threshold, got {}",
+        l0.table_count(),
+    );
+
+    let strategy = Strategy::default();
+    assert!(!strategy.l0_triggered(l0));
+    assert_eq!(strategy.pending_compaction_bytes(&version), 0);
+    Ok(())
+}
+
+/// Runs, not tables, reach the threshold: as many overlapping flushes as the
+/// threshold trip it, each of them a single table.
+#[test]
+fn as_many_l0_runs_as_the_threshold_trip_the_l0_trigger() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let strategy = Strategy::default();
+    for flush in 0..u64::from(strategy.l0_threshold) {
+        // The same keys every time, so the runs overlap and stay apart.
+        tree.insert("a", "v", flush);
+        tree.insert("z", "v", flush);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let version = tree.current_version();
+    assert_eq!(version.l0().run_count(), usize::from(strategy.l0_threshold));
+    assert!(strategy.l0_triggered(version.l0()));
+    assert!(strategy.l0_score(version.l0()) >= 1.0);
+    assert_eq!(
+        strategy.pending_compaction_bytes(&version),
+        version.l0().size(),
+        "the whole of a triggered L0 is pending",
+    );
+    Ok(())
+}
+
+/// The file-count guard trips on a single run once it holds that many tables,
+/// so a fan-out of tiny tables is still merged down.
+#[test]
+fn the_l0_file_threshold_trips_on_one_run_of_that_many_tables() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = small_tables_tree(dir.path())?;
+    flush_one_run(&tree, b'a', 200, 0)?;
+
+    let version = tree.current_version();
+    let tables = version.l0().table_count();
+    let guard = u16::try_from(tables).unwrap();
+    assert!(
+        Strategy::default()
+            .with_l0_file_threshold(guard)
+            .l0_triggered(version.l0())
+    );
+    assert!(
+        !Strategy::default()
+            .with_l0_file_threshold(guard + 1)
+            .l0_triggered(version.l0())
+    );
+    Ok(())
+}
+
+/// Below the trigger, several L0 runs are merged into one within L0 whatever
+/// their table count, so a run of many tables does not by itself push L0 into
+/// an L0→L1 merge.
+#[test]
+fn runs_below_the_trigger_merge_within_l0() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = small_tables_tree(dir.path())?;
+    // Two overlapping multi-table runs: far more tables than the run
+    // threshold, two runs.
+    flush_one_run(&tree, b'a', 200, 0)?;
+    flush_one_run(&tree, b'a', 200, 1)?;
+    assert_eq!(tree.current_version().l0().run_count(), 2);
+
+    tree.compact(Arc::new(Strategy::default()), MAX_SEQNO)?;
+
+    let version = tree.current_version();
+    assert_eq!(version.l0().run_count(), 1, "merged into one run in L0");
+    assert!(
+        version.iter_levels().skip(1).all(|level| level.is_empty()),
+        "nothing went to L1",
     );
     Ok(())
 }

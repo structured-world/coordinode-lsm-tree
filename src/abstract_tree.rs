@@ -288,7 +288,7 @@ pub trait AbstractTree: sealed::Sealed {
         strategy.pending_compaction_bytes(&self.current_version())
     }
 
-    /// Computed write-backpressure verdict from the live L0 table count and the
+    /// Computed write-backpressure verdict from the live L0 run count and the
     /// strategy's pending-compaction bytes, against the configured
     /// [`RuntimeConfig::backpressure`](crate::runtime_config::RuntimeConfig)
     /// thresholds.

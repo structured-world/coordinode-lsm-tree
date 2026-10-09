@@ -2,7 +2,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end tests for the opt-in computed write-backpressure verdict
-//! ([`AbstractTree::write_backpressure`]): the L0-count and pending-compaction-
+//! ([`AbstractTree::write_backpressure`]): the L0-run and pending-compaction-
 //! bytes signals driving the Slowdown then Stop tiers, the off-by-default no-op,
 //! live re-configuration, and BlobTree delegation. The pure tier/ramp arithmetic
 //! is unit-tested in `src/backpressure/tests.rs`; here we prove the wiring reads
@@ -45,14 +45,14 @@ fn open_blob_tree(path: &std::path::Path) -> lsm_tree::BlobTree {
     }
 }
 
-/// Flush one non-empty memtable, adding exactly one L0 table (compaction is
-/// caller-driven, so nothing merges L0 underneath us).
+/// Flush one non-empty memtable, adding exactly one L0 run (compaction is
+/// caller-driven, so nothing merges L0 underneath us). Every round writes the
+/// same two keys, so each flush overlaps the ones before it and stays a run of
+/// its own; disjoint flushes would share one run, which a read pays once.
 fn add_l0_table(tree: &lsm_tree::Tree, round: u64) {
-    tree.insert(
-        format!("k{round:05}").as_bytes(),
-        b"payload".as_slice(),
-        round,
-    );
+    for key in ["a", "z"] {
+        tree.insert(key, format!("payload{round}"), round);
+    }
     tree.flush_active_memtable(0).expect("flush");
 }
 
@@ -111,6 +111,33 @@ fn l0_count_drives_slowdown_then_stop() -> lsm_tree::Result<()> {
         Backpressure::Stop,
         "four L0 tables must reach the stop tier"
     );
+    Ok(())
+}
+
+/// Disjoint flushes share one L0 run, and a read pays one table of it per key:
+/// however many of them pile up, the L0 axis does not throttle.
+#[test]
+fn disjoint_flushes_share_a_run_and_do_not_throttle() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let strat = Leveled::default();
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: Some(2),
+            l0_stop: Some(4),
+            bytes_slowdown: None,
+            bytes_stop: None,
+            max_slowdown: Some(Duration::from_millis(5)),
+        };
+    })?;
+
+    for round in 0..6u64 {
+        tree.insert(format!("k{round:05}"), "payload", round);
+        tree.flush_active_memtable(0)?;
+    }
+    assert_eq!(tree.table_count(), 6);
+    assert_eq!(tree.l0_run_count(), 1);
+    assert_eq!(tree.write_backpressure(&strat), Backpressure::None);
     Ok(())
 }
 
@@ -188,9 +215,9 @@ fn draining_compaction_clears_the_verdict() -> lsm_tree::Result<()> {
 #[test]
 fn bytes_axis_drives_verdict_with_l0_axis_off() -> lsm_tree::Result<()> {
     // Prove the wiring forwards `strategy.pending_compaction_bytes(&version)`
-    // into the verdict, independent of the L0-count axis. Leveled counts L0's
-    // whole size as pending once L0 reaches its file threshold (default 4), so
-    // four flushed tables give a non-zero pending-bytes signal.
+    // into the verdict, independent of the L0-run axis. Leveled counts L0's
+    // whole size as pending once L0 reaches its run threshold (default 4), so
+    // four overlapping flushes give a non-zero pending-bytes signal.
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
     let strat = Leveled::default();
@@ -260,12 +287,11 @@ fn blob_tree_delegates_backpressure_to_index() -> lsm_tree::Result<()> {
 
     // Two flushes of the index tree -> stop tier, observed through the blob
     // tree's delegating override.
+    // Overlapping, so each flush is a run of its own.
     for round in 0..2u64 {
-        tree.insert(
-            format!("k{round:05}").as_bytes(),
-            b"payload".as_slice(),
-            round,
-        );
+        for key in ["a", "z"] {
+            tree.insert(key, format!("payload{round}"), round);
+        }
         tree.flush_active_memtable(0).expect("flush");
     }
     assert_eq!(tree.write_backpressure(&strat), Backpressure::Stop);

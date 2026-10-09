@@ -5,8 +5,19 @@ use lsm_tree::{CompressionType, PrefixExtractor, config::CompressionPolicy};
 use std::sync::Arc;
 use test_log::test;
 
-/// The table size an ingestion rotates at.
-const TARGET: u64 = 64 * 1_024 * 1_024;
+/// The table size these trees are configured to rotate a flush or an
+/// ingestion at, small so a few megabytes of rows exercise the cut.
+const TARGET: u64 = 1_024 * 1_024;
+
+/// A tree whose flushes and ingestions rotate at [`TARGET`].
+fn config(folder: &std::path::Path) -> Config {
+    Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .table_target_size(TARGET)
+}
 
 /// Deterministic incompressible bytes, so the table's size on disk is the
 /// size of what was written.
@@ -63,14 +74,9 @@ fn ingest(
 #[test]
 fn one_large_ingestion_is_cut_into_tables_of_the_target_size() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
-    let tree = Config::new(
-        &folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .open()?;
+    let tree = config(folder.path()).open()?;
     // About 3.5 times the target of incompressible rows.
-    ingest(&tree, 850_000, noise)?;
+    ingest(&tree, 13_300, noise)?;
     assert_tables_within_target(tree, folder.path())?;
     Ok(())
 }
@@ -83,24 +89,25 @@ fn one_large_ingestion_is_cut_into_tables_of_the_target_size() -> lsm_tree::Resu
 fn a_compressible_ingestion_is_cut_into_tables_within_the_target() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = small_rows_tree(folder.path())?;
-    ingest(&tree, 1_000_000, |_, buf| buf.fill(0x5a))?;
+    ingest(&tree, SMALL_ROWS, |_, buf| buf.fill(0x5a))?;
     let sizes = table_sizes(tree, folder.path())?;
     assert!(sizes.len() >= 2, "one ingestion wrote {sizes:?}");
     assert_within(&sizes, TARGET);
     Ok(())
 }
 
+/// Rows of [`small_rows_tree`] whose per-key writer state passes [`TARGET`]
+/// at least twice while their compressed data stays far below it.
+#[cfg(feature = "lz4")]
+const SMALL_ROWS: u64 = 40_000;
+
 /// A tree of small, well-compressing rows under a prefix extractor.
 #[cfg(feature = "lz4")]
 fn small_rows_tree(folder: &std::path::Path) -> lsm_tree::Result<lsm_tree::AnyTree> {
-    Config::new(
-        folder,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
-    .prefix_extractor(Arc::new(ColonPrefixes))
-    .open()
+    config(folder)
+        .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
+        .prefix_extractor(Arc::new(ColonPrefixes))
+        .open()
 }
 
 /// A flush writes through the same table writer as an ingestion: a memtable
@@ -112,11 +119,11 @@ fn small_rows_tree(folder: &std::path::Path) -> lsm_tree::Result<lsm_tree::AnyTr
 fn a_flush_of_small_rows_is_cut_into_tables_within_the_target() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = small_rows_tree(folder.path())?;
-    for i in 0..1_000_000u64 {
+    for i in 0..SMALL_ROWS {
         tree.insert(format!("node:{i:016}"), [0x5a], 0);
     }
     tree.flush_active_memtable(0)?;
-    assert_eq!(tree.len(SeqNo::MAX, None)?, 1_000_000);
+    assert_eq!(tree.len(SeqNo::MAX, None)?, SMALL_ROWS as usize);
     let sizes = table_sizes(tree, folder.path())?;
     assert!(sizes.len() >= 2, "one flush wrote {sizes:?}");
     assert_within(&sizes, TARGET);
@@ -183,5 +190,71 @@ fn assert_tables_within_target(
         sizes.len(),
     );
     assert_within(&sizes, TARGET);
+    Ok(())
+}
+
+/// Flushes `rows` incompressible 21-byte-key, 256-byte-value rows as one
+/// memtable.
+fn flush_noise(tree: &lsm_tree::AnyTree, rows: u64) -> lsm_tree::Result<()> {
+    let mut buf = [0u8; 256];
+    for i in 0..rows {
+        noise(i, &mut buf);
+        tree.insert(format!("node:{i:016}"), buf.to_vec(), i);
+    }
+    tree.flush_active_memtable(0)
+}
+
+/// A flush rotates at the configured target, and the tables it cuts form one
+/// run: disjoint key ranges, so a read still looks at one table per key.
+#[test]
+fn a_flush_rotates_at_the_configured_target_into_one_run() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = config(folder.path()).open()?;
+    // About four times the target.
+    flush_noise(&tree, 15_000)?;
+    assert_eq!(tree.l0_run_count(), 1, "one flush is one run");
+    assert!(
+        tree.table_count() >= 4,
+        "a flush four times the target wrote {} table(s)",
+        tree.table_count(),
+    );
+    assert_eq!(tree.len(SeqNo::MAX, None)?, 15_000);
+    assert_tables_within_target(tree, folder.path())?;
+    Ok(())
+}
+
+/// Unset, the target is the 64 MiB default: the same flush stays one table.
+#[test]
+fn an_unconfigured_flush_keeps_the_default_target() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    flush_noise(&tree, 15_000)?;
+    assert_eq!(
+        tree.table_count(),
+        1,
+        "a 4 MiB flush is far below the default target"
+    );
+    Ok(())
+}
+
+/// A blob tree's ingestion writes its index tables through the same cut.
+#[test]
+fn a_blob_tree_ingestion_rotates_its_index_tables_at_the_target() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = config(folder.path())
+        .with_kv_separation(Some(lsm_tree::KvSeparationOptions {
+            // Every value stays inline in the index, so the index tables carry
+            // the volume the cut is measured on.
+            separation_threshold: u32::MAX,
+            ..Default::default()
+        }))
+        .open()?;
+    ingest(&tree, 13_300, noise)?;
+    assert_tables_within_target(tree, folder.path())?;
     Ok(())
 }

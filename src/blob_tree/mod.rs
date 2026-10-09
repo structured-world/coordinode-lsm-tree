@@ -1262,8 +1262,9 @@ impl AbstractTree for BlobTree {
         strategy: &dyn crate::compaction::CompactionStrategy,
     ) -> crate::Backpressure {
         // Same delegation as write_admission: the index tree holds the runtime
-        // config and its version is this blob tree's version, so the L0-count
-        // and pending-compaction-bytes signals are computed on the right state.
+        // config and its version is this blob tree's version, so the L0 run
+        // count and pending-compaction-bytes signals are computed on the right
+        // state.
         self.index.write_backpressure(strategy)
     }
 
@@ -1611,7 +1612,7 @@ impl AbstractTree for BlobTree {
         let mut table_writer = MultiWriter::new(
             table_folder.clone(),
             self.index.table_id_counter.clone(),
-            64 * 1_024 * 1_024,
+            self.index.config.table_target_size,
             0,
             level_fs.clone(),
         )?

@@ -14,8 +14,8 @@
 //! caller-configured thresholds (see the `*_slowdown` / `*_stop` fields on
 //! [`RuntimeConfig`](crate::runtime_config::RuntimeConfig)):
 //!
-//! - **L0 table count** — count-triggered, the same signal the leveled `choose`
-//!   trigger uses; a tall L0 is what spikes read amplification.
+//! - **L0 run count**: the signal the leveled trigger counts; each run costs a
+//!   read one table lookup, so a tall L0 is what spikes read amplification.
 //! - **Pending compaction bytes** — the size-target debt the strategy reports.
 //!
 //! The verdict is the more severe of the two axes. With every threshold unset the
@@ -32,10 +32,10 @@ use core::time::Duration;
 /// independently: the axis still produces the tier whose threshold is set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackpressureThresholds {
-    /// L0 table count at or above which the verdict is at least
+    /// L0 run count at or above which the verdict is at least
     /// [`Backpressure::Slowdown`].
     pub l0_slowdown: Option<usize>,
-    /// L0 table count at or above which the verdict is [`Backpressure::Stop`].
+    /// L0 run count at or above which the verdict is [`Backpressure::Stop`].
     pub l0_stop: Option<usize>,
     /// Pending-compaction bytes at or above which the verdict is at least
     /// [`Backpressure::Slowdown`].
@@ -128,11 +128,11 @@ impl Backpressure {
     /// Compute the verdict from the two live signals against `thresholds`.
     ///
     /// Pure and allocation-free so it is unit-testable without a tree. The result
-    /// is the more severe of the L0-count and pending-bytes axes; the slowdown
+    /// is the more severe of the L0-run and pending-bytes axes; the slowdown
     /// delay is the larger of the two axes' ramped delays.
     #[must_use]
     pub fn compute(
-        l0_table_count: usize,
+        l0_run_count: usize,
         pending_bytes: u64,
         thresholds: &BackpressureThresholds,
     ) -> Self {
@@ -141,7 +141,7 @@ impl Backpressure {
         }
 
         // Stop dominates: if either axis is at its stop threshold, stop.
-        let l0_stop = thresholds.l0_stop.is_some_and(|t| l0_table_count >= t);
+        let l0_stop = thresholds.l0_stop.is_some_and(|t| l0_run_count >= t);
         let bytes_stop = thresholds.bytes_stop.is_some_and(|t| pending_bytes >= t);
         if l0_stop || bytes_stop {
             return Self::Stop;
@@ -154,10 +154,10 @@ impl Backpressure {
         let mut slowing = false;
 
         if let Some(soft) = thresholds.l0_slowdown
-            && l0_table_count >= soft
+            && l0_run_count >= soft
         {
             slowing = true;
-            delay = delay.max(ramp_usize(l0_table_count, soft, thresholds.l0_stop, cap));
+            delay = delay.max(ramp_usize(l0_run_count, soft, thresholds.l0_stop, cap));
         }
         if let Some(soft) = thresholds.bytes_slowdown
             && pending_bytes >= soft

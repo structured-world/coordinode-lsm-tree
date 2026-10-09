@@ -753,15 +753,11 @@ impl AbstractTree for Tree {
             return crate::Backpressure::None;
         }
         let version = self.current_version();
-        // L0 is the first level; its table (file) count is the count-trigger
-        // signal, matching the leveled `choose` trigger and the L0 term of
-        // `pending_compaction_bytes`.
-        let l0_count = version
-            .iter_levels()
-            .next()
-            .map_or(0, |level| level.table_count());
+        // L0's run count is what a read pays there and what the leveled
+        // trigger counts.
+        let l0_runs = version.l0().run_count();
         let pending = strategy.pending_compaction_bytes(&version);
-        crate::Backpressure::compute(l0_count, pending, &thresholds)
+        crate::Backpressure::compute(l0_runs, pending, &thresholds)
     }
 
     fn get_flush_lock(&self) -> FlushGuard<'_> {
@@ -1066,7 +1062,7 @@ impl AbstractTree for Tree {
         let mut table_writer = MultiWriter::new(
             folder.clone(),
             self.table_id_counter.clone(),
-            64 * 1_024 * 1_024,
+            self.config.table_target_size,
             0,
             level_fs.clone(),
         )?
