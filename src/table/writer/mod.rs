@@ -3350,7 +3350,7 @@ impl Writer {
                     // The page's checksum is bound to the place it lay; the
                     // payload is written as it is.
                     let mut frame = copied.frame.to_vec();
-                    super::block::Header::rebind_frame(&mut frame, copied.at, at)?;
+                    super::block::Header::rebind_verified_frame(&mut frame, copied.at, at)?;
                     #[cfg(not(feature = "std"))]
                     use crate::io::Write;
                     #[cfg(feature = "std")]
@@ -4312,7 +4312,7 @@ impl Writer {
                 ));
             }
             let relative = at as u64;
-            Header::rebind_frame(
+            Header::rebind_verified_frame(
                 frame,
                 ChecksumAt::table(source.table_id, source.offset + relative),
                 ChecksumAt::table(self.table_id, dest + relative),

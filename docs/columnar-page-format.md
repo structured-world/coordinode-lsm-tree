@@ -352,8 +352,9 @@ those rows applies the level's policy.
 A merge copies an input's row group whole, as it lies on disk, when every row
 of it comes out of the merge exactly as it was read and nothing else lands
 among them: the group's bytes are then what the output would encode for those
-rows. It does so only from a level whose encoding policy is the output
-level's, into an output of the same data codec and dictionary, and with
+rows. It does so only from a level whose encoding, row group size and page
+size policies are the output level's, into an output of the same data codec
+and dictionary, and with
 neither encryption nor Page-ECC, so a copied page is always one the output's
 level would have written. The block checksums, which bind each block to its
 table and place, are moved to the copy's; the pages, their stamps and the

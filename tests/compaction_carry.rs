@@ -177,6 +177,181 @@ fn compaction_tied_key_group_changed_elsewhere_is_written() {
     assert_blocks_verify(&tree);
 }
 
+/// Groups ingested with their value split into sub-columns, copied one after
+/// another into one output: a run of groups of the same layout stays in one
+/// table, as the size target allows, rather than one table a group.
+#[test]
+fn compaction_carried_split_groups_share_a_table() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::{Column, TypeTag, entries_to_column_batch};
+    use lsm_tree::{InternalValue, ValueType};
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    // Five batches of disjoint keys, each one row group whose value is a
+    // fixed-4 sub-column.
+    let batches = 5u32;
+    let rows = 50u32;
+    let mut ingestion = any.ingestion()?;
+    for b in 0..batches {
+        let entries: Vec<InternalValue> = (0..rows)
+            .map(|r| InternalValue::from_components(key(b * rows + r), b"x", 0, ValueType::Value))
+            .collect();
+        let mut batch = entries_to_column_batch(&entries)?;
+        batch.columns.pop();
+        batch.columns.push(Column {
+            column_id: 3,
+            type_tag: TypeTag::Fixed(4),
+            validity: None,
+            data: (0..rows)
+                .flat_map(|r| (b * rows + r).to_le_bytes())
+                .collect::<Vec<u8>>()
+                .into(),
+        });
+        ingestion.write_columnar_batch(&batch)?;
+    }
+    ingestion.finish()?;
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .all(|t| t.global_seqno() == 0),
+        "the first ingestion's groups can be copied"
+    );
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert_eq!(
+        tree.metrics().compaction_groups_carried(),
+        u64::from(batches)
+    );
+    assert_eq!(
+        tree.current_version().iter_tables().count(),
+        1,
+        "the copied groups share one table"
+    );
+    assert_eq!(
+        tree.iter(SeqNo::MAX, None).count(),
+        (batches * rows) as usize
+    );
+    assert_blocks_verify(tree);
+    Ok(())
+}
+
+/// A level whose pages are cut to another size than the output level's: its
+/// groups would keep the source geometry, so they are encoded again, cut as
+/// the output level cuts them.
+#[test]
+fn compaction_into_another_page_size_carries_nothing() {
+    use lsm_tree::config::BlockSizePolicy;
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_page_size_policy(BlockSizePolicy::new([
+        4 * 1024,
+        4 * 1024,
+        4 * 1024,
+        4 * 1024,
+        4 * 1024,
+        4 * 1024,
+        16 * 1024,
+    ]))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    flush_keys(&tree, 2_000..4_000, 0, &mut seqno);
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    assert_eq!(tree.metrics().compaction_groups_carried(), 0);
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 4_000);
+    assert_blocks_verify(&tree);
+}
+
+/// A compaction run in slices on a disk too small for a full rewrite installs
+/// each slice itself: the groups a slice copies are counted as a merge's are.
+#[test]
+fn tight_space_slices_count_the_groups_they_copy() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::MemFs;
+    use std::sync::Arc;
+
+    let folder = get_tmp_folder();
+    let mem = MemFs::with_capacity(u64::MAX);
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()?;
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    let mut seqno = 1;
+    flush_keys(&tree, 0..4_000, 0, &mut seqno);
+    let used = tree.storage_stats()?.used_bytes;
+    let tables_before = tree.table_count();
+    // Too little room for the rewrite next to its input: the merge runs in
+    // slices that punch the input as they go.
+    mem.set_capacity(used + used / 4);
+    tree.update_runtime_config(|cfg| {
+        cfg.storage_admission_check = true;
+        cfg.storage_limit_bytes = None;
+        cfg.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert!(
+        tree.table_count() > tables_before,
+        "the merge ran in slices"
+    );
+    assert!(
+        tree.metrics().compaction_groups_carried() > 0,
+        "the slices' copied groups are counted"
+    );
+    for i in 0..4_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX)?.as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    Ok(())
+}
+
 /// A tree keeping no zone map has no statistics to carry along, and needs
 /// none: its groups are copied as when it keeps one.
 #[test]

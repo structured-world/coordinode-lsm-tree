@@ -21,8 +21,9 @@ pub struct CarryInputs {
     /// Where the inputs' scanners record their groups.
     pub(crate) queue: CarryQueue,
     /// Per level, whether its tables' groups may be carried into the output:
-    /// a copied page keeps the encoding it was written with, so only a level
-    /// whose pages the output's level would encode the same way qualifies.
+    /// a copied group keeps the encodings and the row group and page sizes
+    /// it was written with, so only a level whose groups the output's level
+    /// would write the same way qualifies.
     levels: alloc::vec::Vec<bool>,
 }
 
@@ -46,9 +47,19 @@ impl CarryInputs {
         {
             return None;
         }
-        let dest_encoding = config.column_encoding_policy.get(dest_level);
+        // A copied group keeps its row group and page sizes as well as its
+        // encodings, so only a level that cuts them as the output's does
+        // writes groups the output's level would have written.
+        let shape = |level: usize| {
+            (
+                config.column_encoding_policy.get(level),
+                config.columnar_row_group_size_policy.get(level),
+                config.columnar_page_size_policy.get(level),
+            )
+        };
+        let dest_shape = shape(dest_level);
         let levels = (0..version.iter_levels().count())
-            .map(|level| config.column_encoding_policy.get(level) == dest_encoding)
+            .map(|level| shape(level) == dest_shape)
             .collect();
         Some(Self {
             queue: CarryQueue::default(),

@@ -1529,7 +1529,9 @@ impl MultiWriter {
                 self.tombstone_share.open_output(&first.key.user_key);
             }
         }
-        let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
+        // A table records one value layout: a group stored the other way
+        // starts the next table, a run of groups stored one way shares it.
+        let layout_changes = self.value_layout.is_some_and(|current| current != layout);
         if layout_changes || (self.table_full() && self.rotation_sheds(&first.key.user_key, (0, 0)))
         {
             self.rotate()?;

@@ -535,6 +535,13 @@ impl ProducedOutput {
         self.carried = (carried.groups, carried.partial_groups, carried.bytes);
     }
 
+    /// What the run copied instead of encoding, as groups, partly copied
+    /// groups and bytes, for the tight-space loop, which installs its slices
+    /// itself.
+    pub(super) fn carried(&self) -> (u64, u64, u64) {
+        self.carried
+    }
+
     /// Builds the output for a merge-on-read relocation: the `created` segment
     /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
     /// `deleted` source segment, with no blob files and no fragmentation. Lets
@@ -613,6 +620,31 @@ pub(super) trait CompactionFlavour {
         blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
     ) -> crate::Result<ProducedOutput>;
+}
+
+/// Charges the counters an installed output moves: the blob bytes its
+/// relocation copied, and the groups, partly copied groups and bytes it
+/// copied instead of encoding. Every path that installs an output calls it
+/// once the version edit is published.
+#[cfg(feature = "metrics")]
+pub(super) fn charge_installed(
+    metrics: &crate::metrics::Metrics,
+    relocated_bytes: u64,
+    carried: (u64, u64, u64),
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    metrics
+        .blob_bytes_relocated
+        .fetch_add(relocated_bytes, Relaxed);
+    metrics
+        .compaction_groups_carried
+        .fetch_add(carried.0, Relaxed);
+    metrics
+        .compaction_groups_partly_carried
+        .fetch_add(carried.1, Relaxed);
+    metrics
+        .compaction_bytes_carried
+        .fetch_add(carried.2, Relaxed);
 }
 
 /// Installs one atomic version edit replacing `payload.table_ids` with the SSTs
@@ -820,21 +852,7 @@ pub(super) fn install_merge(
             .record(published, released_objects, []);
     }
     #[cfg(feature = "metrics")]
-    {
-        use core::sync::atomic::Ordering::Relaxed;
-        opts.metrics
-            .blob_bytes_relocated
-            .fetch_add(relocated_bytes, Relaxed);
-        opts.metrics
-            .compaction_groups_carried
-            .fetch_add(carried.0, Relaxed);
-        opts.metrics
-            .compaction_groups_partly_carried
-            .fetch_add(carried.1, Relaxed);
-        opts.metrics
-            .compaction_bytes_carried
-            .fetch_add(carried.2, Relaxed);
-    }
+    charge_installed(&opts.metrics, relocated_bytes, carried);
     #[cfg(not(feature = "metrics"))]
     let _ = (relocated_bytes, carried);
 
