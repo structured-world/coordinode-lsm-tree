@@ -1339,10 +1339,14 @@ fn subcompaction_boundaries(
 }
 
 /// Turns interior boundary keys into `boundaries.len() + 1` disjoint key ranges
-/// that partition the whole key space: `(Unbounded, Excluded(b0))`,
-/// `[Included(b_i), Excluded(b_{i+1}))`, …, `[Included(b_last), Unbounded)`.
+/// that partition the whole key space: `(Unbounded, Included(b0)]`,
+/// `(Excluded(b_i), Included(b_{i+1})]`, …, `(Excluded(b_last), Unbounded)`.
 /// Every entry falls in exactly one range, so the sub-compaction outputs union
 /// to the same set the serial compaction would produce.
+///
+/// A boundary is the last key of a table of the level written into, so it
+/// closes its range: the table's rows, its last row group's included, lie in
+/// one range, which can then copy that group whole.
 #[cfg(feature = "std")]
 fn ranges_from_boundaries(
     boundaries: &[UserKey],
@@ -1351,8 +1355,8 @@ fn ranges_from_boundaries(
     let mut ranges = Vec::with_capacity(boundaries.len() + 1);
     let mut lo = Unbounded;
     for b in boundaries {
-        ranges.push((lo.clone(), Excluded(b.clone())));
-        lo = Included(b.clone());
+        ranges.push((lo.clone(), Included(b.clone())));
+        lo = Excluded(b.clone());
     }
     ranges.push((lo, Unbounded));
     ranges
@@ -2576,7 +2580,7 @@ fn run_subcompaction(
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
     #[cfg(feature = "columnar")]
-    produced.set_carried(carried.groups, carried.bytes);
+    produced.set_carried(carried);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }
@@ -3895,7 +3899,7 @@ fn merge_tables(
         })?;
     produce_output.set_released_objects(released_objects);
     #[cfg(feature = "columnar")]
-    produce_output.set_carried(carried.groups, carried.bytes);
+    produce_output.set_carried(carried);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
     }
@@ -3958,6 +3962,14 @@ impl super::carry::CarrySink for FlavourSink<'_> {
         candidate: &crate::table::group_carry::CarryCandidate,
     ) -> crate::Result<bool> {
         self.flavour.carry(candidate, self.pace)
+    }
+
+    fn carry_pages(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        emitted: &[InternalValue],
+    ) -> crate::Result<Option<u64>> {
+        self.flavour.carry_pages(candidate, emitted, self.pace)
     }
 }
 

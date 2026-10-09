@@ -140,6 +140,41 @@ fn compaction_interleaved_versions_rewrites_only_their_groups() {
     assert_blocks_verify(&tree);
 }
 
+/// One key updated in a second table lands in one row page of one group:
+/// that group is rebuilt around the pages of its other row pages, copied as
+/// they lie, every other group is copied whole, and both versions of the key
+/// read back.
+#[test]
+fn compaction_one_updated_row_copies_the_rest_of_its_group() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    let groups = row_groups(&tree);
+    let before = seqno;
+    flush_keys(&tree, 1_000..1_001, 1, &mut seqno);
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    let metrics = tree.metrics();
+    assert_eq!(metrics.compaction_groups_partly_carried(), 1);
+    assert_eq!(metrics.compaction_groups_carried(), groups - 1);
+    for i in 0..2_000 {
+        let round = u32::from(i == 1_000);
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, round).as_slice()),
+            "latest of key {i}",
+        );
+    }
+    assert_eq!(
+        tree.get(key(1_000), before).expect("get").as_deref(),
+        Some(value(1_000, 0).as_slice()),
+    );
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 2_000);
+    assert_blocks_verify(&tree);
+}
+
 /// At the bottom level, a merge with the watermark above every seqno writes
 /// them as zero, which changes every row: nothing is copied, and the output
 /// reads the same. A later merge of that output, whose rows are already at
@@ -324,6 +359,128 @@ fn compaction_carried_cell_rows_keep_owning_their_objects() -> lsm_tree::Result<
     tree.major_compact(64_000_000, SeqNo::MAX)?;
     assert_eq!(tree.blob_file_count(), 0, "the bodies were let go once");
     Ok(())
+}
+
+/// A user compaction filter runs on every row as it does without carrying:
+/// the rows it replaces come out with their new values, which the groups
+/// holding them are rewritten for, and every other group is copied.
+#[test]
+fn compaction_filter_replacing_values_rewrites_only_their_groups() {
+    use lsm_tree::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use std::sync::Arc;
+
+    struct Replace;
+    impl CompactionFilter for Replace {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> lsm_tree::Result<Verdict> {
+            let replaced = (1_000..1_010).any(|i| &item.key()[..] == key(i).as_slice());
+            Ok(if replaced {
+                Verdict::ReplaceValue(b"replaced".to_vec().into())
+            } else {
+                Verdict::Keep
+            })
+        }
+    }
+    struct ReplaceFactory;
+    impl Factory for ReplaceFactory {
+        fn name(&self) -> &str {
+            "replace"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(Replace)
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_compaction_filter_factory(Some(Arc::new(ReplaceFactory)))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    let groups = row_groups(&tree);
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    let carried = tree.metrics().compaction_groups_carried();
+    assert!(carried > 0 && carried < groups, "{carried} of {groups}");
+    for i in 0..2_000 {
+        let expected = if (1_000..1_010).contains(&i) {
+            b"replaced".to_vec()
+        } else {
+            value(i, 0)
+        };
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(expected.as_slice()),
+            "key {i}",
+        );
+    }
+    assert_blocks_verify(&tree);
+}
+
+/// An encrypted table's blocks are bound to its id: nothing is copied into
+/// another table, and every block of the output verifies as its own.
+#[test]
+#[cfg(feature = "encryption")]
+fn compaction_encrypted_tree_carries_nothing() {
+    use std::sync::Arc;
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_encryption(Some(Arc::new(lsm_tree::Aes256GcmProvider::new(
+        &[0x42; 32],
+    ))))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..1_000, 0, &mut seqno);
+    flush_keys(&tree, 1_000..2_000, 0, &mut seqno);
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    assert_eq!(tree.metrics().compaction_groups_carried(), 0);
+    for i in 0..2_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_blocks_verify(&tree);
 }
 
 /// An output of another data codec cannot take the input's pages as they are:

@@ -1411,6 +1411,47 @@ impl MultiWriter {
         rows: &[InternalValue],
         columns: Vec<crate::table::zone_map::ColumnStats>,
     ) -> crate::Result<bool> {
+        self.carry_into((compression, layout), rows, |writer, comparator| {
+            writer.append_carried_row_group((raw, source), group, layout, rows, columns, comparator)
+        })
+    }
+
+    /// Writes `rows` as one group that copies the pages `carry` names from
+    /// another table's group, encoding the rest (see
+    /// [`Writer::append_partly_carried_row_group`]); `compression` is the
+    /// source's data codec. The group's first key is taken as [`Self::write`]
+    /// takes a new key.
+    ///
+    /// Returns `false`, having written none of it, when the group cannot be
+    /// written so; the caller then writes `rows` through [`Self::write`].
+    ///
+    /// # Errors
+    ///
+    /// Any error of the rotation or of the write.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn carry_row_pages(
+        &mut self,
+        rows: &[InternalValue],
+        carry: &super::writer::PageCarry<'_>,
+        compression: CompressionType,
+    ) -> crate::Result<bool> {
+        self.carry_into(
+            (compression, crate::table::meta::ValueLayout::Whole),
+            rows,
+            |writer, comparator| writer.append_partly_carried_row_group(rows, carry, comparator),
+        )
+    }
+
+    /// Takes `rows`' first key as [`Self::write`] takes a new key and has
+    /// `write` put the group in the current table, when this run writes the
+    /// copied pages' transform; `false`, having written nothing, otherwise.
+    #[cfg(feature = "columnar")]
+    fn carry_into(
+        &mut self,
+        (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
+        rows: &[InternalValue],
+        write: impl FnOnce(&mut Writer, &crate::comparator::SharedComparator) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
         let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
             return Ok(false);
         };
@@ -1453,14 +1494,7 @@ impl MultiWriter {
         }
 
         let comparator = self.comparator.clone();
-        if !self.writer.append_carried_row_group(
-            (raw, source),
-            group,
-            layout,
-            rows,
-            columns,
-            &comparator,
-        )? {
+        if !write(&mut self.writer, &comparator)? {
             return Ok(false);
         }
         // The group's later keys move the tombstone share as written rows

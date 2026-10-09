@@ -67,8 +67,8 @@ impl CarryInputs {
     }
 }
 
-/// Where the rows the merge emitted go: written one by one, or a whole group
-/// copied in their place.
+/// Where the rows the merge emitted go: written one by one, a whole group
+/// copied in their place, or a group rebuilt around the pages it copies.
 pub trait CarrySink {
     /// Writes one row.
     fn write(&mut self, row: InternalValue) -> crate::Result<()>;
@@ -76,28 +76,43 @@ pub trait CarrySink {
     /// Copies `candidate`'s group in place of its rows, returning `false`
     /// when this output cannot take it as it is.
     fn carry(&mut self, candidate: &CarryCandidate) -> crate::Result<bool>;
+
+    /// Writes `emitted`, what the merge made of `candidate`'s key range, as
+    /// one group that copies the candidate's pages on the row pages it left
+    /// as they were, returning the bytes of the pages copied, or `None`,
+    /// having written nothing, when it cannot.
+    fn carry_pages(
+        &mut self,
+        candidate: &CarryCandidate,
+        emitted: &[InternalValue],
+    ) -> crate::Result<Option<u64>>;
 }
 
-/// What a compaction copied whole.
+/// What a compaction copied instead of encoding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Carried {
-    /// Row groups copied.
+    /// Row groups copied whole.
     pub(crate) groups: u64,
     /// Rows those groups hold.
     pub(crate) rows: u64,
-    /// Their bytes on disk.
+    /// Groups rebuilt around some of their pages, copied.
+    pub(crate) partial_groups: u64,
+    /// The bytes on disk copied, whole groups and pages together.
     pub(crate) bytes: u64,
 }
 
-/// Watches the rows a merge emits for runs that are a candidate's whole group.
+/// A candidate whose key range the merge is emitting, and what it emitted.
+struct Open {
+    candidate: CarryCandidate,
+    emitted: alloc::vec::Vec<InternalValue>,
+}
+
+/// Watches the rows a merge emits for the key ranges of the candidates.
 pub struct CarryMatcher {
     queue: CarryQueue,
     comparator: crate::comparator::SharedComparator,
-    /// The candidate whose rows the merge is emitting, with how many it has.
-    open: Option<(CarryCandidate, usize)>,
-    /// A candidate the merge emitted whole, held until a row of another key
-    /// shows that its last key does not go on past it.
-    complete: Option<CarryCandidate>,
+    /// The candidate whose key range the merge is emitting.
+    open: Option<Open>,
     /// The key of the last row passed on, written or held.
     last_key: Option<UserKey>,
     carried: Carried,
@@ -110,7 +125,6 @@ impl CarryMatcher {
             queue,
             comparator,
             open: None,
-            complete: None,
             last_key: None,
             carried: Carried::default(),
         }
@@ -126,37 +140,39 @@ impl CarryMatcher {
         row: InternalValue,
         sink: &mut dyn CarrySink,
     ) -> crate::Result<()> {
-        if let Some(complete) = self.complete.take() {
-            let continues = complete.rows.last().is_some_and(|last| {
-                crate::comparator::same_user_key(&last.key.user_key, &row.key.user_key)
+        if let Some(mut open) = self.open.take() {
+            let within = open.candidate.rows.last().is_some_and(|last| {
+                self.comparator
+                    .compare(&row.key.user_key, &last.key.user_key)
+                    != core::cmp::Ordering::Greater
             });
-            if continues {
-                Self::write_rows(&complete.rows, sink)?;
-            } else {
-                self.carry(&complete, sink)?;
-            }
-        }
-
-        if let Some((candidate, matched)) = self.open.take() {
-            if candidate
-                .rows
-                .get(matched)
-                .is_some_and(|next| same_row(next, &row))
-            {
-                self.pass(candidate, matched + 1, &row);
+            if within {
+                open.emitted.push(row);
+                // A range the merge filled far past the group's rows is no
+                // group of the source's shape any more; it goes out as rows,
+                // which bounds what is held to about two groups.
+                if open.emitted.len() > 2 * open.candidate.rows.len() {
+                    self.last_key = open.emitted.last().map(|r| r.key.user_key.clone());
+                    Self::write_rows(&open.emitted, sink)?;
+                } else {
+                    self.open = Some(open);
+                }
                 return Ok(());
             }
-            Self::write_rows(candidate.rows.get(..matched).unwrap_or_default(), sink)?;
+            self.resolve(open, sink)?;
         }
 
-        // A group starts a key: one whose first key continues the key passed
-        // on last would split that key's versions across the copy's edge.
+        // A group starts a key: one whose range opens on the key passed on
+        // last would split that key's versions across the copy's edge.
         let continues_last = self
             .last_key
             .as_ref()
             .is_some_and(|last| crate::comparator::same_user_key(last, &row.key.user_key));
-        if !continues_last && let Some(candidate) = self.take_starting_with(&row) {
-            self.pass(candidate, 1, &row);
+        if !continues_last && let Some(candidate) = self.take_covering(&row) {
+            self.open = Some(Open {
+                candidate,
+                emitted: alloc::vec![row],
+            });
             return Ok(());
         }
 
@@ -170,38 +186,56 @@ impl CarryMatcher {
     ///
     /// Any error of the sink.
     pub(crate) fn finish(mut self, sink: &mut dyn CarrySink) -> crate::Result<Carried> {
-        if let Some(complete) = self.complete.take() {
-            self.carry(&complete, sink)?;
-        }
-        if let Some((candidate, matched)) = self.open.take() {
-            Self::write_rows(candidate.rows.get(..matched).unwrap_or_default(), sink)?;
+        if let Some(open) = self.open.take() {
+            self.resolve(open, sink)?;
         }
         Ok(self.carried)
     }
 
-    /// Records that `candidate`'s first `matched` rows came out of the merge,
-    /// `row` the last of them.
-    fn pass(&mut self, candidate: CarryCandidate, matched: usize, row: &InternalValue) {
-        self.last_key = Some(row.key.user_key.clone());
-        if matched == candidate.rows.len() {
-            self.complete = Some(candidate);
-        } else {
-            self.open = Some((candidate, matched));
+    /// Writes what the merge emitted over `open`'s key range: the group as it
+    /// lies when that is exactly its rows, else a group copying the pages of
+    /// the row pages it left as they were, else the rows.
+    fn resolve(&mut self, open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
+        let Open { candidate, emitted } = open;
+        self.last_key = emitted.last().map(|row| row.key.user_key.clone());
+        let unchanged = emitted.len() == candidate.rows.len()
+            && emitted
+                .iter()
+                .zip(candidate.rows.iter())
+                .all(|(row, read)| same_row(read, row));
+        if unchanged {
+            if sink.carry(&candidate)? {
+                self.carried.groups += 1;
+                self.carried.rows += candidate.rows.len() as u64;
+                self.carried.bytes += u64::from(candidate.group.size());
+                return Ok(());
+            }
+        } else if let Some(bytes) = sink.carry_pages(&candidate, &emitted)? {
+            self.carried.partial_groups += 1;
+            self.carried.bytes += bytes;
+            return Ok(());
         }
+        Self::write_rows(&emitted, sink)
     }
 
-    /// The candidate whose first row is `row`, taken from the queue, after
-    /// dropping every candidate the merge has moved past: rows come out in
-    /// key order, so one whose first key sorts below `row`'s can no longer
-    /// start.
-    fn take_starting_with(&self, row: &InternalValue) -> Option<CarryCandidate> {
+    /// The candidate whose key range holds `row`'s key, taken from the queue,
+    /// after dropping every candidate the merge has moved past: rows come out
+    /// in key order, so one whose last key sorts below `row`'s can no longer
+    /// be reached.
+    fn take_covering(&self, row: &InternalValue) -> Option<CarryCandidate> {
+        use core::cmp::Ordering::{Greater, Less};
+
+        let key = &row.key.user_key;
         let mut queue = self.queue.lock();
         let mut found = None;
         queue.retain(|candidate| {
-            let Some(first) = candidate.rows.first() else {
+            let (Some(first), Some(last)) = (candidate.rows.first(), candidate.rows.last()) else {
                 return false;
             };
-            if found.is_none() && same_row(first, row) {
+            if self.comparator.compare(&last.key.user_key, key) == Less {
+                return false;
+            }
+            if found.is_none() && self.comparator.compare(&first.key.user_key, key) != Greater {
                 found = Some(CarryCandidate {
                     table: candidate.table.clone(),
                     group: candidate.group,
@@ -209,23 +243,9 @@ impl CarryMatcher {
                 });
                 return false;
             }
-            self.comparator
-                .compare(&first.key.user_key, &row.key.user_key)
-                != core::cmp::Ordering::Less
+            true
         });
         found
-    }
-
-    /// Copies `candidate`'s group, or writes its rows when the sink refuses it.
-    fn carry(&mut self, candidate: &CarryCandidate, sink: &mut dyn CarrySink) -> crate::Result<()> {
-        if sink.carry(candidate)? {
-            self.carried.groups += 1;
-            self.carried.rows += candidate.rows.len() as u64;
-            self.carried.bytes += u64::from(candidate.group.size());
-            Ok(())
-        } else {
-            Self::write_rows(&candidate.rows, sink)
-        }
     }
 
     /// Writes `rows` one by one: rows the merge emitted that are not copied.
@@ -233,6 +253,87 @@ impl CarryMatcher {
         rows.iter().try_for_each(|row| sink.write(row.clone()))
     }
 }
+
+/// How `emitted`, what the merge made of a group's key range, is cut into
+/// row pages that keep the group's: the rows of each, one row page per source
+/// row page, and which of them are the source's own, exactly its rows, so
+/// their pages can be copied. `None` when no row page is the source's, or the
+/// rows cannot be cut into as many non-empty row pages as the source has.
+///
+/// `source` are the group's rows and `source_pages` the rows of each of its
+/// row pages. A row page whose rows come out unchanged and in place is kept;
+/// the rows between two kept ones, or after the last, are spread over the row
+/// pages between them, so every row page keeps its ordinal, which a copied
+/// page's stamp names.
+pub fn align_row_pages(
+    source: &[InternalValue],
+    source_pages: &[u32],
+    emitted: &[InternalValue],
+) -> Option<(alloc::vec::Vec<u32>, alloc::vec::Vec<bool>)> {
+    // The source rows of each row page.
+    let mut spans = alloc::vec::Vec::with_capacity(source_pages.len());
+    let mut start = 0usize;
+    for &rows in source_pages {
+        let end = start + rows as usize;
+        spans.push(source.get(start..end)?);
+        start = end;
+    }
+    let matches_at = |span: &[InternalValue], at: usize| {
+        emitted
+            .get(at..at + span.len())
+            .is_some_and(|rows| rows.iter().zip(span).all(|(row, read)| same_row(read, row)))
+    };
+
+    let mut rows = alloc::vec::Vec::with_capacity(spans.len());
+    let mut copied = alloc::vec::Vec::with_capacity(spans.len());
+    let mut at = 0usize;
+    let mut page = 0usize;
+    while let Some(span) = spans.get(page) {
+        if matches_at(span, at) {
+            rows.push(u32::try_from(span.len()).ok()?);
+            copied.push(true);
+            at += span.len();
+            page += 1;
+            continue;
+        }
+        // A run of changed row pages ends where a later one is found in
+        // place, or at the end of what was emitted.
+        let (next_page, next_at) = (page + 1..spans.len())
+            .find_map(|later| {
+                let later_span = spans.get(later)?;
+                (at..=emitted.len().checked_sub(later_span.len())?)
+                    .find(|&from| matches_at(later_span, from))
+                    .map(|from| (later, from))
+            })
+            .unwrap_or((spans.len(), emitted.len()));
+        let pages = next_page - page;
+        let available = next_at - at;
+        if available < pages {
+            return None;
+        }
+        // Spread as evenly as the counts allow, every row page non-empty.
+        for share in 0..pages {
+            let take = available / pages + usize::from(share < available % pages);
+            rows.push(u32::try_from(take).ok()?);
+            copied.push(false);
+        }
+        at = next_at;
+        page = next_page;
+    }
+    // Rows left past the last row page, later versions of its last key or
+    // keys a kept last row page did not hold, join it.
+    if at < emitted.len() {
+        let extra = u32::try_from(emitted.len() - at).ok()?;
+        let last = rows.last_mut()?;
+        *last = last.checked_add(extra)?;
+        *copied.last_mut()? = false;
+    }
+    copied.contains(&true).then_some((rows, copied))
+}
+
+#[cfg(test)]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+mod tests;
 
 /// Whether the merge emitted `row` exactly as `read`: the same key, version,
 /// kind and value. A row the merge rewrote, re-seqnoed or replaced with

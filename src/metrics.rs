@@ -160,7 +160,12 @@ pub struct Metrics {
     /// the outputs are installed.
     pub(crate) compaction_groups_carried: AtomicU64,
 
-    /// The on-disk bytes of those groups.
+    /// Columnar row groups compactions rebuilt around pages they copied from
+    /// an input's group, encoding only the row pages the merge changed.
+    /// Charged when the outputs are installed.
+    pub(crate) compaction_groups_partly_carried: AtomicU64,
+
+    /// The on-disk bytes copied instead of encoded: whole groups and pages.
     pub(crate) compaction_bytes_carried: AtomicU64,
 
     /// Number of index block bytes that were requested from OS or disk
@@ -402,9 +407,16 @@ impl Metrics {
         self.compaction_groups_carried.load(Relaxed)
     }
 
-    /// On-disk bytes of the row groups in
-    /// [`Self::compaction_groups_carried`]: what compactions wrote without
-    /// encoding it again.
+    /// Columnar row groups compactions rebuilt around the pages of an
+    /// input's group that the merge left as they were: only the row pages it
+    /// changed were encoded again.
+    pub fn compaction_groups_partly_carried(&self) -> u64 {
+        self.compaction_groups_partly_carried.load(Relaxed)
+    }
+
+    /// On-disk bytes compactions copied instead of encoding them again: the
+    /// row groups of [`Self::compaction_groups_carried`] and the pages of
+    /// [`Self::compaction_groups_partly_carried`].
     pub fn compaction_bytes_carried(&self) -> u64 {
         self.compaction_bytes_carried.load(Relaxed)
     }
