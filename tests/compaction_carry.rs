@@ -191,6 +191,7 @@ fn compaction_carried_split_groups_share_a_table() -> lsm_tree::Result<()> {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1024))
     .open()?;
     let AnyTree::Standard(tree) = &any else {
         panic!("expected standard tree");
@@ -200,10 +201,10 @@ fn compaction_carried_split_groups_share_a_table() -> lsm_tree::Result<()> {
         cfg.data_block_compression_policy =
             lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
     })?;
-    // Five batches of disjoint keys, each one row group whose value is a
-    // fixed-4 sub-column.
+    // Batches of disjoint keys whose value is a fixed-4 sub-column, each far
+    // past a row group's size, so the ingestion writes several groups.
     let batches = 5u32;
-    let rows = 50u32;
+    let rows = 2_000u32;
     let mut ingestion = any.ingestion()?;
     for b in 0..batches {
         let entries: Vec<InternalValue> = (0..rows)
@@ -229,12 +230,19 @@ fn compaction_carried_split_groups_share_a_table() -> lsm_tree::Result<()> {
             .all(|t| t.global_seqno() == 0),
         "the first ingestion's groups can be copied"
     );
+    let groups_in = row_groups(tree);
+    let tables_in = tree.current_version().iter_tables().count();
+    assert!(
+        groups_in > 1,
+        "the ingestion wrote several groups: {groups_in} in {tables_in} tables"
+    );
 
     tree.major_compact(64 * 1024 * 1024, 0)?;
 
     assert_eq!(
         tree.metrics().compaction_groups_carried(),
-        u64::from(batches)
+        groups_in,
+        "{tables_in} input tables"
     );
     assert_eq!(
         tree.current_version().iter_tables().count(),
