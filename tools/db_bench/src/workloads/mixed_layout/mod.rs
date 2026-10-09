@@ -94,6 +94,10 @@ struct LatencyPass {
 /// payload bytes the rewrite wrote.
 type UpdateFn = fn(&Fixture) -> lsm_tree::Result<UpdatePass>;
 
+/// Checks what an update pass left against the write history, run after the
+/// measured window so its reads are not counted as the update's.
+type VerifyFn = fn(&Fixture) -> lsm_tree::Result<()>;
+
 /// What an update pass measured beyond the tree's counters.
 struct UpdatePass {
     rows: u64,
@@ -113,8 +117,8 @@ enum Support {
     /// of its repetitions.
     Latency(LatencyFn),
     /// Rewrites rows through this pass and reports the payload bytes the
-    /// rewrite wrote per updated row.
-    Update(UpdateFn),
+    /// rewrite wrote per updated row, then checks the rows with the second.
+    Update(UpdateFn, VerifyFn),
     /// Rewrites the fixture in rounds of flushes and compactions, reports what
     /// collecting the stale blobs cost, then measures a full scan of what is
     /// left, so placement's two costs come from one run.
@@ -816,9 +820,9 @@ fn updated_bucket(seed: u64) -> u64 {
 /// its payload by reference, flushes, and counts the blob bytes the flush
 /// wrote: a metadata-only update should write none.
 ///
-/// Each row is then read back and checked against the write history with the
-/// new field, so an update that lost its payload or kept the old field fails
-/// instead of reporting zero.
+/// The rows are checked afterwards by [`verify_metadata_update`], outside the
+/// measured window: reading every payload back would otherwise be counted as
+/// the update's own read cost.
 #[expect(
     clippy::expect_used,
     reason = "a visible row that does not read back, or a payload that is not a reference, is a wrong result, and a verify pass panics on one"
@@ -829,7 +833,7 @@ fn cells_metadata_update(fixture: &Fixture) -> lsm_tree::Result<UpdatePass> {
     let AnyTree::Blob(blob) = &fixture.tree else {
         panic!("a metadata-only update needs a blob tree");
     };
-    let fixtures::Shape::Cells { spread } = fixture.shape else {
+    let fixtures::Shape::Cells { .. } = fixture.shape else {
         panic!("a metadata-only update needs a cell-row fixture");
     };
     let (files_before, bytes_before): (Vec<_>, _) = {
@@ -874,8 +878,22 @@ fn cells_metadata_update(fixture: &Fixture) -> lsm_tree::Result<UpdatePass> {
             .all(|&id| after.blob_files.contains_key(id)),
         "a blob file went during the update, so the size difference is not what it wrote",
     );
-    let payload_written = after.blob_files.on_disk_size() - bytes_before;
+    Ok(UpdatePass {
+        rows,
+        payload_written: after.blob_files.on_disk_size() - bytes_before,
+    })
+}
 
+/// Reads every row back after [`cells_metadata_update`] and checks it against
+/// the write history with the new field and its payload, so an update that
+/// lost a payload or kept the old field fails instead of reporting zero.
+fn verify_metadata_update(fixture: &Fixture) -> lsm_tree::Result<()> {
+    let AnyTree::Blob(blob) = &fixture.tree else {
+        panic!("a metadata-only update needs a blob tree");
+    };
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a metadata-only update needs a cell-row fixture");
+    };
     for row in &fixture.oracle.rows {
         let Some(value) = row.expect else { continue };
         let [group, _, cluster, spread_field] = fixtures::cell_fields(value.seed, spread);
@@ -895,10 +913,7 @@ fn cells_metadata_update(fixture: &Fixture) -> lsm_tree::Result<UpdatePass> {
             String::from_utf8_lossy(&row.key),
         );
     }
-    Ok(UpdatePass {
-        rows,
-        payload_written,
-    })
+    Ok(())
 }
 
 /// ~1% of the scattered blobs: the payload of the rows the predicate drops is
@@ -1227,7 +1242,7 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
         Scenario {
             name: "metadata-only-update",
             fixture: fixtures::cells_wide,
-            support: Support::Update(cells_metadata_update),
+            support: Support::Update(cells_metadata_update, verify_metadata_update),
         },
         Scenario {
             name: "cells-scan-sparse-clustered",
@@ -1413,7 +1428,7 @@ impl Workload for MixedLayout {
                         );
                     }
                 }
-                Support::Update(pass) => {
+                Support::Update(pass, verify) => {
                     let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
                     let t = Instant::now();
                     let keys = fixture.oracle.rows.len() as u64;
@@ -1424,6 +1439,7 @@ impl Workload for MixedLayout {
                         Ok(measured.rows)
                     })?;
                     reporter.record_duration(t.elapsed());
+                    verify(&fixture)?;
                     readings.report(name);
                     readings.publish(name, reporter);
                     // Engine-counted bytes, so a cost; zero is the expected

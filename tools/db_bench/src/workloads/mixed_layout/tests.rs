@@ -77,14 +77,26 @@ const ALL_FIXTURES: [(&str, fixtures::FixtureFn); 16] = [
 ];
 
 /// The metadata-only update rewrites every visible row and its flush writes
-/// no payload bytes, each row reading back with the new field (the pass
-/// checks that itself and panics otherwise).
+/// no payload bytes, each row reading back with the new field (the check
+/// panics otherwise).
 #[test]
 fn a_metadata_only_update_writes_no_payload_bytes() -> lsm_tree::Result<()> {
     let fixture = build(fixtures::cells_wide)?;
     let pass = super::cells_metadata_update(&fixture)?;
     assert_eq!(pass.rows, fixture.oracle.visible());
     assert_eq!(pass.payload_written, 0);
+    super::verify_metadata_update(&fixture)
+}
+
+/// The update pass reads each row's header and passes its payload on by
+/// reference, so it fetches no blob: its read counters are published as the
+/// update's cost, and a read-back of every payload inside them would be.
+#[test]
+fn a_metadata_only_update_pass_fetches_no_payload() -> lsm_tree::Result<()> {
+    let fixture = build(fixtures::cells_wide)?;
+    let before = fixture.tree.metrics().blob_read_count();
+    super::cells_metadata_update(&fixture)?;
+    assert_eq!(fixture.tree.metrics().blob_read_count(), before);
     Ok(())
 }
 
