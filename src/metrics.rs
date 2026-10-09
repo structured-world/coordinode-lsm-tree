@@ -155,6 +155,14 @@ pub struct Metrics {
     /// so a relocation that fails before install moves nothing.
     pub(crate) blob_bytes_relocated: AtomicU64,
 
+    /// Columnar row groups compactions copied into their output whole, as
+    /// they lay on disk, instead of encoding their rows again. Charged when
+    /// the outputs are installed.
+    pub(crate) compaction_groups_carried: AtomicU64,
+
+    /// The on-disk bytes of those groups.
+    pub(crate) compaction_bytes_carried: AtomicU64,
+
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
 
@@ -383,6 +391,22 @@ impl Metrics {
     /// freed, which placement moves by deciding which values share a file.
     pub fn blob_bytes_relocated(&self) -> u64 {
         self.blob_bytes_relocated.load(Relaxed)
+    }
+
+    /// Columnar row groups compactions copied into their output as they lay
+    /// on disk, because the merge left every row of them as it was.
+    ///
+    /// Each one is a group whose pages were neither decoded for writing nor
+    /// encoded and compressed again.
+    pub fn compaction_groups_carried(&self) -> u64 {
+        self.compaction_groups_carried.load(Relaxed)
+    }
+
+    /// On-disk bytes of the row groups in
+    /// [`Self::compaction_groups_carried`]: what compactions wrote without
+    /// encoding it again.
+    pub fn compaction_bytes_carried(&self) -> u64 {
+        self.compaction_bytes_carried.load(Relaxed)
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

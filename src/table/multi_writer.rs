@@ -1388,6 +1388,99 @@ impl MultiWriter {
         Ok(())
     }
 
+    /// Writes `raw`, a row group of another table copied whole, in place of its
+    /// `rows`, which the compaction would otherwise write one by one; `group`
+    /// is its index entry there, `layout` how its values are stored and
+    /// `columns` its zone-map statistics. The group's first key is taken as
+    /// [`Self::write`] takes a new key, rotating first when the table is full.
+    ///
+    /// Returns `false` when the group cannot be copied here, having written
+    /// none of it: one that does not start a new key, or one the current
+    /// table refuses (see [`Writer::append_carried_row_group`]). The caller
+    /// then writes `rows` through [`Self::write`].
+    ///
+    /// # Errors
+    ///
+    /// Any error of the rotation or of the copy.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn carry_row_group(
+        &mut self,
+        (raw, source): (&[u8], super::writer::VerbatimSource),
+        group: super::index_block::RowGroupRef,
+        (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
+        rows: &[InternalValue],
+        columns: Vec<crate::table::zone_map::ColumnStats>,
+    ) -> crate::Result<bool> {
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Ok(false);
+        };
+        // The copied pages keep the transform they were written under: this
+        // run's must be the same, so a read of the copy decodes them with the
+        // codec and dictionary its table names, and an encrypted or parity
+        // run gets blocks bound to its own identity and scheme.
+        if self.encryption.is_some()
+            || self.ecc.is_some()
+            || self.data_block_compression != compression
+        {
+            return Ok(false);
+        }
+        // A key's versions stay in one output, and a group that continues the
+        // key written last would split them across the copy's boundary.
+        if self
+            .current_key
+            .as_ref()
+            .is_some_and(|c| crate::comparator::same_user_key(c, &first.key.user_key))
+        {
+            return Ok(false);
+        }
+        let first_key = self.current_key.is_none();
+        self.current_key = Some(first.key.user_key.clone());
+        if !self.range_tombstones.is_empty() {
+            self.tombstone_share.advance(
+                &self.range_tombstones,
+                &first.key.user_key,
+                self.comparator.as_ref(),
+            );
+            if first_key && self.clip_range_tombstones {
+                self.tombstone_share.open_output(&first.key.user_key);
+            }
+        }
+        let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
+        if layout_changes || (self.table_full() && self.rotation_sheds(&first.key.user_key, (0, 0)))
+        {
+            self.rotate()?;
+            self.tombstone_share.open_output(&first.key.user_key);
+        }
+
+        let comparator = self.comparator.clone();
+        if !self.writer.append_carried_row_group(
+            (raw, source),
+            group,
+            layout,
+            rows,
+            columns,
+            &comparator,
+        )? {
+            return Ok(false);
+        }
+        // The group's later keys move the tombstone share as written rows
+        // would; it only moves forward, so its last key is enough.
+        if !self.range_tombstones.is_empty() {
+            self.tombstone_share.advance(
+                &self.range_tombstones,
+                &last.key.user_key,
+                self.comparator.as_ref(),
+            );
+        }
+        self.current_key = Some(last.key.user_key.clone());
+        self.value_layout = Some(layout);
+        self.note_output_base();
+        if let Some(marker) = &self.transform_marker {
+            self.transforms_after_last_write = marker.load(core::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
     /// Writes a consumer-provided columnar batch as one columnar block, rotating
     /// to a fresh table first if the current one has reached the target size (a
     /// batch is a block boundary, mirroring the new-key rotation in

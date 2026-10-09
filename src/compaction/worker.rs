@@ -678,27 +678,51 @@ fn create_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
+    #[cfg(feature = "columnar")] carry: Option<&super::carry::CarryInputs>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
 
-    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(unused_variables, reason = "only a columnar build carries row groups")
+    )]
+    for (level, run) in version
+        .iter_levels()
+        .enumerate()
+        .flat_map(|(level, lvl)| lvl.iter().map(move |run| (level, run)))
+    {
+        #[cfg(feature = "columnar")]
+        let queue = carry.and_then(|carry| carry.queue_for(level));
         if run.len() > 1 {
             let Some((lo, hi)) = pick_run_indexes(run, to_compact) else {
                 continue;
             };
 
-            readers.push(Box::new(RunScanner::culled(
-                run.clone(),
-                (Some(lo), Some(hi)),
-                pace.cloned(),
-            )?));
+            let scanner = RunScanner::culled(run.clone(), (Some(lo), Some(hi)), pace.cloned())?;
+            #[cfg(feature = "columnar")]
+            let scanner = match queue {
+                Some(queue) => scanner.with_carry(Arc::clone(queue)),
+                None => scanner,
+            };
+            readers.push(Box::new(scanner));
 
             found += hi - lo + 1;
         } else {
             for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
                 found += 1;
-                readers.push(Box::new(table.scan_paced(pace)?));
+                let scanner = table.scan_paced(pace)?;
+                #[cfg(feature = "columnar")]
+                let scanner = match queue {
+                    Some(queue) if table.carries_row_groups() => {
+                        scanner.with_carry(crate::table::group_carry::GroupCarry::new(
+                            table.clone(),
+                            Arc::clone(queue),
+                        ))
+                    }
+                    _ => scanner,
+                };
+                readers.push(Box::new(scanner));
             }
         }
     }
@@ -3383,6 +3407,21 @@ fn merge_tables(
         &opts.config,
     );
 
+    // One runtime snapshot for everything this compaction writes, its tables
+    // and its filter's blob files, held until its output is installed.
+    let rc = opts.runtime_config.load_full();
+
+    // Row groups the merge leaves as they were are copied into the output
+    // instead of being encoded again (see `carry`).
+    #[cfg(feature = "columnar")]
+    let carry = super::carry::CarryInputs::plan(
+        &current_super_version.version,
+        &opts.config,
+        &rc,
+        payload.canonical_level.into(),
+        &tables,
+    );
+
     let Some(mut merge_iter) = create_compaction_stream(
         &current_super_version.version,
         &payload.table_ids.iter().copied().collect::<Vec<_>>(),
@@ -3390,6 +3429,8 @@ fn merge_tables(
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
         pace.as_ref(),
+        #[cfg(feature = "columnar")]
+        carry.as_ref(),
     )?
     else {
         log::warn!(
@@ -3460,10 +3501,6 @@ fn merge_tables(
     // This is used by the compaction filter if it wants to write new blobs
     // TODO: the filter should really pipe new blobs into the compaction stream directly,
     // TODO: but that will probably require to change the protocol between filter <-> compaction stream a bit
-    // One runtime snapshot for everything this compaction writes, its tables
-    // and its filter's blob files, held until its output is installed.
-    let rc = opts.runtime_config.load_full();
-
     let mut filter_blob_writer = None;
     // Filter-only transform counter (see `TransformCounters::filter`): read
     // after `produce` to decide the install's retention effect.
@@ -3586,29 +3623,52 @@ fn merge_tables(
     // IMPORTANT: Unlock exclusive compaction lock as we are now doing the actual (CPU-intensive) compaction
     drop(compaction_state);
 
-    hidden_guard(payload, opts, || {
-        // Propagate range tombstones to output tables BEFORE writing KV items,
-        // so that if the compactor rotates tables during the merge loop,
-        // earlier tables already carry the RT metadata.
-        //
-        // NOTE: this path does NOT GC fully-applied tombstones (unlike the
-        // parallel sub-compaction path). The serial stop-signal handling below
-        // commits whatever was written so far (`return Ok(())`), so a stop
-        // landing after this write but before the covered tail is processed
-        // could drop a below-watermark tombstone while some covered keys were
-        // never visited — resurrecting them. Tombstone GC therefore only runs in
-        // the sub-compaction path, which is atomic (it returns an error and
-        // rolls back on stop). Covered keys are still physically dropped here by
-        // the merge stream; keeping the tombstone is the conservative, correct
-        // choice when the compaction may commit partial output.
-        if !input_range_tombstones.is_empty() {
-            log::debug!(
-                "Propagating {} range tombstones to compaction output",
-                input_range_tombstones.len(),
-            );
-            compactor.write_range_tombstones(&input_range_tombstones);
-        }
+    // Propagate range tombstones to output tables BEFORE writing KV items,
+    // so that if the compactor rotates tables during the merge loop,
+    // earlier tables already carry the RT metadata.
+    //
+    // NOTE: this path does NOT GC fully-applied tombstones (unlike the
+    // parallel sub-compaction path). The serial stop-signal handling below
+    // commits whatever was written so far (`return Ok(())`), so a stop
+    // landing after this write but before the covered tail is processed
+    // could drop a below-watermark tombstone while some covered keys were
+    // never visited — resurrecting them. Tombstone GC therefore only runs in
+    // the sub-compaction path, which is atomic (it returns an error and
+    // rolls back on stop). Covered keys are still physically dropped here by
+    // the merge stream; keeping the tombstone is the conservative, correct
+    // choice when the compaction may commit partial output.
+    if !input_range_tombstones.is_empty() {
+        log::debug!(
+            "Propagating {} range tombstones to compaction output",
+            input_range_tombstones.len(),
+        );
+        compactor.write_range_tombstones(&input_range_tombstones);
+    }
 
+    // Every row the merge emits goes to the output through here: written, or,
+    // when a run of them is an input's row group as it was read, copied as
+    // the group.
+    #[cfg(feature = "columnar")]
+    let mut matcher = carry.as_ref().map(|carry| {
+        super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
+    });
+    #[cfg(feature = "columnar")]
+    let read_pace = pace.as_deref();
+    let mut emit = |row: InternalValue| -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        if let Some(matcher) = matcher.as_mut() {
+            return matcher.write(
+                row,
+                &mut FlavourSink {
+                    flavour: &mut *compactor,
+                    pace: read_pace,
+                },
+            );
+        }
+        compactor.write(row)
+    };
+
+    hidden_guard(payload, opts, || {
         // Bottommost seqno-zeroing: at the last level, entries below the GC
         // watermark and not covered by any range tombstone get seqno 0. The
         // zeroer and the whole-version tombstone scan are `core` + `alloc`, so
@@ -3652,9 +3712,7 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            ledger
-                .borrow_mut()
-                .admit(item, &mut |row| compactor.write(row))?;
+            ledger.borrow_mut().admit(item, &mut emit)?;
             if let Some(e) = ledger_error.borrow_mut().take() {
                 return Err(e);
             }
@@ -3688,14 +3746,31 @@ fn merge_tables(
     // The rows the ledger still holds go out before the outputs are finished,
     // guarded like the merge: a failure here shows the inputs again.
     let (blob_frag_map, released_objects) = hidden_guard(payload, opts, || {
-        let settled = ledger
-            .into_inner()
-            .finish(&mut |row| compactor.write(row))?;
+        let settled = ledger.into_inner().finish(&mut emit)?;
         if let Some(e) = ledger_error.into_inner() {
             return Err(e);
         }
         Ok(settled)
     })?;
+
+    // What the matcher still holds goes out after the last row, guarded alike.
+    #[cfg(feature = "columnar")]
+    let carried = match matcher.take() {
+        Some(matcher) => hidden_guard(payload, opts, || {
+            matcher.finish(&mut FlavourSink {
+                flavour: &mut *compactor,
+                pace: read_pace,
+            })
+        })?,
+        None => super::carry::Carried::default(),
+    };
+    #[cfg(feature = "columnar")]
+    log::debug!(
+        "Carried {} row groups ({} rows, {} bytes) into the output whole",
+        carried.groups,
+        carried.rows,
+        carried.bytes,
+    );
 
     if let Some(filter) = compaction_filter {
         filter.finish();
@@ -3740,6 +3815,8 @@ fn merge_tables(
                 .show(payload.table_ids.iter().copied());
         })?;
     produce_output.set_released_objects(released_objects);
+    #[cfg(feature = "columnar")]
+    produce_output.set_carried(carried.groups, carried.bytes);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
     }
@@ -3781,6 +3858,28 @@ fn merge_tables(
         tables_in,
         tables_out,
     })
+}
+
+/// A compaction's output as the carry matcher sees it.
+#[cfg(feature = "columnar")]
+struct FlavourSink<'a> {
+    flavour: &'a mut dyn super::flavour::CompactionFlavour,
+    /// Told how long reading a carried group takes.
+    pace: Option<&'a dyn crate::table::util::ReadPacer>,
+}
+
+#[cfg(feature = "columnar")]
+impl super::carry::CarrySink for FlavourSink<'_> {
+    fn write(&mut self, row: InternalValue) -> crate::Result<()> {
+        self.flavour.write(row)
+    }
+
+    fn carry(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+    ) -> crate::Result<bool> {
+        self.flavour.carry(candidate, self.pace)
+    }
 }
 
 fn drop_tables(

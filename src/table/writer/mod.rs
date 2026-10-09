@@ -849,10 +849,15 @@ pub struct Writer {
     key_range_cover: Option<(UserKey, UserKey)>,
 
     /// Tag of the last columnar row group written, `None` before the first.
-    /// Tags strictly increase so they stay unique within the table, which is
-    /// what makes a page's stamp name exactly one group.
     #[cfg(feature = "columnar")]
     last_group_tag: Option<u64>,
+
+    /// Every tag a row group of this table was written under. Tags are unique
+    /// within the table, which is what makes a page's stamp name exactly one
+    /// group: a group encoded here takes the first free tag past the last
+    /// one, and a group copied in keeps its own when it is free.
+    #[cfg(feature = "columnar")]
+    group_tags: crate::HashSet<u64>,
 
     /// Tag of the first row group encoded here: a hash of the table's path,
     /// id and creation time, in the lower half of `u64` so the increments
@@ -1115,6 +1120,8 @@ impl Writer {
 
             #[cfg(feature = "columnar")]
             last_group_tag: None,
+            #[cfg(feature = "columnar")]
+            group_tags: crate::HashSet::default(),
             #[cfg(feature = "columnar")]
             group_tag_base,
 
@@ -1675,7 +1682,15 @@ impl Writer {
         let meta_phase =
             index_scratch + sections_held + section_scratch + meta_scratch + bitmap_retained;
 
+        // The tags of the groups written stay to the end, a slot and a
+        // control byte each.
+        #[cfg(feature = "columnar")]
+        let tags_held = self.group_tags.capacity() as u64 * (WORD + 1);
+        #[cfg(not(feature = "columnar"))]
+        let tags_held = 0;
+
         self.held_state_bytes = lineage_held
+            + tags_held
             + index_phase
                 .max(filter_phase)
                 .max(section_phase)
@@ -3136,6 +3151,7 @@ impl Writer {
             uncompressed += u64::from(header.uncompressed_length);
         }
         self.last_group_tag = Some(group_tag);
+        self.group_tags.insert(group_tag);
 
         // Per-column zone-map stats for this row group, derived once from the
         // batch. Gated on the zone-map policy exactly like the row-block
@@ -3925,23 +3941,89 @@ impl Writer {
             comparator,
         )?;
         self.last_group_tag = Some(group_tag);
+        self.group_tags.insert(group_tag);
         Ok(first_key)
     }
 
-    /// Whether a row group tagged `group_tag` may be copied in next. A copy
-    /// keeps the tag its pages were stamped with, so it must still be above
-    /// every tag already in the table; a group encoded here takes the next
-    /// one instead.
+    /// Appends `raw`, a row group of another table copied whole, whose rows are
+    /// `rows` and whose values are stored as `layout`, under the tag and
+    /// lengths `group` records for it; `columns` are its per-column zone-map
+    /// statistics, as its own table recorded them.
     ///
-    /// A salvage copying one source table in key order always satisfies
-    /// this: the source's tags increase, a first group it re-encodes takes
+    /// Returns `false`, writing nothing, when this table cannot take the group
+    /// as it is: a row-major table, one whose values are stored the other way,
+    /// or one whose last tag is not below the group's. The caller then writes
+    /// the rows instead.
+    ///
+    /// The group's transform must be this writer's: its pages compressed with
+    /// this writer's codec and dictionary, and neither encrypted nor
+    /// ECC-protected, which a caller establishes before offering it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_verbatim_row_group`], plus
+    /// [`crate::Error::InvalidHeader`] when `raw` does not tile into whole
+    /// blocks.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn append_carried_row_group(
+        &mut self,
+        (raw, source): (&[u8], VerbatimSource),
+        group: crate::table::index_block::RowGroupRef,
+        layout: crate::table::meta::ValueLayout,
+        rows: &[InternalValue],
+        columns: Vec<crate::table::zone_map::ColumnStats>,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<bool> {
+        use crate::coding::Decode;
+        use crate::table::block::Header;
+
+        if !self.use_columnar
+            || self.value_layout.is_some_and(|fixed| fixed != layout)
+            || !self.accepts_group_tag(group.tag.get())
+        {
+            return Ok(false);
+        }
+        // What the group decodes to, summed over its blocks as an encoded
+        // group sums it.
+        let mut uncompressed = 0u64;
+        let mut at = 0usize;
+        while let Some(frame) = raw.get(at..).filter(|frame| !frame.is_empty()) {
+            let header = Header::decode_from(&mut &*frame)?;
+            let len = header.on_disk_size_with(self.ecc) as usize;
+            if len == 0 || len > frame.len() {
+                return Err(crate::Error::InvalidHeader(
+                    "carried row group does not tile into blocks",
+                ));
+            }
+            uncompressed += u64::from(header.uncompressed_length);
+            at += len;
+        }
+        self.append_verbatim_row_group(
+            (raw, source),
+            uncompressed,
+            (group.tag.get(), group.head_zones_len),
+            rows,
+            Some(columns),
+            comparator,
+        )?;
+        self.value_layout = Some(layout);
+        Ok(true)
+    }
+
+    /// Whether a row group tagged `group_tag` may be copied in next. A copy
+    /// keeps the tag its pages were stamped with, so no group of the table may
+    /// have taken it already; a group encoded here takes a free one instead.
+    ///
+    /// A salvage copying one source table in key order always finds its tags
+    /// free: the source's tags are unique, a first group it re-encodes takes
     /// the source tag it replaces ([`Self::start_group_tags_at`]), and a later
     /// one takes one above the last emitted, which is at most the source tag
-    /// it replaces.
+    /// it replaces. A compaction copying the groups of several tables finds
+    /// them free unless two of its inputs drew the same tags, by chance.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
-        group_tag != 0 && self.last_group_tag.is_none_or(|last| group_tag > last)
+        group_tag != 0 && !self.group_tags.contains(&group_tag)
     }
 
     /// Starts this table's tags at `tag`, when no group has been written yet;
@@ -3956,16 +4038,20 @@ impl Writer {
         }
     }
 
-    /// The tag for the next row group encoded here: never zero, since the base
-    /// is not and the increments are checked.
+    /// The tag for the next row group encoded here: the first tag past the
+    /// last one written, or the base before any, that no group of the table
+    /// took. Never zero, since the base is not and the increments are checked.
     #[cfg(feature = "columnar")]
     fn next_group_tag(&self) -> crate::Result<u64> {
-        match self.last_group_tag {
-            None => Ok(self.group_tag_base),
-            Some(last) => last.checked_add(1).ok_or(crate::Error::InvalidHeader(
-                "columnar: row group tags exhausted",
-            )),
+        let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
+        let mut tag = match self.last_group_tag {
+            None => self.group_tag_base,
+            Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
+        };
+        while self.group_tags.contains(&tag) {
+            tag = tag.checked_add(1).ok_or_else(exhausted)?;
         }
+        Ok(tag)
     }
 
     /// `raw`, the blocks of one extent copied from `source`, with each block's

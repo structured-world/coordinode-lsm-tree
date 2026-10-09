@@ -16,6 +16,10 @@ pub struct RunScanner {
     lo_reader: Option<Scanner>,
     /// Told how long each table's reads take, for every table of the run.
     pace: Option<crate::table::util::Pacer>,
+    /// Where each table's scanner records the row groups it reads, for a
+    /// compaction that copies groups whole.
+    #[cfg(feature = "columnar")]
+    carry: Option<crate::table::group_carry::CarryQueue>,
 }
 
 impl RunScanner {
@@ -35,7 +39,7 @@ impl RunScanner {
         )]
         let lo_table = run.get(lo).expect("should exist");
 
-        let lo_reader = Self::scan(lo_table, pace.as_ref())?;
+        let lo_reader = lo_table.scan_paced(pace.as_ref())?;
 
         Ok(Self {
             tables: run,
@@ -43,11 +47,51 @@ impl RunScanner {
             hi,
             lo_reader: Some(lo_reader),
             pace,
+            #[cfg(feature = "columnar")]
+            carry: None,
         })
     }
 
-    fn scan(table: &Table, pace: Option<&crate::table::util::Pacer>) -> crate::Result<Scanner> {
-        table.scan_paced(pace)
+    /// Has the scanner of every table of the run whose groups can be copied
+    /// record them in `queue` (see [`Table::carries_row_groups`]).
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn with_carry(mut self, queue: crate::table::group_carry::CarryQueue) -> Self {
+        if let (Some(reader), Some(table)) = (self.lo_reader.take(), self.tables.get(self.lo)) {
+            self.lo_reader = Some(carrying(reader, table, &queue));
+        }
+        self.carry = Some(queue);
+        self
+    }
+
+    fn scan_table(&self, index: usize) -> crate::Result<Option<Scanner>> {
+        let Some(table) = self.tables.get(index) else {
+            return Ok(None);
+        };
+        let scanner = table.scan_paced(self.pace.as_ref())?;
+        #[cfg(feature = "columnar")]
+        if let Some(queue) = &self.carry {
+            return Ok(Some(carrying(scanner, table, queue)));
+        }
+        Ok(Some(scanner))
+    }
+}
+
+/// `scanner` of `table`, recording its groups in `queue` when they can be
+/// copied whole.
+#[cfg(feature = "columnar")]
+fn carrying(
+    scanner: Scanner,
+    table: &Table,
+    queue: &crate::table::group_carry::CarryQueue,
+) -> Scanner {
+    if table.carries_row_groups() {
+        scanner.with_carry(crate::table::group_carry::GroupCarry::new(
+            table.clone(),
+            Arc::clone(queue),
+        ))
+    } else {
+        scanner
     }
 }
 
@@ -66,16 +110,9 @@ impl Iterator for RunScanner {
                 self.lo += 1;
 
                 if self.lo <= self.hi {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "hi is at most equal to the last slot; so because 0 <= lo <= hi, it must be a valid index"
-                    )]
-                    let scanner = fail_iter!(Self::scan(
-                        self.tables.get(self.lo).expect("should exist"),
-                        self.pace.as_ref()
-                    ));
-
-                    self.lo_reader = Some(scanner);
+                    // `hi` is at most the last slot, so every `lo` up to it
+                    // names a table.
+                    self.lo_reader = fail_iter!(self.scan_table(self.lo));
                 }
             } else {
                 return None;
