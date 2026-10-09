@@ -430,13 +430,15 @@ group is lost, every later group's ordinal in the copy shifts, and each copied
 page would fail verification under its new one. A carried tag survives the
 copy. What the binding needs is uniqueness within a table, and the writer
 keeps every tag the table's groups were written under: a group it encodes
-takes the first free tag past the last one written, and a copied group is
+takes the first free tag past the last one it encoded, and a copied group is
 accepted only when its own tag is free. A salvage copying one table in key
 order always finds its tags free, because the source's tags are unique and a
 re-encoded group takes a tag no higher than the source tag it replaces; a
 compaction copying the groups of several tables finds them free unless two of
 its inputs drew the same tags, by chance, and then writes the rows of the one
-that clashes.
+that clashes. The groups a compaction encodes take tags from the output's own
+base, never from the sequence of a group it copied, so they do not take the
+tags of that source's later groups.
 
 Moving a page between slots of one group is refused by
 `(column_id, part, row_page)`, which the stamp repeats. The row page is what

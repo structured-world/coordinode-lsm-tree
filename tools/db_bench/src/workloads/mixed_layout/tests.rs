@@ -153,6 +153,20 @@ fn compaction_scenarios_copy_what_the_merge_left_as_it_was() -> lsm_tree::Result
     let pass = super::compact_keeping_versions(&overlap)?;
     assert_eq!(pass.rows, overlap.oracle.visible());
     assert_eq!(pass.carried_bytes, 0);
+
+    // The row updates leave the tree writing columnar again, so the merge
+    // of the base and the updates is a columnar output a copy can land in.
+    let updates = build(fixtures::columnar_base_row_updates)?;
+    let pass = super::compact_keeping_versions(&updates)?;
+    assert_eq!(pass.rows, updates.oracle.visible());
+    assert!(
+        updates
+            .tree
+            .current_version()
+            .iter_tables()
+            .all(|t| t.metadata.columnar),
+        "the compacted output is columnar",
+    );
     Ok(())
 }
 

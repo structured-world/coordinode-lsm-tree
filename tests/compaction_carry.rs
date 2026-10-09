@@ -127,6 +127,56 @@ fn compaction_tied_key_group_is_written_not_copied() {
     assert_blocks_verify(&tree);
 }
 
+/// The same tie in a group the next merge changes elsewhere: the group is
+/// rebuilt around its unchanged row pages only when its rows keep the order a
+/// block requires, so here its rows are written, and every key stays readable.
+#[test]
+fn compaction_tied_key_group_changed_elsewhere_is_written() {
+    // The tree's default policies, a compaction out of level 0 encoding its
+    // rows again, and short keys and values of one width.
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("enable columnar");
+    let short_key = |i: u32| format!("k{i:04}").into_bytes();
+    let short = |i: u32| vec![i as u8; 18];
+    let mut seqno = 1;
+    for i in 365..469 {
+        tree.insert(short_key(i), short(i), seqno);
+        seqno += 1;
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    tree.insert(short_key(365), vec![0u8; 16], 1);
+    tree.flush_active_memtable(0).expect("flush");
+    tree.major_compact(64 * 1024 * 1024, 0)
+        .expect("first compaction");
+
+    tree.remove(short_key(366), seqno);
+    tree.flush_active_memtable(0).expect("flush");
+    tree.major_compact(64 * 1024 * 1024, 0)
+        .expect("second compaction");
+
+    assert_eq!(tree.get(short_key(366), SeqNo::MAX).expect("get"), None);
+    for i in 367..469 {
+        assert_eq!(
+            tree.get(short_key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(short(i).as_slice()),
+            "key {i}",
+        );
+    }
+    assert!(tree.get(short_key(365), SeqNo::MAX).expect("get").is_some());
+    assert_blocks_verify(&tree);
+}
+
 /// A tree keeping no zone map has no statistics to carry along, and needs
 /// none: its groups are copied as when it keeps one.
 #[test]
@@ -375,6 +425,119 @@ fn compaction_key_continued_by_another_input_is_not_split() {
     assert_blocks_verify(&tree);
 }
 
+/// Many new keys land among the rows of the base table's second group, whose
+/// range comes out as several groups encoded here: they take tags of the
+/// output's own, so every later group of the base keeps a free tag and is
+/// copied.
+#[test]
+fn compaction_groups_encoded_after_a_copy_leave_later_tags_free() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    let base_groups = row_groups(&tree);
+    assert!(
+        base_groups > 4,
+        "the base spans several groups: {base_groups}"
+    );
+    // A key in the middle of the second group, past one group to copy.
+    let at = u32::try_from(2_000 / base_groups * 3 / 2).expect("small");
+    // Keys sorting right after it, enough for more than two groups of rows
+    // of their own, written row-major so only the base's groups can be
+    // copied.
+    tree.update_runtime_config(|cfg| cfg.columnar = false)
+        .expect("row-major");
+    for j in 0..800u32 {
+        let mut k = key(at);
+        k.extend_from_slice(format!("-{j:04}").as_bytes());
+        tree.insert(k, value(j, 9), seqno);
+        seqno += 1;
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("columnar");
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    assert_eq!(
+        tree.metrics().compaction_groups_carried(),
+        base_groups - 1,
+        "every base group but the one the new keys land in is copied",
+    );
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 2_800);
+    assert_blocks_verify(&tree);
+}
+
+/// A key the parallel ranges are cut at, written in many versions that span
+/// several row groups of an input: the range ending at the key reads every
+/// group holding a version of it, so no version is lost at the cut.
+#[test]
+fn compaction_parallel_range_keeps_every_version_of_its_end_key() {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // More threads than bottom tables: every table's last key but the
+    // highest cuts a range, the one picked below among them.
+    .compaction_threads(32)
+    .subcompaction_min_bytes(0)
+    .columnar_row_group_size_policy(lsm_tree::config::BlockSizePolicy::all(4 * 1024))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..4_000, 0, &mut seqno);
+    tree.major_compact(32 * 1024, SeqNo::MAX).expect("compact");
+    let bottom = tree.current_version().iter_tables().count();
+    assert!(
+        (3..32).contains(&bottom),
+        "fewer bottom tables than threads: {bottom}"
+    );
+    // The last key of the first bottom table is where the next compaction's
+    // first range ends.
+    let cut = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.key_range.max().clone())
+        .min()
+        .expect("tables");
+
+    let first_version = seqno;
+    for round in 0..120 {
+        tree.insert(cut.clone(), value(round, round), seqno);
+        seqno += 1;
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    assert!(
+        tree.current_version()
+            .iter_tables()
+            .any(|t| t.metadata.key_range.min() == &cut && t.metadata.data_block_count > 2),
+        "the versions span several groups",
+    );
+    tree.major_compact(32 * 1024, 0).expect("compact");
+
+    for round in 0..120u32 {
+        let at = first_version + u64::from(round);
+        assert_eq!(
+            tree.get(&cut, at + 1).expect("get").as_deref(),
+            Some(value(round, round).as_slice()),
+            "version {round} of the cut key",
+        );
+    }
+    assert_blocks_verify(&tree);
+}
+
 /// Cell rows of a blob tree whose bodies live in blob files: a group of them
 /// copied whole still records the objects its rows own in the output, so the
 /// bodies are charged when their last holder goes and the files are dropped.
@@ -436,6 +599,30 @@ fn compaction_carried_cell_rows_keep_owning_their_objects() -> lsm_tree::Result<
         );
     }
     assert_eq!(tree.stale_blob_bytes(), 0, "every body is still held");
+    // Each blob file is linked under the keys that hold its objects: the
+    // first and the last cell row, not the last row of each copied group.
+    let links: Vec<_> = tree
+        .index
+        .current_version()
+        .iter_tables()
+        .map(|t| t.list_blob_file_references())
+        .collect::<lsm_tree::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+    let first = links
+        .iter()
+        .map(|l| l.first_key.clone())
+        .min()
+        .expect("links");
+    let last = links
+        .iter()
+        .map(|l| l.last_key.clone())
+        .max()
+        .expect("links");
+    assert_eq!(&*first, &key(0)[..], "first holder of a body");
+    assert_eq!(&*last, &key(docs - 1)[..], "last holder of a body");
 
     for i in 0..docs {
         tree.remove(key(i), u64::from(docs + 1 + i));

@@ -848,9 +848,12 @@ pub struct Writer {
     /// engine writes itself.
     key_range_cover: Option<(UserKey, UserKey)>,
 
-    /// Tag of the last columnar row group written, `None` before the first.
+    /// Tag of the last row group encoded here under a tag of its own, `None`
+    /// before the first. Encoded tags advance from it rather than from a
+    /// copied group's, which follows its source's sequence: stepping past a
+    /// copy would take the tags of that source's next groups and refuse them.
     #[cfg(feature = "columnar")]
-    last_group_tag: Option<u64>,
+    last_encoded_tag: Option<u64>,
 
     /// Every tag a row group of this table was written under. Tags are unique
     /// within the table, which is what makes a page's stamp name exactly one
@@ -1229,7 +1232,7 @@ impl Writer {
             next_refresh_hashes: 0,
 
             #[cfg(feature = "columnar")]
-            last_group_tag: None,
+            last_encoded_tag: None,
             #[cfg(feature = "columnar")]
             group_tags: crate::HashSet::default(),
             #[cfg(feature = "columnar")]
@@ -3073,11 +3076,16 @@ impl Writer {
         {
             return Ok(false);
         }
+        // A key two inputs held at one seqno comes out twice, an order the
+        // block check refuses; such rows go through the ordinary path, as for
+        // a group copied whole.
+        if self.validate_direct_block_order(rows, comparator).is_err() {
+            return Ok(false);
+        }
         let batch = crate::table::columnar::entries_to_column_batch(rows)?;
         if !carry.fits(&batch) {
             return Ok(false);
         }
-        self.validate_direct_block_order(rows, comparator)?;
         self.claim_value_layout(ValueLayout::Whole)?;
         let Some(inputs) = self.account_direct_block(rows)? else {
             return Ok(false);
@@ -3358,7 +3366,9 @@ impl Writer {
                 ))?;
             uncompressed += u64::from(header.uncompressed_length);
         }
-        self.last_group_tag = Some(group_tag);
+        if carry.is_none() {
+            self.last_encoded_tag = Some(group_tag);
+        }
         self.group_tags.insert(group_tag);
 
         // Per-column zone-map stats for this row group, derived once from the
@@ -4149,7 +4159,6 @@ impl Writer {
             Some(row_group_ref(group_tag, directory_len, head_zones_len)?),
             comparator,
         )?;
-        self.last_group_tag = Some(group_tag);
         self.group_tags.insert(group_tag);
         Ok(first_key)
     }
@@ -4237,34 +4246,37 @@ impl Writer {
     /// A salvage copying one source table in key order always finds its tags
     /// free: the source's tags are unique, a first group it re-encodes takes
     /// the source tag it replaces ([`Self::start_group_tags_at`]), and a later
-    /// one takes one above the last emitted, which is at most the source tag
-    /// it replaces. A compaction copying the groups of several tables finds
-    /// them free unless two of its inputs drew the same tags, by chance.
+    /// one the first free tag above the last re-encoded, which is at most the
+    /// source tag it replaces. A compaction copying the groups of several
+    /// tables finds them free unless two of its inputs drew the same tags, by
+    /// chance: the groups it encodes take tags from the output's own base,
+    /// not from the sequence of a group it copied.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
         group_tag != 0 && !self.group_tags.contains(&group_tag)
     }
 
-    /// Starts this table's tags at `tag`, when no group has been written yet;
-    /// once one has, the order the written tags set stands. A salvage calls it
-    /// with each source group's tag before emitting the group, so a group it
-    /// must re-encode first takes the tag it replaces, and the source's later
-    /// groups, whose tags are above it, can still be copied verbatim.
+    /// Starts the tags of the groups encoded here at `tag`, when none has been
+    /// encoded yet; once one has, the order the encoded tags set stands. A
+    /// salvage calls it with each source group's tag before emitting the
+    /// group, so a group it must re-encode first takes the tag it replaces,
+    /// and the source's later groups, whose tags are above it, can still be
+    /// copied verbatim.
     #[cfg(feature = "columnar")]
     pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
-        if self.last_group_tag.is_none() && tag != 0 {
+        if self.last_encoded_tag.is_none() && tag != 0 {
             self.group_tag_base = tag;
         }
     }
 
     /// The tag for the next row group encoded here: the first tag past the
-    /// last one written, or the base before any, that no group of the table
+    /// last one encoded, or the base before any, that no group of the table
     /// took. Never zero, since the base is not and the increments are checked.
     #[cfg(feature = "columnar")]
     fn next_group_tag(&self) -> crate::Result<u64> {
         let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
-        let mut tag = match self.last_group_tag {
+        let mut tag = match self.last_encoded_tag {
             None => self.group_tag_base,
             Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
         };

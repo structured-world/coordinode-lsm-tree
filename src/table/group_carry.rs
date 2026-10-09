@@ -185,12 +185,12 @@ impl Table {
                 continue;
             }
             groups.push(*keyed.as_ref());
-            // A group ending at or past the upper bound is the last that can
-            // hold a key below it.
+            // The last group that can hold a key within the upper bound. A
+            // group is cut by size, so one ending at an included bound may be
+            // followed by older versions of that key, and the scan goes on.
             let reaches_hi = match &bounds.hi {
-                Bound::Included(hi) | Bound::Excluded(hi) => {
-                    bounds.comparator.compare(end, hi) != Ordering::Less
-                }
+                Bound::Included(hi) => bounds.comparator.compare(end, hi) == Ordering::Greater,
+                Bound::Excluded(hi) => bounds.comparator.compare(end, hi) != Ordering::Less,
                 Bound::Unbounded => false,
             };
             if reaches_hi {

@@ -1378,20 +1378,11 @@ impl StandardCompaction {
     }
 
     /// Records the blob objects `rows`, written into the output not one by
-    /// one, reference, as [`CompactionFlavour::write`] records a written
-    /// row's.
+    /// one, reference, each under its own row's key, as
+    /// [`CompactionFlavour::write`] records a written row's.
     #[cfg(feature = "columnar")]
     fn register_references(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
-        for row in rows {
-            if row.key.value_type.is_cell_row() {
-                self.table_writer.register_cell_row(&row.value)?;
-            } else if row.key.value_type.is_indirection() {
-                let mut reader = &row.value[..];
-                self.table_writer
-                    .register_blob(BlobIndirection::decode_from(&mut reader)?);
-            }
-        }
-        Ok(())
+        self.table_writer.register_carried_rows(rows)
     }
 
     fn consume_writer(self, opts: &Options, dst_lvl: usize) -> crate::Result<Vec<Table>> {

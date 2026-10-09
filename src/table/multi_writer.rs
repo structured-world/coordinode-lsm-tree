@@ -646,6 +646,49 @@ impl MultiWriter {
         );
     }
 
+    /// Records the blob references of `rows`, written into the current table
+    /// not one by one but as a copied row group, each under its own row's key,
+    /// as [`Self::register_blob`] and [`Self::register_cell_row`] record a
+    /// written row's under the current key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a row tagged as an indirection or a cell row does
+    /// not decode as one.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn register_carried_rows(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
+        use crate::coding::Decode;
+
+        for row in rows {
+            let key = &row.key.user_key;
+            if row.key.value_type.is_cell_row() {
+                for (indirection, owned) in crate::blob_tree::field_row::row_refs(&row.value)? {
+                    self.linked_blobs.register(
+                        indirection.vhandle.blob_file_id,
+                        u64::from(indirection.size),
+                        u64::from(indirection.vhandle.on_disk_size),
+                        key,
+                        owned,
+                    );
+                    if owned {
+                        self.owned_objects
+                            .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+                    }
+                }
+            } else if row.key.value_type.is_indirection() {
+                let indirection = BlobIndirection::decode_from(&mut &row.value[..])?;
+                self.linked_blobs.register(
+                    indirection.vhandle.blob_file_id,
+                    u64::from(indirection.size),
+                    u64::from(indirection.vhandle.on_disk_size),
+                    key,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Records the blob files the cell row just written references, as
     /// [`Self::register_blob`] does for an indirection: each owned reference
     /// adds to its file's counts, each borrowed one only links the file.
