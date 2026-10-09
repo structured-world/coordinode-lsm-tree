@@ -14,6 +14,8 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
+use core::ops::Bound;
 
 #[cfg(feature = "std")]
 use parking_lot::Mutex;
@@ -22,7 +24,8 @@ use parking_lot::Mutex;
 use spin::Mutex;
 
 use super::{BlockHandle, Table};
-use crate::InternalValue;
+use crate::comparator::SharedComparator;
+use crate::{InternalValue, UserKey};
 
 /// A row group a scanner read, with the rows it handed out for it.
 pub struct CarryCandidate {
@@ -39,11 +42,40 @@ pub struct CarryCandidate {
 /// read them; shared by every input's scanner and the write side.
 pub type CarryQueue = Arc<Mutex<VecDeque<CarryCandidate>>>;
 
+/// The key range a scanner hands out rows of, under the tree's comparator.
+pub struct KeyBounds {
+    /// The lower bound.
+    pub(crate) lo: Bound<UserKey>,
+    /// The upper bound.
+    pub(crate) hi: Bound<UserKey>,
+    /// The order the bounds are taken in.
+    pub(crate) comparator: SharedComparator,
+}
+
+impl KeyBounds {
+    /// Whether `key` lies within the bounds.
+    fn contains(&self, key: &[u8]) -> bool {
+        let above_lo = match &self.lo {
+            Bound::Included(lo) => self.comparator.compare(key, lo) != Ordering::Less,
+            Bound::Excluded(lo) => self.comparator.compare(key, lo) == Ordering::Greater,
+            Bound::Unbounded => true,
+        };
+        above_lo
+            && match &self.hi {
+                Bound::Included(hi) => self.comparator.compare(key, hi) != Ordering::Greater,
+                Bound::Excluded(hi) => self.comparator.compare(key, hi) == Ordering::Less,
+                Bound::Unbounded => true,
+            }
+    }
+}
+
 /// A scanner's carry state: the rows of the group it is handing out, and where
 /// it records the groups it reads.
 pub struct GroupCarry {
     table: Table,
     queue: CarryQueue,
+    /// The range the scan hands out rows of, `None` for the whole table.
+    bounds: Option<KeyBounds>,
     rows: Arc<[InternalValue]>,
     next: usize,
 }
@@ -54,17 +86,34 @@ impl GroupCarry {
         Self {
             table,
             queue,
+            bounds: None,
             rows: Arc::from(Vec::new()),
             next: 0,
         }
     }
 
+    /// Carry state for a scanner of `table` handing out the rows within
+    /// `bounds` only: a group the bounds cut is handed out in part and not
+    /// recorded, since the rows outside them are another range's to write.
+    pub(crate) fn bounded(table: Table, queue: CarryQueue, bounds: KeyBounds) -> Self {
+        Self {
+            bounds: Some(bounds),
+            ..Self::new(table, queue)
+        }
+    }
+
     /// Starts handing out `rows`, the rows of the group `group` names, and
     /// records the group as a candidate.
-    pub(crate) fn start(&mut self, group: Option<BlockHandle>, rows: Vec<InternalValue>) {
+    pub(crate) fn start(&mut self, group: Option<BlockHandle>, mut rows: Vec<InternalValue>) {
+        let read = rows.len();
+        if let Some(bounds) = &self.bounds {
+            rows.retain(|row| bounds.contains(&row.key.user_key));
+        }
+        let whole = rows.len() == read;
         self.rows = Arc::from(rows);
         self.next = 0;
-        if let Some(group) = group
+        if whole
+            && let Some(group) = group
             && group.row_group().is_some()
             && !self.rows.is_empty()
         {
@@ -102,6 +151,61 @@ impl Table {
             && self.global_seqno() == 0
             && !self.has_delete_bitmap_section()
             && self.delete_bitmap.is_empty()
+    }
+
+    /// A scan of the row groups that may hold a key within `bounds`, recording
+    /// them in `queue` (see [`GroupCarry::bounded`]), or `None` when none can;
+    /// only a table whose groups can be carried is read this way.
+    ///
+    /// # Errors
+    ///
+    /// Any error reading the index or opening the scan.
+    pub(crate) fn scan_carrying(
+        &self,
+        bounds: KeyBounds,
+        queue: CarryQueue,
+        pace: Option<&super::util::Pacer>,
+    ) -> crate::Result<Option<super::Scanner>> {
+        let mut groups = Vec::new();
+        let walk = self.maintenance_index_walk();
+        let walk = match pace {
+            Some(pace) => walk.with_pace(Arc::clone(pace)),
+            None => walk,
+        };
+        for keyed in walk {
+            let keyed = keyed?;
+            let end = keyed.end_key();
+            // Below the lower bound: no key of the group is in range.
+            let below = match &bounds.lo {
+                Bound::Included(lo) => bounds.comparator.compare(end, lo) == Ordering::Less,
+                Bound::Excluded(lo) => bounds.comparator.compare(end, lo) != Ordering::Greater,
+                Bound::Unbounded => false,
+            };
+            if below {
+                continue;
+            }
+            groups.push(*keyed.as_ref());
+            // A group ending at or past the upper bound is the last that can
+            // hold a key below it.
+            let reaches_hi = match &bounds.hi {
+                Bound::Included(hi) | Bound::Excluded(hi) => {
+                    bounds.comparator.compare(end, hi) != Ordering::Less
+                }
+                Bound::Unbounded => false,
+            };
+            if reaches_hi {
+                break;
+            }
+        }
+        let Some(first) = groups.first() else {
+            return Ok(None);
+        };
+        let start = first.offset().0;
+        let count = groups.len();
+        Ok(Some(
+            self.scan_groups(count, start, groups, pace)?
+                .with_carry(GroupCarry::bounded(self.clone(), queue, bounds)),
+        ))
     }
 
     /// The bytes of the row group `group` names, as they lie on disk.

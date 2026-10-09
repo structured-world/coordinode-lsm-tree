@@ -745,6 +745,13 @@ fn create_compaction_stream<'a>(
 /// slice. The bounds must partition the key space across sub-compactions
 /// (`Included(lo)..Excluded(hi)`) so every entry lands in exactly one.
 #[cfg(feature = "std")]
+#[cfg_attr(
+    feature = "columnar",
+    expect(
+        clippy::too_many_arguments,
+        reason = "the serial stream's inputs plus the range and the carry plan"
+    )
+)]
 fn create_bounded_compaction_stream<'a>(
     version: &'a Version,
     to_compact: &HashSet<TableId>,
@@ -753,13 +760,43 @@ fn create_bounded_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
-) -> Option<CompactionStream<'a, Merger<CompactionReader<'a>>>> {
+    #[cfg(feature = "columnar")] carry: Option<&super::carry::CarryInputs>,
+) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
 
-    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(unused_variables, reason = "only a columnar build carries row groups")
+    )]
+    for (level, run) in version
+        .iter_levels()
+        .enumerate()
+        .flat_map(|(level, lvl)| lvl.iter().map(move |run| (level, run)))
+    {
         for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
             found += 1;
+            // A table whose groups can be carried is scanned group by group,
+            // recording the groups wholly within this range.
+            #[cfg(feature = "columnar")]
+            if let Some(queue) = carry.and_then(|carry| carry.queue_for(level))
+                && table.carries_row_groups()
+            {
+                let scanner = table.scan_carrying(
+                    crate::table::group_carry::KeyBounds {
+                        lo: bounds.0.clone(),
+                        hi: bounds.1.clone(),
+                        comparator: comparator.clone(),
+                    },
+                    Arc::clone(queue),
+                    pace,
+                )?;
+                match scanner {
+                    Some(scanner) => readers.push(Box::new(scanner)),
+                    None => readers.push(Box::new(core::iter::empty())),
+                }
+                continue;
+            }
             // Compaction input is maintenance, not a read a caller made, so
             // it stays out of the read counters like the serial scanner's.
             let reader = table.range_iter(bounds.clone()).for_maintenance();
@@ -771,14 +808,10 @@ fn create_bounded_compaction_stream<'a>(
         }
     }
 
-    if found == to_compact.len() {
-        Some(
-            CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
-                .with_merge_operator(merge_operator),
-        )
-    } else {
-        None
-    }
+    Ok((found == to_compact.len()).then(|| {
+        CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
+            .with_merge_operator(merge_operator)
+    }))
 }
 
 /// Sorts the destination-level max-keys, drops comparator-equal duplicates, and
@@ -2244,6 +2277,23 @@ fn run_subcompaction(
         _ => None,
     };
 
+    // Row groups of this range the merge leaves as they were are copied into
+    // the output instead of being encoded again (see `carry`). Each range
+    // records and matches its own.
+    #[cfg(feature = "columnar")]
+    let carry = super::carry::CarryInputs::plan(
+        version,
+        &opts.config,
+        rc,
+        payload.canonical_level.into(),
+        &version
+            .iter_tables()
+            .filter(|t| payload.table_ids.contains(&t.id()))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let pace = input_pacer(&opts.rate_limiter);
+
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
         &payload.table_ids,
@@ -2251,8 +2301,11 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        input_pacer(&opts.rate_limiter).as_ref(),
-    ) else {
+        pace.as_ref(),
+        #[cfg(feature = "columnar")]
+        carry.as_ref(),
+    )?
+    else {
         // The caller validated every input exists, so a missing table here is
         // unexpected. Fail closed: an empty output would let the install delete
         // the source tables (this range may own input deletion) while producing
@@ -2453,6 +2506,26 @@ fn run_subcompaction(
         compactor.write_range_tombstones(&output_rts);
     }
 
+    #[cfg(feature = "columnar")]
+    let mut matcher = carry.as_ref().map(|carry| {
+        super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
+    });
+    #[cfg(feature = "columnar")]
+    let read_pace = pace.as_deref();
+    let mut emit = |row: InternalValue| -> crate::Result<()> {
+        #[cfg(feature = "columnar")]
+        if let Some(matcher) = matcher.as_mut() {
+            return matcher.write(
+                row,
+                &mut FlavourSink {
+                    flavour: &mut *compactor,
+                    pace: read_pace,
+                },
+            );
+        }
+        compactor.write(row)
+    };
+
     for (idx, item) in merge_iter.enumerate() {
         let item = item?;
 
@@ -2469,9 +2542,7 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger
-            .borrow_mut()
-            .admit(item, &mut |row| compactor.write(row))?;
+        ledger.borrow_mut().admit(item, &mut emit)?;
         if let Some(e) = ledger_error.borrow_mut().take() {
             return Err(e);
         }
@@ -2490,14 +2561,22 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    let (blob_frag_map, released_objects) = ledger
-        .into_inner()
-        .finish(&mut |row| compactor.write(row))?;
+    let (blob_frag_map, released_objects) = ledger.into_inner().finish(&mut emit)?;
     if let Some(e) = ledger_error.into_inner() {
         return Err(e);
     }
+    #[cfg(feature = "columnar")]
+    let carried = match matcher.take() {
+        Some(matcher) => matcher.finish(&mut FlavourSink {
+            flavour: &mut *compactor,
+            pace: read_pace,
+        })?,
+        None => super::carry::Carried::default(),
+    };
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
+    #[cfg(feature = "columnar")]
+    produced.set_carried(carried.groups, carried.bytes);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
     }

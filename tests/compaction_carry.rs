@@ -170,6 +170,57 @@ fn compaction_zeroed_seqnos_carries_only_once_rows_stop_changing() {
     assert_blocks_verify(&tree);
 }
 
+/// A compaction split into parallel ranges copies the groups each range holds
+/// whole, as the serial merge does: the ranges are cut at the tables of the
+/// level written into, so a group of those tables lies in one range.
+#[test]
+fn compaction_parallel_ranges_carry_their_row_groups() {
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_threads(4)
+    .subcompaction_min_bytes(0)
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..4_000, 0, &mut seqno);
+    // Small outputs, so the bottom level holds several tables to cut the next
+    // compaction's ranges at, and zeroed seqnos, so their rows stop changing.
+    tree.major_compact(32 * 1024, SeqNo::MAX).expect("compact");
+    assert!(
+        tree.current_version().iter_tables().count() > 2,
+        "the bottom level holds several tables",
+    );
+    let zeroed_groups = row_groups(&tree);
+
+    flush_keys(&tree, 4_000..4_100, 0, &mut seqno);
+    tree.major_compact(32 * 1024, SeqNo::MAX).expect("compact");
+
+    assert_eq!(tree.metrics().compaction_groups_carried(), zeroed_groups);
+    for i in 0..4_100 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 4_100);
+    assert_blocks_verify(&tree);
+}
+
 /// A key whose older version sits in another table continues past the end of
 /// the group holding its newer one: copying that group would split the key's
 /// versions across its edge, so its rows are written, and both versions read.
@@ -201,6 +252,78 @@ fn compaction_key_continued_by_another_input_is_not_split() {
         );
     }
     assert_blocks_verify(&tree);
+}
+
+/// Cell rows of a blob tree whose bodies live in blob files: a group of them
+/// copied whole still records the objects its rows own in the output, so the
+/// bodies are charged when their last holder goes and the files are dropped.
+#[test]
+fn compaction_carried_cell_rows_keep_owning_their_objects() -> lsm_tree::Result<()> {
+    use lsm_tree::KvSeparationOptions;
+    use lsm_tree::blob_tree::field_row::{FIRST_FIELD_COLUMN, Field};
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?;
+    let AnyTree::Blob(tree) = any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.index.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    let body = |i: u32| format!("body-{i}-{}", "b".repeat(200)).into_bytes();
+    let docs = 300u32;
+    for i in 0..docs {
+        tree.insert_cells(
+            key(i),
+            &[
+                Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+                Field::bytes(FIRST_FIELD_COLUMN + 1, &body(i)),
+            ],
+            u64::from(i),
+        )?;
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+    let groups = tree
+        .index
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.data_block_count)
+        .sum::<u64>();
+    tree.insert(key(docs), "plain", u64::from(docs));
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.index.metrics().compaction_groups_carried(), groups);
+    for i in 0..docs {
+        let row = tree.get_cells(key(i), SeqNo::MAX)?.expect("written");
+        assert_eq!(
+            row.resolve(FIRST_FIELD_COLUMN + 1)?.as_deref(),
+            Some(&body(i)[..])
+        );
+    }
+    assert_eq!(tree.stale_blob_bytes(), 0, "every body is still held");
+
+    for i in 0..docs {
+        tree.remove(key(i), u64::from(docs + 1 + i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(tree.blob_file_count(), 0, "the bodies were let go once");
+    Ok(())
 }
 
 /// An output of another data codec cannot take the input's pages as they are:
