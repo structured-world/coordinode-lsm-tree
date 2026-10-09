@@ -222,7 +222,6 @@ measured on.
 |---|---|
 | `narrow-records` | A few small fields per row. The control: no projection can cost more per row than reading a narrow row whole. |
 | `wide-records-full-read` | Small fields plus a 4 KiB payload, read whole. The baseline a projection is compared against. |
-| `wide-records-projected` | **Unsupported.** Needs a projection that returns the header fields without the payload. |
 | `mixed-value-sizes` | Short and long values in one key space, so no single block geometry fits both. |
 | `row-updates-over-columnar-base` | A columnar base flushed first, then the layout switched off and a third of the keys rewritten, so the newest version of those lives in a row-major run above a columnar one. Read by point reads. |
 | `row-updates-over-columnar-base-scan` | The same fixture read by the projected columnar scan of key and value, which merges the row-major run with the columnar base. Same extra figures as the columnar scans below. |
@@ -236,7 +235,8 @@ measured on.
 | `blobs-well-placed-churn`, `blobs-scattered-churn` | The two placement fixtures, then eight rounds of writes, each flushed and compacted: one key in ten rewritten three times a round, one in ten once every other round, the rest never, and as many new keys as hot ones appended each round and never rewritten, so a flush mixes values that die by the next round with values that live on. Publishes `relocated bytes per reclaimed byte` (blob bytes the relocating compactions copied over the blob bytes the compactions removed) and the full scan's per-row figures afterwards, so what collection costs and what placement then costs a scan come from one run. Unsupported under `--cache-mb 0`, like the placement scans. |
 | `blobs-well-placed-churn-one-group`, `blobs-scattered-churn-one-group` | The same, in trees that keep every blob value in one lifetime group (`KvSeparationOptions::lifetime_groups(LifetimeGroups::ONE)`) instead of the default four: the comparison the grouping is judged by. |
 | `blobs-filtered-before-fetch` | Rows written as cells into a blob tree with columnar tables, an 8 KiB payload in blob files scattered by rewrite rounds, read by the projected scan with a ~1% predicate on a field of its own: the payload of a row the predicate drops is never fetched. |
-| `wide-cells-projected` | Rows written as cells with a 4 KiB payload in blob files, projected to a header field alone: no blob is read at all. The cell-row counterpart of `wide-records-projected`. |
+| `wide-cells-projected` | Rows written as cells with a 4 KiB payload in blob files, projected to a header field alone: no blob is read at all. This is how a projection of the header fields of a wide record is measured; a projection of fields inside one opaque value is not a capability the engine offers. |
+| `metadata-only-update` | The `wide-cells-projected` rows, each rewritten with a new near-full field and its payload passed by reference, then flushed. Publishes `payload bytes written per row`, the blob bytes the rewrite and its flush wrote per updated row: zero is the expected value, and anything above it is payload a metadata-only update rewrote. Every row is read back afterwards with the new field and its payload. |
 | `cells-scan-sparse-clustered` | Rows written as cells with a 64-byte payload kept in its column, a ~1% predicate keeping runs of neighbouring keys: the payload is read only from the few pages holding them (`payload_bytes_incidental` stays small). |
 | `cells-scan-sparse-one-per-page` | The same rows, a predicate keeping about one row in each row page: every payload page holds a kept row, so a late read spares no I/O and must cost no more than an eager one; what it spares is materialising the rows dropped (`bytes_materialized`). |
 | `cells-scan-sparse-one-per-page-eager` | The `cells-scan-sparse-one-per-page` rows read whole, the predicate applied by the caller: the time the late read is held against. |
@@ -269,7 +269,8 @@ one line rather than a fresh argument about what the expected result is.
 counter, named `mixed-layout / <scenario> bytes read per row` (and
 `… bytes decoded per row`, `… bytes copied per row`, and, for a projected
 scan, `… bytes materialized per row` and `… payload bytes useful per row` /
-`… payload bytes incidental per row` where it read a payload late), in place of the ops/sec
+`… payload bytes incidental per row` where it read a payload late, and
+`… payload bytes written per row` for `metadata-only-update`), in place of the ops/sec
 every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in

@@ -90,6 +90,21 @@ struct LatencyPass {
     latencies: Vec<Duration>,
 }
 
+/// A pass that rewrites rows, reporting besides the rows it updated the blob
+/// payload bytes the rewrite wrote.
+type UpdateFn = fn(&Fixture) -> lsm_tree::Result<UpdatePass>;
+
+/// Checks what an update pass left against the write history, run after the
+/// measured window so its reads are not counted as the update's.
+type VerifyFn = fn(&Fixture) -> lsm_tree::Result<()>;
+
+/// What an update pass measured beyond the tree's counters.
+struct UpdatePass {
+    rows: u64,
+    /// Blob bytes written while the rows were rewritten and flushed.
+    payload_written: u64,
+}
+
 /// Whether a scenario's native path exists in this build.
 enum Support {
     /// Runs, through this read pass, and its figures mean what the scenario
@@ -101,6 +116,9 @@ enum Support {
     /// Runs, through this repeated pass, which also reports the P50 and P99
     /// of its repetitions.
     Latency(LatencyFn),
+    /// Rewrites rows through this pass and reports the payload bytes the
+    /// rewrite wrote per updated row, then checks the rows with the second.
+    Update(UpdateFn, VerifyFn),
     /// Rewrites the fixture in rounds of flushes and compactions, reports what
     /// collecting the stale blobs cost, then measures a full scan of what is
     /// left, so placement's two costs come from one run.
@@ -792,6 +810,116 @@ fn cells_projected(fixture: &Fixture) -> lsm_tree::Result<u64> {
     Ok(rows)
 }
 
+/// The near-full field after a metadata-only update: a value no row held
+/// before, so a read that returned the old version disagrees.
+fn updated_bucket(seed: u64) -> u64 {
+    (fixtures::bucket_of(seed) + 1) % 10
+}
+
+/// Rewrites every visible wide cell row with a new near-full field, keeping
+/// its payload by reference, flushes, and counts the blob bytes the flush
+/// wrote: a metadata-only update should write none.
+///
+/// The rows are checked afterwards by [`verify_metadata_update`], outside the
+/// measured window: reading every payload back would otherwise be counted as
+/// the update's own read cost.
+#[expect(
+    clippy::expect_used,
+    reason = "a visible row that does not read back, or a payload that is not a reference, is a wrong result, and a verify pass panics on one"
+)]
+fn cells_metadata_update(fixture: &Fixture) -> lsm_tree::Result<UpdatePass> {
+    use lsm_tree::blob_tree::field_row::{Cell, Field};
+
+    let AnyTree::Blob(blob) = &fixture.tree else {
+        panic!("a metadata-only update needs a blob tree");
+    };
+    let fixtures::Shape::Cells { .. } = fixture.shape else {
+        panic!("a metadata-only update needs a cell-row fixture");
+    };
+    let (files_before, bytes_before): (Vec<_>, _) = {
+        let version = blob.current_version();
+        (
+            version.blob_files.list_ids().copied().collect(),
+            version.blob_files.on_disk_size(),
+        )
+    };
+
+    let mut seqno = blob.get_highest_seqno().map_or(0, |s| s + 1);
+    let mut rows = 0_u64;
+    for row in &fixture.oracle.rows {
+        let Some(value) = row.expect else { continue };
+        let read = blob
+            .get_cells(&*row.key, SeqNo::MAX)?
+            .expect("a visible row reads back");
+        let bucket = updated_bucket(value.seed).to_be_bytes();
+        let mut update: Vec<Field<'_>> = read.fields()?;
+        for field in &mut update {
+            if field.column == fixtures::CELL_BUCKET {
+                field.cell = Cell::Value(&bucket);
+            }
+        }
+        assert!(
+            update
+                .iter()
+                .any(|f| f.column == fixtures::CELL_PAYLOAD && matches!(f.cell, Cell::Ref(_))),
+            "the payload of key {:?} is not in a blob file, so the update measures nothing",
+            String::from_utf8_lossy(&row.key),
+        );
+        blob.insert_cells(row.key.clone(), &update, seqno)?;
+        seqno += 1;
+        rows += 1;
+    }
+    blob.flush_active_memtable(0)?;
+
+    let after = blob.current_version();
+    assert!(
+        files_before
+            .iter()
+            .all(|&id| after.blob_files.contains_key(id)),
+        "a blob file went during the update, so the size difference is not what it wrote",
+    );
+    Ok(UpdatePass {
+        rows,
+        payload_written: after
+            .blob_files
+            .on_disk_size()
+            .checked_sub(bytes_before)
+            .expect("blob files shrank during the update, so the difference is not what it wrote"),
+    })
+}
+
+/// Reads every row back after [`cells_metadata_update`] and checks it against
+/// the write history with the new field and its payload, so an update that
+/// lost a payload or kept the old field fails instead of reporting zero.
+fn verify_metadata_update(fixture: &Fixture) -> lsm_tree::Result<()> {
+    let AnyTree::Blob(blob) = &fixture.tree else {
+        panic!("a metadata-only update needs a blob tree");
+    };
+    let fixtures::Shape::Cells { spread } = fixture.shape else {
+        panic!("a metadata-only update needs a cell-row fixture");
+    };
+    for row in &fixture.oracle.rows {
+        let Some(value) = row.expect else { continue };
+        let [group, _, cluster, spread_field] = fixtures::cell_fields(value.seed, spread);
+        let bucket = updated_bucket(value.seed).to_be_bytes();
+        let payload = value.bytes();
+        let expected = lsm_tree::table::columnar::frame_value_cells(&[
+            (fixtures::u64_be(), &group),
+            (fixtures::u64_be(), &bucket),
+            (fixtures::u64_be(), &cluster),
+            (fixtures::u64_be(), &spread_field),
+            (lsm_tree::table::columnar::TypeTag::Bytes, &payload),
+        ])?;
+        assert_eq!(
+            blob.get(&*row.key, SeqNo::MAX)?.as_deref(),
+            Some(expected.as_slice()),
+            "key {:?} does not read back with the updated field and its payload",
+            String::from_utf8_lossy(&row.key),
+        );
+    }
+    Ok(())
+}
+
 /// ~1% of the scattered blobs: the payload of the rows the predicate drops is
 /// never fetched.
 fn cells_blobs_filtered(fixture: &Fixture) -> lsm_tree::Result<u64> {
@@ -1033,14 +1161,6 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             support: Support::Native(verify_point_reads),
         },
         Scenario {
-            name: "wide-records-projected",
-            fixture: fixtures::wide,
-            support: Support::Missing(
-                "needs a projection that reads the header fields without the \
-                 payload; today a read returns the whole value",
-            ),
-        },
-        Scenario {
             name: "mixed-value-sizes",
             fixture: fixtures::mixed_sizes,
             support: Support::Native(verify_point_reads),
@@ -1122,6 +1242,11 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             name: "wide-cells-projected",
             fixture: fixtures::cells_wide,
             support: Support::Native(cells_projected),
+        },
+        Scenario {
+            name: "metadata-only-update",
+            fixture: fixtures::cells_wide,
+            support: Support::Update(cells_metadata_update, verify_metadata_update),
         },
         Scenario {
             name: "cells-scan-sparse-clustered",
@@ -1304,6 +1429,40 @@ impl Workload for MixedLayout {
                             "us",
                             format!("keys: {keys} | scans: {}", latencies.len()),
                             Suite::Timings,
+                        );
+                    }
+                }
+                Support::Update(pass, verify) => {
+                    let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
+                    let t = Instant::now();
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let mut payload_written = 0;
+                    let readings = Readings::measure(&fixture.tree, keys, || {
+                        let measured = pass(&fixture)?;
+                        payload_written = measured.payload_written;
+                        Ok(measured.rows)
+                    })?;
+                    reporter.record_duration(t.elapsed());
+                    verify(&fixture)?;
+                    readings.report(name);
+                    readings.publish(name, reporter);
+                    // Engine-counted bytes, so a cost; zero is the expected
+                    // value, and anything above it is payload a metadata-only
+                    // update rewrote.
+                    if let Some(per_row) = readings.per_row(payload_written) {
+                        eprintln!(
+                            "  {:<34} payload written={payload_written} B ({per_row:.1} B/row)",
+                            ""
+                        );
+                        reporter.publish_series(
+                            format!("{name} payload bytes written per row"),
+                            per_row,
+                            "B/row",
+                            format!(
+                                "keys: {keys} | rows: {} | payload written: {payload_written} B",
+                                readings.rows
+                            ),
+                            Suite::Costs,
                         );
                     }
                 }
