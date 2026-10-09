@@ -4161,8 +4161,9 @@ impl Writer {
     ///
     /// Returns `false`, writing nothing, when this table cannot take the group
     /// as it is: a row-major table, one whose values are stored the other way,
-    /// or one whose last tag is not below the group's. The caller then writes
-    /// the rows instead.
+    /// one already holding the group's tag, one keeping a zone map the group
+    /// has no statistics for, or one the group's rows do not continue in
+    /// internal-key order. The caller then writes the rows instead.
     ///
     /// The group's transform must be this writer's: its pages compressed with
     /// this writer's codec and dictionary, and neither encrypted nor
@@ -4193,6 +4194,13 @@ impl Writer {
             || !self.accepts_group_tag(group.tag.get())
             || (self.use_zone_map && columns.is_none())
         {
+            return Ok(false);
+        }
+        // Two inputs may hold one key at one seqno (a write repeated at the
+        // seqno it had), and the merge emits both; a table that took them so
+        // holds a group a copy refuses as out of order. Its rows go through
+        // the ordinary path, which keeps such a tie as the merge emitted it.
+        if self.validate_direct_block_order(rows, comparator).is_err() {
             return Ok(false);
         }
         // What the group decodes to, summed over its blocks as an encoded

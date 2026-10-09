@@ -98,6 +98,35 @@ fn compaction_disjoint_columnar_tables_carries_every_row_group() {
     assert_blocks_verify(&tree);
 }
 
+/// A key rewritten at the seqno it already had leaves two tables holding one
+/// internal key; the first merge emits both into one group, and the next must
+/// write that group's rows rather than copy a group whose order a copy
+/// refuses, and keep every key readable.
+#[test]
+fn compaction_tied_key_group_is_written_not_copied() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    let mut seqno = 1;
+    flush_keys(&tree, 0..100, 0, &mut seqno);
+    tree.insert(key(0), value(0, 1), 1);
+    tree.flush_active_memtable(0).expect("flush");
+
+    tree.major_compact(64 * 1024 * 1024, 0)
+        .expect("first compaction");
+    tree.major_compact(64 * 1024 * 1024, 0)
+        .expect("second compaction");
+
+    for i in 1..100 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert!(tree.get(key(0), SeqNo::MAX).expect("get").is_some());
+    assert_blocks_verify(&tree);
+}
+
 /// A tree keeping no zone map has no statistics to carry along, and needs
 /// none: its groups are copied as when it keeps one.
 #[test]
