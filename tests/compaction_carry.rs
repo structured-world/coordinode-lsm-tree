@@ -98,6 +98,63 @@ fn compaction_disjoint_columnar_tables_carries_every_row_group() {
     assert_blocks_verify(&tree);
 }
 
+/// A tree keeping no zone map has no statistics to carry along, and needs
+/// none: its groups are copied as when it keeps one.
+#[test]
+fn compaction_without_zone_map_carries_every_row_group() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.update_runtime_config(|cfg| cfg.zone_map = false)
+        .expect("drop the zone map");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    flush_keys(&tree, 2_000..4_000, 0, &mut seqno);
+    let groups_in = row_groups(&tree);
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    assert_eq!(tree.metrics().compaction_groups_carried(), groups_in);
+    for i in 0..4_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_blocks_verify(&tree);
+}
+
+/// A table written without a zone map, merged into a tree that now keeps one:
+/// its groups have no statistics for the output's zone map, so they are
+/// encoded again, while the groups of a table written with one are copied.
+#[test]
+fn compaction_into_zone_map_rewrites_groups_written_without_one() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    tree.update_runtime_config(|cfg| cfg.zone_map = false)
+        .expect("drop the zone map");
+    let mut seqno = 1;
+    flush_keys(&tree, 0..2_000, 0, &mut seqno);
+    let without = row_groups(&tree);
+    tree.update_runtime_config(|cfg| cfg.zone_map = true)
+        .expect("keep a zone map");
+    flush_keys(&tree, 2_000..4_000, 0, &mut seqno);
+    let with = row_groups(&tree) - without;
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    assert_eq!(tree.metrics().compaction_groups_carried(), with);
+    for i in 0..4_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 4_000);
+    assert_blocks_verify(&tree);
+}
+
 /// Newer versions of a few keys in a second table land among the first
 /// table's rows: the groups they land in are written row by row, every other
 /// group is copied, and both versions of each key stay readable.

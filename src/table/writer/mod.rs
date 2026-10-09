@@ -4180,15 +4180,18 @@ impl Writer {
         group: crate::table::index_block::RowGroupRef,
         layout: crate::table::meta::ValueLayout,
         rows: &[InternalValue],
-        columns: Vec<crate::table::zone_map::ColumnStats>,
+        columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<bool> {
         use crate::coding::Decode;
         use crate::table::block::Header;
 
+        // A table keeping a zone map needs the group's per-column statistics,
+        // which only the source's zone map holds for bytes copied unread.
         if !self.use_columnar
             || self.value_layout.is_some_and(|fixed| fixed != layout)
             || !self.accepts_group_tag(group.tag.get())
+            || (self.use_zone_map && columns.is_none())
         {
             return Ok(false);
         }
@@ -4212,7 +4215,7 @@ impl Writer {
             uncompressed,
             (group.tag.get(), group.head_zones_len),
             rows,
-            Some(columns),
+            columns,
             comparator,
         )?;
         self.value_layout = Some(layout);

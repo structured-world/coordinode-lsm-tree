@@ -139,14 +139,14 @@ impl Table {
     /// re-stamped for a new place. Encrypted blocks are bound to this table's
     /// id and parity to its scheme; a positional delete mask, a restricted
     /// view or an ingested table's seqno base change what its rows read as
-    /// without changing their bytes; and the zone map supplies the copy's
-    /// per-column statistics.
+    /// without changing their bytes. A destination keeping a zone map takes
+    /// the copy's per-column statistics from this table's, and refuses a group
+    /// it has none for.
     pub(crate) fn carries_row_groups(&self) -> bool {
         self.metadata.columnar
             && self.encryption.is_none()
             && self.metadata.ecc_params.is_none()
             && !self.metadata.ecc_unrecognized
-            && !self.zone_map.is_empty()
             && self.restrict_lower_bound().is_none()
             && self.global_seqno() == 0
             && !self.has_delete_bitmap_section()

@@ -1473,13 +1473,13 @@ impl CompactionFlavour for StandardCompaction {
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<bool> {
         let table = &candidate.table;
-        let (Some(group), Some(columns)) = (
-            candidate.group.row_group(),
-            table.zone_map.columns_for(candidate.group.offset().0),
-        ) else {
+        let Some(group) = candidate.group.row_group() else {
             return Ok(false);
         };
-        let columns = columns.to_vec();
+        let columns = table
+            .zone_map
+            .columns_for(candidate.group.offset().0)
+            .map(<[_]>::to_vec);
         let raw = table.read_row_group_raw(&candidate.group, pace)?;
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),

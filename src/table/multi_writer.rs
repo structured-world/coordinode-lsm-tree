@@ -1409,7 +1409,7 @@ impl MultiWriter {
         group: super::index_block::RowGroupRef,
         (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
         rows: &[InternalValue],
-        columns: Vec<crate::table::zone_map::ColumnStats>,
+        columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
     ) -> crate::Result<bool> {
         self.carry_into((compression, layout), rows, |writer, comparator| {
             writer.append_carried_row_group((raw, source), group, layout, rows, columns, comparator)

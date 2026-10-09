@@ -7,7 +7,9 @@
 //! Random writes (runs of keys, point deletes, range deletes) are flushed into
 //! overlapping columnar tables and compacted under watermarks that keep every
 //! version, drop some or zero the seqnos, so the merge sometimes leaves a
-//! group as it was and sometimes rewrites, drops or interleaves its rows.
+//! group as it was and sometimes rewrites, drops or interleaves its rows. The
+//! zone map is switched on and off between writes, so some tables have no
+//! statistics for the groups a destination keeping one would copy.
 //! After every compaction each key reads as a `BTreeMap` oracle of the writes
 //! says, a full scan returns exactly the live keys, and every block of every
 //! table verifies at the place it lies.
@@ -47,6 +49,9 @@ enum Op {
     Compact {
         watermark: Watermark,
     },
+    /// Whether the tables written from here on keep a zone map, so a merge
+    /// mixes groups that carry their statistics with groups that have none.
+    ZoneMap(bool),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +77,7 @@ fn op() -> impl Strategy<Value = Op> {
             Just(Watermark::Max)
         ]
         .prop_map(|watermark| Op::Compact { watermark }),
+        1 => any::<bool>().prop_map(Op::ZoneMap),
     ]
 }
 
@@ -164,6 +170,9 @@ proptest! {
                     };
                     tree.major_compact(16 * 1024, watermark).expect("compact");
                     check(&tree, &oracle);
+                }
+                Op::ZoneMap(on) => {
+                    tree.update_runtime_config(|cfg| cfg.zone_map = on).expect("zone map");
                 }
             }
         }
