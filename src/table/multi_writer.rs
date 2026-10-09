@@ -1036,6 +1036,24 @@ impl MultiWriter {
         self
     }
 
+    /// The transform counter's value now, `None` when none is wired.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn transforms_seen(&self) -> Option<u64> {
+        self.transform_marker
+            .as_ref()
+            .map(|marker| marker.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Takes `seen`, the counter's value when the record just put in the
+    /// current output was emitted, as the after-last-write milestone, in
+    /// place of the value read as it was written: a record written after the
+    /// merge held it would otherwise take the verdicts ticked meanwhile,
+    /// which belong to the next output (see `transforms_after_last_write`).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn settle_transforms(&mut self, seen: u64) {
+        self.transforms_after_last_write = seen;
+    }
+
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
     pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
@@ -1517,15 +1535,14 @@ impl MultiWriter {
         {
             return Ok(false);
         }
-        let first_key = self.current_key.is_none();
-        self.current_key = Some(first.key.user_key.clone());
+        let previous_key = self.current_key.replace(first.key.user_key.clone());
         if !self.range_tombstones.is_empty() {
             self.tombstone_share.advance(
                 &self.range_tombstones,
                 &first.key.user_key,
                 self.comparator.as_ref(),
             );
-            if first_key && self.clip_range_tombstones {
+            if previous_key.is_none() && self.clip_range_tombstones {
                 self.tombstone_share.open_output(&first.key.user_key);
             }
         }
@@ -1540,6 +1557,11 @@ impl MultiWriter {
 
         let comparator = self.comparator.clone();
         if !write(&mut self.writer, &comparator)? {
+            // The rows are written next, as rows: their first key must reach
+            // [`Self::write`] as a new key, so it rotates for their layout as
+            // it would without this attempt. Advancing the tombstone share to
+            // that key and opening an output there do the same again.
+            self.current_key = previous_key;
             return Ok(false);
         }
         // The group's later keys move the tombstone share as written rows

@@ -3977,6 +3977,14 @@ impl super::carry::CarrySink for FlavourSink<'_> {
     ) -> crate::Result<Option<u64>> {
         self.flavour.carry_pages(candidate, emitted, self.pace)
     }
+
+    fn transforms_seen(&self) -> Option<u64> {
+        self.flavour.transforms_seen()
+    }
+
+    fn settle_transforms(&mut self, seen: u64) {
+        self.flavour.settle_transforms(seen);
+    }
 }
 
 fn drop_tables(

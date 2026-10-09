@@ -97,6 +97,17 @@ pub trait CarrySink {
         candidate: &CarryCandidate,
         emitted: &[InternalValue],
     ) -> crate::Result<Option<u64>>;
+
+    /// The count of the compaction filter's transformations so far, `None`
+    /// without a filter.
+    fn transforms_seen(&self) -> Option<u64>;
+
+    /// Takes `seen`, read by [`Self::transforms_seen`] when the row last put
+    /// in the output was emitted, as the count the output's window closes at:
+    /// a row written or copied after being held must not take the
+    /// transformations of the keys the merge passed meanwhile, which belong
+    /// to the window of the output holding the next row.
+    fn settle_transforms(&mut self, seen: u64);
 }
 
 /// What a compaction copied instead of encoding.
@@ -116,6 +127,20 @@ pub struct Carried {
 struct Open {
     candidate: CarryCandidate,
     emitted: alloc::vec::Vec<InternalValue>,
+    /// The filter's transformation count when each of `emitted` came out.
+    seen: alloc::vec::Vec<Option<u64>>,
+}
+
+impl Open {
+    fn hold(&mut self, row: InternalValue, sink: &dyn CarrySink) {
+        self.emitted.push(row);
+        self.seen.push(sink.transforms_seen());
+    }
+
+    /// The count when the last held row came out.
+    fn last_seen(&self) -> Option<u64> {
+        self.seen.last().copied().flatten()
+    }
 }
 
 /// Watches the rows a merge emits for the key ranges of the candidates.
@@ -157,13 +182,13 @@ impl CarryMatcher {
                 .compare(&row.key.user_key, open.candidate.last_key())
                 != core::cmp::Ordering::Greater;
             if within {
-                open.emitted.push(row);
+                open.hold(row, sink);
                 // A range the merge filled far past the group's rows is no
                 // group of the source's shape any more; it goes out as rows,
                 // which bounds what is held to about two groups.
                 if open.emitted.len() > 2 * open.candidate.rows.len() {
                     self.last_key = open.emitted.last().map(|r| r.key.user_key.clone());
-                    Self::write_rows(&open.emitted, sink)?;
+                    Self::write_rows(open, sink)?;
                 } else {
                     self.open = Some(open);
                 }
@@ -179,10 +204,13 @@ impl CarryMatcher {
             .as_ref()
             .is_some_and(|last| crate::comparator::same_user_key(last, &row.key.user_key));
         if !continues_last && let Some(candidate) = self.take_covering(&row) {
-            self.open = Some(Open {
+            let mut open = Open {
                 candidate,
-                emitted: alloc::vec![row],
-            });
+                emitted: alloc::vec::Vec::new(),
+                seen: alloc::vec::Vec::new(),
+            };
+            open.hold(row, sink);
+            self.open = Some(open);
             return Ok(());
         }
 
@@ -206,7 +234,8 @@ impl CarryMatcher {
     /// lies when that is exactly its rows, else a group copying the pages of
     /// the row pages it left as they were, else the rows.
     fn resolve(&mut self, open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
-        let Open { candidate, emitted } = open;
+        let candidate = &open.candidate;
+        let emitted = &open.emitted;
         self.last_key = emitted.last().map(|row| row.key.user_key.clone());
         let unchanged = emitted.len() == candidate.rows.len()
             && emitted
@@ -214,18 +243,24 @@ impl CarryMatcher {
                 .zip(candidate.rows.iter())
                 .all(|(row, read)| same_row(read, row));
         if unchanged {
-            if sink.carry(&candidate)? {
+            if sink.carry(candidate)? {
                 self.carried.groups += 1;
                 self.carried.rows += candidate.rows.len() as u64;
                 self.carried.bytes += u64::from(candidate.group.size());
+                if let Some(seen) = open.last_seen() {
+                    sink.settle_transforms(seen);
+                }
                 return Ok(());
             }
-        } else if let Some(bytes) = sink.carry_pages(&candidate, &emitted)? {
+        } else if let Some(bytes) = sink.carry_pages(candidate, emitted)? {
             self.carried.partial_groups += 1;
             self.carried.bytes += bytes;
+            if let Some(seen) = open.last_seen() {
+                sink.settle_transforms(seen);
+            }
             return Ok(());
         }
-        Self::write_rows(&emitted, sink)
+        Self::write_rows(open, sink)
     }
 
     /// The candidate whose key range holds `row`'s key, taken from the queue,
@@ -244,9 +279,17 @@ impl CarryMatcher {
         queue.remove(at)
     }
 
-    /// Writes `rows` one by one: rows the merge emitted that are not copied.
-    fn write_rows(rows: &[InternalValue], sink: &mut dyn CarrySink) -> crate::Result<()> {
-        rows.iter().try_for_each(|row| sink.write(row.clone()))
+    /// Writes the rows `open` held one by one, each closing the output's
+    /// window at the count seen when it came out: rows the merge emitted
+    /// that are not copied.
+    fn write_rows(open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
+        for (row, seen) in open.emitted.into_iter().zip(open.seen) {
+            sink.write(row)?;
+            if let Some(seen) = seen {
+                sink.settle_transforms(seen);
+            }
+        }
+        Ok(())
     }
 }
 

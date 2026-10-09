@@ -121,12 +121,27 @@ impl GroupCarry {
 
     /// Starts handing out `rows`, the rows of the group `group` names, and
     /// records the group as a candidate.
+    ///
+    /// The scan is asked for a new group once the merge has taken the last
+    /// row of the one before, so every key below that row has gone through
+    /// the merge: a candidate ending below it can no longer be emitted, and
+    /// is dropped here, whether or not the merge emitted anything since. The
+    /// queue then holds about one group per input, however long a run the
+    /// merge drops. A one-key group the merge still holds at that moment is
+    /// dropped too, and its rows are written instead of copied.
     pub(crate) fn start(&mut self, group: Option<BlockHandle>, mut rows: Vec<InternalValue>) {
         let read = rows.len();
         if let Some(bounds) = &self.bounds {
             rows.retain(|row| bounds.contains(&row.key.user_key));
         }
         let whole = rows.len() == read;
+        let mut queue = self.queue.lock();
+        if let Some(passed) = self.rows.last() {
+            let comparator = &self.table.comparator;
+            queue.retain(|candidate| {
+                comparator.compare(candidate.last_key(), &passed.key.user_key) != Ordering::Less
+            });
+        }
         self.rows = Arc::from(rows);
         self.next = 0;
         if whole
@@ -135,7 +150,7 @@ impl GroupCarry {
             && let (Some(first), Some(last)) = (self.rows.first(), self.rows.last())
         {
             let keys = (first.key.user_key.clone(), last.key.user_key.clone());
-            self.queue.lock().push_back(CarryCandidate {
+            queue.push_back(CarryCandidate {
                 table: self.table.clone(),
                 group,
                 row_group,
@@ -143,6 +158,8 @@ impl GroupCarry {
                 keys,
             });
         }
+        #[cfg(test)]
+        tests::note_queue_len(queue.len());
     }
 
     /// The next row of the current group, or `None` once it is handed out.

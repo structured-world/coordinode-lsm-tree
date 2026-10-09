@@ -894,6 +894,111 @@ fn compaction_filter_replacing_values_rewrites_only_their_groups() {
     assert_blocks_verify(&tree);
 }
 
+/// A filter that removes keys right after a copied group: the removals belong
+/// to the output that takes the next written row, as they do without copying,
+/// so of the outputs exactly those whose key window holds a removed key are
+/// marked transformed.
+#[test]
+fn compaction_filter_removals_after_a_copied_group_mark_the_next_output() {
+    use lsm_tree::compaction::filter::{
+        CompactionFilter, Context as FilterContext, Factory, ItemAccessor, Verdict,
+    };
+    use std::sync::Arc;
+
+    const REMOVED: core::ops::Range<u32> = 100..110;
+    struct Remove;
+    impl CompactionFilter for Remove {
+        fn filter_item(
+            &mut self,
+            item: ItemAccessor<'_>,
+            _ctx: &FilterContext,
+        ) -> lsm_tree::Result<Verdict> {
+            let removed = REMOVED
+                .into_iter()
+                .any(|i| &item.key()[..] == key(i).as_slice());
+            Ok(if removed {
+                Verdict::Remove
+            } else {
+                Verdict::Keep
+            })
+        }
+    }
+    struct RemoveFactory;
+    impl Factory for RemoveFactory {
+        fn name(&self) -> &str {
+            "remove"
+        }
+        fn make_filter(&self, _ctx: &FilterContext) -> Box<dyn CompactionFilter> {
+            Box::new(Remove)
+        }
+    }
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_compaction_filter_factory(Some(Arc::new(RemoveFactory)))
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+    let mut seqno = 1;
+    // One group of keys copied whole, then keys the filter removes, written
+    // row-major so they are no group to copy, then more copied groups.
+    flush_keys(&tree, 0..20, 0, &mut seqno);
+    tree.update_runtime_config(|cfg| cfg.columnar = false)
+        .expect("row-major");
+    flush_keys(&tree, REMOVED, 0, &mut seqno);
+    tree.update_runtime_config(|cfg| cfg.columnar = true)
+        .expect("columnar");
+    flush_keys(&tree, 200..2_200, 0, &mut seqno);
+
+    // A target of one byte: every output closes at its first chance.
+    tree.major_compact(1, 0).expect("compact");
+    assert!(tree.metrics().compaction_groups_carried() > 0);
+
+    let mut outputs: Vec<(Vec<u8>, bool)> = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| {
+            (
+                t.metadata.key_range.max().to_vec(),
+                t.metadata.lineage_transformed,
+            )
+        })
+        .collect();
+    outputs.sort();
+    let mut previous_last: Option<Vec<u8>> = None;
+    for (i, (last, transformed)) in outputs.iter().enumerate() {
+        let is_final = i + 1 == outputs.len();
+        let holds_removed = REMOVED.into_iter().any(|r| {
+            let k = key(r);
+            previous_last.as_ref().is_none_or(|p| k > *p) && (is_final || k <= *last)
+        });
+        assert_eq!(
+            *transformed,
+            holds_removed,
+            "output {i} ending at {:?}",
+            String::from_utf8_lossy(last),
+        );
+        previous_last = Some(last.clone());
+    }
+    for i in REMOVED {
+        assert_eq!(tree.get(key(i), SeqNo::MAX).expect("get"), None);
+    }
+    assert_blocks_verify(&tree);
+}
+
 /// An encrypted table's blocks are bound to its id: nothing is copied into
 /// another table, and every block of the output verifies as its own.
 #[test]

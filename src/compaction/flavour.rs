@@ -605,6 +605,18 @@ pub(super) trait CompactionFlavour {
         Ok(None)
     }
 
+    /// The count of the compaction filter's transformations so far, `None`
+    /// without a filter (see [`crate::compaction::carry::CarrySink`]).
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        None
+    }
+
+    /// Closes the current output's transformation window at `seen` for the
+    /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, _seen: u64) {}
+
     /// Writes range tombstones to the current output table.
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
 
@@ -1193,6 +1205,16 @@ impl CompactionFlavour for RelocatingCompaction {
         self.inner.write_range_tombstones(tombstones);
     }
 
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        self.inner.transforms_seen()
+    }
+
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, seen: u64) {
+        self.inner.settle_transforms(seen);
+    }
+
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         if item.key.value_type.is_cell_row() {
             return self.write_cell_row(item);
@@ -1446,6 +1468,16 @@ impl StandardCompaction {
 impl CompactionFlavour for StandardCompaction {
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
         self.table_writer.set_range_tombstones(tombstones.to_vec());
+    }
+
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        self.table_writer.transforms_seen()
+    }
+
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, seen: u64) {
+        self.table_writer.settle_transforms(seen);
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {

@@ -2,8 +2,63 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use super::KeyBounds;
-use crate::UserKey;
+use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, UserKey};
 use core::ops::Bound;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// The most candidates the carry queues of this process held at once. Each
+/// test runs in a process of its own, so the figure is the test's.
+static PEAK_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn note_queue_len(len: usize) {
+    PEAK_QUEUE.fetch_max(len, Ordering::Relaxed);
+}
+
+/// A merge that drops every row emits nothing, so nothing it emits retires
+/// the groups its inputs' scans record: they are retired as the scans move
+/// on, and the queue holds a group or two per input rather than the input.
+#[test]
+fn carry_queue_stays_bounded_when_the_merge_drops_everything() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            crate::config::CompressionPolicy::all(crate::CompressionType::None);
+    })?;
+    let key = |i: u32| format!("k{i:06}").into_bytes();
+    let mut seqno: SeqNo = 1;
+    for range in [0..2_000u32, 2_000..4_000] {
+        for i in range {
+            tree.insert(key(i), vec![b'v'; 64], seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let groups: u64 = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.data_block_count)
+        .sum();
+    tree.remove_range(key(0), key(5_000), seqno);
+    tree.flush_active_memtable(0)?;
+
+    tree.major_compact(64 * 1024 * 1024, SeqNo::MAX)?;
+
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 0);
+    let peak = PEAK_QUEUE.load(Ordering::Relaxed) as u64;
+    assert!(groups > 8, "the inputs span many groups: {groups}");
+    assert!(peak <= 4, "{peak} of {groups} groups held at once");
+    Ok(())
+}
 
 fn bounds(lo: Bound<&str>, hi: Bound<&str>) -> KeyBounds {
     KeyBounds {
