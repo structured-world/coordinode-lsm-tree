@@ -1043,7 +1043,6 @@ fn range_tombstone_multi_table_flush_keeps_newer_values_reachable() -> lsm_tree:
 /// an older table on both sides and between the outputs stay deleted, also
 /// after the tree reopens.
 #[test]
-#[ignore = "heavy: allocates ~68 MiB to force MultiWriter rotation; run with `cargo nextest run --run-ignored only`"]
 fn range_tombstone_cut_by_a_rotated_flush_covers_older_keys() -> lsm_tree::Result<()> {
     use lsm_tree::CompressionType;
     use lsm_tree::config::CompressionPolicy;
@@ -1056,6 +1055,7 @@ fn range_tombstone_cut_by_a_rotated_flush_covers_older_keys() -> lsm_tree::Resul
             SequenceNumberCounter::default(),
         )
         .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
+        .table_target_size(64 * 1_024)
         .open()
     };
     let tree = open()?;
@@ -1066,9 +1066,9 @@ fn range_tombstone_cut_by_a_rotated_flush_covers_older_keys() -> lsm_tree::Resul
     tree.flush_active_memtable(0)?;
     let tables_before = tree.table_count();
 
-    // Four 17 MiB values pass the 64 MiB flush target, so the flush rotates
+    // Four 17 KiB values pass the 64 KiB flush target, so the flush rotates
     // before "c5".
-    let large_value = "a".repeat(17 * 1_024 * 1_024);
+    let large_value = "a".repeat(17 * 1_024);
     for (seqno, key) in (5..).zip(["b0", "b1", "c0", "c1"]) {
         tree.insert(key, &large_value, seqno);
     }
