@@ -753,15 +753,22 @@ impl AbstractTree for Tree {
             return crate::Backpressure::None;
         }
         let version = self.current_version();
-        // L0 is the first level; its table (file) count is the count-trigger
-        // signal, matching the leveled `choose` trigger and the L0 term of
-        // `pending_compaction_bytes`.
-        let l0_count = version
-            .iter_levels()
-            .next()
-            .map_or(0, |level| level.table_count());
-        let pending = strategy.pending_compaction_bytes(&version);
-        crate::Backpressure::compute(l0_count, pending, &thresholds)
+        let signals = crate::BackpressureSignals {
+            // L0's run count is what a read pays there and what the leveled
+            // trigger counts.
+            l0_runs: version.l0().run_count(),
+            pending_compaction_bytes: strategy.pending_compaction_bytes(&version),
+            // Summed over a shared budget's members, so read only when an
+            // axis compares it.
+            unflushed_memtable_bytes: if thresholds.memtable_slowdown.is_some()
+                || thresholds.memtable_stop.is_some()
+            {
+                self.unflushed_memtable_bytes()
+            } else {
+                0
+            },
+        };
+        crate::Backpressure::compute(&signals, &thresholds)
     }
 
     fn get_flush_lock(&self) -> FlushGuard<'_> {
@@ -1066,7 +1073,7 @@ impl AbstractTree for Tree {
         let mut table_writer = MultiWriter::new(
             folder.clone(),
             self.table_id_counter.clone(),
-            64 * 1_024 * 1_024,
+            self.config.table_target_size,
             0,
             level_fs.clone(),
         )?
@@ -1865,6 +1872,10 @@ impl AbstractTree for Tree {
 
     fn compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
         Arc::clone(&self.compaction_rate_limiter)
+    }
+
+    fn write_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
+        Arc::clone(&self.write_rate_limiter)
     }
 
     fn get<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<UserValue>> {
@@ -4376,6 +4387,26 @@ impl Tree {
         self.version_history.read().get_version_for_snapshot(seqno)
     }
 
+    /// Unflushed memtable bytes the memtable backpressure axis compares: the
+    /// total of the shared write-buffer budget when the tree joined one, else
+    /// the tree's own active and sealed memtables.
+    #[cfg(feature = "std")]
+    pub(crate) fn unflushed_memtable_bytes(&self) -> u64 {
+        match &self.config.write_buffer_budget {
+            Some(budget) => budget.unflushed_bytes(),
+            None => self.latest_super_version.load().unflushed_bytes(),
+        }
+    }
+
+    /// The tree's own unflushed memtable bytes; see the `std` build's twin.
+    #[cfg(not(feature = "std"))]
+    pub(crate) fn unflushed_memtable_bytes(&self) -> u64 {
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .unflushed_bytes()
+    }
+
     /// The snapshot for one point read, without a clone.
     ///
     /// Every snapshot above the retention floor is served by the current
@@ -5384,6 +5415,7 @@ impl Tree {
         let sync_mode = config.sync_mode;
         // Same reason: built before the move.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
         // dropping the tree has to wake it.
         let stop_signal = StopSignal::default();
@@ -5402,6 +5434,10 @@ impl Tree {
         }
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
+        #[cfg(feature = "std")]
+        if let Some(budget) = &config.write_buffer_budget {
+            budget.register(Arc::downgrade(&latest_super_version));
+        }
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
@@ -5423,6 +5459,7 @@ impl Tree {
             heal_hints: Arc::clone(&heal_hints),
             filter_budget,
             compaction_rate_limiter,
+            write_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,
             )),

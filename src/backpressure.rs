@@ -10,17 +10,27 @@
 //! the blocked thread may be the one that runs compaction. This mirrors the
 //! storage-admission predicate ([`crate::AbstractTree::write_admission`]).
 //!
-//! [`Backpressure`] is computed from two independent signals against
+//! [`Backpressure`] is computed from three independent signals against
 //! caller-configured thresholds (see the `*_slowdown` / `*_stop` fields on
 //! [`RuntimeConfig`](crate::runtime_config::RuntimeConfig)):
 //!
-//! - **L0 table count** — count-triggered, the same signal the leveled `choose`
-//!   trigger uses; a tall L0 is what spikes read amplification.
-//! - **Pending compaction bytes** — the size-target debt the strategy reports.
+//! - **L0 run count**: the signal the leveled trigger counts; each run costs a
+//!   read one table lookup, so a tall L0 is what spikes read amplification.
+//! - **Pending compaction bytes**: the size-target debt the strategy reports.
+//! - **Unflushed memtable bytes**: the active plus the sealed memtables, the
+//!   memory flushes have not yet released; for trees sharing a
+//!   [`WriteBufferBudget`], their total.
 //!
-//! The verdict is the more severe of the two axes. With every threshold unset the
-//! verdict is always [`Backpressure::None`], so the feature is off by default and
-//! the write path is unchanged.
+//! The verdict is the most severe of the three axes. With every threshold unset
+//! the verdict is always [`Backpressure::None`], so the feature is off by default
+//! and the write path is unchanged.
+//!
+//! Under [`Backpressure::Slowdown`] a tree with a write rate limit (see
+//! [`Config::write_rate_limit`](crate::Config::write_rate_limit)) paces by bytes:
+//! [`AbstractTree::write_backpressure_for`](crate::AbstractTree::write_backpressure_for)
+//! debits a write's bytes from the tree's write limiter and returns what they
+//! owe, so throughput under slowdown is bounded by the rate whatever the write
+//! sizes.
 
 use core::time::Duration;
 
@@ -32,10 +42,10 @@ use core::time::Duration;
 /// independently: the axis still produces the tier whose threshold is set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackpressureThresholds {
-    /// L0 table count at or above which the verdict is at least
+    /// L0 run count at or above which the verdict is at least
     /// [`Backpressure::Slowdown`].
     pub l0_slowdown: Option<usize>,
-    /// L0 table count at or above which the verdict is [`Backpressure::Stop`].
+    /// L0 run count at or above which the verdict is [`Backpressure::Stop`].
     pub l0_stop: Option<usize>,
     /// Pending-compaction bytes at or above which the verdict is at least
     /// [`Backpressure::Slowdown`].
@@ -43,6 +53,12 @@ pub struct BackpressureThresholds {
     /// Pending-compaction bytes at or above which the verdict is
     /// [`Backpressure::Stop`].
     pub bytes_stop: Option<u64>,
+    /// Unflushed memtable bytes at or above which the verdict is at least
+    /// [`Backpressure::Slowdown`].
+    pub memtable_slowdown: Option<u64>,
+    /// Unflushed memtable bytes at or above which the verdict is
+    /// [`Backpressure::Stop`].
+    pub memtable_stop: Option<u64>,
     /// The slowdown delay returned at the stop threshold. The actual
     /// [`Backpressure::Slowdown`] delay ramps linearly from zero at the slowdown
     /// threshold to this cap at the stop threshold, so there is no cliff between
@@ -59,6 +75,8 @@ impl BackpressureThresholds {
         l0_stop: None,
         bytes_slowdown: None,
         bytes_stop: None,
+        memtable_slowdown: None,
+        memtable_stop: None,
         max_slowdown: None,
     };
 
@@ -71,7 +89,21 @@ impl BackpressureThresholds {
             && self.l0_stop.is_none()
             && self.bytes_slowdown.is_none()
             && self.bytes_stop.is_none()
+            && self.memtable_slowdown.is_none()
+            && self.memtable_stop.is_none()
     }
+}
+
+/// The live signals a [`Backpressure`] verdict is computed from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackpressureSignals {
+    /// Runs in L0.
+    pub l0_runs: usize,
+    /// The size-target debt the compaction strategy reports.
+    pub pending_compaction_bytes: u64,
+    /// Bytes held by the active and the sealed memtables: the tree's own, or
+    /// the total of every tree sharing its [`WriteBufferBudget`].
+    pub unflushed_memtable_bytes: u64,
 }
 
 /// A computed write-backpressure verdict.
@@ -125,45 +157,70 @@ pub enum Backpressure {
 }
 
 impl Backpressure {
-    /// Compute the verdict from the two live signals against `thresholds`.
+    /// Compute the verdict from the live `signals` against `thresholds`.
     ///
     /// Pure and allocation-free so it is unit-testable without a tree. The result
-    /// is the more severe of the L0-count and pending-bytes axes; the slowdown
-    /// delay is the larger of the two axes' ramped delays.
+    /// is the most severe of the L0-run, pending-bytes and memtable-bytes axes;
+    /// the slowdown delay is the largest of their ramped delays.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Backpressure, BackpressureSignals, BackpressureThresholds};
+    ///
+    /// let thresholds = BackpressureThresholds {
+    ///     memtable_slowdown: Some(64 << 20),
+    ///     memtable_stop: Some(256 << 20),
+    ///     ..BackpressureThresholds::OFF
+    /// };
+    /// let signals = BackpressureSignals {
+    ///     unflushed_memtable_bytes: 300 << 20,
+    ///     ..BackpressureSignals::default()
+    /// };
+    /// assert_eq!(Backpressure::compute(&signals, &thresholds), Backpressure::Stop);
+    /// ```
     #[must_use]
-    pub fn compute(
-        l0_table_count: usize,
-        pending_bytes: u64,
-        thresholds: &BackpressureThresholds,
-    ) -> Self {
+    pub fn compute(signals: &BackpressureSignals, thresholds: &BackpressureThresholds) -> Self {
         if thresholds.is_off() {
             return Self::None;
         }
+        let BackpressureSignals {
+            l0_runs,
+            pending_compaction_bytes: pending,
+            unflushed_memtable_bytes: unflushed,
+        } = *signals;
 
-        // Stop dominates: if either axis is at its stop threshold, stop.
-        let l0_stop = thresholds.l0_stop.is_some_and(|t| l0_table_count >= t);
-        let bytes_stop = thresholds.bytes_stop.is_some_and(|t| pending_bytes >= t);
-        if l0_stop || bytes_stop {
+        // Stop dominates: if any axis is at its stop threshold, stop.
+        if thresholds.l0_stop.is_some_and(|t| l0_runs >= t)
+            || thresholds.bytes_stop.is_some_and(|t| pending >= t)
+            || thresholds.memtable_stop.is_some_and(|t| unflushed >= t)
+        {
             return Self::Stop;
         }
 
-        // Otherwise, the slowdown tier if either axis is past its slowdown
-        // threshold. The delay is the larger ramp across the two axes.
+        // Otherwise, the slowdown tier if any axis is past its slowdown
+        // threshold. The delay is the largest ramp across the axes.
         let cap = thresholds.max_slowdown.unwrap_or(Duration::ZERO);
         let mut delay = Duration::ZERO;
         let mut slowing = false;
 
         if let Some(soft) = thresholds.l0_slowdown
-            && l0_table_count >= soft
+            && l0_runs >= soft
         {
             slowing = true;
-            delay = delay.max(ramp_usize(l0_table_count, soft, thresholds.l0_stop, cap));
+            delay = delay.max(ramp_usize(l0_runs, soft, thresholds.l0_stop, cap));
         }
         if let Some(soft) = thresholds.bytes_slowdown
-            && pending_bytes >= soft
+            && pending >= soft
         {
             slowing = true;
-            delay = delay.max(ramp_u64(pending_bytes, soft, thresholds.bytes_stop, cap));
+            delay = delay.max(ramp_u64(pending, soft, thresholds.bytes_stop, cap));
+        }
+        if let Some(soft) = thresholds.memtable_slowdown
+            && unflushed >= soft
+        {
+            slowing = true;
+            delay = delay.max(ramp_u64(unflushed, soft, thresholds.memtable_stop, cap));
         }
 
         if slowing {
@@ -179,6 +236,82 @@ impl Backpressure {
     #[must_use]
     pub const fn is_throttled(&self) -> bool {
         !matches!(self, Self::None)
+    }
+}
+
+/// The current memtables of a tree, as a budget reads them: the tree's
+/// lock-free mirror of its latest super version.
+#[cfg(feature = "std")]
+type MemtableProbe = alloc::sync::Weak<arc_swap::ArcSwap<crate::version::SuperVersion>>;
+
+/// A write-buffer budget several trees share: the memtable axis of each
+/// member's [`Backpressure`] verdict compares the members' unflushed memtable
+/// bytes together, so N trees are bounded as one.
+///
+/// Hand the same `Arc` to every tree through
+/// [`Config::write_buffer_budget`](crate::Config::write_buffer_budget). The
+/// total is summed when a verdict asks for it, from each member's current
+/// memtables, so a write pays nothing for the budget; a dropped tree leaves it.
+///
+/// # Examples
+///
+/// ```
+/// use lsm_tree::{AbstractTree, Config, WriteBufferBudget};
+/// use std::sync::Arc;
+///
+/// # let a = tempfile::tempdir()?;
+/// # let b = tempfile::tempdir()?;
+/// let budget = Arc::new(WriteBufferBudget::default());
+/// let first = Config::new(a.path(), Default::default(), Default::default())
+///     .write_buffer_budget(Arc::clone(&budget))
+///     .open()?;
+/// let second = Config::new(b.path(), Default::default(), Default::default())
+///     .write_buffer_budget(Arc::clone(&budget))
+///     .open()?;
+/// first.insert("k", "v", 0);
+/// second.insert("k", "v", 0);
+/// assert!(budget.unflushed_bytes() >= 4);
+/// # Ok::<(), lsm_tree::Error>(())
+/// ```
+// no-std: members would register their version history behind spin::RwLock
+#[cfg(feature = "std")]
+#[derive(Default)]
+pub struct WriteBufferBudget {
+    members: parking_lot::Mutex<alloc::vec::Vec<MemtableProbe>>,
+}
+
+#[cfg(feature = "std")]
+impl WriteBufferBudget {
+    /// Unflushed memtable bytes of every live member: their active and sealed
+    /// memtables together.
+    #[must_use]
+    pub fn unflushed_bytes(&self) -> u64 {
+        let mut members = self.members.lock();
+        let mut total = 0u64;
+        members.retain(|member| {
+            let Some(mirror) = member.upgrade() else {
+                return false;
+            };
+            // Each term is one tree's memtable bytes in memory, so the sum is
+            // bounded by the process's memory and cannot overflow u64.
+            total += mirror.load().unflushed_bytes();
+            true
+        });
+        total
+    }
+
+    /// Adds a tree, by the mirror of its latest super version.
+    pub(crate) fn register(&self, mirror: MemtableProbe) {
+        self.members.lock().push(mirror);
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Debug for WriteBufferBudget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WriteBufferBudget")
+            .field("members", &self.members.lock().len())
+            .finish()
     }
 }
 

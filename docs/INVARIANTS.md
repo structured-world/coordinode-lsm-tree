@@ -148,10 +148,16 @@ matching entry (and add one for a new subsystem).
   are gathered from every level, not just this compaction's inputs. Enforced in the
   bottommost seqno-zeroer (`src/compaction/seqno_zeroer.rs`).
 
-- **L0 compaction is triggered by table (file) count, and pending-compaction debt
-  is measured the same way.** Both the `choose` trigger and `compaction_debt`
-  count tables, not runs, so a multi-table L0 run is not under-counted. Enforced
-  in `src/compaction/leveled` (test `compaction_debt_flags_l0_over_threshold_then_clears`).
+- **L0 compaction is triggered by run count, with a separate table-count guard,
+  and pending-compaction debt and the L0 backpressure axis use the same signal.**
+  A run's tables are disjoint, so a read pays at most one table per run: the run
+  count bounds L0 read amplification, and a flush rotated into many tables is
+  one run that does not trip the trigger on its own. The table-count guard
+  (`Leveled::with_l0_file_threshold`) still merges a fan-out of many small
+  tables. Enforced in `src/compaction/leveled` (tests
+  `one_l0_run_of_many_tables_does_not_trip_the_l0_trigger`,
+  `as_many_l0_runs_as_the_threshold_trip_the_l0_trigger`,
+  `compaction_debt_flags_l0_over_threshold_then_clears`).
 
 ## File lifecycle and concurrency
 

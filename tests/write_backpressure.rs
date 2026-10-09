@@ -2,7 +2,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! End-to-end tests for the opt-in computed write-backpressure verdict
-//! ([`AbstractTree::write_backpressure`]): the L0-count and pending-compaction-
+//! ([`AbstractTree::write_backpressure`]): the L0-run and pending-compaction-
 //! bytes signals driving the Slowdown then Stop tiers, the off-by-default no-op,
 //! live re-configuration, and BlobTree delegation. The pure tier/ramp arithmetic
 //! is unit-tested in `src/backpressure/tests.rs`; here we prove the wiring reads
@@ -10,9 +10,10 @@
 
 use core::time::Duration;
 use lsm_tree::compaction::Leveled;
+use lsm_tree::rate_limiter::RateLimiter;
 use lsm_tree::{
     AbstractTree, AnyTree, Backpressure, BackpressureThresholds, Config, KvSeparationOptions,
-    SequenceNumberCounter, get_tmp_folder,
+    SequenceNumberCounter, WriteBufferBudget, get_tmp_folder,
 };
 use std::sync::Arc;
 
@@ -45,14 +46,14 @@ fn open_blob_tree(path: &std::path::Path) -> lsm_tree::BlobTree {
     }
 }
 
-/// Flush one non-empty memtable, adding exactly one L0 table (compaction is
-/// caller-driven, so nothing merges L0 underneath us).
+/// Flush one non-empty memtable, adding exactly one L0 run (compaction is
+/// caller-driven, so nothing merges L0 underneath us). Every round writes the
+/// same two keys, so each flush overlaps the ones before it and stays a run of
+/// its own; disjoint flushes would share one run, which a read pays once.
 fn add_l0_table(tree: &lsm_tree::Tree, round: u64) {
-    tree.insert(
-        format!("k{round:05}").as_bytes(),
-        b"payload".as_slice(),
-        round,
-    );
+    for key in ["a", "z"] {
+        tree.insert(key, format!("payload{round}"), round);
+    }
     tree.flush_active_memtable(0).expect("flush");
 }
 
@@ -86,6 +87,7 @@ fn l0_count_drives_slowdown_then_stop() -> lsm_tree::Result<()> {
             bytes_slowdown: None,
             bytes_stop: None,
             max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
         };
     })?;
 
@@ -114,6 +116,34 @@ fn l0_count_drives_slowdown_then_stop() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Disjoint flushes share one L0 run, and a read pays one table of it per key:
+/// however many of them pile up, the L0 axis does not throttle.
+#[test]
+fn disjoint_flushes_share_a_run_and_do_not_throttle() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let strat = Leveled::default();
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: Some(2),
+            l0_stop: Some(4),
+            bytes_slowdown: None,
+            bytes_stop: None,
+            max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
+        };
+    })?;
+
+    for round in 0..6u64 {
+        tree.insert(format!("k{round:05}"), "payload", round);
+        tree.flush_active_memtable(0)?;
+    }
+    assert_eq!(tree.table_count(), 6);
+    assert_eq!(tree.l0_run_count(), 1);
+    assert_eq!(tree.write_backpressure(&strat), Backpressure::None);
+    Ok(())
+}
+
 #[test]
 fn thresholds_are_live_toggleable() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -133,6 +163,7 @@ fn thresholds_are_live_toggleable() -> lsm_tree::Result<()> {
             bytes_slowdown: None,
             bytes_stop: None,
             max_slowdown: Some(Duration::from_millis(1)),
+            ..BackpressureThresholds::OFF
         };
     })?;
     assert_eq!(tree.write_backpressure(&strat), Backpressure::Stop);
@@ -162,6 +193,7 @@ fn draining_compaction_clears_the_verdict() -> lsm_tree::Result<()> {
             bytes_slowdown: None,
             bytes_stop: None,
             max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
         };
     })?;
 
@@ -188,9 +220,9 @@ fn draining_compaction_clears_the_verdict() -> lsm_tree::Result<()> {
 #[test]
 fn bytes_axis_drives_verdict_with_l0_axis_off() -> lsm_tree::Result<()> {
     // Prove the wiring forwards `strategy.pending_compaction_bytes(&version)`
-    // into the verdict, independent of the L0-count axis. Leveled counts L0's
-    // whole size as pending once L0 reaches its file threshold (default 4), so
-    // four flushed tables give a non-zero pending-bytes signal.
+    // into the verdict, independent of the L0-run axis. Leveled counts L0's
+    // whole size as pending once L0 reaches its run threshold (default 4), so
+    // four overlapping flushes give a non-zero pending-bytes signal.
     let folder = get_tmp_folder();
     let tree = open_tree(folder.path());
     let strat = Leveled::default();
@@ -208,6 +240,7 @@ fn bytes_axis_drives_verdict_with_l0_axis_off() -> lsm_tree::Result<()> {
             bytes_slowdown: Some(1),
             bytes_stop: Some(u64::MAX),
             max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
         };
     })?;
     assert!(
@@ -227,6 +260,7 @@ fn bytes_axis_drives_verdict_with_l0_axis_off() -> lsm_tree::Result<()> {
             bytes_slowdown: Some(1),
             bytes_stop: Some(1),
             max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
         };
     })?;
     assert_eq!(
@@ -252,6 +286,7 @@ fn blob_tree_delegates_backpressure_to_index() -> lsm_tree::Result<()> {
             bytes_slowdown: None,
             bytes_stop: None,
             max_slowdown: Some(Duration::from_millis(1)),
+            ..BackpressureThresholds::OFF
         };
     })?;
 
@@ -260,14 +295,279 @@ fn blob_tree_delegates_backpressure_to_index() -> lsm_tree::Result<()> {
 
     // Two flushes of the index tree -> stop tier, observed through the blob
     // tree's delegating override.
+    // Overlapping, so each flush is a run of its own.
     for round in 0..2u64 {
-        tree.insert(
-            format!("k{round:05}").as_bytes(),
-            b"payload".as_slice(),
-            round,
-        );
+        for key in ["a", "z"] {
+            tree.insert(key, format!("payload{round}"), round);
+        }
         tree.flush_active_memtable(0).expect("flush");
     }
     assert_eq!(tree.write_backpressure(&strat), Backpressure::Stop);
     Ok(())
+}
+
+/// Thresholds on the memtable axis alone.
+fn memtable_axis(slowdown: u64, stop: u64) -> BackpressureThresholds {
+    BackpressureThresholds {
+        memtable_slowdown: Some(slowdown),
+        memtable_stop: Some(stop),
+        max_slowdown: Some(Duration::from_millis(5)),
+        ..BackpressureThresholds::OFF
+    }
+}
+
+/// Writes `count` 1 KiB values under `prefix`.
+fn write_kib(tree: &impl AbstractTree, prefix: &str, count: u64, seqno: u64) {
+    for i in 0..count {
+        tree.insert(format!("{prefix}{i:06}"), vec![b'v'; 1_024], seqno + i);
+    }
+}
+
+/// The memtable axis counts the active and the sealed memtables: a slowdown
+/// past its first threshold, a stop past its second, sealing does not hide
+/// the bytes, and flushing them returns the verdict to `None`.
+#[test]
+fn unflushed_memtable_bytes_drive_slowdown_then_stop_until_flushed() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+    let strat = Leveled::default();
+    tree.update_runtime_config(|c| c.backpressure = memtable_axis(256 * 1_024, 1_024 * 1_024))?;
+
+    assert_eq!(tree.write_backpressure(&strat), Backpressure::None);
+
+    write_kib(&tree, "a", 300, 0);
+    assert!(matches!(
+        tree.write_backpressure(&strat),
+        Backpressure::Slowdown { .. }
+    ));
+
+    // Sealed, not yet flushed: still memory the flush has to release.
+    assert!(tree.rotate_memtable().is_some());
+    assert_eq!(tree.sealed_memtable_count(), 1);
+    write_kib(&tree, "b", 800, 1_000);
+    assert_eq!(tree.write_backpressure(&strat), Backpressure::Stop);
+
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.sealed_memtable_count(), 0);
+    assert_eq!(tree.write_backpressure(&strat), Backpressure::None);
+    Ok(())
+}
+
+/// Two trees on one write-buffer budget: writes to one raise the verdict of
+/// both once the shared total crosses a threshold, though neither tree alone
+/// is past it.
+#[test]
+fn trees_sharing_a_write_buffer_budget_are_bounded_together() -> lsm_tree::Result<()> {
+    let budget = Arc::new(WriteBufferBudget::default());
+    let (a_dir, b_dir) = (get_tmp_folder(), get_tmp_folder());
+    let open = |path: &std::path::Path| match Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .write_buffer_budget(Arc::clone(&budget))
+    .open()
+    .expect("open")
+    {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    let (a, b) = (open(a_dir.path()), open(b_dir.path()));
+    let strat = Leveled::default();
+    for tree in [&a, &b] {
+        tree.update_runtime_config(|c| {
+            c.backpressure = memtable_axis(512 * 1_024, 4 * 1_024 * 1_024);
+        })?;
+    }
+
+    write_kib(&a, "a", 300, 0);
+    assert_eq!(b.write_backpressure(&strat), Backpressure::None);
+    write_kib(&b, "b", 300, 0);
+    // About 600 KiB together: each tree holds half, the budget the sum.
+    assert!(budget.unflushed_bytes() >= 600 * 1_024);
+    for tree in [&a, &b] {
+        assert!(matches!(
+            tree.write_backpressure(&strat),
+            Backpressure::Slowdown { .. }
+        ));
+    }
+
+    // A tree that leaves (is dropped) leaves the budget.
+    drop(b);
+    assert!(budget.unflushed_bytes() < 600 * 1_024);
+    assert_eq!(a.write_backpressure(&strat), Backpressure::None);
+    Ok(())
+}
+
+/// A tree past an L0 slowdown threshold, paced at `rate` bytes per second.
+fn slowed_tree(path: &std::path::Path, rate: u64) -> lsm_tree::Tree {
+    let tree = match Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .write_rate_limit(rate)
+    .open()
+    .expect("open")
+    {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: Some(1),
+            max_slowdown: Some(Duration::from_millis(5)),
+            ..BackpressureThresholds::OFF
+        };
+    })
+    .expect("config");
+    add_l0_table(&tree, 0);
+    tree
+}
+
+/// Asks for `total` bytes in `size`-byte writes at once and returns the delay
+/// the last one is told to wait: a write's delay runs until every byte debited
+/// before it, its own included, is paid off at the rate.
+fn paced(tree: &lsm_tree::Tree, size: u64, total: u64) -> Duration {
+    let strat = Leveled::default();
+    let mut last = Duration::ZERO;
+    for _ in 0..total / size {
+        match tree.write_backpressure_for(&strat, size) {
+            Backpressure::Slowdown { suggested_delay } => last = suggested_delay,
+            other => panic!("expected a slowdown, got {other:?}"),
+        }
+    }
+    last
+}
+
+/// Under slowdown with a write rate set, writes asking at once are told to
+/// wait what their bytes owe at that rate past its one-second burst, for small
+/// writes and large writes alike: the throughput is bounded in bytes.
+#[test]
+fn a_write_rate_paces_slowed_writes_by_their_bytes() {
+    const RATE: u64 = 1_024 * 1_024;
+    const TOTAL: u64 = 4 * RATE;
+    // Three seconds past the burst, for the same bytes in either shape.
+    let owed = Duration::from_secs(3);
+    for size in [1_024, 256 * 1_024] {
+        let folder = get_tmp_folder();
+        let tree = slowed_tree(folder.path(), RATE);
+        let waited = paced(&tree, size, TOTAL);
+        // The bucket refills while the loop runs, so the delay can only fall
+        // short of the exact debt by the loop's own duration.
+        assert!(
+            waited <= owed && waited >= owed.mul_f64(0.9),
+            "{TOTAL} B in {size}-byte writes at {RATE} B/s owe {owed:?}, told {waited:?}",
+        );
+    }
+}
+
+/// Outside the slowdown tier nothing is debited: writes at full speed do not
+/// spend the budget a later slowdown paces against.
+#[test]
+fn writes_outside_the_slowdown_do_not_spend_the_write_budget() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = match Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .write_rate_limit(1_024)
+    .open()?
+    {
+        AnyTree::Standard(t) => t,
+        AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    tree.update_runtime_config(|c| {
+        c.backpressure = BackpressureThresholds {
+            l0_slowdown: Some(1),
+            ..BackpressureThresholds::OFF
+        };
+    })?;
+    let strat = Leveled::default();
+    for _ in 0..100 {
+        assert_eq!(
+            tree.write_backpressure_for(&strat, 1 << 20),
+            Backpressure::None
+        );
+    }
+
+    add_l0_table(&tree, 0);
+    // The full one-second burst is still there for the first slowed write.
+    assert_eq!(
+        tree.write_backpressure_for(&strat, 1_024),
+        Backpressure::Slowdown {
+            suggested_delay: Duration::ZERO
+        }
+    );
+    Ok(())
+}
+
+/// Without a write rate the slowdown keeps its ramped delay, whatever the
+/// write size.
+#[test]
+fn without_a_write_rate_the_slowdown_keeps_its_ramp() {
+    let folder = get_tmp_folder();
+    let tree = slowed_tree(folder.path(), 0);
+    let strat = Leveled::default();
+    assert_eq!(
+        tree.write_backpressure_for(&strat, 1 << 30),
+        tree.write_backpressure(&strat),
+    );
+}
+
+/// Two trees on one shared write limiter draw on one budget, and a retune
+/// through either reaches both.
+#[test]
+fn trees_sharing_a_write_limiter_pace_against_one_budget() {
+    const RATE: u64 = 1_024 * 1_024;
+    let shared = Arc::new(RateLimiter::new(RATE));
+    let open = |path: &std::path::Path| {
+        let tree = match Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .write_rate_limit(RATE * 100)
+        .write_rate_limiter(Arc::clone(&shared))
+        .open()
+        .expect("open")
+        {
+            AnyTree::Standard(t) => t,
+            AnyTree::Blob(_) => panic!("expected Standard tree"),
+        };
+        tree.update_runtime_config(|c| {
+            c.backpressure = BackpressureThresholds {
+                l0_slowdown: Some(1),
+                ..BackpressureThresholds::OFF
+            };
+        })
+        .expect("config");
+        add_l0_table(&tree, 0);
+        tree
+    };
+    let (a_dir, b_dir) = (get_tmp_folder(), get_tmp_folder());
+    let (a, b) = (open(a_dir.path()), open(b_dir.path()));
+
+    // A spends the burst and two seconds more; B, at the same moment, owes it.
+    let on_a = paced(&a, 64 * 1_024, 3 * RATE);
+    assert!(on_a >= Duration::from_millis(1_800), "a owed {on_a:?}");
+    let Backpressure::Slowdown { suggested_delay } =
+        b.write_backpressure_for(&Leveled::default(), 1)
+    else {
+        panic!("b is slowed down");
+    };
+    assert!(
+        suggested_delay >= Duration::from_millis(1_800),
+        "b meets the debt a left: {suggested_delay:?}",
+    );
+
+    // Retuned through b: a's next write is priced at the new rate.
+    b.write_rate_limiter().set_rate(0);
+    assert_eq!(a.write_rate_limiter().rate(), 0);
+    assert_eq!(
+        a.write_backpressure_for(&Leveled::default(), 1 << 30),
+        a.write_backpressure(&Leveled::default()),
+        "a rate of 0 turns byte pacing off for every holder",
+    );
 }

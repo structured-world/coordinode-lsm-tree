@@ -838,6 +838,17 @@ impl RateLimiter {
         bucket.wait_for(position, rate)
     }
 
+    /// Debits `bytes` now and returns how long the caller owes for them,
+    /// without sleeping: [`acquire_wait`](Self::acquire_wait) on the limiter's
+    /// own clock. For a caller that paces itself, such as a writer honouring a
+    /// [`Backpressure`](crate::Backpressure) verdict.
+    // no-std: acquire_wait with a caller-provided monotonic clock
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn reserve(&self, bytes: u64) -> Duration {
+        self.acquire_wait(bytes, Self::std_now())
+    }
+
     /// Waits (sleeping the current thread) until an I/O of `bytes` may
     /// proceed, checking `should_stop` so a shutdown can break a long wait.
     /// Use it where the I/O may still happen after a stop; a caller that does

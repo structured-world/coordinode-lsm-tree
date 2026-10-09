@@ -224,6 +224,9 @@ fn pick_minimal_compaction(
 #[doc(hidden)]
 pub const NAME: &str = "LeveledCompaction";
 
+/// The default of [`Strategy::with_l0_file_threshold`].
+pub const DEFAULT_L0_FILE_THRESHOLD: u16 = 500;
+
 /// Leveled compaction strategy (LCS)
 ///
 /// When a level reaches some threshold size, parts of it are merged into overlapping tables in the next level.
@@ -237,7 +240,11 @@ pub const NAME: &str = "LeveledCompaction";
 /// More info here: <https://fjall-rs.github.io/post/lsm-leveling/>
 #[derive(Clone)]
 pub struct Strategy {
+    /// L0 run count that triggers a merge into L1.
     l0_threshold: u8,
+
+    /// L0 table count that triggers a merge into L1 whatever the run count.
+    l0_file_threshold: u16,
 
     /// The target table size as disk (possibly compressed).
     target_size: u64,
@@ -270,6 +277,7 @@ impl Default for Strategy {
     fn default() -> Self {
         Self {
             l0_threshold: 4,
+            l0_file_threshold: DEFAULT_L0_FILE_THRESHOLD,
             target_size:/* 64 MiB */ 64 * 1_024 * 1_024,
             level_ratio_policy: vec![10.0],
             dynamic: false,
@@ -293,16 +301,69 @@ impl Strategy {
 
     /// Sets the L0 threshold.
     ///
-    /// When the number of tables in L0 reaches this threshold,
-    /// they are merged into L1.
+    /// When the number of runs in L0 reaches this threshold, L0 is merged
+    /// into L1. A run's tables have disjoint key ranges, so a read pays at
+    /// most one table per run: the run count bounds L0's read amplification,
+    /// where the table count does not. A flush larger than
+    /// [`Config::table_target_size`](crate::Config::table_target_size) writes
+    /// one run of several tables and counts once.
     ///
-    /// Same as `level0_file_num_compaction_trigger` in `RocksDB`.
+    /// Plays the role of `level0_file_num_compaction_trigger` in `RocksDB`,
+    /// whose flushes write one table each, so files and runs coincide there.
     ///
-    /// Default = 4
+    /// Default = 4; `0` is taken as `1`, since no run count is below zero.
     #[must_use]
     pub fn with_l0_threshold(mut self, threshold: u8) -> Self {
-        self.l0_threshold = threshold;
+        self.l0_threshold = threshold.max(1);
         self
+    }
+
+    /// Sets the L0 table count that triggers a merge into L1 whatever the run
+    /// count.
+    ///
+    /// A guard against fan-out: every L0 table costs a file handle, a
+    /// manifest entry and per-table metadata in memory, however few runs
+    /// hold them.
+    ///
+    /// Keep it above the run threshold times the tables one flush writes
+    /// (memtable size over
+    /// [`Config::table_target_size`](crate::Config::table_target_size)):
+    /// below that it fires before the run trigger, on every few flushes,
+    /// and L0 merges into L1 as often as a file-count trigger would make it.
+    /// The default, with the default run threshold of 4, leaves room for a
+    /// memtable of 125 tables of the target (about 8 GiB at 64 MiB).
+    ///
+    /// Default = 500; `0` is taken as `1`, since no table count is below zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::compaction::Leveled;
+    ///
+    /// let strategy = Leveled::default().with_l0_file_threshold(200);
+    /// # let _ = strategy;
+    /// ```
+    #[must_use]
+    pub fn with_l0_file_threshold(mut self, threshold: u16) -> Self {
+        self.l0_file_threshold = threshold.max(1);
+        self
+    }
+
+    /// Whether L0's shape alone calls for a merge into L1: its run count or
+    /// its table count has reached its threshold.
+    fn l0_triggered(&self, l0: &Level) -> bool {
+        l0.run_count() >= usize::from(self.l0_threshold)
+            || l0.table_count() >= usize::from(self.l0_file_threshold)
+    }
+
+    /// L0's score: how far past the nearer of its two thresholds it is.
+    fn l0_score(&self, l0: &Level) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "counts of runs and tables are far below 2^52"
+        )]
+        let (runs, tables) = (l0.run_count() as f64, l0.table_count() as f64);
+        (runs / f64::from(self.l0_threshold)).max(tables / f64::from(self.l0_file_threshold))
     }
 
     /// Sets the table target size on disk (possibly compressed).
@@ -564,6 +625,10 @@ impl CompactionStrategy for Strategy {
                 crate::UserValue::from(self.l0_threshold.to_le_bytes()),
             ),
             (
+                crate::UserKey::from("leveled_l0_file_threshold"),
+                crate::UserValue::from(self.l0_file_threshold.to_le_bytes()),
+            ),
+            (
                 crate::UserKey::from("leveled_target_size"),
                 crate::UserValue::from(self.target_size.to_le_bytes()),
             ),
@@ -611,11 +676,10 @@ impl CompactionStrategy for Strategy {
             // bounded by the tree's total footprint (disk capacity) and cannot
             // overflow u64 — plain addition.
             if idx == 0 {
-                // L0 is count-triggered: once it reaches the L0 file threshold its
-                // whole size is pending a merge into L1. Use the table (file)
-                // count, matching the `choose` trigger; `iter().count()` would
-                // count runs, undercounting a multi-table L0 run.
-                if level.table_count() >= usize::from(self.l0_threshold) {
+                // L0 is shape-triggered: once its runs or its tables reach their
+                // threshold, its whole size is pending a merge into L1, the same
+                // predicate `choose` acts on.
+                if self.l0_triggered(level) {
                     debt += level.size();
                 }
             } else if let Some(&target) = targets.get(idx) {
@@ -781,13 +845,20 @@ impl CompactionStrategy for Strategy {
             }
         }
 
-        // Intra-L0 compaction: merge multiple L0 runs into a single run within L0
-        // when table count is below the L0→L1 threshold
+        // Intra-L0 compaction: merge multiple L0 runs into a single run within
+        // L0 while L0 is a few tables. It rewrites the whole of L0, so it pays
+        // only on a small L0: on runs of many tables it would fire after every
+        // flush, keep the run count under the trigger and never let L0 go
+        // down, rewriting an ever larger L0 each time.
         {
             let first_level = version.l0();
 
+            // A triggered L0 goes down instead: rewriting it here would clear
+            // the debt (a file guard below the run threshold) without moving
+            // anything to L1.
             if first_level.run_count() > 1
                 && first_level.table_count() < usize::from(self.l0_threshold)
+                && !self.l0_triggered(first_level)
                 && !version.level_is_busy(0, state.hidden_set())
             {
                 return Choice::Merge(CompactionInput {
@@ -813,13 +884,8 @@ impl CompactionStrategy for Strategy {
             // Score first level
             let first_level = version.l0();
 
-            if first_level.table_count() >= usize::from(self.l0_threshold) {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "precision loss is acceptable for scoring calculations"
-                )]
-                let ratio = (first_level.table_count() as f64) / f64::from(self.l0_threshold);
-                scores[0] = (ratio, 0);
+            if self.l0_triggered(first_level) {
+                scores[0] = (self.l0_score(first_level), 0);
             }
 
             // Score L1+

@@ -575,7 +575,9 @@ pub use compression::{ZstdDictionaries, ZstdDictionary};
 #[cfg(feature = "metrics")]
 pub use metrics::{CacheStats, Metrics};
 
-pub use backpressure::{Backpressure, BackpressureThresholds};
+#[cfg(feature = "std")]
+pub use backpressure::WriteBufferBudget;
+pub use backpressure::{Backpressure, BackpressureSignals, BackpressureThresholds};
 
 #[cfg(feature = "std")]
 #[doc(hidden)]

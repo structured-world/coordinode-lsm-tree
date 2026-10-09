@@ -1795,3 +1795,47 @@ fn a_flush_output_counts_its_tombstones_toward_a_full_table() -> crate::Result<(
     }
     Ok(())
 }
+
+/// A flush cut at a small configured target writes tables whose key ranges
+/// follow each other without overlapping and together span exactly the keys
+/// flushed: the cut lands between keys, never inside one table's range.
+#[test]
+fn a_rotated_flush_writes_tables_of_adjacent_disjoint_key_ranges() -> crate::Result<()> {
+    use crate::version::run::Ranged;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(CompressionPolicy::all(crate::CompressionType::None))
+    .table_target_size(64 * 1_024)
+    .open()?;
+    let keys = 2_000u64;
+    for i in 0..keys {
+        tree.insert(i.to_be_bytes(), vec![b'v'; 200], i);
+    }
+    tree.flush_active_memtable(0)?;
+
+    let version = tree.current_version();
+    let l0 = version.l0();
+    assert_eq!(l0.run_count(), 1, "one flush is one run");
+    let tables: Vec<_> = l0.iter().flat_map(|run| run.iter()).collect();
+    assert!(tables.len() >= 4, "{} tables", tables.len());
+
+    let first = tables.first().unwrap().key_range();
+    let last = tables.last().unwrap().key_range();
+    assert_eq!(first.min().as_ref(), 0u64.to_be_bytes());
+    assert_eq!(last.max().as_ref(), (keys - 1).to_be_bytes());
+    for pair in tables.windows(2) {
+        let (left, right) = (pair[0].key_range(), pair[1].key_range());
+        assert!(
+            left.max() < right.min(),
+            "tables overlap or are out of order: {left:?} then {right:?}",
+        );
+    }
+    let counted: u64 = tables.iter().map(|table| table.metadata.item_count).sum();
+    assert_eq!(counted, keys, "every flushed key in exactly one table");
+    Ok(())
+}

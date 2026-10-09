@@ -991,7 +991,7 @@ pub struct RuntimeConfig {
     /// the verdict is always [`crate::Backpressure::None`] and the write path is
     /// byte-for-byte unchanged. When set,
     /// [`crate::AbstractTree::write_backpressure`] reports a `Slowdown` / `Stop`
-    /// verdict from the live L0 table count and pending compaction bytes, which
+    /// verdict from the live L0 run count and pending compaction bytes, which
     /// the caller honours in its own write loop (the engine never blocks
     /// internally — it does not own the compaction that would drain the debt).
     /// Live-toggleable: the verdict is computed, not latched, so it clears as
