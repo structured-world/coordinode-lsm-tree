@@ -103,8 +103,28 @@ fn boundaries_of(tables: &[Table]) -> Vec<u32> {
     keys
 }
 
-/// Writes keys `keys` with `value_len`-byte values, flushes them and moves the
-/// flushed run to `level`.
+/// A `len`-byte value that does not compress, drawn from `seed`: outputs then
+/// close on their size, where a compressible value would leave the writer's
+/// held state to close them first.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    let mut value: Vec<u8> = core::iter::repeat_with(|| {
+        // splitmix64
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)).to_le_bytes()
+    })
+    .take(len.div_ceil(8))
+    .flatten()
+    .collect();
+    value.truncate(len);
+    value
+}
+
+/// Writes keys `keys` with incompressible `value_len`-byte values, flushes
+/// them and moves the flushed run to `level`.
 fn flush_into(
     tree: &crate::Tree,
     keys: core::ops::Range<u32>,
@@ -113,7 +133,7 @@ fn flush_into(
     seqno: &mut u64,
 ) -> crate::Result<()> {
     for i in keys {
-        tree.insert(key(i), vec![b'v'; value_len], *seqno);
+        tree.insert(key(i), noise(*seqno, value_len), *seqno);
         *seqno += 1;
     }
     tree.flush_active_memtable(0)?;
