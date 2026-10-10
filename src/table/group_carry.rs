@@ -288,6 +288,8 @@ impl Table {
         group: &BlockHandle,
         pace: Option<&dyn super::util::ReadPacer>,
     ) -> crate::Result<crate::Slice> {
+        #[cfg(test)]
+        tests::note_raw_read(group.size());
         let fd = self
             .file_accessor
             .peek_or_open_table(&self.global_id(), &self.path)?;

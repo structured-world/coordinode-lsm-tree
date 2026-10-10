@@ -951,6 +951,13 @@ impl MultiWriter {
         self
     }
 
+    /// Whether the tables this writes keep a zone map, so a group copied into
+    /// them needs its per-column statistics.
+    #[cfg(feature = "columnar")]
+    pub(crate) const fn keeps_zone_map(&self) -> bool {
+        self.use_zone_map
+    }
+
     #[must_use]
     pub fn use_columnar(mut self, columnar: bool) -> Self {
         self.use_columnar = columnar;

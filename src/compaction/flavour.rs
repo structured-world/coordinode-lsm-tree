@@ -1519,6 +1519,14 @@ impl CompactionFlavour for StandardCompaction {
             .zone_map
             .columns_for(candidate.group.offset().0)
             .map(<[_]>::to_vec);
+        // An output keeping a zone map refuses a group without statistics,
+        // so it is refused before its bytes are read for nothing.
+        if columns.is_none() && self.table_writer.keeps_zone_map() {
+            return Ok(false);
+        }
+        // Read as the inputs are read: the limiter is told how long it takes
+        // and charged nothing, since the merge loop already pays for every
+        // row of the group as it pays for rows written anew.
         let raw = table.read_row_group_raw(&candidate.group, pace)?;
         let source = crate::table::writer::VerbatimSource {
             table_id: table.id(),
@@ -1557,6 +1565,7 @@ impl CompactionFlavour for StandardCompaction {
         if table.metadata.value_layout != crate::table::meta::ValueLayout::Whole {
             return Ok(None);
         }
+        // Paced and uncharged, as in `carry`.
         let raw = table.read_row_group_raw(&candidate.group, pace)?;
         let offset = candidate.group.offset().0;
         // The directory is checked at the place it lies, as a read checks it.

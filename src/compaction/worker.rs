@@ -2268,18 +2268,23 @@ fn run_subcompaction(
 
     // Row groups of this range the merge leaves as they were are copied into
     // the output instead of being encoded again (see `carry`). Each range
-    // records and matches its own.
+    // records and matches its own. A relocating slice writes every row
+    // itself, so its scans record nothing.
     #[cfg(feature = "columnar")]
-    let carry = super::carry::plan(
-        &opts.config,
-        rc,
-        payload.canonical_level.into(),
-        &version
-            .iter_tables()
-            .filter(|t| payload.table_ids.contains(&t.id()))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
+    let carry = if relocation.is_some() {
+        None
+    } else {
+        super::carry::plan(
+            &opts.config,
+            rc,
+            payload.canonical_level.into(),
+            &version
+                .iter_tables()
+                .filter(|t| payload.table_ids.contains(&t.id()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
     let pace = input_pacer(&opts.rate_limiter);
 
     let Some(mut merge_iter) = create_bounded_compaction_stream(
@@ -3479,9 +3484,14 @@ fn merge_tables(
     let rc = opts.runtime_config.load_full();
 
     // Row groups the merge leaves as they were are copied into the output
-    // instead of being encoded again (see `carry`).
+    // instead of being encoded again (see `carry`). A compaction relocating
+    // blob files writes every row itself, so its scans record nothing.
     #[cfg(feature = "columnar")]
-    let carry = super::carry::plan(&opts.config, &rc, payload.canonical_level.into(), &tables);
+    let carry = if blob_files_to_rewrite.is_empty() {
+        super::carry::plan(&opts.config, &rc, payload.canonical_level.into(), &tables)
+    } else {
+        None
+    };
 
     let Some(mut merge_iter) = create_compaction_stream(
         &current_super_version.version,
