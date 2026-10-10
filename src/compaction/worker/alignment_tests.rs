@@ -378,11 +378,20 @@ fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate:
         assert_eq!(carried, cluster, "the tables past {}", index(&boundary.key));
         largest_cluster = largest_cluster.max(cluster.len());
 
-        let (last_min, _) = *cluster.last().unwrap();
-        let reached: u64 = cluster.iter().map(|&(_, bytes)| bytes).sum();
-        assert_eq!(boundary.reached_bytes(&key(last_min), &cmp), reached);
-        let (first_min, first_bytes) = cluster[0];
-        assert_eq!(boundary.reached_bytes(&key(first_min), &cmp), first_bytes);
+        for &(end, _) in &cluster {
+            let reached: u64 = cluster
+                .iter()
+                .filter(|&&(min, _)| min <= end)
+                .map(|&(_, bytes)| bytes)
+                .sum();
+            assert_eq!(
+                boundary.reached_bytes(&key(end), &cmp),
+                reached,
+                "an output past {} ending at {end}",
+                index(&boundary.key)
+            );
+        }
+        let (first_min, _) = cluster[0];
         assert_eq!(
             boundary.reached_bytes(&key(first_min - 1), &cmp),
             0,
