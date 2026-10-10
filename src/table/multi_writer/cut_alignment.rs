@@ -102,18 +102,21 @@ impl CutAlignment {
     pub(super) fn commit(&mut self, crossing: Crossing, cut: bool) {
         self.next += crossing.passed;
         self.started = true;
+        // Counts are bounded by the boundaries, one per table of a level.
         self.crossed = if cut {
             0
         } else {
-            self.crossed.saturating_add(crossing.counted)
+            self.crossed + crossing.counted
         };
     }
 
     /// The share of the target, in percent, an output must hold to be cut at
     /// a boundary when it crosses `crossing` there.
     pub(super) fn floor_percent(&self, crossing: Crossing) -> u64 {
-        let n = self.crossed.saturating_add(crossing.counted);
-        50 + 5 * u64::from(n.saturating_sub(1).min(8))
+        // The first boundary crossed sets the floor at half the target, as
+        // does none: the rule's `n - 1` starts at zero.
+        let n = self.crossed + crossing.counted;
+        50 + 5 * u64::from(n.clamp(1, 9) - 1)
     }
 
     /// Whether a boundary is ahead of the boundaries `crossing` passes, one a

@@ -266,6 +266,29 @@ pub struct MultiWriter {
     alignment: Option<cut_alignment::CutAlignment>,
 }
 
+/// What the current table weighs, measured once and judged against any size
+/// target: by its bytes, counting what `finish` appends, or by the state it
+/// holds until `finish`, which is judged against the target whatever size the
+/// table is cut at, since that bounds memory.
+#[derive(Clone, Copy, Debug)]
+struct OutputLoad {
+    size: u64,
+    held: u64,
+    /// The least size target its bytes are judged against; `None` while the
+    /// table holds no content its bytes could be cut for.
+    size_floor: Option<u64>,
+    held_target: u64,
+}
+
+impl OutputLoad {
+    /// Whether the table is full at `size_target`.
+    fn reaches(self, size_target: u64) -> bool {
+        self.size_floor
+            .is_some_and(|floor| self.size >= size_target.max(floor))
+            || self.held >= self.held_target
+    }
+}
+
 impl MultiWriter {
     /// Sets up a new `MultiWriter` at the given tables folder
     pub fn new(
@@ -399,12 +422,28 @@ impl MultiWriter {
     /// once the output it goes into is known. Without boundaries the output
     /// ends at the target size.
     fn decide_cut(&self, key: &[u8]) -> (bool, Option<cut_alignment::Crossing>) {
+        self.decide_cut_at(key, self.output_load())
+    }
+
+    /// [`Self::decide_cut`] for an output weighing `load`, measured once for
+    /// every share of the target the rule compares it with.
+    fn decide_cut_at(
+        &self,
+        key: &[u8],
+        load: Option<OutputLoad>,
+    ) -> (bool, Option<cut_alignment::Crossing>) {
         let Some(alignment) = &self.alignment else {
-            return (self.table_full() && self.rotation_sheds(key, (0, 0)), None);
+            let full = load.is_some_and(|load| load.reaches(self.target_size));
+            return (full && self.rotation_sheds(key, (0, 0)), None);
         };
         let comparator = self.comparator.as_ref();
         let mut crossing = alignment.crossing(key, comparator);
-        let full = |percent| self.table_full_at(cut_alignment::share_of(self.target_size, percent));
+        // An output with no record yet is below half of any target.
+        let Some(load) = load else {
+            crossing.counted = 0;
+            return (false, Some(crossing));
+        };
+        let full = |percent| load.reaches(cut_alignment::share_of(self.target_size, percent));
         let past_half = full(50);
         // A boundary passed below half the target is no candidate, so it does
         // not raise the share the output is cut at later.
@@ -1314,10 +1353,17 @@ impl MultiWriter {
     /// rather than the target; the state it holds is judged against the target
     /// whatever the size it is cut at, since that bounds memory.
     fn table_full_at(&self, size_target: u64) -> bool {
-        // A table holds at least one record: closing an empty one would write
-        // its tombstones alone, unclipped, over its successors' keys.
+        self.output_load()
+            .is_some_and(|load| load.reaches(size_target))
+    }
+
+    /// What the current table weighs at the current key, measured once so it
+    /// can be judged against several size targets; `None` before its first
+    /// record, which no target counts as full: closing an empty table would
+    /// write its tombstones alone, unclipped, over its successors' keys.
+    fn output_load(&self) -> Option<OutputLoad> {
         if self.writer.meta.key_count == 0 {
-            return false;
+            return None;
         }
         // The blob files this table links, and its share of the range
         // tombstones, are handed to its writer only when it rotates, and it
@@ -1328,7 +1374,7 @@ impl MultiWriter {
         // tombstones starting at the key go where the key goes, and the last
         // key has no successor whose check would count them, so they count here.
         let (tombstones, pieces, longest) = self.tombstones_at_key();
-        self.full_with_tombstones(tombstones, pieces, longest, (0, 0), size_target)
+        Some(self.load_with_tombstones(tombstones, pieces, longest, (0, 0)))
     }
 
     /// The current output's share of the range tombstones at the current key:
@@ -1352,22 +1398,21 @@ impl MultiWriter {
         }
     }
 
-    /// The current table reached its target if it closes holding `pieces`
+    /// What the current table weighs if it closes holding `pieces`
     /// range-tombstone entries of `tombstones` encoded bytes, with bounds of
     /// up to `longest` bytes. `alone` is what a table of tombstones alone
     /// writes and holds for its synthetic entry, which its writer does not
     /// count, and zero for a table with records. The writer holds each entry
     /// until `finish`, which encodes them into a block buffer and frames that
     /// when the block is transformed. The table's key range widens to the
-    /// entries' bounds. Its bytes are judged against `size_target`.
-    fn full_with_tombstones(
+    /// entries' bounds.
+    fn load_with_tombstones(
         &self,
         tombstones: u64,
         pieces: u64,
         longest: u64,
         alone: (u64, u64),
-        size_target: u64,
-    ) -> bool {
+    ) -> OutputLoad {
         use crate::table::block::{BlockType, framed_len_bound};
 
         let linked = self.linked_blobs.section_len();
@@ -1423,8 +1468,12 @@ impl MultiWriter {
         // them smaller.
         let block = self.writer.block_len();
         if alone_written > 0 {
-            return size >= size_target.max(alone_written + block)
-                || held >= self.target_size.max(writer_held + alone_held + block);
+            return OutputLoad {
+                size,
+                held,
+                size_floor: Some(alone_written + block),
+                held_target: self.target_size.max(writer_held + alone_held + block),
+            };
         }
         let (base_held, base_tombstones) = self.output_base.unwrap_or((0, 0));
         let holds_content = size_hint > self.writer.finish_metadata_bytes()
@@ -1434,7 +1483,12 @@ impl MultiWriter {
         } else {
             self.target_size
         };
-        (holds_content && size >= size_target) || held >= held_target
+        OutputLoad {
+            size,
+            held,
+            size_floor: holds_content.then_some(0),
+            held_target,
+        }
     }
 
     /// Closing the current table at `key` sheds what it holds: the next one
@@ -1445,7 +1499,7 @@ impl MultiWriter {
     /// What is carried is judged as fullness is: by the bytes it encodes to
     /// and by the entries it holds in memory, against the part of the target
     /// left past what the next output carries anyway, `next_alone` for one of
-    /// tombstones alone (see [`Self::full_with_tombstones`]).
+    /// tombstones alone (see [`Self::load_with_tombstones`]).
     fn rotation_sheds(&self, key: &[u8], next_alone: (u64, u64)) -> bool {
         let entries = self.tombstone_share.open_count();
         if entries == 0 {
@@ -1618,11 +1672,13 @@ impl MultiWriter {
     #[cfg(feature = "columnar")]
     fn splits_cheaper_than_straddling(
         &self,
+        load: Option<OutputLoad>,
         crossing: Option<cut_alignment::Crossing>,
         last: &InternalValue,
         bytes: u64,
     ) -> bool {
-        let (Some(alignment), Some(crossing)) = (&self.alignment, crossing) else {
+        let (Some(alignment), Some(crossing), Some(load)) = (&self.alignment, crossing, load)
+        else {
             return false;
         };
         let Some(boundary) =
@@ -1630,13 +1686,14 @@ impl MultiWriter {
         else {
             return false;
         };
-        // One boundary past those `crossing` counts: the one inside.
+        // One boundary past those `crossing` counts: the one inside. Counts
+        // are bounded by the boundaries, one per table of a level.
         let inside = cut_alignment::Crossing {
             passed: crossing.passed + 1,
-            counted: crossing.counted.saturating_add(1),
+            counted: crossing.counted + 1,
         };
         bytes < boundary.after_bytes
-            && self.table_full_at(cut_alignment::share_of(
+            && load.reaches(cut_alignment::share_of(
                 self.target_size,
                 alignment.floor_percent(inside),
             ))
@@ -1650,6 +1707,7 @@ impl MultiWriter {
     #[cfg(feature = "columnar")]
     fn writes_group_by_rows(
         &self,
+        load: Option<OutputLoad>,
         rotates: bool,
         crossing: Option<cut_alignment::Crossing>,
         last: &InternalValue,
@@ -1662,13 +1720,13 @@ impl MultiWriter {
             } else {
                 // A group past the ceiling on its own takes any output with a
                 // record past it, hence the floor of zero.
-                self.table_full_at(ceiling.checked_sub(bytes).unwrap_or(0))
+                load.is_some_and(|load| load.reaches(ceiling.checked_sub(bytes).unwrap_or(0)))
             };
             if past_ceiling {
                 return true;
             }
         }
-        !rotates && self.splits_cheaper_than_straddling(crossing, last, bytes)
+        !rotates && self.splits_cheaper_than_straddling(load, crossing, last, bytes)
     }
 
     /// Takes `rows`' first key as [`Self::write`] takes a new key and has
@@ -1729,8 +1787,10 @@ impl MultiWriter {
         // A table records one value layout: a group stored the other way
         // starts the next table, a run of groups stored one way shares it.
         let layout_changes = self.value_layout.is_some_and(|current| current != layout);
-        let (cut, crossing) = self.decide_cut(&first.key.user_key);
-        if self.writes_group_by_rows(layout_changes || cut, crossing, last, bytes) {
+        // The output is weighed once for the cut and for the copy's checks.
+        let load = self.output_load();
+        let (cut, crossing) = self.decide_cut_at(&first.key.user_key, load);
+        if self.writes_group_by_rows(load, layout_changes || cut, crossing, last, bytes) {
             self.current_key = previous_key;
             return Ok(false);
         }
@@ -1905,15 +1965,16 @@ impl MultiWriter {
             // records is not empty, whatever tombstones it has so far.
             if (bytes > 0 || self.writer.meta.key_count > 0)
                 && self.tombstone_share.has_more(&self.range_tombstones)
-                && self.full_with_tombstones(
-                    bytes + group.bytes,
-                    self.tombstone_share.pieces() + group.entries,
-                    self.tombstone_share
-                        .longest_bound(&point)
-                        .max(group.longest),
-                    alone,
-                    self.target_size,
-                )
+                && self
+                    .load_with_tombstones(
+                        bytes + group.bytes,
+                        self.tombstone_share.pieces() + group.entries,
+                        self.tombstone_share
+                            .longest_bound(&point)
+                            .max(group.longest),
+                        alone,
+                    )
+                    .reaches(self.target_size)
                 // The output after this one holds tombstones alone.
                 && self.rotation_sheds(&point, alone_overhead)
             {

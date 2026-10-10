@@ -192,7 +192,6 @@ fn next_level_boundaries(
     payload: &CompactionPayload,
 ) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
     use crate::version::run::Ranged;
-    use core::cmp::Ordering;
 
     if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
         return alloc::sync::Arc::from([]);
@@ -204,14 +203,36 @@ fn next_level_boundaries(
         return alloc::sync::Arc::from([]);
     };
     let comparator = opts.config.comparator.as_ref();
-    let mut tables: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
-    tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
-    let mut boundaries = Vec::with_capacity(tables.len().saturating_sub(1));
+    // A level holds at least one table here, found non-empty above.
+    let capacity = level.table_count() - 1;
+    // One run is already in key order with disjoint tables and is walked in
+    // place; only several runs are merged into one order first.
+    let boundaries = match level.first_run() {
+        Some(run) if level.run_count() == 1 => boundaries_between(run.iter(), capacity, comparator),
+        _ => {
+            let mut tables: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+            tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            boundaries_between(tables.into_iter(), capacity, comparator)
+        }
+    };
+    boundaries.into()
+}
+
+/// The boundaries between `tables`, given in order of their min key.
+pub(super) fn boundaries_between<'a>(
+    tables: impl Iterator<Item = &'a Table>,
+    capacity: usize,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> Vec<crate::table::multi_writer::Boundary> {
+    use crate::version::run::Ranged;
+    use core::cmp::Ordering;
+
+    let mut boundaries = Vec::with_capacity(capacity);
     // The largest key reached so far: a table starting above it starts past
     // every table before it, whichever run they are in.
     let mut reached: Option<&crate::UserKey> = None;
-    for pair in tables.windows(2) {
-        let [before, after] = pair else { continue };
+    let mut tables = tables.peekable();
+    while let (Some(before), Some(&after)) = (tables.next(), tables.peek()) {
         let max = before.key_range().max();
         let reach = match reached {
             Some(far) if comparator.compare(far, max) == Ordering::Greater => far,
@@ -225,7 +246,7 @@ fn next_level_boundaries(
             });
         }
     }
-    boundaries.into()
+    boundaries
 }
 
 /// The largest key among `payload`'s inputs: no key the compaction writes

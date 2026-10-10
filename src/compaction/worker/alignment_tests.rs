@@ -232,30 +232,35 @@ fn a_merge_above_an_empty_level_ends_its_outputs_on_the_next_level_holding_table
     Ok(())
 }
 
-/// A level below holding two overlapping runs has no boundary inside their
-/// overlap: an output ending there would reach a table of each run. Every cut
-/// lands where no table of either run spans it.
+/// A level holding two overlapping runs has no boundary inside their overlap:
+/// an output ending there would reach a table of each run. Every boundary lies
+/// where no table of either run spans it, and the runs' tables outside the
+/// overlap still give theirs.
 #[test]
-fn outputs_end_outside_every_table_of_overlapping_runs_below() -> crate::Result<()> {
+fn overlapping_runs_give_no_boundary_inside_a_table_of_either() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let tree = open(
-        Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .compaction_threads(1),
-    )?;
+    let tree = open(Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    ))?;
+    // Two flushes stay in L0 as two runs over overlapping keys.
     let mut seqno = 1;
-    flush_into(&tree, 0..1_800, 700, 3, &mut seqno)?;
-    flush_into(&tree, 1_200..3_000, 700, 3, &mut seqno)?;
-    let runs = tree
-        .current_version()
-        .level(3)
-        .map_or(0, |level| level.run_count());
-    assert_eq!(runs, 2, "the level below holds two overlapping runs");
-    flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
-    let below: Vec<(u32, u32)> = tables(&tree, 3)
+    for keys in [0..1_800, 1_200..3_000] {
+        for i in keys {
+            tree.insert(key(i), noise(seqno, 700), seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let version = tree.current_version();
+    let Some(level) = version.level(0) else {
+        panic!("L0 exists");
+    };
+    assert_eq!(level.run_count(), 2, "two overlapping runs");
+    let mut all: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+    all.sort_by(|a, b| a.metadata.key_range.min().cmp(b.metadata.key_range.min()));
+    let spans: Vec<(u32, u32)> = all
         .iter()
         .map(|t| {
             (
@@ -264,17 +269,23 @@ fn outputs_end_outside_every_table_of_overlapping_runs_below() -> crate::Result<
             )
         })
         .collect();
-    let ids = tables(&tree, 1).iter().map(Table::id).collect();
-    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
 
-    let outputs = last_keys(&tables(&tree, 2));
-    assert!(outputs.len() > 3, "{} outputs", outputs.len());
-    let (_, cut) = outputs.split_last().unwrap();
-    for &last in cut {
+    let boundaries: Vec<u32> = crate::compaction::flavour::boundaries_between(
+        all.iter().copied(),
+        all.len() - 1,
+        &crate::comparator::DefaultUserComparator,
+    )
+    .iter()
+    .map(|boundary| index(&boundary.key))
+    .collect();
+    assert!(
+        boundaries.iter().any(|&b| b < 1_200) && boundaries.iter().any(|&b| b >= 1_800),
+        "the tables outside the overlap give boundaries: {boundaries:?}"
+    );
+    for &b in &boundaries {
         assert!(
-            !below.iter().any(|&(min, max)| min <= last && last < max),
-            "an output ends at {last}, inside a table below: outputs end at {outputs:?}, \
-             the tables below span {below:?}"
+            !spans.iter().any(|&(min, max)| min <= b && b < max),
+            "a boundary at {b} lies inside a table: {spans:?}"
         );
     }
     Ok(())

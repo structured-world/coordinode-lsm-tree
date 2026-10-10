@@ -2167,19 +2167,20 @@ fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> 
 
     // Past half the target, a group from key 31 to 60 holds the boundary at 50.
     let (_folder, mw) = writer(31)?;
+    let load = mw.output_load();
     let (cut, crossing) = mw.decide_cut(&seq_key(31));
     assert!(!cut, "no boundary is crossed at the group's first key");
-    assert!(mw.splits_cheaper_than_straddling(crossing, &row(60), 1_000));
-    assert!(!mw.splits_cheaper_than_straddling(crossing, &row(60), 1_000_000));
+    assert!(mw.splits_cheaper_than_straddling(load, crossing, &row(60), 1_000));
+    assert!(!mw.splits_cheaper_than_straddling(load, crossing, &row(60), 1_000_000));
     assert!(
-        !mw.splits_cheaper_than_straddling(crossing, &row(50), 1_000),
+        !mw.splits_cheaper_than_straddling(load, crossing, &row(50), 1_000),
         "a group ending on the boundary does not straddle it"
     );
 
     // Below half the target the output would not end there anyway.
     let (_folder, small) = writer(5)?;
     let (_, crossing) = small.decide_cut(&seq_key(5));
-    assert!(!small.splits_cheaper_than_straddling(crossing, &row(60), 1_000));
+    assert!(!small.splits_cheaper_than_straddling(small.output_load(), crossing, &row(60), 1_000));
     Ok(())
 }
 
@@ -2218,16 +2219,17 @@ fn a_group_whose_copy_would_pass_twice_the_target_is_written_by_rows() -> crate:
     }
 
     // Keys 31 to 40 hold no boundary; the output holds about 31 KB.
+    let load = mw.output_load();
     let (cut, crossing) = mw.decide_cut(&seq_key(31));
     assert!(!cut);
     assert!(
-        mw.writes_group_by_rows(false, crossing, &row(40), 60_000),
+        mw.writes_group_by_rows(load, false, crossing, &row(40), 60_000),
         "a 60 KB copy would take a 31 KB output past 80 KB"
     );
-    assert!(!mw.writes_group_by_rows(false, crossing, &row(40), 1_000));
+    assert!(!mw.writes_group_by_rows(load, false, crossing, &row(40), 1_000));
     // Into a fresh output, only a group past the ceiling alone.
-    assert!(mw.writes_group_by_rows(true, crossing, &row(40), 100_000));
-    assert!(!mw.writes_group_by_rows(true, crossing, &row(40), 60_000));
+    assert!(mw.writes_group_by_rows(load, true, crossing, &row(40), 100_000));
+    assert!(!mw.writes_group_by_rows(load, true, crossing, &row(40), 60_000));
     Ok(())
 }
 
