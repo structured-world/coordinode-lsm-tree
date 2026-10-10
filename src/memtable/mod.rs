@@ -565,6 +565,11 @@ impl Memtable {
             .query_suppression(key, key_seqno, read_seqno)
     }
 
+    /// Pushes onto `out` the range tombstones holding `key`.
+    pub(crate) fn range_tombstones_containing(&self, key: &[u8], out: &mut Vec<RangeTombstone>) {
+        self.range_tombstones.read().containing(key, out);
+    }
+
     /// Returns all range tombstones in sorted order (for flush).
     pub(crate) fn range_tombstones_sorted(&self) -> Vec<RangeTombstone> {
         self.range_tombstones.read().iter_sorted()

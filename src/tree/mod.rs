@@ -3246,10 +3246,7 @@ impl Tree {
         match entry {
             Some((ValueType::MergeOperand, entry_seqno, value)) => {
                 if let Some(merge_op) = merge_operator {
-                    // Build a bloom-filtered single-key iterator pipeline that
-                    // reuses MvccStream for merge/RT/Indirection resolution,
-                    // eliminating the previous hand-rolled merge collection.
-                    Self::resolve_merge_via_pipeline(
+                    Self::resolve_point_merge(
                         super_version.clone(),
                         key,
                         seqno,
@@ -3307,8 +3304,8 @@ impl Tree {
         if entry.key.value_type == ValueType::MergeOperand
             && let Some(merge_op) = merge_operator
         {
-            // Merge resolution always produces Owned (pipeline result).
-            return Self::resolve_merge_via_pipeline(
+            // A merged value is built anew, so it is Owned.
+            return Self::resolve_point_merge(
                 super_version.clone(),
                 key,
                 seqno,
@@ -3413,57 +3410,34 @@ impl Tree {
             })
     }
 
-    /// Resolves merge operands for a point read via a bloom-filtered iterator pipeline.
-    ///
-    /// Builds a single-key range (`key..=key`) with bloom pre-filtering, wraps
-    /// all sources in `Merger → MvccStream`, and takes the first result. This
-    /// reuses the unified merge/RT/Indirection resolution logic from `MvccStream`
-    /// instead of duplicating it in a hand-rolled collection loop.
-    ///
-    /// Bloom pre-filtering can reject many disk tables at the filter level,
-    /// which typically improves point-read performance on deep LSM trees.
+    /// Resolves the merge of `key` for a point read whose newest visible
+    /// version is an operand: reads the sources newest first and stops at the
+    /// first base, so a table below it is never opened.
     ///
     /// `blob_source` reads a base kept in the value log, which only a blob
     /// tree's index holds.
-    pub(crate) fn resolve_merge_via_pipeline(
+    pub(crate) fn resolve_point_merge(
         version: SuperVersion,
         key: &[u8],
         seqno: SeqNo,
         merge_operator: Arc<dyn crate::merge_operator::MergeOperator>,
         blob_source: Option<crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
-        use crate::range::{IterState, TreeIter};
-
-        let key_hash = crate::hash::hash64(key);
-        // NOTE: Slice::from(&[u8]) copies the key (small, typically < 100 bytes).
-        // This runs once per merge resolution, not per-table — cost is negligible
-        // compared to the I/O saved by partition-aware bloom filtering.
-        let bloom_key = crate::Slice::from(key);
         let comparator = version.active_memtable.comparator.clone();
-
-        let iter_state = IterState {
+        let state = crate::range::IterState {
             version,
             ephemeral: None,
             merge_operator: Some(merge_operator),
             blob_source,
             comparator,
             prefix_hash: None,
-            key_hash: Some(key_hash),
-            bloom_key: Some(bloom_key),
+            key_hash: Some(crate::hash::hash64(key)),
+            // The partition-aware filter seeks by the key itself.
+            bloom_key: Some(crate::Slice::from(key)),
             #[cfg(feature = "metrics")]
             metrics: None,
         };
-
-        // Point-read fast path: skips eager RT collection, sort+dedup, table-skip,
-        // and RangeTombstoneFilter wrapper. MvccStream handles merge-internal RT
-        // suppression; a post-merge linear RT check catches the rest.
-        let mut iter = TreeIter::create_range_point(iter_state, key, seqno);
-
-        match iter.next() {
-            Some(Ok(entry)) => Ok(Some(entry.value)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
+        Ok(crate::range::resolve_point_merge(&state, key, seqno)?.map(|entry| entry.value))
     }
 
     #[doc(hidden)]

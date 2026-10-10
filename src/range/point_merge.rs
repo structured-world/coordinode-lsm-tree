@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Dmitry Prudnikov
+
+//! Merge resolution of one key, read source by source.
+//!
+//! The memtables and the tables that may hold a version of the key are read
+//! newest first, by the highest seqno each holds, as `RocksDB`'s
+//! `Version::Get` collects operands in its `MergeContext`. Once a base is
+//! found (a value, a point tombstone, or a range tombstone holding the key),
+//! a source whose highest seqno is below it holds only versions the base
+//! hides and tombstones too old to hide anything the merge reads, so it is
+//! not opened. Ordering by seqno rather than by level keeps the stop right
+//! where a deeper table holds newer data, as an ingestion with caller-chosen
+//! seqnos can place it.
+
+use super::{FilterAnswer, IterState, filter_answer, seqno_filter, table_reader};
+use crate::{
+    InternalValue, SeqNo, UserKey, ValueType, key::InternalKey, memtable::Memtable,
+    mvcc_stream::MvccStream, range_tombstone::RangeTombstone, table::Table,
+};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::ops::Bound;
+
+/// A place a version of the key may be held.
+enum Source<'a> {
+    Memtable(&'a Memtable),
+    Table(&'a Table),
+}
+
+/// Resolves the merge of `key` at `seqno`: the value the operands visible
+/// there make over the newest base, or `None` when the key reads as deleted.
+pub fn resolve_point_merge(
+    state: &IterState,
+    key: &[u8],
+    seqno: SeqNo,
+) -> crate::Result<Option<InternalValue>> {
+    let comparator = state.comparator.as_ref();
+    let super_version = &state.version;
+    // The filter's copy of the key, shared rather than copied again.
+    let user_key = state
+        .bloom_key
+        .clone()
+        .unwrap_or_else(|| UserKey::from(key));
+
+    let mut sources: Vec<(SeqNo, Source<'_>)> = Vec::new();
+    for memtable in core::iter::once(&super_version.active_memtable)
+        .chain(super_version.sealed_memtables.iter().rev())
+    {
+        if let Some(highest) = memtable.get_highest_seqno() {
+            sources.push((highest, Source::Memtable(memtable)));
+        }
+    }
+    let bounds = (Bound::Included(key), Bound::Included(key));
+    for run in super_version
+        .version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+    {
+        let Some((lo, hi)) = run.range_overlap_indexes_cmp::<&[u8], _, _>(&bounds, comparator)
+        else {
+            continue;
+        };
+        for table in run.get(lo..=hi).unwrap_or_default() {
+            if table.check_key_range_overlap_cmp(&bounds, comparator) {
+                sources.push((table.get_highest_seqno(), Source::Table(table)));
+            }
+        }
+    }
+    // Stable: sources holding the same highest seqno keep the point read's
+    // order, memtables newest first, then the levels top down.
+    sources.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut entries: Vec<InternalValue> = Vec::new();
+    let mut tombstones: Vec<RangeTombstone> = Vec::new();
+    // The seqno of the newest base found: what is below it is hidden.
+    let mut floor: Option<SeqNo> = None;
+
+    for (highest, source) in &sources {
+        if floor.is_some_and(|floor| *highest < floor) {
+            // Every source left holds a highest seqno at most this one's.
+            break;
+        }
+        let (entries_before, tombstones_before) = (entries.len(), tombstones.len());
+        match source {
+            Source::Memtable(memtable) => {
+                memtable.range_tombstones_containing(key, &mut tombstones);
+                let range = (
+                    Bound::Included(InternalKey::new(
+                        user_key.clone(),
+                        SeqNo::MAX,
+                        ValueType::Tombstone,
+                    )),
+                    Bound::Included(InternalKey::new(user_key.clone(), 0, ValueType::Value)),
+                );
+                take_versions(
+                    memtable
+                        .range_internal(range)
+                        .filter(|item| seqno_filter(item.key.seqno, seqno))
+                        .map(Ok),
+                    &mut entries,
+                )?;
+            }
+            Source::Table(table) => {
+                // A table's tombstones are sorted by start: those starting
+                // past the key cannot hold it.
+                let starting = table.range_tombstones().partition_point(|rt| {
+                    comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
+                });
+                tombstones.extend(
+                    table
+                        .range_tombstones()
+                        .iter()
+                        .take(starting)
+                        .filter(|rt| rt.contains_key_with(key, comparator))
+                        .cloned(),
+                );
+                let answer = filter_answer(state, table);
+                if answer != FilterAnswer::Absent {
+                    take_versions(
+                        table_reader(
+                            answer,
+                            *table,
+                            (
+                                Bound::Included(user_key.clone()),
+                                Bound::Included(user_key.clone()),
+                            ),
+                            seqno,
+                        ),
+                        &mut entries,
+                    )?;
+                }
+            }
+        }
+
+        let bases = entries
+            .get(entries_before..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| !entry.key.value_type.is_merge_operand())
+            .map(|entry| entry.key.seqno);
+        let hiding = tombstones
+            .get(tombstones_before..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|rt| rt.visible_at(seqno))
+            .map(|rt| rt.seqno);
+        floor = floor.max(bases.chain(hiding).max());
+    }
+
+    // Stable: equal seqnos keep the order the sources were read in, the
+    // newest source first, as the merging read resolves them.
+    entries.sort_by(|a, b| b.key.seqno.cmp(&a.key.seqno));
+    let Some(head) = entries.first() else {
+        return Ok(None);
+    };
+    if tombstones
+        .iter()
+        .any(|rt| rt.should_suppress_with(key, head.key.seqno, seqno, comparator))
+    {
+        return Ok(None);
+    }
+
+    let resolved = MvccStream::new_with_comparator(
+        entries.into_iter().map(Ok),
+        state.merge_operator.clone(),
+        state.comparator.clone(),
+    )
+    .with_value_log(state.value_log())
+    .with_range_tombstones(tombstones.into_iter().map(|rt| (rt, seqno)).collect())
+    .next()
+    .transpose()?;
+    Ok(resolved.filter(|value| !value.key.is_tombstone()))
+}
+
+/// Takes one source's versions of the key, newest first, down to its first
+/// base: the source's older versions are hidden by it.
+fn take_versions(
+    versions: impl Iterator<Item = crate::Result<InternalValue>>,
+    entries: &mut Vec<InternalValue>,
+) -> crate::Result<()> {
+    for version in versions {
+        let version = version?;
+        let base = !version.key.value_type.is_merge_operand();
+        entries.push(version);
+        if base {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

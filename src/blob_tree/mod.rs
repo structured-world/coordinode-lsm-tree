@@ -322,7 +322,7 @@ impl BlobTree {
         if item.key.value_type.is_merge_operand()
             && let Some(merge_operator) = &self.index.config.merge_operator
         {
-            return crate::Tree::resolve_merge_via_pipeline(
+            return crate::Tree::resolve_point_merge(
                 super_version.clone(),
                 key,
                 seqno,

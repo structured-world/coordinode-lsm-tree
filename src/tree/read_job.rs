@@ -203,7 +203,7 @@ impl Job {
             Self::Merge { idx } => JobDone::Value {
                 idx,
                 value: match &ctx.merge_operator {
-                    Some(merge_operator) => Tree::resolve_merge_via_pipeline(
+                    Some(merge_operator) => Tree::resolve_point_merge(
                         (*ctx.super_version).clone(),
                         ctx.key(idx),
                         ctx.seqno,

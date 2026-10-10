@@ -262,6 +262,30 @@ fn any_overlapping_suppresses(
     false
 }
 
+/// Pushes onto `out` the tombstones whose interval holds `key`, whatever
+/// their seqno.
+fn collect_containing(
+    node: Option<&Node>,
+    key: &[u8],
+    out: &mut Vec<RangeTombstone>,
+    comparator: &dyn crate::comparator::UserComparator,
+) {
+    let Some(n) = node else { return };
+
+    if comparator.compare(&n.subtree_max_end, key) != Ordering::Greater {
+        return;
+    }
+
+    collect_containing(n.left.as_deref(), key, out, comparator);
+
+    if comparator.compare(&n.tombstone.start, key) != Ordering::Greater {
+        if n.tombstone.contains_key_with(key, comparator) {
+            out.push(n.tombstone.clone());
+        }
+        collect_containing(n.right.as_deref(), key, out, comparator);
+    }
+}
+
 /// In-order traversal to produce sorted output.
 fn inorder(node: Option<&Node>, result: &mut Vec<RangeTombstone>) {
     let Some(n) = node else { return };
@@ -351,6 +375,12 @@ impl IntervalTree {
             read_seqno,
             self.comparator.as_ref(),
         )
+    }
+
+    /// Pushes onto `out` the tombstones holding `key`. O(log n + k) where k
+    /// is the number of overlapping tombstones.
+    pub fn containing(&self, key: &[u8], out: &mut Vec<RangeTombstone>) {
+        collect_containing(self.root.as_deref(), key, out, self.comparator.as_ref());
     }
 
     /// Returns the highest-seqno visible tombstone that fully covers `[min, max]`,
