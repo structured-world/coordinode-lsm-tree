@@ -137,7 +137,8 @@ fn random_layout(dir: &std::path::Path, draws: &mut Draws) -> crate::Result<crat
 #[test]
 fn the_picker_chooses_what_pricing_every_window_anew_chooses() -> crate::Result<()> {
     let cmp = crate::comparator::DefaultUserComparator;
-    let mut compared = 0;
+    // Moves, merges, and choices of nothing.
+    let mut outcomes = [0u32; 3];
     for seed in 0..12 {
         let mut draws = Draws(seed);
         let dir = tempfile::tempdir()?;
@@ -160,16 +161,17 @@ fn the_picker_chooses_what_pricing_every_window_anew_chooses() -> crate::Result<
                     [usize::try_from(draws.below(3)).unwrap()];
                 let slack = draws.below(64 * 1_024);
                 let (curr_level, next_level) = (level(curr), level(curr + 1));
+                let chosen = pick_minimal_compaction(
+                    curr_level,
+                    next_level,
+                    &hidden_set,
+                    overshoot,
+                    base,
+                    slack,
+                    &cmp,
+                );
                 assert_eq!(
-                    pick_minimal_compaction(
-                        curr_level,
-                        next_level,
-                        &hidden_set,
-                        overshoot,
-                        base,
-                        slack,
-                        &cmp
-                    ),
+                    chosen,
                     reference_pick(
                         curr_level,
                         next_level,
@@ -182,10 +184,15 @@ fn the_picker_chooses_what_pricing_every_window_anew_chooses() -> crate::Result<
                     "seed {seed}, L{curr} into L{}, round {round}",
                     curr + 1,
                 );
-                compared += 1;
+                match chosen {
+                    Some((_, true)) => outcomes[0] += 1,
+                    Some((_, false)) => outcomes[1] += 1,
+                    None => outcomes[2] += 1,
+                }
             }
         }
     }
-    assert_eq!(compared, 12 * 4 * 6);
+    // Both kinds of choice were compared, moves and merges.
+    assert!(outcomes[0] > 0 && outcomes[1] > 0, "{outcomes:?}");
     Ok(())
 }
