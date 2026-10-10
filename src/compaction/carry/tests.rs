@@ -96,36 +96,3 @@ fn align_changed_run_spreads_over_its_row_pages() {
         Some((vec![4, 4, 3, 4], vec![true, false, false, true]))
     );
 }
-
-/// With the levels past level 0 shifted two places down, a source level is
-/// judged by the policies of its canonical level, as the destination is: a
-/// physical level whose canonical level cuts pages as the destination does
-/// qualifies, and one whose physical index would wrongly match does not.
-#[test]
-fn levels_share_shape_judges_a_shifted_level_by_its_canonical_policy() {
-    use super::levels_share_shape;
-    use crate::config::BlockSizePolicy;
-
-    // Pages of 4 KiB at canonical level 1, 16 KiB at canonical level 2.
-    let config = crate::Config::new(
-        "unused",
-        crate::SequenceNumberCounter::default(),
-        crate::SequenceNumberCounter::default(),
-    )
-    .columnar_page_size_policy(BlockSizePolicy::new([
-        4_096, 4_096, 16_384, 16_384, 4_096, 4_096, 4_096,
-    ]));
-    let (shift, dest_canonical) = (2, 2);
-
-    // Physical level 4 is canonical level 2, the destination's.
-    assert!(levels_share_shape(&config, 4, shift, dest_canonical));
-    // Physical level 3 is canonical level 1, whose pages differ, though
-    // physical index 3 names the destination's page size.
-    assert!(!levels_share_shape(&config, 3, shift, dest_canonical));
-    // Physical levels 1 and 2 sit above the shifted ones and hold no table.
-    assert!(!levels_share_shape(&config, 1, shift, dest_canonical));
-    assert!(!levels_share_shape(&config, 2, shift, dest_canonical));
-    // Level 0 is canonical level 0.
-    assert!(!levels_share_shape(&config, 0, shift, dest_canonical));
-    assert!(levels_share_shape(&config, 0, shift, 0));
-}

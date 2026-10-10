@@ -1571,6 +1571,11 @@ impl Writer {
             value_layout: self
                 .value_layout
                 .unwrap_or(crate::table::meta::ValueLayout::Whole),
+            group_shape: crate::table::meta::GroupShape {
+                encoding: self.column_encoding,
+                row_group_size: self.row_group_size,
+                page_size: self.columnar_page_size,
+            },
             bulk_ingested: self.bulk_ingested,
             recency: self.recency,
             lineage: self.lineage.clone(),
@@ -2237,6 +2242,16 @@ impl Writer {
             // block-skip: the writer re-derives the per-block ranges from
             // the re-emitted entries (never copies the source's map).
             .use_seqno_in_index(has_seqno_bounds);
+        // Groups it copies keep the source's shape, and groups it re-encodes
+        // are cut the same way, so the copy records the shape all of them
+        // have.
+        let writer = match meta.group_shape {
+            Some(shape) => writer
+                .use_column_encoding(shape.encoding)
+                .use_row_group_size(shape.row_group_size)
+                .use_columnar_page_size(shape.page_size),
+            None => writer,
+        };
         // Re-emit per-KV checksum footers under the source's algorithm when it
         // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
         // the same per-block footer state).
@@ -5384,6 +5399,9 @@ struct MetaSectionParams<'a> {
     /// How the columnar blocks store each row's value; written only for a
     /// columnar table.
     value_layout: crate::table::meta::ValueLayout,
+    /// How the row groups were cut and encoded; written only for a columnar
+    /// table.
+    group_shape: crate::table::meta::GroupShape,
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
@@ -5670,6 +5688,10 @@ fn encode_meta_payload(
     // which one its column is. A row-major table has no value columns.
     if p.use_columnar {
         meta_items.push(meta("descriptor#value_layout", &[p.value_layout.to_byte()]));
+        // How its row groups were cut and encoded: a group copied into
+        // another table keeps all of it, so a copy goes only into a table
+        // that would write it the same way.
+        meta_items.push(meta("descriptor#group_shape", &p.group_shape.to_bytes()));
     }
 
     // L0 recency key, on every table: the reader requires it.

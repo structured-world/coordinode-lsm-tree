@@ -352,23 +352,20 @@ those rows applies the level's policy.
 A merge copies an input's row group whole, as it lies on disk, when every row
 of it comes out of the merge exactly as it was read and nothing else lands
 among them: the group's bytes are then what the output would encode for those
-rows. It does so only from a level whose encoding, row group size and page
-size policies are the output level's, into an output of the same data codec
-and dictionary, and with
-neither encryption nor Page-ECC, so a copied page is always one the output's
-level would have written. The block checksums, which bind each block to its
+rows. It does so only from a table that records the encoding, row group size
+and page size the output level writes with (every columnar table records the
+three it was written with, as `descriptor#group_shape`), into an output of the
+same data codec and dictionary, and with neither encryption nor Page-ECC, so a
+copied page is always one the output's level would have written: a table
+written before the level's policy changed, or moved whole from a level with
+another policy, is rewritten under the new one rather than copied. The block
+checksums, which bind each block to its
 table and place, are moved to the copy's; the pages, their stamps and the
 group's zone blocks are not touched. An output keeping a zone map takes the
 copied group's statistics from the input's, and writes the rows of a group
 whose table kept none. When some rows of a group change, the group is written
 again under its own tag, and the pages of each row page whose rows all came
 out as they were read are copied into it unchanged.
-
-The policies compared are the ones configured now. A group written before
-they changed keeps its row group size, page size and encodings when copied,
-as a table moved to another level whole keeps them: the group describes its
-own layout, so it reads the same, and the level's new policy applies to it
-once a merge changes its rows.
 
 A read also bounds what a row group's pages may decode to: a writer closes a
 group once its rows reach at most 4 MiB, an ingested batch past that cut into

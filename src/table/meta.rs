@@ -64,6 +64,57 @@ impl ValueLayout {
     }
 }
 
+/// How a columnar table cut and encoded its row groups, from the optional
+/// `descriptor#group_shape` property: the column encoding of its pages, and
+/// the row group and page sizes its writer cut at.
+///
+/// A group copied into another table keeps all three, so a table's groups
+/// are copied only into a table that would write them the same way.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct GroupShape {
+    /// The encoding its column pages were written with.
+    pub encoding: crate::config::ColumnEncoding,
+    /// The size its writer closed a row group at.
+    pub row_group_size: u32,
+    /// The size its writer cut a column page at.
+    pub page_size: u32,
+}
+
+impl GroupShape {
+    /// The property's encoding: the column encoding as one byte, then the
+    /// row group and page sizes as little-endian `u32`s.
+    pub(crate) fn to_bytes(self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[0] = match self.encoding {
+            crate::config::ColumnEncoding::Plain => 0,
+            crate::config::ColumnEncoding::Auto => 1,
+        };
+        out[1..5].copy_from_slice(&self.row_group_size.to_le_bytes());
+        out[5..9].copy_from_slice(&self.page_size.to_le_bytes());
+        out
+    }
+
+    /// Decodes [`Self::to_bytes`], or `None` for any other byte string and for
+    /// sizes past [`crate::config::MAX_BLOCK_SIZE`], which no writer accepts.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (&tag, rest) = bytes.split_first()?;
+        let encoding = match tag {
+            0 => crate::config::ColumnEncoding::Plain,
+            1 => crate::config::ColumnEncoding::Auto,
+            _ => return None,
+        };
+        let (row_group, page) = rest.split_at_checked(4)?;
+        let shape = Self {
+            encoding,
+            row_group_size: u32::from_le_bytes(row_group.try_into().ok()?),
+            page_size: u32::from_le_bytes(page.try_into().ok()?),
+        };
+        (shape.row_group_size <= crate::config::MAX_BLOCK_SIZE
+            && shape.page_size <= crate::config::MAX_BLOCK_SIZE)
+            .then_some(shape)
+    }
+}
+
 /// Nanosecond timestamp.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
 pub struct Timestamp(u128);
@@ -264,6 +315,11 @@ pub struct ParsedMeta {
     /// table without the property, and for a row-major table, which has no
     /// value columns.
     pub value_layout: ValueLayout,
+
+    /// How a columnar table cut and encoded its row groups; `None` for a
+    /// row-major table, which has no row groups. Every columnar table records
+    /// it, and one that does not is refused as it is read.
+    pub group_shape: Option<GroupShape>,
 
     /// Bulk-ingest provenance from the optional `descriptor#bulk_ingested`
     /// property: `Some(true)` = bulk-ingested (every entry at LOCAL seqno 0, MVCC
@@ -529,6 +585,17 @@ impl ParsedMeta {
                 [2] => ValueLayout::Cells,
                 _ => return Err(crate::Error::InvalidHeader("TableMeta")),
             },
+        };
+
+        // The row group shape, recorded by every columnar table and by no
+        // row-major one.
+        let group_shape = match block.point_read(b"descriptor#group_shape", SeqNo::MAX, &cmp)? {
+            None if columnar => return Err(crate::Error::InvalidHeader("TableMeta")),
+            None => None,
+            Some(v) => Some(
+                GroupShape::from_bytes(v.value.as_ref())
+                    .ok_or(crate::Error::InvalidHeader("TableMeta"))?,
+            ),
         };
 
         // Optional bulk-ingest provenance. `None` = the key is ABSENT: a legacy
@@ -800,6 +867,7 @@ impl ParsedMeta {
             filter_format,
             columnar_format,
             value_layout,
+            group_shape,
             bulk_ingested,
             recency,
             lineage,

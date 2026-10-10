@@ -302,6 +302,61 @@ fn compaction_into_another_page_size_carries_nothing() {
     assert_blocks_verify(&tree);
 }
 
+/// Tables written before the page size policy changed keep the pages they
+/// were cut into, though every level's policy now agrees with the output's:
+/// the first merge after the change encodes their groups again, cut as the
+/// policy now cuts them, and the merge after it copies them.
+#[test]
+fn compaction_after_a_page_size_change_rewrites_older_groups_then_copies_them() {
+    use lsm_tree::config::BlockSizePolicy;
+
+    let folder = get_tmp_folder();
+    let mut seqno = 1;
+    {
+        let tree = open_columnar(folder.path());
+        flush_keys(&tree, 0..2_000, 0, &mut seqno);
+        flush_keys(&tree, 2_000..4_000, 0, &mut seqno);
+    }
+
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .columnar_page_size_policy(BlockSizePolicy::all(1_024))
+    .open()
+    .expect("reopen");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })
+    .expect("enable columnar");
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+    assert_eq!(tree.metrics().compaction_groups_carried(), 0);
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 4_000);
+
+    // The rewritten groups now have the shape the policy writes, as do the
+    // ones a flush adds beside them: the next merge copies all of them.
+    flush_keys(&tree, 4_000..6_000, 0, &mut seqno);
+    let groups_in = row_groups(&tree);
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+    assert_eq!(tree.metrics().compaction_groups_carried(), groups_in);
+    for i in 0..6_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_blocks_verify(&tree);
+}
+
 /// A compaction run in slices on a disk too small for a full rewrite installs
 /// each slice itself: the groups a slice copies are counted as a merge's are.
 #[test]

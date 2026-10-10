@@ -678,22 +678,12 @@ fn create_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
-    #[cfg(feature = "columnar")] carry: Option<&super::carry::CarryInputs>,
+    #[cfg(feature = "columnar")] carry: Option<&crate::table::group_carry::CarryTarget>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
 
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(unused_variables, reason = "only a columnar build carries row groups")
-    )]
-    for (level, run) in version
-        .iter_levels()
-        .enumerate()
-        .flat_map(|(level, lvl)| lvl.iter().map(move |run| (level, run)))
-    {
-        #[cfg(feature = "columnar")]
-        let target = carry.and_then(|carry| carry.target_for(level));
+    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
         if run.len() > 1 {
             let Some((lo, hi)) = pick_run_indexes(run, to_compact) else {
                 continue;
@@ -701,7 +691,7 @@ fn create_compaction_stream<'a>(
 
             let scanner = RunScanner::culled(run.clone(), (Some(lo), Some(hi)), pace.cloned())?;
             #[cfg(feature = "columnar")]
-            let scanner = match target {
+            let scanner = match carry {
                 Some(target) => scanner.with_carry(target.clone()),
                 None => scanner,
             };
@@ -713,7 +703,7 @@ fn create_compaction_stream<'a>(
                 found += 1;
                 let scanner = table.scan_paced(pace)?;
                 #[cfg(feature = "columnar")]
-                let scanner = match target {
+                let scanner = match carry {
                     Some(target) if target.takes(table) => {
                         scanner.with_carry(target.carry_for(table))
                     }
@@ -764,26 +754,18 @@ fn create_bounded_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
-    #[cfg(feature = "columnar")] carry: Option<&super::carry::CarryInputs>,
+    #[cfg(feature = "columnar")] carry: Option<&crate::table::group_carry::CarryTarget>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
 
-    #[cfg_attr(
-        not(feature = "columnar"),
-        expect(unused_variables, reason = "only a columnar build carries row groups")
-    )]
-    for (level, run) in version
-        .iter_levels()
-        .enumerate()
-        .flat_map(|(level, lvl)| lvl.iter().map(move |run| (level, run)))
-    {
+    for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
         for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
             found += 1;
             // A table whose groups can be carried is scanned group by group,
             // recording the groups wholly within this range.
             #[cfg(feature = "columnar")]
-            if let Some(target) = carry.and_then(|carry| carry.target_for(level))
+            if let Some(target) = carry
                 && target.takes(table)
             {
                 let scanner = table.scan_carrying(
@@ -2288,11 +2270,10 @@ fn run_subcompaction(
     // the output instead of being encoded again (see `carry`). Each range
     // records and matches its own.
     #[cfg(feature = "columnar")]
-    let carry = super::carry::CarryInputs::plan(
-        version,
+    let carry = super::carry::plan(
         &opts.config,
         rc,
-        (payload.canonical_level.into(), payload.level_shift()),
+        payload.canonical_level.into(),
         &version
             .iter_tables()
             .filter(|t| payload.table_ids.contains(&t.id()))
@@ -2515,10 +2496,7 @@ fn run_subcompaction(
 
     #[cfg(feature = "columnar")]
     let mut matcher = carry.as_ref().map(|carry| {
-        super::carry::CarryMatcher::new(
-            Arc::clone(&carry.target.queue),
-            opts.config.comparator.clone(),
-        )
+        super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
     let read_pace = pace.as_deref();
@@ -3503,13 +3481,7 @@ fn merge_tables(
     // Row groups the merge leaves as they were are copied into the output
     // instead of being encoded again (see `carry`).
     #[cfg(feature = "columnar")]
-    let carry = super::carry::CarryInputs::plan(
-        &current_super_version.version,
-        &opts.config,
-        &rc,
-        (payload.canonical_level.into(), payload.level_shift()),
-        &tables,
-    );
+    let carry = super::carry::plan(&opts.config, &rc, payload.canonical_level.into(), &tables);
 
     let Some(mut merge_iter) = create_compaction_stream(
         &current_super_version.version,
@@ -3739,10 +3711,7 @@ fn merge_tables(
     // the group.
     #[cfg(feature = "columnar")]
     let mut matcher = carry.as_ref().map(|carry| {
-        super::carry::CarryMatcher::new(
-            Arc::clone(&carry.target.queue),
-            opts.config.comparator.clone(),
-        )
+        super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
     let read_pace = pace.as_deref();

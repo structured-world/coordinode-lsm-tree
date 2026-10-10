@@ -122,19 +122,6 @@ pub struct Input {
     pub target_size: u64,
 }
 
-impl Input {
-    /// How far below its canonical level the destination sits, which is how
-    /// far every level past level 0 sits below its own; `None` when a
-    /// strategy names a canonical level below the destination's physical
-    /// one, which places no level.
-    #[cfg(feature = "columnar")]
-    pub(crate) fn level_shift(&self) -> Option<usize> {
-        self.dest_level
-            .checked_sub(self.canonical_level)
-            .map(usize::from)
-    }
-}
-
 /// Describes what to do (compact or not)
 #[derive(Debug, Eq, PartialEq)]
 pub enum Choice {

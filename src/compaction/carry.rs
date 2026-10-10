@@ -16,88 +16,31 @@
 use crate::table::group_carry::{CarryCandidate, CarryQueue, CarryTarget};
 use crate::{InternalValue, UserKey};
 
-/// Which inputs of one compaction record their row groups, and where.
-pub struct CarryInputs {
-    /// Where the inputs' scanners record their groups, and the codec a table
-    /// must have been written with for its groups to be copied.
-    pub(crate) target: CarryTarget,
-    /// Per physical level, whether its tables' groups may be carried into the
-    /// output: a copied group keeps the encodings and the row group and page
-    /// sizes it was written with, so only a level whose groups the output's
-    /// level would write the same way qualifies.
-    levels: alloc::vec::Vec<bool>,
-}
-
-impl CarryInputs {
-    /// The plan for a compaction of `inputs` from `version` into the level
-    /// whose policies are those of canonical level `dest_canonical`, writing
-    /// under `rc`; `None` when nothing it reads could be carried. Its output
-    /// must be columnar and neither encrypted nor ECC-protected, since a
-    /// copied group's blocks keep the plain transform of the tables that may
-    /// be carried.
-    ///
-    /// `level_shift` is how far below its canonical place the levels past
-    /// level 0 sit: a source at physical level `p > 0` was written under the
-    /// policies of canonical level `p - level_shift`, as the destination is.
-    pub(crate) fn plan(
-        version: &crate::version::Version,
-        config: &crate::Config,
-        rc: &crate::runtime_config::RuntimeConfig,
-        (dest_canonical, level_shift): (usize, Option<usize>),
-        inputs: &[crate::Table],
-    ) -> Option<Self> {
-        let level_shift = level_shift?;
-        let target = CarryTarget {
-            queue: CarryQueue::default(),
-            codec: rc.data_block_compression_policy.get(dest_canonical),
-        };
-        if !rc.columnar
-            || config.encryption.is_some()
-            || config.page_ecc
-            || !inputs.iter().any(|table| target.takes(table))
-        {
-            return None;
-        }
-        let levels = (0..version.iter_levels().count())
-            .map(|level| levels_share_shape(config, level, level_shift, dest_canonical))
-            .collect();
-        Some(Self { target, levels })
-    }
-
-    /// Where the tables of physical level `level` record their groups, or
-    /// `None` when they may not be carried.
-    pub(crate) fn target_for(&self, level: usize) -> Option<&CarryTarget> {
-        self.levels
-            .get(level)
-            .copied()
-            .unwrap_or(false)
-            .then_some(&self.target)
-    }
-}
-
-/// Whether the groups of physical level `level`, written under the policies
-/// of its canonical level, are cut and encoded as canonical level
-/// `dest_canonical` would write them: the same column encodings, row group
-/// size and page size. Level 0 is canonical level 0; a level between it and
-/// the shifted ones holds no table and has no canonical place.
-pub fn levels_share_shape(
+/// Where the inputs of a compaction into the level whose policies are those
+/// of canonical level `dest_canonical`, writing under `rc`, record their row
+/// groups; `None` when none of `inputs` could be carried. The output must be
+/// columnar and neither encrypted nor ECC-protected, since a copied group's
+/// blocks keep the plain transform of the tables that may be carried.
+pub fn plan(
     config: &crate::Config,
-    level: usize,
-    level_shift: usize,
+    rc: &crate::runtime_config::RuntimeConfig,
     dest_canonical: usize,
-) -> bool {
-    let canonical = match level {
-        0 => Some(0),
-        _ => level.checked_sub(level_shift).filter(|c| *c > 0),
+    inputs: &[crate::Table],
+) -> Option<CarryTarget> {
+    let target = CarryTarget {
+        queue: CarryQueue::default(),
+        codec: rc.data_block_compression_policy.get(dest_canonical),
+        shape: crate::table::meta::GroupShape {
+            encoding: config.column_encoding_policy.get(dest_canonical),
+            row_group_size: config.columnar_row_group_size_policy.get(dest_canonical),
+            page_size: config.columnar_page_size_policy.get(dest_canonical),
+        },
     };
-    let shape = |canonical: usize| {
-        (
-            config.column_encoding_policy.get(canonical),
-            config.columnar_row_group_size_policy.get(canonical),
-            config.columnar_page_size_policy.get(canonical),
-        )
-    };
-    canonical.is_some_and(|canonical| shape(canonical) == shape(dest_canonical))
+    (rc.columnar
+        && config.encryption.is_none()
+        && !config.page_ecc
+        && inputs.iter().any(|table| target.takes(table)))
+    .then_some(target)
 }
 
 /// Where the rows the merge emitted go: written one by one, a whole group

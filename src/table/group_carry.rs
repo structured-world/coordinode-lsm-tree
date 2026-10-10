@@ -68,14 +68,22 @@ pub struct CarryTarget {
     /// The data codec of the output: a copied group keeps its pages' codec,
     /// so only a table written with this one has groups worth recording.
     pub(crate) codec: crate::CompressionType,
+    /// How the output cuts and encodes its row groups: a copied group keeps
+    /// the shape it was written with, so only a table that recorded this one
+    /// has groups worth recording.
+    pub(crate) shape: crate::table::meta::GroupShape,
 }
 
 impl CarryTarget {
     /// Whether `table`'s groups may be recorded: ones that can be copied
-    /// (see [`Table::carries_row_groups`]) and compressed as the output
-    /// compresses, so none is read twice only to be refused.
+    /// (see [`Table::carries_row_groups`]), compressed as the output
+    /// compresses and cut and encoded as it writes them, so none is read
+    /// twice only to be refused and none lands in a table that would hold
+    /// it in another shape.
     pub(crate) fn takes(&self, table: &Table) -> bool {
-        table.carries_row_groups() && table.metadata.data_block_compression == self.codec
+        table.carries_row_groups()
+            && table.metadata.data_block_compression == self.codec
+            && table.metadata.group_shape == Some(self.shape)
     }
 
     /// A scanner's carry state for `table`, recording into this target.
