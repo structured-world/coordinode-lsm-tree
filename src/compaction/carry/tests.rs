@@ -117,6 +117,42 @@ fn changed_pages_fit_weighs_only_the_pages_written_anew() {
     assert!(!changed_pages_fit(&rows, (&[3, 3], &[false, false]), 1_000));
 }
 
+/// A row read and emitted alike is found among newer and older versions the
+/// merge put around it; rows re-seqnoed or rewritten at their own version
+/// are not the rows read.
+#[test]
+fn shares_a_row_finds_a_row_left_as_read() {
+    use super::shares_a_row;
+
+    let cmp = crate::comparator::default_comparator();
+    let source = vec![row(1, 5, "a"), row(2, 5, "b"), row(3, 5, "c")];
+
+    let interleaved = vec![
+        row(1, 9, "new"),
+        row(1, 0, "a"),
+        row(2, 9, "new"),
+        row(2, 5, "b"),
+    ];
+    assert!(shares_a_row(&source, &interleaved, &cmp));
+
+    let zeroed: Vec<_> = source.iter().map(|r| row_at(r, 0)).collect();
+    assert!(!shares_a_row(&source, &zeroed, &cmp));
+
+    let rewritten = vec![row(1, 5, "x"), row(2, 5, "y"), row(3, 5, "z")];
+    assert!(!shares_a_row(&source, &rewritten, &cmp));
+    assert!(!shares_a_row(&source, &[], &cmp));
+}
+
+/// `read` at seqno `seqno`.
+fn row_at(read: &InternalValue, seqno: u64) -> InternalValue {
+    InternalValue::from_components(
+        read.key.user_key.clone(),
+        read.value.clone(),
+        seqno,
+        read.key.value_type,
+    )
+}
+
 std::thread_local! {
     /// The most bytes of rows a matcher held at once on this thread.
     static PEAK_HELD: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };

@@ -230,7 +230,9 @@ impl CarryMatcher {
                 sink.settle_transforms(open.last_seen);
                 return Ok(());
             }
-        } else if let Some(bytes) = sink.carry_pages(candidate, emitted)? {
+        } else if shares_a_row(&candidate.rows, emitted, &self.comparator)
+            && let Some(bytes) = sink.carry_pages(candidate, emitted)?
+        {
             self.carried.partial_groups += 1;
             self.carried.bytes += bytes;
             sink.settle_transforms(open.last_seen);
@@ -376,6 +378,42 @@ pub fn changed_pages_fit(
 #[cfg(test)]
 #[expect(clippy::indexing_slicing, reason = "test code")]
 mod tests;
+
+/// Whether some row of `source` came out in `emitted` exactly as it was read.
+/// A copied page needs its rows so, and both lists are in the merge's order,
+/// key ascending and version descending, so one pass over them decides it
+/// before the group's bytes are read: a merge that changed every row, as one
+/// writing seqnos as zero does, copies no page.
+fn shares_a_row(
+    source: &[InternalValue],
+    emitted: &[InternalValue],
+    comparator: &crate::comparator::SharedComparator,
+) -> bool {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+
+    let (mut source, mut emitted) = (source.iter().peekable(), emitted.iter().peekable());
+    while let (Some(read), Some(row)) = (source.peek(), emitted.peek()) {
+        match comparator
+            .compare(&read.key.user_key, &row.key.user_key)
+            .then_with(|| row.key.seqno.cmp(&read.key.seqno))
+        {
+            Less => {
+                source.next();
+            }
+            Greater => {
+                emitted.next();
+            }
+            Equal => {
+                if same_row(read, row) {
+                    return true;
+                }
+                source.next();
+                emitted.next();
+            }
+        }
+    }
+    false
+}
 
 /// Whether the merge emitted `row` exactly as `read`: the same key, version,
 /// kind and value. A row the merge rewrote, re-seqnoed or replaced with

@@ -65,6 +65,45 @@ fn groups_without_statistics_are_not_read_for_an_output_keeping_a_zone_map() -> 
     Ok(())
 }
 
+/// A merge into the last level with the watermark above every seqno writes
+/// them as zero, so no row of any group comes out as it was read: no page
+/// can be copied, and no group is read raw only to find that out.
+#[test]
+fn groups_with_no_row_left_as_read_are_not_read_raw() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            crate::config::CompressionPolicy::all(crate::CompressionType::None);
+    })?;
+    let key = |i: u32| format!("k{i:06}").into_bytes();
+    let mut seqno: SeqNo = 1;
+    for range in [0..2_000u32, 2_000..4_000] {
+        for i in range {
+            tree.insert(key(i), vec![b'v'; 64], seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    RAW_READ.with(|read| read.set(0));
+    tree.major_compact(64 * 1024 * 1024, SeqNo::MAX)?;
+    let read = RAW_READ.with(Cell::get);
+
+    assert_eq!(read, 0, "{read} bytes of groups read raw for no copy");
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 4_000);
+    Ok(())
+}
+
 /// A compaction that relocates blob files writes every row itself, so its
 /// scans record no group: none is held for a copy that cannot happen.
 #[cfg(feature = "metrics")]
