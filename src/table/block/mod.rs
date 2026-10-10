@@ -567,11 +567,12 @@ impl Block {
             expect(unused_variables, reason = "recovery scheme only used under page_ecc")
         )]
         ecc_params: EccParams,
+        take: &mut impl FnMut(&mut R, usize) -> crate::Result<Slice>,
     ) -> crate::Result<(Slice, Option<EccRecoveryKind>)> {
-        // Read straight into the Slice allocation — `read_exact` overwrites every
-        // byte, so a zero-filled scratch buffer would be wasted, and returning a
-        // Slice lets the no-compression / ECC-recovery callers avoid a later copy.
-        let data = Slice::from_reader(reader, data_length as usize)?;
+        // Taken as a Slice — read straight into its allocation, or viewed in
+        // the reader's own — so the no-compression / ECC-recovery callers
+        // avoid a later copy.
+        let data = take(reader, data_length as usize)?;
 
         let computed = Checksum::from_raw(crate::hash::hash128(&data));
 
@@ -587,7 +588,7 @@ impl Block {
         // ECC trailer present — always consume the parity bytes so
         // the reader cursor lands on the next block's header even
         // when the happy path doesn't need them.
-        let parity = Slice::from_reader(reader, ecc_length as usize)?;
+        let parity = take(reader, ecc_length as usize)?;
 
         if computed == expected {
             return Ok((data, None));
@@ -1352,6 +1353,22 @@ impl Block {
         at: ChecksumAt,
         produced: &mut usize,
     ) -> crate::Result<Self> {
+        Self::from_reader_taking(reader, identity, transform, at, produced, |reader, len| {
+            Ok(Slice::from_reader(reader, len)?)
+        })
+    }
+
+    /// [`Self::from_reader_counting`] with the payload and parity bytes taken
+    /// by `take`, `len` of them at a time: a reader already holding the bytes
+    /// hands out a view of them instead of a copy.
+    pub(crate) fn from_reader_taking<R: crate::io::Read>(
+        reader: &mut R,
+        identity: BlockIdentity,
+        transform: &BlockTransform<'_>,
+        at: ChecksumAt,
+        produced: &mut usize,
+        mut take: impl FnMut(&mut R, usize) -> crate::Result<Slice>,
+    ) -> crate::Result<Self> {
         let encryption = transform.encryption();
         // `identity` (tree/table + dict/window context) feeds AAD
         // reconstruction on the encrypted path; `block_type` is still derived
@@ -1412,6 +1429,7 @@ impl Block {
                 ecc_length,
                 expected,
                 block_ecc_params(&header, transform),
+                &mut take,
             )?;
 
             // Recover the plaintext: AAD-bound envelope under zstd (verifies the
@@ -1430,7 +1448,7 @@ impl Block {
             // legacy shape); ECC blocks go through the Vec-allocating
             // recovery-capable helper instead.
             let raw_data = if ecc_length == 0 {
-                let s = Slice::from_reader(reader, header.data_length as usize)?;
+                let s = take(reader, header.data_length as usize)?;
                 let checksum = Checksum::from_raw(crate::hash::hash128(&s));
                 checksum.check(expected).inspect_err(|_| {
                     log::error!(
@@ -1446,6 +1464,7 @@ impl Block {
                     ecc_length,
                     expected,
                     block_ecc_params(&header, transform),
+                    &mut take,
                 )?;
                 payload
             };
@@ -2049,6 +2068,7 @@ impl Block {
                 *handle.offset(),
             )),
             ecc_params,
+            &mut |cursor, len| Ok(Slice::from_reader(cursor, len)?),
         )?;
         let Some(kind) = recovery else {
             // Clean read: nothing to persist. NOTE this is a FRAME-level clean
