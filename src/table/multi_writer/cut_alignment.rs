@@ -23,17 +23,33 @@
 
 use crate::UserKey;
 use crate::comparator::UserComparator;
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::cmp::Ordering;
 
-/// A boundary between two adjacent tables of one run of the level below.
+/// A boundary between the tables of the level below: past every table before
+/// it and before every table after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Boundary {
-    /// The largest key of the table before the boundary.
+    /// The largest key of the tables before the boundary.
     pub key: UserKey,
-    /// The bytes of the table after it: what an output straddling the
-    /// boundary has the next merge read and write again.
-    pub after_bytes: u64,
+    /// The tables after it up to the next boundary, as their smallest key and
+    /// their bytes, in key order: one table in a level of one run, a cluster
+    /// of overlapping ones in a level of several.
+    pub after: Vec<(UserKey, u64)>,
+}
+
+impl Boundary {
+    /// The bytes an output reaching past the boundary to `last` has the next
+    /// merge read and write again: the tables after it that start at or
+    /// before `last`. One ending in the gap before the next table reaches
+    /// none of them.
+    pub fn reached_bytes(&self, last: &[u8], comparator: &dyn UserComparator) -> u64 {
+        self.after
+            .iter()
+            .take_while(|(min, _)| comparator.compare(min, last) != Ordering::Greater)
+            .map(|&(_, bytes)| bytes)
+            .sum()
+    }
 }
 
 /// Where a key falls among the boundaries, decided before anything is

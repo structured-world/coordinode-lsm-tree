@@ -8,11 +8,15 @@ fn key(i: u32) -> Vec<u8> {
     format!("{i:06}").into_bytes()
 }
 
+fn index_of(key: &[u8]) -> u32 {
+    core::str::from_utf8(key).unwrap().parse().unwrap()
+}
+
 fn boundaries(keys: &[u32]) -> alloc::sync::Arc<[Boundary]> {
     keys.iter()
         .map(|&i| Boundary {
             key: UserKey::from(key(i)),
-            after_bytes: u64::from(i),
+            after: vec![(UserKey::from(key(i + 1)), u64::from(i))],
         })
         .collect()
 }
@@ -113,7 +117,7 @@ fn inside_finds_the_boundary_between_a_run_of_keys() {
 
     let at_first = align.crossing(&key(15), cmp.as_ref());
     let inside = align.inside(at_first, &key(25), cmp.as_ref());
-    assert_eq!(inside.map(|b| b.after_bytes), Some(20));
+    assert_eq!(inside.map(|b| index_of(&b.key)), Some(20));
     assert!(
         align.inside(at_first, &key(20), cmp.as_ref()).is_none(),
         "a run ending on the boundary does not cross it"

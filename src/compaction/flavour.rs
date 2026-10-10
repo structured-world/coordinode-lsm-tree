@@ -267,8 +267,15 @@ pub(super) fn boundaries_between<'a>(
         if comparator.compare(reach, after.key_range().min()) == Ordering::Less {
             boundaries.push(crate::table::multi_writer::Boundary {
                 key: reach.clone(),
-                after_bytes: after.file_size(),
+                after: Vec::new(),
             });
+        }
+        // Every table belongs to the cluster after the last boundary before
+        // it; tables before the first boundary to none.
+        if let Some(boundary) = boundaries.last_mut() {
+            boundary
+                .after
+                .push((after.key_range().min().clone(), after.file_size()));
         }
     }
     boundaries

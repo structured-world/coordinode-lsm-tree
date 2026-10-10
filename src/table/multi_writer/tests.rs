@@ -1806,13 +1806,14 @@ fn key_index(key: &[u8]) -> u32 {
     std::str::from_utf8(key).unwrap().parse().unwrap()
 }
 
-/// The boundaries at the largest keys `marks` of the tables below.
+/// The boundaries at the largest keys `marks` of the tables below, each
+/// followed by one table of `after_bytes` starting at the next key.
 fn marks_at(marks: &[u32], after_bytes: u64) -> std::sync::Arc<[super::Boundary]> {
     marks
         .iter()
         .map(|&i| super::Boundary {
             key: crate::UserKey::from(seq_key(i)),
-            after_bytes,
+            after: vec![(crate::UserKey::from(seq_key(i + 1)), after_bytes)],
         })
         .collect()
 }

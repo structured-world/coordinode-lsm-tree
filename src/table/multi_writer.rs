@@ -1680,7 +1680,8 @@ impl MultiWriter {
     /// boundary between its keys: the current output, not cut before it, is
     /// already past the share of the target it would be cut at there. Copied,
     /// the output straddles the boundary and the next merge reads and writes
-    /// the table after it again; written key by key, the group's bytes are
+    /// again every table past it that the group reaches, several where runs
+    /// overlap there; written key by key, the group's bytes are
     /// encoded again now. The cheaper of the two is taken.
     #[cfg(feature = "columnar")]
     fn splits_cheaper_than_straddling(
@@ -1705,7 +1706,7 @@ impl MultiWriter {
             passed: crossing.passed + 1,
             counted: crossing.counted + 1,
         };
-        bytes < boundary.after_bytes
+        bytes < boundary.reached_bytes(&last.key.user_key, self.comparator.as_ref())
             && load.reaches(cut_alignment::share_of(
                 self.target_size,
                 alignment.floor_percent(inside),

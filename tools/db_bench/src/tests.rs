@@ -1,8 +1,32 @@
-use super::{append_github_json, distinct_github_outputs, parse_benchmark};
+use super::{append_github_json, database_dir, distinct_github_outputs, parse_benchmark};
 use serde_json::json;
 use std::path::Path;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Under one `--db`, each workload of a comma-separated list gets a fresh
+/// directory of its own even when run once, so the second never opens the tree
+/// the first left behind; a single workload run once uses the path itself.
+#[test]
+fn several_workloads_under_one_db_get_fresh_directories() -> TestResult {
+    let db = tempfile::tempdir()?;
+    assert_eq!(database_dir(db.path(), "fillseq", 0, 1, 1)?, db.path());
+
+    let first = database_dir(db.path(), "fillseq", 0, 1, 2)?;
+    let second = database_dir(db.path(), "overwrite", 0, 1, 2)?;
+    assert_ne!(first, second, "each workload has its own directory");
+    assert_ne!(first, db.path());
+    assert!(first.starts_with(db.path()) && second.starts_with(db.path()));
+
+    std::fs::write(first.join("left-behind"), b"")?;
+    let again = database_dir(db.path(), "fillseq", 0, 1, 2)?;
+    assert_eq!(again, first);
+    assert!(
+        std::fs::read_dir(&again)?.next().is_none(),
+        "a directory is emptied before its run"
+    );
+    Ok(())
+}
 
 /// Several workloads are named in one run, comma-separated, so a `counters`
 /// build writes all of their costs and timings into one set of files; an

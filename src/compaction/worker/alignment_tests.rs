@@ -333,6 +333,69 @@ fn overlapping_runs_give_no_boundary_inside_a_table_of_either() -> crate::Result
     Ok(())
 }
 
+/// Past a boundary of a level holding overlapping runs lies a cluster of
+/// tables, not one: an output reaching past the boundary has the next merge
+/// read every table of the cluster it reaches, and the boundary carries each.
+#[test]
+fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    ))?;
+    let mut seqno = 1;
+    for keys in [0..1_800, 1_200..3_000] {
+        for i in keys {
+            tree.insert(key(i), noise(seqno, 700), seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let version = tree.current_version();
+    let Some(level) = version.level(0) else {
+        panic!("L0 exists");
+    };
+    let mut all: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+    all.sort_by(|a, b| a.metadata.key_range.min().cmp(b.metadata.key_range.min()));
+
+    let cmp = crate::comparator::DefaultUserComparator;
+    let boundaries =
+        crate::compaction::flavour::boundaries_between(all.iter().copied(), all.len() - 1, &cmp);
+    let mut largest_cluster = 0;
+    for (at, boundary) in boundaries.iter().enumerate() {
+        let next = boundaries.get(at + 1).map(|next| index(&next.key));
+        let cluster: Vec<(u32, u64)> = all
+            .iter()
+            .map(|t| (index(t.metadata.key_range.min()), t.file_size()))
+            .filter(|&(min, _)| min > index(&boundary.key) && next.is_none_or(|next| min <= next))
+            .collect();
+        let carried: Vec<(u32, u64)> = boundary
+            .after
+            .iter()
+            .map(|(min, bytes)| (index(min), *bytes))
+            .collect();
+        assert_eq!(carried, cluster, "the tables past {}", index(&boundary.key));
+        largest_cluster = largest_cluster.max(cluster.len());
+
+        let (last_min, _) = *cluster.last().unwrap();
+        let reached: u64 = cluster.iter().map(|&(_, bytes)| bytes).sum();
+        assert_eq!(boundary.reached_bytes(&key(last_min), &cmp), reached);
+        let (first_min, first_bytes) = cluster[0];
+        assert_eq!(boundary.reached_bytes(&key(first_min), &cmp), first_bytes);
+        assert_eq!(
+            boundary.reached_bytes(&key(first_min - 1), &cmp),
+            0,
+            "an output ending in the gap before the cluster reaches none of it"
+        );
+    }
+    assert!(
+        largest_cluster > 1,
+        "the overlap puts tables of both runs past one boundary"
+    );
+    Ok(())
+}
+
 /// The compaction byte counter grows by the bytes of the tables a merge
 /// installs, and a move, which writes none, leaves it as it was.
 #[cfg(feature = "metrics")]
