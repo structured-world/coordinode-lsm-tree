@@ -103,16 +103,13 @@ fn partitioned_bloom_skip_beyond_partitions() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Exercises bloom_may_contain_key through the merge pipeline
-/// (resolve_merge_via_pipeline → TreeIter → bloom_passes → bloom_may_contain_key).
+/// Exercises the partition-aware key filter through the merge of a point
+/// read, which asks each table's filter by the key itself. Correctness of the
+/// merge result (110 = merge(100, [10])) confirms the read goes through it
+/// without errors.
 ///
-/// With a merge operator, point reads go through the iterator pipeline where
-/// bloom_key enables partition-aware filtering. Correctness of the merge
-/// result (110 = merge(100, [10])) confirms the pipeline executes without
-/// errors through the new bloom_may_contain_key code path.
-///
-/// Note: io_skipped_by_filter is only incremented by Table::get, not by
-/// bloom_passes in the pipeline path, so we assert correctness not metrics.
+/// Note: io_skipped_by_filter is only incremented by Table::get, not by the
+/// merge's filter check, so we assert correctness not metrics.
 #[test_log::test]
 fn partitioned_bloom_skip_merge_pipeline() -> lsm_tree::Result<()> {
     use lsm_tree::{
@@ -140,7 +137,7 @@ fn partitioned_bloom_skip_merge_pipeline() -> lsm_tree::Result<()> {
     tree.insert("zzz", 2_i64.to_le_bytes(), seqno.next());
     tree.flush_active_memtable(0)?;
 
-    // Merge operand in active memtable — triggers resolve_merge_via_pipeline
+    // Merge operand in active memtable: the read resolves a merge
     tree.merge("counter", 10_i64.to_le_bytes(), seqno.next());
 
     let result = tree.get("counter", MAX_SEQNO)?;

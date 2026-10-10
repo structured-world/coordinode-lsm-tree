@@ -203,12 +203,12 @@ impl Job {
             Self::Merge { idx } => JobDone::Value {
                 idx,
                 value: match &ctx.merge_operator {
-                    Some(merge_operator) => Tree::resolve_merge_via_pipeline(
-                        (*ctx.super_version).clone(),
+                    Some(merge_operator) => Tree::resolve_point_merge(
+                        &ctx.super_version,
                         ctx.key(idx),
                         ctx.seqno,
-                        Arc::clone(merge_operator),
-                        ctx.merge_base.clone(),
+                        merge_operator,
+                        ctx.merge_base.as_ref(),
                     ),
                     None => Err(misplaced()),
                 },

@@ -4,6 +4,35 @@ fn rt(start: &[u8], end: &[u8], seqno: SeqNo) -> RangeTombstone {
     RangeTombstone::new(UserKey::from(start), UserKey::from(end), seqno)
 }
 
+/// `for_each_containing` visits every tombstone holding the key, whatever its
+/// seqno, and none that ends at it (the end is exclusive) or starts past it.
+#[test]
+fn for_each_containing_visits_the_tombstones_holding_the_key() {
+    let mut tree = IntervalTree::new();
+    for tombstone in [
+        rt(b"a", b"f", 10),
+        rt(b"d", b"m", 20),
+        rt(b"b", b"e", 1),
+        rt(b"e", b"z", 5),
+        rt(b"p", b"z", 7),
+    ] {
+        tree.insert(tombstone);
+    }
+
+    let mut seqnos = Vec::new();
+    tree.for_each_containing(b"e", |rt| seqnos.push(rt.seqno));
+    seqnos.sort_unstable();
+    assert_eq!(
+        seqnos,
+        [5, 10, 20],
+        "[b, e) ends at the key, [p, z) starts past it"
+    );
+
+    let mut visited = 0;
+    tree.for_each_containing(b"0", |_| visited += 1);
+    assert_eq!(visited, 0, "a key before every tombstone is held by none");
+}
+
 #[test]
 fn empty_tree_no_suppression() {
     let tree = IntervalTree::new();

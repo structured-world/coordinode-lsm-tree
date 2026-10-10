@@ -136,8 +136,8 @@ pub struct IterState {
     ///
     /// When set alongside `key_hash`, enables partitioned/TLI bloom filters
     /// to seek directly to the relevant partition instead of returning the
-    /// conservative `Ok(true)` fallback. Only set for single-key pipelines
-    /// (e.g. `resolve_merge_via_pipeline`).
+    /// conservative `Ok(true)` fallback. Only set for single-key reads (the
+    /// merge of a point read).
     pub(crate) bloom_key: Option<UserKey>,
 
     /// Optional metrics handle for recording prefix-related statistics (e.g. bloom skips).
@@ -159,6 +159,28 @@ impl IterState {
                 version: &self.version.version,
             })
     }
+
+    /// What this read asks each table's filters.
+    fn filter_query(&self) -> FilterQuery<'_> {
+        FilterQuery {
+            prefix_hash: self.prefix_hash,
+            key_hash: self.key_hash,
+            bloom_key: self.bloom_key.as_deref(),
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.as_ref(),
+        }
+    }
+}
+
+/// What a read asks each table's filters: the prefix it scans, or the key it
+/// reads. See the fields of [`IterState`] of the same names.
+#[derive(Clone, Copy)]
+pub(crate) struct FilterQuery<'a> {
+    pub(crate) prefix_hash: Option<u64>,
+    pub(crate) key_hash: Option<u64>,
+    pub(crate) bloom_key: Option<&'a [u8]>,
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: Option<&'a Arc<crate::Metrics>>,
 }
 
 type BoxedMerge<'a> = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + 'a>;
@@ -237,14 +259,14 @@ impl FilterAnswer {
 /// Returns `true` if the table should be included (bloom says "maybe" or no
 /// filter available), `false` if it can be safely skipped.
 fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
-    filter_answer(state, table) != FilterAnswer::Absent
+    filter_answer(state.filter_query(), table) != FilterAnswer::Absent
 }
 
 /// Asks a table's prefix and key filters about the read, counting the probes
 /// they answer (see [`FilterAnswer`]).
-fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer {
+fn filter_answer(query: FilterQuery<'_>, table: &crate::table::Table) -> FilterAnswer {
     let mut answer = FilterAnswer::Unanswered;
-    if let Some(prefix_hash) = state.prefix_hash {
+    if let Some(prefix_hash) = query.prefix_hash {
         // A prefix answer counts as a key's does: the filter holds the
         // prefix's hash beside the keys'.
         use crate::table::probe_stats::ProbeCounts;
@@ -255,7 +277,7 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
                     negatives: 1,
                 });
                 #[cfg(feature = "metrics")]
-                if let Some(m) = &state.metrics {
+                if let Some(m) = query.metrics {
                     m.prefix_bloom_skips
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -277,14 +299,13 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
 
     // bloom_key without key_hash is meaningless — catch misuse early
     debug_assert!(
-        state.bloom_key.is_none() || state.key_hash.is_some(),
+        query.bloom_key.is_none() || query.key_hash.is_some(),
         "bloom_key requires key_hash to be set"
     );
 
-    if let Some(key_hash) = state.key_hash {
+    if let Some(key_hash) = query.key_hash {
         use crate::table::KeyFilterAnswer;
-        let result = if let Some(bloom_key) = &state.bloom_key {
-            // UserKey (Slice) implements Deref<Target=[u8]>, coerces to &[u8]
+        let result = if let Some(bloom_key) = query.bloom_key {
             table.key_filter_answer(bloom_key, key_hash)
         } else {
             table.bloom_may_contain_key_hash(key_hash).map(|may| {
@@ -309,7 +330,7 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
             }
             Ok(KeyFilterAnswer::PastPartitions) => return FilterAnswer::Absent,
             Ok(KeyFilterAnswer::MayContain)
-                if table.key_check_consults_filter(state.bloom_key.is_some()) =>
+                if table.key_check_consults_filter(query.bloom_key.is_some()) =>
             {
                 table.count_probes(ProbeCounts {
                     probes: 1,
@@ -421,239 +442,6 @@ where
 }
 
 impl TreeIter {
-    /// Fast path for single-key point-read merge resolution.
-    ///
-    /// Unlike [`create_range`], this skips:
-    /// - RT sort + dedup + table-skip computation
-    /// - `RangeTombstoneFilter` wrapper (uses inline post-merge RT check instead)
-    /// - Reverse-direction RT clone+sort (point reads are forward-only)
-    ///
-    /// Range tombstones are still collected from all tables (not just
-    /// bloom-passing) because an RT in a bloom-negative table can suppress
-    /// the target key. Only iterator construction is bloom-gated.
-    ///
-    /// `MvccStream::is_rt_suppressed` handles merge-internal suppression; the
-    /// post-merge filter catches RT-suppressed resolved entries that would
-    /// otherwise leak through.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "mirrors create_range structure for the point-read fast path; splitting would reduce clarity"
-    )]
-    #[must_use]
-    pub fn create_range_point(guard: IterState, key: &[u8], seqno: SeqNo) -> Self {
-        let key_slice = UserKey::from(key);
-
-        Self::new(guard, |lock| {
-            let user_range = (
-                Bound::Included(key_slice.clone()),
-                Bound::Included(key_slice.clone()),
-            );
-
-            // Arc bumps, not byte copies — see the bound construction note in
-            // `create_range` / `user_to_internal_bounds`.
-            let range = (
-                Bound::Included(InternalKey::new(
-                    key_slice.clone(),
-                    SeqNo::MAX,
-                    crate::ValueType::Tombstone,
-                )),
-                Bound::Included(InternalKey::new(key_slice, 0, crate::ValueType::Value)),
-            );
-
-            let mut iters: Vec<BoxedIterator<'_>> = Vec::new();
-            let mut range_tombstones: Vec<(RangeTombstone, SeqNo)> = Vec::new();
-
-            // Constant for a point key — computed once and reused for
-            // key-range overlap checks and bloom filtering across all runs.
-            let bounds = (
-                user_range.0.as_ref().map(core::convert::AsRef::as_ref),
-                user_range.1.as_ref().map(core::convert::AsRef::as_ref),
-            );
-
-            for run in lock
-                .version
-                .version
-                .iter_levels()
-                .flat_map(|lvl| lvl.iter())
-            {
-                // Collect RTs from all key-range-overlapping tables regardless
-                // of bloom — an RT in a bloom-negative table can still suppress
-                // the target key. The key-range check avoids loading RTs from
-                // tables that cannot possibly contain a covering tombstone.
-                for table in run.iter() {
-                    if !table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref()) {
-                        continue;
-                    }
-                    range_tombstones.extend(
-                        table
-                            .range_tombstones()
-                            .iter()
-                            .filter(|rt| {
-                                range_tombstone_overlaps_bounds(
-                                    rt,
-                                    &user_range,
-                                    lock.comparator.as_ref(),
-                                )
-                            })
-                            .map(|rt| (rt.clone(), seqno)),
-                    );
-                }
-
-                // Build iterators only from bloom-passing tables.
-                match run.len() {
-                    0 => {}
-                    1 => {
-                        #[expect(clippy::expect_used, reason = "we checked for length")]
-                        let table = run.first().expect("should exist");
-
-                        if table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref()) {
-                            let answer = filter_answer(lock, table);
-                            if answer != FilterAnswer::Absent {
-                                iters.push(table_reader(answer, table, user_range.clone(), seqno));
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
-                            .iter()
-                            .filter(|table| {
-                                table.check_key_range_overlap_cmp(&bounds, lock.comparator.as_ref())
-                            })
-                            .filter_map(|table| {
-                                let answer = filter_answer(lock, table);
-                                (answer != FilterAnswer::Absent).then(|| (table.clone(), answer))
-                            })
-                            .collect();
-
-                        match surviving.len() {
-                            0 => {}
-                            1 => {
-                                if let Some((table, answer)) = surviving.pop() {
-                                    iters.push(table_reader(
-                                        answer,
-                                        table,
-                                        user_range.clone(),
-                                        seqno,
-                                    ));
-                                }
-                            }
-                            _ => {
-                                let surviving =
-                                    surviving.into_iter().map(|(table, _)| table).collect();
-                                #[expect(
-                                    clippy::expect_used,
-                                    reason = "Run::new returns None only for empty vecs"
-                                )]
-                                let new_run =
-                                    Run::new(surviving).expect("non-empty surviving tables");
-                                if let Some(reader) = RunReader::new_cmp(
-                                    Arc::new(new_run),
-                                    user_range.clone(),
-                                    lock.comparator.as_ref(),
-                                ) {
-                                    iters.push(Box::new(reader.filter(move |item| match item {
-                                        Ok(item) => seqno_filter(item.key.seqno, seqno),
-                                        Err(_) => true,
-                                    })));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Sealed memtables
-            let table_source_count = iters.len();
-            for memtable in lock.version.sealed_memtables.iter() {
-                range_tombstones.extend(
-                    memtable
-                        .range_tombstones_sorted()
-                        .into_iter()
-                        .filter(|rt| {
-                            range_tombstone_overlaps_bounds(
-                                rt,
-                                &user_range,
-                                lock.comparator.as_ref(),
-                            )
-                        })
-                        .map(|rt| (rt, seqno)),
-                );
-
-                let iter = memtable.range_internal(range.clone());
-                iters.push(Box::new(
-                    iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                        .map(Ok),
-                ));
-            }
-
-            // Active memtable
-            {
-                range_tombstones.extend(
-                    lock.version
-                        .active_memtable
-                        .range_tombstones_sorted()
-                        .into_iter()
-                        .filter(|rt| {
-                            range_tombstone_overlaps_bounds(
-                                rt,
-                                &user_range,
-                                lock.comparator.as_ref(),
-                            )
-                        })
-                        .map(|rt| (rt, seqno)),
-                );
-
-                let iter = lock.version.active_memtable.range_internal(range);
-                iters.push(Box::new(
-                    iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                        .map(Ok),
-                ));
-            }
-
-            // Tie-break order: the merger resolves identical (key, seqno)
-            // entries to the LOWEST source index, so sources must run NEWEST
-            // FIRST — the point read's order (active memtable, sealed newest
-            // first, then tables). The blocks above push tables first and
-            // memtables oldest-first, so reverse the memtable segment and
-            // rotate it to the front rather than reordering the collection.
-            if let Some(memtable_segment) = iters.get_mut(table_source_count..) {
-                memtable_segment.reverse();
-            }
-            iters.rotate_left(table_source_count);
-
-            let merged = build_seeking(iters, lock.comparator.clone());
-            // Clone is cheap: point-read RT sets are typically 0-2 entries.
-            // An Arc would add indirection overhead that exceeds the clone cost.
-            let iter = MvccStream::new_with_comparator(
-                merged,
-                lock.merge_operator.clone(),
-                lock.comparator.clone(),
-            )
-            .with_value_log(lock.value_log())
-            .with_range_tombstones(range_tombstones.clone());
-
-            // Post-merge RT suppression: unlike create_range which uses
-            // RangeTombstoneFilter (requires sorted RTs + O(n log n) init),
-            // point reads just do a linear scan over the (typically tiny) RT set.
-            Box::new(iter.filter(move |x| match x {
-                Ok(value) => {
-                    if value.key.is_tombstone() {
-                        return false;
-                    }
-                    !range_tombstones.iter().any(|(rt, cutoff)| {
-                        rt.should_suppress_with(
-                            &value.key.user_key,
-                            value.key.seqno,
-                            *cutoff,
-                            lock.comparator.as_ref(),
-                        )
-                    })
-                }
-                Err(_) => true,
-            }))
-        })
-    }
-
     #[expect(
         clippy::too_many_lines,
         reason = "create_range wires up multiple iterator sources, filters, and tombstone handling; splitting further would reduce clarity"
@@ -866,7 +654,7 @@ impl TreeIter {
                     .into_iter()
                     .filter(|table| !is_covered(table))
                     .filter_map(|table| {
-                        let answer = filter_answer(lock, &table);
+                        let answer = filter_answer(lock.filter_query(), &table);
                         (answer != FilterAnswer::Absent).then_some((table, answer))
                     })
                     .collect();
@@ -1805,6 +1593,9 @@ impl<I: Iterator<Item = (Bound<UserKey>, Bound<UserKey>)>> Iterator for BatchRan
         }
     }
 }
+
+mod point_merge;
+pub(crate) use point_merge::resolve_point_merge;
 
 #[cfg(test)]
 mod tests;
