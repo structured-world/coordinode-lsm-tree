@@ -168,6 +168,9 @@ pub struct Metrics {
     /// The on-disk bytes copied instead of encoded: whole groups and pages.
     pub(crate) compaction_bytes_carried: AtomicU64,
 
+    /// The on-disk bytes of the tables compactions installed.
+    pub(crate) compaction_bytes_written: AtomicU64,
+
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
 
@@ -419,6 +422,13 @@ impl Metrics {
     /// [`Self::compaction_groups_partly_carried`].
     pub fn compaction_bytes_carried(&self) -> u64 {
         self.compaction_bytes_carried.load(Relaxed)
+    }
+
+    /// On-disk bytes of the tables compactions wrote and installed, carried
+    /// groups included: divided by the bytes the tree took in, the write
+    /// amplification compaction adds.
+    pub fn compaction_bytes_written(&self) -> u64 {
+        self.compaction_bytes_written.load(Relaxed)
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

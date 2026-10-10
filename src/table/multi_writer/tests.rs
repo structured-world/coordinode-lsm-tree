@@ -1796,6 +1796,443 @@ fn a_flush_output_counts_its_tombstones_toward_a_full_table() -> crate::Result<(
     Ok(())
 }
 
+/// Key `i` of the alignment fixtures, ordered as its index.
+fn seq_key(i: u32) -> Vec<u8> {
+    format!("{i:06}").into_bytes()
+}
+
+/// The index a key of the alignment fixtures was made from.
+fn key_index(key: &[u8]) -> u32 {
+    std::str::from_utf8(key).unwrap().parse().unwrap()
+}
+
+/// The boundaries at the largest keys `marks` of the tables below.
+fn marks_at(marks: &[u32], after_bytes: u64) -> std::sync::Arc<[super::Boundary]> {
+    marks
+        .iter()
+        .map(|&i| super::Boundary {
+            key: crate::UserKey::from(seq_key(i)),
+            after_bytes,
+        })
+        .collect()
+}
+
+/// Writes keys `keys`, one 1000-byte value each, through a writer of
+/// `target`, aligned to `marks` when given, and returns each output's first
+/// and last key index and its size on disk.
+fn aligned_outputs(
+    keys: core::ops::Range<u32>,
+    target: u64,
+    marks: Option<&[u32]>,
+) -> crate::Result<Vec<(u32, u32, u64)>> {
+    bounded_outputs(keys, target, marks, None)
+}
+
+/// Like [`aligned_outputs`], the writer told that key `upper` is the last it
+/// can be handed, as a writer of one key range of a compaction is.
+fn bounded_outputs(
+    keys: core::ops::Range<u32>,
+    target: u64,
+    marks: Option<&[u32]>,
+    upper: Option<u32>,
+) -> crate::Result<Vec<(u32, u32, u64)>> {
+    use crate::{InternalValue, UserKey, fs::StdFs, version::run::Ranged};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        target,
+        1,
+        fs,
+    )?;
+    if let Some(marks) = marks {
+        mw = mw.use_cut_alignment(marks_at(marks, target), None);
+    }
+    if let Some(upper) = upper {
+        mw.limit_cut_alignment(UserKey::from(seq_key(upper)));
+    }
+    for i in keys {
+        mw.write(InternalValue::from_components(
+            UserKey::from(seq_key(i)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let results = mw.finish()?;
+    Ok(recover_outputs(&base_path, &results)?
+        .iter()
+        .map(|table| {
+            (
+                key_index(table.key_range().min()),
+                key_index(table.key_range().max()),
+                table.file_size(),
+            )
+        })
+        .collect())
+}
+
+/// Over a densely divided level below, every output but the last ends on a
+/// boundary and lands within half the target and twice it. The first output
+/// ends at the first boundary past half the target, not near ninety percent:
+/// the floor rises with the boundaries the output crossed, not with the
+/// boundaries still ahead in the stream.
+///
+/// The writer judges an output by an estimate that bounds what `finish`
+/// appends from above, so a file lands a little below the share it was cut
+/// at: the target is large enough for that margin to stay a few percent.
+#[test]
+fn aligned_outputs_end_on_boundaries_within_the_size_band() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    const GAP: u32 = 70;
+    let marks: Vec<u32> = (0..10_000).step_by(GAP as usize).collect();
+    let outputs = aligned_outputs(0..10_000, TARGET, Some(&marks))?;
+    assert!(outputs.len() > 10, "{} outputs", outputs.len());
+
+    let (_, rest) = outputs.split_last().unwrap();
+    for &(first, last, size) in rest {
+        assert!(
+            marks.contains(&last),
+            "output {first}..={last} ends off a boundary"
+        );
+        assert!(
+            size >= TARGET * 45 / 100,
+            "output {first}..={last}: {size} bytes"
+        );
+        assert!(
+            size <= 2 * TARGET + 16_384,
+            "output {first}..={last}: {size} bytes"
+        );
+    }
+    let (_, _, first_size) = outputs[0];
+    assert!(
+        first_size <= TARGET / 2 + u64::from(GAP) * 1_000 + 16_384,
+        "the first output waited past the first boundary beyond half the target: {first_size} bytes"
+    );
+    Ok(())
+}
+
+/// Over a sparsely divided level below, outputs still land within half the
+/// target and twice it: one that meets no boundary past half the target grows
+/// toward the next, and ends at twice the target if none comes.
+#[test]
+fn sparse_boundaries_keep_outputs_in_the_size_band() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks: Vec<u32> = (0..10_000).step_by(1_100).collect();
+    let outputs = aligned_outputs(0..10_000, TARGET, Some(&marks))?;
+    let (_, rest) = outputs.split_last().unwrap();
+    for &(first, last, size) in rest {
+        assert!(
+            size >= TARGET * 45 / 100,
+            "output {first}..={last}: {size} bytes"
+        );
+        assert!(
+            size <= 2 * TARGET + 16_384,
+            "output {first}..={last}: {size} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// A stream ending shortly after a cut leaves a short last output: nothing is
+/// left to grow it, which is the one place an output is below half the target.
+#[test]
+fn a_stream_ending_after_a_cut_leaves_a_short_last_output() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks: Vec<u32> = (0..10_000).step_by(70).collect();
+    let (_, first_last, _) = aligned_outputs(0..10_000, TARGET, Some(&marks))?[0];
+    let outputs = aligned_outputs(0..first_last + 21, TARGET, Some(&marks))?;
+    assert_eq!(outputs.len(), 2, "{outputs:?}");
+    let (_, _, last_size) = outputs[1];
+    assert!(last_size < TARGET / 2, "the last output: {last_size} bytes");
+    Ok(())
+}
+
+/// A writer told the last key of its range ends its outputs at the target past
+/// its last boundary there, where a writer of the whole stream, seeing a
+/// boundary further on, grows its output toward it.
+#[test]
+fn a_writer_bounded_by_its_range_does_not_wait_for_a_boundary_past_it() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks = [100, 5_000];
+    let bounded = bounded_outputs(0..2_000, TARGET, Some(&marks), Some(1_999))?;
+    let (_, rest) = bounded.split_last().unwrap();
+    for &(first, last, size) in rest.iter().filter(|(first, _, _)| *first > 100) {
+        assert!(
+            size <= TARGET + 16_384,
+            "output {first}..={last} of a bounded writer: {size} bytes"
+        );
+    }
+    let whole = aligned_outputs(0..2_000, TARGET, Some(&marks))?;
+    assert!(
+        whole
+            .iter()
+            .any(|&(first, _, size)| first > 100 && size > TARGET * 3 / 2),
+        "the whole stream waits for the boundary at 5000: {whole:?}"
+    );
+    Ok(())
+}
+
+/// With no boundary below, an aligned writer cuts where a writer without
+/// alignment does: an empty level below writes today's outputs.
+#[test]
+fn no_boundaries_cut_at_the_target_as_without_alignment() -> crate::Result<()> {
+    let plain = aligned_outputs(0..600, 40_000, None)?;
+    let empty = aligned_outputs(0..600, 40_000, Some(&[]))?;
+    assert_eq!(plain, empty);
+    Ok(())
+}
+
+/// Past the last boundary no boundary is ahead: outputs there end at the
+/// target, not at twice it.
+#[test]
+fn past_the_last_boundary_outputs_end_at_the_target() -> crate::Result<()> {
+    const TARGET: u64 = 40_000;
+    let outputs = aligned_outputs(0..1_000, TARGET, Some(&[100]))?;
+    let (_, rest) = outputs.split_last().unwrap();
+    for &(first, last, size) in rest.iter().filter(|(first, _, _)| *first > 100) {
+        assert!(
+            size <= TARGET + 8_192,
+            "output {first}..={last} past the last boundary: {size} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// A writer whose first key lies past many boundaries counts none of them: it
+/// cuts as a writer handed only the boundaries from its first key on, as a
+/// sub-compaction over the upper half does against the whole list.
+#[test]
+fn boundaries_before_the_first_key_are_not_counted_by_the_writer() -> crate::Result<()> {
+    let all: Vec<u32> = (0..1_000).step_by(7).collect();
+    let ahead: Vec<u32> = all.iter().copied().filter(|&m| m >= 500).collect();
+    assert_eq!(
+        aligned_outputs(500..1_000, 40_000, Some(&all))?,
+        aligned_outputs(500..1_000, 40_000, Some(&ahead))?,
+    );
+    Ok(())
+}
+
+/// A key whose versions pass twice the target stays in one output: the key
+/// is never split, whatever the size bounds.
+#[test]
+fn a_key_past_twice_the_target_is_not_split() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, version::run::Ranged};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 40_000;
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let marks: Vec<u32> = (0..100).collect();
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_cut_alignment(marks_at(&marks, TARGET), None);
+    for i in 0..10 {
+        let versions = if i == 5 { 200 } else { 1 };
+        for seqno in (1..=versions).rev() {
+            mw.write(InternalValue::from_components(
+                UserKey::from(seq_key(i)),
+                vec![b'v'; 1_000],
+                seqno,
+                crate::ValueType::Value,
+            ))?;
+        }
+    }
+    let results = mw.finish()?;
+    let tables = recover_outputs(&base_path, &results)?;
+    let holding: Vec<_> = tables
+        .iter()
+        .filter(|table| {
+            let range = table.key_range();
+            key_index(range.min()) <= 5 && 5 <= key_index(range.max())
+        })
+        .collect();
+    assert_eq!(holding.len(), 1, "the key's versions are in one output");
+    assert!(holding[0].file_size() > 2 * TARGET);
+    Ok(())
+}
+
+/// A reversed comparator over the mirrored keys and boundaries cuts the same
+/// outputs as the byte comparator: the stream and the boundaries are walked
+/// in the comparator's order, never in byte order.
+#[test]
+fn a_reversed_comparator_aligns_as_the_byte_comparator() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+        fn is_lexicographic(&self) -> bool {
+            false
+        }
+    }
+
+    const TARGET: u64 = 40_000;
+    let marks: Vec<u32> = (0..999).step_by(7).collect();
+    let forward: Vec<u64> = aligned_outputs(0..999, TARGET, Some(&marks))?
+        .iter()
+        .map(|&(first, last, _)| u64::from(last - first + 1))
+        .collect();
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    // Stream position `t` holds key `998 - t`; a boundary after position `m`
+    // is the key at that position.
+    let mirrored: Vec<u32> = marks.iter().map(|&m| 998 - m).collect();
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .set_comparator(Arc::new(ReverseComparator))
+    .use_cut_alignment(marks_at(&mirrored, TARGET), None);
+    for t in 0..999 {
+        mw.write(InternalValue::from_components(
+            UserKey::from(seq_key(998 - t)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let results = mw.finish()?;
+    let reversed: Vec<u64> = recover_outputs(&base_path, &results)?
+        .iter()
+        .map(|table| table.metadata.item_count)
+        .collect();
+    assert_eq!(forward, reversed);
+    Ok(())
+}
+
+/// A group to copy whole that holds a boundary between its keys, with the
+/// output already past the share it would be cut at there, is written key by
+/// key when its bytes cost less than the table the output would otherwise
+/// straddle, and copied when they cost more. An output not yet at that share,
+/// or a group holding no boundary, is copied.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 40_000;
+    let writer = |keys: u32| -> crate::Result<(tempfile::TempDir, super::MultiWriter)> {
+        let folder = tempfile::tempdir()?;
+        let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+        let mut mw = super::MultiWriter::new(
+            folder.path().to_path_buf(),
+            SequenceNumberCounter::default(),
+            TARGET,
+            1,
+            fs,
+        )?
+        .use_cut_alignment(marks_at(&[50], TARGET), None);
+        for i in 0..keys {
+            mw.write(InternalValue::from_components(
+                UserKey::from(seq_key(i)),
+                vec![b'v'; 1_000],
+                1,
+                crate::ValueType::Value,
+            ))?;
+        }
+        Ok((folder, mw))
+    };
+    let row = |i: u32| {
+        InternalValue::from_components(
+            UserKey::from(seq_key(i)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        )
+    };
+
+    // Past half the target, a group from key 31 to 60 holds the boundary at 50.
+    let (_folder, mw) = writer(31)?;
+    let load = mw.output_load();
+    let (cut, crossing) = mw.decide_cut(&seq_key(31));
+    assert!(!cut, "no boundary is crossed at the group's first key");
+    assert!(mw.splits_cheaper_than_straddling(load, crossing, &row(60), 1_000));
+    assert!(!mw.splits_cheaper_than_straddling(load, crossing, &row(60), 1_000_000));
+    assert!(
+        !mw.splits_cheaper_than_straddling(load, crossing, &row(50), 1_000),
+        "a group ending on the boundary does not straddle it"
+    );
+
+    // Below half the target the output would not end there anyway.
+    let (_folder, small) = writer(5)?;
+    let (_, crossing) = small.decide_cut(&seq_key(5));
+    assert!(!small.splits_cheaper_than_straddling(small.output_load(), crossing, &row(60), 1_000));
+    Ok(())
+}
+
+/// A group whose copy would take an aligned output past twice the target is
+/// written key by key, so the output ends at the ceiling as written rows would
+/// make it, whether or not the group holds a boundary; a smaller group is
+/// copied. Opening a fresh output, only a group past the ceiling on its own is
+/// written so.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_whose_copy_would_pass_twice_the_target_is_written_by_rows() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 40_000;
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_cut_alignment(marks_at(&[50], TARGET), None);
+    let row = |i: u32| {
+        InternalValue::from_components(
+            UserKey::from(seq_key(i)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        )
+    };
+    for i in 0..31 {
+        mw.write(row(i))?;
+    }
+
+    // Keys 31 to 40 hold no boundary; the output holds about 31 KB.
+    let load = mw.output_load();
+    let (cut, crossing) = mw.decide_cut(&seq_key(31));
+    assert!(!cut);
+    assert!(
+        mw.writes_group_by_rows(load, false, crossing, &row(40), 60_000),
+        "a 60 KB copy would take a 31 KB output past 80 KB"
+    );
+    assert!(!mw.writes_group_by_rows(load, false, crossing, &row(40), 1_000));
+    // Into a fresh output, only a group past the ceiling alone.
+    assert!(mw.writes_group_by_rows(load, true, crossing, &row(40), 100_000));
+    assert!(!mw.writes_group_by_rows(load, true, crossing, &row(40), 60_000));
+    Ok(())
+}
+
 /// A flush cut at a small configured target writes tables whose key ranges
 /// follow each other without overlapping and together span exactly the keys
 /// flushed: the cut lands between keys, never inside one table's range.

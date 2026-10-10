@@ -177,6 +177,94 @@ pub(super) fn plan_filters(
     )
 }
 
+/// The boundaries between the tables of the level `payload`'s outputs are
+/// merged into next, in key order, across all its runs: none when output
+/// alignment is off or no level below the destination holds tables. That level
+/// is the first one below holding tables, not the adjacent one: outputs move
+/// down through empty levels untouched and are next merged where tables are,
+/// as an intra-L0 merge's outputs are merged into the base level. A boundary lies
+/// after a table that the next one, in key order, starts above; tables that
+/// overlap, in a level holding several runs, have none between them, since an
+/// output reaching either reaches both.
+fn next_level_boundaries(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
+    use crate::version::run::Ranged;
+
+    if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
+        return alloc::sync::Arc::from([]);
+    }
+    let Some(level) = (usize::from(payload.dest_level) + 1..)
+        .map_while(|index| version.level(index))
+        .find(|level| !level.is_empty())
+    else {
+        return alloc::sync::Arc::from([]);
+    };
+    let comparator = opts.config.comparator.as_ref();
+    // A level holds at least one table here, found non-empty above.
+    let capacity = level.table_count() - 1;
+    // One run is already in key order with disjoint tables and is walked in
+    // place; only several runs are merged into one order first.
+    let boundaries = match level.first_run() {
+        Some(run) if level.run_count() == 1 => boundaries_between(run.iter(), capacity, comparator),
+        _ => {
+            let mut tables: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+            tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            boundaries_between(tables.into_iter(), capacity, comparator)
+        }
+    };
+    boundaries.into()
+}
+
+/// The boundaries between `tables`, given in order of their min key.
+pub(super) fn boundaries_between<'a>(
+    tables: impl Iterator<Item = &'a Table>,
+    capacity: usize,
+    comparator: &dyn crate::comparator::UserComparator,
+) -> Vec<crate::table::multi_writer::Boundary> {
+    use crate::version::run::Ranged;
+    use core::cmp::Ordering;
+
+    let mut boundaries = Vec::with_capacity(capacity);
+    // The largest key reached so far: a table starting above it starts past
+    // every table before it, whichever run they are in.
+    let mut reached: Option<&crate::UserKey> = None;
+    let mut tables = tables.peekable();
+    while let (Some(before), Some(&after)) = (tables.next(), tables.peek()) {
+        let max = before.key_range().max();
+        let reach = match reached {
+            Some(far) if comparator.compare(far, max) == Ordering::Greater => far,
+            _ => max,
+        };
+        reached = Some(reach);
+        if comparator.compare(reach, after.key_range().min()) == Ordering::Less {
+            boundaries.push(crate::table::multi_writer::Boundary {
+                key: reach.clone(),
+                after_bytes: after.file_size(),
+            });
+        }
+    }
+    boundaries
+}
+
+/// The largest key among `payload`'s inputs: no key the compaction writes
+/// sorts past it.
+fn inputs_upper(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> Option<crate::UserKey> {
+    let comparator = opts.config.comparator.as_ref();
+    version
+        .iter_tables()
+        .filter(|table| payload.table_ids.contains(&table.id()))
+        .map(|table| table.metadata.key_range.max())
+        .max_by(|a, b| comparator.compare(a, b))
+        .cloned()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a per-compaction choice its writers share (the filter \
@@ -276,6 +364,12 @@ pub(super) fn prepare_table_writer(
         opts.config.comparator.clone(),
     );
 
+    let boundaries = next_level_boundaries(version, opts, payload);
+    log::debug!(
+        "Outputs into L{} cut on {} boundaries of the level below",
+        payload.dest_level,
+        boundaries.len(),
+    );
     let mut table_writer = MultiWriter::new(
         table_base_folder,
         opts.table_id_generator.clone(),
@@ -295,7 +389,8 @@ pub(super) fn prepare_table_writer(
     .use_lineage(Some(payload.table_ids.iter().copied().collect()))
     .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
-    .use_clip_range_tombstones();
+    .use_clip_range_tombstones()
+    .use_cut_alignment(boundaries, inputs_upper(version, opts, payload));
 
     if let Some(marker) = transform_marker {
         table_writer = table_writer.use_transform_marker(marker);
@@ -602,16 +697,20 @@ pub(super) trait CompactionFlavour {
 }
 
 /// Charges the counters an installed output moves: the blob bytes its
-/// relocation copied, and the groups, partly copied groups and bytes it
-/// copied instead of encoding. Every path that installs an output calls it
-/// once the version edit is published.
+/// relocation copied, the groups, partly copied groups and bytes it copied
+/// instead of encoding, and the bytes of the tables it wrote. Every path that
+/// installs an output calls it once the version edit is published.
 #[cfg(feature = "metrics")]
 pub(super) fn charge_installed(
     metrics: &crate::metrics::Metrics,
     relocated_bytes: u64,
     carried: (u64, u64, u64),
+    written_bytes: u64,
 ) {
     use core::sync::atomic::Ordering::Relaxed;
+    metrics
+        .compaction_bytes_written
+        .fetch_add(written_bytes, Relaxed);
     metrics
         .blob_bytes_relocated
         .fetch_add(relocated_bytes, Relaxed);
@@ -679,6 +778,7 @@ pub(super) fn install_merge(
     );
 
     let tables_out = created_tables.len();
+    let written_bytes: u64 = created_tables.iter().map(Table::file_size).sum();
 
     // Install the tree-wide sinks on every output BEFORE the version edit makes
     // it visible. A flush registers these via `register_tables`; a compaction
@@ -831,9 +931,9 @@ pub(super) fn install_merge(
             .record(published, released_objects, []);
     }
     #[cfg(feature = "metrics")]
-    charge_installed(&opts.metrics, relocated_bytes, carried);
+    charge_installed(&opts.metrics, relocated_bytes, carried, written_bytes);
     #[cfg(not(feature = "metrics"))]
-    let _ = (relocated_bytes, carried);
+    let _ = (relocated_bytes, carried, written_bytes);
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
