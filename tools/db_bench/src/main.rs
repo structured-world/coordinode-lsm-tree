@@ -465,7 +465,33 @@ fn database_dir(
         )
         .into());
     }
-    let sub = bench_root.join(benchmark).join(format!("iter-{iter}"));
+    // The workload directory is a parent of the one removed as well: the same
+    // two checks apply to it.
+    let workload_root = bench_root.join(benchmark);
+    if let Ok(md) = std::fs::symlink_metadata(&workload_root)
+        && md.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to clean iteration data: {} is a symlink. \
+             Remove or replace it with a real directory before re-running.",
+            workload_root.display()
+        )
+        .into());
+    }
+    std::fs::create_dir_all(&workload_root)?;
+    let workload_canon = workload_root.canonicalize()?;
+    if !workload_canon.starts_with(&db_canon) {
+        return Err(format!(
+            "refusing to clean iteration data: {} canonicalises to {}, \
+             which is outside the --db path {} (resolved {}).",
+            workload_root.display(),
+            workload_canon.display(),
+            db.display(),
+            db_canon.display(),
+        )
+        .into());
+    }
+    let sub = workload_root.join(format!("iter-{iter}"));
     // Clean previous run data so each run starts fresh.
     if let Err(e) = std::fs::remove_dir_all(&sub)
         && e.kind() != std::io::ErrorKind::NotFound

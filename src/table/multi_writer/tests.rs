@@ -2187,6 +2187,72 @@ fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> 
     Ok(())
 }
 
+/// A copied group crossing a boundary does not count it toward the output's
+/// floor when the output held less than half the target before the group:
+/// written key by key, the output reaches the boundary below half and does not
+/// count it either, though the copy takes it past half.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_copied_group_counts_no_boundary_it_crosses_below_half() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 40_000;
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_cut_alignment(marks_at(&[50, 100], TARGET), None);
+    let row = |i: u32| {
+        InternalValue::from_components(
+            UserKey::from(seq_key(i)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        )
+    };
+    // About 10 KB written, a quarter of the target.
+    for i in 0..10 {
+        mw.write(row(i))?;
+    }
+    // Keys 45 to 74 hold the boundary at 50 and take the output past half.
+    let group: Vec<InternalValue> = (45..75).map(row).collect();
+    let compression = mw.data_block_compression;
+    let copied = mw.carry_into(
+        (compression, crate::table::meta::ValueLayout::Whole),
+        (&group, 30_000),
+        |writer, _| {
+            for item in &group {
+                writer.write(item.clone())?;
+            }
+            Ok(true)
+        },
+    )?;
+    assert!(copied, "the group is copied");
+    assert!(
+        mw.output_load()
+            .is_some_and(|load| load.reaches(TARGET / 2)),
+        "the copy takes the output past half the target"
+    );
+
+    let Some(alignment) = &mw.alignment else {
+        panic!("the writer is aligned");
+    };
+    let next = alignment.crossing(&seq_key(101), mw.comparator.as_ref());
+    assert_eq!(next.passed, 1, "the boundary at 50 is behind");
+    assert_eq!(
+        alignment.floor_percent(next),
+        50,
+        "the boundary the copy crossed below half does not raise the floor"
+    );
+    Ok(())
+}
+
 /// A group whose copy would take an aligned output past twice the target is
 /// written key by key, so the output ends at the ceiling as written rows would
 /// make it, whether or not the group holds a boundary; a smaller group is

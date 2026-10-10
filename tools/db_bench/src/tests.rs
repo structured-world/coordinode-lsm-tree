@@ -28,6 +28,25 @@ fn several_workloads_under_one_db_get_fresh_directories() -> TestResult {
     Ok(())
 }
 
+/// A workload directory that is a symlink out of `--db` is refused before
+/// anything is removed: the iteration directory cleaned under it would lie
+/// outside the database path.
+#[cfg(unix)]
+#[test]
+fn a_workload_directory_linked_out_of_the_db_is_refused() -> TestResult {
+    let db = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let precious = outside.path().join("iter-0");
+    std::fs::create_dir_all(&precious)?;
+    std::fs::write(precious.join("data"), b"keep")?;
+    std::fs::create_dir_all(db.path().join(".db_bench"))?;
+    std::os::unix::fs::symlink(outside.path(), db.path().join(".db_bench").join("fillseq"))?;
+
+    assert!(database_dir(db.path(), "fillseq", 0, 1, 2).is_err());
+    assert_eq!(std::fs::read(precious.join("data"))?, b"keep");
+    Ok(())
+}
+
 /// Several workloads are named in one run, comma-separated, so a `counters`
 /// build writes all of their costs and timings into one set of files; an
 /// unknown name anywhere in the list refuses the run by that name.

@@ -1835,10 +1835,13 @@ impl MultiWriter {
                 self.comparator.as_ref(),
             );
         }
+        // A boundary counts once the output holds half the target when a key
+        // crosses it. Where among the group's keys the copy took the output
+        // past half is unknown, so its boundaries count only when the output
+        // held half before it: never overstating the floor rows would reach.
         let past_half = self.alignment.is_some()
-            && self
-                .output_load()
-                .is_some_and(|load| load.reaches(cut_alignment::share_of(self.target_size, 50)));
+            && !(layout_changes || cut)
+            && load.is_some_and(|load| load.reaches(cut_alignment::share_of(self.target_size, 50)));
         if let Some(alignment) = &mut self.alignment {
             alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
         }
