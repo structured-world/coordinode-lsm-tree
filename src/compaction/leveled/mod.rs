@@ -12,12 +12,15 @@
 )]
 mod test;
 
+#[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+mod picker_tests;
+
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
     HashSet, TableId,
     compaction::state::{CompactionState, hidden_set::HiddenSet},
     config::Config,
-    slice_windows::{GrowingWindowsExt, ShrinkingWindowsExt},
     table::{Table, util::aggregate_run_key_range},
     version::{Level, Version, run::Ranged},
 };
@@ -133,29 +136,8 @@ fn pick_minimal_compaction(
     promotion_slack: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
-    // NOTE: Find largest trivial move (if it exists)
-    // Check all runs in curr_level for a window that doesn't overlap ANY run
-    // in next_level.
-    for curr_run in curr_level.iter() {
-        if let Some(window) = curr_run.shrinking_windows().find(|window| {
-            if hidden_set.is_blocked(window.iter().map(Table::id)) {
-                return false;
-            }
-
-            if next_level.is_empty() {
-                return true;
-            }
-
-            let key_range = aggregate_run_key_range(window);
-
-            // Must not overlap ANY run in the next level
-            next_level
-                .iter()
-                .all(|run| run.get_overlapping_cmp(&key_range, cmp).is_empty())
-        }) {
-            let ids = window.iter().map(Table::id).collect();
-            return Some((ids, true));
-        }
+    if let Some(ids) = largest_trivial_move(curr_level, next_level, hidden_set, cmp) {
+        return Some((ids, true));
     }
 
     // NOTE: Look for merges
@@ -165,60 +147,238 @@ fn pick_minimal_compaction(
         return None;
     }
 
-    // The tables of `curr_level` a merge of `window` promotes, from all its runs.
-    let pull_in = |window: &[Table]| {
-        let key_range = aggregate_run_key_range(window);
-        curr_level
-            .iter()
-            .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
-            .collect::<Vec<&Table>>()
-    };
-
-    // Candidates are ranked as they are enumerated, holding only a window and
-    // its cost for the leaders; the winner's pull-in is rebuilt at the end.
+    // Candidates are ranked as they are enumerated, holding only a window's
+    // place and its cost for the leaders; the winner's tables are collected at
+    // the end.
     let mut ranking = MergeRanking::new(overshoot, promotion_slack);
-    let windows = next_level.iter().flat_map(|run| {
-        // Cap per-run windows at 50x table_base_size. take_while is safe
-        // here because growing_windows within a single run are monotonically
-        // increasing in size — once one exceeds the cap, all subsequent will too.
-        run.growing_windows().take_while(|window| {
-            let size = window.iter().map(Table::file_size).sum::<u64>();
-            size <= (50 * table_base_size)
-        })
-    });
-    for window in windows {
-        if hidden_set.is_blocked(window.iter().map(Table::id)) {
-            continue;
-        }
-        let curr_level_pull_in = pull_in(window);
-        let curr_level_size = curr_level_pull_in
+    let cap = 50 * table_base_size;
+    for (run_index, run) in next_level.iter().enumerate() {
+        let window_bytes = prefix_sums(run.iter().map(Table::file_size));
+        let window_hidden =
+            prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
+        let pull_ins: Vec<PullIn> = curr_level
             .iter()
-            .map(|t| Table::file_size(t))
-            .sum::<u64>();
-        if curr_level_size == 0
-            || hidden_set.is_blocked(curr_level_pull_in.iter().map(|t| Table::id(t)))
-        {
-            continue;
+            .map(|curr_run| PullIn::new(curr_run, run, hidden_set, cmp))
+            .collect();
+        // Windows by width, then by start, the order that decides ties; the
+        // first window past the cap ends the run's candidates, whatever the
+        // width of those after it.
+        'run: for width in 1..=run.len() {
+            for start in 0..=(run.len() - width) {
+                let end = start + width;
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "start < end <= run.len(), and the sums hold run.len() + 1 entries"
+                )]
+                let (next_level_size, next_hidden) = (
+                    window_bytes[end] - window_bytes[start],
+                    window_hidden[end] - window_hidden[start],
+                );
+                if next_level_size > cap {
+                    break 'run;
+                }
+                if next_hidden > 0 {
+                    continue;
+                }
+                let mut promoted = 0;
+                let mut blocked = false;
+                for pull_in in &pull_ins {
+                    let (bytes, hidden) = pull_in.contained(start, end - 1);
+                    promoted += bytes;
+                    blocked |= hidden > 0;
+                }
+                if promoted == 0 || blocked {
+                    continue;
+                }
+                ranking.offer(
+                    MergeCost {
+                        promoted,
+                        total: promoted + next_level_size,
+                    },
+                    (run_index, start, end),
+                );
+            }
         }
-        let next_level_size = window.iter().map(Table::file_size).sum::<u64>();
-        ranking.offer(
-            MergeCost {
-                promoted: curr_level_size,
-                total: curr_level_size + next_level_size,
-            },
-            window,
-        );
     }
 
     let offered = ranking.offered();
-    let ((chosen, cost, window), runner_up) = ranking.finish()?;
+    let ((chosen, cost, (run_index, start, end)), runner_up) = ranking.finish()?;
     log::debug!(
         "leveled: merge candidate {chosen} of {offered} chosen at {cost:?}, runner-up \
          {runner_up:?} (overshoot {overshoot}, slack {promotion_slack})",
     );
+    #[expect(
+        clippy::expect_used,
+        reason = "the ranking holds a window it was offered from these runs"
+    )]
+    let window = next_level
+        .iter()
+        .nth(run_index)
+        .and_then(|run| run.get(start..end))
+        .expect("the chosen window lies in its run");
+    let key_range = aggregate_run_key_range(window);
     let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    ids.extend(pull_in(window).iter().map(|t| Table::id(t)));
+    ids.extend(
+        curr_level
+            .iter()
+            .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
+            .map(Table::id),
+    );
     Some((ids, false))
+}
+
+/// The longest window of one run of `curr_level` that overlaps no table of
+/// `next_level` and holds no hidden table, the leftmost of that length and from
+/// the first run that has one: a move that rewrites nothing.
+///
+/// A window's key range is its tables' ranges and the gaps between them, so it
+/// overlaps the level below exactly when one of its tables does or one of its
+/// gaps does. The windows that qualify are therefore the stretches of
+/// neighbouring tables that each qualify with clear gaps between them, and
+/// the longest such stretch is found in one pass.
+fn largest_trivial_move(
+    curr_level: &Level,
+    next_level: &Level,
+    hidden_set: &HiddenSet,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Option<HashSet<TableId>> {
+    use core::ops::Bound;
+
+    let clear = |bounds: (Bound<&crate::Slice>, Bound<&crate::Slice>)| {
+        next_level.iter().all(|run| {
+            run.range_overlap_indexes_cmp::<crate::Slice, _, _>(&bounds, cmp)
+                .is_none()
+        })
+    };
+    for curr_run in curr_level.iter() {
+        // The longest stretch so far, as (start, length), and the current one.
+        let mut best: Option<(usize, usize)> = None;
+        let (mut stretch_start, mut stretch_len) = (0, 0);
+        let mut previous: Option<&Table> = None;
+        for (index, table) in curr_run.iter().enumerate() {
+            let range = table.key_range();
+            let movable = !hidden_set.is_hidden(table.id())
+                && clear((Bound::Included(range.min()), Bound::Included(range.max())));
+            if !movable {
+                stretch_len = 0;
+                previous = None;
+                continue;
+            }
+            let joins = previous.is_some_and(|previous| {
+                clear((
+                    Bound::Excluded(previous.key_range().max()),
+                    Bound::Excluded(range.min()),
+                ))
+            });
+            if joins {
+                stretch_len += 1;
+            } else {
+                (stretch_start, stretch_len) = (index, 1);
+            }
+            previous = Some(table);
+            if best.is_none_or(|(_, len)| stretch_len > len) {
+                best = Some((stretch_start, stretch_len));
+            }
+        }
+        if let Some((start, len)) = best {
+            return curr_run
+                .get(start..start + len)
+                .map(|window| window.iter().map(Table::id).collect());
+        }
+    }
+    None
+}
+
+/// Prefix sums: entry `i` is the sum of the first `i` items.
+fn prefix_sums(items: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut sums = Vec::with_capacity(items.size_hint().0 + 1);
+    sums.push(0);
+    let mut total = 0;
+    for item in items {
+        // Byte sizes or counts of one run's tables, bounded by the disk.
+        total += item;
+        sums.push(total);
+    }
+    sums
+}
+
+/// The tables of one run of the level a merge promotes from that each window
+/// of one run of the level below would pull in, priced in constant time.
+///
+/// A window pulls in the tables its key range contains. In a run, sorted by
+/// key with disjoint ranges, those are the tables starting at or after the
+/// window's min key and ending at or before its max key: a contiguous stretch
+/// whose ends move only forward as the window's ends do.
+struct PullIn {
+    /// For each table of the window run, the first table of this run starting
+    /// at or after its min key.
+    first_from: Vec<usize>,
+    /// For each table of the window run, the number of tables of this run
+    /// ending at or before its max key.
+    end_through: Vec<usize>,
+    /// Prefix sums of this run's table sizes and of its hidden tables.
+    bytes: Vec<u64>,
+    hidden: Vec<u64>,
+}
+
+impl PullIn {
+    fn new(
+        run: &[Table],
+        window_run: &[Table],
+        hidden_set: &HiddenSet,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) -> Self {
+        use core::cmp::Ordering;
+
+        let mut first_from = Vec::with_capacity(window_run.len());
+        let mut at = 0;
+        for table in window_run {
+            let min = table.key_range().min();
+            while run
+                .get(at)
+                .is_some_and(|t| cmp.compare(t.key_range().min(), min) == Ordering::Less)
+            {
+                at += 1;
+            }
+            first_from.push(at);
+        }
+        let mut end_through = Vec::with_capacity(window_run.len());
+        at = 0;
+        for table in window_run {
+            let max = table.key_range().max();
+            while run
+                .get(at)
+                .is_some_and(|t| cmp.compare(t.key_range().max(), max) != Ordering::Greater)
+            {
+                at += 1;
+            }
+            end_through.push(at);
+        }
+        Self {
+            first_from,
+            end_through,
+            bytes: prefix_sums(run.iter().map(Table::file_size)),
+            hidden: prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id())))),
+        }
+    }
+
+    /// The bytes and the hidden tables of what the window from the window
+    /// run's table `first` to its table `last` pulls in.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "first and last index the window run, and the stretch ends lie in 0..=run.len()"
+    )]
+    fn contained(&self, first: usize, last: usize) -> (u64, u64) {
+        let (from, through) = (self.first_from[first], self.end_through[last]);
+        if from < through {
+            (
+                self.bytes[through] - self.bytes[from],
+                self.hidden[through] - self.hidden[from],
+            )
+        } else {
+            (0, 0)
+        }
+    }
 }
 
 #[doc(hidden)]
