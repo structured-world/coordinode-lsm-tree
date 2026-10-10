@@ -104,6 +104,7 @@ fn no_boundary_is_ahead_past_the_last_or_the_writer_s_range() {
 
 /// The boundary inside a run of keys is the first past those its first key
 /// crosses, and lies below its last key.
+#[cfg(feature = "columnar")]
 #[test]
 fn inside_finds_the_boundary_between_a_run_of_keys() {
     let cmp = default_comparator();

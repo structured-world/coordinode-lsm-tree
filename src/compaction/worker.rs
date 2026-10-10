@@ -1980,7 +1980,12 @@ fn run_tight_space_compaction(
             // must not remove them.
             opts.outputs.installed();
             #[cfg(feature = "metrics")]
-            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
+            super::flavour::charge_installed(
+                &opts.metrics,
+                relocated_bytes,
+                carried,
+                outputs.iter().map(Table::file_size).sum(),
+            );
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the

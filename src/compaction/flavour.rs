@@ -656,16 +656,20 @@ pub(super) trait CompactionFlavour {
 }
 
 /// Charges the counters an installed output moves: the blob bytes its
-/// relocation copied, and the groups, partly copied groups and bytes it
-/// copied instead of encoding. Every path that installs an output calls it
-/// once the version edit is published.
+/// relocation copied, the groups, partly copied groups and bytes it copied
+/// instead of encoding, and the bytes of the tables it wrote. Every path that
+/// installs an output calls it once the version edit is published.
 #[cfg(feature = "metrics")]
 pub(super) fn charge_installed(
     metrics: &crate::metrics::Metrics,
     relocated_bytes: u64,
     carried: (u64, u64, u64),
+    written_bytes: u64,
 ) {
     use core::sync::atomic::Ordering::Relaxed;
+    metrics
+        .compaction_bytes_written
+        .fetch_add(written_bytes, Relaxed);
     metrics
         .blob_bytes_relocated
         .fetch_add(relocated_bytes, Relaxed);
@@ -733,6 +737,7 @@ pub(super) fn install_merge(
     );
 
     let tables_out = created_tables.len();
+    let written_bytes: u64 = created_tables.iter().map(Table::file_size).sum();
 
     // Install the tree-wide sinks on every output BEFORE the version edit makes
     // it visible. A flush registers these via `register_tables`; a compaction
@@ -885,9 +890,9 @@ pub(super) fn install_merge(
             .record(published, released_objects, []);
     }
     #[cfg(feature = "metrics")]
-    charge_installed(&opts.metrics, relocated_bytes, carried);
+    charge_installed(&opts.metrics, relocated_bytes, carried, written_bytes);
     #[cfg(not(feature = "metrics"))]
-    let _ = (relocated_bytes, carried);
+    let _ = (relocated_bytes, carried, written_bytes);
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.

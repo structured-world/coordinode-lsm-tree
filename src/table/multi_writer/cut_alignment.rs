@@ -131,6 +131,7 @@ impl CutAlignment {
     /// The first boundary a run of keys from `first` to `last` crosses after
     /// `first`, past the boundaries `crossing` passes at `first`: one between
     /// two of its keys, where an output written key by key could end.
+    #[cfg(feature = "columnar")]
     pub(super) fn inside(
         &self,
         crossing: Crossing,
@@ -145,6 +146,7 @@ impl CutAlignment {
     /// Moves past the boundaries the keys up to `last` cross, written into the
     /// current output without a cut among them; they count toward its floor
     /// when it holds half the target, `past_half`.
+    #[cfg(feature = "columnar")]
     pub(super) fn pass_through(
         &mut self,
         last: &[u8],
