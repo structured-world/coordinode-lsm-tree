@@ -1345,16 +1345,10 @@ impl MultiWriter {
     /// `finish` will append, or by the heap its per-key state holds for
     /// `finish`. Rows that compress well reach the second first: their data
     /// stays small while the filter, index and locator state grow per key.
+    #[cfg(any(test, feature = "columnar"))]
     fn table_full(&self) -> bool {
-        self.table_full_at(self.target_size)
-    }
-
-    /// Like [`Self::table_full`], the table's size judged against `size_target`
-    /// rather than the target; the state it holds is judged against the target
-    /// whatever the size it is cut at, since that bounds memory.
-    fn table_full_at(&self, size_target: u64) -> bool {
         self.output_load()
-            .is_some_and(|load| load.reaches(size_target))
+            .is_some_and(|load| load.reaches(self.target_size))
     }
 
     /// What the current table weighs at the current key, measured once so it
@@ -1822,7 +1816,9 @@ impl MultiWriter {
             );
         }
         let past_half = self.alignment.is_some()
-            && self.table_full_at(cut_alignment::share_of(self.target_size, 50));
+            && self
+                .output_load()
+                .is_some_and(|load| load.reaches(cut_alignment::share_of(self.target_size, 50)));
         if let Some(alignment) = &mut self.alignment {
             alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
         }
