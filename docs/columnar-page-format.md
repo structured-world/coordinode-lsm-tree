@@ -364,6 +364,12 @@ whose table kept none. When some rows of a group change, the group is written
 again under its own tag, and the pages of each row page whose rows all came
 out as they were read are copied into it unchanged.
 
+The policies compared are the ones configured now. A group written before
+they changed keeps its row group size, page size and encodings when copied,
+as a table moved to another level whole keeps them: the group describes its
+own layout, so it reads the same, and the level's new policy applies to it
+once a merge changes its rows.
+
 A read also bounds what a row group's pages may decode to: a writer closes a
 group once its rows reach at most 4 MiB, an ingested batch past that cut into
 groups the same way, counting every column's bytes of each row. A group it
