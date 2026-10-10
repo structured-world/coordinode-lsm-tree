@@ -3,7 +3,8 @@
 
 //! A compaction into a level with a level below it ends its outputs on the
 //! boundaries between the tables below: run as one stream, split into key
-//! ranges run side by side, and around a row group it would copy whole.
+//! ranges run side by side, in the slices of a tight-space pass, and around a
+//! row group it would copy whole.
 
 use crate::{
     AbstractTree, AnyTree, Config, SequenceNumberCounter, Table, TableId,
@@ -249,6 +250,100 @@ fn without_alignment_outputs_end_off_the_level_below() -> crate::Result<()> {
         cut.iter().any(|last| !boundaries.contains(last)),
         "a cut at the target alone lands off the level below"
     );
+    Ok(())
+}
+
+/// The slices of a tight-space pass end their outputs on the boundaries of the
+/// level below as one stream does. An output ends off one only where no
+/// boundary is left before its slice ends: at the slice's end, or at the
+/// target with no boundary left to wait for.
+#[cfg(feature = "std")]
+#[test]
+fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    // What the quota leaves past the tree's footprint: the budget of a slice,
+    // a fraction of the merge's output.
+    const HEADROOM: u64 = 256 << 10;
+
+    let folder = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let faulty = FaultFs::new(mem.clone());
+    // Free space reads as unknown, so the quota alone constrains the merge.
+    faulty.injector().arm(FaultRule::new(
+        FaultOp::AvailableSpace,
+        Fault::Error(crate::io::ErrorKind::Unsupported),
+    ));
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(faulty))
+    .compaction_threads(1)
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    let mut seqno = 1;
+    for start in (0..3_000).step_by(30) {
+        flush_into(&tree, start..start + 30, 700, 3, &mut seqno)?;
+    }
+    // One table above: the space gate finds no narrower merge that fits.
+    flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
+    let inputs = tables(&tree, 1);
+    assert_eq!(inputs.len(), 1, "the merge reads one table");
+    let boundaries = boundaries_of(&tables(&tree, 3));
+    let slice_ends: Vec<u32> = super::tight_slice_boundaries(
+        &inputs,
+        HEADROOM,
+        &crate::comparator::DefaultUserComparator,
+    )?
+    .iter()
+    .map(|end| index(end))
+    .collect();
+    assert!(
+        slice_ends.len() > 2,
+        "the pass runs in slices: {slice_ends:?}"
+    );
+
+    let used = crate::storage_stats::compute_used_bytes(&tree.current_version())?;
+    tree.update_runtime_config(|cfg| {
+        cfg.storage_admission_check = true;
+        cfg.tight_space_compaction = true;
+        cfg.storage_limit_bytes = Some(used + HEADROOM);
+    })?;
+    tree.compact(
+        Arc::new(Merge(inputs.iter().map(Table::id).collect(), 2)),
+        0,
+    )?;
+    assert!(
+        mem.punched_bytes() > 0,
+        "the merge ran as a tight-space pass"
+    );
+    for i in 0..3_000 {
+        assert!(tree.get(key(i), crate::SeqNo::MAX)?.is_some(), "key {i}");
+    }
+
+    let outputs = last_keys(&tables(&tree, 2));
+    let (_, cut) = outputs.split_last().unwrap();
+    let mut at_boundaries = 0;
+    for &last in cut {
+        if boundaries.contains(&last) {
+            at_boundaries += 1;
+            continue;
+        }
+        // A slice holds the keys below its end key.
+        let slice_end = slice_ends.iter().copied().find(|&end| end > last);
+        assert!(
+            !boundaries
+                .iter()
+                .any(|&b| b > last && slice_end.is_none_or(|end| b < end)),
+            "an output ends at {last} with a boundary still ahead in its slice: outputs end at \
+             {outputs:?}, the level below at {boundaries:?}, slices at {slice_ends:?}"
+        );
+    }
+    assert!(at_boundaries > 0, "the slices' outputs end on boundaries");
     Ok(())
 }
 
