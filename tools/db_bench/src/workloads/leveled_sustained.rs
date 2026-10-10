@@ -55,6 +55,8 @@ struct Arm {
     /// Merges run, and the tables they read.
     merges: u64,
     merged_tables: u64,
+    /// Tables the merges wrote.
+    output_tables: u64,
     /// Debt after each flush and the compactions run after it.
     debt_peak: u64,
     debt_sum: u64,
@@ -64,6 +66,10 @@ struct Arm {
     /// Time of each flush and the compactions run after it, in nanoseconds:
     /// the time the writer is held.
     steps: Histogram<u64>,
+    /// Bytes the compactions of each step wrote.
+    step_bytes: Histogram<u64>,
+    /// Time of all steps together, in nanoseconds.
+    steps_total: u64,
 }
 
 impl Workload for LeveledSustained {
@@ -117,11 +123,14 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
         compacted: 0,
         merges: 0,
         merged_tables: 0,
+        output_tables: 0,
         debt_peak: 0,
         debt_sum: 0,
         flushes: 0,
         reads: Histogram::new_with_max(10_000_000_000, 3).expect("valid histogram params"),
         steps: Histogram::new_with_max(1_000_000_000_000, 3).expect("valid histogram params"),
+        step_bytes: Histogram::new_with_max(1 << 40, 3).expect("valid histogram params"),
+        steps_total: 0,
     };
     let mut seqno = 1u64;
     let mut pending = 0u64;
@@ -144,9 +153,13 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
         let budget =
             COMPACTION_BYTES_PER_FLUSHED_BYTE * i64::try_from(FLUSH_BYTES).unwrap_or(i64::MAX);
         allowance = (allowance + budget).min(budget);
+        let bytes_before = tree.metrics().compaction_bytes_written();
         compact(&tree, &strategy, seqno, Some(&mut allowance), &mut arm)?;
         let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
         arm.steps.saturating_record(nanos);
+        arm.steps_total += nanos;
+        arm.step_bytes
+            .saturating_record(tree.metrics().compaction_bytes_written() - bytes_before);
         let debt = strategy.pending_compaction_bytes(&tree.current_version());
         arm.debt_peak = arm.debt_peak.max(debt);
         arm.debt_sum += debt;
@@ -189,6 +202,7 @@ fn compact(
             CompactionAction::Merged => {
                 arm.merges += 1;
                 arm.merged_tables += result.tables_in as u64;
+                arm.output_tables += result.tables_out as u64;
             }
             CompactionAction::Moved | CompactionAction::Dropped => {}
         }
@@ -218,6 +232,13 @@ fn publish(reporter: &mut Reporter, name: &str, arm: &Arm, config: &BenchConfig)
         Suite::Costs,
     );
     reporter.publish_series(
+        format!("{name} / output tables per merge"),
+        ratio(arm.output_tables, arm.merges),
+        "tables",
+        extra.clone(),
+        Suite::Costs,
+    );
+    reporter.publish_series(
         format!("{name} / peak debt"),
         arm.debt_peak as f64,
         "bytes",
@@ -242,7 +263,21 @@ fn publish(reporter: &mut Reporter, name: &str, arm: &Arm, config: &BenchConfig)
         format!("{name} / flush and compaction step p99"),
         arm.steps.value_at_quantile(0.99) as f64 / 1_000_000.0,
         "ms",
-        extra,
+        extra.clone(),
         Suite::Timings,
+    );
+    reporter.publish_series(
+        format!("{name} / flush and compaction steps total"),
+        arm.steps_total as f64 / 1_000_000_000.0,
+        "s",
+        extra.clone(),
+        Suite::Timings,
+    );
+    reporter.publish_series(
+        format!("{name} / compaction bytes per step p99"),
+        arm.step_bytes.value_at_quantile(0.99) as f64,
+        "bytes",
+        extra,
+        Suite::Costs,
     );
 }
