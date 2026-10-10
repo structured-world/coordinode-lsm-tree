@@ -148,7 +148,8 @@ fn compaction_tied_key_group_changed_elsewhere_is_written() {
     tree.update_runtime_config(|cfg| cfg.columnar = true)
         .expect("enable columnar");
     let short_key = |i: u32| format!("k{i:04}").into_bytes();
-    let short = |i: u32| vec![i as u8; 18];
+    // The low byte of the key index: the value only needs a fixed width.
+    let short = |i: u32| vec![i.to_le_bytes()[0]; 18];
     let mut seqno = 1;
     for i in 365..469 {
         tree.insert(short_key(i), short(i), seqno);
