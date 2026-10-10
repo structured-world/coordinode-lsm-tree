@@ -43,7 +43,7 @@ const READS_PER_FLUSH: u64 = 200;
 /// lags ingest. Both arms get the same budget in bytes rather than in merges,
 /// since a merge of fewer tables costs less. A merge under way runs to its
 /// end and what it overspends is taken from the next flush's budget, so over
-/// the stream both arms spend the same; what is left is drained at its end.
+/// the stream both arms spend alike; what is left is drained at its end.
 const COMPACTION_BYTES_PER_FLUSHED_BYTE: i64 = 2;
 
 /// What one arm measured.
@@ -139,8 +139,11 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
         pending = 0;
         let step = Instant::now();
         tree.flush_active_memtable(seqno)?;
-        allowance +=
+        // A flush's budget is the burst: bytes left unspent while there was
+        // nothing to compact are not saved up for one long step later.
+        let budget =
             COMPACTION_BYTES_PER_FLUSHED_BYTE * i64::try_from(FLUSH_BYTES).unwrap_or(i64::MAX);
+        allowance = (allowance + budget).min(budget);
         compact(&tree, &strategy, seqno, Some(&mut allowance), &mut arm)?;
         let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
         arm.steps.saturating_record(nanos);
