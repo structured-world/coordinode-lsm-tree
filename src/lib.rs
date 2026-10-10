@@ -414,6 +414,7 @@ pub(crate) mod secded;
 
 mod seqno;
 mod slice;
+#[cfg(test)]
 mod slice_windows;
 
 #[doc(hidden)]
