@@ -500,6 +500,21 @@ fn writer_rejects_partitioned_filter_switch_after_write() {
     let _writer = writer.use_partitioned_filter();
 }
 
+/// A table whose last group took the largest tag has none left for the next:
+/// encoding one more group fails rather than wrapping to a tag already used.
+#[cfg(feature = "columnar")]
+#[test]
+fn group_tags_past_the_largest_are_refused() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_columnar(true);
+    writer.last_encoded_tag = Some(u64::MAX);
+    assert!(matches!(
+        writer.next_group_tag(),
+        Err(crate::Error::InvalidHeader(_))
+    ));
+    Ok(())
+}
+
 /// A block re-emitted through the verbatim columnar path can hold several MVCC
 /// versions of one user key (same key, descending seqno). Unlike bulk ingest,
 /// that path must NOT reject equal user keys — only strictly-unique keys are an

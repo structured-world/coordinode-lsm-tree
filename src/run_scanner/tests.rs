@@ -75,3 +75,34 @@ fn run_scanner_basic() -> crate::Result<()> {
 
     Ok(())
 }
+
+/// A scan told to go past the run's last table hands out every table it
+/// holds and then fails, rather than ending as if the run were complete.
+#[test]
+fn run_scanner_past_the_run_fails_after_its_tables() -> crate::Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        &tempdir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for id in ["a", "b"] {
+        tree.insert(id, vec![], 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let tables = tree
+        .current_version()
+        .iter_tables()
+        .cloned()
+        .collect::<Vec<_>>();
+    let run = Arc::new(Run::new(tables).unwrap());
+
+    let mut items = RunScanner::culled(run, (None, Some(2)), None)?;
+
+    assert_eq!(items.next().unwrap()?.key.user_key, Slice::from(*b"a"));
+    assert_eq!(items.next().unwrap()?.key.user_key, Slice::from(*b"b"));
+    assert!(items.next().unwrap().is_err(), "the missing table fails");
+    assert!(items.next().is_none(), "nothing after the failure");
+    Ok(())
+}

@@ -57,9 +57,17 @@ impl RunScanner {
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn with_carry(mut self, target: crate::table::group_carry::CarryTarget) -> Self {
-        if let (Some(reader), Some(table)) = (self.lo_reader.take(), self.tables.get(self.lo)) {
-            self.lo_reader = Some(carrying(reader, table, &target));
-        }
+        // Called on a scanner just built: its first reader is open and its
+        // table is in the run.
+        #[expect(
+            clippy::expect_used,
+            reason = "culled opened the reader of table lo, which the run holds"
+        )]
+        let table = self.tables.get(self.lo).expect("lo is within the run");
+        self.lo_reader = self
+            .lo_reader
+            .take()
+            .map(|reader| carrying(reader, table, &target));
         self.carry = Some(target);
         self
     }

@@ -63,9 +63,8 @@ pub trait CarrySink {
         emitted: &[InternalValue],
     ) -> crate::Result<Option<u64>>;
 
-    /// The count of the compaction filter's transformations so far, `None`
-    /// without a filter.
-    fn transforms_seen(&self) -> Option<u64>;
+    /// The count of the compaction filter's transformations so far.
+    fn transforms_seen(&self) -> u64;
 
     /// Takes `seen`, read by [`Self::transforms_seen`] when the row last put
     /// in the output was emitted, as the count the output's window closes at:
@@ -88,23 +87,32 @@ pub struct Carried {
     pub(crate) bytes: u64,
 }
 
-/// A candidate whose key range the merge is emitting, and what it emitted.
+/// A candidate whose key range the merge is emitting, and what it emitted:
+/// never nothing, since it opens on the first row of the range.
 struct Open {
     candidate: CarryCandidate,
     emitted: alloc::vec::Vec<InternalValue>,
     /// The filter's transformation count when each of `emitted` came out.
-    seen: alloc::vec::Vec<Option<u64>>,
+    seen: alloc::vec::Vec<u64>,
+    /// The count when the last of `emitted` came out.
+    last_seen: u64,
 }
 
 impl Open {
-    fn hold(&mut self, row: InternalValue, sink: &dyn CarrySink) {
-        self.emitted.push(row);
-        self.seen.push(sink.transforms_seen());
+    fn new(candidate: CarryCandidate, row: InternalValue, sink: &dyn CarrySink) -> Self {
+        let last_seen = sink.transforms_seen();
+        Self {
+            candidate,
+            emitted: alloc::vec![row],
+            seen: alloc::vec![last_seen],
+            last_seen,
+        }
     }
 
-    /// The count when the last held row came out.
-    fn last_seen(&self) -> Option<u64> {
-        self.seen.last().copied().flatten()
+    fn hold(&mut self, row: InternalValue, sink: &dyn CarrySink) {
+        self.last_seen = sink.transforms_seen();
+        self.emitted.push(row);
+        self.seen.push(self.last_seen);
     }
 }
 
@@ -169,13 +177,7 @@ impl CarryMatcher {
             .as_ref()
             .is_some_and(|last| crate::comparator::same_user_key(last, &row.key.user_key));
         if !continues_last && let Some(candidate) = self.take_covering(&row) {
-            let mut open = Open {
-                candidate,
-                emitted: alloc::vec::Vec::new(),
-                seen: alloc::vec::Vec::new(),
-            };
-            open.hold(row, sink);
-            self.open = Some(open);
+            self.open = Some(Open::new(candidate, row, sink));
             return Ok(());
         }
 
@@ -212,17 +214,13 @@ impl CarryMatcher {
                 self.carried.groups += 1;
                 self.carried.rows += candidate.rows.len() as u64;
                 self.carried.bytes += u64::from(candidate.group.size());
-                if let Some(seen) = open.last_seen() {
-                    sink.settle_transforms(seen);
-                }
+                sink.settle_transforms(open.last_seen);
                 return Ok(());
             }
         } else if let Some(bytes) = sink.carry_pages(candidate, emitted)? {
             self.carried.partial_groups += 1;
             self.carried.bytes += bytes;
-            if let Some(seen) = open.last_seen() {
-                sink.settle_transforms(seen);
-            }
+            sink.settle_transforms(open.last_seen);
             return Ok(());
         }
         Self::write_rows(open, sink)
@@ -250,9 +248,7 @@ impl CarryMatcher {
     fn write_rows(open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
         for (row, seen) in open.emitted.into_iter().zip(open.seen) {
             sink.write(row)?;
-            if let Some(seen) = seen {
-                sink.settle_transforms(seen);
-            }
+            sink.settle_transforms(seen);
         }
         Ok(())
     }

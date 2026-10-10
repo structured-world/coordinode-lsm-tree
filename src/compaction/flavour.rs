@@ -605,12 +605,12 @@ pub(super) trait CompactionFlavour {
         Ok(None)
     }
 
-    /// The count of the compaction filter's transformations so far, `None`
-    /// without a filter (see [`crate::compaction::carry::CarrySink`]). Every
-    /// flavour answers it, as a held row written without it would take the
-    /// next output's transformations.
+    /// The count of the compaction filter's transformations so far (see
+    /// [`crate::compaction::carry::CarrySink`]). Every flavour answers it, as
+    /// a held row written without it would take the next output's
+    /// transformations.
     #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> Option<u64>;
+    fn transforms_seen(&self) -> u64;
 
     /// Closes the current output's transformation window at `seen` for the
     /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
@@ -1206,7 +1206,7 @@ impl CompactionFlavour for RelocatingCompaction {
     }
 
     #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> Option<u64> {
+    fn transforms_seen(&self) -> u64 {
         self.inner.transforms_seen()
     }
 
@@ -1471,7 +1471,7 @@ impl CompactionFlavour for StandardCompaction {
     }
 
     #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> Option<u64> {
+    fn transforms_seen(&self) -> u64 {
         self.table_writer.transforms_seen()
     }
 

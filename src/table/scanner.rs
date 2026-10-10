@@ -198,18 +198,21 @@ impl Scanner {
     }
 
     /// Records every row group this scan reads in `carry`'s queue, with the
-    /// rows it hands out for the group. Only a columnar table read whole and
-    /// as stored records any: a restricted view drops rows of its first group
-    /// and an ingested table shifts their seqnos, so what it hands out is not
-    /// what the group's bytes hold.
+    /// rows it hands out for the group. Only the scan of a table whose groups
+    /// can be carried takes one (see `Table::carries_row_groups`): a columnar
+    /// table read whole and as stored, since a restricted view drops rows of
+    /// its first group and an ingested table shifts their seqnos, so what it
+    /// hands out is not what the group's bytes hold.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn with_carry(mut self, mut carry: super::group_carry::GroupCarry) -> Self {
-        if self.columnar && self.lower_bound.is_none() && self.global_seqno == 0 {
-            let rows = self.iter.by_ref().collect();
-            carry.start(self.current_group, rows);
-            self.carry = Some(carry);
-        }
+        debug_assert!(
+            self.columnar && self.lower_bound.is_none() && self.global_seqno == 0,
+            "only a table whose groups can be carried records them",
+        );
+        let rows = self.iter.by_ref().collect();
+        carry.start(self.current_group, rows);
+        self.carry = Some(carry);
         self
     }
 
@@ -226,39 +229,46 @@ impl Scanner {
                 return None;
             }
             let group = self.groups.next();
-            let block = match Self::fetch_next_block(
-                &mut self.reader,
-                self.table_id,
-                self.compression,
-                self.encryption.as_deref(),
-                self.ecc,
-                self.has_kv_footer,
-                self.columnar,
-                self.restart_interval,
-                group,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            ) {
-                Ok(block) => block,
-                Err(e) => {
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
-            };
-            let cmp = self.comparator.clone();
-            let rows = match OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp)) {
+            let rows = match self.read_group(group) {
                 Ok(iter) => iter.collect(),
-                Err(e) => {
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
+                Err(e) => return Some(Err(e)),
             };
-            self.read_count += 1;
             self.current_group = group;
             if let Some(carry) = self.carry.as_mut() {
                 carry.start(group, rows);
             }
         }
+    }
+
+    /// Reads and opens the block of `group`, the next in the stream. A block
+    /// that fails poisons the scan, so that no caller skips it and resumes on
+    /// the blocks after it.
+    fn read_group(
+        &mut self,
+        group: Option<super::BlockHandle>,
+    ) -> crate::Result<OwnedDataBlockIter> {
+        let block = Self::fetch_next_block(
+            &mut self.reader,
+            self.table_id,
+            self.compression,
+            self.encryption.as_deref(),
+            self.ecc,
+            self.has_kv_footer,
+            self.columnar,
+            self.restart_interval,
+            group,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )
+        .and_then(|block| {
+            let cmp = self.comparator.clone();
+            OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp))
+        });
+        match block {
+            Ok(_) => self.read_count += 1,
+            Err(_) => self.read_count = self.block_count,
+        }
+        block
     }
 
     #[expect(
@@ -558,37 +568,9 @@ impl Iterator for Scanner {
 
             // Init new block
             self.current_group = self.groups.next();
-            let block = match Self::fetch_next_block(
-                &mut self.reader,
-                self.table_id,
-                self.compression,
-                self.encryption.as_deref(),
-                self.ecc,
-                self.has_kv_footer,
-                self.columnar,
-                self.restart_interval,
-                self.current_group,
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            ) {
-                Ok(block) => block,
-                Err(e) => {
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
-            };
-            let cmp = self.comparator.clone();
-            match OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp)) {
-                Ok(iter) => {
-                    self.iter = iter;
-                    self.read_count += 1;
-                }
-                Err(e) => {
-                    // Poison the scanner so callers cannot silently skip
-                    // the corrupt block and resume on later blocks.
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
+            match self.read_group(self.current_group) {
+                Ok(iter) => self.iter = iter,
+                Err(e) => return Some(Err(e)),
             }
         }
     }

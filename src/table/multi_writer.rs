@@ -1043,12 +1043,15 @@ impl MultiWriter {
         self
     }
 
-    /// The transform counter's value now, `None` when none is wired.
+    /// The transform counter's value now; without a counter, the milestone
+    /// as it stands, so settling it changes nothing.
     #[cfg(feature = "columnar")]
-    pub(crate) fn transforms_seen(&self) -> Option<u64> {
+    pub(crate) fn transforms_seen(&self) -> u64 {
         self.transform_marker
             .as_ref()
-            .map(|marker| marker.load(core::sync::atomic::Ordering::Relaxed))
+            .map_or(self.transforms_after_last_write, |marker| {
+                marker.load(core::sync::atomic::Ordering::Relaxed)
+            })
     }
 
     /// Takes `seen`, the counter's value when the record just put in the

@@ -872,6 +872,84 @@ fn compaction_carried_cell_rows_keep_owning_their_objects() -> lsm_tree::Result<
     Ok(())
 }
 
+/// Newer versions of cell rows that borrow their bodies from the versions
+/// they replace: the merge drops the owners and copies the borrowers' groups
+/// whole, and a copied borrower takes no ownership, so no body is charged as
+/// garbage and every body still reads through the row that borrows it.
+#[test]
+fn compaction_carried_borrowing_cell_rows_charge_nothing() -> lsm_tree::Result<()> {
+    use lsm_tree::KvSeparationOptions;
+    use lsm_tree::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
+
+    let folder = get_tmp_folder();
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(64),
+    ))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?;
+    let AnyTree::Blob(tree) = any else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    tree.index.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    let body = |i: u32| format!("body-{i}-{}", "b".repeat(200)).into_bytes();
+    let docs = 300u32;
+    for i in 0..docs {
+        tree.insert_cells(
+            key(i),
+            &[
+                Field::bytes(FIRST_FIELD_COLUMN, b"draft"),
+                Field::bytes(FIRST_FIELD_COLUMN + 1, &body(i)),
+            ],
+            u64::from(i),
+        )?;
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..docs {
+        let row = tree.get_cells(key(i), SeqNo::MAX)?.expect("written");
+        let borrowed = row
+            .fields()?
+            .into_iter()
+            .find(|field| field.column == FIRST_FIELD_COLUMN + 1)
+            .expect("the body");
+        assert!(
+            matches!(borrowed.cell, Cell::Ref(_)),
+            "the body is a reference"
+        );
+        tree.insert_cells(
+            key(i),
+            &[Field::bytes(FIRST_FIELD_COLUMN, b"final"), borrowed],
+            u64::from(docs + i),
+        )?;
+    }
+    tree.flush_active_memtable(0)?;
+
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+
+    assert!(
+        tree.index.metrics().compaction_groups_carried() > 0,
+        "the borrowers' groups are copied"
+    );
+    assert_eq!(tree.stale_blob_bytes(), 0, "a borrowed body is not charged");
+    assert_eq!(tree.blob_file_count(), 1, "the bodies' file stays");
+    for i in 0..docs {
+        let row = tree.get_cells(key(i), SeqNo::MAX)?.expect("written");
+        assert_eq!(
+            row.resolve(FIRST_FIELD_COLUMN + 1)?.as_deref(),
+            Some(&body(i)[..])
+        );
+    }
+    Ok(())
+}
+
 /// Values kept whole in blob files: a group of their pointers copied whole
 /// still links the blob files under the keys that point into them, every
 /// value reads back, and none of their bytes is counted as stale.

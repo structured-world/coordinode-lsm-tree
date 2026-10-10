@@ -3960,7 +3960,7 @@ impl super::carry::CarrySink for FlavourSink<'_> {
         self.flavour.carry_pages(candidate, emitted, self.pace)
     }
 
-    fn transforms_seen(&self) -> Option<u64> {
+    fn transforms_seen(&self) -> u64 {
         self.flavour.transforms_seen()
     }
 
