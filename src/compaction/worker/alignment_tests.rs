@@ -193,7 +193,9 @@ fn a_serial_merge_ends_its_outputs_on_the_level_below() -> crate::Result<()> {
 }
 
 /// A merge split into key ranges ends every output on a boundary of the level
-/// below, as the stream does, or where its range ends.
+/// below, as the stream does, or where its range ends. In a range with no
+/// boundary left before its end, an output ends at the target: no boundary
+/// would come to end it on.
 #[test]
 fn a_split_merge_ends_its_outputs_on_the_level_below_or_its_range() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
@@ -207,13 +209,23 @@ fn a_split_merge_ends_its_outputs_on_the_level_below_or_its_range() -> crate::Re
     let (outputs, boundaries, seams) = merge_above_a_level(config)?;
     let (_, cut) = outputs.split_last().unwrap();
     let mut at_boundaries = 0;
-    for last in cut {
+    for &last in cut {
+        if boundaries.contains(&last) {
+            at_boundaries += 1;
+            continue;
+        }
+        if seams.contains(&last) {
+            continue;
+        }
+        // A range ends on the first seam at or past its keys.
+        let range_end = seams.iter().copied().find(|&seam| seam > last);
         assert!(
-            boundaries.contains(last) || seams.contains(last),
-            "an output ends at {last}, on neither a boundary nor a range's end: outputs end \
+            !boundaries
+                .iter()
+                .any(|&b| b > last && range_end.is_none_or(|end| b < end)),
+            "an output ends at {last} with a boundary still ahead in its range: outputs end \
              at {outputs:?}, the level below at {boundaries:?}, ranges at {seams:?}"
         );
-        at_boundaries += usize::from(boundaries.contains(last));
     }
     assert!(at_boundaries > 0, "the ranges' outputs end on boundaries");
     Ok(())
@@ -269,7 +281,11 @@ fn a_group_holding_a_boundary_is_written_so_the_output_ends_on_it() -> crate::Re
                 CompressionPolicy::all(crate::CompressionType::None);
         })?;
         let mut seqno = 1;
-        flush_into(&tree, 0..3_000, 700, 3, &mut seqno)?;
+        // Tables of 50 keys below: half their boundaries fall between two
+        // keys of a 4-row group above, not on a group's edge.
+        for start in (0..3_000).step_by(50) {
+            flush_into(&tree, start..start + 50, 700, 3, &mut seqno)?;
+        }
         flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
         let groups_in: u64 = tables(&tree, 1)
             .iter()
@@ -303,7 +319,11 @@ fn a_group_holding_a_boundary_is_written_so_the_output_ends_on_it() -> crate::Re
     );
     let (_, cut) = outputs.split_last().unwrap();
     for last in cut {
-        assert!(boundaries.contains(last), "an output ends at {last}");
+        assert!(
+            boundaries.contains(last),
+            "an output ends at {last}: outputs end at {outputs:?}, the level below at \
+             {boundaries:?}"
+        );
     }
     Ok(())
 }

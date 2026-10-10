@@ -38,10 +38,12 @@ const TABLE_TARGET: u64 = 256 << 10;
 /// Point reads taken after each flush and the compactions it triggered.
 const READS_PER_FLUSH: u64 = 200;
 
-/// Compactions run after each flush: fewer than the writes call for, so debt
-/// builds up while the tree is written to, as when compaction lags ingest.
-/// What is left is drained once the stream ends.
-const COMPACTIONS_PER_FLUSH: usize = 2;
+/// The bytes compaction may write after each flush, per byte flushed: less
+/// than the writes call for, so debt builds up while the tree is written to,
+/// as when compaction I/O lags ingest. Both arms get the same budget, in bytes
+/// rather than merges, since a merge of fewer tables costs less. A merge under
+/// way runs to its end, and what is left is drained once the stream ends.
+const COMPACTION_BYTES_PER_FLUSHED_BYTE: u64 = 2;
 
 /// What one arm measured.
 struct Arm {
@@ -138,7 +140,7 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
             &tree,
             &strategy,
             seqno,
-            Some(COMPACTIONS_PER_FLUSH),
+            Some(COMPACTION_BYTES_PER_FLUSHED_BYTE * FLUSH_BYTES),
             &mut arm,
         )?;
         let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -163,16 +165,17 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
     Ok(arm)
 }
 
-/// Runs compactions until the strategy has nothing to do, or `limit` of them.
-/// No snapshot is held, so every version below `seqno` may go.
+/// Runs compactions until the strategy has nothing to do, or until they wrote
+/// `budget` bytes. No snapshot is held, so every version below `seqno` may go.
 fn compact(
     tree: &AnyTree,
     strategy: &Arc<dyn CompactionStrategy>,
     seqno: u64,
-    limit: Option<usize>,
+    budget: Option<u64>,
     arm: &mut Arm,
 ) -> lsm_tree::Result<()> {
-    for _ in 0..limit.unwrap_or(usize::MAX) {
+    let before = tree.metrics().compaction_bytes_written();
+    while budget.is_none_or(|budget| tree.metrics().compaction_bytes_written() - before < budget) {
         let result = tree.compact(Arc::clone(strategy), seqno)?;
         match result.action {
             CompactionAction::Nothing => break,
