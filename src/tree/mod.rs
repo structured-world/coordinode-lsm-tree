@@ -3247,11 +3247,11 @@ impl Tree {
             Some((ValueType::MergeOperand, entry_seqno, value)) => {
                 if let Some(merge_op) = merge_operator {
                     Self::resolve_point_merge(
-                        super_version.clone(),
+                        super_version,
                         key,
                         seqno,
-                        Arc::clone(merge_op),
-                        blob_source(),
+                        merge_op,
+                        blob_source().as_ref(),
                     )
                 } else if Self::is_suppressed_by_range_tombstones(
                     super_version,
@@ -3306,11 +3306,11 @@ impl Tree {
         {
             // A merged value is built anew, so it is Owned.
             return Self::resolve_point_merge(
-                super_version.clone(),
+                super_version,
                 key,
                 seqno,
-                Arc::clone(merge_op),
-                blob_source(),
+                merge_op,
+                blob_source().as_ref(),
             )
             .map(|opt| opt.map(PinnableSlice::owned));
         }
@@ -3417,27 +3417,20 @@ impl Tree {
     /// `blob_source` reads a base kept in the value log, which only a blob
     /// tree's index holds.
     pub(crate) fn resolve_point_merge(
-        version: SuperVersion,
+        super_version: &SuperVersion,
         key: &[u8],
         seqno: SeqNo,
-        merge_operator: Arc<dyn crate::merge_operator::MergeOperator>,
-        blob_source: Option<crate::blob_tree::BlobSource>,
+        merge_operator: &Arc<dyn crate::merge_operator::MergeOperator>,
+        blob_source: Option<&crate::blob_tree::BlobSource>,
     ) -> crate::Result<Option<UserValue>> {
-        let comparator = version.active_memtable.comparator.clone();
-        let state = crate::range::IterState {
-            version,
-            ephemeral: None,
-            merge_operator: Some(merge_operator),
+        Ok(crate::range::resolve_point_merge(
+            super_version,
+            key,
+            seqno,
+            merge_operator,
             blob_source,
-            comparator,
-            prefix_hash: None,
-            key_hash: Some(crate::hash::hash64(key)),
-            // The partition-aware filter seeks by the key itself.
-            bloom_key: Some(crate::Slice::from(key)),
-            #[cfg(feature = "metrics")]
-            metrics: None,
-        };
-        Ok(crate::range::resolve_point_merge(&state, key, seqno)?.map(|entry| entry.value))
+        )?
+        .map(|entry| entry.value))
     }
 
     #[doc(hidden)]

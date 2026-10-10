@@ -13,11 +13,19 @@
 //! where a deeper table holds newer data, as an ingestion with caller-chosen
 //! seqnos can place it.
 
-use super::{FilterAnswer, IterState, filter_answer, seqno_filter, table_reader};
+use super::{FilterAnswer, FilterQuery, filter_answer, seqno_filter, table_reader};
 use crate::{
-    InternalValue, SeqNo, UserKey, ValueType, key::InternalKey, memtable::Memtable,
-    mvcc_stream::MvccStream, range_tombstone::RangeTombstone, table::Table,
+    InternalValue, SeqNo, UserKey, ValueType,
+    blob_tree::BlobSource,
+    key::InternalKey,
+    memtable::Memtable,
+    merge_operator::MergeOperator,
+    mvcc_stream::{MvccStream, ValueLog},
+    range_tombstone::RangeTombstone,
+    table::Table,
+    version::SuperVersion,
 };
+use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::Bound;
@@ -28,20 +36,28 @@ enum Source<'a> {
     Table(&'a Table),
 }
 
-/// Resolves the merge of `key` at `seqno`: the value the operands visible
-/// there make over the newest base, or `None` when the key reads as deleted.
+/// Resolves the merge of `key` at `seqno` in `super_version`: the value the
+/// operands visible there make over the newest base, or `None` when the key
+/// reads as deleted. `blob_source` reads a base kept in the value log, which
+/// only a blob tree's index holds.
 pub fn resolve_point_merge(
-    state: &IterState,
+    super_version: &SuperVersion,
     key: &[u8],
     seqno: SeqNo,
+    merge_operator: &Arc<dyn MergeOperator>,
+    blob_source: Option<&BlobSource>,
 ) -> crate::Result<Option<InternalValue>> {
-    let comparator = state.comparator.as_ref();
-    let super_version = &state.version;
-    // The filter's copy of the key, shared rather than copied again.
-    let user_key = state
-        .bloom_key
-        .clone()
-        .unwrap_or_else(|| UserKey::from(key));
+    let comparator = super_version.active_memtable.comparator.as_ref();
+    // The partition-aware filter seeks by the key itself.
+    let filter_query = FilterQuery {
+        prefix_hash: None,
+        key_hash: Some(crate::hash::hash64(key)),
+        bloom_key: Some(key),
+        #[cfg(feature = "metrics")]
+        metrics: None,
+    };
+    // The bounds of the memtable and table reads share this one copy.
+    let user_key = UserKey::from(key);
 
     let mut sources: Vec<(SeqNo, Source<'_>)> = Vec::new();
     for memtable in core::iter::once(&super_version.active_memtable)
@@ -72,7 +88,8 @@ pub fn resolve_point_merge(
     sources.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut entries: Vec<InternalValue> = Vec::new();
-    let mut tombstones: Vec<RangeTombstone> = Vec::new();
+    // Each with the read's seqno, the cutoff the merge checks it against.
+    let mut tombstones: Vec<(RangeTombstone, SeqNo)> = Vec::new();
     // The seqno of the newest base found: what is below it is hidden.
     let mut floor: Option<SeqNo> = None;
 
@@ -84,7 +101,9 @@ pub fn resolve_point_merge(
         let (entries_before, tombstones_before) = (entries.len(), tombstones.len());
         match source {
             Source::Memtable(memtable) => {
-                memtable.range_tombstones_containing(key, &mut tombstones);
+                memtable.for_each_range_tombstone_containing(key, |rt| {
+                    tombstones.push((rt.clone(), seqno));
+                });
                 let range = (
                     Bound::Included(InternalKey::new(
                         user_key.clone(),
@@ -113,9 +132,9 @@ pub fn resolve_point_merge(
                         .iter()
                         .take(starting)
                         .filter(|rt| rt.contains_key_with(key, comparator))
-                        .cloned(),
+                        .map(|rt| (rt.clone(), seqno)),
                 );
-                let answer = filter_answer(state, table);
+                let answer = filter_answer(filter_query, table);
                 if answer != FilterAnswer::Absent {
                     take_versions(
                         table_reader(
@@ -143,8 +162,8 @@ pub fn resolve_point_merge(
             .get(tombstones_before..)
             .unwrap_or_default()
             .iter()
-            .filter(|rt| rt.visible_at(seqno))
-            .map(|rt| rt.seqno);
+            .filter(|(rt, _)| rt.visible_at(seqno))
+            .map(|(rt, _)| rt.seqno);
         floor = floor.max(bases.chain(hiding).max());
     }
 
@@ -156,18 +175,21 @@ pub fn resolve_point_merge(
     };
     if tombstones
         .iter()
-        .any(|rt| rt.should_suppress_with(key, head.key.seqno, seqno, comparator))
+        .any(|(rt, cutoff)| rt.should_suppress_with(key, head.key.seqno, *cutoff, comparator))
     {
         return Ok(None);
     }
 
     let resolved = MvccStream::new_with_comparator(
         entries.into_iter().map(Ok),
-        state.merge_operator.clone(),
-        state.comparator.clone(),
+        Some(Arc::clone(merge_operator)),
+        super_version.active_memtable.comparator.clone(),
     )
-    .with_value_log(state.value_log())
-    .with_range_tombstones(tombstones.into_iter().map(|rt| (rt, seqno)).collect())
+    .with_value_log(blob_source.map(|source| ValueLog {
+        source,
+        version: &super_version.version,
+    }))
+    .with_range_tombstones(tombstones)
     .next()
     .transpose()?;
     Ok(resolved.filter(|value| !value.key.is_tombstone()))

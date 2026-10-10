@@ -323,11 +323,11 @@ impl BlobTree {
             && let Some(merge_operator) = &self.index.config.merge_operator
         {
             return crate::Tree::resolve_point_merge(
-                super_version.clone(),
+                super_version,
                 key,
                 seqno,
-                Arc::clone(merge_operator),
-                Some(self.blob_source()),
+                merge_operator,
+                Some(&self.blob_source()),
             );
         }
 

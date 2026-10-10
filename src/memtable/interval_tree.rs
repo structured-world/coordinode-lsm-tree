@@ -262,12 +262,12 @@ fn any_overlapping_suppresses(
     false
 }
 
-/// Pushes onto `out` the tombstones whose interval holds `key`, whatever
-/// their seqno.
-fn collect_containing(
+/// Hands `visit` the tombstones whose interval holds `key`, whatever their
+/// seqno, in order.
+fn visit_containing(
     node: Option<&Node>,
     key: &[u8],
-    out: &mut Vec<RangeTombstone>,
+    visit: &mut impl FnMut(&RangeTombstone),
     comparator: &dyn crate::comparator::UserComparator,
 ) {
     let Some(n) = node else { return };
@@ -276,13 +276,13 @@ fn collect_containing(
         return;
     }
 
-    collect_containing(n.left.as_deref(), key, out, comparator);
+    visit_containing(n.left.as_deref(), key, visit, comparator);
 
     if comparator.compare(&n.tombstone.start, key) != Ordering::Greater {
         if n.tombstone.contains_key_with(key, comparator) {
-            out.push(n.tombstone.clone());
+            visit(&n.tombstone);
         }
-        collect_containing(n.right.as_deref(), key, out, comparator);
+        visit_containing(n.right.as_deref(), key, visit, comparator);
     }
 }
 
@@ -377,10 +377,15 @@ impl IntervalTree {
         )
     }
 
-    /// Pushes onto `out` the tombstones holding `key`. O(log n + k) where k
-    /// is the number of overlapping tombstones.
-    pub fn containing(&self, key: &[u8], out: &mut Vec<RangeTombstone>) {
-        collect_containing(self.root.as_deref(), key, out, self.comparator.as_ref());
+    /// Hands `visit` the tombstones holding `key`. O(log n + k) where k is
+    /// the number of overlapping tombstones.
+    pub fn for_each_containing(&self, key: &[u8], mut visit: impl FnMut(&RangeTombstone)) {
+        visit_containing(
+            self.root.as_deref(),
+            key,
+            &mut visit,
+            self.comparator.as_ref(),
+        );
     }
 
     /// Returns the highest-seqno visible tombstone that fully covers `[min, max]`,

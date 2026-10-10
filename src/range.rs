@@ -159,6 +159,28 @@ impl IterState {
                 version: &self.version.version,
             })
     }
+
+    /// What this read asks each table's filters.
+    fn filter_query(&self) -> FilterQuery<'_> {
+        FilterQuery {
+            prefix_hash: self.prefix_hash,
+            key_hash: self.key_hash,
+            bloom_key: self.bloom_key.as_deref(),
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.as_ref(),
+        }
+    }
+}
+
+/// What a read asks each table's filters: the prefix it scans, or the key it
+/// reads. See the fields of [`IterState`] of the same names.
+#[derive(Clone, Copy)]
+pub(crate) struct FilterQuery<'a> {
+    pub(crate) prefix_hash: Option<u64>,
+    pub(crate) key_hash: Option<u64>,
+    pub(crate) bloom_key: Option<&'a [u8]>,
+    #[cfg(feature = "metrics")]
+    pub(crate) metrics: Option<&'a Arc<crate::Metrics>>,
 }
 
 type BoxedMerge<'a> = Box<dyn DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + 'a>;
@@ -237,14 +259,14 @@ impl FilterAnswer {
 /// Returns `true` if the table should be included (bloom says "maybe" or no
 /// filter available), `false` if it can be safely skipped.
 fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
-    filter_answer(state, table) != FilterAnswer::Absent
+    filter_answer(state.filter_query(), table) != FilterAnswer::Absent
 }
 
 /// Asks a table's prefix and key filters about the read, counting the probes
 /// they answer (see [`FilterAnswer`]).
-fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer {
+fn filter_answer(query: FilterQuery<'_>, table: &crate::table::Table) -> FilterAnswer {
     let mut answer = FilterAnswer::Unanswered;
-    if let Some(prefix_hash) = state.prefix_hash {
+    if let Some(prefix_hash) = query.prefix_hash {
         // A prefix answer counts as a key's does: the filter holds the
         // prefix's hash beside the keys'.
         use crate::table::probe_stats::ProbeCounts;
@@ -255,7 +277,7 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
                     negatives: 1,
                 });
                 #[cfg(feature = "metrics")]
-                if let Some(m) = &state.metrics {
+                if let Some(m) = query.metrics {
                     m.prefix_bloom_skips
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -277,14 +299,13 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
 
     // bloom_key without key_hash is meaningless — catch misuse early
     debug_assert!(
-        state.bloom_key.is_none() || state.key_hash.is_some(),
+        query.bloom_key.is_none() || query.key_hash.is_some(),
         "bloom_key requires key_hash to be set"
     );
 
-    if let Some(key_hash) = state.key_hash {
+    if let Some(key_hash) = query.key_hash {
         use crate::table::KeyFilterAnswer;
-        let result = if let Some(bloom_key) = &state.bloom_key {
-            // UserKey (Slice) implements Deref<Target=[u8]>, coerces to &[u8]
+        let result = if let Some(bloom_key) = query.bloom_key {
             table.key_filter_answer(bloom_key, key_hash)
         } else {
             table.bloom_may_contain_key_hash(key_hash).map(|may| {
@@ -309,7 +330,7 @@ fn filter_answer(state: &IterState, table: &crate::table::Table) -> FilterAnswer
             }
             Ok(KeyFilterAnswer::PastPartitions) => return FilterAnswer::Absent,
             Ok(KeyFilterAnswer::MayContain)
-                if table.key_check_consults_filter(state.bloom_key.is_some()) =>
+                if table.key_check_consults_filter(query.bloom_key.is_some()) =>
             {
                 table.count_probes(ProbeCounts {
                     probes: 1,
@@ -633,7 +654,7 @@ impl TreeIter {
                     .into_iter()
                     .filter(|table| !is_covered(table))
                     .filter_map(|table| {
-                        let answer = filter_answer(lock, &table);
+                        let answer = filter_answer(lock.filter_query(), &table);
                         (answer != FilterAnswer::Absent).then_some((table, answer))
                     })
                     .collect();

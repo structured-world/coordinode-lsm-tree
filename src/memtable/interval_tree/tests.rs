@@ -4,10 +4,10 @@ fn rt(start: &[u8], end: &[u8], seqno: SeqNo) -> RangeTombstone {
     RangeTombstone::new(UserKey::from(start), UserKey::from(end), seqno)
 }
 
-/// `containing` returns every tombstone holding the key, whatever its seqno,
-/// and none that ends at it (the end is exclusive) or starts past it.
+/// `for_each_containing` visits every tombstone holding the key, whatever its
+/// seqno, and none that ends at it (the end is exclusive) or starts past it.
 #[test]
-fn containing_returns_the_tombstones_holding_the_key() {
+fn for_each_containing_visits_the_tombstones_holding_the_key() {
     let mut tree = IntervalTree::new();
     for tombstone in [
         rt(b"a", b"f", 10),
@@ -19,22 +19,18 @@ fn containing_returns_the_tombstones_holding_the_key() {
         tree.insert(tombstone);
     }
 
-    let mut held = Vec::new();
-    tree.containing(b"e", &mut held);
-    held.sort_by_key(|rt| rt.seqno);
-    let seqnos: Vec<SeqNo> = held.iter().map(|rt| rt.seqno).collect();
+    let mut seqnos = Vec::new();
+    tree.for_each_containing(b"e", |rt| seqnos.push(rt.seqno));
+    seqnos.sort_unstable();
     assert_eq!(
         seqnos,
         [5, 10, 20],
         "[b, e) ends at the key, [p, z) starts past it"
     );
 
-    held.clear();
-    tree.containing(b"0", &mut held);
-    assert!(
-        held.is_empty(),
-        "a key before every tombstone is held by none"
-    );
+    let mut visited = 0;
+    tree.for_each_containing(b"0", |_| visited += 1);
+    assert_eq!(visited, 0, "a key before every tombstone is held by none");
 }
 
 #[test]
