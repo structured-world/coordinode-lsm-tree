@@ -17,6 +17,8 @@ pub mod columnar_predicate;
 pub mod data_block;
 pub mod delete_bitmap;
 pub mod filter;
+#[cfg(feature = "columnar")]
+pub(crate) mod group_carry;
 mod id;
 mod index_block;
 mod inner;

@@ -75,6 +75,12 @@ pub struct Scanner {
     /// directory does not carry the tag and lengths its entry records. Empty
     /// for a row-major table.
     groups: alloc::vec::IntoIter<super::BlockHandle>,
+    /// The index entry of the group whose rows are being handed out.
+    current_group: Option<super::BlockHandle>,
+    /// Hands out each group's rows from the group's own list and records the
+    /// group as a candidate for a whole copy, when a compaction asked for it.
+    #[cfg(feature = "columnar")]
+    carry: Option<super::group_carry::GroupCarry>,
 }
 
 impl Scanner {
@@ -142,6 +148,7 @@ impl Scanner {
             position: start_offset,
         };
         let mut groups = groups.into_iter();
+        let current_group = groups.next();
 
         let block = Self::fetch_next_block(
             &mut reader,
@@ -152,7 +159,7 @@ impl Scanner {
             has_kv_footer,
             columnar,
             restart_interval,
-            groups.next(),
+            current_group,
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
@@ -184,7 +191,84 @@ impl Scanner {
             filtering_below_bound: lower_bound.is_some(),
             lower_bound,
             groups,
+            current_group,
+            #[cfg(feature = "columnar")]
+            carry: None,
         })
+    }
+
+    /// Records every row group this scan reads in `carry`'s queue, with the
+    /// rows it hands out for the group. Only the scan of a table whose groups
+    /// can be carried takes one (see `Table::carries_row_groups`): a columnar
+    /// table read whole and as stored, since a restricted view drops rows of
+    /// its first group and an ingested table shifts their seqnos, so what it
+    /// hands out is not what the group's bytes hold.
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn with_carry(mut self, mut carry: super::group_carry::GroupCarry) -> Self {
+        debug_assert!(
+            self.columnar && self.lower_bound.is_none() && self.global_seqno == 0,
+            "only a table whose groups can be carried records them",
+        );
+        let rows = self.iter.by_ref().collect();
+        carry.start(self.current_group, rows);
+        self.carry = Some(carry);
+        self
+    }
+
+    /// [`Iterator::next`] of a scan that records its groups: each group's rows
+    /// are taken from the block at once, so the candidate holds them all
+    /// before the first is handed out.
+    #[cfg(feature = "columnar")]
+    fn next_carried(&mut self) -> Option<crate::Result<InternalValue>> {
+        loop {
+            if let Some(row) = self.carry.as_mut()?.next_row() {
+                return Some(Ok(row));
+            }
+            if self.read_count >= self.block_count {
+                return None;
+            }
+            let group = self.groups.next();
+            let rows = match self.read_group(group) {
+                Ok(iter) => iter.collect(),
+                Err(e) => return Some(Err(e)),
+            };
+            self.current_group = group;
+            if let Some(carry) = self.carry.as_mut() {
+                carry.start(group, rows);
+            }
+        }
+    }
+
+    /// Reads and opens the block of `group`, the next in the stream. A block
+    /// that fails poisons the scan, so that no caller skips it and resumes on
+    /// the blocks after it.
+    fn read_group(
+        &mut self,
+        group: Option<super::BlockHandle>,
+    ) -> crate::Result<OwnedDataBlockIter> {
+        let block = Self::fetch_next_block(
+            &mut self.reader,
+            self.table_id,
+            self.compression,
+            self.encryption.as_deref(),
+            self.ecc,
+            self.has_kv_footer,
+            self.columnar,
+            self.restart_interval,
+            group,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )
+        .and_then(|block| {
+            let cmp = self.comparator.clone();
+            OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp))
+        });
+        match block {
+            Ok(_) => self.read_count += 1,
+            Err(_) => self.read_count = self.block_count,
+        }
+        block
     }
 
     #[expect(
@@ -456,6 +540,10 @@ impl Iterator for Scanner {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        #[cfg(feature = "columnar")]
+        if self.carry.is_some() {
+            return self.next_carried();
+        }
         loop {
             if let Some(mut item) = self.iter.next() {
                 // Sub-bound entries of the straddling first block belong to
@@ -479,37 +567,10 @@ impl Iterator for Scanner {
             }
 
             // Init new block
-            let block = match Self::fetch_next_block(
-                &mut self.reader,
-                self.table_id,
-                self.compression,
-                self.encryption.as_deref(),
-                self.ecc,
-                self.has_kv_footer,
-                self.columnar,
-                self.restart_interval,
-                self.groups.next(),
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            ) {
-                Ok(block) => block,
-                Err(e) => {
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
-            };
-            let cmp = self.comparator.clone();
-            match OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp)) {
-                Ok(iter) => {
-                    self.iter = iter;
-                    self.read_count += 1;
-                }
-                Err(e) => {
-                    // Poison the scanner so callers cannot silently skip
-                    // the corrupt block and resume on later blocks.
-                    self.read_count = self.block_count;
-                    return Some(Err(e));
-                }
+            self.current_group = self.groups.next();
+            match self.read_group(self.current_group) {
+                Ok(iter) => self.iter = iter,
+                Err(e) => return Some(Err(e)),
             }
         }
     }

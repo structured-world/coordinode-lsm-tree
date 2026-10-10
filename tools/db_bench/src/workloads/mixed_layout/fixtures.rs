@@ -501,6 +501,9 @@ pub fn columnar_base_row_updates(
         rows[i as usize].expect = Some(value);
     }
     tree.flush_active_memtable(0)?;
+    // What the tree writes from here on, a compaction's output, is columnar
+    // again, as the base was; the runs already written keep their shapes.
+    set_columnar(&tree, true)?;
 
     Ok(Fixture {
         tree,

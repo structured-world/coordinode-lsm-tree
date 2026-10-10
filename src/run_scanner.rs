@@ -16,6 +16,10 @@ pub struct RunScanner {
     lo_reader: Option<Scanner>,
     /// Told how long each table's reads take, for every table of the run.
     pace: Option<crate::table::util::Pacer>,
+    /// Where each table's scanner records the row groups it reads, for a
+    /// compaction that copies groups whole.
+    #[cfg(feature = "columnar")]
+    carry: Option<crate::table::group_carry::CarryTarget>,
 }
 
 impl RunScanner {
@@ -35,7 +39,7 @@ impl RunScanner {
         )]
         let lo_table = run.get(lo).expect("should exist");
 
-        let lo_reader = Self::scan(lo_table, pace.as_ref())?;
+        let lo_reader = lo_table.scan_paced(pace.as_ref())?;
 
         Ok(Self {
             tables: run,
@@ -43,11 +47,60 @@ impl RunScanner {
             hi,
             lo_reader: Some(lo_reader),
             pace,
+            #[cfg(feature = "columnar")]
+            carry: None,
         })
     }
 
-    fn scan(table: &Table, pace: Option<&crate::table::util::Pacer>) -> crate::Result<Scanner> {
-        table.scan_paced(pace)
+    /// Has the scanner of every table of the run `target` takes record its
+    /// groups there (see [`crate::table::group_carry::CarryTarget::takes`]).
+    #[cfg(feature = "columnar")]
+    #[must_use]
+    pub(crate) fn with_carry(mut self, target: crate::table::group_carry::CarryTarget) -> Self {
+        // Called on a scanner just built: its first reader is open and its
+        // table is in the run.
+        #[expect(
+            clippy::expect_used,
+            reason = "culled opened the reader of table lo, which the run holds"
+        )]
+        let table = self.tables.get(self.lo).expect("lo is within the run");
+        self.lo_reader = self
+            .lo_reader
+            .take()
+            .map(|reader| carrying(reader, table, &target));
+        self.carry = Some(target);
+        self
+    }
+
+    fn scan_table(&self, index: usize) -> crate::Result<Scanner> {
+        // `index` is within `lo..=hi`, every slot of which names a table: a
+        // missing one fails the scan rather than ending it early, which would
+        // hand a merge the run without its tail.
+        let Some(table) = self.tables.get(index) else {
+            return Err(crate::Error::from(crate::io::Error::other(
+                "run scanner: table index past the run",
+            )));
+        };
+        let scanner = table.scan_paced(self.pace.as_ref())?;
+        #[cfg(feature = "columnar")]
+        if let Some(target) = &self.carry {
+            return Ok(carrying(scanner, table, target));
+        }
+        Ok(scanner)
+    }
+}
+
+/// `scanner` of `table`, recording its groups in `target` when it takes them.
+#[cfg(feature = "columnar")]
+fn carrying(
+    scanner: Scanner,
+    table: &Table,
+    target: &crate::table::group_carry::CarryTarget,
+) -> Scanner {
+    if target.takes(table) {
+        scanner.with_carry(target.carry_for(table))
+    } else {
+        scanner
     }
 }
 
@@ -66,16 +119,7 @@ impl Iterator for RunScanner {
                 self.lo += 1;
 
                 if self.lo <= self.hi {
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "hi is at most equal to the last slot; so because 0 <= lo <= hi, it must be a valid index"
-                    )]
-                    let scanner = fail_iter!(Self::scan(
-                        self.tables.get(self.lo).expect("should exist"),
-                        self.pace.as_ref()
-                    ));
-
-                    self.lo_reader = Some(scanner);
+                    self.lo_reader = Some(fail_iter!(self.scan_table(self.lo)));
                 }
             } else {
                 return None;

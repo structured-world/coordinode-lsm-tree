@@ -245,6 +245,10 @@ measured on.
 | `cells-scan-ref-filtered` | The `cells-scan-sparse-clustered` rows with the cluster field kept in a blob file however small, so the ~1% predicate on it judges a row only once its object is read: the rows it drops cost their objects, and the inline payload of their pages is what the scan still spares. |
 | `cells-scan-ref-filtered-eager` | The `cells-scan-ref-filtered` rows read whole, the predicate applied by the caller. |
 | `cells-scan-under-compaction` | The `blobs-filtered-before-fetch` scan repeated forty times while a second thread writes other rows, flushes and compacts, so blob files are relocated and dropped under the scans. Each repetition is verified; it publishes the scans' `scan P50` and `scan P99` in microseconds, to the host's timings suite, and no byte series, since the compacting thread reads and copies through the same counters. |
+| `compaction-one-segment` | The `columnar-scan-one-segment` fixture compacted once with every version kept, then read back whole. Publishes `encoded share of output`: the share of the output's bytes the compaction encoded again rather than copied as the input held them, near zero here, since nothing lands among the segment's rows. |
+| `compaction-overlap-8` | The `columnar-scan-overlap-8` fixture compacted the same way: every segment's rows land among the others', so every group is encoded again and the share is one. |
+| `compaction-row-updates-over-columnar-base` | The `row-updates-over-columnar-base` fixture compacted the same way into a columnar output: a third of the keys updated land in every row page of the base, so the share shows what a dense update leaves to copy. |
+| `compaction-wide-cells` | The `wide-cells-projected` fixture, rows written as cells with their payload in blob files, compacted the same way: its groups are copied whole with the references their rows own. |
 
 The selective scans hand the predicate to the engine rather than filtering
 returned rows: a harness-side filter would make every selectivity cost the same
@@ -269,8 +273,9 @@ one line rather than a fresh argument about what the expected result is.
 counter, named `mixed-layout / <scenario> bytes read per row` (and
 `… bytes decoded per row`, `… bytes copied per row`, and, for a projected
 scan, `… bytes materialized per row` and `… payload bytes useful per row` /
-`… payload bytes incidental per row` where it read a payload late, and
-`… payload bytes written per row` for `metadata-only-update`), in place of the ops/sec
+`… payload bytes incidental per row` where it read a payload late,
+`… payload bytes written per row` for `metadata-only-update`, and, for a
+compaction scenario, `… encoded share of output`), in place of the ops/sec
 every other workload reports — for a scenario sweep the
 rate counts scenarios per second, which describes the harness rather than the
 engine. The `--json` report and the plain summary carry the same series in

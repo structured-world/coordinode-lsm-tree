@@ -548,6 +548,70 @@ fn load_with_handle_delete_bitmap_len_wrong_width_returns_err() {
     );
 }
 
+/// The row group shape a writer records parses back as it was written.
+#[test]
+fn load_with_handle_group_shape_round_trips() {
+    let shape = GroupShape {
+        encoding: crate::config::ColumnEncoding::Auto,
+        row_group_size: 64 * 1_024,
+        page_size: 1_024,
+    };
+    let parsed = load_meta_from_items(&meta_items_with(meta(
+        "descriptor#group_shape",
+        &shape.to_bytes(),
+    )))
+    .unwrap();
+    assert_eq!(parsed.group_shape, Some(shape));
+}
+
+/// A row group shape of the wrong width, an encoding this build does not
+/// know, or a size past the largest a writer accepts is corrupt meta: its
+/// groups would otherwise be judged against a shape no table was written in.
+#[test]
+fn load_with_handle_malformed_group_shape_returns_err() {
+    let oversized = GroupShape {
+        encoding: crate::config::ColumnEncoding::Plain,
+        row_group_size: crate::config::MAX_BLOCK_SIZE + 1,
+        page_size: 1_024,
+    }
+    .to_bytes();
+    let mut unknown_encoding = oversized;
+    unknown_encoding[0] = 2;
+    unknown_encoding[1..5].copy_from_slice(&1_024u32.to_le_bytes());
+    for bytes in [&oversized[..], &unknown_encoding[..], &oversized[..8]] {
+        let result = load_meta_from_items(&meta_items_with(meta("descriptor#group_shape", bytes)));
+        assert!(
+            matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+            "{bytes:?}: expected InvalidHeader(\"TableMeta\"), got {result:?}",
+        );
+    }
+}
+
+/// A columnar table that does not record how its row groups were cut is
+/// refused, so no group of it is ever judged against a guessed shape; one
+/// that records it parses.
+#[test]
+fn load_with_handle_columnar_without_group_shape_returns_err() {
+    let columnar = meta_items_with(meta("descriptor#columnar", &[1u8]));
+    let result = load_meta_from_items(&columnar);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+
+    let shape = GroupShape {
+        encoding: crate::config::ColumnEncoding::Plain,
+        row_group_size: crate::config::DEFAULT_COLUMNAR_ROW_GROUP_SIZE,
+        page_size: crate::config::DEFAULT_COLUMNAR_PAGE_SIZE,
+    };
+    let mut items = columnar;
+    items.push(meta("descriptor#group_shape", &shape.to_bytes()));
+    items.sort_by(|a, b| a.key.user_key.cmp(&b.key.user_key));
+    let parsed = load_meta_from_items(&items).unwrap();
+    assert!(parsed.columnar);
+    assert_eq!(parsed.group_shape, Some(shape));
+}
+
 /// A present `descriptor#delete_bitmap_hash` that is not exactly sixteen bytes
 /// is corrupt meta.
 #[test]

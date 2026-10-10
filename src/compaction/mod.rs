@@ -4,6 +4,8 @@
 
 //! Contains compaction strategies
 
+#[cfg(feature = "columnar")]
+pub(crate) mod carry;
 pub(crate) mod fifo;
 pub(crate) mod leveled;
 // pub(crate) mod maintenance;

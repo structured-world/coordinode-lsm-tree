@@ -848,11 +848,19 @@ pub struct Writer {
     /// engine writes itself.
     key_range_cover: Option<(UserKey, UserKey)>,
 
-    /// Tag of the last columnar row group written, `None` before the first.
-    /// Tags strictly increase so they stay unique within the table, which is
-    /// what makes a page's stamp name exactly one group.
+    /// Tag of the last row group encoded here under a tag of its own, `None`
+    /// before the first. Encoded tags advance from it rather than from a
+    /// copied group's, which follows its source's sequence: stepping past a
+    /// copy would take the tags of that source's next groups and refuse them.
     #[cfg(feature = "columnar")]
-    last_group_tag: Option<u64>,
+    last_encoded_tag: Option<u64>,
+
+    /// Every tag a row group of this table was written under. Tags are unique
+    /// within the table, which is what makes a page's stamp name exactly one
+    /// group: a group encoded here takes the first free tag past the last
+    /// one, and a group copied in keeps its own when it is free.
+    #[cfg(feature = "columnar")]
+    group_tags: crate::HashSet<u64>,
 
     /// Tag of the first row group encoded here: a hash of the table's path,
     /// id and creation time, in the lower half of `u64` so the increments
@@ -931,6 +939,116 @@ pub(crate) struct VerbatimSource {
     pub table_id: TableId,
     /// The source offset of the extent's first block.
     pub offset: u64,
+}
+
+/// The pages of another table's row group that a group written here copies:
+/// the group keeps the source's tag and its row pages one for one, and on the
+/// row pages named copied takes the source's pages as they lie.
+#[cfg(feature = "columnar")]
+pub(crate) struct PageCarry<'a> {
+    /// The source group's tag, which every copied page's stamp names.
+    pub tag: u64,
+    /// Rows of each row page of the group written, one per source row page.
+    pub row_pages: Vec<u32>,
+    /// Per row page, whether its pages are the source's.
+    pub copied: Vec<bool>,
+    /// The source group's bytes on disk.
+    pub raw: &'a [u8],
+    /// Where they lay.
+    pub source: VerbatimSource,
+    /// The source group's directory and its on-disk length.
+    pub directory: &'a crate::table::column_page::PageDirectory,
+    /// The on-disk length of that directory, its header included.
+    pub directory_len: u32,
+}
+
+#[cfg(feature = "columnar")]
+impl<'a> PageCarry<'a> {
+    /// Whether the group of `batch`'s rows can take the copied pages: its
+    /// columns are the source's, in the source's order, its row pages as many
+    /// as the source's, and every copied row page as many rows as the
+    /// source's.
+    fn fits(&self, batch: &crate::table::columnar::ColumnBatch) -> bool {
+        let source_pages = self.directory.row_pages();
+        let row_pages = source_pages.len();
+        let entries = self.directory.entries();
+        row_pages == self.row_pages.len()
+            && row_pages == self.copied.len()
+            && entries.len() == batch.columns.len() * row_pages
+            && self.row_pages.iter().sum::<u32>() == batch.row_count
+            && batch.columns.iter().enumerate().all(|(column, col)| {
+                entries
+                    .get(column * row_pages)
+                    .is_some_and(|e| e.id.column_id == col.column_id && e.id.part == 0)
+            })
+            && self
+                .copied
+                .iter()
+                .zip(self.row_pages.iter().zip(source_pages))
+                .all(|(&copied, (rows, source_rows))| !copied || rows == source_rows)
+    }
+
+    /// The source's page of the `column`-th column on row page `row_page`,
+    /// when that row page is copied.
+    fn page(&self, column: usize, row_page: usize) -> Option<CopiedPage<'a>> {
+        use crate::coding::Decode;
+
+        if !self.copied.get(row_page).copied().unwrap_or(false) {
+            return None;
+        }
+        let entry = self
+            .directory
+            .entries()
+            .get(column * self.directory.row_pages().len() + row_page)?;
+        let start = self.directory_len as usize
+            + self.directory.pages_start() as usize
+            + entry.offset as usize;
+        let frame = self.raw.get(start..start + entry.length as usize)?;
+        let header = crate::table::block::Header::decode_from(&mut &*frame).ok()?;
+        Some(CopiedPage {
+            frame,
+            header,
+            at: crate::table::block::ChecksumAt::table(
+                self.source.table_id,
+                self.source.offset + start as u64,
+            ),
+        })
+    }
+}
+
+/// A source page a group copies: its frame, its header, and the place its
+/// checksum is bound to.
+#[cfg(feature = "columnar")]
+#[derive(Clone, Copy)]
+struct CopiedPage<'a> {
+    frame: &'a [u8],
+    header: crate::table::block::Header,
+    at: crate::table::block::ChecksumAt,
+}
+
+/// A page of a group being written: encoded here, or copied.
+#[cfg(feature = "columnar")]
+enum PagePayload<'a> {
+    Encoded(Vec<u8>),
+    Copied(CopiedPage<'a>),
+}
+
+/// A block of a group being written, ready to go out.
+#[cfg(feature = "columnar")]
+enum PageOut<'a, 'p> {
+    Prepared(crate::table::block::PreparedBlock<'p>),
+    Copied(CopiedPage<'a>),
+}
+
+#[cfg(feature = "columnar")]
+impl PageOut<'_, '_> {
+    /// Its length on disk under `ecc`.
+    fn on_disk_len(&self, ecc: Option<crate::table::block::EccParams>) -> u32 {
+        match self {
+            Self::Prepared(prepared) => prepared.on_disk_len(ecc),
+            Self::Copied(copied) => copied.header.on_disk_size_with(ecc),
+        }
+    }
 }
 
 /// A membership filter built elsewhere, as the wire bytes it is written as.
@@ -1114,7 +1232,9 @@ impl Writer {
             next_refresh_hashes: 0,
 
             #[cfg(feature = "columnar")]
-            last_group_tag: None,
+            last_encoded_tag: None,
+            #[cfg(feature = "columnar")]
+            group_tags: crate::HashSet::default(),
             #[cfg(feature = "columnar")]
             group_tag_base,
 
@@ -1451,6 +1571,11 @@ impl Writer {
             value_layout: self
                 .value_layout
                 .unwrap_or(crate::table::meta::ValueLayout::Whole),
+            group_shape: crate::table::meta::GroupShape {
+                encoding: self.column_encoding,
+                row_group_size: self.row_group_size,
+                page_size: self.columnar_page_size,
+            },
             bulk_ingested: self.bulk_ingested,
             recency: self.recency,
             lineage: self.lineage.clone(),
@@ -1675,7 +1800,15 @@ impl Writer {
         let meta_phase =
             index_scratch + sections_held + section_scratch + meta_scratch + bitmap_retained;
 
+        // The tags of the groups written stay to the end, a slot and a
+        // control byte each.
+        #[cfg(feature = "columnar")]
+        let tags_held = self.group_tags.capacity() as u64 * (WORD + 1);
+        #[cfg(not(feature = "columnar"))]
+        let tags_held = 0;
+
         self.held_state_bytes = lineage_held
+            + tags_held
             + index_phase
                 .max(filter_phase)
                 .max(section_phase)
@@ -2109,6 +2242,16 @@ impl Writer {
             // block-skip: the writer re-derives the per-block ranges from
             // the re-emitted entries (never copies the source's map).
             .use_seqno_in_index(has_seqno_bounds);
+        // Groups it copies keep the source's shape, and groups it re-encodes
+        // are cut the same way, so the copy records the shape all of them
+        // have.
+        let writer = match meta.group_shape {
+            Some(shape) => writer
+                .use_column_encoding(shape.encoding)
+                .use_row_group_size(shape.row_group_size)
+                .use_columnar_page_size(shape.page_size),
+            None => writer,
+        };
         // Re-emit per-KV checksum footers under the source's algorithm when it
         // carried them (an SST is footer-homogeneous, so `AllLevels` reproduces
         // the same per-block footer state).
@@ -2912,10 +3055,67 @@ impl Writer {
             seqno_bounds,
             item_count,
             zone_block_min,
+            None,
         )?;
         self.chunk.clear();
         self.chunk_size = 0;
         Ok(())
+    }
+
+    /// Writes `rows` as one row group that keeps another table's row group's
+    /// tag and copies the pages of its row pages `carry` names as unchanged,
+    /// as they lie on disk, encoding only the rest.
+    ///
+    /// Returns `false`, writing nothing, when this table cannot take the group
+    /// so: a row-major table, one whose values are not stored whole, one that
+    /// already holds the tag, or rows whose columns are not the source's, in
+    /// its order. The caller then writes the rows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_verbatim_row_group`].
+    #[cfg(feature = "columnar")]
+    pub(crate) fn append_partly_carried_row_group(
+        &mut self,
+        rows: &[InternalValue],
+        carry: &PageCarry<'_>,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<bool> {
+        use crate::table::meta::ValueLayout;
+
+        if !self.use_columnar
+            || self
+                .value_layout
+                .is_some_and(|fixed| fixed != ValueLayout::Whole)
+            || !self.accepts_group_tag(carry.tag)
+        {
+            return Ok(false);
+        }
+        // A key two inputs held at one seqno comes out twice, an order the
+        // block check refuses; such rows go through the ordinary path, as for
+        // a group copied whole.
+        if self.validate_direct_block_order(rows, comparator).is_err() {
+            return Ok(false);
+        }
+        let batch = crate::table::columnar::entries_to_column_batch(rows)?;
+        if !carry.fits(&batch) {
+            return Ok(false);
+        }
+        self.claim_value_layout(ValueLayout::Whole)?;
+        let Some(inputs) = self.account_direct_block(rows)? else {
+            return Ok(false);
+        };
+        self.encode_columnar_batch_block(
+            &batch,
+            inputs.last_key,
+            inputs.last_seqno,
+            inputs.seqno_bounds,
+            inputs.item_count,
+            inputs.zone_block_min,
+            Some(carry),
+        )?;
+        self.locator_block_done();
+        Ok(true)
     }
 
     /// Encodes a `ColumnBatch` as a columnar (PAX) block and registers it like a
@@ -2923,6 +3123,10 @@ impl Writer {
     /// intrinsic transpose spill ([`Self::spill_columnar_block`]) and the
     /// consumer columnar-ingest path ([`Self::write_columnar_batch`]).
     #[cfg(feature = "columnar")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the group's per-block index fields, plus the pages it copies"
+    )]
     fn encode_columnar_batch_block(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
@@ -2931,6 +3135,7 @@ impl Writer {
         seqno_bounds: Option<(u64, u64)>,
         item_count: usize,
         zone_block_min: Option<crate::UserKey>,
+        carry: Option<&PageCarry<'_>>,
     ) -> crate::Result<()> {
         use crate::table::column_page::{PageDirectory, PageId, PageStamp};
 
@@ -2942,7 +3147,12 @@ impl Writer {
         check_group_column_count(batch)?;
         let page_transform = self.data_transform(self.data_block_compression)?;
         let directory_transform = self.data_transform(crate::CompressionType::None)?;
-        let group_tag = self.next_group_tag()?;
+        // A group copying another's pages keeps that group's tag, which every
+        // copied page's stamp names.
+        let group_tag = match carry {
+            Some(carry) => carry.tag,
+            None => self.next_group_tag()?,
+        };
 
         // The group's rows are cut into row pages shared by every column, and
         // each column gets one page per row page, all of one column's pages
@@ -2958,7 +3168,11 @@ impl Writer {
         // short tail page is kept rather than folded into the page before it:
         // folding costs the sparse scan more, since the enlarged page is read
         // whole whenever a match lands on it.
-        let row_pages = {
+        // A group copying pages keeps the source's row pages one for one, since
+        // a copied page's stamp names its row page by ordinal.
+        let row_pages = if let Some(carry) = carry {
+            carry.row_pages.clone()
+        } else {
             let cuts = batch.row_page_cuts(self.columnar_page_size)?;
             // The directory counts the group's column pages in a `u16`, so a
             // page size that gives more row pages than it can list merges
@@ -2976,8 +3190,10 @@ impl Writer {
                     .collect()
             }
         };
+        // Each page is encoded here, or, on a row page a carry names as
+        // unchanged, the source's page as it lies on disk.
         let mut payloads = Vec::with_capacity(batch.columns.len() * row_pages.len());
-        for col in &batch.columns {
+        for (column, col) in batch.columns.iter().enumerate() {
             let id = PageId {
                 column_id: col.column_id,
                 part: 0,
@@ -2988,6 +3204,11 @@ impl Writer {
                     crate::Error::InvalidHeader("columnar: more row pages than a group holds")
                 })?;
                 let end = start + rows;
+                if let Some(copied) = carry.and_then(|carry| carry.page(column, index)) {
+                    payloads.push((id, row_page, PagePayload::Copied(copied)));
+                    start = end;
+                    continue;
+                }
                 let piece;
                 let page_rows = if row_pages.len() == 1 {
                     col
@@ -3003,7 +3224,11 @@ impl Writer {
                 payloads.push((
                     id,
                     row_page,
-                    page_rows.encode_page(rows, stamp, self.column_encoding)?,
+                    PagePayload::Encoded(page_rows.encode_page(
+                        rows,
+                        stamp,
+                        self.column_encoding,
+                    )?),
                 ));
                 start = end;
             }
@@ -3011,18 +3236,21 @@ impl Writer {
         let pages = payloads
             .iter()
             .map(|(id, row_page, payload)| {
-                let prepared = Block::prepare_with_flags(
-                    payload,
-                    super::block::BlockIdentity {
-                        table_id: self.table_id,
-                        block_type: super::block::BlockType::ColumnPage,
-                        dict_id: self.data_block_compression.dict_id(),
-                        window_log: 0,
-                    },
-                    &page_transform,
-                    0, // pages carry no per-KV checksum footer
-                )?;
-                Ok((*id, *row_page, prepared))
+                let page = match payload {
+                    PagePayload::Encoded(payload) => PageOut::Prepared(Block::prepare_with_flags(
+                        payload,
+                        super::block::BlockIdentity {
+                            table_id: self.table_id,
+                            block_type: super::block::BlockType::ColumnPage,
+                            dict_id: self.data_block_compression.dict_id(),
+                            window_log: 0,
+                        },
+                        &page_transform,
+                        0, // pages carry no per-KV checksum footer
+                    )?),
+                    PagePayload::Copied(copied) => PageOut::Copied(*copied),
+                };
+                Ok((*id, *row_page, page))
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -3089,7 +3317,7 @@ impl Writer {
             row_pages,
             pages
                 .iter()
-                .map(|(id, row_page, prepared)| (*id, *row_page, prepared.on_disk_len(self.ecc))),
+                .map(|(id, row_page, page)| (*id, *row_page, page.on_disk_len(self.ecc))),
             head_zone_block.as_ref().map(listing),
             zone_blocks.iter().map(listing).collect(),
         )?;
@@ -3120,14 +3348,32 @@ impl Writer {
                 .write_to(&mut self.file_writer, at)?
                 .uncompressed_length,
         );
-        for prepared in head_zone_block
+        for page in head_zone_block
             .into_iter()
-            .map(|(_, prepared)| prepared)
-            .chain(pages.into_iter().map(|(_, _, prepared)| prepared))
-            .chain(zone_blocks.into_iter().map(|(_, prepared)| prepared))
+            .map(|(_, prepared)| PageOut::Prepared(prepared))
+            .chain(pages.into_iter().map(|(_, _, page)| page))
+            .chain(
+                zone_blocks
+                    .into_iter()
+                    .map(|(_, prepared)| PageOut::Prepared(prepared)),
+            )
         {
             let at = next_block_at(self.table_id, &self.file_writer);
-            let header = prepared.write_to(&mut self.file_writer, at)?;
+            let header = match page {
+                PageOut::Prepared(prepared) => prepared.write_to(&mut self.file_writer, at)?,
+                PageOut::Copied(copied) => {
+                    // The page's checksum is bound to the place it lay; the
+                    // payload is written as it is.
+                    let mut frame = copied.frame.to_vec();
+                    super::block::Header::rebind_verified_frame(&mut frame, copied.at, at)?;
+                    #[cfg(not(feature = "std"))]
+                    use crate::io::Write;
+                    #[cfg(feature = "std")]
+                    use std::io::Write;
+                    self.file_writer.write_all(&frame)?;
+                    copied.header
+                }
+            };
             bytes_written = bytes_written
                 .checked_add(header.on_disk_size_with(self.ecc))
                 .ok_or(crate::Error::InvalidHeader(
@@ -3135,7 +3381,10 @@ impl Writer {
                 ))?;
             uncompressed += u64::from(header.uncompressed_length);
         }
-        self.last_group_tag = Some(group_tag);
+        if carry.is_none() {
+            self.last_encoded_tag = Some(group_tag);
+        }
+        self.group_tags.insert(group_tag);
 
         // Per-column zone-map stats for this row group, derived once from the
         // batch. Gated on the zone-map policy exactly like the row-block
@@ -3386,6 +3635,7 @@ impl Writer {
             inputs.seqno_bounds,
             inputs.item_count,
             inputs.zone_block_min,
+            None,
         )?;
         // This block's keys were recorded with the current locator ordinal;
         // advance it so a following batch's keys belong to the next block (the
@@ -3924,48 +4174,131 @@ impl Writer {
             Some(row_group_ref(group_tag, directory_len, head_zones_len)?),
             comparator,
         )?;
-        self.last_group_tag = Some(group_tag);
+        self.group_tags.insert(group_tag);
         Ok(first_key)
     }
 
-    /// Whether a row group tagged `group_tag` may be copied in next. A copy
-    /// keeps the tag its pages were stamped with, so it must still be above
-    /// every tag already in the table; a group encoded here takes the next
-    /// one instead.
+    /// Appends `raw`, a row group of another table copied whole, whose rows are
+    /// `rows` and whose values are stored as `layout`, under the tag and
+    /// lengths `group` records for it; `columns` are its per-column zone-map
+    /// statistics, as its own table recorded them.
     ///
-    /// A salvage copying one source table in key order always satisfies
-    /// this: the source's tags increase, a first group it re-encodes takes
+    /// Returns `false`, writing nothing, when this table cannot take the group
+    /// as it is: a row-major table, one whose values are stored the other way,
+    /// one already holding the group's tag, one keeping a zone map the group
+    /// has no statistics for, or one the group's rows do not continue in
+    /// internal-key order. The caller then writes the rows instead.
+    ///
+    /// The group's transform must be this writer's: its pages compressed with
+    /// this writer's codec and dictionary, and neither encrypted nor
+    /// ECC-protected, which a caller establishes before offering it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_verbatim_row_group`], plus
+    /// [`crate::Error::InvalidHeader`] when `raw` does not tile into whole
+    /// blocks.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn append_carried_row_group(
+        &mut self,
+        (raw, source): (&[u8], VerbatimSource),
+        group: crate::table::index_block::RowGroupRef,
+        layout: crate::table::meta::ValueLayout,
+        rows: &[InternalValue],
+        columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<bool> {
+        use crate::coding::Decode;
+        use crate::table::block::Header;
+
+        // A table keeping a zone map needs the group's per-column statistics,
+        // which only the source's zone map holds for bytes copied unread.
+        if !self.use_columnar
+            || self.value_layout.is_some_and(|fixed| fixed != layout)
+            || !self.accepts_group_tag(group.tag.get())
+            || (self.use_zone_map && columns.is_none())
+        {
+            return Ok(false);
+        }
+        // Two inputs may hold one key at one seqno (a write repeated at the
+        // seqno it had), and the merge emits both; a table that took them so
+        // holds a group a copy refuses as out of order. Its rows go through
+        // the ordinary path, which keeps such a tie as the merge emitted it.
+        if self.validate_direct_block_order(rows, comparator).is_err() {
+            return Ok(false);
+        }
+        // What the group decodes to, summed over its blocks as an encoded
+        // group sums it.
+        let mut uncompressed = 0u64;
+        let mut at = 0usize;
+        while let Some(frame) = raw.get(at..).filter(|frame| !frame.is_empty()) {
+            let header = Header::decode_from(&mut &*frame)?;
+            let len = header.on_disk_size_with(self.ecc) as usize;
+            if len == 0 || len > frame.len() {
+                return Err(crate::Error::InvalidHeader(
+                    "carried row group does not tile into blocks",
+                ));
+            }
+            uncompressed += u64::from(header.uncompressed_length);
+            at += len;
+        }
+        self.append_verbatim_row_group(
+            (raw, source),
+            uncompressed,
+            (group.tag.get(), group.head_zones_len),
+            rows,
+            columns,
+            comparator,
+        )?;
+        self.value_layout = Some(layout);
+        Ok(true)
+    }
+
+    /// Whether a row group tagged `group_tag` may be copied in next. A copy
+    /// keeps the tag its pages were stamped with, so no group of the table may
+    /// have taken it already; a group encoded here takes a free one instead.
+    ///
+    /// A salvage copying one source table in key order always finds its tags
+    /// free: the source's tags are unique, a first group it re-encodes takes
     /// the source tag it replaces ([`Self::start_group_tags_at`]), and a later
-    /// one takes one above the last emitted, which is at most the source tag
-    /// it replaces.
+    /// one the first free tag above the last re-encoded, which is at most the
+    /// source tag it replaces. A compaction copying the groups of several
+    /// tables finds them free unless two of its inputs drew the same tags, by
+    /// chance: the groups it encodes take tags from the output's own base,
+    /// not from the sequence of a group it copied.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
-        group_tag != 0 && self.last_group_tag.is_none_or(|last| group_tag > last)
+        group_tag != 0 && !self.group_tags.contains(&group_tag)
     }
 
-    /// Starts this table's tags at `tag`, when no group has been written yet;
-    /// once one has, the order the written tags set stands. A salvage calls it
-    /// with each source group's tag before emitting the group, so a group it
-    /// must re-encode first takes the tag it replaces, and the source's later
-    /// groups, whose tags are above it, can still be copied verbatim.
+    /// Starts the tags of the groups encoded here at `tag`, when none has been
+    /// encoded yet; once one has, the order the encoded tags set stands. A
+    /// salvage calls it with each source group's tag before emitting the
+    /// group, so a group it must re-encode first takes the tag it replaces,
+    /// and the source's later groups, whose tags are above it, can still be
+    /// copied verbatim.
     #[cfg(feature = "columnar")]
     pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
-        if self.last_group_tag.is_none() && tag != 0 {
+        if self.last_encoded_tag.is_none() && tag != 0 {
             self.group_tag_base = tag;
         }
     }
 
-    /// The tag for the next row group encoded here: never zero, since the base
-    /// is not and the increments are checked.
+    /// The tag for the next row group encoded here: the first tag past the
+    /// last one encoded, or the base before any, that no group of the table
+    /// took. Never zero, since the base is not and the increments are checked.
     #[cfg(feature = "columnar")]
     fn next_group_tag(&self) -> crate::Result<u64> {
-        match self.last_group_tag {
-            None => Ok(self.group_tag_base),
-            Some(last) => last.checked_add(1).ok_or(crate::Error::InvalidHeader(
-                "columnar: row group tags exhausted",
-            )),
+        let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
+        let mut tag = match self.last_encoded_tag {
+            None => self.group_tag_base,
+            Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
+        };
+        while self.group_tags.contains(&tag) {
+            tag = tag.checked_add(1).ok_or_else(exhausted)?;
         }
+        Ok(tag)
     }
 
     /// `raw`, the blocks of one extent copied from `source`, with each block's
@@ -3994,7 +4327,7 @@ impl Writer {
                 ));
             }
             let relative = at as u64;
-            Header::rebind_frame(
+            Header::rebind_verified_frame(
                 frame,
                 ChecksumAt::table(source.table_id, source.offset + relative),
                 ChecksumAt::table(self.table_id, dest + relative),
@@ -5066,6 +5399,9 @@ struct MetaSectionParams<'a> {
     /// How the columnar blocks store each row's value; written only for a
     /// columnar table.
     value_layout: crate::table::meta::ValueLayout,
+    /// How the row groups were cut and encoded; written only for a columnar
+    /// table.
+    group_shape: crate::table::meta::GroupShape,
     /// Bulk-ingest provenance: `Some(_)` writes `descriptor#bulk_ingested`,
     /// `None` omits it (unknown provenance, preserving a legacy SST's absence).
     bulk_ingested: Option<bool>,
@@ -5352,6 +5688,10 @@ fn encode_meta_payload(
     // which one its column is. A row-major table has no value columns.
     if p.use_columnar {
         meta_items.push(meta("descriptor#value_layout", &[p.value_layout.to_byte()]));
+        // How its row groups were cut and encoded: a group copied into
+        // another table keeps all of it, so a copy goes only into a table
+        // that would write it the same way.
+        meta_items.push(meta("descriptor#group_shape", &p.group_shape.to_bytes()));
     }
 
     // L0 recency key, on every table: the reader requires it.

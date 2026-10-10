@@ -102,6 +102,10 @@
     "blobs-well-placed": "Large values stored as blobs, written in key order.",
     "blobs-scattered": "The same blobs scattered across files by strided rewrites.",
     "metadata-only-update": "Every wide cell row rewritten with a new header field, its 4 KiB payload kept by reference: payload bytes written per row, expected zero.",
+    "compaction-one-segment": "One columnar segment compacted with every version kept: the share of its output encoded again rather than copied, near zero.",
+    "compaction-overlap-8": "Eight interleaved segments compacted the same way: every group encoded again.",
+    "compaction-row-updates-over-columnar-base": "Row updates over a columnar base compacted the same way: updates in every row page, what a dense update leaves to copy.",
+    "compaction-wide-cells": "Cell rows with blob payloads compacted the same way: groups copied whole with their references.",
   };
 
   const data = window.BENCHMARK_DATA;
