@@ -189,6 +189,24 @@ impl TombstoneShare {
             })
     }
 
+    /// Whether a pending tombstone starts past `after`, the key last advanced
+    /// to, and at or before `through`: one that would open between two keys
+    /// written at once.
+    #[cfg(feature = "columnar")]
+    pub(super) fn starts_within(
+        &self,
+        tombstones: &[RangeTombstone],
+        (after, through): (&[u8], &[u8]),
+        comparator: &dyn UserComparator,
+    ) -> bool {
+        tombstones
+            .get(self.next_start..)
+            .unwrap_or_default()
+            .iter()
+            .find(|rt| comparator.compare(&rt.start, after) == Ordering::Greater)
+            .is_some_and(|rt| comparator.compare(&rt.start, through) != Ordering::Greater)
+    }
+
     /// The least end among the open tombstones.
     pub(super) fn first_open_end<'t>(
         &self,

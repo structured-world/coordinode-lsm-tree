@@ -1558,6 +1558,18 @@ impl MultiWriter {
                 &first.key.user_key,
                 self.comparator.as_ref(),
             );
+            // A tombstone starting among the group's keys could take the table
+            // past its target between two of them, where rows written one by
+            // one would close it: those rows are written so. Advancing to the
+            // first key again for them changes nothing.
+            if self.tombstone_share.starts_within(
+                &self.range_tombstones,
+                (&first.key.user_key, &last.key.user_key),
+                self.comparator.as_ref(),
+            ) {
+                self.current_key = previous_key;
+                return Ok(false);
+            }
             if previous_key.is_none() && self.clip_range_tombstones {
                 self.tombstone_share.open_output(&first.key.user_key);
             }

@@ -98,6 +98,44 @@ fn compaction_disjoint_columnar_tables_carries_every_row_group() {
     assert_blocks_verify(&tree);
 }
 
+/// Range tombstones older than the rows they span leave the rows as they
+/// were, but a table holding them may have to close between two of those
+/// rows: a group a tombstone starts inside is written as rows, which check
+/// the table's size at every key, and the groups no tombstone starts in are
+/// still copied.
+#[test]
+fn compaction_group_a_tombstone_starts_inside_is_written() {
+    let folder = get_tmp_folder();
+    let tree = open_columnar(folder.path());
+    for i in 0..2_000 {
+        tree.insert(key(i), value(i, 0), 10_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0).expect("flush");
+    let groups = row_groups(&tree);
+    // Tombstones between the first groups' keys, older than every row.
+    for j in 0..100u32 {
+        tree.remove_range(key(100 + j), key(101 + j), u64::from(j) + 1);
+    }
+    tree.flush_active_memtable(0).expect("flush");
+
+    tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+
+    let carried = tree.metrics().compaction_groups_carried();
+    assert!(carried > 0, "the groups no tombstone starts in are copied");
+    assert!(
+        carried < groups,
+        "{carried} of {groups} groups copied, those holding tombstone starts included"
+    );
+    for i in 0..2_000 {
+        assert_eq!(
+            tree.get(key(i), SeqNo::MAX).expect("get").as_deref(),
+            Some(value(i, 0).as_slice()),
+            "key {i}",
+        );
+    }
+    assert_blocks_verify(&tree);
+}
+
 /// A key rewritten at the seqno it already had leaves two tables holding one
 /// internal key; the first merge emits both into one group, and the next must
 /// write that group's rows rather than copy a group whose order a copy

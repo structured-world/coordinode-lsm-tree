@@ -32,6 +32,31 @@ fn the_share_tracks_only_the_open_tombstones() {
     assert!(share.tracked() <= 8, "{} tracking entries", share.tracked());
 }
 
+/// A tombstone starting past the key advanced to and at or before the last
+/// key of a run would open within it; one starting at the key advanced to
+/// opened there already, and one starting past the run opens after it.
+#[cfg(feature = "columnar")]
+#[test]
+fn starts_within_finds_a_tombstone_opening_inside_a_run() {
+    let comparator = default_comparator();
+    let tombstone = |start: u64, end: u64| {
+        RangeTombstone::new(UserKey::from(key(start)), UserKey::from(key(end)), 1)
+    };
+    let tombstones = vec![tombstone(10, 11), tombstone(20, 21), tombstone(30, 31)];
+    let mut share = TombstoneShare::new();
+    share.advance(&tombstones, &key(10), comparator.as_ref());
+
+    let within = |through: u64| {
+        share.starts_within(&tombstones, (&key(10), &key(through)), comparator.as_ref())
+    };
+    assert!(!within(19), "the next one starts past the run");
+    assert!(within(20), "the next one starts at the run's last key");
+    assert!(within(25));
+    // Past every tombstone, none is pending.
+    share.advance(&tombstones, &key(40), comparator.as_ref());
+    assert!(!share.starts_within(&tombstones, (&key(40), &key(50)), comparator.as_ref()));
+}
+
 /// Overlapping tombstones of scattered ends: at every key the share equals
 /// the bytes of the pieces an output from the last boundary would hold,
 /// counted directly.
