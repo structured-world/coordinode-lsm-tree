@@ -114,7 +114,8 @@ fn relocating_compaction_records_no_group() -> crate::Result<()> {
         tree.get("big2", SeqNo::MAX)?.as_deref(),
         Some(big.as_slice())
     );
-    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 2_003);
+    // `big`, `big2` and the 2 000 small keys.
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 2_002);
     Ok(())
 }
 
