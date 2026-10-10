@@ -281,10 +281,11 @@ fn a_group_holding_a_boundary_is_written_so_the_output_ends_on_it() -> crate::Re
                 CompressionPolicy::all(crate::CompressionType::None);
         })?;
         let mut seqno = 1;
-        // Tables of 50 keys below: half their boundaries fall between two
-        // keys of a 4-row group above, not on a group's edge.
-        for start in (0..3_000).step_by(50) {
-            flush_into(&tree, start..start + 50, 700, 3, &mut seqno)?;
+        // Tables of 30 keys below: every other boundary falls between two keys
+        // of a 4-row group above, once the output holds 28 rows, past half
+        // its target, and before the writer's held state closes it.
+        for start in (0..3_000).step_by(30) {
+            flush_into(&tree, start..start + 30, 700, 3, &mut seqno)?;
         }
         flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
         let groups_in: u64 = tables(&tree, 1)
@@ -315,7 +316,8 @@ fn a_group_holding_a_boundary_is_written_so_the_output_ends_on_it() -> crate::Re
     assert!(carried > 0, "the groups holding no boundary are copied");
     assert!(
         carried < groups_in,
-        "{carried} of {groups_in} groups copied, those an output ends inside included"
+        "{carried} of {groups_in} groups copied, those an output ends inside included: outputs \
+         end at {outputs:?}, the level below at {boundaries:?}"
     );
     let (_, cut) = outputs.split_last().unwrap();
     for last in cut {

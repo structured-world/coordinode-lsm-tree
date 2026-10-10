@@ -38,12 +38,13 @@ const TABLE_TARGET: u64 = 256 << 10;
 /// Point reads taken after each flush and the compactions it triggered.
 const READS_PER_FLUSH: u64 = 200;
 
-/// The bytes compaction may write after each flush, per byte flushed: less
-/// than the writes call for, so debt builds up while the tree is written to,
-/// as when compaction I/O lags ingest. Both arms get the same budget, in bytes
-/// rather than merges, since a merge of fewer tables costs less. A merge under
-/// way runs to its end, and what is left is drained once the stream ends.
-const COMPACTION_BYTES_PER_FLUSHED_BYTE: u64 = 2;
+/// The bytes compaction may write per byte flushed: less than the writes call
+/// for, so debt builds up while the tree is written to, as when compaction I/O
+/// lags ingest. Both arms get the same budget in bytes rather than in merges,
+/// since a merge of fewer tables costs less. A merge under way runs to its
+/// end and what it overspends is taken from the next flush's budget, so over
+/// the stream both arms spend the same; what is left is drained at its end.
+const COMPACTION_BYTES_PER_FLUSHED_BYTE: i64 = 2;
 
 /// What one arm measured.
 struct Arm {
@@ -124,6 +125,8 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
     };
     let mut seqno = 1u64;
     let mut pending = 0u64;
+    // Bytes compaction may still write: negative after a merge overspent it.
+    let mut allowance = 0i64;
     for _ in 0..config.num {
         let key = make_sequential_key(stream.random_range(0..keys), config.key_size);
         tree.insert(key, value.clone(), seqno);
@@ -136,13 +139,9 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
         pending = 0;
         let step = Instant::now();
         tree.flush_active_memtable(seqno)?;
-        compact(
-            &tree,
-            &strategy,
-            seqno,
-            Some(COMPACTION_BYTES_PER_FLUSHED_BYTE * FLUSH_BYTES),
-            &mut arm,
-        )?;
+        allowance +=
+            COMPACTION_BYTES_PER_FLUSHED_BYTE * i64::try_from(FLUSH_BYTES).unwrap_or(i64::MAX);
+        compact(&tree, &strategy, seqno, Some(&mut allowance), &mut arm)?;
         let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
         arm.steps.saturating_record(nanos);
         let debt = strategy.pending_compaction_bytes(&tree.current_version());
@@ -165,18 +164,23 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
     Ok(arm)
 }
 
-/// Runs compactions until the strategy has nothing to do, or until they wrote
-/// `budget` bytes. No snapshot is held, so every version below `seqno` may go.
+/// Runs compactions until the strategy has nothing to do, or while
+/// `allowance` has bytes left, taking what each writes from it. No snapshot is
+/// held, so every version below `seqno` may go.
 fn compact(
     tree: &AnyTree,
     strategy: &Arc<dyn CompactionStrategy>,
     seqno: u64,
-    budget: Option<u64>,
+    mut allowance: Option<&mut i64>,
     arm: &mut Arm,
 ) -> lsm_tree::Result<()> {
-    let before = tree.metrics().compaction_bytes_written();
-    while budget.is_none_or(|budget| tree.metrics().compaction_bytes_written() - before < budget) {
+    while allowance.as_deref().is_none_or(|left| *left > 0) {
+        let before = tree.metrics().compaction_bytes_written();
         let result = tree.compact(Arc::clone(strategy), seqno)?;
+        if let Some(left) = allowance.as_deref_mut() {
+            let written = tree.metrics().compaction_bytes_written() - before;
+            *left -= i64::try_from(written).unwrap_or(i64::MAX);
+        }
         match result.action {
             CompactionAction::Nothing => break,
             CompactionAction::Merged => {
