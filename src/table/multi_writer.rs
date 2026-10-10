@@ -1719,8 +1719,8 @@ impl MultiWriter {
                 bytes > ceiling
             } else {
                 // A group past the ceiling on its own takes any output with a
-                // record past it, hence the floor of zero.
-                load.is_some_and(|load| load.reaches(ceiling.checked_sub(bytes).unwrap_or(0)))
+                // record past it; a smaller one, an output past what it leaves.
+                load.is_some_and(|load| bytes > ceiling || load.reaches(ceiling - bytes))
             };
             if past_ceiling {
                 return true;
