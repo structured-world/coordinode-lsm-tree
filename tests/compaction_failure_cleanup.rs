@@ -209,6 +209,16 @@ fn a_merge_copying_groups_failing_to_read_leaves_none_of_its_tables() -> lsm_tre
             |i| value(i, 0),
         )?;
     }
+    // The scans stream the groups after the first: failing that stream
+    // alone fails a group read part-way through the scan that records it.
+    for skip in [3, 8] {
+        assert_fails_cleanly(
+            &f,
+            [io_error(FaultOp::Read, "tables", skip)],
+            16 * 1024,
+            |i| value(i, 0),
+        )?;
+    }
     Ok(())
 }
 

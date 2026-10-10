@@ -606,16 +606,16 @@ pub(super) trait CompactionFlavour {
     }
 
     /// The count of the compaction filter's transformations so far, `None`
-    /// without a filter (see [`crate::compaction::carry::CarrySink`]).
+    /// without a filter (see [`crate::compaction::carry::CarrySink`]). Every
+    /// flavour answers it, as a held row written without it would take the
+    /// next output's transformations.
     #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> Option<u64> {
-        None
-    }
+    fn transforms_seen(&self) -> Option<u64>;
 
     /// Closes the current output's transformation window at `seen` for the
     /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
     #[cfg(feature = "columnar")]
-    fn settle_transforms(&mut self, _seen: u64) {}
+    fn settle_transforms(&mut self, seen: u64);
 
     /// Writes range tombstones to the current output table.
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
