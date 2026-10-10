@@ -177,6 +177,56 @@ pub(super) fn plan_filters(
     )
 }
 
+/// The boundaries between adjacent tables of each run of the level
+/// `payload`'s outputs are merged into next, in key order: none when output
+/// alignment is off or the destination is the last level. A run's last table
+/// has no boundary after it, since an output past it overlaps no further table
+/// of that run.
+fn next_level_boundaries(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
+    use crate::version::run::Ranged;
+
+    if !opts.config.compaction_output_alignment {
+        return alloc::sync::Arc::from([]);
+    }
+    let Some(level) = version.level(usize::from(payload.dest_level) + 1) else {
+        return alloc::sync::Arc::from([]);
+    };
+    let comparator = opts.config.comparator.as_ref();
+    let mut boundaries: Vec<_> = level
+        .iter()
+        .flat_map(|run| {
+            run.iter().zip(run.iter().skip(1)).map(|(before, after)| {
+                crate::table::multi_writer::Boundary {
+                    key: before.key_range().max().clone(),
+                    after_bytes: after.file_size(),
+                }
+            })
+        })
+        .collect();
+    boundaries.sort_by(|a, b| comparator.compare(&a.key, &b.key));
+    boundaries.into()
+}
+
+/// The largest key among `payload`'s inputs: no key the compaction writes
+/// sorts past it.
+fn inputs_upper(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> Option<crate::UserKey> {
+    let comparator = opts.config.comparator.as_ref();
+    version
+        .iter_tables()
+        .filter(|table| payload.table_ids.contains(&table.id()))
+        .map(|table| table.metadata.key_range.max())
+        .max_by(|a, b| comparator.compare(a, b))
+        .cloned()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a per-compaction choice its writers share (the filter \
@@ -295,7 +345,11 @@ pub(super) fn prepare_table_writer(
     .use_lineage(Some(payload.table_ids.iter().copied().collect()))
     .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
-    .use_clip_range_tombstones();
+    .use_clip_range_tombstones()
+    .use_cut_alignment(
+        next_level_boundaries(version, opts, payload),
+        inputs_upper(version, opts, payload),
+    );
 
     if let Some(marker) = transform_marker {
         table_writer = table_writer.use_transform_marker(marker);

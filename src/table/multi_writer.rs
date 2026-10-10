@@ -2,7 +2,10 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+mod cut_alignment;
 mod tombstone_share;
+
+pub use cut_alignment::Boundary;
 
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
@@ -256,6 +259,11 @@ pub struct MultiWriter {
     /// Where a compaction learns of every table file this writer creates, so
     /// it can remove the ones it never installs. `None` outside compaction.
     outputs: Option<crate::compaction::output_ledger::OutputLedger>,
+
+    /// The boundaries of the level a compaction's outputs are merged into
+    /// next, which an output prefers to end on. `None` cuts at the target
+    /// size alone.
+    alignment: Option<cut_alignment::CutAlignment>,
 }
 
 impl MultiWriter {
@@ -357,7 +365,68 @@ impl MultiWriter {
             parallel: None,
 
             outputs: None,
+
+            alignment: None,
         })
+    }
+
+    /// Prefers to end outputs on `boundaries`, the boundaries between the
+    /// tables of the level the outputs are merged into next, sorted by the
+    /// writer's comparator (see `cut_alignment`); `upper`, when known, is the
+    /// last key the writer can be handed. An empty list cuts at the target size
+    /// alone.
+    #[must_use]
+    pub(crate) fn use_cut_alignment(
+        mut self,
+        boundaries: Arc<[Boundary]>,
+        upper: Option<UserKey>,
+    ) -> Self {
+        self.alignment =
+            (!boundaries.is_empty()).then(|| cut_alignment::CutAlignment::new(boundaries, upper));
+        self
+    }
+
+    /// Bounds the keys this writer can be handed by `upper`: a writer of one
+    /// key range of a compaction does not wait for a boundary past it.
+    pub(crate) fn limit_cut_alignment(&mut self, upper: UserKey) {
+        if let Some(alignment) = &mut self.alignment {
+            alignment.limit(upper);
+        }
+    }
+
+    /// Whether the current output ends before `key`, the next new key, and
+    /// where `key` falls among the boundaries, which [`Self::commit_cut`] takes
+    /// once the output it goes into is known. Without boundaries the output
+    /// ends at the target size.
+    fn decide_cut(&self, key: &[u8]) -> (bool, Option<cut_alignment::Crossing>) {
+        let Some(alignment) = &self.alignment else {
+            return (self.table_full() && self.rotation_sheds(key, (0, 0)), None);
+        };
+        let comparator = self.comparator.as_ref();
+        let mut crossing = alignment.crossing(key, comparator);
+        let full = |percent| self.table_full_at(cut_alignment::share_of(self.target_size, percent));
+        let past_half = full(50);
+        // A boundary passed below half the target is no candidate, so it does
+        // not raise the share the output is cut at later.
+        if !past_half {
+            crossing.counted = 0;
+        }
+        let cut = past_half
+            && (full(200)
+                || if crossing.counted > 0 {
+                    full(alignment.floor_percent(crossing))
+                } else {
+                    !alignment.ahead(crossing, comparator) && full(100)
+                });
+        (cut && self.rotation_sheds(key, (0, 0)), Some(crossing))
+    }
+
+    /// Takes the key `crossing` was decided at into the output: a new one when
+    /// `cut`.
+    fn commit_cut(&mut self, crossing: Option<cut_alignment::Crossing>, cut: bool) {
+        if let (Some(alignment), Some(crossing)) = (&mut self.alignment, crossing) {
+            alignment.commit(crossing, cut);
+        }
     }
 
     /// Records the table file already open and every one a rotation creates
@@ -1238,6 +1307,13 @@ impl MultiWriter {
     /// `finish`. Rows that compress well reach the second first: their data
     /// stays small while the filter, index and locator state grow per key.
     fn table_full(&self) -> bool {
+        self.table_full_at(self.target_size)
+    }
+
+    /// Like [`Self::table_full`], the table's size judged against `size_target`
+    /// rather than the target; the state it holds is judged against the target
+    /// whatever the size it is cut at, since that bounds memory.
+    fn table_full_at(&self, size_target: u64) -> bool {
         // A table holds at least one record: closing an empty one would write
         // its tombstones alone, unclipped, over its successors' keys.
         if self.writer.meta.key_count == 0 {
@@ -1252,7 +1328,7 @@ impl MultiWriter {
         // tombstones starting at the key go where the key goes, and the last
         // key has no successor whose check would count them, so they count here.
         let (tombstones, pieces, longest) = self.tombstones_at_key();
-        self.full_with_tombstones(tombstones, pieces, longest, (0, 0))
+        self.full_with_tombstones(tombstones, pieces, longest, (0, 0), size_target)
     }
 
     /// The current output's share of the range tombstones at the current key:
@@ -1283,13 +1359,14 @@ impl MultiWriter {
     /// count, and zero for a table with records. The writer holds each entry
     /// until `finish`, which encodes them into a block buffer and frames that
     /// when the block is transformed. The table's key range widens to the
-    /// entries' bounds.
+    /// entries' bounds. Its bytes are judged against `size_target`.
     fn full_with_tombstones(
         &self,
         tombstones: u64,
         pieces: u64,
         longest: u64,
         alone: (u64, u64),
+        size_target: u64,
     ) -> bool {
         use crate::table::block::{BlockType, framed_len_bound};
 
@@ -1346,7 +1423,7 @@ impl MultiWriter {
         // them smaller.
         let block = self.writer.block_len();
         if alone_written > 0 {
-            return size >= self.target_size.max(alone_written + block)
+            return size >= size_target.max(alone_written + block)
                 || held >= self.target_size.max(writer_held + alone_held + block);
         }
         let (base_held, base_tombstones) = self.output_base.unwrap_or((0, 0));
@@ -1357,7 +1434,7 @@ impl MultiWriter {
         } else {
             self.target_size
         };
-        (holds_content && size >= self.target_size) || held >= held_target
+        (holds_content && size >= size_target) || held >= held_target
     }
 
     /// Closing the current table at `key` sheds what it holds: the next one
@@ -1437,12 +1514,12 @@ impl MultiWriter {
             // A table records one value layout, so a row after an ingested
             // batch starts the next table.
             let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
-            if layout_changes
-                || (self.table_full() && self.rotation_sheds(&item.key.user_key, (0, 0)))
-            {
+            let (cut, crossing) = self.decide_cut(&item.key.user_key);
+            if layout_changes || cut {
                 self.rotate()?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
+            self.commit_cut(crossing, layout_changes || cut);
         }
 
         self.writer.write(item)?;
@@ -1488,9 +1565,20 @@ impl MultiWriter {
         rows: &[InternalValue],
         columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
     ) -> crate::Result<bool> {
-        self.carry_into((compression, layout), rows, |writer, comparator| {
-            writer.append_carried_row_group((raw, source), group, layout, rows, columns, comparator)
-        })
+        self.carry_into(
+            (compression, layout),
+            (rows, raw.len() as u64),
+            |writer, comparator| {
+                writer.append_carried_row_group(
+                    (raw, source),
+                    group,
+                    layout,
+                    rows,
+                    columns,
+                    comparator,
+                )
+            },
+        )
     }
 
     /// Writes `rows` as one group that copies the pages `carry` names from
@@ -1514,9 +1602,44 @@ impl MultiWriter {
     ) -> crate::Result<bool> {
         self.carry_into(
             (compression, crate::table::meta::ValueLayout::Whole),
-            rows,
+            // The source group's bytes bound what the copy saves.
+            (rows, carry.raw.len() as u64),
             |writer, comparator| writer.append_partly_carried_row_group(rows, carry, comparator),
         )
+    }
+
+    /// Whether a group about to be copied whole, `bytes` on disk and ending
+    /// at `last`, is cheaper written key by key so the output can end on the
+    /// boundary between its keys: the current output, not cut before it, is
+    /// already past the share of the target it would be cut at there. Copied,
+    /// the output straddles the boundary and the next merge reads and writes
+    /// the table after it again; written key by key, the group's bytes are
+    /// encoded again now. The cheaper of the two is taken.
+    #[cfg(feature = "columnar")]
+    fn splits_cheaper_than_straddling(
+        &self,
+        crossing: Option<cut_alignment::Crossing>,
+        last: &InternalValue,
+        bytes: u64,
+    ) -> bool {
+        let (Some(alignment), Some(crossing)) = (&self.alignment, crossing) else {
+            return false;
+        };
+        let Some(boundary) =
+            alignment.inside(crossing, &last.key.user_key, self.comparator.as_ref())
+        else {
+            return false;
+        };
+        // One boundary past those `crossing` counts: the one inside.
+        let inside = cut_alignment::Crossing {
+            passed: crossing.passed + 1,
+            counted: crossing.counted.saturating_add(1),
+        };
+        bytes < boundary.after_bytes
+            && self.table_full_at(cut_alignment::share_of(
+                self.target_size,
+                alignment.floor_percent(inside),
+            ))
     }
 
     /// Takes `rows`' first key as [`Self::write`] takes a new key and has
@@ -1526,7 +1649,7 @@ impl MultiWriter {
     fn carry_into(
         &mut self,
         (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
-        rows: &[InternalValue],
+        (rows, bytes): (&[InternalValue], u64),
         write: impl FnOnce(&mut Writer, &crate::comparator::SharedComparator) -> crate::Result<bool>,
     ) -> crate::Result<bool> {
         let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
@@ -1577,11 +1700,18 @@ impl MultiWriter {
         // A table records one value layout: a group stored the other way
         // starts the next table, a run of groups stored one way shares it.
         let layout_changes = self.value_layout.is_some_and(|current| current != layout);
-        if layout_changes || (self.table_full() && self.rotation_sheds(&first.key.user_key, (0, 0)))
-        {
+        let (cut, crossing) = self.decide_cut(&first.key.user_key);
+        if !(layout_changes || cut) && self.splits_cheaper_than_straddling(crossing, last, bytes) {
+            self.current_key = previous_key;
+            return Ok(false);
+        }
+        if layout_changes || cut {
             self.rotate()?;
             self.tombstone_share.open_output(&first.key.user_key);
         }
+        // Taken now: rows written one by one after a refused copy reach the
+        // same key in the same output, which has passed these boundaries.
+        self.commit_cut(crossing, layout_changes || cut);
 
         let comparator = self.comparator.clone();
         if !write(&mut self.writer, &comparator)? {
@@ -1592,14 +1722,21 @@ impl MultiWriter {
             self.current_key = previous_key;
             return Ok(false);
         }
-        // The group's later keys move the tombstone share as written rows
-        // would; it only moves forward, so its last key is enough.
+        // The group's later keys move the tombstone share and the boundaries
+        // as written rows would; both only move forward, so its last key is
+        // enough.
         if !self.range_tombstones.is_empty() {
             self.tombstone_share.advance(
                 &self.range_tombstones,
                 &last.key.user_key,
                 self.comparator.as_ref(),
             );
+        }
+        if self.alignment.is_some() {
+            let past_half = self.table_full_at(cut_alignment::share_of(self.target_size, 50));
+            if let Some(alignment) = &mut self.alignment {
+                alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
+            }
         }
         self.current_key = Some(last.key.user_key.clone());
         self.value_layout = Some(layout);
@@ -1747,6 +1884,7 @@ impl MultiWriter {
                         .longest_bound(&point)
                         .max(group.longest),
                     alone,
+                    self.target_size,
                 )
                 // The output after this one holds tombstones alone.
                 && self.rotation_sheds(&point, alone_overhead)
