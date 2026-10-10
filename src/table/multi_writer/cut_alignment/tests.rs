@@ -8,14 +8,19 @@ fn key(i: u32) -> Vec<u8> {
     format!("{i:06}").into_bytes()
 }
 
+#[cfg(feature = "columnar")]
 fn index_of(key: &[u8]) -> u32 {
-    core::str::from_utf8(key).unwrap().parse().unwrap()
+    core::str::from_utf8(key)
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(u32::MAX)
 }
 
 fn boundaries(keys: &[u32]) -> alloc::sync::Arc<[Boundary]> {
     keys.iter()
         .map(|&i| Boundary {
             key: UserKey::from(key(i)),
+            #[cfg(feature = "columnar")]
             after: vec![(UserKey::from(key(i + 1)), u64::from(i))],
         })
         .collect()

@@ -23,7 +23,9 @@
 
 use crate::UserKey;
 use crate::comparator::UserComparator;
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+#[cfg(feature = "columnar")]
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 /// A boundary between the tables of the level below: past every table before
@@ -34,10 +36,13 @@ pub struct Boundary {
     pub key: UserKey,
     /// The tables after it up to the next boundary, as their smallest key and
     /// their bytes, in key order: one table in a level of one run, a cluster
-    /// of overlapping ones in a level of several.
+    /// of overlapping ones in a level of several. Only a columnar writer, which
+    /// may copy a group across the boundary, weighs them.
+    #[cfg(feature = "columnar")]
     pub after: Vec<(UserKey, u64)>,
 }
 
+#[cfg(feature = "columnar")]
 impl Boundary {
     /// The bytes an output reaching past the boundary to `last` has the next
     /// merge read and write again: the tables after it that start at or

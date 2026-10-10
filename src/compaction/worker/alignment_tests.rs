@@ -336,6 +336,7 @@ fn overlapping_runs_give_no_boundary_inside_a_table_of_either() -> crate::Result
 /// Past a boundary of a level holding overlapping runs lies a cluster of
 /// tables, not one: an output reaching past the boundary has the next merge
 /// read every table of the cluster it reaches, and the boundary carries each.
+#[cfg(feature = "columnar")]
 #[test]
 fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
@@ -391,7 +392,7 @@ fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate:
                 index(&boundary.key)
             );
         }
-        let (first_min, _) = cluster[0];
+        let &(first_min, _) = cluster.first().unwrap();
         assert_eq!(
             boundary.reached_bytes(&key(first_min - 1), &cmp),
             0,

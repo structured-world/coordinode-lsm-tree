@@ -1808,11 +1808,13 @@ fn key_index(key: &[u8]) -> u32 {
 
 /// The boundaries at the largest keys `marks` of the tables below, each
 /// followed by one table of `after_bytes` starting at the next key.
+#[cfg_attr(not(feature = "columnar"), expect(unused_variables))]
 fn marks_at(marks: &[u32], after_bytes: u64) -> std::sync::Arc<[super::Boundary]> {
     marks
         .iter()
         .map(|&i| super::Boundary {
             key: crate::UserKey::from(seq_key(i)),
+            #[cfg(feature = "columnar")]
             after: vec![(crate::UserKey::from(seq_key(i + 1)), after_bytes)],
         })
         .collect()
