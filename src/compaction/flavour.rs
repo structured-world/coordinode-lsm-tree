@@ -337,6 +337,12 @@ pub(super) fn prepare_table_writer(
         opts.config.comparator.clone(),
     );
 
+    let boundaries = next_level_boundaries(version, opts, payload);
+    log::debug!(
+        "Outputs into L{} cut on {} boundaries of the level below",
+        payload.dest_level,
+        boundaries.len(),
+    );
     let mut table_writer = MultiWriter::new(
         table_base_folder,
         opts.table_id_generator.clone(),
@@ -357,10 +363,7 @@ pub(super) fn prepare_table_writer(
     .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones()
-    .use_cut_alignment(
-        next_level_boundaries(version, opts, payload),
-        inputs_upper(version, opts, payload),
-    );
+    .use_cut_alignment(boundaries, inputs_upper(version, opts, payload));
 
     if let Some(marker) = transform_marker {
         table_writer = table_writer.use_transform_marker(marker);
