@@ -231,7 +231,11 @@ fn run_arms(base: &Path, config: &BenchConfig) -> lsm_tree::Result<(Arm, Arm)> {
     let mut pending = 0u64;
     let mut steps = 0u64;
     let mut step = |arms: &mut [ArmRun; 2], flushed, seqno| -> lsm_tree::Result<()> {
-        let order = if steps % 2 == 0 { [0, 1] } else { [1, 0] };
+        let order = if steps.is_multiple_of(2) {
+            [0, 1]
+        } else {
+            [1, 0]
+        };
         steps += 1;
         for index in order {
             if let Some(arm) = arms.get_mut(index) {

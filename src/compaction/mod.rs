@@ -187,8 +187,7 @@ pub trait CompactionStrategy: Send + Sync {
     /// the base level. A strategy whose outputs are next merged elsewhere, such
     /// as back into the level they were written to, overrides it.
     fn next_merge_level(&self, version: &Version, dest_level: u8) -> Option<usize> {
-        (usize::from(dest_level) + 1..)
-            .take_while(|&index| version.level(index).is_some())
+        (usize::from(dest_level) + 1..version.level_count())
             .find(|&index| version.level(index).is_some_and(|level| !level.is_empty()))
     }
 }
