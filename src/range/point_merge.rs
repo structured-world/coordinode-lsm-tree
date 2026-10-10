@@ -177,10 +177,11 @@ pub fn resolve_point_merge(
     }
 
     // Newest first; at one seqno the newer source first, as the point read
-    // and a merging read take it.
-    entries.sort_unstable_by(|(a_rank, a), (b_rank, b)| {
-        b.key.seqno.cmp(&a.key.seqno).then(a_rank.cmp(b_rank))
-    });
+    // and a merging read take it. Stable: one batch's operands of the key
+    // share a seqno and a source, and an operator may depend on their order,
+    // which each source hands over as written.
+    entries
+        .sort_by(|(a_rank, a), (b_rank, b)| b.key.seqno.cmp(&a.key.seqno).then(a_rank.cmp(b_rank)));
     let Some((_, head)) = entries.first() else {
         return Ok(None);
     };

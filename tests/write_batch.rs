@@ -231,6 +231,47 @@ fn write_batch_with_merge_operand() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Many merges of one key in one batch share a seqno and a source: an
+/// order-sensitive operator still sees them in the order they were written,
+/// whether they sit in the memtable or in a table under an operand newer
+/// than them.
+#[test]
+fn write_batch_many_merges_keep_their_order() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(ConcatMerge)))
+    .open()?;
+
+    tree.insert("counter", "<", 0);
+    let mut batch = WriteBatch::new();
+    let mut expected = b"<".to_vec();
+    for i in 0..64u8 {
+        let operand = [b'0' + i];
+        batch.merge("counter", operand.to_vec());
+        expected.extend_from_slice(&operand);
+    }
+    tree.apply_batch(batch, 1)?;
+
+    assert_eq!(
+        tree.get("counter", 2)?.as_deref(),
+        Some(expected.as_slice())
+    );
+
+    tree.flush_active_memtable(0)?;
+    tree.merge("counter", ">", 2);
+    expected.push(b'>');
+    assert_eq!(
+        tree.get("counter", 3)?.as_deref(),
+        Some(expected.as_slice())
+    );
+
+    Ok(())
+}
+
 #[test]
 fn write_batch_remove_weak() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
