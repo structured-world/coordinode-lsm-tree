@@ -228,8 +228,9 @@ fn point_read_merge_rt_in_sealed_memtable() {
 /// and whose base for "counter" sits in a newer table above it at seqno 5.
 fn tree_with_a_deep_tombstone(folder: &tempfile::TempDir, rt_seqno: u64) -> lsm_tree::AnyTree {
     let tree = tree_with_merge(folder);
-    tree.insert("a", vec![0u8; 8], rt_seqno - 1);
-    tree.insert("e", vec![0u8; 8], rt_seqno - 1);
+    // Below the base: only the tombstone's seqno can order this table above it.
+    tree.insert("a", vec![0u8; 8], 0);
+    tree.insert("e", vec![0u8; 8], 0);
     tree.remove_range("c", "d", rt_seqno);
     tree.flush_active_memtable(0).unwrap();
     tree.major_compact(u64::MAX, 0).unwrap();
@@ -260,6 +261,22 @@ fn point_read_merge_deeper_older_tombstone_leaves_the_base() {
     tree.merge("counter", 42_i64.to_le_bytes(), 11);
 
     assert_eq!(get_counter(&tree, "counter", 12), Some(142));
+}
+
+/// An operand in the memtable and a value in a table share one seqno for the
+/// key, the table also holding a newer key: the memtable's version is the
+/// newer of the two, as the point read takes it, so it is merged onto the
+/// table's value rather than hidden by it.
+#[test]
+fn point_read_merge_same_seqno_takes_the_newer_source_first() {
+    let folder = tempdir().unwrap();
+    let tree = tree_with_merge(&folder);
+    tree.insert("counter", 100_i64.to_le_bytes(), 7);
+    tree.insert("zzz", vec![0u8; 8], 100);
+    tree.flush_active_memtable(0).unwrap();
+    tree.merge("counter", 5_i64.to_le_bytes(), 7);
+
+    assert_eq!(get_counter(&tree, "counter", 101), Some(105));
 }
 
 /// A base below a newer table holding operands: the read takes the operands

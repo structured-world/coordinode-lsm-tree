@@ -24,10 +24,15 @@ fn take_versions_stops_at_the_first_base() -> crate::Result<()> {
         .into_iter()
         .inspect(|_| read.set(read.get() + 1))
         .map(Ok),
+        4,
         &mut entries,
     )?;
-    let seqnos: Vec<u64> = entries.iter().map(|e| e.key.seqno).collect();
+    let seqnos: Vec<u64> = entries.iter().map(|(_, e)| e.key.seqno).collect();
     assert_eq!(seqnos, [9, 8, 7]);
+    assert!(
+        entries.iter().all(|&(rank, _)| rank == 4),
+        "each version keeps its source's rank"
+    );
     assert_eq!(read.get(), 3, "the version below the base is not read");
     Ok(())
 }
@@ -43,6 +48,7 @@ fn take_versions_takes_every_operand_without_a_base() -> crate::Result<()> {
         ]
         .into_iter()
         .map(Ok),
+        0,
         &mut entries,
     )?;
     assert_eq!(entries.len(), 2);
@@ -60,6 +66,7 @@ fn take_versions_returns_the_error_of_a_failed_read() {
             Ok(version(3, ValueType::Value)),
         ]
         .into_iter(),
+        0,
         &mut entries,
     );
     assert!(matches!(result, Err(crate::Error::Unrecoverable)));

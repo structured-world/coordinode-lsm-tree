@@ -59,12 +59,16 @@ pub fn resolve_point_merge(
     // The bounds of the memtable and table reads share this one copy.
     let user_key = UserKey::from(key);
 
-    let mut sources: Vec<(SeqNo, Source<'_>)> = Vec::new();
+    // Each source with its highest seqno and its recency rank: its place in
+    // the point read's order, memtables newest first, then the levels top
+    // down. Two sources holding the key at one seqno are ordered by the rank,
+    // which the highest seqno, taken over every key, cannot stand for.
+    let mut sources: Vec<(SeqNo, usize, Source<'_>)> = Vec::new();
     for memtable in core::iter::once(&super_version.active_memtable)
         .chain(super_version.sealed_memtables.iter().rev())
     {
         if let Some(highest) = memtable.get_highest_seqno() {
-            sources.push((highest, Source::Memtable(memtable)));
+            sources.push((highest, sources.len(), Source::Memtable(memtable)));
         }
     }
     let bounds = (Bound::Included(key), Bound::Included(key));
@@ -79,22 +83,25 @@ pub fn resolve_point_merge(
         };
         for table in run.get(lo..=hi).unwrap_or_default() {
             if table.check_key_range_overlap_cmp(&bounds, comparator) {
-                sources.push((table.get_highest_seqno(), Source::Table(table)));
+                sources.push((
+                    table.get_highest_seqno(),
+                    sources.len(),
+                    Source::Table(table),
+                ));
             }
         }
     }
-    // Stable: sources holding the same highest seqno keep the point read's
-    // order, memtables newest first, then the levels top down.
-    sources.sort_by(|a, b| b.0.cmp(&a.0));
+    sources.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-    let mut entries: Vec<InternalValue> = Vec::new();
+    // Each version with the rank of the source it was read from.
+    let mut entries: Vec<(usize, InternalValue)> = Vec::new();
     // Each with the read's seqno, the cutoff the merge checks it against.
     let mut tombstones: Vec<(RangeTombstone, SeqNo)> = Vec::new();
     // The seqno of the newest base found: what is below it is hidden.
     let mut floor: Option<SeqNo> = None;
 
-    for (highest, source) in &sources {
-        if floor.is_some_and(|floor| *highest < floor) {
+    for &(highest, rank, ref source) in &sources {
+        if floor.is_some_and(|floor| highest < floor) {
             // Every source left holds a highest seqno at most this one's.
             break;
         }
@@ -117,6 +124,7 @@ pub fn resolve_point_merge(
                         .range_internal(range)
                         .filter(|item| seqno_filter(item.key.seqno, seqno))
                         .map(Ok),
+                    rank,
                     &mut entries,
                 )?;
             }
@@ -146,6 +154,7 @@ pub fn resolve_point_merge(
                             ),
                             seqno,
                         ),
+                        rank,
                         &mut entries,
                     )?;
                 }
@@ -156,8 +165,8 @@ pub fn resolve_point_merge(
             .get(entries_before..)
             .unwrap_or_default()
             .iter()
-            .filter(|entry| !entry.key.value_type.is_merge_operand())
-            .map(|entry| entry.key.seqno);
+            .filter(|(_, entry)| !entry.key.value_type.is_merge_operand())
+            .map(|(_, entry)| entry.key.seqno);
         let hiding = tombstones
             .get(tombstones_before..)
             .unwrap_or_default()
@@ -167,10 +176,12 @@ pub fn resolve_point_merge(
         floor = floor.max(bases.chain(hiding).max());
     }
 
-    // Stable: equal seqnos keep the order the sources were read in, the
-    // newest source first, as the merging read resolves them.
-    entries.sort_by(|a, b| b.key.seqno.cmp(&a.key.seqno));
-    let Some(head) = entries.first() else {
+    // Newest first; at one seqno the newer source first, as the point read
+    // and a merging read take it.
+    entries.sort_unstable_by(|(a_rank, a), (b_rank, b)| {
+        b.key.seqno.cmp(&a.key.seqno).then(a_rank.cmp(b_rank))
+    });
+    let Some((_, head)) = entries.first() else {
         return Ok(None);
     };
     if tombstones
@@ -181,7 +192,7 @@ pub fn resolve_point_merge(
     }
 
     let resolved = MvccStream::new_with_comparator(
-        entries.into_iter().map(Ok),
+        entries.into_iter().map(|(_, entry)| Ok(entry)),
         Some(Arc::clone(merge_operator)),
         super_version.active_memtable.comparator.clone(),
     )
@@ -196,15 +207,17 @@ pub fn resolve_point_merge(
 }
 
 /// Takes one source's versions of the key, newest first, down to its first
-/// base: the source's older versions are hidden by it.
+/// base: the source's older versions are hidden by it. Each is kept with the
+/// source's recency `rank`.
 fn take_versions(
     versions: impl Iterator<Item = crate::Result<InternalValue>>,
-    entries: &mut Vec<InternalValue>,
+    rank: usize,
+    entries: &mut Vec<(usize, InternalValue)>,
 ) -> crate::Result<()> {
     for version in versions {
         let version = version?;
         let base = !version.key.value_type.is_merge_operand();
-        entries.push(version);
+        entries.push((rank, version));
         if base {
             break;
         }
