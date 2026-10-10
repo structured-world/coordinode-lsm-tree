@@ -226,41 +226,46 @@ fn point_read_merge_rt_in_sealed_memtable() {
 /// A tree whose range tombstone [c, d), with neighbours "a" and "e" keeping
 /// the table's key range around it, sits in the last level at `rt_seqno`,
 /// and whose base for "counter" sits in a newer table above it at seqno 5.
-fn tree_with_a_deep_tombstone(folder: &tempfile::TempDir, rt_seqno: u64) -> lsm_tree::AnyTree {
+fn tree_with_a_deep_tombstone(
+    folder: &tempfile::TempDir,
+    rt_seqno: u64,
+) -> lsm_tree::Result<lsm_tree::AnyTree> {
     let tree = tree_with_merge(folder);
     // Below the base: only the tombstone's seqno can order this table above it.
     tree.insert("a", vec![0u8; 8], 0);
     tree.insert("e", vec![0u8; 8], 0);
     tree.remove_range("c", "d", rt_seqno);
-    tree.flush_active_memtable(0).unwrap();
-    tree.major_compact(u64::MAX, 0).unwrap();
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
 
     tree.insert("counter", 100_i64.to_le_bytes(), 5);
-    tree.flush_active_memtable(0).unwrap();
-    tree
+    tree.flush_active_memtable(0)?;
+    Ok(tree)
 }
 
 /// A range tombstone newer than the base, held in a table below the base's,
 /// still hides the base: the read goes past the base's table because the
 /// deeper table holds a higher seqno.
 #[test]
-fn point_read_merge_deeper_newer_tombstone_hides_the_base() {
-    let folder = tempdir().unwrap();
-    let tree = tree_with_a_deep_tombstone(&folder, 10);
+fn point_read_merge_deeper_newer_tombstone_hides_the_base() -> lsm_tree::Result<()> {
+    let folder = tempdir()?;
+    let tree = tree_with_a_deep_tombstone(&folder, 10)?;
     tree.merge("counter", 42_i64.to_le_bytes(), 11);
 
     assert_eq!(get_counter(&tree, "counter", 12), Some(42));
+    Ok(())
 }
 
 /// A range tombstone older than the base, held in a table below it, hides
 /// nothing the merge reads.
 #[test]
-fn point_read_merge_deeper_older_tombstone_leaves_the_base() {
-    let folder = tempdir().unwrap();
-    let tree = tree_with_a_deep_tombstone(&folder, 3);
+fn point_read_merge_deeper_older_tombstone_leaves_the_base() -> lsm_tree::Result<()> {
+    let folder = tempdir()?;
+    let tree = tree_with_a_deep_tombstone(&folder, 3)?;
     tree.merge("counter", 42_i64.to_le_bytes(), 11);
 
     assert_eq!(get_counter(&tree, "counter", 12), Some(142));
+    Ok(())
 }
 
 /// An operand in the memtable and a value in a table share one seqno for the
@@ -268,34 +273,36 @@ fn point_read_merge_deeper_older_tombstone_leaves_the_base() {
 /// newer of the two, as the point read takes it, so it is merged onto the
 /// table's value rather than hidden by it.
 #[test]
-fn point_read_merge_same_seqno_takes_the_newer_source_first() {
-    let folder = tempdir().unwrap();
+fn point_read_merge_same_seqno_takes_the_newer_source_first() -> lsm_tree::Result<()> {
+    let folder = tempdir()?;
     let tree = tree_with_merge(&folder);
     tree.insert("counter", 100_i64.to_le_bytes(), 7);
     tree.insert("zzz", vec![0u8; 8], 100);
-    tree.flush_active_memtable(0).unwrap();
+    tree.flush_active_memtable(0)?;
     tree.merge("counter", 5_i64.to_le_bytes(), 7);
 
     assert_eq!(get_counter(&tree, "counter", 101), Some(105));
+    Ok(())
 }
 
 /// A base below a newer table holding operands: the read takes the operands
 /// first, then goes down to the base.
 #[test]
-fn point_read_merge_operands_above_a_deep_base() {
-    let folder = tempdir().unwrap();
+fn point_read_merge_operands_above_a_deep_base() -> lsm_tree::Result<()> {
+    let folder = tempdir()?;
     let tree = tree_with_merge(&folder);
     tree.insert("counter", 100_i64.to_le_bytes(), 0);
-    tree.flush_active_memtable(0).unwrap();
-    tree.major_compact(u64::MAX, 0).unwrap();
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
     tree.merge("counter", 1_i64.to_le_bytes(), 1);
     tree.merge("counter", 2_i64.to_le_bytes(), 2);
-    tree.flush_active_memtable(0).unwrap();
+    tree.flush_active_memtable(0)?;
     tree.merge("counter", 3_i64.to_le_bytes(), 3);
 
     assert_eq!(get_counter(&tree, "counter", 4), Some(106));
     // An older snapshot sees only the versions below it.
     assert_eq!(get_counter(&tree, "counter", 2), Some(101));
+    Ok(())
 }
 
 /// With the block cache off, a merge over a base in the last level and
@@ -303,10 +310,10 @@ fn point_read_merge_operands_above_a_deep_base() {
 /// table holding a base only: the older tables hold nothing above that base.
 #[cfg(feature = "metrics")]
 #[test]
-fn point_read_merge_loads_only_the_newest_base_table() {
+fn point_read_merge_loads_only_the_newest_base_table() -> lsm_tree::Result<()> {
     const NEWER: u64 = 4;
 
-    let folder = tempdir().unwrap();
+    let folder = tempdir()?;
     let lsm_tree::AnyTree::Standard(tree) = Config::new(
         &folder,
         SequenceNumberCounter::default(),
@@ -314,22 +321,24 @@ fn point_read_merge_loads_only_the_newest_base_table() {
     )
     .use_cache(Arc::new(lsm_tree::Cache::with_capacity_bytes(0)))
     .with_merge_operator(Some(Arc::new(CounterMerge)))
-    .open()
-    .unwrap() else {
+    .open()?
+    else {
         panic!("expected a standard tree");
     };
 
     tree.insert("counter", 0_i64.to_le_bytes(), 0);
-    tree.flush_active_memtable(0).unwrap();
-    tree.major_compact(u64::MAX, 0).unwrap();
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
     for seqno in 1..=NEWER {
         tree.insert("counter", (seqno as i64 * 100).to_le_bytes(), seqno);
-        tree.flush_active_memtable(0).unwrap();
+        tree.flush_active_memtable(0)?;
     }
     tree.merge("counter", 7_i64.to_le_bytes(), NEWER + 1);
 
     let before = tree.metrics().data_block_load_count();
-    let value = tree.get("counter", NEWER + 2).unwrap().unwrap();
+    let Some(value) = tree.get("counter", NEWER + 2)? else {
+        panic!("the merged key reads as missing");
+    };
     let loaded = tree.metrics().data_block_load_count() - before;
 
     assert_eq!(i64::from_le_bytes((*value).try_into().unwrap()), 407);
@@ -339,6 +348,7 @@ fn point_read_merge_loads_only_the_newest_base_table() {
         "only the newest of the {} tables holding a base is read",
         NEWER + 1
     );
+    Ok(())
 }
 
 /// Tables whose key range does not overlap the target key are skipped
