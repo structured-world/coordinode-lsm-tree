@@ -4120,3 +4120,6 @@ fn drop_tables(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod alignment_tests;

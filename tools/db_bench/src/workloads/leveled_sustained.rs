@@ -6,8 +6,9 @@
 //! straddles two tables of the level below drags both into that merge. So the
 //! series are what compaction costs while the tree is written to, not after it
 //! drains: the bytes compaction writes per byte written, the tables each merge
-//! reads, the debt left after each flush, and the time of point reads taken
-//! between flushes.
+//! reads, the debt left after each flush with compaction running behind the
+//! writes, the time each flush and its compactions hold the writer, and the
+//! time of point reads taken between flushes.
 
 use crate::config::BenchConfig;
 use crate::db::make_sequential_key;
@@ -37,6 +38,11 @@ const TABLE_TARGET: u64 = 256 << 10;
 /// Point reads taken after each flush and the compactions it triggered.
 const READS_PER_FLUSH: u64 = 200;
 
+/// Compactions run after each flush: fewer than the writes call for, so debt
+/// builds up while the tree is written to, as when compaction lags ingest.
+/// What is left is drained once the stream ends.
+const COMPACTIONS_PER_FLUSH: usize = 2;
+
 /// What one arm measured.
 struct Arm {
     /// Bytes of keys and values written.
@@ -46,12 +52,15 @@ struct Arm {
     /// Merges run, and the tables they read.
     merges: u64,
     merged_tables: u64,
-    /// Debt after each flush, before the compactions it triggers.
+    /// Debt after each flush and the compactions run after it.
     debt_peak: u64,
     debt_sum: u64,
     flushes: u64,
     /// Point read times, in nanoseconds.
     reads: Histogram<u64>,
+    /// Time of each flush and the compactions run after it, in nanoseconds:
+    /// the time the writer is held.
+    steps: Histogram<u64>,
 }
 
 impl Workload for LeveledSustained {
@@ -109,6 +118,7 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
         debt_sum: 0,
         flushes: 0,
         reads: Histogram::new_with_max(10_000_000_000, 3).expect("valid histogram params"),
+        steps: Histogram::new_with_max(1_000_000_000_000, 3).expect("valid histogram params"),
     };
     let mut seqno = 1u64;
     let mut pending = 0u64;
@@ -122,23 +132,21 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
             continue;
         }
         pending = 0;
+        let step = Instant::now();
         tree.flush_active_memtable(seqno)?;
+        compact(
+            &tree,
+            &strategy,
+            seqno,
+            Some(COMPACTIONS_PER_FLUSH),
+            &mut arm,
+        )?;
+        let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        arm.steps.saturating_record(nanos);
         let debt = strategy.pending_compaction_bytes(&tree.current_version());
         arm.debt_peak = arm.debt_peak.max(debt);
         arm.debt_sum += debt;
         arm.flushes += 1;
-        // No snapshot is held, so every version below the next write may go.
-        loop {
-            let result = tree.compact(Arc::clone(&strategy), seqno)?;
-            match result.action {
-                CompactionAction::Nothing => break,
-                CompactionAction::Merged => {
-                    arm.merges += 1;
-                    arm.merged_tables += result.tables_in as u64;
-                }
-                CompactionAction::Moved | CompactionAction::Dropped => {}
-            }
-        }
         for _ in 0..READS_PER_FLUSH {
             let key = make_sequential_key(lookups.random_range(0..keys), config.key_size);
             let at = Instant::now();
@@ -148,8 +156,34 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
             arm.reads.saturating_record(nanos);
         }
     }
+    // What the stream left is drained, so both arms end at a tree the strategy
+    // has nothing more to do for and their compaction bytes compare.
+    compact(&tree, &strategy, seqno, None, &mut arm)?;
     arm.compacted = tree.metrics().compaction_bytes_written() - compacted_before;
     Ok(arm)
+}
+
+/// Runs compactions until the strategy has nothing to do, or `limit` of them.
+/// No snapshot is held, so every version below `seqno` may go.
+fn compact(
+    tree: &AnyTree,
+    strategy: &Arc<dyn CompactionStrategy>,
+    seqno: u64,
+    limit: Option<usize>,
+    arm: &mut Arm,
+) -> lsm_tree::Result<()> {
+    for _ in 0..limit.unwrap_or(usize::MAX) {
+        let result = tree.compact(Arc::clone(strategy), seqno)?;
+        match result.action {
+            CompactionAction::Nothing => break,
+            CompactionAction::Merged => {
+                arm.merges += 1;
+                arm.merged_tables += result.tables_in as u64;
+            }
+            CompactionAction::Moved | CompactionAction::Dropped => {}
+        }
+    }
+    Ok(())
 }
 
 /// Publishes `arm`'s series under `name`.
@@ -191,6 +225,13 @@ fn publish(reporter: &mut Reporter, name: &str, arm: &Arm, config: &BenchConfig)
         format!("{name} / read p99"),
         arm.reads.value_at_quantile(0.99) as f64 / 1_000.0,
         "us",
+        extra.clone(),
+        Suite::Timings,
+    );
+    reporter.publish_series(
+        format!("{name} / flush and compaction step p99"),
+        arm.steps.value_at_quantile(0.99) as f64 / 1_000_000.0,
+        "ms",
         extra,
         Suite::Timings,
     );

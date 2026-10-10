@@ -1825,6 +1825,17 @@ fn aligned_outputs(
     target: u64,
     marks: Option<&[u32]>,
 ) -> crate::Result<Vec<(u32, u32, u64)>> {
+    bounded_outputs(keys, target, marks, None)
+}
+
+/// Like [`aligned_outputs`], the writer told that key `upper` is the last it
+/// can be handed, as a writer of one key range of a compaction is.
+fn bounded_outputs(
+    keys: core::ops::Range<u32>,
+    target: u64,
+    marks: Option<&[u32]>,
+    upper: Option<u32>,
+) -> crate::Result<Vec<(u32, u32, u64)>> {
     use crate::{InternalValue, UserKey, fs::StdFs, version::run::Ranged};
     use std::sync::Arc;
 
@@ -1840,6 +1851,9 @@ fn aligned_outputs(
     )?;
     if let Some(marks) = marks {
         mw = mw.use_cut_alignment(marks_at(marks, target), None);
+    }
+    if let Some(upper) = upper {
+        mw.limit_cut_alignment(UserKey::from(seq_key(upper)));
     }
     for i in keys {
         mw.write(InternalValue::from_components(
@@ -1898,6 +1912,67 @@ fn aligned_outputs_end_on_boundaries_within_the_size_band() -> crate::Result<()>
     assert!(
         first_size <= TARGET / 2 + u64::from(GAP) * 1_000 + 16_384,
         "the first output waited past the first boundary beyond half the target: {first_size} bytes"
+    );
+    Ok(())
+}
+
+/// Over a sparsely divided level below, outputs still land within half the
+/// target and twice it: one that meets no boundary past half the target grows
+/// toward the next, and ends at twice the target if none comes.
+#[test]
+fn sparse_boundaries_keep_outputs_in_the_size_band() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks: Vec<u32> = (0..10_000).step_by(1_100).collect();
+    let outputs = aligned_outputs(0..10_000, TARGET, Some(&marks))?;
+    let (_, rest) = outputs.split_last().unwrap();
+    for &(first, last, size) in rest {
+        assert!(
+            size >= TARGET * 45 / 100,
+            "output {first}..={last}: {size} bytes"
+        );
+        assert!(
+            size <= 2 * TARGET + 16_384,
+            "output {first}..={last}: {size} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// A stream ending shortly after a cut leaves a short last output: nothing is
+/// left to grow it, which is the one place an output is below half the target.
+#[test]
+fn a_stream_ending_after_a_cut_leaves_a_short_last_output() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks: Vec<u32> = (0..10_000).step_by(70).collect();
+    let (_, first_last, _) = aligned_outputs(0..10_000, TARGET, Some(&marks))?[0];
+    let outputs = aligned_outputs(0..first_last + 21, TARGET, Some(&marks))?;
+    assert_eq!(outputs.len(), 2, "{outputs:?}");
+    let (_, _, last_size) = outputs[1];
+    assert!(last_size < TARGET / 2, "the last output: {last_size} bytes");
+    Ok(())
+}
+
+/// A writer told the last key of its range ends its outputs at the target past
+/// its last boundary there, where a writer of the whole stream, seeing a
+/// boundary further on, grows its output toward it.
+#[test]
+fn a_writer_bounded_by_its_range_does_not_wait_for_a_boundary_past_it() -> crate::Result<()> {
+    const TARGET: u64 = 400_000;
+    let marks = [100, 5_000];
+    let bounded = bounded_outputs(0..2_000, TARGET, Some(&marks), Some(1_999))?;
+    let (_, rest) = bounded.split_last().unwrap();
+    for &(first, last, size) in rest.iter().filter(|(first, _, _)| *first > 100) {
+        assert!(
+            size <= TARGET + 16_384,
+            "output {first}..={last} of a bounded writer: {size} bytes"
+        );
+    }
+    let whole = aligned_outputs(0..2_000, TARGET, Some(&marks))?;
+    assert!(
+        whole
+            .iter()
+            .any(|&(first, _, size)| first > 100 && size > TARGET * 3 / 2),
+        "the whole stream waits for the boundary at 5000: {whole:?}"
     );
     Ok(())
 }
