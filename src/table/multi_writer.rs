@@ -1642,6 +1642,35 @@ impl MultiWriter {
             ))
     }
 
+    /// Whether a group about to be copied whole, `bytes` on disk and ending at
+    /// `last`, is written key by key instead, given whether the output
+    /// `rotates` before it: when the copy would take an aligned output past
+    /// twice the target, where written rows would have ended it, or when
+    /// splitting it costs less than straddling a boundary inside it.
+    #[cfg(feature = "columnar")]
+    fn writes_group_by_rows(
+        &self,
+        rotates: bool,
+        crossing: Option<cut_alignment::Crossing>,
+        last: &InternalValue,
+        bytes: u64,
+    ) -> bool {
+        if self.alignment.is_some() {
+            let ceiling = cut_alignment::share_of(self.target_size, 200);
+            let past_ceiling = if rotates {
+                bytes > ceiling
+            } else {
+                // A group past the ceiling on its own takes any output with a
+                // record past it, hence the floor of zero.
+                self.table_full_at(ceiling.checked_sub(bytes).unwrap_or(0))
+            };
+            if past_ceiling {
+                return true;
+            }
+        }
+        !rotates && self.splits_cheaper_than_straddling(crossing, last, bytes)
+    }
+
     /// Takes `rows`' first key as [`Self::write`] takes a new key and has
     /// `write` put the group in the current table, when this run writes the
     /// copied pages' transform; `false`, having written nothing, otherwise.
@@ -1701,7 +1730,7 @@ impl MultiWriter {
         // starts the next table, a run of groups stored one way shares it.
         let layout_changes = self.value_layout.is_some_and(|current| current != layout);
         let (cut, crossing) = self.decide_cut(&first.key.user_key);
-        if !(layout_changes || cut) && self.splits_cheaper_than_straddling(crossing, last, bytes) {
+        if self.writes_group_by_rows(layout_changes || cut, crossing, last, bytes) {
             self.current_key = previous_key;
             return Ok(false);
         }
@@ -1732,11 +1761,10 @@ impl MultiWriter {
                 self.comparator.as_ref(),
             );
         }
-        if self.alignment.is_some() {
-            let past_half = self.table_full_at(cut_alignment::share_of(self.target_size, 50));
-            if let Some(alignment) = &mut self.alignment {
-                alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
-            }
+        let past_half = self.alignment.is_some()
+            && self.table_full_at(cut_alignment::share_of(self.target_size, 50));
+        if let Some(alignment) = &mut self.alignment {
+            alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
         }
         self.current_key = Some(last.key.user_key.clone());
         self.value_layout = Some(layout);

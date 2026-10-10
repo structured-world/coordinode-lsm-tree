@@ -193,6 +193,119 @@ fn a_serial_merge_ends_its_outputs_on_the_level_below() -> crate::Result<()> {
     Ok(())
 }
 
+/// A merge into a level whose next level is empty aligns to the first level
+/// below that holds tables: its outputs move down through the empty levels
+/// untouched and are next merged there, as an intra-L0 merge's outputs are
+/// merged into the base level.
+#[test]
+fn a_merge_above_an_empty_level_ends_its_outputs_on_the_next_level_holding_tables()
+-> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .compaction_threads(1),
+    )?;
+    let mut seqno = 1;
+    flush_into(&tree, 0..3_000, 700, 3, &mut seqno)?;
+    flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
+    assert!(
+        tables(&tree, 2).is_empty(),
+        "the level below the merge is empty"
+    );
+    let boundaries = boundaries_of(&tables(&tree, 3));
+    let ids = tables(&tree, 1).iter().map(Table::id).collect();
+    tree.compact(Arc::new(Merge(ids, 1)), 0)?;
+
+    let outputs = last_keys(&tables(&tree, 1));
+    assert!(outputs.len() > 3, "{} outputs", outputs.len());
+    let (_, cut) = outputs.split_last().unwrap();
+    for last in cut {
+        assert!(
+            boundaries.contains(last),
+            "an output ends at {last}: outputs end at {outputs:?}, L3 at {boundaries:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A level below holding two overlapping runs has no boundary inside their
+/// overlap: an output ending there would reach a table of each run. Every cut
+/// lands where no table of either run spans it.
+#[test]
+fn outputs_end_outside_every_table_of_overlapping_runs_below() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(
+        Config::new(
+            folder.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .compaction_threads(1),
+    )?;
+    let mut seqno = 1;
+    flush_into(&tree, 0..1_800, 700, 3, &mut seqno)?;
+    flush_into(&tree, 1_200..3_000, 700, 3, &mut seqno)?;
+    let runs = tree
+        .current_version()
+        .level(3)
+        .map_or(0, |level| level.run_count());
+    assert_eq!(runs, 2, "the level below holds two overlapping runs");
+    flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
+    let below: Vec<(u32, u32)> = tables(&tree, 3)
+        .iter()
+        .map(|t| {
+            (
+                index(t.metadata.key_range.min()),
+                index(t.metadata.key_range.max()),
+            )
+        })
+        .collect();
+    let ids = tables(&tree, 1).iter().map(Table::id).collect();
+    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
+
+    let outputs = last_keys(&tables(&tree, 2));
+    assert!(outputs.len() > 3, "{} outputs", outputs.len());
+    let (_, cut) = outputs.split_last().unwrap();
+    for &last in cut {
+        assert!(
+            !below.iter().any(|&(min, max)| min <= last && last < max),
+            "an output ends at {last}, inside a table below: outputs end at {outputs:?}, \
+             the tables below span {below:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The compaction byte counter grows by the bytes of the tables a merge
+/// installs, and a move, which writes none, leaves it as it was.
+#[cfg(feature = "metrics")]
+#[test]
+fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    ))?;
+    let mut seqno = 1;
+    flush_into(&tree, 0..1_000, 1_000, 1, &mut seqno)?;
+    assert_eq!(
+        tree.metrics().compaction_bytes_written(),
+        0,
+        "a move writes nothing"
+    );
+    let ids = tables(&tree, 1).iter().map(Table::id).collect();
+    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
+    let installed: u64 = tables(&tree, 2).iter().map(Table::file_size).sum();
+    assert!(installed > 0);
+    assert_eq!(tree.metrics().compaction_bytes_written(), installed);
+    Ok(())
+}
+
 /// A merge split into key ranges ends every output on a boundary of the level
 /// below, as the stream does, or where its range ends. In a range with no
 /// boundary left before its end, an output ends at the target: no boundary

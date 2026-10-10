@@ -25,6 +25,9 @@ use std::time::Instant;
 
 pub struct LeveledSustained;
 
+#[cfg(test)]
+mod tests;
+
 /// The key stream's seed: both arms write the same keys in the same order.
 const SEED: u64 = 0x5EED_0661;
 
@@ -77,6 +80,13 @@ impl Workload for LeveledSustained {
         if config.threads != 1 {
             return Err("leveled-sustained runs one writer; pass --threads 1".to_string());
         }
+        // Compaction bytes are counted in tables; a blob tree writes most of
+        // its bytes to blob files, which the ratio would leave out.
+        if config.use_blob_tree {
+            return Err(
+                "leveled-sustained measures table compaction; drop --use-blob-tree".to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -89,7 +99,8 @@ impl Workload for LeveledSustained {
     ) -> lsm_tree::Result<()> {
         reporter.start();
         for (name, aligned) in [("aligned", true), ("size-only", false)] {
-            let arm = run_arm(config, aligned)?;
+            let folder = tempfile::tempdir()?;
+            let arm = run_arm(folder.path(), config, aligned)?;
             publish(reporter, name, &arm, config);
         }
         reporter.stop();
@@ -97,11 +108,10 @@ impl Workload for LeveledSustained {
     }
 }
 
-/// Writes the key stream into a fresh tree, flushing every [`FLUSH_BYTES`]
-/// and compacting until the strategy has nothing left to do.
-fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
-    let folder = tempfile::tempdir()?;
-    let tree = crate::config::tree_builder(folder.path(), config)?
+/// Writes the key stream into a fresh tree in `folder`, flushing every
+/// [`FLUSH_BYTES`] and compacting until the strategy has nothing left to do.
+fn run_arm(folder: &std::path::Path, config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
+    let tree = crate::config::tree_builder(folder, config)?
         .table_target_size(TABLE_TARGET)
         .compaction_output_alignment(aligned)
         .open()?;
@@ -173,8 +183,12 @@ fn run_arm(config: &BenchConfig, aligned: bool) -> lsm_tree::Result<Arm> {
             arm.reads.saturating_record(nanos);
         }
     }
-    // What the stream left is drained, so both arms end at a tree the strategy
-    // has nothing more to do for and their compaction bytes compare.
+    // What the stream left is flushed and drained, so both arms end at a tree
+    // the strategy has nothing more to do for, every byte counted as written
+    // has reached the tables, and their compaction bytes compare.
+    if pending > 0 {
+        tree.flush_active_memtable(seqno)?;
+    }
     compact(&tree, &strategy, seqno, None, &mut arm)?;
     arm.compacted = tree.metrics().compaction_bytes_written() - compacted_before;
     Ok(arm)

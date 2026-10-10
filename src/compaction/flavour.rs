@@ -179,7 +179,10 @@ pub(super) fn plan_filters(
 
 /// The boundaries between the tables of the level `payload`'s outputs are
 /// merged into next, in key order, across all its runs: none when output
-/// alignment is off or the destination is the last level. A boundary lies
+/// alignment is off or no level below the destination holds tables. That level
+/// is the first one below holding tables, not the adjacent one: outputs move
+/// down through empty levels untouched and are next merged where tables are,
+/// as an intra-L0 merge's outputs are merged into the base level. A boundary lies
 /// after a table that the next one, in key order, starts above; tables that
 /// overlap, in a level holding several runs, have none between them, since an
 /// output reaching either reaches both.
@@ -194,7 +197,10 @@ fn next_level_boundaries(
     if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
         return alloc::sync::Arc::from([]);
     }
-    let Some(level) = version.level(usize::from(payload.dest_level) + 1) else {
+    let Some(level) = (usize::from(payload.dest_level) + 1..)
+        .map_while(|index| version.level(index))
+        .find(|level| !level.is_empty())
+    else {
         return alloc::sync::Arc::from([]);
     };
     let comparator = opts.config.comparator.as_ref();

@@ -2183,6 +2183,54 @@ fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> 
     Ok(())
 }
 
+/// A group whose copy would take an aligned output past twice the target is
+/// written key by key, so the output ends at the ceiling as written rows would
+/// make it, whether or not the group holds a boundary; a smaller group is
+/// copied. Opening a fresh output, only a group past the ceiling on its own is
+/// written so.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_group_whose_copy_would_pass_twice_the_target_is_written_by_rows() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    const TARGET: u64 = 40_000;
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        folder.path().to_path_buf(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_cut_alignment(marks_at(&[50], TARGET), None);
+    let row = |i: u32| {
+        InternalValue::from_components(
+            UserKey::from(seq_key(i)),
+            vec![b'v'; 1_000],
+            1,
+            crate::ValueType::Value,
+        )
+    };
+    for i in 0..31 {
+        mw.write(row(i))?;
+    }
+
+    // Keys 31 to 40 hold no boundary; the output holds about 31 KB.
+    let (cut, crossing) = mw.decide_cut(&seq_key(31));
+    assert!(!cut);
+    assert!(
+        mw.writes_group_by_rows(false, crossing, &row(40), 60_000),
+        "a 60 KB copy would take a 31 KB output past 80 KB"
+    );
+    assert!(!mw.writes_group_by_rows(false, crossing, &row(40), 1_000));
+    // Into a fresh output, only a group past the ceiling alone.
+    assert!(mw.writes_group_by_rows(true, crossing, &row(40), 100_000));
+    assert!(!mw.writes_group_by_rows(true, crossing, &row(40), 60_000));
+    Ok(())
+}
+
 /// A flush cut at a small configured target writes tables whose key ranges
 /// follow each other without overlapping and together span exactly the keys
 /// flushed: the cut lands between keys, never inside one table's range.
