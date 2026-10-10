@@ -265,6 +265,32 @@ impl Header {
         Ok(())
     }
 
+    /// [`Self::rebind_frame`] for a whole block frame read as it lies, whose
+    /// payload is first checked against the checksum it was written under.
+    /// A block copied unread by any other path would move a mismatching
+    /// checksum along with damaged bytes into a new table, and the input that
+    /// held them would be retired; checked here, the copy fails instead, as a
+    /// read of the block would.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `frame` does not start with a decodable header,
+    /// is shorter than the payload it declares, or the payload does not match
+    /// its checksum.
+    pub(crate) fn rebind_verified_frame(
+        frame: &mut [u8],
+        from: ChecksumAt,
+        to: ChecksumAt,
+    ) -> crate::Result<()> {
+        let header = Self::decode_from(&mut &*frame)?;
+        let start = Self::header_len(header.block_type);
+        let payload = frame
+            .get(start..start + header.data_length as usize)
+            .ok_or(crate::Error::InvalidHeader("Block"))?;
+        Checksum::from_raw(crate::hash::hash128(payload)).check(header.payload_checksum(from))?;
+        Self::rebind_frame(frame, from, to)
+    }
+
     /// Header size WITHOUT the optional `block_flags` byte: the fixed part
     /// every block carries (magic + `block_type` + checksum + `data_length` +
     /// `uncompressed_length` + header checksum). Pre-decode lower bound; the

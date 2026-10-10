@@ -349,6 +349,21 @@ to mask a sparse delete writes no page and keeps the ones it copies as they
 were encoded, as it keeps their compression; the next merge that rewrites
 those rows applies the level's policy.
 
+A merge copies an input's row group whole, as it lies on disk, when every row
+of it comes out of the merge exactly as it was read and nothing else lands
+among them: the group's bytes are then what the output would encode for those
+rows. It does so only from a level whose encoding, row group size and page
+size policies are the output level's, into an output of the same data codec
+and dictionary, and with
+neither encryption nor Page-ECC, so a copied page is always one the output's
+level would have written. The block checksums, which bind each block to its
+table and place, are moved to the copy's; the pages, their stamps and the
+group's zone blocks are not touched. An output keeping a zone map takes the
+copied group's statistics from the input's, and writes the rows of a group
+whose table kept none. When some rows of a group change, the group is written
+again under its own tag, and the pages of each row page whose rows all came
+out as they were read are copied into it unchanged.
+
 A read also bounds what a row group's pages may decode to: a writer closes a
 group once its rows reach at most 4 MiB, an ingested batch past that cut into
 groups the same way, counting every column's bytes of each row. A group it
@@ -415,11 +430,16 @@ the byte-for-byte copy that salvage makes of intact groups: once an earlier
 group is lost, every later group's ordinal in the copy shifts, and each copied
 page would fail verification under its new one. A carried tag survives the
 copy. What the binding needs is uniqueness within a table, and the writer
-supplies it by issuing tags in strictly increasing order: a group it encodes
-takes the next tag, and a copied group is accepted only above the last tag
-already written. A salvage copying one table in key order always satisfies
-that, because the source's tags increase and a re-encoded group takes a tag
-no higher than the source tag it replaces.
+keeps every tag the table's groups were written under: a group it encodes
+takes the first free tag past the last one it encoded, and a copied group is
+accepted only when its own tag is free. A salvage copying one table in key
+order always finds its tags free, because the source's tags are unique and a
+re-encoded group takes a tag no higher than the source tag it replaces; a
+compaction copying the groups of several tables finds them free unless two of
+its inputs drew the same tags, by chance, and then writes the rows of the one
+that clashes. The groups a compaction encodes take tags from the output's own
+base, never from the sequence of a group it copied, so they do not take the
+tags of that source's later groups.
 
 Moving a page between slots of one group is refused by
 `(column_id, part, row_page)`, which the stamp repeats. The row page is what

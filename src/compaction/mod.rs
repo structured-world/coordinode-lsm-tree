@@ -4,6 +4,8 @@
 
 //! Contains compaction strategies
 
+#[cfg(feature = "columnar")]
+pub(crate) mod carry;
 pub(crate) mod fifo;
 pub(crate) mod leveled;
 // pub(crate) mod maintenance;
@@ -118,6 +120,19 @@ pub struct Input {
     /// If a table merge reaches the size threshold, a new table is started.
     /// This results in a sorted "run" of tables.
     pub target_size: u64,
+}
+
+impl Input {
+    /// How far below its canonical level the destination sits, which is how
+    /// far every level past level 0 sits below its own; `None` when a
+    /// strategy names a canonical level below the destination's physical
+    /// one, which places no level.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn level_shift(&self) -> Option<usize> {
+        self.dest_level
+            .checked_sub(self.canonical_level)
+            .map(usize::from)
+    }
 }
 
 /// Describes what to do (compact or not)

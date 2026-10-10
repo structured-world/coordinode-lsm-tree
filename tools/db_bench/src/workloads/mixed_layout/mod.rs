@@ -105,6 +105,20 @@ struct UpdatePass {
     payload_written: u64,
 }
 
+/// A compaction of a built fixture, reporting besides the rows that read back
+/// after it what it wrote and what of that it copied instead of encoding.
+type CompactFn = fn(&Fixture) -> lsm_tree::Result<CompactionPass>;
+
+/// What a compaction pass measured.
+struct CompactionPass {
+    /// Rows the tree reads back after the compaction, each checked.
+    rows: u64,
+    /// On-disk bytes of the tables the compaction left.
+    output_bytes: u64,
+    /// The part of them it copied as an input held them, groups and pages.
+    carried_bytes: u64,
+}
+
 /// Whether a scenario's native path exists in this build.
 enum Support {
     /// Runs, through this read pass, and its figures mean what the scenario
@@ -119,6 +133,9 @@ enum Support {
     /// Rewrites rows through this pass and reports the payload bytes the
     /// rewrite wrote per updated row, then checks the rows with the second.
     Update(UpdateFn, VerifyFn),
+    /// Compacts the fixture through this pass and reports the share of the
+    /// output it encoded rather than copied.
+    Compaction(CompactFn),
     /// Rewrites the fixture in rounds of flushes and compactions, reports what
     /// collecting the stale blobs cost, then measures a full scan of what is
     /// left, so placement's two costs come from one run.
@@ -1288,7 +1305,54 @@ fn scenarios(config: &BenchConfig) -> Vec<Scenario> {
             fixture: fixtures::cells_scattered,
             support: Support::Latency(cells_scan_under_compaction),
         },
+        // Each compacts its fixture once, every version kept, and reports the
+        // share of the output it encoded rather than copied from an input.
+        Scenario {
+            name: "compaction-one-segment",
+            fixture: fixtures::columnar_segment,
+            support: Support::Compaction(compact_keeping_versions),
+        },
+        Scenario {
+            name: "compaction-overlap-8",
+            fixture: fixtures::columnar_overlap,
+            support: Support::Compaction(compact_keeping_versions),
+        },
+        Scenario {
+            name: "compaction-row-updates-over-columnar-base",
+            fixture: fixtures::columnar_base_row_updates,
+            support: Support::Compaction(compact_keeping_versions),
+        },
+        Scenario {
+            name: "compaction-wide-cells",
+            fixture: fixtures::cells_wide,
+            support: Support::Compaction(compact_keeping_versions),
+        },
     ]
+}
+
+/// One major compaction of the fixture that keeps every version, then every
+/// row read back against the write history.
+///
+/// Keeping every version leaves the merge to decide only what lands next to
+/// what: rows of one input come out as they were read unless another input's
+/// rows land among them, so the share copied measures how much of the output
+/// the merge left as an input laid it out.
+fn compact_keeping_versions(fixture: &Fixture) -> lsm_tree::Result<CompactionPass> {
+    let metrics = fixture.tree.metrics();
+    let carried_before = metrics.compaction_bytes_carried();
+    fixture.tree.major_compact(64 * 1024 * 1024, 0)?;
+    let carried_bytes = metrics.compaction_bytes_carried() - carried_before;
+    let output_bytes = fixture
+        .tree
+        .current_version()
+        .iter_tables()
+        .map(|table| table.metadata.file_size)
+        .sum();
+    Ok(CompactionPass {
+        rows: scan_all(fixture)?,
+        output_bytes,
+        carried_bytes,
+    })
 }
 
 /// The latency at percentile `p` of `latencies`, in microseconds.
@@ -1465,6 +1529,41 @@ impl Workload for MixedLayout {
                             Suite::Costs,
                         );
                     }
+                }
+                Support::Compaction(pass) => {
+                    let fixture = (scenario.fixture)(config, seqno, fixtures_in)?;
+                    let t = Instant::now();
+                    let keys = fixture.oracle.rows.len() as u64;
+                    let measured = pass(&fixture)?;
+                    reporter.record_duration(t.elapsed());
+                    let encoded =
+                        measured.output_bytes - measured.carried_bytes.min(measured.output_bytes);
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "a table's bytes, far below f64's exact range"
+                    )]
+                    let share = if measured.output_bytes == 0 {
+                        0.0
+                    } else {
+                        encoded as f64 / measured.output_bytes as f64
+                    };
+                    eprintln!(
+                        "  {name:<34} rows={} output={} B copied={} B encoded share={share:.3}",
+                        measured.rows, measured.output_bytes, measured.carried_bytes,
+                    );
+                    // Engine-counted bytes, so a cost: the share of the output
+                    // encoded again, zero when the merge left all of it as an
+                    // input held it.
+                    reporter.publish_series(
+                        format!("{name} encoded share of output"),
+                        share,
+                        "B/B",
+                        format!(
+                            "keys: {keys} | rows: {} | output: {} B | copied: {} B",
+                            measured.rows, measured.output_bytes, measured.carried_bytes,
+                        ),
+                        Suite::Costs,
+                    );
                 }
                 Support::Churn => {
                     run_churn(name, scenario.fixture, config, seqno, fixtures_in, reporter)?;

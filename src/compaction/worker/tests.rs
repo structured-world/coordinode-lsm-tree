@@ -2195,6 +2195,8 @@ fn compaction_stream_run_not_found() -> crate::Result<()> {
             None,
             crate::comparator::default_comparator(),
             None,
+            #[cfg(feature = "columnar")]
+            None,
         )?
         .is_none()
     );

@@ -459,6 +459,10 @@ pub(super) struct ProducedOutput {
     /// On-disk blob bytes this output's relocation copied into new blob
     /// files, charged to the tree's metrics once the output is installed.
     relocated_bytes: u64,
+    /// Row groups this output copied whole, groups it rebuilt around copied
+    /// pages, and the on-disk bytes copied, charged to the tree's metrics
+    /// once the output is installed.
+    carried: (u64, u64, u64),
 }
 
 #[cfg_attr(
@@ -524,6 +528,20 @@ impl ProducedOutput {
         &self.released_objects
     }
 
+    /// Records what the run copied instead of encoding (called by the
+    /// producer, which owns the carry matcher).
+    #[cfg(feature = "columnar")]
+    pub(super) fn set_carried(&mut self, carried: super::carry::Carried) {
+        self.carried = (carried.groups, carried.partial_groups, carried.bytes);
+    }
+
+    /// What the run copied instead of encoding, as groups, partly copied
+    /// groups and bytes, for the tight-space loop, which installs its slices
+    /// itself.
+    pub(super) fn carried(&self) -> (u64, u64, u64) {
+        self.carried
+    }
+
     /// Builds the output for a merge-on-read relocation: the `created` segment
     /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
     /// `deleted` source segment, with no blob files and no fragmentation. Lets
@@ -551,6 +569,7 @@ impl ProducedOutput {
             filter_sizing: None,
             released_objects: Vec::new(),
             relocated_bytes: 0,
+            carried: (0, 0, 0),
         }
     }
 }
@@ -558,6 +577,45 @@ impl ProducedOutput {
 // TODO: find a better name
 pub(super) trait CompactionFlavour {
     fn write(&mut self, item: InternalValue) -> crate::Result<()>;
+
+    /// Copies `candidate`'s row group into the output in place of its rows,
+    /// returning `false`, having written nothing, when this output cannot
+    /// take it as it is; the caller then writes the rows. `pace` is told how
+    /// long reading the group takes.
+    #[cfg(feature = "columnar")]
+    fn carry(
+        &mut self,
+        _candidate: &crate::table::group_carry::CarryCandidate,
+        _pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    /// Writes `emitted`, what the merge made of `candidate`'s key range, as
+    /// one group that copies the candidate's pages on the row pages left as
+    /// they were, returning the bytes copied; `None`, having written nothing,
+    /// when this output cannot. The caller then writes the rows.
+    #[cfg(feature = "columnar")]
+    fn carry_pages(
+        &mut self,
+        _candidate: &crate::table::group_carry::CarryCandidate,
+        _emitted: &[InternalValue],
+        _pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// The count of the compaction filter's transformations so far, `None`
+    /// without a filter (see [`crate::compaction::carry::CarrySink`]).
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        None
+    }
+
+    /// Closes the current output's transformation window at `seen` for the
+    /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, _seen: u64) {}
 
     /// Writes range tombstones to the current output table.
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
@@ -574,6 +632,31 @@ pub(super) trait CompactionFlavour {
         blob_frag_map: FragmentationMap,
         extra_blob_files: Vec<BlobFile>,
     ) -> crate::Result<ProducedOutput>;
+}
+
+/// Charges the counters an installed output moves: the blob bytes its
+/// relocation copied, and the groups, partly copied groups and bytes it
+/// copied instead of encoding. Every path that installs an output calls it
+/// once the version edit is published.
+#[cfg(feature = "metrics")]
+pub(super) fn charge_installed(
+    metrics: &crate::metrics::Metrics,
+    relocated_bytes: u64,
+    carried: (u64, u64, u64),
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    metrics
+        .blob_bytes_relocated
+        .fetch_add(relocated_bytes, Relaxed);
+    metrics
+        .compaction_groups_carried
+        .fetch_add(carried.0, Relaxed);
+    metrics
+        .compaction_groups_partly_carried
+        .fetch_add(carried.1, Relaxed);
+    metrics
+        .compaction_bytes_carried
+        .fetch_add(carried.2, Relaxed);
 }
 
 /// Installs one atomic version edit replacing `payload.table_ids` with the SSTs
@@ -599,9 +682,15 @@ pub(super) fn install_merge(
     let mut filter_sizings = Vec::new();
 
     let mut released_objects = Vec::new();
+    let mut carried = (0u64, 0u64, 0u64);
     for out in outputs {
         released_objects.extend(out.released_objects);
         relocated_bytes += out.relocated_bytes;
+        carried = (
+            carried.0 + out.carried.0,
+            carried.1 + out.carried.1,
+            carried.2 + out.carried.2,
+        );
         filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
@@ -775,11 +864,9 @@ pub(super) fn install_merge(
             .record(published, released_objects, []);
     }
     #[cfg(feature = "metrics")]
-    opts.metrics
-        .blob_bytes_relocated
-        .fetch_add(relocated_bytes, core::sync::atomic::Ordering::Relaxed);
+    charge_installed(&opts.metrics, relocated_bytes, carried);
     #[cfg(not(feature = "metrics"))]
-    let _ = relocated_bytes;
+    let _ = (relocated_bytes, carried);
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -1118,6 +1205,16 @@ impl CompactionFlavour for RelocatingCompaction {
         self.inner.write_range_tombstones(tombstones);
     }
 
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        self.inner.transforms_seen()
+    }
+
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, seen: u64) {
+        self.inner.settle_transforms(seen);
+    }
+
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         if item.key.value_type.is_cell_row() {
             return self.write_cell_row(item);
@@ -1298,6 +1395,8 @@ impl CompactionFlavour for RelocatingCompaction {
             // The producer owns the ownership ledger and sets this after.
             released_objects: Vec::new(),
             relocated_bytes: self.relocated_bytes,
+            // A relocating run writes its rows; it copies no group.
+            carried: (0, 0, 0),
         })
     }
 }
@@ -1316,6 +1415,14 @@ impl StandardCompaction {
             table_writer,
             tables_to_rewrite,
         }
+    }
+
+    /// Records the blob objects `rows`, written into the output not one by
+    /// one, reference, each under its own row's key, as
+    /// [`CompactionFlavour::write`] records a written row's.
+    #[cfg(feature = "columnar")]
+    fn register_references(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
+        self.table_writer.register_carried_rows(rows)
     }
 
     fn consume_writer(self, opts: &Options, dst_lvl: usize) -> crate::Result<Vec<Table>> {
@@ -1363,6 +1470,16 @@ impl CompactionFlavour for StandardCompaction {
         self.table_writer.set_range_tombstones(tombstones.to_vec());
     }
 
+    #[cfg(feature = "columnar")]
+    fn transforms_seen(&self) -> Option<u64> {
+        self.table_writer.transforms_seen()
+    }
+
+    #[cfg(feature = "columnar")]
+    fn settle_transforms(&mut self, seen: u64) {
+        self.table_writer.settle_transforms(seen);
+    }
+
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         if item.key.value_type.is_cell_row() {
             // The row is kept as it is, ownership included; the slice clone
@@ -1388,6 +1505,119 @@ impl CompactionFlavour for StandardCompaction {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "columnar")]
+    fn carry(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<bool> {
+        let table = &candidate.table;
+        let group = candidate.row_group;
+        let columns = table
+            .zone_map
+            .columns_for(candidate.group.offset().0)
+            .map(<[_]>::to_vec);
+        let raw = table.read_row_group_raw(&candidate.group, pace)?;
+        let source = crate::table::writer::VerbatimSource {
+            table_id: table.id(),
+            offset: candidate.group.offset().0,
+        };
+        if !self.table_writer.carry_row_group(
+            (&raw, source),
+            group,
+            (
+                table.metadata.data_block_compression,
+                table.metadata.value_layout,
+            ),
+            &candidate.rows,
+            columns,
+        )? {
+            return Ok(false);
+        }
+        self.register_references(&candidate.rows)?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "columnar")]
+    fn carry_pages(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        emitted: &[InternalValue],
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<Option<u64>> {
+        use crate::coding::Decode;
+        use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType, ChecksumAt};
+
+        let table = &candidate.table;
+        // Pages of values stored whole only: a group of cells has the columns
+        // its rows' fields make, which a rebuilt group need not repeat.
+        let group = candidate.row_group;
+        if table.metadata.value_layout != crate::table::meta::ValueLayout::Whole {
+            return Ok(None);
+        }
+        let raw = table.read_row_group_raw(&candidate.group, pace)?;
+        let offset = candidate.group.offset().0;
+        // The directory is checked at the place it lies, as a read checks it.
+        let directory_block = Block::from_reader(
+            &mut &raw[..],
+            BlockIdentity {
+                table_id: table.id(),
+                block_type: BlockType::ColumnPageDirectory,
+                dict_id: 0,
+                window_log: 0,
+            },
+            &BlockTransform::PLAIN,
+            ChecksumAt::table(table.id(), offset),
+        )?;
+        let directory_len =
+            crate::table::block::Header::decode_from(&mut &raw[..])?.on_disk_size_with(None);
+        if directory_len != group.directory_len.get() {
+            return Ok(None);
+        }
+        let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
+        let Some((row_pages, copied)) =
+            super::carry::align_row_pages(&candidate.rows, directory.row_pages(), emitted)
+        else {
+            return Ok(None);
+        };
+        let carry = crate::table::writer::PageCarry {
+            tag: group.tag.get(),
+            row_pages,
+            copied,
+            raw: &raw,
+            source: crate::table::writer::VerbatimSource {
+                table_id: table.id(),
+                offset,
+            },
+            directory: &directory,
+            directory_len,
+        };
+        if !self.table_writer.carry_row_pages(
+            emitted,
+            &carry,
+            table.metadata.data_block_compression,
+        )? {
+            return Ok(None);
+        }
+        self.register_references(emitted)?;
+        // What the copied row pages hold on disk, every column's page of each.
+        let row_page_count = directory.row_pages().len();
+        let bytes = directory
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                carry
+                    .copied
+                    .get(index % row_page_count.max(1))
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .map(|(_, entry)| u64::from(entry.length))
+            .sum();
+        Ok(Some(bytes))
     }
 
     fn produce(
@@ -1421,6 +1651,8 @@ impl CompactionFlavour for StandardCompaction {
             // The producer owns the ownership ledger and sets this after.
             released_objects: Vec::new(),
             relocated_bytes: 0,
+            // The producer owns the carry matcher and sets this after.
+            carried: (0, 0, 0),
         })
     }
 }
