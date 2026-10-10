@@ -1535,6 +1535,15 @@ impl StandardCompaction {
         else {
             return Ok(None);
         };
+        // A changed row page takes all its rows in one page; one the writer
+        // would have cut apart for its size is written as rows instead.
+        if !super::carry::changed_pages_fit(
+            emitted,
+            (&row_pages, &copied),
+            u64::from(self.table_writer.row_group_size()),
+        ) {
+            return Ok(None);
+        }
         let carry = crate::table::writer::PageCarry {
             tag: group.tag.get(),
             row_pages,

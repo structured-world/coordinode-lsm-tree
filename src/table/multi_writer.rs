@@ -958,6 +958,12 @@ impl MultiWriter {
         self.use_zone_map
     }
 
+    /// The bytes of rows a columnar group written here is closed at.
+    #[cfg(feature = "columnar")]
+    pub(crate) const fn row_group_size(&self) -> u32 {
+        self.row_group_size
+    }
+
     #[must_use]
     pub fn use_columnar(mut self, columnar: bool) -> Self {
         self.use_columnar = columnar;

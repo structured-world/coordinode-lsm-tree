@@ -174,6 +174,121 @@ fn bounds(lo: Bound<&str>, hi: Bound<&str>) -> KeyBounds {
     }
 }
 
+/// One key whose versions fill many groups: once the merge has passed the
+/// key on as rows, no later group of it can be copied, and each is retired
+/// as the scan moves on rather than held until the key ends.
+#[test]
+fn carry_queue_stays_bounded_over_one_key_spanning_many_groups() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            crate::config::CompressionPolicy::all(crate::CompressionType::None);
+    })?;
+    for seqno in 1..=4_000 {
+        tree.insert("hot", vec![b'v'; 64], seqno);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.insert("other", vec![b'v'; 64], 5_000);
+    tree.flush_active_memtable(0)?;
+    let groups: u64 = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.metadata.data_block_count)
+        .sum();
+
+    PEAK_QUEUE.with(|peak| peak.set(0));
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    let peak = PEAK_QUEUE.with(Cell::get) as u64;
+
+    assert!(groups > 8, "the key spans many groups: {groups}");
+    assert!(peak <= 4, "{peak} of {groups} groups held at once");
+    assert_eq!(tree.get("hot", SeqNo::MAX)?.map(|v| v.len()), Some(64));
+    assert_eq!(tree.get("hot", 2)?.map(|v| v.len()), Some(64));
+    Ok(())
+}
+
+/// Counts the reads it is told of.
+#[derive(Default)]
+struct CountingPacer(core::sync::atomic::AtomicUsize);
+
+impl crate::table::util::ReadPacer for CountingPacer {
+    fn active(&self) -> bool {
+        true
+    }
+
+    fn pace(&self, _offset: u64, _len: u64) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A scan from a lower bound near a table's end seeks its index there: of a
+/// partitioned index read from disk, it reads the partitions from the bound
+/// on, not every one before it, as a scan of the whole table does.
+#[test]
+fn scan_carrying_seeks_the_index_at_its_lower_bound() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    let folder = crate::get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::new(crate::Cache::with_capacity_bytes(1)))
+    .index_block_pinning_policy(crate::config::PinningPolicy::all(false))
+    .index_block_partitioning_policy(crate::config::PinningPolicy::all(true))
+    .index_block_partition_size_policy(crate::config::BlockSizePolicy::all(128))
+    .columnar_row_group_size_policy(crate::config::BlockSizePolicy::all(1_024))
+    .open()?
+    else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.index_partition_spill_threshold = 0;
+    })?;
+    let key = |i: u32| format!("k{i:06}");
+    for i in 0..4_000u32 {
+        tree.insert(key(i), vec![b'v'; 64], 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let Some(table) = tree.current_version().iter_tables().next().cloned() else {
+        panic!("one table");
+    };
+
+    let reads = |lo: Bound<&str>| -> crate::Result<usize> {
+        let pacer = Arc::new(CountingPacer::default());
+        let pace: crate::table::util::Pacer = pacer.clone();
+        let scan = table.scan_carrying(
+            bounds(lo, Bound::Unbounded),
+            crate::table::group_carry::CarryQueue::default(),
+            Some(&pace),
+        )?;
+        assert!(scan.is_some(), "the table holds the range");
+        Ok(pacer.0.load(core::sync::atomic::Ordering::Relaxed))
+    };
+    let whole = reads(Bound::Unbounded)?;
+    let last = key(3_990);
+    let tail = reads(Bound::Included(last.as_str()))?;
+
+    assert!(whole > 8, "the index has many partitions: {whole}");
+    assert!(
+        tail * 4 < whole,
+        "{tail} index reads from the bound, {whole} for the table"
+    );
+    Ok(())
+}
+
 /// A scan from an included lower bound skips the groups that end below it
 /// and starts at the group holding the bound itself, whose rows below the
 /// bound come with it.

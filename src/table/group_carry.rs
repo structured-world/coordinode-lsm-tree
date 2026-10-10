@@ -41,9 +41,21 @@ pub struct CarryCandidate {
     pub(crate) rows: Arc<[InternalValue]>,
     /// The first and the last of `rows`' keys.
     keys: (UserKey, UserKey),
+    /// The bytes of `rows`' keys and values.
+    bytes: u64,
+}
+
+/// The bytes of `row`'s key and value, as a carry counts what it holds.
+pub fn row_bytes(row: &InternalValue) -> u64 {
+    (row.key.user_key.len() + row.value.len()) as u64
 }
 
 impl CarryCandidate {
+    /// The bytes of the group's rows' keys and values.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// The key of the group's first row.
     pub(crate) fn first_key(&self) -> &UserKey {
         &self.keys.0
@@ -158,21 +170,25 @@ impl GroupCarry {
     /// The scan is asked for a new group once the merge has taken the last
     /// row of the one before, so every key below that row has gone through
     /// the merge: a candidate ending below it can no longer be emitted, and
-    /// is dropped here, whether or not the merge emitted anything since. The
-    /// queue then holds about one group per input, however long a run the
-    /// merge drops. A one-key group the merge still holds at that moment is
-    /// dropped too, and its rows are written instead of copied.
+    /// is dropped here, whether or not the merge emitted anything since. One
+    /// ending on that key is dropped too: a group whose earlier keys went
+    /// through the merge either opened on them and left the queue or can no
+    /// longer be copied whole, and a group of that key alone, whose versions
+    /// the merge may still be emitting, is written as rows instead. The queue
+    /// then holds about one group per input, however long a run the merge
+    /// drops and however many groups one key's versions fill.
     pub(crate) fn start(&mut self, group: Option<BlockHandle>, mut rows: Vec<InternalValue>) {
         let read = rows.len();
         if let Some(bounds) = &self.bounds {
             rows.retain(|row| bounds.contains(&row.key.user_key));
         }
         let whole = rows.len() == read;
+        let bytes = rows.iter().map(row_bytes).sum();
         let mut queue = self.queue.lock();
         if let Some(passed) = self.rows.last() {
             let comparator = &self.table.comparator;
             queue.retain(|candidate| {
-                comparator.compare(candidate.last_key(), &passed.key.user_key) != Ordering::Less
+                comparator.compare(candidate.last_key(), &passed.key.user_key) == Ordering::Greater
             });
         }
         self.rows = Arc::from(rows);
@@ -189,6 +205,7 @@ impl GroupCarry {
                 row_group,
                 rows: Arc::clone(&self.rows),
                 keys,
+                bytes,
             });
         }
         #[cfg(test)]
@@ -236,12 +253,22 @@ impl Table {
         queue: CarryQueue,
         pace: Option<&super::util::Pacer>,
     ) -> crate::Result<Option<super::Scanner>> {
+        use super::block_index::BlockIndexIter;
+
         let mut groups = Vec::new();
         let walk = self.maintenance_index_walk();
-        let walk = match pace {
+        let mut walk = match pace {
             Some(pace) => walk.with_pace(Arc::clone(pace)),
             None => walk,
         };
+        // Straight to the first group ending at or past the lower bound, as a
+        // bounded read seeks, rather than through every entry before it: a
+        // range of a table's tail reads the index from there on.
+        if let Bound::Included(lo) | Bound::Excluded(lo) = &bounds.lo
+            && !walk.seek_lower(lo, crate::SeqNo::MAX)
+        {
+            return Ok(None);
+        }
         for keyed in walk {
             let keyed = keyed?;
             let end = keyed.end_key();

@@ -96,6 +96,8 @@ struct Open {
     seen: alloc::vec::Vec<u64>,
     /// The count when the last of `emitted` came out.
     last_seen: u64,
+    /// The bytes of `emitted`'s keys and values.
+    held_bytes: u64,
 }
 
 impl Open {
@@ -103,6 +105,7 @@ impl Open {
         let last_seen = sink.transforms_seen();
         Self {
             candidate,
+            held_bytes: crate::table::group_carry::row_bytes(&row),
             emitted: alloc::vec![row],
             seen: alloc::vec![last_seen],
             last_seen,
@@ -111,8 +114,19 @@ impl Open {
 
     fn hold(&mut self, row: InternalValue, sink: &dyn CarrySink) {
         self.last_seen = sink.transforms_seen();
+        self.held_bytes += crate::table::group_carry::row_bytes(&row);
         self.emitted.push(row);
         self.seen.push(self.last_seen);
+        #[cfg(test)]
+        tests::note_held(&self.emitted);
+    }
+
+    /// Whether the merge has filled the range far past the group's rows, by
+    /// their count or their bytes: it is no group of the source's shape any
+    /// more, and holding it on would hold the merge.
+    fn overfilled(&self) -> bool {
+        self.emitted.len() > 2 * self.candidate.rows.len()
+            || self.held_bytes > 2 * self.candidate.bytes()
     }
 }
 
@@ -156,10 +170,9 @@ impl CarryMatcher {
                 != core::cmp::Ordering::Greater;
             if within {
                 open.hold(row, sink);
-                // A range the merge filled far past the group's rows is no
-                // group of the source's shape any more; it goes out as rows,
-                // which bounds what is held to about two groups.
-                if open.emitted.len() > 2 * open.candidate.rows.len() {
+                // An overfilled range goes out as rows, which bounds what is
+                // held to about two groups and one row.
+                if open.overfilled() {
                     self.last_key = open.emitted.last().map(|r| r.key.user_key.clone());
                     Self::write_rows(open, sink)?;
                 } else {
@@ -329,6 +342,35 @@ pub fn align_row_pages(
         *copied.last_mut()? = false;
     }
     copied.contains(&true).then_some((rows, copied))
+}
+
+/// Whether every row page of `emitted` cut as `row_pages` says, that is not
+/// `copied`, holds a single row or rows of at most `limit` bytes: a page past
+/// it is one the writer would have split, and a group rebuilt with it could
+/// grow a page past what one block may hold.
+pub fn changed_pages_fit(
+    emitted: &[InternalValue],
+    (row_pages, copied): (&[u32], &[bool]),
+    limit: u64,
+) -> bool {
+    let mut rest = emitted;
+    for (&rows, &copied) in row_pages.iter().zip(copied) {
+        let Some((page, after)) = rest.split_at_checked(rows as usize) else {
+            return false;
+        };
+        if !copied
+            && page.len() > 1
+            && page
+                .iter()
+                .map(crate::table::group_carry::row_bytes)
+                .sum::<u64>()
+                > limit
+        {
+            return false;
+        }
+        rest = after;
+    }
+    true
 }
 
 #[cfg(test)]
