@@ -646,6 +646,49 @@ impl MultiWriter {
         );
     }
 
+    /// Records the blob references of `rows`, written into the current table
+    /// not one by one but as a copied row group, each under its own row's key,
+    /// as [`Self::register_blob`] and [`Self::register_cell_row`] record a
+    /// written row's under the current key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a row tagged as an indirection or a cell row does
+    /// not decode as one.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn register_carried_rows(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
+        use crate::coding::Decode;
+
+        for row in rows {
+            let key = &row.key.user_key;
+            if row.key.value_type.is_cell_row() {
+                for (indirection, owned) in crate::blob_tree::field_row::row_refs(&row.value)? {
+                    self.linked_blobs.register(
+                        indirection.vhandle.blob_file_id,
+                        u64::from(indirection.size),
+                        u64::from(indirection.vhandle.on_disk_size),
+                        key,
+                        owned,
+                    );
+                    if owned {
+                        self.owned_objects
+                            .push((indirection.vhandle.blob_file_id, indirection.vhandle.offset));
+                    }
+                }
+            } else if row.key.value_type.is_indirection() {
+                let indirection = BlobIndirection::decode_from(&mut &row.value[..])?;
+                self.linked_blobs.register(
+                    indirection.vhandle.blob_file_id,
+                    u64::from(indirection.size),
+                    u64::from(indirection.vhandle.on_disk_size),
+                    key,
+                    true,
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Records the blob files the cell row just written references, as
     /// [`Self::register_blob`] does for an indirection: each owned reference
     /// adds to its file's counts, each borrowed one only links the file.
@@ -991,6 +1034,24 @@ impl MultiWriter {
         self.transforms_after_last_write = now;
         self.transform_marker = Some(marker);
         self
+    }
+
+    /// The transform counter's value now, `None` when none is wired.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn transforms_seen(&self) -> Option<u64> {
+        self.transform_marker
+            .as_ref()
+            .map(|marker| marker.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Takes `seen`, the counter's value when the record just put in the
+    /// current output was emitted, as the after-last-write milestone, in
+    /// place of the value read as it was written: a record written after the
+    /// merge held it would otherwise take the verdicts ticked meanwhile,
+    /// which belong to the next output (see `transforms_after_last_write`).
+    #[cfg(feature = "columnar")]
+    pub(crate) fn settle_transforms(&mut self, seen: u64) {
+        self.transforms_after_last_write = seen;
     }
 
     /// Sets the delete strategy for this and every rotated successor writer.
@@ -1386,6 +1447,139 @@ impl MultiWriter {
         }
 
         Ok(())
+    }
+
+    /// Writes `raw`, a row group of another table copied whole, in place of its
+    /// `rows`, which the compaction would otherwise write one by one; `group`
+    /// is its index entry there, `layout` how its values are stored and
+    /// `columns` its zone-map statistics. The group's first key is taken as
+    /// [`Self::write`] takes a new key, rotating first when the table is full.
+    ///
+    /// Returns `false` when the group cannot be copied here, having written
+    /// none of it: one that does not start a new key, or one the current
+    /// table refuses (see [`Writer::append_carried_row_group`]). The caller
+    /// then writes `rows` through [`Self::write`].
+    ///
+    /// # Errors
+    ///
+    /// Any error of the rotation or of the copy.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn carry_row_group(
+        &mut self,
+        (raw, source): (&[u8], super::writer::VerbatimSource),
+        group: super::index_block::RowGroupRef,
+        (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
+        rows: &[InternalValue],
+        columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
+    ) -> crate::Result<bool> {
+        self.carry_into((compression, layout), rows, |writer, comparator| {
+            writer.append_carried_row_group((raw, source), group, layout, rows, columns, comparator)
+        })
+    }
+
+    /// Writes `rows` as one group that copies the pages `carry` names from
+    /// another table's group, encoding the rest (see
+    /// [`Writer::append_partly_carried_row_group`]); `compression` is the
+    /// source's data codec. The group's first key is taken as [`Self::write`]
+    /// takes a new key.
+    ///
+    /// Returns `false`, having written none of it, when the group cannot be
+    /// written so; the caller then writes `rows` through [`Self::write`].
+    ///
+    /// # Errors
+    ///
+    /// Any error of the rotation or of the write.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn carry_row_pages(
+        &mut self,
+        rows: &[InternalValue],
+        carry: &super::writer::PageCarry<'_>,
+        compression: CompressionType,
+    ) -> crate::Result<bool> {
+        self.carry_into(
+            (compression, crate::table::meta::ValueLayout::Whole),
+            rows,
+            |writer, comparator| writer.append_partly_carried_row_group(rows, carry, comparator),
+        )
+    }
+
+    /// Takes `rows`' first key as [`Self::write`] takes a new key and has
+    /// `write` put the group in the current table, when this run writes the
+    /// copied pages' transform; `false`, having written nothing, otherwise.
+    #[cfg(feature = "columnar")]
+    fn carry_into(
+        &mut self,
+        (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
+        rows: &[InternalValue],
+        write: impl FnOnce(&mut Writer, &crate::comparator::SharedComparator) -> crate::Result<bool>,
+    ) -> crate::Result<bool> {
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Ok(false);
+        };
+        // The copied pages keep the transform they were written under: this
+        // run's must be the same, so a read of the copy decodes them with the
+        // codec and dictionary its table names, and an encrypted or parity
+        // run gets blocks bound to its own identity and scheme.
+        if self.encryption.is_some()
+            || self.ecc.is_some()
+            || self.data_block_compression != compression
+        {
+            return Ok(false);
+        }
+        // A key's versions stay in one output, and a group that continues the
+        // key written last would split them across the copy's boundary.
+        if self
+            .current_key
+            .as_ref()
+            .is_some_and(|c| crate::comparator::same_user_key(c, &first.key.user_key))
+        {
+            return Ok(false);
+        }
+        let previous_key = self.current_key.replace(first.key.user_key.clone());
+        if !self.range_tombstones.is_empty() {
+            self.tombstone_share.advance(
+                &self.range_tombstones,
+                &first.key.user_key,
+                self.comparator.as_ref(),
+            );
+            if previous_key.is_none() && self.clip_range_tombstones {
+                self.tombstone_share.open_output(&first.key.user_key);
+            }
+        }
+        // A table records one value layout: a group stored the other way
+        // starts the next table, a run of groups stored one way shares it.
+        let layout_changes = self.value_layout.is_some_and(|current| current != layout);
+        if layout_changes || (self.table_full() && self.rotation_sheds(&first.key.user_key, (0, 0)))
+        {
+            self.rotate()?;
+            self.tombstone_share.open_output(&first.key.user_key);
+        }
+
+        let comparator = self.comparator.clone();
+        if !write(&mut self.writer, &comparator)? {
+            // The rows are written next, as rows: their first key must reach
+            // [`Self::write`] as a new key, so it rotates for their layout as
+            // it would without this attempt. Advancing the tombstone share to
+            // that key and opening an output there do the same again.
+            self.current_key = previous_key;
+            return Ok(false);
+        }
+        // The group's later keys move the tombstone share as written rows
+        // would; it only moves forward, so its last key is enough.
+        if !self.range_tombstones.is_empty() {
+            self.tombstone_share.advance(
+                &self.range_tombstones,
+                &last.key.user_key,
+                self.comparator.as_ref(),
+            );
+        }
+        self.current_key = Some(last.key.user_key.clone());
+        self.value_layout = Some(layout);
+        self.note_output_base();
+        if let Some(marker) = &self.transform_marker {
+            self.transforms_after_last_write = marker.load(core::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
     }
 
     /// Writes a consumer-provided columnar batch as one columnar block, rotating

@@ -4214,6 +4214,48 @@ fn salvaged_columnar_table_keeps_per_column_zone_statistics() -> crate::Result<(
     Ok(())
 }
 
+/// A salvaged copy keeps the source's groups as they were cut and encoded,
+/// so it records the source's shape rather than the writer's defaults: a
+/// later merge would otherwise copy those groups into a table that cuts them
+/// another way.
+#[cfg(feature = "columnar")]
+#[test]
+fn salvage_records_the_source_group_shape() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_column_encoding(crate::config::ColumnEncoding::Auto)
+        .use_row_group_size(4_096)
+        .use_columnar_page_size(256);
+    for i in 0u32..64 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+    let shape = open(source.clone(), &fs)?.metadata.group_shape;
+    assert_eq!(
+        shape,
+        Some(crate::table::meta::GroupShape {
+            encoding: crate::config::ColumnEncoding::Auto,
+            row_group_size: 4_096,
+            page_size: 256,
+        }),
+    );
+
+    let report = salvage_sst(&source, dest.clone(), &fs)?;
+    assert!(
+        report.blocks_copied_verbatim > 0,
+        "the source's groups are copied as they are: {report:?}",
+    );
+    assert_eq!(open(dest, &fs)?.metadata.group_shape, shape);
+    Ok(())
+}
+
 /// A clean group of row pages is copied verbatim with its zone blocks: the
 /// copy is the group whole, directory, pages and zones, so the salvaged
 /// table's groups still fill their extents, pass every gate, and prune and

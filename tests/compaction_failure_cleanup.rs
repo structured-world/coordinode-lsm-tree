@@ -104,11 +104,22 @@ fn assert_fails_cleanly(
     target_size: u64,
     expected: impl Fn(u64) -> Vec<u8>,
 ) -> lsm_tree::Result<()> {
+    assert_fails_cleanly_at(f, rules, target_size, PAST_EVERY_VERSION, expected)
+}
+
+/// [`assert_fails_cleanly`] for a compaction under `gc_watermark`.
+fn assert_fails_cleanly_at(
+    f: &Fixture,
+    rules: impl IntoIterator<Item = FaultRule>,
+    target_size: u64,
+    gc_watermark: u64,
+    expected: impl Fn(u64) -> Vec<u8>,
+) -> lsm_tree::Result<()> {
     let before = on_disk(f.dir.path())?;
     for rule in rules {
         f.injector.arm(rule);
     }
-    let result = f.tree.major_compact(target_size, PAST_EVERY_VERSION);
+    let result = f.tree.major_compact(target_size, gc_watermark);
     f.injector.clear();
 
     assert!(
@@ -170,6 +181,75 @@ fn a_merge_failing_to_read_an_input_leaves_none_of_its_tables() -> lsm_tree::Res
         16 * 1024,
         |i| value(i, 0),
     )
+}
+
+/// Two columnar tables of disjoint keys written as the output level writes
+/// them, so a merge keeping every version copies their groups.
+#[cfg(feature = "columnar")]
+fn copying_fixture() -> lsm_tree::Result<Fixture> {
+    let f = open(|c| c)?;
+    let AnyTree::Standard(tree) = &f.tree else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.data_block_compression_policy =
+            lsm_tree::config::CompressionPolicy::all(lsm_tree::CompressionType::None);
+    })?;
+    for i in 0..KEYS / 2 {
+        f.tree.insert(key(i), value(i, 0), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    for i in KEYS / 2..KEYS {
+        f.tree.insert(key(i), value(i, 0), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+    Ok(f)
+}
+
+/// The same read error in a merge that copies its inputs' row groups: the
+/// scan that records them and the raw read of a group fail the merge as a
+/// row read does, and leave nothing behind. The merge keeps every version,
+/// as one that zeroed seqnos would change every row and copy nothing.
+#[cfg(all(feature = "columnar", feature = "metrics"))]
+#[test]
+fn a_merge_copying_groups_failing_to_read_leaves_none_of_its_tables() -> lsm_tree::Result<()> {
+    // The control: without faults the same merge copies groups.
+    let control = copying_fixture()?;
+    control.tree.major_compact(16 * 1024, 0)?;
+    let AnyTree::Standard(control_tree) = &control.tree else {
+        panic!("expected standard tree");
+    };
+    assert!(
+        control_tree.metrics().compaction_groups_carried() > 0,
+        "the fixture's merge copies groups"
+    );
+
+    let f = copying_fixture()?;
+    for skip in [2, 6, 12] {
+        assert_fails_cleanly_at(
+            &f,
+            [
+                io_error(FaultOp::ReadAt, "tables", skip),
+                io_error(FaultOp::Read, "tables", skip),
+            ],
+            16 * 1024,
+            0,
+            |i| value(i, 0),
+        )?;
+    }
+    // The scans stream the groups after the first: failing that stream
+    // alone fails a group read part-way through the scan that records it.
+    for skip in [3, 8] {
+        assert_fails_cleanly_at(
+            &f,
+            [io_error(FaultOp::Read, "tables", skip)],
+            16 * 1024,
+            0,
+            |i| value(i, 0),
+        )?;
+    }
+    Ok(())
 }
 
 /// One failed sub-compaction aborts the install: the outputs its siblings
