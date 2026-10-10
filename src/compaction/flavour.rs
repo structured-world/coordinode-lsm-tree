@@ -578,44 +578,11 @@ impl ProducedOutput {
 pub(super) trait CompactionFlavour {
     fn write(&mut self, item: InternalValue) -> crate::Result<()>;
 
-    /// Copies `candidate`'s row group into the output in place of its rows,
-    /// returning `false`, having written nothing, when this output cannot
-    /// take it as it is; the caller then writes the rows. `pace` is told how
-    /// long reading the group takes.
+    /// This compaction as the one that copies row groups into its output,
+    /// `None` for a flavour that writes its rows another way: a carry plan is
+    /// made only for a compaction that writes every row itself (see `carry`).
     #[cfg(feature = "columnar")]
-    fn carry(
-        &mut self,
-        _candidate: &crate::table::group_carry::CarryCandidate,
-        _pace: Option<&dyn crate::table::util::ReadPacer>,
-    ) -> crate::Result<bool> {
-        Ok(false)
-    }
-
-    /// Writes `emitted`, what the merge made of `candidate`'s key range, as
-    /// one group that copies the candidate's pages on the row pages left as
-    /// they were, returning the bytes copied; `None`, having written nothing,
-    /// when this output cannot. The caller then writes the rows.
-    #[cfg(feature = "columnar")]
-    fn carry_pages(
-        &mut self,
-        _candidate: &crate::table::group_carry::CarryCandidate,
-        _emitted: &[InternalValue],
-        _pace: Option<&dyn crate::table::util::ReadPacer>,
-    ) -> crate::Result<Option<u64>> {
-        Ok(None)
-    }
-
-    /// The count of the compaction filter's transformations so far (see
-    /// [`crate::compaction::carry::CarrySink`]). Every flavour answers it, as
-    /// a held row written without it would take the next output's
-    /// transformations.
-    #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> u64;
-
-    /// Closes the current output's transformation window at `seen` for the
-    /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
-    #[cfg(feature = "columnar")]
-    fn settle_transforms(&mut self, seen: u64);
+    fn carrying(&mut self) -> Option<&mut StandardCompaction>;
 
     /// Writes range tombstones to the current output table.
     fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
@@ -1205,14 +1172,11 @@ impl CompactionFlavour for RelocatingCompaction {
         self.inner.write_range_tombstones(tombstones);
     }
 
+    /// A relocating compaction moves the blob values its rows point at, so it
+    /// writes every row and copies no group.
     #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> u64 {
-        self.inner.transforms_seen()
-    }
-
-    #[cfg(feature = "columnar")]
-    fn settle_transforms(&mut self, seen: u64) {
-        self.inner.settle_transforms(seen);
+    fn carrying(&mut self) -> Option<&mut StandardCompaction> {
+        None
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
@@ -1465,50 +1429,27 @@ impl StandardCompaction {
     }
 }
 
-impl CompactionFlavour for StandardCompaction {
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
-        self.table_writer.set_range_tombstones(tombstones.to_vec());
-    }
-
-    #[cfg(feature = "columnar")]
-    fn transforms_seen(&self) -> u64 {
+/// The row group copies of a compaction that writes every row of its output
+/// itself: the only flavour a carry plan is made for (see `carry`).
+#[cfg(feature = "columnar")]
+impl StandardCompaction {
+    /// The count of the compaction filter's transformations so far (see
+    /// [`crate::compaction::carry::CarrySink`]).
+    pub(super) fn transforms_seen(&self) -> u64 {
         self.table_writer.transforms_seen()
     }
 
-    #[cfg(feature = "columnar")]
-    fn settle_transforms(&mut self, seen: u64) {
+    /// Closes the current output's transformation window at `seen` for the
+    /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
+    pub(super) fn settle_transforms(&mut self, seen: u64) {
         self.table_writer.settle_transforms(seen);
     }
 
-    fn write(&mut self, item: InternalValue) -> crate::Result<()> {
-        if item.key.value_type.is_cell_row() {
-            // The row is kept as it is, ownership included; the slice clone
-            // is a reference-count bump, since the writer takes the item.
-            let row = item.value.clone();
-            self.table_writer.write(item)?;
-            return self.table_writer.register_cell_row(&row);
-        }
-
-        let indirection = if item.key.value_type.is_indirection() {
-            Some({
-                let mut reader = &item.value[..];
-                BlobIndirection::decode_from(&mut reader)?
-            })
-        } else {
-            None
-        };
-
-        self.table_writer.write(item)?;
-
-        if let Some(indirection) = indirection {
-            self.table_writer.register_blob(indirection);
-        }
-
-        Ok(())
-    }
-
-    #[cfg(feature = "columnar")]
-    fn carry(
+    /// Copies `candidate`'s row group into the output in place of its rows,
+    /// returning `false`, having written nothing, when this output cannot
+    /// take it as it is; the caller then writes the rows. `pace` is told how
+    /// long reading the group takes.
+    pub(super) fn carry(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
         pace: Option<&dyn crate::table::util::ReadPacer>,
@@ -1548,8 +1489,11 @@ impl CompactionFlavour for StandardCompaction {
         Ok(true)
     }
 
-    #[cfg(feature = "columnar")]
-    fn carry_pages(
+    /// Writes `emitted`, what the merge made of `candidate`'s key range, as
+    /// one group that copies the candidate's pages on the row pages left as
+    /// they were, returning the bytes copied; `None`, having written nothing,
+    /// when this output cannot. The caller then writes the rows.
+    pub(super) fn carry_pages(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
         emitted: &[InternalValue],
@@ -1627,6 +1571,44 @@ impl CompactionFlavour for StandardCompaction {
             .map(|(_, entry)| u64::from(entry.length))
             .sum();
         Ok(Some(bytes))
+    }
+}
+
+impl CompactionFlavour for StandardCompaction {
+    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
+        self.table_writer.set_range_tombstones(tombstones.to_vec());
+    }
+
+    fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+        if item.key.value_type.is_cell_row() {
+            // The row is kept as it is, ownership included; the slice clone
+            // is a reference-count bump, since the writer takes the item.
+            let row = item.value.clone();
+            self.table_writer.write(item)?;
+            return self.table_writer.register_cell_row(&row);
+        }
+
+        let indirection = if item.key.value_type.is_indirection() {
+            Some({
+                let mut reader = &item.value[..];
+                BlobIndirection::decode_from(&mut reader)?
+            })
+        } else {
+            None
+        };
+
+        self.table_writer.write(item)?;
+
+        if let Some(indirection) = indirection {
+            self.table_writer.register_blob(indirection);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "columnar")]
+    fn carrying(&mut self) -> Option<&mut StandardCompaction> {
+        Some(self)
     }
 
     fn produce(

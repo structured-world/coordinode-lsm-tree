@@ -2500,18 +2500,20 @@ fn run_subcompaction(
     }
 
     #[cfg(feature = "columnar")]
-    let mut matcher = carry.as_ref().map(|carry| {
+    let mut matcher = compactor.carrying().and(carry.as_ref()).map(|carry| {
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
     let read_pace = pace.as_deref();
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
-        if let Some(matcher) = matcher.as_mut() {
+        if let Some(matcher) = matcher.as_mut()
+            && let Some(flavour) = compactor.carrying()
+        {
             return matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour: &mut *compactor,
+                    flavour,
                     pace: read_pace,
                 },
             );
@@ -2559,12 +2561,12 @@ fn run_subcompaction(
         return Err(e);
     }
     #[cfg(feature = "columnar")]
-    let carried = match matcher.take() {
-        Some(matcher) => matcher.finish(&mut FlavourSink {
-            flavour: &mut *compactor,
+    let carried = match (matcher.take(), compactor.carrying()) {
+        (Some(matcher), Some(flavour)) => matcher.finish(&mut FlavourSink {
+            flavour,
             pace: read_pace,
         })?,
-        None => super::carry::Carried::default(),
+        _ => super::carry::Carried::default(),
     };
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
@@ -3720,18 +3722,20 @@ fn merge_tables(
     // when a run of them is an input's row group as it was read, copied as
     // the group.
     #[cfg(feature = "columnar")]
-    let mut matcher = carry.as_ref().map(|carry| {
+    let mut matcher = compactor.carrying().and(carry.as_ref()).map(|carry| {
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
     let read_pace = pace.as_deref();
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
-        if let Some(matcher) = matcher.as_mut() {
+        if let Some(matcher) = matcher.as_mut()
+            && let Some(flavour) = compactor.carrying()
+        {
             return matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour: &mut *compactor,
+                    flavour,
                     pace: read_pace,
                 },
             );
@@ -3826,14 +3830,14 @@ fn merge_tables(
 
     // What the matcher still holds goes out after the last row, guarded alike.
     #[cfg(feature = "columnar")]
-    let carried = match matcher.take() {
-        Some(matcher) => hidden_guard(payload, opts, || {
+    let carried = match (matcher.take(), compactor.carrying()) {
+        (Some(matcher), Some(flavour)) => hidden_guard(payload, opts, || {
             matcher.finish(&mut FlavourSink {
-                flavour: &mut *compactor,
+                flavour,
                 pace: read_pace,
             })
         })?,
-        None => super::carry::Carried::default(),
+        _ => super::carry::Carried::default(),
     };
     #[cfg(feature = "columnar")]
     log::debug!(
@@ -3934,7 +3938,7 @@ fn merge_tables(
 /// A compaction's output as the carry matcher sees it.
 #[cfg(feature = "columnar")]
 struct FlavourSink<'a> {
-    flavour: &'a mut dyn super::flavour::CompactionFlavour,
+    flavour: &'a mut StandardCompaction,
     /// Told how long reading a carried group takes.
     pace: Option<&'a dyn crate::table::util::ReadPacer>,
 }
@@ -3942,7 +3946,7 @@ struct FlavourSink<'a> {
 #[cfg(feature = "columnar")]
 impl super::carry::CarrySink for FlavourSink<'_> {
     fn write(&mut self, row: InternalValue) -> crate::Result<()> {
-        self.flavour.write(row)
+        super::flavour::CompactionFlavour::write(self.flavour, row)
     }
 
     fn carry(
