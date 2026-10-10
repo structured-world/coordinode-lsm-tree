@@ -873,27 +873,20 @@ fn compaction_carried_cell_rows_keep_owning_their_objects() -> lsm_tree::Result<
 }
 
 /// Newer versions of cell rows that borrow their bodies from the versions
-/// they replace, flushed apart from them: the merge drops the owners and
-/// copies the borrowers' groups whole, and a copied borrower takes no
-/// ownership, so no body is charged as garbage and every body still reads
-/// through the row that borrows it.
+/// they replace, kept beside them: a group holding owners and borrowers is
+/// copied whole, a copied borrower takes no ownership, and so no body is
+/// charged as garbage and every version still reads its body.
 #[test]
 fn compaction_carried_borrowing_cell_rows_charge_nothing() -> lsm_tree::Result<()> {
     use lsm_tree::KvSeparationOptions;
     use lsm_tree::blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field};
-    use lsm_tree::config::{BlockSizePolicy, ColumnEncoding, ColumnEncodingPolicy};
 
     let folder = get_tmp_folder();
-    // Every level cuts and encodes groups alike, so a group flushed to level
-    // 0 is one the last level would write.
     let any = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .columnar_row_group_size_policy(BlockSizePolicy::all(16 * 1024))
-    .columnar_page_size_policy(BlockSizePolicy::all(4 * 1024))
-    .column_encoding_policy(ColumnEncodingPolicy::all(ColumnEncoding::Plain))
     .with_kv_separation(Some(
         KvSeparationOptions::default().separation_threshold(64),
     ))
@@ -938,21 +931,34 @@ fn compaction_carried_borrowing_cell_rows_charge_nothing() -> lsm_tree::Result<(
         )?;
     }
     tree.flush_active_memtable(0)?;
+    // A watermark of zero keeps every version: each key's owner and borrower
+    // now lie side by side in the last level's groups.
+    tree.major_compact(64_000_000, 0)?;
+    let carried_before = tree.index.metrics().compaction_groups_carried();
 
-    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    tree.insert(key(docs), "plain", u64::from(2 * docs));
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64_000_000, 0)?;
 
     assert!(
-        tree.index.metrics().compaction_groups_carried() > 0,
-        "the borrowers' groups are copied"
+        tree.index.metrics().compaction_groups_carried() > carried_before,
+        "the groups of owners and borrowers are copied"
     );
     assert_eq!(tree.stale_blob_bytes(), 0, "a borrowed body is not charged");
     assert_eq!(tree.blob_file_count(), 1, "the bodies' file stays");
     for i in 0..docs {
-        let row = tree.get_cells(key(i), SeqNo::MAX)?.expect("written");
-        assert_eq!(
-            row.resolve(FIRST_FIELD_COLUMN + 1)?.as_deref(),
-            Some(&body(i)[..])
-        );
+        for (at, status) in [(SeqNo::MAX, &b"final"[..]), (u64::from(docs), b"draft")] {
+            let row = tree.get_cells(key(i), at)?.expect("written");
+            assert_eq!(
+                row.resolve(FIRST_FIELD_COLUMN)?.as_deref(),
+                Some(status),
+                "key {i} at {at}"
+            );
+            assert_eq!(
+                row.resolve(FIRST_FIELD_COLUMN + 1)?.as_deref(),
+                Some(&body(i)[..])
+            );
+        }
     }
     Ok(())
 }
