@@ -177,17 +177,19 @@ pub(super) fn plan_filters(
     )
 }
 
-/// The boundaries between adjacent tables of each run of the level
-/// `payload`'s outputs are merged into next, in key order: none when output
-/// alignment is off or the destination is the last level. A run's last table
-/// has no boundary after it, since an output past it overlaps no further table
-/// of that run.
+/// The boundaries between the tables of the level `payload`'s outputs are
+/// merged into next, in key order, across all its runs: none when output
+/// alignment is off or the destination is the last level. A boundary lies
+/// after a table that the next one, in key order, starts above; tables that
+/// overlap, in a level holding several runs, have none between them, since an
+/// output reaching either reaches both.
 fn next_level_boundaries(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
 ) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
     use crate::version::run::Ranged;
+    use core::cmp::Ordering;
 
     if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
         return alloc::sync::Arc::from([]);
@@ -196,18 +198,27 @@ fn next_level_boundaries(
         return alloc::sync::Arc::from([]);
     };
     let comparator = opts.config.comparator.as_ref();
-    let mut boundaries: Vec<_> = level
-        .iter()
-        .flat_map(|run| {
-            run.iter().zip(run.iter().skip(1)).map(|(before, after)| {
-                crate::table::multi_writer::Boundary {
-                    key: before.key_range().max().clone(),
-                    after_bytes: after.file_size(),
-                }
-            })
-        })
-        .collect();
-    boundaries.sort_by(|a, b| comparator.compare(&a.key, &b.key));
+    let mut tables: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+    tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+    let mut boundaries = Vec::with_capacity(tables.len().saturating_sub(1));
+    // The largest key reached so far: a table starting above it starts past
+    // every table before it, whichever run they are in.
+    let mut reached: Option<&crate::UserKey> = None;
+    for pair in tables.windows(2) {
+        let [before, after] = pair else { continue };
+        let max = before.key_range().max();
+        let reach = match reached {
+            Some(far) if comparator.compare(far, max) == Ordering::Greater => far,
+            _ => max,
+        };
+        reached = Some(reach);
+        if comparator.compare(reach, after.key_range().min()) == Ordering::Less {
+            boundaries.push(crate::table::multi_writer::Boundary {
+                key: reach.clone(),
+                after_bytes: after.file_size(),
+            });
+        }
+    }
     boundaries.into()
 }
 

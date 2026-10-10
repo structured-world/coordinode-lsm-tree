@@ -164,7 +164,10 @@ fn a_serial_merge_ends_its_outputs_on_the_level_below() -> crate::Result<()> {
     assert!(outputs.len() > 3, "{} outputs", outputs.len());
     let (_, cut) = outputs.split_last().unwrap();
     for last in cut {
-        assert!(boundaries.contains(last), "an output ends at {last}");
+        assert!(
+            boundaries.contains(last),
+            "an output ends at {last}: outputs end at {outputs:?}, the level below at {boundaries:?}"
+        );
     }
     Ok(())
 }
@@ -187,7 +190,8 @@ fn a_split_merge_ends_its_outputs_on_the_level_below_or_its_range() -> crate::Re
     for last in cut {
         assert!(
             boundaries.contains(last) || seams.contains(last),
-            "an output ends at {last}, on neither a boundary nor a range's end"
+            "an output ends at {last}, on neither a boundary nor a range's end: outputs end \
+             at {outputs:?}, the level below at {boundaries:?}, ranges at {seams:?}"
         );
         at_boundaries += usize::from(boundaries.contains(last));
     }
