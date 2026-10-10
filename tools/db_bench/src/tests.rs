@@ -1,8 +1,28 @@
-use super::{append_github_json, distinct_github_outputs};
+use super::{append_github_json, distinct_github_outputs, parse_benchmark};
 use serde_json::json;
 use std::path::Path;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Several workloads are named in one run, comma-separated, so a `counters`
+/// build writes all of their costs and timings into one set of files; an
+/// unknown name anywhere in the list refuses the run by that name.
+#[test]
+fn several_workloads_are_named_with_commas() {
+    assert_eq!(
+        parse_benchmark("fillseq,overwrite").as_deref(),
+        Ok("fillseq,overwrite")
+    );
+    let err = parse_benchmark("fillseq,nosuch").expect_err("an unknown name");
+    assert!(err.contains("'nosuch'"), "{err}");
+    #[cfg(feature = "counters")]
+    assert!(parse_benchmark("mixed-layout,leveled-sustained").is_ok());
+    #[cfg(not(feature = "counters"))]
+    assert!(
+        parse_benchmark("fillseq,leveled-sustained")
+            .is_err_and(|e| e.contains("--features counters"))
+    );
+}
 
 #[test]
 fn github_outputs_sharing_a_file_are_refused() {

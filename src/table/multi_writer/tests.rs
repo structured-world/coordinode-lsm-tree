@@ -2276,3 +2276,33 @@ fn a_rotated_flush_writes_tables_of_adjacent_disjoint_key_ranges() -> crate::Res
     assert_eq!(counted, keys, "every flushed key in exactly one table");
     Ok(())
 }
+
+/// A partly carried group is judged by a bound on what it writes, not by its
+/// source group: rows a filter or a merge made larger are rebuilt into pages
+/// past the source's size, and the bound covers them.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_partly_carried_group_is_bounded_by_the_rows_it_rebuilds() {
+    use crate::{InternalValue, UserKey};
+
+    let rows: Vec<InternalValue> = (0..10)
+        .map(|i| {
+            InternalValue::from_components(
+                UserKey::from(seq_key(i)),
+                vec![b'v'; 6_000],
+                1,
+                crate::ValueType::Value,
+            )
+        })
+        .collect();
+    let payload: u64 = rows
+        .iter()
+        .map(|row| (row.key.user_key.len() + row.value.len()) as u64)
+        .sum();
+    // A 1 KB source whose rows were replaced by 60 KB of values.
+    let bound = super::partly_carried_bound(1_000, &rows);
+    assert!(
+        bound >= payload + 1_000,
+        "bound {bound} under {payload} bytes of rows"
+    );
+}

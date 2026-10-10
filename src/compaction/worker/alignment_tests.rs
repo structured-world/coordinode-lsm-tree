@@ -232,6 +232,48 @@ fn a_merge_above_an_empty_level_ends_its_outputs_on_the_next_level_holding_table
     Ok(())
 }
 
+/// A size-tiered merge writes back into L0, where its outputs are next merged
+/// with other L0 runs: tables below L0 give it no boundaries, and its outputs
+/// are cut where they would be with alignment off.
+#[test]
+fn a_size_tiered_merge_is_not_aligned_to_the_levels_below() -> crate::Result<()> {
+    let run = |aligned: bool| -> crate::Result<Vec<u32>> {
+        let folder = tempfile::tempdir()?;
+        let tree = open(
+            Config::new(
+                folder.path(),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .compaction_threads(1)
+            .compaction_output_alignment(aligned),
+        )?;
+        let mut seqno = 1;
+        flush_into(&tree, 0..3_000, 700, 3, &mut seqno)?;
+        // Four L0 runs of one size: a size-tiered merge of all of them.
+        for _ in 0..4 {
+            for i in 0..1_000 {
+                tree.insert(key(i * 3), noise(seqno, 1_000), seqno);
+                seqno += 1;
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        let strategy =
+            crate::compaction::SizeTiered::default().with_table_target_size(OUTPUT_TARGET);
+        tree.compact(Arc::new(strategy), 0)?;
+        assert_eq!(
+            tree.current_version()
+                .level(0)
+                .map_or(0, |level| level.run_count()),
+            1,
+            "the four runs were merged"
+        );
+        Ok(last_keys(&tables(&tree, 0)))
+    };
+    assert_eq!(run(true)?, run(false)?);
+    Ok(())
+}
+
 /// A level holding two overlapping runs has no boundary inside their overlap:
 /// an output ending there would reach a table of each run. Every boundary lies
 /// where no table of either run spans it, and the runs' tables outside the

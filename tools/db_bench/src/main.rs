@@ -21,7 +21,8 @@ use std::sync::atomic::AtomicU64;
     about = "LSM-tree benchmark suite (RocksDB db_bench compatible)"
 )]
 struct Cli {
-    /// Benchmark workload to run. Use "all" to run every workload.
+    /// Benchmark workload to run, several separated by commas. Use "all" to
+    /// run every workload.
     #[arg(long, value_parser = parse_benchmark)]
     benchmark: String,
 
@@ -141,26 +142,34 @@ struct Cli {
     flamegraph: bool,
 }
 
+/// The workloads that read the engine's byte counters, compiled only with the
+/// `counters` feature.
+const COUNTER_WORKLOADS: [&str; 2] = ["mixed-layout", "leveled-sustained"];
+
+/// `all`, one workload, or several separated by commas, run in that order.
 fn parse_benchmark(s: &str) -> Result<String, String> {
     if s == "all" {
         return Ok(s.to_string());
     }
     let available = available_benchmarks();
-    if available.contains(&s) {
-        Ok(s.to_string())
-    } else if s == "mixed-layout" {
-        Err(
-            "mixed-layout reads the engine's byte counters, which this build \
-             leaves out; rebuild with `--features counters`"
-                .to_string(),
-        )
-    } else {
-        Err(format!(
-            "unknown benchmark '{}'. Available: all, {}",
-            s,
-            available.join(", ")
-        ))
+    for name in s.split(',') {
+        if available.contains(&name) {
+            continue;
+        }
+        return Err(if COUNTER_WORKLOADS.contains(&name) {
+            format!(
+                "{name} reads the engine's byte counters, which this build \
+                 leaves out; rebuild with `--features counters`"
+            )
+        } else {
+            format!(
+                "unknown benchmark '{}'. Available: all, {}",
+                name,
+                available.join(", ")
+            )
+        });
     }
+    Ok(s.to_string())
 }
 
 /// Appends `entries` to the JSON array held in `path`, creating it when the
@@ -260,8 +269,8 @@ fn main() {
 
     // --json emits one JSON object per workload; with "all" that produces
     // concatenated objects which is not valid JSON.  Use --github-json instead.
-    if cli.json && cli.benchmark == "all" {
-        eprintln!("Error: --json does not support --benchmark all; use --github-json");
+    if cli.json && (cli.benchmark == "all" || cli.benchmark.contains(',')) {
+        eprintln!("Error: --json runs one workload; use --github-json for several");
         std::process::exit(1);
     }
 
@@ -319,7 +328,7 @@ fn main() {
     let benchmarks: Vec<&str> = if cli.benchmark == "all" {
         available_benchmarks()
     } else {
-        vec![&cli.benchmark]
+        cli.benchmark.split(',').collect()
     };
 
     // Collect github-action-benchmark entries when --github-json is set.

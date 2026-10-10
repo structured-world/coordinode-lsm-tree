@@ -175,6 +175,22 @@ pub trait CompactionStrategy: Send + Sync {
     fn pending_compaction_bytes(&self, _version: &Version) -> u64 {
         0
     }
+
+    /// The level a merge into `dest_level` writes outputs that are next merged
+    /// into, whose table boundaries they are cut on (see
+    /// [`Config::compaction_output_alignment`]); `None` cuts them at the target
+    /// size alone.
+    ///
+    /// The default is the first level below the destination that holds tables:
+    /// outputs move down through empty levels untouched and are next merged
+    /// where tables are, as a leveled intra-L0 merge's outputs are merged into
+    /// the base level. A strategy whose outputs are next merged elsewhere, such
+    /// as back into the level they were written to, overrides it.
+    fn next_merge_level(&self, version: &Version, dest_level: u8) -> Option<usize> {
+        (usize::from(dest_level) + 1..)
+            .take_while(|&index| version.level(index).is_some())
+            .find(|&index| version.level(index).is_some_and(|level| !level.is_empty()))
+    }
 }
 
 /// Runs a strategy's structural decision and, only when it would otherwise idle,

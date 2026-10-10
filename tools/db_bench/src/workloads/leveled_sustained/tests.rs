@@ -1,6 +1,6 @@
 use crate::config::{BenchConfig, Compression};
 use crate::workloads::Workload;
-use lsm_tree::{AbstractTree, SeqNo};
+use lsm_tree::AbstractTree;
 
 fn config(num: u64) -> BenchConfig {
     BenchConfig {
@@ -21,22 +21,38 @@ fn config(num: u64) -> BenchConfig {
     }
 }
 
-/// A stream shorter than one flush still reaches the tables: the writes the
-/// ratio counts in its denominator are the ones compaction saw.
+/// A stream shorter than one flush is still one measured step for each tree:
+/// it reaches the tables, and its debt and reads are sampled as any step's.
 #[test]
-fn a_stream_shorter_than_one_flush_reaches_the_tables() -> lsm_tree::Result<()> {
-    let folder = tempfile::tempdir()?;
-    let config = config(1_000);
-    let arm = super::run_arm(folder.path(), &config, true)?;
-    assert!(arm.written > 0);
-    let tree = crate::config::tree_builder(folder.path(), &config)?.open()?;
+fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()> {
+    let base = tempfile::tempdir()?;
+    let (aligned, size_only) = super::run_arms(base.path(), &config(1_000))?;
+    for arm in [&aligned, &size_only] {
+        assert!(arm.written > 0);
+        assert_eq!(arm.flushes, 1, "the writes are one step");
+        assert_eq!(arm.steps.len(), 1);
+        assert_eq!(arm.reads.len(), super::READS_PER_FLUSH);
+    }
+    Ok(())
+}
+
+/// Both trees are built beneath the directory the run was given, the device
+/// `--db` asked for, and removed with the run.
+#[test]
+fn the_trees_are_built_beneath_the_run_directory() -> lsm_tree::Result<()> {
+    let base = tempfile::tempdir()?;
+    let arm = super::ArmRun::open(base.path(), &config(1_000), true)?;
     assert!(
-        tree.table_count() > 0,
-        "{} bytes written and none flushed",
-        arm.written
+        arm.tree.tree_config().path.starts_with(base.path()),
+        "built at {}",
+        arm.tree.tree_config().path.display()
     );
-    // Reopened, the tree serves the keys from its tables alone.
-    assert!(tree.len(SeqNo::MAX, None)? > 0);
+    drop(arm);
+    assert_eq!(
+        std::fs::read_dir(base.path())?.count(),
+        0,
+        "removed with the run"
+    );
     Ok(())
 }
 

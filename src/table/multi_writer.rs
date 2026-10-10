@@ -266,6 +266,26 @@ pub struct MultiWriter {
     alignment: Option<cut_alignment::CutAlignment>,
 }
 
+/// What a row a page of a partly carried group re-encodes may add past its key
+/// and value: its fixed fields (sequence number, value type, offsets) and its
+/// share of the rebuilt page's framing, generously.
+#[cfg(feature = "columnar")]
+const REBUILT_ROW_OVERHEAD: u64 = 64;
+
+/// A bound on the bytes a partly carried group of `rows` writes, its source
+/// group `raw_len` bytes: the copied pages come out of the source, and the
+/// pages rebuilt from rows can grow past it (a value a filter replaced, a
+/// merged one), so every row counts at its key and value plus
+/// [`REBUILT_ROW_OVERHEAD`].
+#[cfg(feature = "columnar")]
+fn partly_carried_bound(raw_len: usize, rows: &[InternalValue]) -> u64 {
+    let rebuilt: u64 = rows
+        .iter()
+        .map(|row| row.key.user_key.len() as u64 + row.value.len() as u64 + REBUILT_ROW_OVERHEAD)
+        .sum();
+    raw_len as u64 + rebuilt
+}
+
 /// What the current table weighs, measured once and judged against any size
 /// target: by its bytes, counting what `finish` appends, or by the state it
 /// holds until `finish`, which is judged against the target whatever size the
@@ -1650,8 +1670,7 @@ impl MultiWriter {
     ) -> crate::Result<bool> {
         self.carry_into(
             (compression, crate::table::meta::ValueLayout::Whole),
-            // The source group's bytes bound what the copy saves.
-            (rows, carry.raw.len() as u64),
+            (rows, partly_carried_bound(carry.raw.len(), rows)),
             |writer, comparator| writer.append_partly_carried_row_group(rows, carry, comparator),
         )
     }

@@ -178,44 +178,69 @@ pub(super) fn plan_filters(
 }
 
 /// The boundaries between the tables of the level `payload`'s outputs are
-/// merged into next, in key order, across all its runs: none when output
-/// alignment is off or no level below the destination holds tables. That level
-/// is the first one below holding tables, not the adjacent one: outputs move
-/// down through empty levels untouched and are next merged where tables are,
-/// as an intra-L0 merge's outputs are merged into the base level. A boundary lies
-/// after a table that the next one, in key order, starts above; tables that
-/// overlap, in a level holding several runs, have none between them, since an
-/// output reaching either reaches both.
+/// merged into next, in key order, across all its runs, within `span`, the
+/// keys the compaction writes: none when output alignment is off or the
+/// strategy names no such level (see
+/// [`CompactionStrategy::next_merge_level`](super::CompactionStrategy::next_merge_level)).
+/// Only the tables meeting `span` are walked: a boundary outside it is one no
+/// output of the compaction can end on. A boundary lies after a table that
+/// the next one, in key order, starts above; tables that overlap, in a level
+/// holding several runs, have none between them, since an output reaching
+/// either reaches both.
 fn next_level_boundaries(
     version: &Version,
     opts: &Options,
     payload: &CompactionPayload,
+    span: Option<(&crate::UserKey, &crate::UserKey)>,
 ) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
     use crate::version::run::Ranged;
+    use core::ops::Bound;
 
     if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
         return alloc::sync::Arc::from([]);
     }
-    let Some(level) = (usize::from(payload.dest_level) + 1..)
-        .map_while(|index| version.level(index))
-        .find(|level| !level.is_empty())
-    else {
+    let (Some(level), Some((lo, hi))) = (
+        opts.strategy
+            .next_merge_level(version, payload.dest_level)
+            .and_then(|index| version.level(index)),
+        span,
+    ) else {
         return alloc::sync::Arc::from([]);
     };
     let comparator = opts.config.comparator.as_ref();
-    // A level holds at least one table here, found non-empty above.
-    let capacity = level.table_count() - 1;
+    let bounds = (Bound::Included(lo), Bound::Included(hi));
     // One run is already in key order with disjoint tables and is walked in
     // place; only several runs are merged into one order first.
     let boundaries = match level.first_run() {
-        Some(run) if level.run_count() == 1 => boundaries_between(run.iter(), capacity, comparator),
+        Some(run) if level.run_count() == 1 => {
+            let tables = tables_meeting(run, &bounds, comparator);
+            boundaries_between(tables.iter(), tables.len(), comparator)
+        }
         _ => {
-            let mut tables: Vec<&Table> = level.iter().flat_map(|run| run.iter()).collect();
+            let mut tables: Vec<&Table> = level
+                .iter()
+                .flat_map(|run| tables_meeting(run, &bounds, comparator))
+                .collect();
             tables.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            let capacity = tables.len();
             boundaries_between(tables.into_iter(), capacity, comparator)
         }
     };
     boundaries.into()
+}
+
+/// The tables of `run` meeting `bounds`, a contiguous slice of it.
+fn tables_meeting<'a>(
+    run: &'a crate::version::run::Run<Table>,
+    bounds: &(
+        core::ops::Bound<&crate::UserKey>,
+        core::ops::Bound<&crate::UserKey>,
+    ),
+    comparator: &dyn crate::comparator::UserComparator,
+) -> &'a [Table] {
+    run.range_overlap_indexes_cmp::<crate::UserKey, _, _>(bounds, comparator)
+        .and_then(|(first, last)| run.get(first..=last))
+        .unwrap_or_default()
 }
 
 /// The boundaries between `tables`, given in order of their min key.
@@ -249,20 +274,39 @@ pub(super) fn boundaries_between<'a>(
     boundaries
 }
 
-/// The largest key among `payload`'s inputs: no key the compaction writes
-/// sorts past it.
-fn inputs_upper(
-    version: &Version,
+/// The smallest and the largest key among `payload`'s inputs: every key the
+/// compaction writes lies between them.
+fn inputs_span<'a>(
+    version: &'a Version,
     opts: &Options,
     payload: &CompactionPayload,
-) -> Option<crate::UserKey> {
+) -> Option<(&'a crate::UserKey, &'a crate::UserKey)> {
+    use core::cmp::Ordering;
+
     let comparator = opts.config.comparator.as_ref();
     version
         .iter_tables()
         .filter(|table| payload.table_ids.contains(&table.id()))
-        .map(|table| table.metadata.key_range.max())
-        .max_by(|a, b| comparator.compare(a, b))
-        .cloned()
+        .map(|table| {
+            (
+                table.metadata.key_range.min(),
+                table.metadata.key_range.max(),
+            )
+        })
+        .reduce(|(lo, hi), (min, max)| {
+            (
+                if comparator.compare(min, lo) == Ordering::Less {
+                    min
+                } else {
+                    lo
+                },
+                if comparator.compare(max, hi) == Ordering::Greater {
+                    max
+                } else {
+                    hi
+                },
+            )
+        })
 }
 
 #[expect(
@@ -364,7 +408,8 @@ pub(super) fn prepare_table_writer(
         opts.config.comparator.clone(),
     );
 
-    let boundaries = next_level_boundaries(version, opts, payload);
+    let span = inputs_span(version, opts, payload);
+    let boundaries = next_level_boundaries(version, opts, payload, span);
     log::debug!(
         "Outputs into L{} cut on {} boundaries of the level below",
         payload.dest_level,
@@ -390,7 +435,7 @@ pub(super) fn prepare_table_writer(
     .use_lineage_whole_run(whole_run)
     // Compaction consumes input tables, so clip RTs to each output table's key range.
     .use_clip_range_tombstones()
-    .use_cut_alignment(boundaries, inputs_upper(version, opts, payload));
+    .use_cut_alignment(boundaries, span.map(|(_, upper)| upper.clone()));
 
     if let Some(marker) = transform_marker {
         table_writer = table_writer.use_transform_marker(marker);

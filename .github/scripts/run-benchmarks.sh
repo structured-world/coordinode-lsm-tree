@@ -26,15 +26,17 @@ cargo run --release --manifest-path tools/db_bench/Cargo.toml -- \
   --github-json \
   > benchmark-results.json
 
-# The byte-counter workload needs the engine's read counters, which are
-# atomics on every read path, so it runs from a separate `counters` build
-# rather than slowing the rates above. Its series are costs, bytes per emitted
-# row, and the times its scans take to a first batch; any rate it publishes is
-# appended to the rate suite rather than replacing it. It lives in its own
-# target directory, the one build-benchmarks.sh builds it in.
+# The byte-counter workloads need the engine's counters, which are atomics on
+# every read and compaction path, so they run from a separate `counters` build
+# rather than slowing the rates above, in one run so their costs and timings
+# share one pair of files. Their series are costs (bytes per emitted row,
+# compaction bytes per written byte, debt) and times (scans to a first batch,
+# compaction steps); any rate they publish is appended to the rate suite
+# rather than replacing it. They live in their own target directory, the one
+# build-benchmarks.sh builds them in.
 cargo run --release --manifest-path tools/db_bench/Cargo.toml --features counters \
   --target-dir tools/db_bench/target/counters -- \
-  --benchmark mixed-layout --num "$NUM" --iterations "$ITERATIONS" \
+  --benchmark mixed-layout,leveled-sustained --num "$NUM" --iterations "$ITERATIONS" \
   --github-json \
   --github-json-append benchmark-results.json \
   --github-json-costs benchmark-costs.json \
