@@ -6,7 +6,7 @@
 //!
 //! An output whose key range straddles such a boundary drags both tables into
 //! that merge; one cut at it drags one. The rule is Pebble's output splitter
-//! (`internal/compact/splitting.go`, `shouldSplitBasedOnSize`), RocksDB's
+//! (`internal/compact/splitting.go`, `shouldSplitBasedOnSize`), `RocksDB`'s
 //! aligned cut with one refinement. A cut is taken only before a new user key;
 //! with `n` the boundaries the output crossed since it held half the target,
 //! counting the one at hand:

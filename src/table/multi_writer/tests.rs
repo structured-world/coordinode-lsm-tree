@@ -1863,15 +1863,20 @@ fn aligned_outputs(
 }
 
 /// Over a densely divided level below, every output but the last ends on a
-/// boundary, holds at least half the target and at most twice it. The first
-/// output ends at the first boundary past half the target, not near ninety
-/// percent: the floor rises with the boundaries the output crossed, not with
-/// the boundaries still ahead in the stream.
+/// boundary and lands within half the target and twice it. The first output
+/// ends at the first boundary past half the target, not near ninety percent:
+/// the floor rises with the boundaries the output crossed, not with the
+/// boundaries still ahead in the stream.
+///
+/// The writer judges an output by an estimate that bounds what `finish`
+/// appends from above, so a file lands a little below the share it was cut
+/// at: the target is large enough for that margin to stay a few percent.
 #[test]
 fn aligned_outputs_end_on_boundaries_within_the_size_band() -> crate::Result<()> {
-    const TARGET: u64 = 40_000;
-    let marks: Vec<u32> = (0..1_000).step_by(7).collect();
-    let outputs = aligned_outputs(0..1_000, TARGET, Some(&marks))?;
+    const TARGET: u64 = 400_000;
+    const GAP: u32 = 70;
+    let marks: Vec<u32> = (0..10_000).step_by(GAP as usize).collect();
+    let outputs = aligned_outputs(0..10_000, TARGET, Some(&marks))?;
     assert!(outputs.len() > 10, "{} outputs", outputs.len());
 
     let (_, rest) = outputs.split_last().unwrap();
@@ -1880,15 +1885,18 @@ fn aligned_outputs_end_on_boundaries_within_the_size_band() -> crate::Result<()>
             marks.contains(&last),
             "output {first}..={last} ends off a boundary"
         );
-        assert!(size >= TARGET / 2, "output {first}..={last}: {size} bytes");
         assert!(
-            size <= 2 * TARGET + 8_192,
+            size >= TARGET * 45 / 100,
+            "output {first}..={last}: {size} bytes"
+        );
+        assert!(
+            size <= 2 * TARGET + 16_384,
             "output {first}..={last}: {size} bytes"
         );
     }
     let (_, _, first_size) = outputs[0];
     assert!(
-        first_size <= TARGET / 2 + 7 * 1_000 + 2 * 4_096,
+        first_size <= TARGET / 2 + u64::from(GAP) * 1_000 + 16_384,
         "the first output waited past the first boundary beyond half the target: {first_size} bytes"
     );
     Ok(())

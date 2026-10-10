@@ -189,7 +189,7 @@ fn next_level_boundaries(
 ) -> alloc::sync::Arc<[crate::table::multi_writer::Boundary]> {
     use crate::version::run::Ranged;
 
-    if !opts.config.compaction_output_alignment {
+    if opts.config.compaction_output_cuts == crate::config::OutputCuts::TargetSize {
         return alloc::sync::Arc::from([]);
     }
     let Some(level) = version.level(usize::from(payload.dest_level) + 1) else {
