@@ -311,6 +311,13 @@ impl CompactionStrategy for Strategy {
         ]
     }
 
+    /// A size-tiered merge writes back into L0, where its outputs are next
+    /// merged with other L0 runs, not with a level below: no boundaries to
+    /// cut them on.
+    fn next_merge_level(&self, _version: &Version, _dest_level: u8) -> Option<usize> {
+        None
+    }
+
     fn pending_compaction_bytes(&self, version: &Version) -> u64 {
         // Tiered debt mirrors the space-amplification trigger in `choose`: the
         // bytes by which total L0 size exceeds the budget

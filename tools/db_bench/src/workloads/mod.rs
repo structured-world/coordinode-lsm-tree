@@ -1,5 +1,7 @@
 pub mod fillrandom;
 pub mod fillseq;
+#[cfg(feature = "counters")]
+pub mod leveled_sustained;
 pub mod mergerandom;
 pub mod mixed;
 #[cfg(feature = "counters")]
@@ -155,6 +157,11 @@ define_workloads! {
     // rate series instead.
     #[cfg(feature = "counters")]
     "mixed-layout" => mixed_layout::MixedLayout,
+    // What cutting compaction outputs on the level below's boundaries does to
+    // compaction under sustained writes; reads the engine's compaction
+    // counter, so only in a `counters` build.
+    #[cfg(feature = "counters")]
+    "leveled-sustained" => leveled_sustained::LeveledSustained,
     "fillseq" => fillseq::FillSeq,
     "fillrandom" => fillrandom::FillRandom,
     "readrandom" => readrandom::ReadRandom,

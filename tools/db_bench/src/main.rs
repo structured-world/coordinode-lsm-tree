@@ -21,7 +21,8 @@ use std::sync::atomic::AtomicU64;
     about = "LSM-tree benchmark suite (RocksDB db_bench compatible)"
 )]
 struct Cli {
-    /// Benchmark workload to run. Use "all" to run every workload.
+    /// Benchmark workload to run, several separated by commas. Use "all" to
+    /// run every workload.
     #[arg(long, value_parser = parse_benchmark)]
     benchmark: String,
 
@@ -123,6 +124,8 @@ struct Cli {
     github_json_append: Option<PathBuf>,
 
     /// Database directory path. If not set, a temporary directory is used.
+    /// Several workloads or iterations each get a fresh directory under
+    /// `<db>/.db_bench/`; one workload run once uses the path itself.
     /// Note: some workloads (e.g. `prefixscan`, `mergerandom`) create their
     /// own temporary database (they require special tree configuration) and
     /// will not reuse this path.
@@ -141,26 +144,34 @@ struct Cli {
     flamegraph: bool,
 }
 
+/// The workloads that read the engine's byte counters, compiled only with the
+/// `counters` feature.
+const COUNTER_WORKLOADS: [&str; 2] = ["mixed-layout", "leveled-sustained"];
+
+/// `all`, one workload, or several separated by commas, run in that order.
 fn parse_benchmark(s: &str) -> Result<String, String> {
     if s == "all" {
         return Ok(s.to_string());
     }
     let available = available_benchmarks();
-    if available.contains(&s) {
-        Ok(s.to_string())
-    } else if s == "mixed-layout" {
-        Err(
-            "mixed-layout reads the engine's byte counters, which this build \
-             leaves out; rebuild with `--features counters`"
-                .to_string(),
-        )
-    } else {
-        Err(format!(
-            "unknown benchmark '{}'. Available: all, {}",
-            s,
-            available.join(", ")
-        ))
+    for name in s.split(',') {
+        if available.contains(&name) {
+            continue;
+        }
+        return Err(if COUNTER_WORKLOADS.contains(&name) {
+            format!(
+                "{name} reads the engine's byte counters, which this build \
+                 leaves out; rebuild with `--features counters`"
+            )
+        } else {
+            format!(
+                "unknown benchmark '{}'. Available: all, {}",
+                name,
+                available.join(", ")
+            )
+        });
     }
+    Ok(s.to_string())
 }
 
 /// Appends `entries` to the JSON array held in `path`, creating it when the
@@ -260,8 +271,8 @@ fn main() {
 
     // --json emits one JSON object per workload; with "all" that produces
     // concatenated objects which is not valid JSON.  Use --github-json instead.
-    if cli.json && cli.benchmark == "all" {
-        eprintln!("Error: --json does not support --benchmark all; use --github-json");
+    if cli.json && (cli.benchmark == "all" || cli.benchmark.contains(',')) {
+        eprintln!("Error: --json runs one workload; use --github-json for several");
         std::process::exit(1);
     }
 
@@ -319,7 +330,7 @@ fn main() {
     let benchmarks: Vec<&str> = if cli.benchmark == "all" {
         available_benchmarks()
     } else {
-        vec![&cli.benchmark]
+        cli.benchmark.split(',').collect()
     };
 
     // Collect github-action-benchmark entries when --github-json is set.
@@ -332,6 +343,7 @@ fn main() {
             &bench_config,
             &cli,
             iterations,
+            benchmarks.len(),
             &mut github_entries,
         ) {
             eprintln!("Error: {benchmark_name} failed: {e}");
@@ -377,6 +389,119 @@ fn main() {
     }
 }
 
+/// The database directory of iteration `iter` of `benchmark` under `--db`
+/// `db`. One workload run once uses `db` itself. Several workloads or
+/// iterations each get a fresh directory of their own, so none opens the tree
+/// another left behind: fill workloads would append to it, read workloads
+/// would prefill on top of it.
+fn database_dir(
+    db: &std::path::Path,
+    benchmark: &str,
+    iter: u32,
+    iterations: u32,
+    workloads: usize,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if iterations == 1 && workloads == 1 {
+        return Ok(db.to_path_buf());
+    }
+    // Nest under a tool-specific `.db_bench/` directory so `remove_dir_all`
+    // here can never clobber user data that happened to live under `<db>`. The
+    // dot-prefix + tool name makes the namespace collision-impossible: a real
+    // workload would never pick this exact path by accident. Workload names
+    // are checked against the known workloads before any run, so one never
+    // carries a path separator.
+    //
+    // Defence-in-depth against symlink-based path escape happens in two
+    // stages:
+    //
+    // 1. `symlink_metadata` on the bench-root leaf rejects the easy case where
+    //    `<db>/.db_bench` is itself a symlink. `symlink_metadata` does not
+    //    follow symlinks on the final component, so it inspects the link
+    //    itself.
+    //
+    // 2. After `create_dir_all` materialises the directory, canonicalise BOTH
+    //    `<db>` and the bench root and require the bench-root canonical path
+    //    to start with the `<db>` canonical path. `canonicalize` follows
+    //    symlinks during resolution, so this catches the case where an
+    //    INTERMEDIATE parent component is a symlink pointing outside `<db>`
+    //    (the leaf check alone would miss this).
+    //
+    // A small TOCTOU window remains between this validation and the
+    // `remove_dir_all` below. Closing it requires opening `<db>` as a
+    // directory file descriptor and operating via openat()-style relative
+    // paths (e.g. cap-std). That is deliberately out of scope for a
+    // single-user bench tool whose `--db` path is user-supplied: the realistic
+    // mistake-case (pre-existing symlink at the leaf, or parent-component
+    // symlink) is fully caught by the two checks above. A deliberate
+    // concurrent attacker who can race-swap entries inside `<db>` already has
+    // the privileges to do worse without exploiting this tool.
+    let bench_root = db.join(".db_bench");
+    if let Ok(md) = std::fs::symlink_metadata(&bench_root)
+        && md.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to clean iteration data: {} is a symlink. \
+             Remove or replace it with a real directory before re-running.",
+            bench_root.display()
+        )
+        .into());
+    }
+    // Materialise the bench root so canonicalize can resolve it;
+    // create_dir_all is a no-op if it already exists as a real directory (and
+    // was rejected above if it existed as a symlink).
+    std::fs::create_dir_all(&bench_root)?;
+    let db_canon = db.canonicalize()?;
+    let bench_canon = bench_root.canonicalize()?;
+    if !bench_canon.starts_with(&db_canon) {
+        return Err(format!(
+            "refusing to clean iteration data: {} canonicalises to {}, \
+             which is outside the --db path {} (resolved {}). A symlink \
+             in one of the parent components is redirecting it. Replace \
+             the symlink with a real directory before re-running.",
+            bench_root.display(),
+            bench_canon.display(),
+            db.display(),
+            db_canon.display(),
+        )
+        .into());
+    }
+    // The workload directory is a parent of the one removed as well: the same
+    // two checks apply to it.
+    let workload_root = bench_root.join(benchmark);
+    if let Ok(md) = std::fs::symlink_metadata(&workload_root)
+        && md.file_type().is_symlink()
+    {
+        return Err(format!(
+            "refusing to clean iteration data: {} is a symlink. \
+             Remove or replace it with a real directory before re-running.",
+            workload_root.display()
+        )
+        .into());
+    }
+    std::fs::create_dir_all(&workload_root)?;
+    let workload_canon = workload_root.canonicalize()?;
+    if !workload_canon.starts_with(&db_canon) {
+        return Err(format!(
+            "refusing to clean iteration data: {} canonicalises to {}, \
+             which is outside the --db path {} (resolved {}).",
+            workload_root.display(),
+            workload_canon.display(),
+            db.display(),
+            db_canon.display(),
+        )
+        .into());
+    }
+    let sub = workload_root.join(format!("iter-{iter}"));
+    // Clean previous run data so each run starts fresh.
+    if let Err(e) = std::fs::remove_dir_all(&sub)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
+    std::fs::create_dir_all(&sub)?;
+    Ok(sub)
+}
+
 /// Result from a single iteration of a workload.
 struct IterationResult {
     reporter: Reporter,
@@ -388,6 +513,7 @@ fn run_single(
     bench_config: &BenchConfig,
     cli: &Cli,
     iterations: u32,
+    workloads: usize,
     github_entries: &mut GithubSuites,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== db_bench: {benchmark_name} ===");
@@ -412,93 +538,9 @@ fn run_single(
     let mut results: Vec<IterationResult> = Vec::with_capacity(iterations as usize);
 
     for iter in 0..iterations {
-        // Each iteration gets a fresh database so results are comparable.
-        // With --db, create per-iteration subdirectories to avoid data
-        // accumulation across iterations (fill workloads would append,
-        // read workloads would prefill on top of existing data).
         let _tmpdir;
         let db_path = match &cli.db {
-            Some(p) if iterations > 1 => {
-                // Nest under a tool-specific `.db_bench/` directory so
-                // `remove_dir_all` here can never clobber user data
-                // that happened to live under `<db>/iter-N`. The
-                // dot-prefix + tool name makes the namespace
-                // collision-impossible: a real workload would never
-                // pick this exact path by accident.
-                //
-                // Defence-in-depth against symlink-based path escape
-                // happens in two stages:
-                //
-                // 1. `symlink_metadata` on the bench-root leaf rejects
-                //    the easy case where `<db>/.db_bench` is itself a
-                //    symlink. `symlink_metadata` does not follow
-                //    symlinks on the final component, so it inspects
-                //    the link itself.
-                //
-                // 2. After `create_dir_all` materialises the directory,
-                //    canonicalise BOTH `<db>` and the bench root and
-                //    require the bench-root canonical path to start
-                //    with the `<db>` canonical path. `canonicalize`
-                //    follows symlinks during resolution, so this
-                //    catches the case where an INTERMEDIATE parent
-                //    component is a symlink pointing outside `<db>`
-                //    (the leaf check alone would miss this).
-                //
-                // A small TOCTOU window remains between this
-                // validation and the `remove_dir_all` below. Closing
-                // it requires opening `<db>` as a directory file
-                // descriptor and operating via openat()-style
-                // relative paths (e.g. cap-std). That is deliberately
-                // out of scope for a single-user bench tool whose
-                // `--db` path is user-supplied: the realistic
-                // mistake-case (pre-existing symlink at the leaf, or
-                // parent-component symlink) is fully caught by the
-                // two checks above. A deliberate concurrent attacker
-                // who can race-swap entries inside `<db>` already has
-                // the privileges to do worse without exploiting this
-                // tool.
-                let bench_root = p.join(".db_bench");
-                if let Ok(md) = std::fs::symlink_metadata(&bench_root)
-                    && md.file_type().is_symlink()
-                {
-                    return Err(format!(
-                        "refusing to clean iteration data: {} is a symlink. \
-                         Remove or replace it with a real directory before re-running.",
-                        bench_root.display()
-                    )
-                    .into());
-                }
-                // Materialise the bench root so canonicalize can
-                // resolve it; create_dir_all is a no-op if it
-                // already exists as a real directory (and was
-                // rejected above if it existed as a symlink).
-                std::fs::create_dir_all(&bench_root)?;
-                let db_canon = p.canonicalize()?;
-                let bench_canon = bench_root.canonicalize()?;
-                if !bench_canon.starts_with(&db_canon) {
-                    return Err(format!(
-                        "refusing to clean iteration data: {} canonicalises to {}, \
-                         which is outside the --db path {} (resolved {}). A symlink \
-                         in one of the parent components is redirecting it. Replace \
-                         the symlink with a real directory before re-running.",
-                        bench_root.display(),
-                        bench_canon.display(),
-                        p.display(),
-                        db_canon.display(),
-                    )
-                    .into());
-                }
-                let sub = bench_root.join(format!("iter-{iter}"));
-                // Clean previous iteration data so each run starts fresh.
-                if let Err(e) = std::fs::remove_dir_all(&sub)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-                std::fs::create_dir_all(&sub)?;
-                sub
-            }
-            Some(p) => p.clone(),
+            Some(p) => database_dir(p, benchmark_name, iter, iterations, workloads)?,
             None => {
                 _tmpdir = tempfile::tempdir()?;
                 _tmpdir.path().to_path_buf()

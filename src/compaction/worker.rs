@@ -1980,7 +1980,12 @@ fn run_tight_space_compaction(
             // must not remove them.
             opts.outputs.installed();
             #[cfg(feature = "metrics")]
-            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
+            super::flavour::charge_installed(
+                &opts.metrics,
+                relocated_bytes,
+                carried,
+                outputs.iter().map(Table::file_size).sum(),
+            );
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the
@@ -2265,6 +2270,14 @@ fn run_subcompaction(
         (Some(_), core::ops::Bound::Excluded(upper)) => Some(upper.clone()),
         _ => None,
     };
+    // This range's writer does not wait for a boundary past its upper bound,
+    // which another range's writer reaches.
+    let range_upper = match &bounds.1 {
+        core::ops::Bound::Included(upper) | core::ops::Bound::Excluded(upper) => {
+            Some(upper.clone())
+        }
+        core::ops::Bound::Unbounded => None,
+    };
 
     // Row groups of this range the merge leaves as they were are copied into
     // the output instead of being encoded again (see `carry`). Each range
@@ -2408,7 +2421,7 @@ fn run_subcompaction(
     // so its block compression must stay serial (nested-pool deadlock otherwise).
     // whole_run = false: several sub-compactions (or tight-space slices) share
     // this payload's lineage, so no single writer may close the run.
-    let table_writer = super::flavour::prepare_table_writer(
+    let mut table_writer = super::flavour::prepare_table_writer(
         version,
         opts,
         payload,
@@ -2418,6 +2431,9 @@ fn run_subcompaction(
         false,
         rc,
     )?;
+    if let Some(upper) = range_upper {
+        table_writer.limit_cut_alignment(upper);
+    }
     let mut compactor: Box<dyn CompactionFlavour> = match relocation {
         // Tight-space blob defrag: relocate the stale files' live entries into a
         // fresh compact file, resuming each stale scan at its carried-over
@@ -4104,3 +4120,7 @@ fn drop_tables(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test code")]
+mod alignment_tests;

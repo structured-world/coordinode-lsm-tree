@@ -657,6 +657,16 @@ impl KvSeparationOptions {
     }
 }
 
+/// Where a compaction ends its outputs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputCuts {
+    /// On the boundaries between the tables of the level the outputs are
+    /// merged into next, within half the target size and twice it.
+    Aligned,
+    /// At the target size alone.
+    TargetSize,
+}
+
 /// Tree configuration builder
 // Clone: every shared handle is `Arc`-backed, so a clone is a cheap second
 // reference to the same backends — which is what lets `open_or_repair` retry
@@ -771,6 +781,10 @@ pub struct Config {
     /// If `true`, the last level will not build filters, reducing the filter size of a database
     /// by ~90% typically
     pub(crate) expect_point_read_hits: bool,
+
+    /// Where a compaction ends its outputs; see
+    /// [`Self::compaction_output_alignment`].
+    pub(crate) compaction_output_cuts: OutputCuts,
 
     /// Per-block Page ECC. When `true`, every block on disk carries a parity
     /// trailer; on read, if the block's XXH3 disagrees with the on-disk bytes,
@@ -1147,6 +1161,8 @@ impl Default for Config {
             prefix_extractor: None,
 
             expect_point_read_hits: false,
+
+            compaction_output_cuts: OutputCuts::Aligned,
 
             page_ecc: false,
 
@@ -1663,6 +1679,44 @@ impl Config {
     #[must_use]
     pub fn expect_point_read_hits(mut self, b: bool) -> Self {
         self.expect_point_read_hits = b;
+        self
+    }
+
+    /// Whether a compaction ends its outputs on the boundaries between the
+    /// tables of the level they are merged into next.
+    ///
+    /// An output straddling such a boundary drags both tables into that next
+    /// merge, which reads and rewrites the extra one. Aligned, an output ends
+    /// at the first boundary past half the target size; each boundary it
+    /// passes without ending raises that share by five percent, up to ninety;
+    /// it ends at twice the target whatever the boundaries, and at the target
+    /// when no boundary is left ahead. A user key's versions stay in one output
+    /// above every size bound. Off, outputs end at the target size alone.
+    ///
+    /// Default = `true`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let config = Config::new(
+    ///     folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .compaction_output_alignment(false);
+    /// # let _ = config;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn compaction_output_alignment(mut self, enabled: bool) -> Self {
+        self.compaction_output_cuts = if enabled {
+            OutputCuts::Aligned
+        } else {
+            OutputCuts::TargetSize
+        };
         self
     }
 
