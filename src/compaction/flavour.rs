@@ -1492,7 +1492,9 @@ impl StandardCompaction {
     /// Writes `emitted`, what the merge made of `candidate`'s key range, as
     /// one group that copies the candidate's pages on the row pages left as
     /// they were, returning the bytes copied; `None`, having written nothing,
-    /// when this output cannot. The caller then writes the rows.
+    /// when this output cannot. The caller then writes the rows. The matcher
+    /// asks only once a row of the group came out as read, so the group is
+    /// not read for a merge that changed every row.
     pub(super) fn carry_pages(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
