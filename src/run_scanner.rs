@@ -64,16 +64,21 @@ impl RunScanner {
         self
     }
 
-    fn scan_table(&self, index: usize) -> crate::Result<Option<Scanner>> {
+    fn scan_table(&self, index: usize) -> crate::Result<Scanner> {
+        // `index` is within `lo..=hi`, every slot of which names a table: a
+        // missing one fails the scan rather than ending it early, which would
+        // hand a merge the run without its tail.
         let Some(table) = self.tables.get(index) else {
-            return Ok(None);
+            return Err(crate::Error::from(crate::io::Error::other(
+                "run scanner: table index past the run",
+            )));
         };
         let scanner = table.scan_paced(self.pace.as_ref())?;
         #[cfg(feature = "columnar")]
         if let Some(target) = &self.carry {
-            return Ok(Some(carrying(scanner, table, target)));
+            return Ok(carrying(scanner, table, target));
         }
-        Ok(Some(scanner))
+        Ok(scanner)
     }
 }
 
@@ -106,9 +111,7 @@ impl Iterator for RunScanner {
                 self.lo += 1;
 
                 if self.lo <= self.hi {
-                    // `hi` is at most the last slot, so every `lo` up to it
-                    // names a table.
-                    self.lo_reader = fail_iter!(self.scan_table(self.lo));
+                    self.lo_reader = Some(fail_iter!(self.scan_table(self.lo)));
                 }
             } else {
                 return None;

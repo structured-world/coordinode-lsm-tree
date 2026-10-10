@@ -284,8 +284,10 @@ impl Header {
     ) -> crate::Result<()> {
         let header = Self::decode_from(&mut &*frame)?;
         let start = Self::header_len(header.block_type);
-        let payload = frame
-            .get(start..start + header.data_length as usize)
+        let payload = usize::try_from(header.data_length)
+            .ok()
+            .and_then(|len| start.checked_add(len))
+            .and_then(|end| frame.get(start..end))
             .ok_or(crate::Error::InvalidHeader("Block"))?;
         Checksum::from_raw(crate::hash::hash128(payload)).check(header.payload_checksum(from))?;
         Self::rebind_frame(frame, from, to)

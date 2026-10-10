@@ -162,6 +162,28 @@ fn a_rebound_frame_verifies_at_its_new_place() -> crate::Result<()> {
     Ok(())
 }
 
+/// A header declaring a payload longer than any frame, as far as `u32` goes,
+/// is refused with an error rather than overflowing the end of the payload
+/// on a 32-bit target.
+#[test]
+fn a_verified_rebind_refuses_a_payload_past_the_frame() {
+    let header = Header {
+        data_length: u32::MAX,
+        uncompressed_length: 3,
+        ..Header::test_dummy(BlockType::Data)
+    };
+    let mut frame = header.encode_into_vec();
+    frame.extend_from_slice(b"abc");
+    assert!(
+        Header::rebind_verified_frame(
+            &mut frame,
+            ChecksumAt::table(1, 100),
+            ChecksumAt::table(2, 900),
+        )
+        .is_err()
+    );
+}
+
 /// A frame whose payload no longer matches the checksum it was written under
 /// is refused, its header untouched, rather than re-stamped for a new place
 /// where it would carry the damage; an intact one moves as `rebind_frame`

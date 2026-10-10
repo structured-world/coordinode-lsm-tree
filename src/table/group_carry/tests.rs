@@ -3,15 +3,18 @@
 
 use super::KeyBounds;
 use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, UserKey};
+use core::cell::Cell;
 use core::ops::Bound;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// The most candidates the carry queues of this process held at once. Each
-/// test runs in a process of its own, so the figure is the test's.
-static PEAK_QUEUE: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    /// The most candidates a carry queue held at once on this thread: a
+    /// serial compaction scans and records on the thread that runs it, and
+    /// tests running alongside on other threads leave the figure alone.
+    static PEAK_QUEUE: Cell<usize> = const { Cell::new(0) };
+}
 
 pub(super) fn note_queue_len(len: usize) {
-    PEAK_QUEUE.fetch_max(len, Ordering::Relaxed);
+    PEAK_QUEUE.with(|peak| peak.set(peak.get().max(len)));
 }
 
 /// A merge that drops every row emits nothing, so nothing it emits retires
@@ -51,10 +54,11 @@ fn carry_queue_stays_bounded_when_the_merge_drops_everything() -> crate::Result<
     tree.remove_range(key(0), key(5_000), seqno);
     tree.flush_active_memtable(0)?;
 
+    PEAK_QUEUE.with(|peak| peak.set(0));
     tree.major_compact(64 * 1024 * 1024, SeqNo::MAX)?;
+    let peak = PEAK_QUEUE.with(Cell::get) as u64;
 
     assert_eq!(tree.iter(SeqNo::MAX, None).count(), 0);
-    let peak = PEAK_QUEUE.load(Ordering::Relaxed) as u64;
     assert!(groups > 8, "the inputs span many groups: {groups}");
     assert!(peak <= 4, "{peak} of {groups} groups held at once");
     Ok(())
