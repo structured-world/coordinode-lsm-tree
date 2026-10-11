@@ -1101,6 +1101,180 @@ fn scan_since_scoped_sees_a_tombstone_reaching_past_the_tables_point_keys() -> l
     Ok(())
 }
 
+/// Key `i` of the range fixtures, ordered as its index.
+fn range_key(i: u32) -> Vec<u8> {
+    format!("k{i:05}").into_bytes()
+}
+
+/// A tree over keys `0..3_000` in small blocks: an old version of each key in
+/// the last level, a newer version of every third key and range deletions in
+/// L0, more of them in a sealed memtable, and the newest in the active one.
+fn layered_tree(path: &std::path::Path) -> lsm_tree::Result<Tree> {
+    let AnyTree::Standard(tree) = Config::new(
+        path,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    let mut seqno = 1;
+    for i in 0..3_000 {
+        tree.insert(range_key(i), b"old", seqno);
+        seqno += 1;
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(4 * 1_024, 0)?;
+    for i in (0..3_000).step_by(3) {
+        tree.insert(range_key(i), b"newer", seqno);
+        seqno += 1;
+    }
+    tree.remove_range(range_key(1_000), range_key(1_010), seqno);
+    seqno += 1;
+    tree.flush_active_memtable(0)?;
+    for i in (1..3_000).step_by(7) {
+        tree.remove(range_key(i), seqno);
+        seqno += 1;
+    }
+    tree.remove_range(range_key(2_000), range_key(2_050), seqno);
+    seqno += 1;
+    assert!(tree.rotate_memtable().is_some(), "a sealed memtable");
+    for i in (2..3_000).step_by(11) {
+        tree.insert(range_key(i), b"newest", seqno);
+        seqno += 1;
+    }
+    Ok(tree)
+}
+
+/// A range scan returns exactly the full scan filtered to the range: point
+/// events whose key lies in it, range deletions whose span overlaps it, from
+/// the active and sealed memtables and every level, for targets below and
+/// above the older versions and for bounds of every kind, at and between
+/// block edges and outside every table.
+#[test]
+fn scan_since_in_range_equals_the_full_scan_filtered_to_the_range() -> lsm_tree::Result<()> {
+    use std::ops::Bound;
+
+    let folder = get_tmp_folder();
+    let tree = layered_tree(folder.path())?;
+    assert!(tree.table_count() > 10, "many tables in the last level");
+
+    let in_lo = |key: &[u8], lo: &Bound<Vec<u8>>| match lo {
+        Bound::Included(b) => key >= b.as_slice(),
+        Bound::Excluded(b) => key > b.as_slice(),
+        Bound::Unbounded => true,
+    };
+    let in_hi = |key: &[u8], hi: &Bound<Vec<u8>>| match hi {
+        Bound::Included(b) => key <= b.as_slice(),
+        Bound::Excluded(b) => key < b.as_slice(),
+        Bound::Unbounded => true,
+    };
+    let mut ranges: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)> = Vec::new();
+    for i in (0..3_000).step_by(97) {
+        let lo = range_key(i);
+        for span in [0, 1, 40, 700] {
+            let hi = range_key(i + span);
+            ranges.push((Bound::Included(lo.clone()), Bound::Included(hi.clone())));
+            ranges.push((Bound::Excluded(lo.clone()), Bound::Excluded(hi.clone())));
+            ranges.push((Bound::Included(lo.clone()), Bound::Excluded(hi)));
+        }
+        ranges.push((Bound::Excluded(lo.clone()), Bound::Unbounded));
+        ranges.push((Bound::Unbounded, Bound::Included(lo)));
+    }
+    // Outside every table, on either side, and between two keys.
+    ranges.push((
+        Bound::Included(b"a".to_vec()),
+        Bound::Included(b"b".to_vec()),
+    ));
+    ranges.push((Bound::Included(b"z".to_vec()), Bound::Unbounded));
+    ranges.push((
+        Bound::Excluded(range_key(5)),
+        Bound::Excluded(b"k00005~".to_vec()),
+    ));
+
+    for target in [0, 3_000, 3_500] {
+        let full: Vec<ScanSinceEvent> = tree.scan_since_seqno(target)?.collect();
+        for (lo, hi) in &ranges {
+            let expected: Vec<&ScanSinceEvent> = full
+                .iter()
+                .filter(|event| match event {
+                    // Span `[start, end)` overlaps the range; a deletion ending
+                    // on an excluded lower bound is delivered too.
+                    ScanSinceEvent::RangeTombstone {
+                        start_key, end_key, ..
+                    } => {
+                        (match lo {
+                            Bound::Included(b) | Bound::Excluded(b) => {
+                                end_key.as_ref() > b.as_slice()
+                            }
+                            Bound::Unbounded => true,
+                        }) && in_hi(start_key, hi)
+                    }
+                    other => in_lo(other.key(), lo) && in_hi(other.key(), hi),
+                })
+                .collect();
+            let got: Vec<ScanSinceEvent> = tree
+                .scan_since_seqno_in_range(target, (lo.clone(), hi.clone()))?
+                .collect();
+            assert_eq!(
+                got.iter().collect::<Vec<_>>(),
+                expected,
+                "target {target}, range {lo:?}..{hi:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A scan of one prefix of a table holding many reads the blocks holding the
+/// prefix and at most one more on each side, not the whole table.
+#[cfg(feature = "metrics")]
+#[test]
+fn scan_since_in_range_reads_only_the_blocks_of_its_range() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .open()?
+    else {
+        panic!("expected a standard tree");
+    };
+    // Ten prefixes of 400 keys each, in one table.
+    let mut seqno = 1;
+    for prefix in 0..10 {
+        for i in 0..400 {
+            tree.insert(format!("p{prefix}/{i:04}"), vec![b'v'; 40], seqno);
+            seqno += 1;
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tree.table_count(), 1);
+    let metrics = tree.metrics();
+
+    let before = metrics.data_block_load_count();
+    let all = tree.scan_since_seqno(0)?.count();
+    let table_blocks = metrics.data_block_load_count() - before;
+    assert_eq!(all, 4_000);
+    assert!(table_blocks >= 50, "{table_blocks} blocks");
+
+    let before = metrics.data_block_load_count();
+    let one = tree
+        .scan_since_seqno_in_range(0, "p4/".as_bytes().."p4/~".as_bytes())?
+        .count();
+    let read = metrics.data_block_load_count() - before;
+    assert_eq!(one, 400);
+    assert!(
+        read <= table_blocks.div_ceil(10) + 3,
+        "{read} of {table_blocks} blocks read for a tenth of the keys"
+    );
+    Ok(())
+}
+
 /// An RT-only flush writes a synthetic weak-tombstone SENTINEL at the range's
 /// start (the writer's `finish`, to give the KV-empty table one index entry).
 /// The stream deliberately KEEPS it: it is a real on-disk entry the read path
