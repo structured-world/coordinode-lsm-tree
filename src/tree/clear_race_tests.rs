@@ -10,7 +10,7 @@ use crate::compaction::{CompactionStrategy, MoveDown};
 use crate::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
 use std::sync::Arc;
 
-const KEYS: u64 = 200;
+const KEYS: usize = 200;
 
 fn open(path: &std::path::Path, blob: bool) -> crate::Result<AnyTree> {
     let config = Config::new(
@@ -29,8 +29,8 @@ fn open(path: &std::path::Path, blob: bool) -> crate::Result<AnyTree> {
 }
 
 fn write_keys(tree: &AnyTree, seqno: SeqNo) {
-    for i in 0..KEYS {
-        tree.insert(format!("key{i:04}"), vec![b'v'; 64], seqno + i);
+    for (i, seqno) in (0..KEYS).zip(seqno..) {
+        tree.insert(format!("key{i:04}"), vec![b'v'; 64], seqno);
     }
 }
 
@@ -43,7 +43,7 @@ fn clear_before_install(tree: &AnyTree) {
 
 /// The files left in `folder` under `path`, absent counting as none.
 fn files_in(path: &std::path::Path, folder: &str) -> usize {
-    std::fs::read_dir(path.join(folder)).map_or(0, |entries| entries.count())
+    std::fs::read_dir(path.join(folder)).map_or(0, Iterator::count)
 }
 
 /// The tree reads nothing, holds no table, leaves no table or blob file once
@@ -77,7 +77,7 @@ fn assert_cleared(path: &std::path::Path, tree: AnyTree, blob: bool) -> crate::R
     write_keys(&tree, 10_000);
     tree.flush_active_memtable(0)?;
     tree.major_compact(u64::MAX, 0)?;
-    assert_eq!(tree.iter(SeqNo::MAX, None).count(), KEYS as usize);
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), KEYS);
     Ok(())
 }
 
