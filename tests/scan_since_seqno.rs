@@ -1171,7 +1171,8 @@ fn scan_since_in_range_equals_the_full_scan_filtered_to_the_range() -> lsm_tree:
         Bound::Excluded(b) => key < b.as_slice(),
         Bound::Unbounded => true,
     };
-    let mut ranges: Vec<(Bound<Vec<u8>>, Bound<Vec<u8>>)> = Vec::new();
+    type KeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+    let mut ranges: Vec<KeyBounds> = Vec::new();
     for i in (0..3_000).step_by(97) {
         let lo = range_key(i);
         for span in [0, 1, 40, 700] {
