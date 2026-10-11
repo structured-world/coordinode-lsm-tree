@@ -146,7 +146,7 @@ struct Cli {
 
 /// The workloads that read the engine's byte counters, compiled only with the
 /// `counters` feature.
-const COUNTER_WORKLOADS: [&str; 2] = ["mixed-layout", "leveled-sustained"];
+const COUNTER_WORKLOADS: [&str; 3] = ["mixed-layout", "leveled-sustained", "planned-sustained"];
 
 /// `all`, one workload, or several separated by commas, run in that order.
 fn parse_benchmark(s: &str) -> Result<String, String> {
