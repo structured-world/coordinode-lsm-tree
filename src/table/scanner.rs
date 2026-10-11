@@ -20,7 +20,7 @@ type IoResult<T> = std::io::Result<T>;
 #[cfg(not(feature = "std"))]
 type IoResult<T> = crate::io::Result<T>;
 
-/// 2 MiB matches RocksDB's `compaction_readahead_size` default: one read
+/// 2 MiB matches the `compaction_readahead_size` default of `RocksDB`: one read
 /// from the file per ~500 typical (4 KiB) data blocks. A chunk is never
 /// larger than what is left of the file, so a small table reads only itself.
 const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;

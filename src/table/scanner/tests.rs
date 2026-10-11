@@ -87,6 +87,23 @@ fn small_reads_cross_chunks() -> crate::Result<()> {
     Ok(())
 }
 
+/// A `len`-byte value drawn from `seed` that does not compress: a compressed
+/// table then stays as large as an uncompressed one.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed;
+    core::iter::repeat_with(|| {
+        // splitmix64
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)).to_le_bytes()
+    })
+    .flatten()
+    .take(len)
+    .collect()
+}
+
 /// A pacer that paces every read.
 struct EveryRead;
 
@@ -109,9 +126,11 @@ fn a_scan_returns_what_an_indexed_read_does() -> crate::Result<()> {
     // About 5 MB of entries: more than two chunks.
     const ENTRIES: u32 = 16_000;
 
-    let mut codecs = vec![crate::CompressionType::None];
-    #[cfg(feature = "lz4")]
-    codecs.push(crate::CompressionType::Lz4);
+    let codecs = [
+        crate::CompressionType::None,
+        #[cfg(feature = "lz4")]
+        crate::CompressionType::Lz4,
+    ];
     for codec in codecs {
         let folder = tempfile::tempdir()?;
         let AnyTree::Standard(tree) = Config::new(
@@ -128,7 +147,7 @@ fn a_scan_returns_what_an_indexed_read_does() -> crate::Result<()> {
             panic!("expected a standard tree");
         };
         for i in 0..ENTRIES {
-            let value = format!("{:0>300}", i.wrapping_mul(2_654_435_761));
+            let value = noise(u64::from(i), 300);
             tree.insert(format!("key{i:06}"), value, u64::from(i));
         }
         tree.flush_active_memtable(0)?;
