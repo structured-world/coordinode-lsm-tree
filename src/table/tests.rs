@@ -3900,14 +3900,14 @@ fn scan_seqno_range_returns_nothing_below_a_bulk_ingest_base() -> crate::Result<
     // The window [0, 50] ends below the base: no effective seqno of this
     // table can fall inside it.
     assert_eq!(
-        table.scan_seqno_range(0, BASE / 2, true)?,
+        table.scan_seqno_range(0, BASE / 2, true, (Bound::Unbounded, Bound::Unbounded))?,
         Vec::new(),
         "an upper bound below the ingest base must exclude the whole table",
     );
     // Sanity: a window that DOES reach the base still returns the row, at its
     // effective (translated) seqno.
     assert_eq!(
-        table.scan_seqno_range(0, BASE, true)?,
+        table.scan_seqno_range(0, BASE, true, (Bound::Unbounded, Bound::Unbounded))?,
         vec![InternalValue::from_components("abc", "abc", BASE, Value)],
         "a window covering the base returns the row at its effective seqno",
     );

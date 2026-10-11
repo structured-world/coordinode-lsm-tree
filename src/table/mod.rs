@@ -8175,7 +8175,12 @@ impl Table {
     /// Returns `Err` if reading the index or a data block fails.
     #[doc(hidden)]
     pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
-        self.scan_seqno_range(target_seqno, SeqNo::MAX, true)
+        self.scan_seqno_range(
+            target_seqno,
+            SeqNo::MAX,
+            true,
+            (Bound::Unbounded, Bound::Unbounded),
+        )
     }
 
     /// Like [`Self::scan_since_seqno`] but also bounds the result above:
@@ -8193,6 +8198,12 @@ impl Table {
     /// somehow slipped past the block XXH3 checksum) cannot cause a qualifying
     /// record to be skipped.
     ///
+    /// `keys` bounds the blocks read, in the table comparator's order: the
+    /// index is sought to the first block that can hold the lower bound and
+    /// the walk stops after the first block reaching past the upper one. The
+    /// blocks at either end hold keys outside the bounds too; filtering those
+    /// is the caller's job.
+    ///
     /// # Errors
     ///
     /// Returns `Err` if reading the index or a data block fails.
@@ -8202,6 +8213,7 @@ impl Table {
         target_seqno: SeqNo,
         end_seqno: SeqNo,
         block_skip: bool,
+        keys: (Bound<&[u8]>, Bound<&[u8]>),
     ) -> crate::Result<Vec<InternalValue>> {
         // Bulk-ingested tables store entries at LOCAL seqno coordinates with a
         // `global_seqno` offset; the on-disk seqno bounds and per-entry seqnos
@@ -8241,61 +8253,100 @@ impl Table {
             return Ok(Vec::new());
         }
 
+        use block_index::BlockIndexIter;
+        use core::cmp::Ordering;
+
         let mut out = Vec::new();
 
-        for handle in self.block_index.iter() {
+        let mut index = self.block_index.iter();
+        // The first block that can hold the lower bound: every block before it
+        // ends below the bound.
+        if let Bound::Included(lo) | Bound::Excluded(lo) = keys.0
+            && !index.seek_lower(lo, SeqNo::MAX)
+        {
+            return Ok(out);
+        }
+        for handle in index {
             let handle = handle?;
-
-            // Tight-space restriction: a block whose last key is below the bound
-            // sits entirely in the punched-out (zeroed) prefix — never read it.
-            // The block straddling the bound is intact (punch starts at its
-            // offset) and is filtered per entry in the loop below.
-            if let Some(bound) = &self.1
-                && self.comparator.compare(handle.end_key(), bound) == core::cmp::Ordering::Less
-            {
-                continue;
-            }
-
-            // Block-skip: look this block's seqno bounds up in the parallel
-            // `seqno_bounds` section (keyed by file offset). If its (local) min
-            // exceeds the upper bound, or its (local) max is below the target, it
-            // cannot reference a qualifying record — skip the data-block read.
-            // Bounds live in the section, NOT inline in the index entry, so a
-            // point read never pays for them. Disabled in paranoid full-scan
-            // mode (`block_skip == false`); absent for legacy/off tables → no
-            // skip, full filter (correct regardless).
-            if block_skip
-                && let Some((seqno_min, seqno_max)) =
-                    self.seqno_bounds.bounds_for(handle.as_ref().offset().0)
-                && (seqno_max < local_target || seqno_min > local_end)
-            {
-                continue;
-            }
-
-            // A wholly-deleted columnar block carries no keys; skip it.
-            let Some(block) = self.load_data_block(handle.as_ref())? else {
-                continue;
+            // The last block that can hold a key within the upper bound. A
+            // block ending ON an included bound may be followed by older
+            // versions of that key, and the walk goes on to them.
+            let reaches_hi = match keys.1 {
+                Bound::Included(hi) => {
+                    self.comparator.compare(handle.end_key(), hi) == Ordering::Greater
+                }
+                Bound::Excluded(hi) => {
+                    self.comparator.compare(handle.end_key(), hi) != Ordering::Less
+                }
+                Bound::Unbounded => false,
             };
-            let data = &block.inner.data;
-            for item in block.iter(self.comparator.clone()) {
-                let mut value = item.materialize(data);
-                // Drop entries below the restriction bound in the straddling
-                // block (their authoritative copy lives in the superseding
-                // output table).
-                if let Some(bound) = &self.1
-                    && self.comparator.compare(&value.key.user_key, bound)
-                        == core::cmp::Ordering::Less
-                {
-                    continue;
-                }
-                if value.key.seqno >= local_target && value.key.seqno <= local_end {
-                    value.key.seqno = apply_global_seqno(value.key.seqno, global_seqno);
-                    out.push(value);
-                }
+            self.collect_seqno_range(&handle, (local_target, local_end), block_skip, &mut out)?;
+            if reaches_hi {
+                break;
             }
         }
 
         Ok(out)
+    }
+
+    /// The entries of the block `handle` names whose local seqno lies in
+    /// `window`, with their global seqnos, appended to `out`.
+    fn collect_seqno_range(
+        &self,
+        handle: &KeyedBlockHandle,
+        (local_target, local_end): (SeqNo, SeqNo),
+        block_skip: bool,
+        out: &mut Vec<InternalValue>,
+    ) -> crate::Result<()> {
+        let global_seqno = self.global_seqno();
+
+        // Tight-space restriction: a block whose last key is below the bound
+        // sits entirely in the punched-out (zeroed) prefix — never read it.
+        // The block straddling the bound is intact (punch starts at its
+        // offset) and is filtered per entry in the loop below.
+        if let Some(bound) = &self.1
+            && self.comparator.compare(handle.end_key(), bound) == core::cmp::Ordering::Less
+        {
+            return Ok(());
+        }
+
+        // Block-skip: look this block's seqno bounds up in the parallel
+        // `seqno_bounds` section (keyed by file offset). If its (local) min
+        // exceeds the upper bound, or its (local) max is below the target, it
+        // cannot reference a qualifying record — skip the data-block read.
+        // Bounds live in the section, NOT inline in the index entry, so a
+        // point read never pays for them. Disabled in paranoid full-scan
+        // mode (`block_skip == false`); absent for a table written without
+        // the section → no skip, full filter (correct regardless).
+        if block_skip
+            && let Some((seqno_min, seqno_max)) =
+                self.seqno_bounds.bounds_for(handle.as_ref().offset().0)
+            && (seqno_max < local_target || seqno_min > local_end)
+        {
+            return Ok(());
+        }
+
+        // A wholly-deleted columnar block carries no keys; skip it.
+        let Some(block) = self.load_data_block(handle.as_ref())? else {
+            return Ok(());
+        };
+        let data = &block.inner.data;
+        for item in block.iter(self.comparator.clone()) {
+            let mut value = item.materialize(data);
+            // Drop entries below the restriction bound in the straddling
+            // block (their authoritative copy lives in the superseding
+            // output table).
+            if let Some(bound) = &self.1
+                && self.comparator.compare(&value.key.user_key, bound) == core::cmp::Ordering::Less
+            {
+                continue;
+            }
+            if value.key.seqno >= local_target && value.key.seqno <= local_end {
+                value.key.seqno = apply_global_seqno(value.key.seqno, global_seqno);
+                out.push(value);
+            }
+        }
+        Ok(())
     }
 
     /// Creates a ranged iterator over the `Table`.
