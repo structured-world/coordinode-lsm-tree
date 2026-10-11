@@ -465,50 +465,7 @@ impl TreeIter {
                 },
             );
 
-            // `key.clone()` (an Arc bump on the refcounted `UserKey`) instead of
-            // `key.as_ref()` (`&[u8]`, which would heap-copy the bound's bytes
-            // into a fresh `Slice`) — same reasoning as `user_to_internal_bounds`.
-            let range = (
-                match &user_range.0 {
-                    // NOTE: See memtable.rs for range explanation
-                    Bound::Included(key) => Bound::Included(InternalKey::new(
-                        key.clone(),
-                        SeqNo::MAX,
-                        crate::ValueType::Tombstone,
-                    )),
-                    Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-                        key.clone(),
-                        0,
-                        crate::ValueType::Tombstone,
-                    )),
-                    Bound::Unbounded => Bound::Unbounded,
-                },
-                match &user_range.1 {
-                    // NOTE: See memtable.rs for range explanation, this is the reverse case
-                    // where we need to go all the way to the last seqno of an item
-                    //
-                    // Example: We search for (Unbounded..Excluded(abdef))
-                    //
-                    // key -> seqno
-                    //
-                    // a   -> 7 <<< This is the lowest key that matches the range
-                    // abc -> 5
-                    // abc -> 4
-                    // abc -> 3 <<< This is the highest key that matches the range
-                    // abcdef -> 6
-                    // abcdef -> 5
-                    //
-                    Bound::Included(key) => {
-                        Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
-                    }
-                    Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-                        key.clone(),
-                        SeqNo::MAX,
-                        crate::ValueType::Value,
-                    )),
-                    Bound::Unbounded => Bound::Unbounded,
-                },
-            );
+            let range = user_to_internal_bounds(&user_range);
 
             let mut iters: Vec<BoxedIterator<'_>> = Vec::with_capacity(5);
             // Each RT is paired with the per-source visibility cutoff so that
@@ -845,34 +802,47 @@ impl TreeIter {
 type UserBounds = (Bound<UserKey>, Bound<UserKey>);
 
 /// Translate user-key bounds into the internal-key bounds the per-source readers
-/// expect. Mirrors the bound construction in [`TreeIter::create_range`] (see
-/// there for the seqno-direction reasoning at each end).
+/// expect. A bound is a search needle, not a stored key, so a bound longer than
+/// any key can be is taken as it is.
 pub(crate) fn user_to_internal_bounds(
     user: &UserBounds,
 ) -> (Bound<InternalKey>, Bound<InternalKey>) {
+    internal_bounds(&user.0, &user.1)
+}
+
+/// [`user_to_internal_bounds`] of the bounds `lo` and `hi`: every version of a
+/// bound key is inside an inclusive bound and outside an exclusive one.
+pub(crate) fn internal_bounds(
+    lo: &Bound<UserKey>,
+    hi: &Bound<UserKey>,
+) -> (Bound<InternalKey>, Bound<InternalKey>) {
     // Clone the `UserKey` (a reference-counted `Slice`: an `Arc` bump, no heap
-    // copy) and hand it to `InternalKey::new` by value — `UserKey: Into<UserKey>`
-    // is the identity, so the key bytes are reused. Passing `key.as_ref()`
-    // (`&[u8]`) instead would force a fresh heap copy of the bytes on every
-    // reposition, which the in-place seek loop must avoid.
-    let lo = match &user.0 {
-        Bound::Included(key) => Bound::Included(InternalKey::new(
+    // copy) and hand it to `InternalKey::bound` by value — `UserKey:
+    // Into<UserKey>` is the identity, so the key bytes are reused. Passing
+    // `key.as_ref()` (`&[u8]`) instead would force a fresh heap copy of the
+    // bytes on every reposition, which the in-place seek loop must avoid.
+    let lo = match lo {
+        // The first version of the key: versions sort by descending seqno.
+        Bound::Included(key) => Bound::Included(InternalKey::bound(
             key.clone(),
             SeqNo::MAX,
             crate::ValueType::Tombstone,
         )),
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
             key.clone(),
             0,
             crate::ValueType::Tombstone,
         )),
         Bound::Unbounded => Bound::Unbounded,
     };
-    let hi = match &user.1 {
+    // The upper end reaches the key's LAST version, the reverse of the lower:
+    // for `..Excluded(abdef)` over `a@7, abc@5, abc@4, abc@3, abdef@6`, the
+    // range is `a@7` through `abc@3`.
+    let hi = match hi {
         Bound::Included(key) => {
-            Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
+            Bound::Included(InternalKey::bound(key.clone(), 0, crate::ValueType::Value))
         }
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
             key.clone(),
             SeqNo::MAX,
             crate::ValueType::Value,

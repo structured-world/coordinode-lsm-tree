@@ -133,7 +133,7 @@ impl RowCursor {
         columns: Vec<u16>,
         share: u64,
     ) -> Self {
-        let (lo, hi) = internal_bounds(lo, hi);
+        let (lo, hi) = crate::range::internal_bounds(lo, hi);
         Self {
             input: RowInput::Memtable { memtable, lo, hi },
             snapshot,
@@ -243,39 +243,6 @@ impl RowCursor {
             columns: out,
         })
     }
-}
-
-/// Internal-key bounds for a user-key range: every version of a bound key is
-/// inside an inclusive bound and outside an exclusive one.
-pub(super) fn internal_bounds(
-    lo: &Bound<UserKey>,
-    hi: &Bound<UserKey>,
-) -> (Bound<InternalKey>, Bound<InternalKey>) {
-    let lo = match lo {
-        Bound::Included(key) => Bound::Included(InternalKey::new(
-            key.clone(),
-            SeqNo::MAX,
-            crate::ValueType::Tombstone,
-        )),
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-            key.clone(),
-            0,
-            crate::ValueType::Tombstone,
-        )),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    let hi = match hi {
-        Bound::Included(key) => {
-            Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
-        }
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
-            key.clone(),
-            SeqNo::MAX,
-            crate::ValueType::Value,
-        )),
-        Bound::Unbounded => Bound::Unbounded,
-    };
-    (lo, hi)
 }
 
 /// The cursor a scan source is read through: a columnar segment's, or a row

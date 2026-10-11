@@ -112,12 +112,12 @@ pub fn resolve_point_merge(
                     tombstones.push((rt.clone(), seqno));
                 });
                 let range = (
-                    Bound::Included(InternalKey::new(
+                    Bound::Included(InternalKey::bound(
                         user_key.clone(),
                         SeqNo::MAX,
                         ValueType::Tombstone,
                     )),
-                    Bound::Included(InternalKey::new(user_key.clone(), 0, ValueType::Value)),
+                    Bound::Included(InternalKey::bound(user_key.clone(), 0, ValueType::Value)),
                 );
                 take_versions(
                     memtable

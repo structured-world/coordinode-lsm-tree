@@ -545,7 +545,11 @@ impl AbstractTree for Tree {
         let key = Slice::from(key);
 
         for kv in super_version.active_memtable.range_internal((
-            Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+            Bound::Included(InternalKey::bound(
+                key.clone(),
+                SeqNo::MAX,
+                ValueType::Value,
+            )),
             Bound::Unbounded,
         )) {
             log::info!("[Active] {kv:?}");
@@ -553,7 +557,11 @@ impl AbstractTree for Tree {
 
         for mt in super_version.sealed_memtables.iter().rev() {
             for kv in mt.range_internal((
-                Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+                Bound::Included(InternalKey::bound(
+                    key.clone(),
+                    SeqNo::MAX,
+                    ValueType::Value,
+                )),
                 Bound::Unbounded,
             )) {
                 log::info!("[Sealed #{}] {kv:?}", mt.id());
@@ -1581,26 +1589,8 @@ impl AbstractTree for Tree {
         // approximate size. Built from the SAME snapshot and the SAME
         // `range_internal` + internal-key bounds the read path uses (range.rs),
         // so the counted slice matches what a read at `seqno` would traverse.
-        let mt_range = (
-            match lo {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
-                }
-                Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-            match hi {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
-                }
-                Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-        );
+        let mt_range =
+            crate::range::internal_bounds(&lo.map(UserKey::from), &hi.map(UserKey::from));
         let estimate = |mt: &crate::Memtable| -> (u64, u64) {
             let total = mt.len() as u64;
             if total == 0 {
@@ -1804,26 +1794,8 @@ impl AbstractTree for Tree {
 
         // Memtables: count the in-range, snapshot-visible entries and add them to
         // both the matched rows and the total (matching the SST accounting).
-        let mt_range = (
-            match lo {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
-                }
-                Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-            match hi {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
-                }
-                Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
-                }
-                Bound::Unbounded => Bound::Unbounded,
-            },
-        );
+        let mt_range =
+            crate::range::internal_bounds(&lo.map(UserKey::from), &hi.map(UserKey::from));
         let mut add_memtable = |mt: &crate::Memtable| {
             // The denominator counts what a read at this snapshot can SEE, the
             // same rule the SST loop applies: an entry at or above `seqno` is
@@ -2501,20 +2473,10 @@ impl Tree {
         // which reads a blob file, and no I/O may happen with writers blocked.
         // The memtables are walked over the scope only, as a range read walks
         // them.
-        let memtable_keys = key_range.map_or((Bound::Unbounded, Bound::Unbounded), |(lo, hi)| {
-            // A bound longer than any key can be is no internal key: no key
-            // reaches it, so that end of the walk stays open and
-            // `in_key_range` decides at the keys there.
-            let walkable = |bound: &Bound<UserKey>| match bound {
-                Bound::Included(key) | Bound::Excluded(key)
-                    if u16::try_from(key.len()).is_err() =>
-                {
-                    Bound::Unbounded
-                }
-                other => other.clone(),
-            };
-            crate::range::user_to_internal_bounds(&(walkable(lo), walkable(hi)))
-        });
+        let memtable_keys = key_range.map_or(
+            (Bound::Unbounded, Bound::Unbounded),
+            crate::range::user_to_internal_bounds,
+        );
         let (super_version, end_seqno, active_entries, active_range_tombstones) = {
             let guard = self.version_history.write();
             let super_version = guard.latest_version();
