@@ -2303,6 +2303,12 @@ impl Table {
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
     }
 
+    /// The bytes the file holds: what a whole read of it takes, and what
+    /// writing it took.
+    pub(crate) fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
     /// The bytes of the data section: every data block or row group as it lies
     /// on disk. It opens the file, and the index follows it, or the top-level
     /// index where the index is not partitioned.
@@ -8627,6 +8633,7 @@ impl Table {
         log::debug!("Recovering table from file {}", file_path.display());
         let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
         let file_path = Arc::new(file_path);
+        let file_len = file.metadata()?.len;
 
         #[cfg(feature = "metrics")]
         metrics
@@ -9505,6 +9512,7 @@ impl Table {
                 tree_id,
 
                 metadata,
+                file_len,
                 l0_recency,
                 regions,
 

@@ -427,7 +427,7 @@ fn compaction_work_written_counts_the_tables_a_merge_installs() -> crate::Result
     );
     let ids = tables(&tree, 1).iter().map(Table::id).collect();
     let result = tree.compact(Arc::new(Merge(ids, 2)), 0)?;
-    let installed: u64 = tables(&tree, 2).iter().map(Table::file_size).sum();
+    let installed: u64 = tables(&tree, 2).iter().map(Table::file_len).sum();
     assert!(installed > 0);
     assert_eq!(result.work.measured.written, installed);
     assert_eq!(tree.metrics().compaction_work_measured().written, installed);

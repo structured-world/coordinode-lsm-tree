@@ -45,6 +45,11 @@ pub struct Inner {
     #[doc(hidden)]
     pub metadata: ParsedMeta,
 
+    /// The bytes the file holds, as the table was opened: its whole length,
+    /// unlike the metadata's `file_size`, which stops where the metadata was
+    /// written and leaves out the sections after it.
+    pub(crate) file_len: u64,
+
     /// Parsed region block handles
     #[doc(hidden)]
     pub regions: ParsedRegions,

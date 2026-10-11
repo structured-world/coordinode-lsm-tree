@@ -702,7 +702,7 @@ impl ProducedOutput {
     /// part of them copied rather than encoded, and the frames read by
     /// handle.
     pub(super) fn installed_work(&self) -> super::work::Installed {
-        let tables: u64 = self.created_tables.iter().map(Table::file_size).sum();
+        let tables: u64 = self.created_tables.iter().map(Table::file_len).sum();
         let frames: u64 = self
             .created_blob_files
             .iter()

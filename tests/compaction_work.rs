@@ -52,11 +52,11 @@ fn flush_keys(tree: &lsm_tree::Tree, range: core::ops::Range<u32>, round: u32, s
     tree.flush_active_memtable(0).expect("flush");
 }
 
-/// The bytes of the tables the tree holds.
+/// The bytes of the files of the tables the tree holds.
 fn table_bytes(tree: &lsm_tree::Tree) -> u64 {
     tree.current_version()
         .iter_tables()
-        .map(|t| t.metadata.file_size)
+        .map(|t| std::fs::metadata(t.path.as_path()).expect("stat").len())
         .sum()
 }
 
@@ -201,7 +201,8 @@ fn compaction_filter_dropping_every_row_is_priced_within_the_bounds() {
         assert_reported(&tree, &result.work);
         (result.work, table_bytes(&tree))
     };
-    let (dropped, dropped_left) = run(|| Verdict::Remove);
+    // Destroyed, not removed: a removal leaves a tombstone to write.
+    let (dropped, dropped_left) = run(|| Verdict::Destroy);
     let (kept, kept_left) = run(|| Verdict::Keep);
 
     assert_eq!(dropped.estimate, kept.estimate);

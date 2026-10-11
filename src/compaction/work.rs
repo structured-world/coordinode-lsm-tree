@@ -244,7 +244,7 @@ impl crate::table::util::ReadPacer for InputPacer {
 /// The work of giving `tables` another level where they lie.
 pub fn estimate_move<'a>(tables: impl IntoIterator<Item = &'a Table>) -> WorkEstimate {
     WorkEstimate::exact(Work {
-        moved: tables.into_iter().map(Table::file_size).sum(),
+        moved: tables.into_iter().map(Table::file_len).sum(),
         ..Work::default()
     })
 }
@@ -279,7 +279,7 @@ pub fn estimate_merge(plan: &MergePlan<'_>, carries: impl Fn(&Table) -> bool) ->
     let mut expected = Work::<u64>::default();
     let mut carried_ceiling = 0;
     for (at, table) in plan.inputs.iter().enumerate() {
-        let size = table.file_size();
+        let size = table.file_len();
         expected.written += size;
         carried_ceiling += size;
         // The whole file is read by its scan.
