@@ -111,8 +111,11 @@ fn strategy() -> Arc<Leveled> {
 #[test]
 fn leveled_compaction_keeps_its_fingerprint() {
     let got = fingerprint(&strategy());
-    println!("leveled fingerprint: {got:#018x}");
-    assert_eq!(got, EXPECTED, "leveled compaction changed what it does");
+    assert_eq!(
+        got, EXPECTED,
+        "leveled compaction changed what it does: {got:#018x}"
+    );
 }
 
-const EXPECTED: u64 = 0;
+/// What the stream ends in under the leveled strategy as it was written.
+const EXPECTED: u64 = 0x425f_6314_c3c4_8510;
