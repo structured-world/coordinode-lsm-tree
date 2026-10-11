@@ -27,7 +27,8 @@ fn config(num: u64) -> BenchConfig {
 #[test]
 fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
-    let (planned, leveled) = super::run_arms(base.path(), &config(1_000))?;
+    let (planned, leveled) =
+        super::run_arms(base.path(), &config(1_000), super::COMPACTION_RATES[0])?;
     for arm in [&planned, &leveled] {
         assert!(arm.written > 0);
         assert_eq!(arm.steps, 1, "the writes are one step");
@@ -38,15 +39,18 @@ fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()
     Ok(())
 }
 
-/// Several steps keep sampling the queries each step asks for, not more.
+/// Several steps keep sampling the queries each step asks for, not more, at
+/// every compaction budget the workload runs.
 #[test]
 fn every_step_takes_its_share_of_queries() -> lsm_tree::Result<()> {
-    let base = tempfile::tempdir()?;
-    let (planned, leveled) = super::run_arms(base.path(), &config(30_000))?;
-    for arm in [&planned, &leveled] {
-        assert!(arm.steps > 1, "{} steps", arm.steps);
-        assert_eq!(arm.points.len(), super::POINTS_PER_FLUSH * arm.steps);
-        assert_eq!(arm.scans.len(), super::SCANS_PER_FLUSH * arm.steps);
+    for compaction_rate in super::COMPACTION_RATES {
+        let base = tempfile::tempdir()?;
+        let (planned, leveled) = super::run_arms(base.path(), &config(30_000), compaction_rate)?;
+        for arm in [&planned, &leveled] {
+            assert!(arm.steps > 1, "{} steps", arm.steps);
+            assert_eq!(arm.points.len(), super::POINTS_PER_FLUSH * arm.steps);
+            assert_eq!(arm.scans.len(), super::SCANS_PER_FLUSH * arm.steps);
+        }
     }
     Ok(())
 }
@@ -56,7 +60,8 @@ fn every_step_takes_its_share_of_queries() -> lsm_tree::Result<()> {
 #[test]
 fn the_trees_are_built_beneath_the_run_directory() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
-    let arm = super::ArmRun::open(base.path(), &config(1_000), super::planned())?;
+    let rate = super::COMPACTION_RATES[0];
+    let arm = super::ArmRun::open(base.path(), &config(1_000), super::planned(rate), rate)?;
     assert!(
         arm.tree.tree_config().path.starts_with(base.path()),
         "built at {}",

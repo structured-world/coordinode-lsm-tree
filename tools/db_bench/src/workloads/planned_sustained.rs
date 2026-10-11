@@ -56,10 +56,11 @@ const SCAN_LENGTH: usize = 100;
 /// Bytes per second the writer is paced to, into each tree.
 const WRITE_RATE: u64 = 8 << 20;
 
-/// Bytes per second each tree's compactions may write: the same budget for
-/// both, enough for either to keep up with the writes, so what tells them
-/// apart is what their compactions take from the reads meanwhile.
-const COMPACTION_RATE: u64 = 8 * WRITE_RATE;
+/// Bytes per second each tree's compactions may write, the same budget for
+/// both, as multiples of the write rate. At 8 either keeps up, and what tells
+/// them apart is what their compactions take from the reads meanwhile; at 2
+/// neither does, and what tells them apart is how they fall behind.
+const COMPACTION_RATES: [u64; 2] = [8 * WRITE_RATE, 2 * WRITE_RATE];
 
 /// Compactions each tree may run at once.
 const COMPACTION_THREADS: usize = 2;
@@ -144,13 +145,14 @@ impl ArmRun {
         base: &Path,
         config: &BenchConfig,
         strategy: Arc<dyn CompactionStrategy>,
+        compaction_rate: u64,
     ) -> lsm_tree::Result<Self> {
         let folder = tempfile::Builder::new()
             .prefix("planned-sustained-")
             .tempdir_in(base)?;
         let tree = crate::config::tree_builder(folder.path(), config)?
             .table_target_size(TABLE_TARGET)
-            .compaction_rate_limit(COMPACTION_RATE)
+            .compaction_rate_limit(compaction_rate)
             .open()?;
         let arm = Arm::new();
         let background = Arc::new(Background::default());
@@ -309,29 +311,34 @@ fn key_space(config: &BenchConfig) -> u64 {
 
 /// The planner at its default round, told the tables' size and the rates it
 /// runs at.
-fn planned() -> Arc<dyn CompactionStrategy> {
+fn planned(compaction_rate: u64) -> Arc<dyn CompactionStrategy> {
     Arc::new(
         Planned::default()
             .with_table_target_size(TABLE_TARGET)
             .with_model(lsm_tree::compaction::planned::Model {
                 write_rate: WRITE_RATE,
-                encode_rate: COMPACTION_RATE,
+                encode_rate: compaction_rate,
                 ..lsm_tree::compaction::planned::Model::default()
             }),
     )
 }
 
 /// Writes the key stream into a planned and a leveled tree beneath `base` at
-/// [`WRITE_RATE`], a step every [`FLUSH_BYTES`] and one for what is left at
-/// the end, the two trees taking each step in turn with the first
-/// alternating.
-fn run_arms(base: &Path, config: &BenchConfig) -> lsm_tree::Result<(Arm, Arm)> {
+/// [`WRITE_RATE`], each compacting at `compaction_rate`, a step every
+/// [`FLUSH_BYTES`] and one for what is left at the end, the two trees taking
+/// each step in turn with the first alternating.
+fn run_arms(
+    base: &Path,
+    config: &BenchConfig,
+    compaction_rate: u64,
+) -> lsm_tree::Result<(Arm, Arm)> {
     let mut arms = [
-        ArmRun::open(base, config, planned())?,
+        ArmRun::open(base, config, planned(compaction_rate), compaction_rate)?,
         ArmRun::open(
             base,
             config,
             Arc::new(Leveled::default().with_table_target_size(TABLE_TARGET)),
+            compaction_rate,
         )?,
     ];
     let keys = key_space(config);
@@ -389,8 +396,15 @@ fn run_arms(base: &Path, config: &BenchConfig) -> lsm_tree::Result<(Arm, Arm)> {
     Ok((planned.finish(seqno)?, leveled.finish(seqno)?))
 }
 
-/// Publishes `arm`'s series under `name`.
-fn publish(reporter: &mut Reporter, name: &str, arm: &Arm, config: &BenchConfig) {
+/// Publishes `arm`'s series, compacted at `compaction_rate`, under `name`.
+fn publish(
+    reporter: &mut Reporter,
+    name: &str,
+    arm: &Arm,
+    config: &BenchConfig,
+    compaction_rate: u64,
+) {
+    let name = format!("{name} at {}x", compaction_rate / WRITE_RATE);
     let extra = format!(
         "num: {} | value_size: {} | steps: {} | merges: {} | scan length: {SCAN_LENGTH} | write \
          rate: {} MiB/s | compaction rate: {} MiB/s",
@@ -399,7 +413,7 @@ fn publish(reporter: &mut Reporter, name: &str, arm: &Arm, config: &BenchConfig)
         arm.steps,
         arm.merges,
         WRITE_RATE >> 20,
-        COMPACTION_RATE >> 20,
+        compaction_rate >> 20,
     );
     let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     let queries = arm.points.len() + arm.scans.len();
@@ -496,9 +510,11 @@ impl Workload for PlannedSustained {
         // The harness's tree holds no data; its directory is where `--db` put
         // the run, so both trees are built beneath it, on the device asked for.
         reporter.start();
-        let (planned, leveled) = run_arms(&tree.tree_config().path, config)?;
-        publish(reporter, "planned", &planned, config);
-        publish(reporter, "leveled", &leveled, config);
+        for compaction_rate in COMPACTION_RATES {
+            let (planned, leveled) = run_arms(&tree.tree_config().path, config, compaction_rate)?;
+            publish(reporter, "planned", &planned, config, compaction_rate);
+            publish(reporter, "leveled", &leveled, config, compaction_rate);
+        }
         reporter.stop();
         Ok(())
     }

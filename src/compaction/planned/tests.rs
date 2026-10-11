@@ -163,6 +163,28 @@ fn a_set_scan_share_stands_in_for_the_counted_reads() -> crate::Result<()> {
     Ok(())
 }
 
+/// A round costs its size ratio plus two units of compaction per unit
+/// written: the ratio used is what the model's compaction rate pays for,
+/// down to one where it pays for none, never past the one set.
+#[test]
+fn the_size_ratio_is_what_the_compaction_rate_pays_for() {
+    let ratio = |encode_rate: u64| {
+        Strategy::default()
+            .with_size_ratio(3)
+            .with_model(Model {
+                write_rate: 10,
+                encode_rate,
+                ..Model::default()
+            })
+            .size_ratio()
+    };
+    assert_eq!(ratio(10), 1, "one unit per unit written pays for no round");
+    assert_eq!(ratio(20), 1, "twice the write rate: the cheapest round");
+    assert_eq!(ratio(40), 2, "four times: a ratio of two");
+    assert_eq!(ratio(50), 3, "five times: the ratio set");
+    assert_eq!(ratio(1_000), 3, "never past the ratio set");
+}
+
 /// The same version, model and reads choose the same, on two strategies.
 #[test]
 fn the_choice_is_the_same_for_the_same_inputs() -> crate::Result<()> {
