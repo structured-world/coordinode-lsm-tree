@@ -498,7 +498,7 @@ fn memtable_span(
 ) -> Option<(UserKey, UserKey)> {
     use core::cmp::Ordering;
 
-    let (ilo, ihi) = rows::internal_bounds(lo, hi);
+    let (ilo, ihi) = crate::range::internal_bounds(lo, hi);
     let mut rows = memtable.range_internal((ilo, ihi));
     let first = rows.next().map(|row| row.key.user_key);
     let last = rows

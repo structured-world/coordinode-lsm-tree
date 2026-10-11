@@ -54,6 +54,21 @@ impl InternalKey {
         }
     }
 
+    /// A read bound at `user_key`: compared against stored keys and never
+    /// stored itself, so it takes a key of any length, one longer than any
+    /// stored key can be included.
+    pub(crate) fn bound<K: Into<UserKey>>(
+        user_key: K,
+        seqno: SeqNo,
+        value_type: ValueType,
+    ) -> Self {
+        Self {
+            user_key: user_key.into(),
+            seqno,
+            value_type,
+        }
+    }
+
     pub fn is_tombstone(&self) -> bool {
         self.value_type.is_tombstone()
     }
