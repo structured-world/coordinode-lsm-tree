@@ -1266,6 +1266,27 @@ impl AbstractTree for Tree {
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
+        // A sealed memtable that left the version while it was flushed was
+        // removed with its data (a `clear`): the tables written from it hold
+        // that data, and are dropped rather than installed.
+        let sealed = &version_lock.latest_version_ref().sealed_memtables;
+        if !sealed_memtables_to_delete
+            .iter()
+            .all(|&id| sealed.iter().any(|mt| mt.id() == id))
+        {
+            log::warn!(
+                "Flushed memtables left the version before the install, declining the flush"
+            );
+            drop(version_lock);
+            for table in tables {
+                table.mark_as_deleted();
+            }
+            for blob_file in blob_files.unwrap_or(&[]) {
+                blob_file.mark_as_deleted();
+            }
+            return Ok(());
+        }
+
         version_lock.upgrade_version(
             &self.config.path,
             |current| {
@@ -6560,3 +6581,7 @@ mod probe_stats_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod filter_advisor_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod clear_race_tests;
