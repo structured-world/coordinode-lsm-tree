@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.12.0...v5.12.1) - 2026-10-11
+
+### Fixed
+
+- *(tree)* decline a flush or compaction whose inputs clear() removed ([#894](https://github.com/structured-world/coordinode-lsm-tree/pull/894))
+
 ## [5.12.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.17...v5.12.0) - 2026-10-08
 
 ### Added
