@@ -2499,6 +2499,22 @@ impl Tree {
         //
         // Mapping runs AFTER the guard drops: it resolves blob indirections,
         // which reads a blob file, and no I/O may happen with writers blocked.
+        // The memtables are walked over the scope only, as a range read walks
+        // them.
+        let memtable_keys = key_range.map_or((Bound::Unbounded, Bound::Unbounded), |(lo, hi)| {
+            // A bound longer than any key can be is no internal key: no key
+            // reaches it, so that end of the walk stays open and
+            // `in_key_range` decides at the keys there.
+            let walkable = |bound: &Bound<UserKey>| match bound {
+                Bound::Included(key) | Bound::Excluded(key)
+                    if u16::try_from(key.len()).is_err() =>
+                {
+                    Bound::Unbounded
+                }
+                other => other.clone(),
+            };
+            crate::range::user_to_internal_bounds(&(walkable(lo), walkable(hi)))
+        });
         let (super_version, end_seqno, active_entries, active_range_tombstones) = {
             let guard = self.version_history.write();
             let super_version = guard.latest_version();
@@ -2522,7 +2538,7 @@ impl Tree {
             let entries: Vec<InternalValue> = end_seqno.map_or_else(Vec::new, |cap| {
                 super_version
                     .active_memtable
-                    .iter()
+                    .range_internal(memtable_keys.clone())
                     .filter(|e| e.key.seqno >= target_seqno && e.key.seqno <= cap)
                     .collect()
             });
@@ -2587,7 +2603,9 @@ impl Tree {
         // merge derives replay precedence from that position.
         for memtable in super_version.sealed_memtables.iter().rev() {
             let mut source = Vec::new();
-            for entry in memtable.iter() {
+            // The walk is bounded by internal keys; the user bounds decide at
+            // their own key, whatever version sits there.
+            for entry in memtable.range_internal(memtable_keys.clone()) {
                 if in_window(entry.key.seqno) && in_key_range(&entry.key.user_key) {
                     source.push(Self::map_event(entry, version, &resolve_indirection)?);
                 }
@@ -2630,7 +2648,8 @@ impl Tree {
             // at the range's start under the range deletion's own seqno is a
             // no-op.
             let mut source = Vec::new();
-            for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip)? {
+            let table_keys = ref_bounds.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+            for entry in table.scan_seqno_range(target_seqno, end_seqno, block_skip, table_keys)? {
                 if !in_key_range(&entry.key.user_key) {
                     continue;
                 }

@@ -847,7 +847,9 @@ type UserBounds = (Bound<UserKey>, Bound<UserKey>);
 /// Translate user-key bounds into the internal-key bounds the per-source readers
 /// expect. Mirrors the bound construction in [`TreeIter::create_range`] (see
 /// there for the seqno-direction reasoning at each end).
-fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<InternalKey>) {
+pub(crate) fn user_to_internal_bounds(
+    user: &UserBounds,
+) -> (Bound<InternalKey>, Bound<InternalKey>) {
     // Clone the `UserKey` (a reference-counted `Slice`: an `Arc` bump, no heap
     // copy) and hand it to `InternalKey::new` by value — `UserKey: Into<UserKey>`
     // is the identity, so the key bytes are reused. Passing `key.as_ref()`
