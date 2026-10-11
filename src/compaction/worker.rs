@@ -2606,6 +2606,9 @@ fn move_tables(
     opts: &Options,
     payload: &CompactionPayload,
 ) -> crate::Result<CompactionResult> {
+    #[cfg(test)]
+    opts.config.fire_before_output_install();
+
     let mut version_history_lock = opts.version_history.write();
 
     // Fail-safe for buggy compaction strategies
@@ -3866,6 +3869,9 @@ fn merge_tables(
     if let Some(filter) = compaction_filter {
         filter.finish();
     }
+
+    #[cfg(test)]
+    opts.config.fire_before_output_install();
 
     let mut compaction_state = opts.compaction_state.lock();
 

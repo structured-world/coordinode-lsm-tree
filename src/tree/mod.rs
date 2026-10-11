@@ -6560,3 +6560,7 @@ mod probe_stats_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod filter_advisor_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod clear_race_tests;

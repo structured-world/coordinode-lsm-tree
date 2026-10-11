@@ -1227,7 +1227,6 @@ pub(crate) type OutputInstallHook = Box<dyn FnOnce() + Send>;
 #[cfg(all(test, feature = "std"))]
 impl Config {
     /// Arms the [`Self::before_output_install`] failpoint with `hook`.
-    #[cfg(zstd_any)]
     pub(crate) fn arm_before_output_install(&self, hook: impl FnOnce() + Send + 'static) {
         #[expect(clippy::unwrap_used, reason = "test-only seam")]
         self.before_output_install
