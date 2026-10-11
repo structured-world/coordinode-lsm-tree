@@ -8158,33 +8158,14 @@ impl Table {
         self.range(..)
     }
 
-    /// Collects every entry in this SST with `seqno >= target_seqno`,
-    /// applying the per-block seqno-bounds skip when the SST carries it.
+    /// Collects the entries of this SST whose global seqno is in
+    /// `[target_seqno, end_seqno]`, applying the per-block seqno-bounds skip
+    /// when the SST carries it: a data block whose `seqno_bounds` entry cannot
+    /// overlap the window is skipped without being read, and an SST without
+    /// the section reads and filters every block. Entries come back in the
+    /// SST's stored order (key-ascending, seqno-descending within a key);
+    /// ordering across sources is the caller's job.
     ///
-    /// A data block whose `seqno_bounds` section entry reports
-    /// `seqno_max < target_seqno` cannot hold a qualifying record, so it is
-    /// skipped without being read. When the SST has no `seqno_bounds` section
-    /// (the feature was off), every block is read and filtered per entry, so
-    /// the result is correct regardless. Entries come back in the SST's stored
-    /// order (key-ascending,
-    /// seqno-descending within a key); ordering across sources is the caller's
-    /// job.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if reading the index or a data block fails.
-    #[doc(hidden)]
-    pub fn scan_since_seqno(&self, target_seqno: SeqNo) -> crate::Result<Vec<InternalValue>> {
-        self.scan_seqno_range(
-            target_seqno,
-            SeqNo::MAX,
-            true,
-            (Bound::Unbounded, Bound::Unbounded),
-        )
-    }
-
-    /// Like [`Self::scan_since_seqno`] but also bounds the result above:
-    /// collects entries whose global seqno is in `[target_seqno, end_seqno]`.
     /// The upper bound is INCLUSIVE so that a watermark of [`SeqNo::MAX`] — the
     /// value a scan derives when an entry sits at the maximum seqno — still
     /// delivers the entry that defined it.

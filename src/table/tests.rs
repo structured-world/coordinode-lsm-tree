@@ -3914,6 +3914,79 @@ fn scan_seqno_range_returns_nothing_below_a_bulk_ingest_base() -> crate::Result<
     Ok(())
 }
 
+/// A seqno scan of a restricted view reads none of the punched prefix and
+/// hands out nothing below the restriction, whole or key-bounded.
+#[test]
+fn scan_seqno_range_of_a_restricted_view_starts_at_the_bound() -> crate::Result<()> {
+    let key = |i: u32| format!("key{i:03}").into_bytes();
+    let items: Vec<_> = (0..40u32)
+        .map(|i| {
+            InternalValue::from_components(key(i), b"v".as_slice(), 1, crate::ValueType::Value)
+        })
+        .collect();
+    test_with_table(
+        &items,
+        |table| {
+            let restricted = table.reopen_restricted(crate::UserKey::from(key(20)))?;
+            let keys = |bounds: (Bound<&[u8]>, Bound<&[u8]>)| -> crate::Result<Vec<Vec<u8>>> {
+                Ok(restricted
+                    .scan_seqno_range(0, SeqNo::MAX, true, bounds)?
+                    .into_iter()
+                    .map(|entry| entry.key.user_key.to_vec())
+                    .collect())
+            };
+            let whole = keys((Bound::Unbounded, Bound::Unbounded))?;
+            assert_eq!(whole, (20..40).map(key).collect::<Vec<_>>());
+
+            let lo = key(5);
+            let hi = key(25);
+            let bounded = keys((Bound::Included(&lo), Bound::Included(&hi)))?;
+            assert_eq!(bounded.first(), Some(&key(20)), "{bounded:?}");
+            assert!(bounded.contains(&key(25)), "{bounded:?}");
+            Ok(())
+        },
+        None,
+        Some(|w: Writer| w.use_data_block_size(64)),
+    )
+}
+
+/// A seqno scan of a columnar table skips the groups its delete bitmap
+/// removes whole and hands out the rows left.
+#[cfg(feature = "columnar")]
+#[test]
+fn scan_seqno_range_skips_wholly_deleted_columnar_groups() -> crate::Result<()> {
+    use crate::config::DeleteStrategy;
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_row_group_size(128)
+        .delete_strategy(DeleteStrategy::MergeOnRead);
+    const ROWS: u32 = 64;
+    for i in 0..ROWS {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"value",
+            u64::from(i) + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    for row in 0..ROWS - 1 {
+        writer.delete_bitmap_mut().insert(row);
+    }
+    let (_, checksum) = writer
+        .finish()?
+        .expect("finish() returns Some after writing data items");
+    let table = Table::recover(test_recover_params(file, checksum))?;
+    assert!(table.metadata.data_block_count > 1, "several groups");
+
+    let rows = table.scan_seqno_range(0, SeqNo::MAX, true, (Bound::Unbounded, Bound::Unbounded))?;
+    let keys: Vec<_> = rows.iter().map(|row| row.key.user_key.to_vec()).collect();
+    assert_eq!(keys, vec![format!("key{:05}", ROWS - 1).into_bytes()]);
+    Ok(())
+}
+
 /// Build a [`Block`] from raw bytes for `decode_range_tombstones` tests.
 #[expect(
     clippy::expect_used,
