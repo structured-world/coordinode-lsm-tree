@@ -191,9 +191,11 @@ fn an_unchecked_reservation_is_counted_by_a_checked_one() -> crate::Result<()> {
     let unchecked = pool
         .reserve(1, &[demand(&fs, "/t", 150 * MIB)], None)
         .expect("an unchecked reservation always holds");
+    assert!(!pool.would_fit(2, &[demand(&fs, "/t", MIB)], check(u64::MAX)));
+    // Past its grant on a volume with no room left, it still refuses nothing.
+    fs.set_capacity(0);
     unchecked.landed(&fs, Path::new("/t"), 200 * MIB)?;
     assert!(!unchecked.refused());
-    assert!(!pool.would_fit(2, &[demand(&fs, "/t", MIB)], check(u64::MAX)));
     Ok(())
 }
 
