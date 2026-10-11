@@ -3961,6 +3961,7 @@ fn scan_seqno_range_skips_wholly_deleted_columnar_groups() -> crate::Result<()> 
     let file = dir.path().join("table");
     let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
         .use_columnar(true)
+        .use_zone_map(true)
         .use_row_group_size(128)
         .delete_strategy(DeleteStrategy::MergeOnRead);
     const ROWS: u32 = 64;
