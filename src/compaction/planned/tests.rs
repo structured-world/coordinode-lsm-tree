@@ -13,7 +13,7 @@ const UNIT: u64 = 8 * 1_024;
 fn strategy(model: Model) -> Arc<Strategy> {
     Arc::new(
         Strategy::default()
-            .with_scan_length(64)
+            .with_round(16)
             .with_size_ratio(3)
             .with_table_target_size(UNIT)
             .with_model(model),

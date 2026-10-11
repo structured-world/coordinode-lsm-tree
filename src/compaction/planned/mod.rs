@@ -52,6 +52,14 @@ use spin::Mutex;
 #[doc(hidden)]
 pub const NAME: &str = "PlannedCompaction";
 
+/// The unit runs a round takes by default.
+///
+/// Measured on sustained writes with point reads and scans under a compaction
+/// rate limit both strategies keep up with: 10 units served more queries than
+/// leveled at no worse p99, where 25 left an ended round's runs to raise the
+/// scan p99 by a sixth.
+pub const DEFAULT_ROUND: u32 = 10;
+
 /// The level an ended round's runs wait in to go into the last level.
 const DRAIN: usize = 2;
 #[expect(clippy::cast_possible_truncation, reason = "a small constant level")]
@@ -102,14 +110,13 @@ impl Default for Model {
 /// ```
 /// use lsm_tree::compaction::Planned;
 ///
-/// // Long scans read 100 keys; the last level holds three times the main.
-/// let strategy = Planned::default().with_scan_length(100).with_size_ratio(3);
+/// // Rounds of ten units; the last level holds three times the main.
+/// let strategy = Planned::default().with_round(10).with_size_ratio(3);
 /// # let _ = strategy;
 /// ```
 pub struct Strategy {
-    /// The keys a long scan reads (`K`): a scan reaching fewer is answered by
-    /// one table whatever the layout.
-    scan_length: u32,
+    /// Unit runs per round (`R`).
+    round: u32,
     /// The last level's size over the main level's at the end of a round
     /// (`C`).
     size_ratio: u32,
@@ -127,7 +134,7 @@ pub struct Strategy {
 impl Default for Strategy {
     fn default() -> Self {
         Self {
-            scan_length: 100,
+            round: DEFAULT_ROUND,
             size_ratio: 3,
             target_size: 64 * 1_024 * 1_024,
             l0_file_threshold: super::leveled::DEFAULT_L0_FILE_THRESHOLD,
@@ -139,12 +146,17 @@ impl Default for Strategy {
 }
 
 impl Strategy {
-    /// Sets the keys a long scan reads (default 100). A round takes
-    /// `scan_length / (size_ratio + 1)` units, at least one and at most
-    /// [`dp::MAX_ROUND`].
+    /// Sets the unit runs a round takes before it ends in the last level
+    /// (default [`DEFAULT_ROUND`], at least one and at most
+    /// [`dp::MAX_ROUND`]).
+    ///
+    /// A round rewrites the last level once per `R` units, `C` units per unit
+    /// written whatever `R` is; what `R` sets is how many runs an ended round
+    /// leaves to read until it is merged into the last, and how large a unit
+    /// is, the last level over `C · R`.
     #[must_use]
-    pub fn with_scan_length(mut self, keys: u32) -> Self {
-        self.scan_length = keys.max(1);
+    pub fn with_round(mut self, units: u32) -> Self {
+        self.round = units.clamp(1, dp::MAX_ROUND);
         self
     }
 
@@ -189,8 +201,8 @@ impl Strategy {
     }
 
     /// Unit runs per round.
-    fn round(&self) -> u32 {
-        (self.scan_length / (self.size_ratio + 1)).clamp(1, dp::MAX_ROUND)
+    const fn round(&self) -> u32 {
+        self.round
     }
 
     /// The unit of a tree whose last level holds `last_bytes`.

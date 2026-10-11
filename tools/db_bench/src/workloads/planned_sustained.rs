@@ -307,12 +307,11 @@ fn key_space(config: &BenchConfig) -> u64 {
     (config.num / 2).max(1)
 }
 
-/// The planner, told the scans' length, the tables' size and the rates it
+/// The planner at its default round, told the tables' size and the rates it
 /// runs at.
 fn planned() -> Arc<dyn CompactionStrategy> {
     Arc::new(
         Planned::default()
-            .with_scan_length(SCAN_LENGTH as u32)
             .with_table_target_size(TABLE_TARGET)
             .with_model(lsm_tree::compaction::planned::Model {
                 write_rate: WRITE_RATE,
