@@ -2501,10 +2501,20 @@ impl Tree {
         // which reads a blob file, and no I/O may happen with writers blocked.
         // The memtables are walked over the scope only, as a range read walks
         // them.
-        let memtable_keys = key_range.map_or(
-            (Bound::Unbounded, Bound::Unbounded),
-            crate::range::user_to_internal_bounds,
-        );
+        let memtable_keys = key_range.map_or((Bound::Unbounded, Bound::Unbounded), |(lo, hi)| {
+            // A bound longer than any key can be is no internal key: no key
+            // reaches it, so that end of the walk stays open and
+            // `in_key_range` decides at the keys there.
+            let walkable = |bound: &Bound<UserKey>| match bound {
+                Bound::Included(key) | Bound::Excluded(key)
+                    if u16::try_from(key.len()).is_err() =>
+                {
+                    Bound::Unbounded
+                }
+                other => other.clone(),
+            };
+            crate::range::user_to_internal_bounds(&(walkable(lo), walkable(hi)))
+        });
         let (super_version, end_seqno, active_entries, active_range_tombstones) = {
             let guard = self.version_history.write();
             let super_version = guard.latest_version();

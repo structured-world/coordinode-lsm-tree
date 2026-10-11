@@ -1229,6 +1229,49 @@ fn scan_since_in_range_equals_the_full_scan_filtered_to_the_range() -> lsm_tree:
     Ok(())
 }
 
+/// A bound longer than any key can be scopes the scan as it would any other
+/// bound, rather than failing: no key reaches its length, so it only decides
+/// where the range starts or ends.
+#[test]
+fn scan_since_in_range_takes_a_bound_longer_than_any_key() -> lsm_tree::Result<()> {
+    use std::ops::Bound;
+
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path())?;
+    for (key, seqno) in [b"b", b"c", b"d", b"e"].into_iter().zip(1..) {
+        tree.insert(key.as_slice(), b"v", seqno);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.insert(b"c", b"newer", 10);
+    assert!(tree.rotate_memtable().is_some(), "a sealed memtable");
+    tree.insert(b"d", b"newest", 11);
+
+    let long_b = vec![b'b'; 70_000];
+    let long_d = vec![b'd'; 70_000];
+    let keys = |lo: Bound<Vec<u8>>, hi: Bound<Vec<u8>>| -> lsm_tree::Result<Vec<Vec<u8>>> {
+        Ok(tree
+            .scan_since_seqno_in_range(0, (lo, hi))?
+            .map(|event| event.key().to_vec())
+            .collect())
+    };
+    let sorted = |mut keys: Vec<Vec<u8>>| {
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        sorted(keys(
+            Bound::Excluded(long_b.clone()),
+            Bound::Included(long_d.clone())
+        )?),
+        vec![b"c".to_vec(), b"c".to_vec(), b"d".to_vec(), b"d".to_vec()],
+    );
+    assert_eq!(
+        sorted(keys(Bound::Included(long_b), Bound::Excluded(long_d))?),
+        vec![b"c".to_vec(), b"c".to_vec(), b"d".to_vec(), b"d".to_vec()],
+    );
+    Ok(())
+}
+
 /// A scan of one prefix of a table holding many reads the blocks holding the
 /// prefix and at most one more on each side, not the whole table.
 #[cfg(feature = "metrics")]
