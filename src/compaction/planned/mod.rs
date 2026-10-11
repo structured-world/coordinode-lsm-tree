@@ -110,6 +110,8 @@ pub struct Strategy {
     /// The L0 table count that sends the top level down whatever its size.
     l0_file_threshold: u16,
     model: Model,
+    /// The share of reads that are scans, when set rather than counted.
+    scan_share: Option<f64>,
     /// The plan last worked out, with what it was worked out from.
     plan: Mutex<Option<(dp::Inputs, Arc<dp::Plan>)>>,
 }
@@ -122,6 +124,7 @@ impl Default for Strategy {
             target_size: 64 * 1_024 * 1_024,
             l0_file_threshold: super::leveled::DEFAULT_L0_FILE_THRESHOLD,
             model: Model::default(),
+            scan_share: None,
             plan: Mutex::new(None),
         }
     }
@@ -168,6 +171,15 @@ impl Strategy {
         self
     }
 
+    /// Plans for `share` of the reads being range scans (clamped to `0..=1`)
+    /// instead of the share the tree's tables counted: a stand-in for a
+    /// workload known ahead, or not yet seen. `None` reads the tables again.
+    #[must_use]
+    pub fn with_scan_share(mut self, share: Option<f64>) -> Self {
+        self.scan_share = share.map(|share| share.clamp(0.0, 1.0));
+        self
+    }
+
     /// Unit runs per round.
     fn round(&self) -> u32 {
         (self.scan_length / (self.size_ratio + 1)).clamp(1, dp::MAX_ROUND)
@@ -194,22 +206,35 @@ impl Strategy {
     /// What the plan for `version` is worked out from, with `budget` bytes
     /// per second the tree's compactions may use, `0` for no limit.
     fn inputs(&self, version: &Version, unit: u64, budget: u64) -> dp::Inputs {
-        let (mut reads, mut scans) = (0u64, 0u64);
-        for table in version.iter_tables() {
-            reads += table.reads();
-            scans += table.scans();
-        }
-        // With no read seen there is nothing to plan for: no merge in the
-        // main level pays, and none runs.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a share of read counts, approximate by nature"
-        )]
-        let scan_share = if reads == 0 {
-            0.0
-        } else {
-            scans as f64 / reads as f64
-        };
+        let scan_share = self.scan_share.unwrap_or_else(|| {
+            let (mut points, mut scans) = (0u64, 0u64);
+            for table in version.iter_tables() {
+                scans += table.scans();
+                points += table.reads() - table.scans();
+            }
+            // A point read is counted by the one table holding its key, a scan
+            // by a table of every run it reaches, which is every run of the
+            // tree for a scan over a few hundred keys: the scans are its
+            // counts over the runs there are.
+            let runs: usize = version.iter_levels().map(|level| level.run_count()).sum();
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a share of read counts, approximate by nature"
+            )]
+            let scans = scans as f64 / runs.max(1) as f64;
+            // With no read seen there is nothing to plan for: no merge in the
+            // main level pays, and none runs.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a share of read counts, approximate by nature"
+            )]
+            let points = points as f64;
+            if scans + points == 0.0 {
+                0.0
+            } else {
+                scans / (scans + points)
+            }
+        });
         let model = self.model;
         let encode_rate = match budget {
             0 => model.encode_rate,

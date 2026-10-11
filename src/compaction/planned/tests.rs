@@ -74,7 +74,9 @@ fn the_top_level_comes_down_a_unit_at_a_time_and_a_round_ends_in_the_last() -> c
     assert!(tree.current_version().level(0).expect("L0").is_empty());
     assert_eq!(level_runs(&tree, 1), 1, "one run of the main level");
 
-    for round in 1..8 {
+    // At least a unit per written round, so more rounds than a round's
+    // sixteen units.
+    for round in 1..24 {
         write_round(&tree, round)?;
         settle(&tree, &strategy)?;
     }
@@ -86,7 +88,7 @@ fn the_top_level_comes_down_a_unit_at_a_time_and_a_round_ends_in_the_last() -> c
     for i in 0..200u64 {
         let value = tree.get(format!("k{i:04}"), SeqNo::MAX)?.expect("kept");
         assert!(
-            value.starts_with(b"00000007"),
+            value.starts_with(b"00000023"),
             "key {i} reads its newest value"
         );
     }
@@ -125,6 +127,33 @@ fn scans_and_cheap_merges_merge_the_main_level() -> crate::Result<()> {
         for _ in 0..50 {
             assert_eq!(tree.iter(SeqNo::MAX, None).count(), 200);
         }
+    }
+    assert!(
+        level_runs(&tree, 1) < 4,
+        "the plan merged the main level's runs: {}",
+        level_runs(&tree, 1),
+    );
+    Ok(())
+}
+
+/// A scan share set on the strategy stands in for the tables' counts: with no
+/// read made, it plans the merges the counted scans would.
+#[test]
+fn a_set_scan_share_stands_in_for_the_counted_reads() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let strategy = Arc::new(
+        Arc::into_inner(strategy(Model {
+            write_rate: 1,
+            encode_rate: u64::MAX,
+            copy_rate: u64::MAX,
+            ..Model::default()
+        }))
+        .expect("sole owner")
+        .with_scan_share(Some(1.0)),
+    );
+    for round in 0..4 {
+        write_round(&tree, round)?;
+        settle(&tree, &strategy)?;
     }
     assert!(
         level_runs(&tree, 1) < 4,
