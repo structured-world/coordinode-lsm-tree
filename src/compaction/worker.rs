@@ -133,6 +133,10 @@ pub struct Options {
     /// share it.
     pub(crate) outputs: super::output_ledger::OutputLedger,
 
+    /// The work this run did, against the estimate it was planned against.
+    /// [`do_compaction`] gives each run its own, as it does `outputs`.
+    pub(crate) work: Arc<super::work::WorkLedger>,
+
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
 }
@@ -163,6 +167,7 @@ impl Options {
             // `TreeInner::compaction_rate_limiter`.
             rate_limiter: Arc::clone(&tree.compaction_rate_limiter),
             outputs: super::output_ledger::OutputLedger::default(),
+            work: Arc::default(),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -174,10 +179,11 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    // A ledger of this run's own: the caller may share its options with runs
-    // that overlap this one, and their outputs are theirs to install.
+    // Ledgers of this run's own: the caller may share its options with runs
+    // that overlap this one, and their outputs and work are theirs.
     let opts = &Options {
         outputs: super::output_ledger::OutputLedger::default(),
+        work: Arc::default(),
         ..opts.clone()
     };
     let result = run_compaction(opts);
@@ -186,7 +192,11 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     // dropped as the run returned.
     opts.outputs
         .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
-    result
+    let mut result = result?;
+    result.work = opts.work.report();
+    #[cfg(feature = "metrics")]
+    opts.metrics.charge_compaction_work(&result.work);
+    Ok(result)
 }
 
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
@@ -643,32 +653,69 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
     Some((lo, hi))
 }
 
-/// What a compaction tells its rate limiter about the reads of its inputs:
-/// how long they take, for a latency backoff on the limiter to steer by. A
-/// limiter shared with a verification scan would otherwise keep a rate the
-/// scan lowered after the scan ends, since only reads report latency.
-#[cfg_attr(
-    feature = "std",
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "a no-std build times no reads and has no pacer to give"
-    )
-)]
-fn input_pacer(
-    limiter: &Arc<crate::rate_limiter::RateLimiter>,
-) -> Option<crate::table::util::Pacer> {
-    // no-std: reads are timed only with std (see `ReadPacer::read_took`)
-    #[cfg(feature = "std")]
-    {
-        Some(Arc::new(crate::table::util::LatencyPacer(Arc::clone(
-            limiter,
-        ))))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = limiter;
+/// The pacer of the run's input reads: it tells the rate limiter how long
+/// they take, for a latency backoff on the limiter to steer by, and counts
+/// what they return to the run's work. A limiter shared with a verification
+/// scan would otherwise keep a rate the scan lowered after the scan ends,
+/// since only reads report latency.
+fn input_pacer(opts: &Options) -> crate::table::util::Pacer {
+    Arc::new(super::work::InputPacer::new(&opts.rate_limiter, &opts.work))
+}
+
+/// The work a merge of `tables` into `payload`'s level is expected to cost,
+/// relocating `blob_files` and applying the range tombstones of `rt_plan`.
+fn merge_estimate(
+    opts: &Options,
+    version: &Version,
+    payload: &CompactionPayload,
+    tables: &[Table],
+    blob_files: &[BlobFile],
+    rt_plan: Option<&(
+        Vec<crate::range_tombstone::RangeTombstone>,
+        RangeTombstoneUse,
+    )>,
+) -> super::work::WorkEstimate {
+    // The groups are recorded as the merge records them: a merge relocating
+    // blob files writes every row itself.
+    #[cfg(feature = "columnar")]
+    let carry = if blob_files.is_empty() {
+        super::carry::plan(
+            &opts.config,
+            &opts.runtime_config.load(),
+            payload.canonical_level.into(),
+            tables,
+        )
+    } else {
         None
-    }
+    };
+    #[cfg(not(feature = "columnar"))]
+    let _ = payload;
+    // Only a deleting tombstone changes the rows it covers; a boundary one
+    // ends an operand chain, which a merge operator's rows answer for.
+    let deleting = match rt_plan {
+        Some((tombstones, RangeTombstoneUse::Delete)) => tombstones.as_slice(),
+        _ => &[],
+    };
+    super::work::estimate_merge(
+        &super::work::MergePlan {
+            inputs: tables,
+            blob_files,
+            gc_stats: version.gc_stats(),
+            user_code: opts.config.compaction_filter_factory.is_some()
+                || opts.config.merge_operator.is_some(),
+            range_tombstones: deleting,
+            comparator: opts.config.comparator.as_ref(),
+        },
+        |table| {
+            #[cfg(feature = "columnar")]
+            return carry.as_ref().is_some_and(|carry| carry.takes(table));
+            #[cfg(not(feature = "columnar"))]
+            {
+                let _ = table;
+                false
+            }
+        },
+    )
 }
 
 fn create_compaction_stream<'a>(
@@ -1467,34 +1514,37 @@ fn run_tight_space_compaction(
     // IDs, not the `BlobFile` handles: retaining an Arc would pin the stale
     // `Inner` and block its punch-on-drop. Each slice re-fetches the current
     // handle from the version.
-    let (stale_ids, stale_total_bytes): (Vec<BlobFileId>, u64) =
-        match &opts.config.kv_separation_opts {
-            Some(blob_opts) => {
-                let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
-                let files = pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?;
-                // Sum of on-disk blob-file sizes; bounded by filesystem capacity,
-                // so it cannot overflow u64 (matches the gate's `acc + size`).
-                let mut total = 0u64;
-                for bf in &files {
-                    total += bf.physical_size()?;
-                }
-                // Each stale file is punched through its OWN backend, which a
-                // separately backed `blobs/` can refuse.
-                if let Some(bf) = files
-                    .iter()
-                    .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
-                {
-                    log::info!(
-                        "Tight-space compaction unavailable: the backend of blob file {} \
-                         lacks punch_hole, so its relocated prefix would stay allocated",
-                        bf.0.path.display(),
-                    );
-                    return Ok(CompactionResult::nothing());
-                }
-                (files.iter().map(BlobFile::id).collect(), total)
-            }
-            None => (Vec::new(), 0),
-        };
+    let stale_files = match &opts.config.kv_separation_opts {
+        Some(blob_opts) => {
+            let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
+            pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?
+        }
+        None => Vec::new(),
+    };
+    // Each stale file is punched through its OWN backend, which a separately
+    // backed `blobs/` can refuse.
+    if let Some(bf) = stale_files
+        .iter()
+        .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
+    {
+        log::info!(
+            "Tight-space compaction unavailable: the backend of blob file {} \
+             lacks punch_hole, so its relocated prefix would stay allocated",
+            bf.0.path.display(),
+        );
+        return Ok(CompactionResult::nothing());
+    }
+    // Sum of on-disk blob-file sizes; bounded by filesystem capacity, so it
+    // cannot overflow u64 (matches the gate's `acc + size`).
+    let mut stale_total_bytes = 0u64;
+    for bf in &stale_files {
+        stale_total_bytes += bf.physical_size()?;
+    }
+    // Slices apply no range tombstone, so none is planned for. Recorded once
+    // the pass is sure to run, below.
+    let estimate = merge_estimate(opts, &latest.version, payload, &inputs, &stale_files, None);
+    let stale_ids: Vec<BlobFileId> = stale_files.iter().map(BlobFile::id).collect();
+    drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
     // The reclaim runs through each INPUT's own backend, not the destination's:
@@ -1625,6 +1675,8 @@ fn run_tight_space_compaction(
         // Indivisible (single block across all inputs) — no incremental reclaim.
         return Ok(CompactionResult::nothing());
     }
+
+    opts.work.plan(estimate);
 
     // Hide the inputs so the strategy cannot re-select them mid-loop.
     compaction_state
@@ -1765,6 +1817,7 @@ fn run_tight_space_compaction(
             // Charged once this slice is installed, below.
             let relocated_bytes = produced.relocated_bytes();
             let carried = produced.carried();
+            let installed_work = produced.installed_work();
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -1990,13 +2043,9 @@ fn run_tight_space_compaction(
             // The version names this slice's outputs now: a later slice's failure
             // must not remove them.
             opts.outputs.installed();
+            opts.work.installed(installed_work);
             #[cfg(feature = "metrics")]
-            super::flavour::charge_installed(
-                &opts.metrics,
-                relocated_bytes,
-                carried,
-                outputs.iter().map(Table::file_size).sum(),
-            );
+            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the
@@ -2182,6 +2231,7 @@ fn run_tight_space_compaction(
         dest_level: Some(payload.dest_level),
         tables_in,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -2309,7 +2359,7 @@ fn run_subcompaction(
                 .collect::<Vec<_>>(),
         )
     };
-    let pace = input_pacer(&opts.rate_limiter);
+    let pace = input_pacer(opts);
 
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
@@ -2318,7 +2368,7 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        pace.as_ref(),
+        Some(&pace),
         #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
@@ -2463,7 +2513,7 @@ fn run_subcompaction(
                     .iter()
                     .map(|bf| {
                         let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
-                        open_blob_scanner_at_frontier(bf, from, &opts.rate_limiter)
+                        open_blob_scanner_at_frontier(bf, from, opts)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
                 opts.config.comparator.clone(),
@@ -2531,7 +2581,7 @@ fn run_subcompaction(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
-    let read_pace = pace.as_deref();
+    let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
         if let Some(matcher) = matcher.as_mut()
@@ -2646,6 +2696,11 @@ fn move_tables(
 
     let table_count = payload.table_ids.len();
     let table_ids = payload.table_ids.iter().copied().collect::<Vec<_>>();
+    let estimate = {
+        let version = &version_history_lock.latest_version().version;
+        super::work::estimate_move(table_ids.iter().filter_map(|&id| version.get_table(id)))
+    };
+    opts.work.plan(estimate);
 
     version_history_lock.upgrade_version(
         &opts.config.path,
@@ -2667,12 +2722,15 @@ fn move_tables(
         // A trivial move rewrites nothing: every version survives as-is.
         crate::version::RetentionEffect::Keep,
     )?;
+    // The estimate of a move is the move.
+    opts.work.moved(estimate.expected.moved);
 
     Ok(CompactionResult {
         action: CompactionAction::Moved,
         dest_level: Some(payload.dest_level),
         tables_in: table_count,
         tables_out: table_count,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -2810,18 +2868,18 @@ fn pick_blob_files_for_merge(
 fn open_blob_scanner_at_frontier(
     bf: &BlobFile,
     from: u64,
-    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+    opts: &Options,
 ) -> crate::Result<BlobFileScanner> {
     let off = from.max(bf.live_data_start());
     // The relocation reads the blob files of its inputs, their trailer and
     // table of contents included: they report their latency as the table
-    // reads do.
+    // reads do, and count to the run's work.
     BlobFileScanner::open_paced(
         &bf.0.path,
         &*bf.0.fs,
         bf.id(),
         (off != 0).then_some(off),
-        input_pacer(limiter),
+        Some(input_pacer(opts)),
     )
 }
 
@@ -3039,7 +3097,7 @@ fn plan_merge_on_read(
     payload: &CompactionPayload,
     tables: &[Table],
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
-    pace: Option<&crate::table::util::Pacer>,
+    pace: &crate::table::util::Pacer,
 ) -> crate::Result<Option<(Table, crate::table::delete_bitmap::DeleteBitmap)>> {
     let dst_lvl: usize = payload.canonical_level.into();
     let strategy = opts.runtime_config.load_full().delete_strategy.get(dst_lvl);
@@ -3079,7 +3137,7 @@ fn plan_merge_on_read(
     // seqno per row, dropping each scanned value so planning does not retain a
     // whole segment's values in memory.
     let keys = source
-        .scan_paced(pace)?
+        .scan_paced(Some(pace))?
         .map(|entry| {
             let entry = entry?;
             Ok((entry.key.user_key, entry.key.seqno))
@@ -3124,7 +3182,7 @@ fn run_merge_on_read_relocation(
     payload: &CompactionPayload,
     source: &Table,
     bitmap: &crate::table::delete_bitmap::DeleteBitmap,
-    pace: Option<&crate::table::util::Pacer>,
+    pace: &crate::table::util::Pacer,
 ) -> crate::Result<CompactionResult> {
     let dst_lvl: usize = payload.canonical_level.into();
     let new_id = opts.table_id_generator.next();
@@ -3133,14 +3191,15 @@ fn run_merge_on_read_relocation(
 
     // Write the relocated SST through the DESTINATION level's filesystem (the
     // same one that recovers and installs it below), not the source table's.
-    let checksum = source.relocate_columnar_with_deletes(
-        &new_path,
-        &*level_fs,
-        new_id,
-        bitmap,
-        opts.config.sync_mode,
-        pace,
-    )?;
+    let crate::table::relocate::Relocated { checksum, copied } = source
+        .relocate_columnar_with_deletes(
+            &new_path,
+            &*level_fs,
+            new_id,
+            bitmap,
+            opts.config.sync_mode,
+            Some(pace),
+        )?;
     // Recorded once finished: the relocation unlinks its own file on a
     // failure before that.
     opts.outputs
@@ -3180,7 +3239,8 @@ fn run_merge_on_read_relocation(
         .hidden_set_mut()
         .hide(payload.table_ids.iter().copied());
 
-    let produced = super::flavour::ProducedOutput::for_relocation(relocated, source.clone());
+    let produced =
+        super::flavour::ProducedOutput::for_relocation(relocated, source.clone(), copied);
     let result = super::flavour::install_merge(
         &mut opts.version_history.write(),
         opts,
@@ -3200,6 +3260,7 @@ fn run_merge_on_read_relocation(
         dest_level: Some(payload.dest_level),
         tables_in: 1,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -3261,9 +3322,21 @@ fn merge_tables(
     let blob_rewrite =
         pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
 
+    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    // Gathered once, for the estimate and for the serial merge below.
+    let rt_plan = range_tombstone_plan(&current_super_version.version, is_last_level, &opts.config);
+    opts.work.plan(merge_estimate(
+        opts,
+        &current_super_version.version,
+        payload,
+        &tables,
+        &blob_rewrite.files,
+        rt_plan.as_ref(),
+    ));
+
     // Every read of the inputs, on the fast path as on the merge, reports its
-    // latency to the limiter (see `input_pacer`).
-    let pace = input_pacer(&opts.rate_limiter);
+    // latency to the limiter and counts to the run's work (see `input_pacer`).
+    let pace = input_pacer(opts);
 
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
@@ -3276,13 +3349,8 @@ fn merge_tables(
     // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
     if !blob_rewrite.for_locality
-        && let Some((source, bitmap)) = plan_merge_on_read(
-            opts,
-            payload,
-            &tables,
-            &input_range_tombstones,
-            pace.as_ref(),
-        )?
+        && let Some((source, bitmap)) =
+            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones, &pace)?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -3292,7 +3360,7 @@ fn merge_tables(
             payload,
             &source,
             &bitmap,
-            pace.as_ref(),
+            &pace,
         );
     }
     let blob_files_to_rewrite = blob_rewrite.files;
@@ -3306,7 +3374,6 @@ fn merge_tables(
     {
         let threads = opts.config.compaction_threads;
         let dst_lvl: usize = payload.canonical_level.into();
-        let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
         // Only KV-separated trees with blob files to relocate get here with a
         // non-empty set; that path is not split.
@@ -3505,6 +3572,7 @@ fn merge_tables(
                 dest_level: Some(payload.dest_level),
                 tables_in,
                 tables_out,
+                work: super::WorkReport::default(),
             });
         }
     }
@@ -3546,7 +3614,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        pace.as_ref(),
+        Some(&pace),
         #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
@@ -3558,7 +3626,6 @@ fn merge_tables(
     };
 
     let dst_lvl = payload.canonical_level.into();
-    let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
     // See `holds_every_surviving_version`: the destination level alone does not
     // prove that a key missing from the inputs is missing from the tree.
@@ -3574,12 +3641,11 @@ fn merge_tables(
         .zero_seqnos(false);
 
     // Whole-version tombstones for compaction-time RT application (drop covered
-    // KVs in the merge) and the bottommost seqno-zeroing gate; gathered from
-    // every level so coverage outside this compaction is respected. The scan and
-    // the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
+    // KVs in the merge) and the bottommost seqno-zeroing gate, gathered above
+    // from every level so coverage outside this compaction is respected. The
+    // scan and the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
     // RT-application + zeroing runs on the `no_std` serial path too (see the
     // zeroer wrap below).
-    let rt_plan = range_tombstone_plan(&current_super_version.version, is_last_level, &opts.config);
     if let Some((tombstones, rt_use)) = &rt_plan {
         merge_iter = merge_iter.with_range_tombstones(
             tombstones.clone(),
@@ -3686,7 +3752,7 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, &opts.rate_limiter))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, opts))
                         .collect::<crate::Result<Vec<_>>>()?,
                     opts.config.comparator.clone(),
                 );
@@ -3771,7 +3837,7 @@ fn merge_tables(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
-    let read_pace = pace.as_deref();
+    let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
         if let Some(matcher) = matcher.as_mut()
@@ -3983,6 +4049,7 @@ fn merge_tables(
         dest_level: Some(payload.dest_level),
         tables_in,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -4150,6 +4217,8 @@ fn drop_tables(
         dest_level: None,
         tables_in: tables_dropped,
         tables_out: 0,
+        // A drop reads and writes nothing, and moves nothing.
+        work: super::WorkReport::default(),
     })
 }
 

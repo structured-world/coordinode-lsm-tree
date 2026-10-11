@@ -168,8 +168,11 @@ pub struct Metrics {
     /// The on-disk bytes copied instead of encoded: whole groups and pages.
     pub(crate) compaction_bytes_carried: AtomicU64,
 
-    /// The on-disk bytes of the tables compactions installed.
-    pub(crate) compaction_bytes_written: AtomicU64,
+    /// The work compactions were estimated to cost before they ran.
+    compaction_work_estimated: WorkCounters,
+
+    /// The work compactions did: what they read, and what they installed.
+    compaction_work_measured: WorkCounters,
 
     /// Number of index block bytes that were requested from OS or disk
     pub(crate) index_block_io_requested: AtomicU64,
@@ -198,6 +201,39 @@ pub struct Metrics {
     /// [`Self::ecc_secded_corrected`]; the two are disjoint by recovery
     /// mechanism and sum to the total on-read ECC recoveries.
     pub(crate) ecc_shard_recovered: AtomicUsize,
+}
+
+/// One cumulative counter per kind of compaction work.
+#[derive(Debug, Default)]
+struct WorkCounters {
+    moved: AtomicU64,
+    carried: AtomicU64,
+    reprotected: AtomicU64,
+    reencoded: AtomicU64,
+    read: AtomicU64,
+    written: AtomicU64,
+}
+
+impl WorkCounters {
+    fn add(&self, work: &crate::compaction::Work<u64>) {
+        self.moved.fetch_add(work.moved, Relaxed);
+        self.carried.fetch_add(work.carried, Relaxed);
+        self.reprotected.fetch_add(work.reprotected, Relaxed);
+        self.reencoded.fetch_add(work.reencoded, Relaxed);
+        self.read.fetch_add(work.read, Relaxed);
+        self.written.fetch_add(work.written, Relaxed);
+    }
+
+    fn get(&self) -> crate::compaction::Work<u64> {
+        crate::compaction::Work {
+            moved: self.moved.load(Relaxed),
+            carried: self.carried.load(Relaxed),
+            reprotected: self.reprotected.load(Relaxed),
+            reencoded: self.reencoded.load(Relaxed),
+            read: self.read.load(Relaxed),
+            written: self.written.load(Relaxed),
+        }
+    }
 }
 
 /// A point-in-time snapshot of block-cache effectiveness and occupancy.
@@ -424,11 +460,27 @@ impl Metrics {
         self.compaction_bytes_carried.load(Relaxed)
     }
 
-    /// On-disk bytes of the tables compactions wrote and installed, carried
-    /// groups included: divided by the bytes the tree took in, the write
-    /// amplification compaction adds.
-    pub fn compaction_bytes_written(&self) -> u64 {
-        self.compaction_bytes_written.load(Relaxed)
+    /// The work compactions were estimated to cost before they ran, summed
+    /// over every compaction, by kind of work.
+    ///
+    /// Read beside [`Self::compaction_work_measured`]: the difference of each
+    /// figure is the estimator's error over the same compactions.
+    pub fn compaction_work_estimated(&self) -> crate::compaction::Work<u64> {
+        self.compaction_work_estimated.get()
+    }
+
+    /// The work compactions did, summed over every compaction, by kind of
+    /// work: the bytes they read, and the bytes of the outputs they
+    /// installed. Its `written` divided by the bytes the tree took in is the
+    /// write amplification compaction adds.
+    pub fn compaction_work_measured(&self) -> crate::compaction::Work<u64> {
+        self.compaction_work_measured.get()
+    }
+
+    /// Charges one compaction's estimate and measured work.
+    pub(crate) fn charge_compaction_work(&self, work: &crate::compaction::WorkReport) {
+        self.compaction_work_estimated.add(&work.estimate.expected);
+        self.compaction_work_measured.add(&work.measured);
     }
 
     /// Bytes moved by a gather — accumulation, filtering, row gathering and

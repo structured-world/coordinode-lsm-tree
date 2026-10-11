@@ -31,7 +31,7 @@ pub(crate) mod multi_writer;
 pub(crate) mod probe_stats;
 pub(crate) mod regions;
 #[cfg(feature = "std")]
-mod relocate;
+pub(crate) mod relocate;
 #[cfg(feature = "columnar")]
 pub(crate) mod row_group;
 mod scanner;
@@ -2301,6 +2301,13 @@ impl Table {
         // subtraction cannot underflow; falling back to the whole size keeps a
         // space gate conservative if the two ever disagreed.
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
+    }
+
+    /// The bytes of the data section: every data block or row group as it lies
+    /// on disk. It opens the file, and the index follows it, or the top-level
+    /// index where the index is not partitioned.
+    pub(crate) fn data_section_len(&self) -> u64 {
+        self.regions.index.unwrap_or(self.regions.tli).offset().0
     }
 
     /// The blocks one data index entry covers, each with the ROLE its writer

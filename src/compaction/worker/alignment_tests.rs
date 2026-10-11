@@ -406,11 +406,12 @@ fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate:
     Ok(())
 }
 
-/// The compaction byte counter grows by the bytes of the tables a merge
-/// installs, and a move, which writes none, leaves it as it was.
+/// The written work of a merge is the bytes of the tables it installs, in its
+/// own report and in the tree's counter, and a move, which writes none,
+/// leaves the counter as it was.
 #[cfg(feature = "metrics")]
 #[test]
-fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
+fn compaction_work_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open(Config::new(
         folder.path(),
@@ -420,15 +421,16 @@ fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Resul
     let mut seqno = 1;
     flush_into(&tree, 0..1_000, 1_000, 1, &mut seqno)?;
     assert_eq!(
-        tree.metrics().compaction_bytes_written(),
+        tree.metrics().compaction_work_measured().written,
         0,
         "a move writes nothing"
     );
     let ids = tables(&tree, 1).iter().map(Table::id).collect();
-    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
+    let result = tree.compact(Arc::new(Merge(ids, 2)), 0)?;
     let installed: u64 = tables(&tree, 2).iter().map(Table::file_size).sum();
     assert!(installed > 0);
-    assert_eq!(tree.metrics().compaction_bytes_written(), installed);
+    assert_eq!(result.work.measured.written, installed);
+    assert_eq!(tree.metrics().compaction_work_measured().written, installed);
     Ok(())
 }
 

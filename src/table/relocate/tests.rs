@@ -62,14 +62,9 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
     for &row in &deleted {
         bitmap.insert(row);
     }
-    let out_checksum = source.relocate_columnar_with_deletes(
-        &out_path,
-        &StdFs,
-        1,
-        &bitmap,
-        SyncMode::Normal,
-        None,
-    )?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .checksum;
 
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
@@ -199,14 +194,9 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
     for &row in &[4u32, 7, 40, 95] {
         bitmap.insert(row);
     }
-    let out_checksum = source.relocate_columnar_with_deletes(
-        &out_path,
-        &StdFs,
-        1,
-        &bitmap,
-        SyncMode::Normal,
-        None,
-    )?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .checksum;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
     // The re-encoded meta describes the appended bitmap, so the forgery
@@ -250,14 +240,9 @@ fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result
 
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(4);
-    let out_checksum = source.relocate_columnar_with_deletes(
-        &out_path,
-        &StdFs,
-        9,
-        &bitmap,
-        SyncMode::Normal,
-        None,
-    )?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 9, &bitmap, SyncMode::Normal, None)?
+        .checksum;
     let relocated = recover_at(&out_path, out_checksum, 9)?;
 
     assert_eq!(
@@ -410,14 +395,9 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
     // copied accounting) still include it.
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(3);
-    let out_checksum = source.relocate_columnar_with_deletes(
-        &out_path,
-        &StdFs,
-        1,
-        &bitmap,
-        SyncMode::Normal,
-        None,
-    )?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .checksum;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
     relocated
