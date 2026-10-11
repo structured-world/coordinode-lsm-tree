@@ -32,6 +32,7 @@ pub use fifo::Strategy as Fifo;
 pub use filter::{CompactionFilter, Factory, ItemAccessor, Verdict};
 pub use heal::Strategy as EccHeal;
 pub use leveled::Strategy as Leveled;
+pub use leveled::{Granularity, Layout, LevelPolicy, Movement, Trigger};
 pub use tiered::Strategy as SizeTiered;
 pub use work::{Work, WorkEstimate, WorkReport};
 

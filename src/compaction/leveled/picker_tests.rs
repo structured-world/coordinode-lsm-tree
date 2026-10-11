@@ -50,7 +50,11 @@ fn reference_pick(
             .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
             .collect::<Vec<&Table>>()
     };
-    let mut ranking = MergeRanking::new(overshoot, promotion_slack);
+    let mut ranking = MergeRanking::new(
+        overshoot,
+        promotion_slack,
+        Movement::LeastRewrite { slack: None },
+    );
     let windows = next_level.iter().flat_map(|run| {
         run.growing_windows().take_while(|window| {
             window.iter().map(Table::file_size).sum::<u64>() <= 50 * table_base_size
@@ -70,6 +74,7 @@ fn reference_pick(
             MergeCost {
                 promoted,
                 total: promoted + next_level_size,
+                heat: 0,
             },
             window,
         );
@@ -167,7 +172,7 @@ fn the_picker_chooses_what_pricing_every_window_anew_chooses() -> crate::Result<
                     &hidden_set,
                     overshoot,
                     base,
-                    slack,
+                    Movement::LeastRewrite { slack: Some(slack) },
                     &cmp,
                 );
                 assert_eq!(

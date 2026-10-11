@@ -2305,6 +2305,11 @@ impl Table {
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
     }
 
+    /// The point reads that consulted this table's data since it was written.
+    pub(crate) fn reads(&self) -> u64 {
+        self.read_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The bytes the file holds: what a whole read of it takes, and what
     /// writing it took.
     pub(crate) fn file_len(&self) -> u64 {
