@@ -8,6 +8,7 @@
 //! its behaviour keeps the fingerprint.
 
 use lsm_tree::compaction::{CompactionAction, Leveled};
+use lsm_tree::config::CompressionPolicy;
 use lsm_tree::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter, get_tmp_folder};
 use std::sync::Arc;
 use test_log::test;
@@ -36,11 +37,14 @@ fn fold(hash: u64, bytes: &[u8]) -> u64 {
 /// and of the tables it leaves.
 fn fingerprint(strategy: &Arc<Leveled>) -> u64 {
     let folder = get_tmp_folder();
+    // Uncompressed whatever codecs are built in: a codec's default changes
+    // the tables' sizes, so where they are cut.
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .data_block_compression_policy(CompressionPolicy::disabled())
     .open()
     .expect("open") else {
         panic!("expected a standard tree");
@@ -118,4 +122,4 @@ fn leveled_compaction_keeps_its_fingerprint() {
 }
 
 /// What the stream ends in under the leveled strategy as it was written.
-const EXPECTED: u64 = 0x425f_6314_c3c4_8510;
+const EXPECTED: u64 = 0xc328_82ea_28db_115b;

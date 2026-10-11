@@ -3804,14 +3804,13 @@ fn a_move_of_part_of_l0_does_not_leave_an_older_peer_above_it() -> crate::Result
     Ok(())
 }
 
-/// The moved tables land in a SINGLE run, and `optimize_runs` only splits
-/// overlapping tables apart when the destination already holds another run: a
-/// move into an empty level leaves them together. A run below L0 is then read
-/// as if it were disjoint, the lookup taking the first table whose range covers
-/// the key and looking no further, so a key held by the OTHER table of that run
-/// is not found at all. Such a move is not trivial.
+/// Overlapping tables moved together into an empty level stay in runs of
+/// their own, newest first, rather than one run: a run below L0 is read as
+/// disjoint, the lookup taking the first table whose range covers the key, so
+/// one run of both would lose a key held by the other table. Kept apart, the
+/// level reads as L0 does and finds every key.
 #[test]
-fn a_move_of_overlapping_tables_into_one_run_is_refused() -> crate::Result<()> {
+fn a_move_of_overlapping_tables_keeps_them_in_separate_runs() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
     let config = Config::new(&dir, seqno.clone(), SequenceNumberCounter::default());
@@ -3834,12 +3833,13 @@ fn a_move_of_overlapping_tables_into_one_run_is_refused() -> crate::Result<()> {
 
     let result = tree.compact(Arc::new(MoveTables(ids, last_level)), seqno.get())?;
 
-    // Reads alone would also pass if the move were admitted and the two tables
-    // happened to land in separate runs, so pin the refusal itself.
+    assert_eq!(crate::compaction::CompactionAction::Moved, result.action);
     assert_eq!(
-        crate::compaction::CompactionAction::Nothing,
-        result.action,
-        "a move of overlapping tables into one run must be declined",
+        2,
+        tree.current_version()
+            .level(usize::from(last_level))
+            .map_or(0, |level| level.run_count()),
+        "the two overlapping tables are kept in runs of their own",
     );
 
     for key in ["a", "m", "z"] {
