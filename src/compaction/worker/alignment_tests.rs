@@ -693,11 +693,11 @@ fn a_group_dearer_than_the_tables_it_reaches_is_copied_across_the_boundary() -> 
         cfg.data_block_compression_policy = CompressionPolicy::all(crate::CompressionType::None);
     })?;
     let mut seqno = 1;
-    // Tables of 30 keys of 10 bytes below, a few KiB each; groups of about 32
-    // keys of 1 000 bytes above, 32 KiB each, so nearly every group holds a
-    // boundary and reaches at most two of those tables past it.
-    for start in (0..3_000).step_by(30) {
-        flush_into(&tree, start..start + 30, 10, 3, &mut seqno)?;
+    // Tables of 300 keys of 4 bytes below, a few KiB each; groups of about 32
+    // keys of 1 000 bytes above, 32 KiB each, so a group holding a boundary
+    // reaches one of those tables past it, far smaller than the group.
+    for start in (0..3_000).step_by(300) {
+        flush_into(&tree, start..start + 300, 4, 3, &mut seqno)?;
     }
     flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
     let groups_in: u64 = tables(&tree, 1)

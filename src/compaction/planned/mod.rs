@@ -5,10 +5,11 @@
 //!
 //! The goal is the queries served, rather than the least write or read
 //! amplification (Wang et al., "Rethinking The Compaction Policies in
-//! LSM-trees", SIGMOD 2025). Compactions and queries draw on the same CPU and I/O, so a merge is an
-//! investment: it costs the queries that run while it does, and it pays them
-//! back in a faster read for as long as its output lasts. The strategy lays
-//! the tree out in three levels by what merging them buys:
+//! LSM-trees", SIGMOD 2025). Compactions and queries draw on the same CPU and
+//! I/O, so a merge is an investment: it costs the queries that run while it
+//! does, and it pays them back in a faster read for as long as its output
+//! lasts. The strategy lays the tree out in three levels by what merging them
+//! buys:
 //!
 //! - **top** (L0): flushed runs, never merged among themselves. Once they
 //!   hold a unit `S` of bytes they go down together as one run of the main
@@ -16,7 +17,9 @@
 //! - **main** (L1): runs of a unit or more. Between two units coming down, the
 //!   newest runs may be merged into one, as the round's plan says.
 //! - **last**: one run. Once `R` units have come down in a round, the main
-//!   level is merged into it, which ends the round.
+//!   level's runs move as they are to L2, which ends the round, and are merged
+//!   from there into the last. That merge holds neither the top nor the main
+//!   level, so the next round's units come down while it runs.
 //!
 //! The plan of a round is worked out by dynamic programming over what the
 //! merges cost and what they buy (see [`dp`]): early in the round a merge
@@ -48,6 +51,11 @@ use spin::Mutex;
 
 #[doc(hidden)]
 pub const NAME: &str = "PlannedCompaction";
+
+/// The level an ended round's runs wait in to go into the last level.
+const DRAIN: usize = 2;
+#[expect(clippy::cast_possible_truncation, reason = "a small constant level")]
+const DRAIN_LEVEL: u8 = DRAIN as u8;
 
 /// What the planner knows of the machine a tree runs on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -289,13 +297,15 @@ impl CompactionStrategy for Strategy {
         let last_bytes = version.level(last).map_or(0, Level::size);
         let unit = self.unit(last_bytes);
         let top = version.level(0).map_or(0, Level::size);
-        let main: u64 = (1..last)
+        let main = version.level(1).map_or(0, Level::size);
+        let draining: u64 = (DRAIN..last)
             .filter_map(|index| version.level(index))
             .map(Level::size)
             .sum();
-        // The top level past its unit, and the main level past its round:
-        // a level within them owes nothing, not less than nothing.
-        top.saturating_sub(unit) + main.saturating_sub(unit * u64::from(self.round()))
+        // The top level past its unit, the main level past its round, and an
+        // ended round still to go into the last: a level within its bound
+        // owes nothing, not less than nothing.
+        top.saturating_sub(unit) + main.saturating_sub(unit * u64::from(self.round())) + draining
     }
 
     fn next_merge_level(&self, version: &Version, dest_level: u8) -> Option<usize> {
@@ -308,13 +318,11 @@ impl CompactionStrategy for Strategy {
 
     fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
         let last = version.level_count() - 1;
-        if last < 2 {
+        if last <= DRAIN {
             return Choice::DoNothing;
         }
         let hidden = state.hidden_set();
-        if (0..=last).any(|index| version.level_is_busy(index, hidden)) {
-            return Choice::DoNothing;
-        }
+        let busy = |index: usize| version.level_is_busy(index, hidden);
         let (Some(top), Some(main), Some(last_level)) =
             (version.level(0), version.level(1), version.level(last))
         else {
@@ -327,29 +335,11 @@ impl CompactionStrategy for Strategy {
         #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
         let last_index = last as u8;
 
-        // The round is over: the main level, and anything left between it
-        // and the last, goes into the last.
-        let between: HashSet<TableId> = (2..last)
-            .filter_map(|index| version.level(index))
-            .flat_map(crate::version::Level::list_ids)
-            .collect();
-        if units >= u64::from(self.round()) || !between.is_empty() {
-            let mut table_ids = main.list_ids();
-            table_ids.extend(between);
-            if table_ids.is_empty() {
-                return Choice::DoNothing;
-            }
-            table_ids.extend(last_level.list_ids());
-            return Choice::Merge(CompactionInput {
-                table_ids,
-                dest_level: last_index,
-                canonical_level: last_index,
-                target_size: self.target_size,
-            });
-        }
-
-        // The top level holds a unit: it comes down as one run.
-        if !top.is_empty()
+        // The top level holds a unit: it comes down as one run. First, as the
+        // cheapest work and the one that keeps flushes from piling up.
+        if !busy(0)
+            && !busy(1)
+            && !top.is_empty()
             && (top.size() >= unit || top.table_count() >= usize::from(self.l0_file_threshold))
         {
             let choice = CompactionInput {
@@ -369,6 +359,39 @@ impl CompactionStrategy for Strategy {
             return Choice::Merge(choice);
         }
 
+        // An ended round's runs, and anything else left between the main and
+        // the last level, go into the last. The merge holds neither the top
+        // nor the main level, so units keep coming down while it runs.
+        let draining: HashSet<TableId> = (DRAIN..last)
+            .filter_map(|index| version.level(index))
+            .flat_map(crate::version::Level::list_ids)
+            .collect();
+        if draining.is_empty() {
+            // The round is over: its runs move out of the main level as they
+            // are, kept apart and in age order, so the next round starts on an
+            // empty one.
+            if units >= u64::from(self.round()) && !busy(1) && !busy(DRAIN) {
+                return Choice::Move(CompactionInput {
+                    table_ids: main.list_ids(),
+                    dest_level: DRAIN_LEVEL,
+                    canonical_level: DRAIN_LEVEL,
+                    target_size: self.target_size,
+                });
+            }
+        } else if (DRAIN..=last).all(|index| !busy(index)) {
+            let mut table_ids = draining;
+            table_ids.extend(last_level.list_ids());
+            return Choice::Merge(CompactionInput {
+                table_ids,
+                dest_level: last_index,
+                canonical_level: last_index,
+                target_size: self.target_size,
+            });
+        }
+
+        if busy(1) {
+            return Choice::DoNothing;
+        }
         // The merge the plan makes after this many units came down.
         let budget = config
             .compaction_rate_limiter
