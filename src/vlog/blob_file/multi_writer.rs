@@ -89,6 +89,9 @@ pub struct MultiWriter {
     /// Where a compaction learns of every blob file this writer creates, so
     /// it can remove the ones it never installs. `None` outside compaction.
     outputs: Option<crate::compaction::output_ledger::OutputLedger>,
+
+    /// How many of `results`, the first ones, have landed in `outputs`.
+    landed: usize,
 }
 
 impl MultiWriter {
@@ -138,6 +141,7 @@ impl MultiWriter {
             descriptor_table,
             fs,
             outputs: None,
+            landed: 0,
         })
     }
 
@@ -368,6 +372,11 @@ impl MultiWriter {
             #[cfg(zstd_any)]
             &self.zstd_dictionaries,
         )?;
+        // Before the next file takes more room.
+        if let (Some(outputs), Some(file)) = (&self.outputs, &blob_file) {
+            outputs.landed(&*self.fs, file.path())?;
+            self.landed += 1;
+        }
         self.results.extend(blob_file);
 
         Ok(())
@@ -612,6 +621,13 @@ impl MultiWriter {
                 file.mark_as_deleted();
             }
             return Err(e.into());
+        }
+        // The files the rotations finished have landed already; the rest land
+        // now. A run stopped here removes them with the rest of its outputs.
+        if let Some(outputs) = &self.outputs {
+            for file in self.results.iter().skip(self.landed) {
+                outputs.landed(&*self.fs, file.path())?;
+            }
         }
         Ok(self.results)
     }

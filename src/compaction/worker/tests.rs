@@ -2572,12 +2572,15 @@ fn narrow_merge_candidates_for_full_run_are_adjacent_pairs_sorted_ascending() ->
 }
 
 #[test]
-fn space_fits_two_layer_combines_shared_volume_outputs_and_separates_routed_ones()
--> crate::Result<()> {
+fn merge_would_fit_combines_shared_volume_outputs_and_separates_routed_ones() -> crate::Result<()> {
     use crate::fs::MemFs;
 
     const MIB: u64 = 1024 * 1024;
     let dir = tempfile::tempdir()?;
+    let pool = crate::CapacityPool::default();
+    let fits = |cfg: &Config, quota: u64, sst: u64, blob: u64| {
+        super::merge_would_fit(&pool, 0, cfg, quota, (sst, blob), 6)
+    };
 
     // Single volume (no routes): the SST tables folder and the blobs folder
     // share the primary filesystem, so the transient peak is their SUM on one
@@ -2594,27 +2597,15 @@ fn space_fits_two_layer_combines_shared_volume_outputs_and_separates_routed_ones
     // two-layer model prevents (checking sst and blob independently would
     // wrongly admit it).
     assert!(
-        !super::space_fits_two_layer(&cfg, u64::MAX, 60 * MIB, 6, 60 * MIB),
+        !fits(&cfg, u64::MAX, 60 * MIB, 60 * MIB),
         "shared-volume outputs must be summed, not checked independently"
     );
     // 60 + 30 = 90 MiB (+1 MiB reserve) ≤ 100 MiB → admitted.
-    assert!(super::space_fits_two_layer(
-        &cfg,
-        u64::MAX,
-        60 * MIB,
-        6,
-        30 * MIB
-    ));
+    assert!(fits(&cfg, u64::MAX, 60 * MIB, 30 * MIB));
 
-    // Layer 1 (logical quota) caps the total regardless of physical free:
+    // The logical quota caps the total regardless of physical free:
     // 50 + 40 = 90 MiB exceeds an 80 MiB quota headroom.
-    assert!(!super::space_fits_two_layer(
-        &cfg,
-        80 * MIB,
-        50 * MIB,
-        6,
-        40 * MIB
-    ));
+    assert!(!fits(&cfg, 80 * MIB, 50 * MIB, 40 * MIB));
 
     // Routed to a PROVEN-independent volume: level 6 lives on its own MemFs
     // (a distinct volume id), blobs on the primary MemFs. The two outputs are
@@ -2633,17 +2624,11 @@ fn space_fits_two_layer_combines_shared_volume_outputs_and_separates_routed_ones
         fs: Arc::new(MemFs::with_capacity(100 * MIB)),
     }]);
     assert!(
-        super::space_fits_two_layer(&routed, u64::MAX, 60 * MIB, 6, 60 * MIB),
+        fits(&routed, u64::MAX, 60 * MIB, 60 * MIB),
         "proven-independent volumes are checked independently"
     );
     // A blob output that overflows the primary volume alone still fails.
-    assert!(!super::space_fits_two_layer(
-        &routed,
-        u64::MAX,
-        60 * MIB,
-        6,
-        130 * MIB
-    ));
+    assert!(!fits(&routed, u64::MAX, 60 * MIB, 130 * MIB));
 
     // Routed but NOT proven independent: the route points at the SAME backend
     // as the primary (one shared MemFs → one volume id / one free-space pool),
@@ -2667,7 +2652,7 @@ fn space_fits_two_layer_combines_shared_volume_outputs_and_separates_routed_ones
         fs: Arc::clone(&shared),
     }]);
     assert!(
-        !super::space_fits_two_layer(&routed_same_mount, u64::MAX, 60 * MIB, 6, 60 * MIB),
+        !fits(&routed_same_mount, u64::MAX, 60 * MIB, 60 * MIB),
         "a route on the same volume must combine budgets, not admit each independently"
     );
 
@@ -2713,7 +2698,7 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         .flat_map(|level| level.iter())
         .find(|run| run.len() >= 3)
         .expect("a bottom-level run with >= 3 tables");
-    let run_sigma: u64 = run.iter().map(Table::file_size).sum();
+    let run_sigma: u64 = run.iter().map(Table::file_len).sum();
     let payload = Input {
         table_ids: run.iter().map(Table::id).collect(),
         dest_level: 6,
@@ -2741,10 +2726,10 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
     match super::space_gate_for_merge(&version, &opts, &payload)? {
-        super::SpaceGate::Narrowed(narrowed) => {
+        super::SpaceGate::Narrowed(narrowed, _) => {
             assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
         }
-        super::SpaceGate::Run => {
+        super::SpaceGate::Run(_) => {
             panic!("expected Narrowed, got Run (full run wrongly admitted)")
         }
         super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
@@ -2955,7 +2940,7 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
     };
     let live = restricted.live_file_size()?;
     assert!(
-        live < restricted.file_size(),
+        live < restricted.file_len(),
         "the fixture's input must carry a punched, superseded prefix",
     );
 
@@ -2978,8 +2963,8 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
     match super::space_gate_for_merge(&version, &opts, &payload)? {
-        super::SpaceGate::Run => Ok(()),
-        super::SpaceGate::Narrowed(_) => {
+        super::SpaceGate::Run(_) => Ok(()),
+        super::SpaceGate::Narrowed(..) => {
             panic!("expected Run, got Narrowed (a single-table merge cannot narrow)")
         }
         super::SpaceGate::Skip => {
@@ -3641,7 +3626,7 @@ fn tight_space_engages_when_the_local_share_covers_the_output() -> crate::Result
         .current_version()
         .iter_tables()
         .filter(|t| t.path.starts_with(dir.path().join("tables")))
-        .map(crate::table::Table::file_size)
+        .map(crate::table::Table::file_len)
         .sum();
     assert!(
         local_bytes > 0,
@@ -3661,7 +3646,7 @@ fn tight_space_engages_when_the_local_share_covers_the_output() -> crate::Result
         .current_version()
         .iter_tables()
         .filter(|t| t.path.starts_with(&hot_dir))
-        .map(crate::table::Table::file_size)
+        .map(crate::table::Table::file_len)
         .sum();
     assert!(
         remote_bytes > 0 && remote_bytes < local_bytes,

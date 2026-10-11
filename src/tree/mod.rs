@@ -723,12 +723,13 @@ impl AbstractTree for Tree {
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
             let quota_headroom = self.quota_headroom(stats.used_bytes);
-            let full_fits = crate::compaction::worker::space_fits_two_layer(
+            let full_fits = crate::compaction::worker::merge_would_fit(
+                &self.0.compaction_capacity,
+                self.0.id,
                 &self.0.config,
                 quota_headroom,
-                sst_need,
+                (sst_need, 0),
                 sst_dest_level,
-                0,
             );
             stats.status = if full_fits {
                 crate::StorageStatus::FullCompactionAvailable
@@ -4746,8 +4747,8 @@ impl Tree {
     /// The logical partition-quota headroom for the two-layer space model:
     /// `max(0, storage_limit_bytes - used)`, or `u64::MAX` when no quota is set.
     ///
-    /// This is Layer 1 (volume-agnostic) of [`crate::compaction::worker::space_fits_two_layer`];
-    /// the physical free-space probe is Layer 2. An operator quota set below the
+    /// The quota half of [`crate::compaction::worker::merge_would_fit`]; the
+    /// free space of each volume is the other. An operator quota set below the
     /// live footprint leaves zero headroom — the clamp-to-zero is the intended
     /// min-semantics, not masking.
     pub(crate) fn quota_headroom(&self, used: u64) -> u64 {
@@ -5384,6 +5385,7 @@ impl Tree {
         let sync_mode = config.sync_mode;
         // Same reason: built before the move.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
         // dropping the tree has to wake it.
@@ -5428,6 +5430,7 @@ impl Tree {
             heal_hints: Arc::clone(&heal_hints),
             filter_budget,
             compaction_rate_limiter,
+            compaction_capacity,
             write_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,

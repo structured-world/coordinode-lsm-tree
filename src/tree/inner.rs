@@ -216,6 +216,13 @@ pub struct TreeInner {
     /// the rate correct once a caller-provided clock is wired in.
     pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
+    /// The pool this tree's compactions reserve the room for their outputs
+    /// in: the one supplied through
+    /// [`Config::compaction_capacity`](crate::Config::compaction_capacity),
+    /// which other trees may hold too, or one of its own. Held here, as the
+    /// rate limiter is, so every compaction of the tree reserves in one pool.
+    pub(crate) compaction_capacity: Arc<crate::CapacityPool>,
+
     /// The budget writes paced under backpressure slowdown draw on: the
     /// limiter supplied through
     /// [`Config::write_rate_limiter`](crate::Config::write_rate_limiter), or
@@ -337,6 +344,7 @@ impl TreeInner {
         let sync_mode = config.sync_mode;
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
         // dropping the tree has to wake it.
@@ -386,6 +394,7 @@ impl TreeInner {
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             filter_budget,
             compaction_rate_limiter,
+            compaction_capacity,
             write_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(kv_digest_at_insert_gate(
                 &initial_runtime,

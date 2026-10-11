@@ -1226,12 +1226,13 @@ impl AbstractTree for BlobTree {
             // degenerate zero-level config) → the last level index.
             let sst_dest_level = self.index.config.level_count.saturating_sub(1);
             let quota_headroom = self.index.quota_headroom(stats.used_bytes);
-            let full_fits = crate::compaction::worker::space_fits_two_layer(
+            let full_fits = crate::compaction::worker::merge_would_fit(
+                &self.index.compaction_capacity,
+                self.index.id,
                 &self.index.config,
                 quota_headroom,
-                sst_need,
+                (sst_need, blob_need),
                 sst_dest_level,
-                blob_need,
             );
             stats.status = if full_fits {
                 crate::StorageStatus::FullCompactionAvailable

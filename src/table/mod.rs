@@ -2296,7 +2296,9 @@ impl Table {
         )
     )]
     pub(crate) fn live_file_size(&self) -> crate::Result<u64> {
-        let size = self.file_size();
+        // The file's length: the recorded `file_size` leaves out the sections
+        // written after the metadata, which a rewrite writes too.
+        let size = self.file_len();
         // The punch offset is a data-block offset inside this same file, so the
         // subtraction cannot underflow; falling back to the whole size keeps a
         // space gate conservative if the two ever disagreed.
