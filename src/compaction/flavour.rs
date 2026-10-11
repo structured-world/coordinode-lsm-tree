@@ -467,13 +467,24 @@ pub(super) trait CompactionFlavour {
 /// Installs one atomic version edit replacing `payload.table_ids` with the SSTs
 /// and blob files produced by all `outputs` (one for a single compaction, N for
 /// parallel sub-compactions). Globally-dead blob files are dropped once here.
-/// Returns the total number of output tables.
+/// Returns the total number of output tables, or `None` when an input left the
+/// version while the compaction ran: the outputs were written from tables the
+/// tree no longer holds (a `clear` removed them), so they are declined, and the
+/// run removes them as it removes any output it did not install.
 pub(super) fn install_merge(
     super_version: &mut SuperVersions,
     opts: &Options,
     payload: &CompactionPayload,
     outputs: Vec<ProducedOutput>,
-) -> crate::Result<usize> {
+) -> crate::Result<Option<usize>> {
+    if !holds_every_input(
+        &super_version.latest_version().version,
+        payload.table_ids.iter().copied(),
+    ) {
+        log::warn!("Compaction inputs left the version before the install, declining the outputs");
+        return Ok(None);
+    }
+
     let mut created_tables = Vec::new();
     let mut created_blob_files = Vec::new();
     let mut blob_files_to_drop = Vec::new();
@@ -579,7 +590,17 @@ pub(super) fn install_merge(
         blob_file.mark_as_deleted();
     }
 
-    Ok(tables_out)
+    Ok(Some(tables_out))
+}
+
+/// Whether `version` still holds every table of `ids`: a compaction reads its
+/// inputs, then installs what it wrote from them, and anything that removed an
+/// input in between (a `clear`) leaves outputs the tree must not take.
+pub(super) fn holds_every_input(
+    version: &Version,
+    ids: impl IntoIterator<Item = crate::TableId>,
+) -> bool {
+    ids.into_iter().all(|id| version.get_table(id).is_some())
 }
 
 /// Compaction worker that will relocate blobs that sit in blob files that are being rewritten
