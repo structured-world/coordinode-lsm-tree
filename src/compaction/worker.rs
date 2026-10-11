@@ -1934,6 +1934,17 @@ fn run_tight_space_compaction(
             // mark step below is strictly post-commit) and the punches never arm;
             // the run removes the slice's outputs as it returns.
             let mut history = opts.version_history.write();
+            // An input that left the version while the slice ran was removed
+            // with its data (a `clear`): the slice's outputs hold that data.
+            if !super::flavour::holds_every_input(
+                &history.latest_version().version,
+                current_views.iter().map(Table::id),
+            ) {
+                log::warn!(
+                    "Compaction inputs left the version before a slice's install, declining it"
+                );
+                return Ok(tables_out);
+            }
             history.upgrade_version(
                 &opts.config.path,
                 |sv| {
@@ -2148,13 +2159,13 @@ fn run_tight_space_compaction(
         )?;
         drop(version);
         let tail_out = produced.created_tables().len();
-        super::flavour::install_merge(
+        let installed = super::flavour::install_merge(
             &mut opts.version_history.write(),
             opts,
             &slice_payload,
             vec![produced],
         )?;
-        Ok(tables_out + tail_out)
+        Ok(tables_out + installed.map_or(0, |_| tail_out))
     })();
     // Held across every slice's install: the installed outputs name their
     // dictionaries from here on (see `WritePin`).
@@ -2620,6 +2631,16 @@ fn move_tables(
             "Compaction task created by {:?} contained hidden tables, declining to run it - please report this at https://github.com/fjall-rs/lsm-tree/issues/new?template=bug_report.md",
             opts.strategy.get_name(),
         );
+        return Ok(CompactionResult::nothing());
+    }
+
+    // A table that left the version since the move was planned (a `clear`
+    // removed it) has nowhere to move from.
+    if !super::flavour::holds_every_input(
+        &version_history_lock.latest_version().version,
+        payload.table_ids.iter().copied(),
+    ) {
+        log::warn!("Tables to move left the version before the install, declining the move");
         return Ok(CompactionResult::nothing());
     }
 
@@ -3171,7 +3192,9 @@ fn run_merge_on_read_relocation(
         .hidden_set_mut()
         .show(payload.table_ids.iter().copied());
 
-    let tables_out = result?;
+    let Some(tables_out) = result? else {
+        return Ok(CompactionResult::nothing());
+    };
     Ok(CompactionResult {
         action: CompactionAction::Merged,
         dest_level: Some(payload.dest_level),
@@ -3472,6 +3495,9 @@ fn merge_tables(
             drop(version_history_lock);
             drop(compaction_state);
 
+            let Some(tables_out) = tables_out else {
+                return Ok(CompactionResult::nothing());
+            };
             log::trace!("Parallel compaction done in {num_ranges} sub-ranges");
 
             return Ok(CompactionResult {
@@ -3947,6 +3973,9 @@ fn merge_tables(
     drop(version_history_lock);
     drop(compaction_state);
 
+    let Some(tables_out) = tables_out else {
+        return Ok(CompactionResult::nothing());
+    };
     log::trace!("Compaction successful");
 
     Ok(CompactionResult {
