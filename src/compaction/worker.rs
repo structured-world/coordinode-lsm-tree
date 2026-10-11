@@ -308,21 +308,6 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                 return gated_merge(compaction_state, version_history_lock, opts, &payload);
             }
 
-            // Only a real trivial move has to answer this one: the rewrites
-            // above consolidate the same inputs into one sorted output, which
-            // is the repair rather than the problem.
-            if !moved_tables_can_share_a_run(
-                &version_history_lock.latest_version_ref().version,
-                &payload,
-                opts.config.comparator.as_ref(),
-            ) {
-                log::warn!(
-                    "Compaction task created by {:?} would move overlapping tables into one run, losing the keys of all but the first - declining to run it",
-                    opts.strategy.get_name(),
-                );
-                return Ok(CompactionResult::nothing());
-            }
-
             drop(version_history_lock);
 
             move_tables(&compaction_state, opts, &payload)
@@ -995,13 +980,12 @@ fn zeroing_tombstones_from(
 ///
 /// A move rewrites nothing: it just relabels which level the tables sit on. The
 /// read path walks levels from the top and stops at the first one holding the
-/// key, taking "higher" to mean "newer", and below L0 it also takes the runs of
-/// one level to be disjoint (it breaks at the first run whose range covers the
-/// key). A move that drops tables underneath an overlapping table breaks both
-/// readings at once: the older copy above now answers the read, and a key that
-/// lives only in the moved table can be missed entirely because the covering
-/// run above it does not hold it. Neither shows up as corruption, since both
-/// tables are intact on disk.
+/// key, taking "higher" to mean "newer". A move that drops tables underneath an
+/// overlapping table breaks that reading: the older copy above now answers the
+/// read. It does not show up as corruption, since both tables are intact on
+/// disk. Within the destination itself the moved runs go ahead of the ones
+/// already there, which is correct for tables newer than them; an overlap there
+/// is still refused, as the move cannot prove the moved tables are the newer.
 ///
 /// This condition is per table rather than over the moved set as a whole, so
 /// that a move spanning a gap is not refused for an overlap that falls inside
@@ -1125,42 +1109,6 @@ fn any_overlap(
     }
 
     false
-}
-
-/// Whether the tables this task hands over can share one run, which is where a
-/// trivial move puts them: below L0 the read path takes the first table of a run
-/// whose range covers the key and looks no further, so a run holding two
-/// overlapping tables loses whatever lives only in the second.
-///
-/// Only a trivial move needs this. A cross-folder task carrying the same inputs
-/// is rewritten instead, and the rewrite reads all of them and emits one sorted
-/// output, which is exactly the repair.
-fn moved_tables_can_share_a_run(
-    version: &Version,
-    payload: &CompactionPayload,
-    comparator: &dyn crate::comparator::UserComparator,
-) -> bool {
-    use crate::version::run::Ranged as _;
-
-    let mut moved: Vec<&Table> = moved_tables(version, payload)
-        .into_iter()
-        .map(|(_, table)| table)
-        .collect();
-    sort_by_min_key(&mut moved, comparator);
-
-    // Sorted by where they start, neighbours are enough: if two tables overlap,
-    // so does every pair between them, because a table starting inside the
-    // first one's range and before the second's start lies within the first.
-    // That is what keeps a whole-level move from costing its table count
-    // squared.
-    !moved.windows(2).any(|pair| {
-        let [a, b] = pair else {
-            return false;
-        };
-        comparator
-            .compare(b.key_range().min(), a.key_range().max())
-            .is_le()
-    })
 }
 
 /// The tables this task moves, each with the level it currently sits on.
@@ -4260,3 +4208,7 @@ mod tests;
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code")]
 mod alignment_tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod move_tests;

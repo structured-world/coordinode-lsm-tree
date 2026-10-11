@@ -3776,10 +3776,10 @@ impl Tree {
     /// `level` key by key, run by run, and returns the versions found by key
     /// index and the keys left for the levels below, still sorted.
     ///
-    /// On level 0 every run is checked and the highest seqno per key kept; a
-    /// key found at the read's ceiling skips the later runs, which cannot
-    /// beat it. On a deeper level the runs do not overlap, so a covering run
-    /// answers a key for the whole level.
+    /// On level 0, and on a deeper level of several runs, every run is
+    /// checked and the highest seqno per key kept; a key found at the read's
+    /// ceiling skips the later runs, which cannot beat it. On a level of one
+    /// run, the table covering a key answers it for the whole level.
     ///
     /// # Errors
     ///
@@ -3796,7 +3796,10 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<tables_read::SerialLevel> {
-        if level_zero {
+        // A deeper level a tiered layout leaves overlapping runs in is read as
+        // L0 is: a key's covering table in one run may miss it while an older
+        // run holds it.
+        if level_zero || level.run_count() > 1 {
             // L0: must check ALL runs, keep highest seqno per key. Track keys
             // at the seqno ceiling (seqno + 1 == read_seqno): no other L0 run
             // can beat them, so skip them in subsequent runs. Both are dense
@@ -4255,8 +4258,9 @@ impl Tree {
 
     /// Generic level-walk for point reads, monomorphized over the lookup result type.
     ///
-    /// L0: check ALL runs, keep highest seqno (runs may not be newest-first).
-    /// L1+: at most one run contains the key — return on first match.
+    /// A level of several runs (always L0, and a deeper level a tiered
+    /// layout leaves overlapping runs in): check ALL runs, keep highest seqno.
+    /// A level of one run: at most one table covers the key.
     /// Once a level yields a match, lower levels cannot have newer data.
     fn find_in_tables<T: TablePointLookup>(
         version: &Version,
@@ -4266,7 +4270,7 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<T>> {
         for (level_idx, level) in version.iter_levels().enumerate() {
-            if level_idx == 0 {
+            if level_idx == 0 || level.run_count() > 1 {
                 let mut best: Option<T> = None;
 
                 for run in level.iter() {
@@ -4291,18 +4295,14 @@ impl Tree {
                 if let Some(entry) = best {
                     return Ok(entry.filter_tombstone());
                 }
-            } else {
-                // L1+ runs have non-overlapping key ranges. Once we find the
-                // covering run (get_for_key_cmp returns Some), no other run in
-                // this level can contain the key — break regardless of hit/miss.
-                for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
-                        if let Some(item) = T::lookup(table, key, seqno, key_hash)? {
-                            return Ok(item.filter_tombstone());
-                        }
-                        break;
-                    }
-                }
+            } else if let Some(table) = level
+                .iter()
+                .next()
+                .and_then(|run| run.get_for_key_cmp(key, comparator))
+                && let Some(item) = T::lookup(table, key, seqno, key_hash)?
+            {
+                // One run: the table covering the key answers for the level.
+                return Ok(item.filter_tombstone());
             }
         }
 
@@ -6569,3 +6569,7 @@ mod filter_advisor_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod clear_race_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod overlapping_runs_tests;
