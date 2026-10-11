@@ -349,7 +349,11 @@ impl AbstractTree for Tree {
         let key = Slice::from(key);
 
         for kv in super_version.active_memtable.range_internal((
-            Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+            Bound::Included(InternalKey::bound(
+                key.clone(),
+                SeqNo::MAX,
+                ValueType::Value,
+            )),
             Bound::Unbounded,
         )) {
             log::info!("[Active] {kv:?}");
@@ -357,7 +361,11 @@ impl AbstractTree for Tree {
 
         for mt in super_version.sealed_memtables.iter().rev() {
             for kv in mt.range_internal((
-                Bound::Included(InternalKey::new(key.clone(), SeqNo::MAX, ValueType::Value)),
+                Bound::Included(InternalKey::bound(
+                    key.clone(),
+                    SeqNo::MAX,
+                    ValueType::Value,
+                )),
                 Bound::Unbounded,
             )) {
                 log::info!("[Sealed #{}] {kv:?}", mt.id());
@@ -1378,20 +1386,22 @@ impl AbstractTree for Tree {
         // so the counted slice matches what a read at `seqno` would traverse.
         let mt_range = (
             match lo {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
-                }
+                Bound::Included(k) => Bound::Included(InternalKey::bound(
+                    k,
+                    SeqNo::MAX,
+                    crate::ValueType::Tombstone,
+                )),
                 Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                    Bound::Excluded(InternalKey::bound(k, 0, crate::ValueType::Tombstone))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match hi {
                 Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                    Bound::Included(InternalKey::bound(k, 0, crate::ValueType::Value))
                 }
                 Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                    Bound::Excluded(InternalKey::bound(k, SeqNo::MAX, crate::ValueType::Value))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
@@ -1597,20 +1607,22 @@ impl AbstractTree for Tree {
         // both the matched rows and the total (matching the SST accounting).
         let mt_range = (
             match lo {
-                Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Tombstone))
-                }
+                Bound::Included(k) => Bound::Included(InternalKey::bound(
+                    k,
+                    SeqNo::MAX,
+                    crate::ValueType::Tombstone,
+                )),
                 Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, 0, crate::ValueType::Tombstone))
+                    Bound::Excluded(InternalKey::bound(k, 0, crate::ValueType::Tombstone))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },
             match hi {
                 Bound::Included(k) => {
-                    Bound::Included(InternalKey::new(k, 0, crate::ValueType::Value))
+                    Bound::Included(InternalKey::bound(k, 0, crate::ValueType::Value))
                 }
                 Bound::Excluded(k) => {
-                    Bound::Excluded(InternalKey::new(k, SeqNo::MAX, crate::ValueType::Value))
+                    Bound::Excluded(InternalKey::bound(k, SeqNo::MAX, crate::ValueType::Value))
                 }
                 Bound::Unbounded => Bound::Unbounded,
             },

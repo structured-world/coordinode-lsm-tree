@@ -286,12 +286,12 @@ impl TreeIter {
             // Arc bumps, not byte copies — see the bound construction note in
             // `create_range` / `user_to_internal_bounds`.
             let range = (
-                Bound::Included(InternalKey::new(
+                Bound::Included(InternalKey::bound(
                     key_slice.clone(),
                     SeqNo::MAX,
                     crate::ValueType::Tombstone,
                 )),
-                Bound::Included(InternalKey::new(key_slice, 0, crate::ValueType::Value)),
+                Bound::Included(InternalKey::bound(key_slice, 0, crate::ValueType::Value)),
             );
 
             let mut iters: Vec<BoxedIterator<'_>> = Vec::new();
@@ -521,12 +521,12 @@ impl TreeIter {
             let range = (
                 match &user_range.0 {
                     // NOTE: See memtable.rs for range explanation
-                    Bound::Included(key) => Bound::Included(InternalKey::new(
+                    Bound::Included(key) => Bound::Included(InternalKey::bound(
                         key.clone(),
                         SeqNo::MAX,
                         crate::ValueType::Tombstone,
                     )),
-                    Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+                    Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
                         key.clone(),
                         0,
                         crate::ValueType::Tombstone,
@@ -549,9 +549,9 @@ impl TreeIter {
                     // abcdef -> 5
                     //
                     Bound::Included(key) => {
-                        Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
+                        Bound::Included(InternalKey::bound(key.clone(), 0, crate::ValueType::Value))
                     }
-                    Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+                    Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
                         key.clone(),
                         SeqNo::MAX,
                         crate::ValueType::Value,
@@ -901,17 +901,17 @@ type UserBounds = (Bound<UserKey>, Bound<UserKey>);
 /// there for the seqno-direction reasoning at each end).
 fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<InternalKey>) {
     // Clone the `UserKey` (a reference-counted `Slice`: an `Arc` bump, no heap
-    // copy) and hand it to `InternalKey::new` by value — `UserKey: Into<UserKey>`
-    // is the identity, so the key bytes are reused. Passing `key.as_ref()`
-    // (`&[u8]`) instead would force a fresh heap copy of the bytes on every
-    // reposition, which the in-place seek loop must avoid.
+    // copy) and hand it to `InternalKey::bound` by value — `UserKey:
+    // Into<UserKey>` is the identity, so the key bytes are reused. Passing
+    // `key.as_ref()` (`&[u8]`) instead would force a fresh heap copy of the
+    // bytes on every reposition, which the in-place seek loop must avoid.
     let lo = match &user.0 {
-        Bound::Included(key) => Bound::Included(InternalKey::new(
+        Bound::Included(key) => Bound::Included(InternalKey::bound(
             key.clone(),
             SeqNo::MAX,
             crate::ValueType::Tombstone,
         )),
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
             key.clone(),
             0,
             crate::ValueType::Tombstone,
@@ -920,9 +920,9 @@ fn user_to_internal_bounds(user: &UserBounds) -> (Bound<InternalKey>, Bound<Inte
     };
     let hi = match &user.1 {
         Bound::Included(key) => {
-            Bound::Included(InternalKey::new(key.clone(), 0, crate::ValueType::Value))
+            Bound::Included(InternalKey::bound(key.clone(), 0, crate::ValueType::Value))
         }
-        Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+        Bound::Excluded(key) => Bound::Excluded(InternalKey::bound(
             key.clone(),
             SeqNo::MAX,
             crate::ValueType::Value,
