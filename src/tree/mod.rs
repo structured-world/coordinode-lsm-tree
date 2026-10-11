@@ -6319,3 +6319,7 @@ mod live_compression_tests;
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]
 mod partition_size_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod clear_race_tests;
