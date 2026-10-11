@@ -375,6 +375,50 @@ fn scan_carrying_from_an_included_bound_starts_at_its_group() -> crate::Result<(
     Ok(())
 }
 
+/// A table wholly past a range's upper bound opens no scan: a sub-compaction
+/// of an earlier range holds none of its keys, and a scan opened for it would
+/// hold a file and its first chunk for the whole sub-compaction.
+#[test]
+fn scan_carrying_past_the_upper_bound_opens_nothing() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let AnyTree::Standard(tree) = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("expected standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    for i in 0..100u32 {
+        tree.insert(format!("k{i:06}"), vec![b'v'; 64], 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let Some(table) = tree.current_version().iter_tables().next().cloned() else {
+        panic!("one table");
+    };
+
+    for hi in [Bound::Included("a"), Bound::Excluded("k000000")] {
+        let scan = table.scan_carrying(
+            bounds(Bound::Unbounded, hi),
+            crate::table::group_carry::CarryQueue::default(),
+            None,
+        )?;
+        assert!(scan.is_none(), "{hi:?} lies below every key");
+    }
+    let at_first = table.scan_carrying(
+        bounds(Bound::Unbounded, Bound::Included("k000000")),
+        crate::table::group_carry::CarryQueue::default(),
+        None,
+    )?;
+    assert!(
+        at_first.is_some(),
+        "the range ends on the table's first key"
+    );
+    Ok(())
+}
+
 /// A damaged group fails a scan that records its groups as it fails any
 /// scan: the rows before it come out, then the error, and nothing after it,
 /// so no group past the damage is handed out or recorded.

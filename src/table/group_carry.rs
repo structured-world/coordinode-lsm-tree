@@ -255,6 +255,19 @@ impl Table {
     ) -> crate::Result<Option<super::Scanner>> {
         use super::block_index::BlockIndexIter;
 
+        // A table wholly past the upper bound holds none of the range's keys.
+        // The walk would still find its first group, which ends past the
+        // bound, and open a scan that holds a file and its first chunk for as
+        // long as the compaction reading the range runs.
+        let min = self.key_range().min();
+        let past = match &bounds.hi {
+            Bound::Included(hi) => bounds.comparator.compare(min, hi) == Ordering::Greater,
+            Bound::Excluded(hi) => bounds.comparator.compare(min, hi) != Ordering::Less,
+            Bound::Unbounded => false,
+        };
+        if past {
+            return Ok(None);
+        }
         let mut groups = Vec::new();
         let walk = self.maintenance_index_walk();
         let mut walk = match pace {
