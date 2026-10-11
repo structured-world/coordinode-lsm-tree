@@ -5,7 +5,6 @@
 use alloc::sync::Arc;
 
 use super::{Block, DataBlock};
-use crate::io::BufReader;
 use crate::path::Path;
 use crate::{
     CompressionType, InternalValue, SeqNo,
@@ -15,13 +14,163 @@ use crate::{
     table::{block::BlockType, iter::OwnedDataBlockIter, util::TimedFile},
 };
 
+/// What a read through the stream returns in this build.
+#[cfg(feature = "std")]
+type IoResult<T> = std::io::Result<T>;
+#[cfg(not(feature = "std"))]
+type IoResult<T> = crate::io::Result<T>;
+
+/// 2 MiB matches the `compaction_readahead_size` default of `RocksDB`: one read
+/// from the file per ~500 typical (4 KiB) data blocks. A chunk is never
+/// larger than what is left of the file, so a small table reads only itself.
+const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
+
 /// The data section read as a stream of blocks, with the offset the next one
 /// starts at: every block is verified at the place it was read from, so a
 /// block of the right shape written at another block's place is refused
 /// rather than streamed out of order.
+///
+/// The file is read a chunk at a time straight into a buffer nothing zeroes,
+/// and a block's payload is handed out as a view of its chunk, not copied out
+/// of it. A view keeps its whole chunk alive, which a scan's consumers, all of
+/// them streaming, hold only until they move on; a block reaching past its
+/// chunk starts the next one, which takes over the bytes not yet handed out.
 struct BlockStream {
-    reader: BufReader<TimedFile>,
+    file: TimedFile,
+    /// The bytes read from the file: those from `at` on are not handed out yet.
+    chunk: crate::Slice,
+    at: usize,
+    /// The bytes of the file not read into a chunk yet.
+    unread: u64,
+    /// The length a chunk is read at, unless less of the file is left or a
+    /// block needs more.
+    readahead: usize,
     position: u64,
+}
+
+impl BlockStream {
+    /// A stream over `file`, positioned `start` bytes into its `len`.
+    fn new(file: TimedFile, start: u64, len: u64, readahead: usize) -> Self {
+        Self {
+            file,
+            chunk: crate::Slice::empty(),
+            at: 0,
+            // A start past the end leaves nothing to read: the first block
+            // read then fails as a truncated file.
+            unread: len.saturating_sub(start),
+            readahead,
+            position: start,
+        }
+    }
+
+    /// The bytes read and not handed out yet.
+    fn pending(&self) -> &[u8] {
+        self.chunk.get(self.at..).unwrap_or_default()
+    }
+
+    /// Reads the next chunk, at least `need` bytes long, the bytes not handed
+    /// out yet at its front. One shorter than `need` is a truncated file.
+    fn refill(&mut self, need: usize) -> IoResult<()> {
+        let pending = self.chunk.get(self.at..).unwrap_or_default();
+        // Bounded by the file's length, a u64.
+        let left = self.unread + pending.len() as u64;
+        let len = usize::try_from(left)
+            .map_or(self.readahead, |left| left.min(self.readahead))
+            .max(need);
+        // `need` exceeds what is pending, so the chunk reads past it.
+        let read = len - pending.len();
+        let chunk = crate::Slice::from_reader(
+            &mut PendingThenFile {
+                pending,
+                file: &mut self.file,
+            },
+            len,
+        )?;
+        self.unread = self.unread.saturating_sub(read as u64);
+        self.chunk = chunk;
+        self.at = 0;
+        Ok(())
+    }
+
+    /// The next `len` bytes, as a view of the chunk holding them.
+    fn view(&mut self, len: usize) -> IoResult<crate::Slice> {
+        if self.pending().len() < len {
+            self.refill(len)?;
+        }
+        let end = self.at + len;
+        let view = self.chunk.slice(self.at..end);
+        self.at = end;
+        Ok(view)
+    }
+
+    fn read_pending(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if self.pending().is_empty() {
+            if self.unread == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            self.refill(1)?;
+        }
+        let pending = self.pending();
+        let n = pending.len().min(buf.len());
+        let (out, _) = buf.split_at_mut(n);
+        let (bytes, _) = pending.split_at(n);
+        out.copy_from_slice(bytes);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for BlockStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_pending(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl crate::io::Read for BlockStream {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        self.read_pending(buf)
+    }
+}
+
+/// The bytes a chunk takes over from the last one, then the file.
+struct PendingThenFile<'a> {
+    pending: &'a [u8],
+    file: &'a mut TimedFile,
+}
+
+impl PendingThenFile<'_> {
+    fn read_next(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        #[cfg(not(feature = "std"))]
+        use crate::io::Read;
+        #[cfg(feature = "std")]
+        use std::io::Read;
+
+        if self.pending.is_empty() {
+            return self.file.read(buf);
+        }
+        let n = self.pending.len().min(buf.len());
+        let (out, _) = buf.split_at_mut(n);
+        let (bytes, rest) = self.pending.split_at(n);
+        out.copy_from_slice(bytes);
+        self.pending = rest;
+        Ok(n)
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::io::Read for PendingThenFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_next(buf)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+impl crate::io::Read for PendingThenFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
+        self.read_next(buf)
+    }
 }
 
 /// Table reader that is optimized for consuming an entire table
@@ -110,18 +259,8 @@ impl Scanner {
         groups: alloc::vec::Vec<super::BlockHandle>,
         pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
-        // 2 MiB buffer matches RocksDB's `compaction_readahead_size`
-        // default and is large enough that the kernel can fold the
-        // sequential-scan readahead heuristic into a single big
-        // userspace fill per ~500 typical (4 KiB) data blocks instead
-        // of one syscall every 8 blocks. Picked to dominate any
-        // pre-#133-Phase1c micro-cost: the loss is at most a few MB
-        // of allocator overhead per concurrent compaction, and
-        // compaction concurrency is bounded by the scheduler. HDD-
-        // tuning beyond this would benefit from a configurable knob,
-        // tracked as the configurable-readahead follow-up under #133.
-        const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
         let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        let len = file.metadata()?.len;
         // The scanner walks every block in order — tell the kernel so
         // it can ramp readahead aggressively and evict already-read
         // pages instead of pinning them. Best-effort: hint() is
@@ -143,10 +282,7 @@ impl Scanner {
         if let Some(pace) = pace {
             timed.set_pace(pace);
         }
-        let mut reader = BlockStream {
-            reader: BufReader::with_capacity(SCANNER_READAHEAD_BYTES, timed),
-            position: start_offset,
-        };
+        let mut reader = BlockStream::new(timed, start_offset, len, SCANNER_READAHEAD_BYTES);
         let mut groups = groups.into_iter();
         let current_group = groups.next();
 
@@ -334,8 +470,8 @@ impl Scanner {
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Block> {
         let at = crate::table::block::ChecksumAt::table(table_id, stream.position);
-        let block = Block::from_reader(
-            &mut stream.reader,
+        let block = Block::from_reader_taking(
+            stream,
             crate::table::block::BlockIdentity {
                 table_id,
                 block_type,
@@ -361,6 +497,10 @@ impl Scanner {
                 }
             },
             at,
+            // The scanner feeds compaction, which is maintenance and outside
+            // the read counters.
+            &mut 0,
+            |stream, len| Ok(stream.view(len)?),
         )?;
         // The block consumed its header, payload and parity trailer; an SST
         // block's trailer is sized by the table's scheme, not its header.
@@ -535,6 +675,10 @@ impl Scanner {
         Err(crate::Error::FeatureUnsupported("columnar"))
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::indexing_slicing, reason = "test code")]
+mod tests;
 
 impl Iterator for Scanner {
     type Item = crate::Result<InternalValue>;
