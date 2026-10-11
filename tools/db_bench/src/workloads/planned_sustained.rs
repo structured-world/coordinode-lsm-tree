@@ -57,9 +57,9 @@ const SCAN_LENGTH: usize = 100;
 const WRITE_RATE: u64 = 8 << 20;
 
 /// Bytes per second each tree's compactions may write: the same budget for
-/// both, twice the write rate, less than leveled calls for at depth, so debt
-/// can build up while the tree is written to.
-const COMPACTION_RATE: u64 = 2 * WRITE_RATE;
+/// both, enough for either to keep up with the writes, so what tells them
+/// apart is what their compactions take from the reads meanwhile.
+const COMPACTION_RATE: u64 = 8 * WRITE_RATE;
 
 /// Compactions each tree may run at once.
 const COMPACTION_THREADS: usize = 2;
@@ -307,12 +307,18 @@ fn key_space(config: &BenchConfig) -> u64 {
     (config.num / 2).max(1)
 }
 
-/// The planner, told the scans' length and the tables' size.
+/// The planner, told the scans' length, the tables' size and the rates it
+/// runs at.
 fn planned() -> Arc<dyn CompactionStrategy> {
     Arc::new(
         Planned::default()
             .with_scan_length(SCAN_LENGTH as u32)
-            .with_table_target_size(TABLE_TARGET),
+            .with_table_target_size(TABLE_TARGET)
+            .with_model(lsm_tree::compaction::planned::Model {
+                write_rate: WRITE_RATE,
+                encode_rate: COMPACTION_RATE,
+                ..lsm_tree::compaction::planned::Model::default()
+            }),
     )
 }
 
