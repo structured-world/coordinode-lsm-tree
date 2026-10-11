@@ -41,12 +41,26 @@ fn cheap_merges_under_scans_are_planned_early() {
     assert!(first < 8, "the first merge comes early: {merges:?}");
 }
 
-/// A merge that takes longer than the arrivals it would serve costs more
-/// queries than it frees, and is not planned.
+/// When scans are rare a run costs a query little, and a merge costs more
+/// queries than it frees: none is planned.
 #[test]
 fn merges_dearer_than_their_benefit_are_not_planned() {
-    let plan = Plan::solve(&inputs(0.5, 1_000.0));
+    let plan = Plan::solve(&inputs(0.001, 5.0));
     assert!(merges(&plan).iter().all(|&units| units == 1), "{plan:?}");
+}
+
+/// The global merge ending the round takes longer the more it merges, and
+/// the queries running meanwhile are faster over fewer runs: even dear
+/// merges pay once, just before the round ends, when scans are common.
+#[test]
+fn a_dear_merge_pays_before_a_long_global_merge() {
+    let plan = Plan::solve(&inputs(0.5, 1_000.0));
+    let merges = merges(&plan);
+    assert!(
+        merges.iter().take(14).all(|&units| units == 1),
+        "{merges:?}"
+    );
+    assert!(merges.iter().any(|&units| units > 1), "{merges:?}");
 }
 
 /// The same inputs give the same plan, solved apart.

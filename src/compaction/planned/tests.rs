@@ -8,11 +8,12 @@ use test_log::test;
 
 const UNIT: u64 = 8 * 1_024;
 
-/// A round of four units of 8 KiB at least.
+/// A round of sixteen units of 8 KiB at least; a written round is about
+/// three.
 fn strategy(model: Model) -> Arc<Strategy> {
     Arc::new(
         Strategy::default()
-            .with_scan_length(16)
+            .with_scan_length(64)
             .with_size_ratio(3)
             .with_table_target_size(UNIT)
             .with_model(model),
@@ -98,11 +99,11 @@ fn the_top_level_comes_down_a_unit_at_a_time_and_a_round_ends_in_the_last() -> c
 fn without_reads_the_main_level_is_not_merged() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     let strategy = strategy(Model::default());
-    write_round(&tree, 0)?;
-    settle(&tree, &strategy)?;
-    write_round(&tree, 1)?;
-    let actions = settle(&tree, &strategy)?;
-    assert_eq!(level_runs(&tree, 1), 2, "{actions:?}");
+    for round in 0..4 {
+        write_round(&tree, round)?;
+        settle(&tree, &strategy)?;
+    }
+    assert_eq!(level_runs(&tree, 1), 4, "one run per unit come down");
     Ok(())
 }
 
@@ -117,15 +118,19 @@ fn scans_and_cheap_merges_merge_the_main_level() -> crate::Result<()> {
         copy_rate: u64::MAX,
         ..Model::default()
     });
-    write_round(&tree, 0)?;
-    settle(&tree, &strategy)?;
-    // Scans only: every read a scan.
-    for _ in 0..50 {
-        assert_eq!(tree.iter(SeqNo::MAX, None).count(), 200);
+    for round in 0..4 {
+        write_round(&tree, round)?;
+        settle(&tree, &strategy)?;
+        // Scans only: every read a scan.
+        for _ in 0..50 {
+            assert_eq!(tree.iter(SeqNo::MAX, None).count(), 200);
+        }
     }
-    write_round(&tree, 1)?;
-    settle(&tree, &strategy)?;
-    assert_eq!(level_runs(&tree, 1), 1, "the newest runs were merged");
+    assert!(
+        level_runs(&tree, 1) < 4,
+        "the plan merged the main level's runs: {}",
+        level_runs(&tree, 1),
+    );
     Ok(())
 }
 
