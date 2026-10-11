@@ -72,7 +72,9 @@ pub struct Model {
     pub write_rate: u64,
     /// Bytes per second a merge in the main level encodes. The tree's
     /// compaction rate limit caps it, when one is set: what a merge may use
-    /// is what the shared budget leaves it.
+    /// is what the shared budget leaves it. Over [`Self::write_rate`] it also
+    /// bounds the size ratio a round can afford: a round costs the ratio plus
+    /// two units of compaction per unit written.
     pub encode_rate: u64,
     /// Bytes per second a merge copies what it does not encode.
     pub copy_rate: u64,
@@ -161,7 +163,9 @@ impl Strategy {
     }
 
     /// Sets the last level's size over the main level's at the end of a
-    /// round (default 3, at most [`dp::MAX_SIZE_RATIO`]).
+    /// round (default 3, at most [`dp::MAX_SIZE_RATIO`]). A model whose
+    /// compaction rate cannot pay for it gets a smaller one (see
+    /// [`Model::encode_rate`]).
     #[must_use]
     pub fn with_size_ratio(mut self, ratio: u32) -> Self {
         self.size_ratio = ratio.clamp(1, dp::MAX_SIZE_RATIO);
@@ -205,9 +209,25 @@ impl Strategy {
         self.round
     }
 
+    /// The last level's size over the main level's at the end of a round, as
+    /// far as the model's compaction rate pays for it.
+    ///
+    /// A round writes each unit down once and rewrites it into the last level
+    /// with `C` more, `C + 2` units of compaction per unit written: a rate
+    /// below that falls behind every round, and what it cannot do piles up in
+    /// L0. The ratio shrinks to what the rate pays, down to 1, never past the
+    /// one set.
+    fn size_ratio(&self) -> u32 {
+        let paid = self.model.encode_rate / self.model.write_rate.max(1);
+        // Below two units per unit written no ratio is paid for; the floor of
+        // one is the cheapest round there is.
+        let paid = u32::try_from(paid.saturating_sub(2)).unwrap_or(u32::MAX);
+        paid.clamp(1, self.size_ratio)
+    }
+
     /// The unit of a tree whose last level holds `last_bytes`.
     fn unit(&self, last_bytes: u64) -> u64 {
-        (last_bytes / u64::from(self.size_ratio * self.round())).max(self.target_size)
+        (last_bytes / u64::from(self.size_ratio() * self.round())).max(self.target_size)
     }
 
     /// The plan for `inputs`, solved once for the same inputs.
@@ -274,7 +294,7 @@ impl Strategy {
         let copied = model.copied_share.clamp(0.0, 1.0);
         dp::Inputs {
             round: self.round(),
-            size_ratio: self.size_ratio,
+            size_ratio: self.size_ratio(),
             arrival_secs: unit / write_rate,
             merge_secs: unit * (1.0 - copied) / encode_rate + unit * copied / copy_rate,
             merge_query_share: model.merge_query_share.clamp(0.0, 1.0),
