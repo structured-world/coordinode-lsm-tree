@@ -259,7 +259,7 @@ impl Table {
         // The walk would still find its first group, which ends past the
         // bound, and open a scan that holds a file and its first chunk for as
         // long as the compaction reading the range runs.
-        let min = self.key_range().min();
+        let min = self.metadata.key_range.min();
         let past = match &bounds.hi {
             Bound::Included(hi) => bounds.comparator.compare(min, hi) == Ordering::Greater,
             Bound::Excluded(hi) => bounds.comparator.compare(min, hi) != Ordering::Less,
