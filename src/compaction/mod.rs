@@ -20,6 +20,7 @@ pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod output_ledger;
 pub(crate) mod ownership;
+pub mod planned;
 pub(crate) mod pulldown;
 pub(crate) mod seqno_zeroer;
 pub(crate) mod state;
@@ -33,6 +34,7 @@ pub use filter::{CompactionFilter, Factory, ItemAccessor, Verdict};
 pub use heal::Strategy as EccHeal;
 pub use leveled::Strategy as Leveled;
 pub use leveled::{Granularity, Layout, LevelPolicy, Movement, Trigger};
+pub use planned::Strategy as Planned;
 pub use tiered::Strategy as SizeTiered;
 pub use work::{Work, WorkEstimate, WorkReport};
 

@@ -116,6 +116,13 @@ pub struct Inner {
     /// (delta over elapsed time). Reset to `0` only when the segment is created.
     pub(crate) read_count: AtomicU64,
 
+    /// Cumulative range scans that opened a reader over this segment, bumped
+    /// (`Relaxed`) once per scan as it reaches the segment. Beside
+    /// [`Self::read_count`] it tells how a segment is read: by point reads,
+    /// whose cost a filter keeps to one run, or by scans, which read every
+    /// run they cross. Reset to `0` only when the segment is created.
+    pub(crate) scan_count: AtomicU64,
+
     /// Unix seconds of the most recent data-consulting read (same gating as
     /// [`Self::read_count`]), or `0` if never read. Maintained only on `std`
     /// builds (system clock); a no-std build leaves it at `0`. The recency

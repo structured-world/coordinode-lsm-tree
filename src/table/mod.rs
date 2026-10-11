@@ -2305,9 +2305,22 @@ impl Table {
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
     }
 
-    /// The point reads that consulted this table's data since it was written.
+    /// The reads that consulted this table's data since it was written:
+    /// point reads that passed its filter, and range scans that reached it.
     pub(crate) fn reads(&self) -> u64 {
-        self.read_count.load(core::sync::atomic::Ordering::Relaxed)
+        self.read_count.load(core::sync::atomic::Ordering::Relaxed) + self.scans()
+    }
+
+    /// The range scans that reached this table since it was written.
+    pub(crate) fn scans(&self) -> u64 {
+        self.scan_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records a range scan reaching this table: one `Relaxed` bump per scan
+    /// and table, beside the scan's own reads of the table.
+    pub(crate) fn note_scan(&self) {
+        self.scan_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// The bytes the file holds: what a whole read of it takes, and what
@@ -9547,6 +9560,7 @@ impl Table {
 
                 blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
+                scan_count: AtomicU64::new(0),
                 last_access_secs: AtomicU64::new(0),
                 probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,

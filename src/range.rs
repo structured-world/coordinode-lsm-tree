@@ -624,12 +624,21 @@ impl TreeIter {
                 // reaching two or more holds keys of every one but perhaps the
                 // first, which is read on its own to count a pass that finds
                 // nothing; the others' passes are no false positives.
+                // A scan reaches every table it reads; a point read merging
+                // operands goes through here too, and counts as a point read.
+                let scanning = lock.key_hash.is_none();
                 let (first, answer) = surviving.remove(0);
+                if scanning {
+                    first.note_scan();
+                }
                 iters.push(table_reader(answer, first, user_range.clone(), seqno));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
+                            if scanning {
+                                table.note_scan();
+                            }
                             iters.push(table_reader(answer, table, user_range.clone(), seqno));
                         }
                     }
@@ -1014,6 +1023,7 @@ struct TableLeaf {
 
 impl TableLeaf {
     fn new(table: crate::table::Table, user_range: UserBounds, seqno: SeqNo) -> Self {
+        table.note_scan();
         let iter = table.range_iter(user_range);
         Self { table, iter, seqno }
     }
