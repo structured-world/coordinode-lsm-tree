@@ -78,10 +78,19 @@ impl OutputLedger {
         self.0.room.lock().clone()
     }
 
-    /// Adds `demand`, already found to fit, to the run's room.
-    pub fn reserve_more(&self, demand: &super::capacity::Demand<'_>) {
-        if let Some(room) = self.room() {
-            room.add(demand);
+    /// Adds `demand` to the run's room when it fits under `check`, checked and
+    /// taken in one step; a run holding no room only checks it against `pool`
+    /// for `tree`.
+    pub fn try_reserve_more(
+        &self,
+        pool: &super::capacity::CapacityPool,
+        tree: crate::tree::inner::TreeId,
+        demand: &super::capacity::Demand<'_>,
+        check: super::capacity::Check,
+    ) -> bool {
+        match self.room() {
+            Some(room) => room.try_add(demand, check),
+            None => pool.would_fit(tree, core::slice::from_ref(demand), check),
         }
     }
 

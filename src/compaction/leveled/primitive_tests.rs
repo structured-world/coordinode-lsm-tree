@@ -87,6 +87,69 @@ fn a_tiered_l1_accumulates_runs_then_goes_down_whole() -> crate::Result<()> {
     Ok(())
 }
 
+/// Merges exactly the L0 tables into a level, as a run of their own beside
+/// what the level holds.
+struct MergeL0(u8);
+
+impl CompactionStrategy for MergeL0 {
+    fn get_name(&self) -> &'static str {
+        "MergeL0Test"
+    }
+
+    fn choose(&self, version: &Version, _: &Config, _: &CompactionState) -> Choice {
+        Choice::Merge(CompactionInput {
+            table_ids: version.l0().list_ids(),
+            dest_level: self.0,
+            canonical_level: self.0,
+            target_size: u64::MAX,
+        })
+    }
+}
+
+/// A deeper level compacted whole, set to go through a full level below,
+/// takes that level on down with it in one merge, as L0 does into a full
+/// L1, instead of rewriting it now and again when it is chosen.
+#[test]
+fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let shape = |granularity| LevelPolicy {
+        trigger: Trigger::Shape {
+            runs: 1,
+            tables: u16::MAX,
+        },
+        layout: Layout::Leveled,
+        granularity,
+        movement: Movement::LeastRewrite { slack: None },
+    };
+    let strategy = Strategy::default()
+        .with_level_policy(
+            1,
+            shape(Granularity::Level {
+                through_full_next: true,
+            }),
+        )
+        .with_level_policy(2, shape(Granularity::Window));
+    // L2 two runs (past its one), L1 three (further past): L1 is chosen.
+    for (round, level) in [(0, 2), (1, 2), (2, 1), (3, 1), (4, 1)] {
+        write_round(&tree, round)?;
+        tree.compact(Arc::new(MergeL0(level)), 0)?;
+    }
+    let version = tree.current_version();
+    assert_eq!(version.level(1).expect("L1").run_count(), 3);
+    assert_eq!(version.level(2).expect("L2").run_count(), 2);
+
+    let Choice::Merge(input) =
+        strategy.choose(&version, tree.tree_config(), &CompactionState::default())
+    else {
+        panic!("a merge is chosen");
+    };
+    assert_eq!(input.dest_level, 3, "through L2 into L3");
+    let mut expected = version.level(1).expect("L1").list_ids();
+    expected.extend(version.level(2).expect("L2").list_ids());
+    assert_eq!(input.table_ids, expected, "every table of L1 and L2");
+    Ok(())
+}
+
 /// A level set never to trigger starts no compaction however far past its
 /// target it grows.
 #[test]

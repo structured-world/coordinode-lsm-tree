@@ -133,24 +133,37 @@ fn fits(bytes: u64, room: u64, floor: Floor) -> bool {
 
 /// The bytes `demands` put into each pool, with the free space of the pool
 /// when `probe` asks for it (`u64::MAX` otherwise), and their total.
+///
+/// Called with the account locked: a probe read before it could predate an
+/// output that landed and gave its room back in between, and count that room
+/// free on the volume and free in the account both.
 fn gather(demands: &[Demand<'_>], probe: bool) -> (Vec<(Pool, u64, u64)>, u64) {
-    // Read before the account is locked, so the lock covers arithmetic only.
-    let mut volumes: Vec<(Pool, u64, u64)> = Vec::new();
-    let mut total = 0u64;
-    for demand in demands {
-        let pool = Pool::of(demand.fs, demand.path);
-        // Bounded by the bytes the volumes hold.
-        total += demand.bytes;
-        if let Some(slot) = volumes.iter_mut().find(|(p, _, _)| *p == pool) {
-            slot.1 += demand.bytes;
-            continue;
-        }
+    tally(demands.iter().map(|demand| {
         let free = if probe {
             demand.fs.available_space(demand.path).unwrap_or(u64::MAX)
         } else {
             u64::MAX
         };
-        volumes.push((pool, demand.bytes, free));
+        (Pool::of(demand.fs, demand.path), demand.bytes, free)
+    }))
+}
+
+/// Sums `(pool, bytes, free)` per pool, keeping the least free space any of
+/// its folders reported: folders with no volume id share the unproven pool
+/// though they may lie on volumes apart, and each must hold what they take
+/// together.
+fn tally(probes: impl Iterator<Item = (Pool, u64, u64)>) -> (Vec<(Pool, u64, u64)>, u64) {
+    let mut volumes: Vec<(Pool, u64, u64)> = Vec::new();
+    let mut total = 0u64;
+    for (pool, bytes, free) in probes {
+        // Bounded by the bytes the volumes hold.
+        total += bytes;
+        if let Some(slot) = volumes.iter_mut().find(|(p, _, _)| *p == pool) {
+            slot.1 += bytes;
+            slot.2 = slot.2.min(free);
+            continue;
+        }
+        volumes.push((pool, bytes, free));
     }
     (volumes, total)
 }
@@ -166,6 +179,20 @@ fn admits(
     total: u64,
     check: Check,
 ) -> bool {
+    volumes_fit(held, volumes, check.floor)
+        && total
+            <= check
+                .quota_headroom
+                .saturating_sub(held_against(held, Pool::Quota(tree)))
+}
+
+/// Whether each pool's room past what reservations sharing it hold takes what
+/// `volumes` write into every pool sharing it.
+fn volumes_fit(
+    held: &crate::HashMap<Pool, u64>,
+    volumes: &[(Pool, u64, u64)],
+    floor: Floor,
+) -> bool {
     volumes.iter().all(|&(pool, _, free)| {
         let own: u64 = volumes
             .iter()
@@ -174,15 +201,8 @@ fn admits(
             .sum();
         // Room past what is reserved is all there is: none, not an error,
         // once the reservations take it all.
-        fits(
-            own,
-            free.saturating_sub(held_against(held, pool)),
-            check.floor,
-        )
-    }) && total
-        <= check
-            .quota_headroom
-            .saturating_sub(held_against(held, Pool::Quota(tree)))
+        fits(own, free.saturating_sub(held_against(held, pool)), floor)
+    })
 }
 
 impl CapacityPool {
@@ -190,12 +210,14 @@ impl CapacityPool {
     /// sharing its volume have still to write; `u64::MAX` when the backend
     /// reports none.
     pub(crate) fn available(&self, fs: &dyn Fs, path: &Path) -> u64 {
+        // Probed with the account locked, as `gather` probes.
+        let held = self.held.lock();
         let Ok(free) = fs.available_space(path) else {
             return u64::MAX;
         };
         // Free space past what is reserved is all there is to give: none,
         // not an error, once the reservations take it all.
-        free.saturating_sub(held_against(&self.held.lock(), Pool::of(fs, path)))
+        free.saturating_sub(held_against(&held, Pool::of(fs, path)))
     }
 
     /// What the compactions of `tree` in progress hold of its quota.
@@ -210,8 +232,9 @@ impl CapacityPool {
     /// Whether `demands` of a compaction of `tree` would fit beside what the
     /// pool holds, as [`Self::reserve`] checks them, reserving nothing.
     pub(crate) fn would_fit(&self, tree: TreeId, demands: &[Demand<'_>], check: Check) -> bool {
+        let held = self.held.lock();
         let (volumes, total) = gather(demands, true);
-        admits(&self.held.lock(), tree, &volumes, total, check)
+        admits(&held, tree, &volumes, total, check)
     }
 
     /// Reserves `demands` for a compaction of `tree`, or `None` when `check`
@@ -223,14 +246,15 @@ impl CapacityPool {
         demands: &[Demand<'_>],
         check: Option<Check>,
     ) -> Option<Reservation> {
-        let (volumes, total) = gather(demands, check.is_some());
         let quota = Pool::Quota(tree);
         let mut held = self.held.lock();
+        let (volumes, total) = gather(demands, check.is_some());
         if let Some(check) = check
             && !admits(&held, tree, &volumes, total, check)
         {
             return None;
         }
+        let others = held_against(&held, quota);
         for &(pool, bytes, _) in &volumes {
             *held.entry(pool).or_default() += bytes;
         }
@@ -239,6 +263,7 @@ impl CapacityPool {
         Some(Reservation {
             pool: Arc::clone(self),
             check,
+            others_at_start: others,
             grants: Mutex::new(Grants {
                 volumes: volumes
                     .into_iter()
@@ -296,19 +321,33 @@ struct Grants {
 pub struct Reservation {
     pool: Arc<CapacityPool>,
     check: Option<Check>,
+    /// What the other compactions of its tree held of the quota when it was
+    /// made. Its quota headroom was measured then, before what they hold was
+    /// installed: once installed, their bytes count in the tree's footprint
+    /// though they no longer hold them here.
+    others_at_start: u64,
     grants: Mutex<Grants>,
     refused: AtomicBool,
 }
 
 impl Reservation {
-    /// Takes `demand` on as well, without checking it: the caller found it to
-    /// fit beside what the pool holds.
-    pub(crate) fn add(&self, demand: &Demand<'_>) {
+    /// Takes `demand` on as well when it fits beside what the pool holds, as
+    /// [`CapacityPool::reserve`] checks a reservation, in one step with the
+    /// check: no other compaction can take the room in between.
+    pub(crate) fn try_add(&self, demand: &Demand<'_>, check: Check) -> bool {
         if demand.bytes == 0 {
-            return;
+            return true;
+        }
+        let mut grants = self.grants.lock();
+        let mut held = self.pool.held.lock();
+        let (volumes, total) = gather(core::slice::from_ref(demand), true);
+        let (quota, granted) = grants.quota;
+        if !volumes_fit(&held, &volumes, check.floor)
+            || granted + total > self.quota_room(&held, grants.quota, check.quota_headroom)
+        {
+            return false;
         }
         let pool = Pool::of(demand.fs, demand.path);
-        let mut grants = self.grants.lock();
         if let Some(grant) = grants.volumes.iter_mut().find(|grant| grant.pool == pool) {
             grant.granted += demand.bytes;
         } else {
@@ -319,11 +358,32 @@ impl Reservation {
             });
         }
         grants.quota.1 += demand.bytes;
-        let quota = grants.quota.0;
         drop(grants);
-        let mut held = self.pool.held.lock();
         *held.entry(pool).or_default() += demand.bytes;
         *held.entry(quota).or_default() += demand.bytes;
+        drop(held);
+        true
+    }
+
+    /// What the tree's quota leaves this reservation, its own `granted`
+    /// bytes included, against `headroom` measured when it was made or
+    /// since.
+    ///
+    /// The others' holds then are counted as taken, whether they still hold
+    /// them or have installed them into the footprint the headroom predates,
+    /// and so are the others' holds now, which include compactions started
+    /// since. A hold present at both times is counted twice: the room is
+    /// never more than the quota leaves, and sometimes less.
+    fn quota_room(
+        &self,
+        held: &crate::HashMap<Pool, u64>,
+        (quota, granted): (Pool, u64),
+        headroom: u64,
+    ) -> u64 {
+        // Its own grant is among what its quota holds.
+        let others_now = held_against(held, quota) - granted;
+        // A quota the others fill leaves none: no room, not an error.
+        headroom.saturating_sub(self.others_at_start + others_now)
     }
 
     /// A file of `len` bytes was written into the folder `path` of `fs`.
@@ -368,17 +428,15 @@ impl Reservation {
         let Some(check) = self.check else {
             return Ok(());
         };
-        let free = fs.available_space(path).unwrap_or(u64::MAX);
         let mut grants = self.grants.lock();
         let (quota, granted) = grants.quota;
         let mut held = self.pool.held.lock();
+        // Probed with the account locked, as `gather` probes.
+        let free = fs.available_space(path).unwrap_or(u64::MAX);
         // The excess lies on the volume already: what is asked is whether the
         // volume keeps the floor beside it and what the others still write.
         let room = free.saturating_sub(held_against(&held, pool));
-        // This reservation's own grant is among what its quota holds.
-        let quota_room = check
-            .quota_headroom
-            .saturating_sub(held_against(&held, quota) - granted);
+        let quota_room = self.quota_room(&held, grants.quota, check.quota_headroom);
         if fits(0, room, Floor::Keep) && granted + excess <= quota_room {
             *held.entry(quota).or_default() += excess;
             grants.quota.1 += excess;

@@ -176,13 +176,58 @@ fn the_size_ratio_is_what_the_compaction_rate_pays_for() {
                 encode_rate,
                 ..Model::default()
             })
-            .size_ratio()
+            .size_ratio(0)
     };
     assert_eq!(ratio(10), 1, "one unit per unit written pays for no round");
     assert_eq!(ratio(20), 1, "twice the write rate: the cheapest round");
     assert_eq!(ratio(40), 2, "four times: a ratio of two");
     assert_eq!(ratio(50), 3, "five times: the ratio set");
     assert_eq!(ratio(1_000), 3, "never past the ratio set");
+}
+
+/// The tree's compaction budget caps the model's rate: a model that could
+/// pay for the ratio set gets the ratio its tree's budget pays for.
+#[test]
+fn the_size_ratio_is_what_the_trees_compaction_budget_pays_for() {
+    let strategy = Strategy::default().with_size_ratio(3).with_model(Model {
+        write_rate: 10,
+        encode_rate: 1_000,
+        ..Model::default()
+    });
+    assert_eq!(strategy.size_ratio(0), 3, "no budget: the model's rate");
+    assert_eq!(strategy.size_ratio(20), 1, "twice the write rate");
+    assert_eq!(strategy.size_ratio(40), 2, "four times the write rate");
+}
+
+/// Runs the L0 table count sends down before they hold a unit count for the
+/// bytes they hold: a round of them, each far below a unit, does not end the
+/// round and send the last level into a merge.
+#[test]
+fn small_runs_sent_down_by_the_table_count_do_not_end_a_round() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let strategy = Arc::new(
+        Strategy::default()
+            .with_round(4)
+            .with_size_ratio(3)
+            // A unit far past what a flush writes.
+            .with_table_target_size(1 << 30)
+            .with_l0_file_threshold(1),
+    );
+    for round in 0..6 {
+        write_round(&tree, round)?;
+        settle(&tree, &strategy)?;
+    }
+    let version = tree.current_version();
+    assert!(
+        version.level(DRAIN).is_none_or(|level| level.is_empty()),
+        "nothing went to the drain level"
+    );
+    let last = version.level_count() - 1;
+    assert!(
+        version.level(last).is_none_or(|level| level.is_empty()),
+        "nothing went into the last level"
+    );
+    Ok(())
 }
 
 /// The same version, model and reads choose the same, on two strategies.

@@ -233,16 +233,22 @@ impl ArmRun {
         Ok(())
     }
 
-    /// Stops the compaction threads, then drains what the stream left without
-    /// a limit, so both trees end at one their strategy has nothing more to do
-    /// for and their compaction bytes compare.
-    fn finish(mut self, seqno: u64) -> lsm_tree::Result<Arm> {
+    /// Stops the compaction threads and waits for them.
+    fn stop_workers(&mut self) -> lsm_tree::Result<()> {
         self.background.stop.store(true, Ordering::Relaxed);
         for worker in self.workers.drain(..) {
             worker
                 .join()
                 .map_err(|_| lsm_tree::Error::Unrecoverable)??;
         }
+        Ok(())
+    }
+
+    /// Drains what the stream left without a limit, once every tree's
+    /// compaction threads are stopped, so both trees end at one their strategy
+    /// has nothing more to do for and their compaction bytes compare.
+    fn finish(mut self, seqno: u64) -> lsm_tree::Result<Arm> {
+        self.stop_workers()?;
         self.tree.compaction_rate_limiter().set_rate(0);
         let draining = Instant::now();
         loop {
@@ -391,6 +397,11 @@ fn run_arms(
     // byte counted as written reaches the tables and is measured as the rest.
     if pending > 0 {
         step(&mut arms, seqno)?;
+    }
+    // Both trees' threads stop before either drains: a drain runs with no
+    // compaction of the other tree beside it, whichever drains first.
+    for arm in &mut arms {
+        arm.stop_workers()?;
     }
     let [planned, leveled] = arms;
     Ok((planned.finish(seqno)?, leveled.finish(seqno)?))

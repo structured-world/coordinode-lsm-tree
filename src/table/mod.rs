@@ -2308,7 +2308,12 @@ impl Table {
     /// The reads that consulted this table's data since it was written:
     /// point reads that passed its filter, and range scans that reached it.
     pub(crate) fn reads(&self) -> u64 {
-        self.read_count.load(core::sync::atomic::Ordering::Relaxed) + self.scans()
+        self.point_reads() + self.scans()
+    }
+
+    /// The point reads that passed this table's filter since it was written.
+    pub(crate) fn point_reads(&self) -> u64 {
+        self.read_count.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// The range scans that reached this table since it was written.

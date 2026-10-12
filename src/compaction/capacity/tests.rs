@@ -199,19 +199,75 @@ fn an_unchecked_reservation_is_counted_by_a_checked_one() -> crate::Result<()> {
     Ok(())
 }
 
-/// Taking more on after admission holds it for the others to see.
+/// Taking more on after admission is checked and held in one step, for the
+/// others to see, and refused whole when it does not fit.
 #[test]
-fn added_room_is_held_until_the_reservation_goes() {
+fn room_taken_on_later_is_checked_and_held_until_the_reservation_goes() {
     let fs = MemFs::with_capacity(100 * MIB);
     let volume = Pool::Volume(fs.volume_id(Path::new("/t")).expect("id"));
     let pool = Arc::new(CapacityPool::default());
     let room = pool
         .reserve(1, &[demand(&fs, "/t", 10 * MIB)], Some(check(u64::MAX)))
         .expect("fits");
-    room.add(&demand(&fs, "/blobs", 20 * MIB));
-    assert_eq!(pool.held(volume), 30 * MIB);
+    let _other = pool
+        .reserve(2, &[demand(&fs, "/u", 60 * MIB)], Some(check(u64::MAX)))
+        .expect("fits");
+
+    assert!(
+        !room.try_add(&demand(&fs, "/blobs", 40 * MIB), check(u64::MAX)),
+        "40 MiB do not fit beside the 70 the two hold of 100",
+    );
+    assert_eq!(pool.held(volume), 70 * MIB, "a refusal takes nothing");
+
+    assert!(room.try_add(&demand(&fs, "/blobs", 20 * MIB), check(u64::MAX)));
+    assert_eq!(pool.held(volume), 90 * MIB);
     assert_eq!(pool.quota_held(1), 30 * MIB);
     drop(room);
-    assert_eq!(pool.held(volume), 0);
+    assert_eq!(pool.held(volume), 60 * MIB);
     assert_eq!(pool.quota_held(1), 0);
+}
+
+/// Folders with no volume id share the unproven pool though they may lie on
+/// volumes apart: each must hold what they take together, so the least free
+/// space any of them reports is the pool's.
+#[test]
+fn an_unproven_pool_takes_the_least_free_space_of_its_folders() {
+    let (volumes, total) = tally(
+        [
+            (Pool::Unproven, 10, 100 * MIB),
+            (Pool::Unproven, 20, 5 * MIB),
+            (Pool::Volume(1), 30, 50 * MIB),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(total, 60);
+    assert_eq!(
+        volumes,
+        [
+            (Pool::Unproven, 30, 5 * MIB),
+            (Pool::Volume(1), 30, 50 * MIB)
+        ]
+    );
+}
+
+/// A compaction of the same tree installed while another runs puts its bytes
+/// into the footprint the other's quota headroom predates: the other may not
+/// count them free when its outputs outgrow its grant.
+#[test]
+fn quota_growth_counts_what_an_installed_compaction_held() {
+    let fs = MemFs::with_capacity(u64::MAX);
+    let pool = Arc::new(CapacityPool::default());
+    let first = pool
+        .reserve(1, &[demand(&fs, "/t", 50 * MIB)], Some(check(100 * MIB)))
+        .expect("50 of a 100 MiB quota");
+    let second = pool
+        .reserve(1, &[demand(&fs, "/t", 30 * MIB)], Some(check(100 * MIB)))
+        .expect("80 of a 100 MiB quota");
+    // Installed: its 50 MiB are in the footprint now, held no longer.
+    drop(first);
+
+    let err = second
+        .landed(&fs, Path::new("/t"), 60 * MIB)
+        .expect_err("50 installed and 60 written are past the 100 MiB quota");
+    assert!(matches!(err, crate::Error::StorageFull { .. }), "{err:?}");
 }

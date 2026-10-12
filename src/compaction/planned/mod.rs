@@ -42,6 +42,7 @@ use crate::version::Version;
 use crate::{HashSet, TableId};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use portable_atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "std")]
 use parking_lot::Mutex;
@@ -129,6 +130,9 @@ pub struct Strategy {
     model: Model,
     /// The share of reads that are scans, when set rather than counted.
     scan_share: Option<f64>,
+    /// The compaction budget the last choice saw, for the debt reported
+    /// between choices.
+    budget_seen: AtomicU64,
     /// The plan last worked out, with what it was worked out from.
     plan: Mutex<Option<(dp::Inputs, Arc<dp::Plan>)>>,
 }
@@ -142,6 +146,7 @@ impl Default for Strategy {
             l0_file_threshold: super::leveled::DEFAULT_L0_FILE_THRESHOLD,
             model: Model::default(),
             scan_share: None,
+            budget_seen: AtomicU64::new(0),
             plan: Mutex::new(None),
         }
     }
@@ -216,18 +221,20 @@ impl Strategy {
     /// with `C` more, `C + 2` units of compaction per unit written: a rate
     /// below that falls behind every round, and what it cannot do piles up in
     /// L0. The ratio shrinks to what the rate pays, down to 1, never past the
-    /// one set.
-    fn size_ratio(&self) -> u32 {
-        let paid = self.model.encode_rate / self.model.write_rate.max(1);
+    /// one set. The rate is the model's, capped by `budget`, the bytes per
+    /// second the tree's compactions may use (`0` for no limit).
+    fn size_ratio(&self, budget: u64) -> u32 {
+        let paid = encode_rate(self.model.encode_rate, budget) / self.model.write_rate.max(1);
         // Below two units per unit written no ratio is paid for; the floor of
         // one is the cheapest round there is.
         let paid = u32::try_from(paid.saturating_sub(2)).unwrap_or(u32::MAX);
         paid.clamp(1, self.size_ratio)
     }
 
-    /// The unit of a tree whose last level holds `last_bytes`.
-    fn unit(&self, last_bytes: u64) -> u64 {
-        (last_bytes / u64::from(self.size_ratio() * self.round())).max(self.target_size)
+    /// The unit of a tree whose last level holds `last_bytes`, compacting
+    /// within `budget`.
+    fn unit(&self, last_bytes: u64, budget: u64) -> u64 {
+        (last_bytes / u64::from(self.size_ratio(budget) * self.round())).max(self.target_size)
     }
 
     /// The plan for `inputs`, solved once for the same inputs.
@@ -247,10 +254,12 @@ impl Strategy {
     /// per second the tree's compactions may use, `0` for no limit.
     fn inputs(&self, version: &Version, unit: u64, budget: u64) -> dp::Inputs {
         let scan_share = self.scan_share.unwrap_or_else(|| {
+            // Each counter read once: a scan between two reads of one would
+            // count it in one and not the other.
             let (mut points, mut scans) = (0u64, 0u64);
             for table in version.iter_tables() {
                 scans += table.scans();
-                points += table.reads() - table.scans();
+                points += table.point_reads();
             }
             // A point read is counted by the one table holding its key, a scan
             // by a table of every run it reaches, which is every run of the
@@ -276,11 +285,7 @@ impl Strategy {
             }
         });
         let model = self.model;
-        let encode_rate = match budget {
-            0 => model.encode_rate,
-            budget => model.encode_rate.min(budget),
-        }
-        .max(1);
+        let encode_rate = encode_rate(model.encode_rate, budget).max(1);
         #[expect(
             clippy::cast_precision_loss,
             reason = "seconds of a unit, approximate by nature"
@@ -294,7 +299,7 @@ impl Strategy {
         let copied = model.copied_share.clamp(0.0, 1.0);
         dp::Inputs {
             round: self.round(),
-            size_ratio: self.size_ratio(),
+            size_ratio: self.size_ratio(budget),
             arrival_secs: unit / write_rate,
             merge_secs: unit * (1.0 - copied) / encode_rate + unit * copied / copy_rate,
             merge_query_share: model.merge_query_share.clamp(0.0, 1.0),
@@ -304,15 +309,29 @@ impl Strategy {
     }
 }
 
-/// The runs of the main level newest first, each with its units.
-fn main_runs(main: &crate::version::Level, unit: u64) -> Vec<(Vec<TableId>, u64)> {
+/// The bytes a merge may encode per second: the model's rate, capped by the
+/// tree's compaction `budget` when it has one (`0` for none).
+fn encode_rate(model_rate: u64, budget: u64) -> u64 {
+    match budget {
+        0 => model_rate,
+        budget => model_rate.min(budget),
+    }
+}
+
+/// The tree's compaction budget in bytes per second, `0` for no limit.
+fn budget(config: &Config) -> u64 {
+    config
+        .compaction_rate_limiter
+        .as_ref()
+        .map_or(config.compaction_rate_limit, |limiter| limiter.rate())
+}
+
+/// The runs of the main level newest first, each with its bytes.
+fn main_runs(main: &crate::version::Level) -> Vec<(Vec<TableId>, u64)> {
     main.iter()
         .map(|run| {
             let bytes: u64 = run.iter().map(Table::file_size).sum();
-            // A run is at least a unit: the top level comes down a unit at a
-            // time, and a merge of runs is the sum of theirs.
-            let units = bytes.div_ceil(unit).max(1);
-            (run.iter().map(Table::id).collect(), units)
+            (run.iter().map(Table::id).collect(), bytes)
         })
         .collect()
 }
@@ -327,7 +346,8 @@ impl CompactionStrategy for Strategy {
 
         let last = version.level_count() - 1;
         let last_bytes = version.level(last).map_or(0, Level::size);
-        let unit = self.unit(last_bytes);
+        // The budget the last choice saw: the version alone does not say it.
+        let unit = self.unit(last_bytes, self.budget_seen.load(Ordering::Relaxed));
         let top = version.level(0).map_or(0, Level::size);
         let main = version.level(1).map_or(0, Level::size);
         let draining: u64 = (DRAIN..last)
@@ -360,10 +380,13 @@ impl CompactionStrategy for Strategy {
         else {
             return Choice::DoNothing;
         };
-        let unit = self.unit(last_level.size());
-        let runs = main_runs(main, unit);
-        // Bounded by the bytes the levels hold.
-        let units: u64 = runs.iter().map(|(_, units)| units).sum();
+        let budget = budget(config);
+        self.budget_seen.store(budget, Ordering::Relaxed);
+        let unit = self.unit(last_level.size(), budget);
+        let runs = main_runs(main);
+        // The units come down so far, counted by bytes: runs the L0 table
+        // count sent down before they held a unit count for what they hold.
+        let units = runs.iter().map(|(_, bytes)| bytes).sum::<u64>() / unit;
         #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
         let last_index = last as u8;
 
@@ -425,21 +448,19 @@ impl CompactionStrategy for Strategy {
             return Choice::DoNothing;
         }
         // The merge the plan makes after this many units came down.
-        let budget = config
-            .compaction_rate_limiter
-            .as_ref()
-            .map_or(config.compaction_rate_limit, |limiter| limiter.rate());
         let plan = self.plan(self.inputs(version, unit, budget));
         let wanted = u64::from(plan.merge_after(u32::try_from(units).unwrap_or(u32::MAX)));
         if wanted > 1 {
+            // At most a round of units, each at most the last level's bytes.
+            let wanted_bytes = wanted * unit;
             let mut table_ids = HashSet::default();
-            let (mut merged_units, mut merged_runs) = (0u64, 0usize);
-            for (ids, run_units) in &runs {
-                if merged_units >= wanted {
+            let (mut merged_bytes, mut merged_runs) = (0u64, 0usize);
+            for (ids, run_bytes) in &runs {
+                if merged_bytes >= wanted_bytes {
                     break;
                 }
                 table_ids.extend(ids.iter().copied());
-                merged_units += run_units;
+                merged_bytes += run_bytes;
                 merged_runs += 1;
             }
             if merged_runs > 1 {

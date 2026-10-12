@@ -2813,18 +2813,9 @@ fn pick_blob_files_for_merge(
     let mut files = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
     let mut for_locality = false;
     if let Some(locality) = blob_opts.locality_relocation {
-        let (extra, extra_bytes) =
-            pick_blob_files_for_locality(opts, version, payload, tables, locality, &files)?;
+        let extra = pick_blob_files_for_locality(opts, version, payload, tables, locality, &files)?;
         for_locality = !extra.is_empty();
         files.extend(extra);
-        // Taken into the merge's room, so the compactions sharing the pool
-        // count what it adds.
-        let blob_dir = opts.config.path.join(BLOBS_FOLDER);
-        opts.outputs.reserve_more(&super::capacity::Demand {
-            fs: &*opts.config.fs,
-            path: &blob_dir,
-            bytes: extra_bytes,
-        });
     }
     Ok(BlobRewrite {
         files,
@@ -2879,9 +2870,10 @@ fn moves_into_locality_relocation(
         return Ok(false);
     };
     let stale = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    // No room is reserved before the move is decided, so the pick only
+    // checks the pool here.
     Ok(
         !pick_blob_files_for_locality(opts, version, payload, &tables, locality, &stale)?
-            .0
             .is_empty(),
     )
 }
@@ -2895,7 +2887,7 @@ fn moves_into_locality_relocation(
 /// on-disk byte while reading and writing them fits the budget. Only whole
 /// files that no table outside the merge references are eligible, and
 /// nothing is picked when the output would not leave the reserved free space
-/// intact.
+/// intact. What is picked is taken into the run's room, when it holds one.
 fn pick_blob_files_for_locality(
     opts: &Options,
     version: &Version,
@@ -2903,7 +2895,7 @@ fn pick_blob_files_for_locality(
     tables: &[Table],
     locality: crate::config::BlobLocalityRelocation,
     stale: &[BlobFile],
-) -> crate::Result<(Vec<BlobFile>, u64)> {
+) -> crate::Result<Vec<BlobFile>> {
     let max_depth = locality.max_depth.get();
 
     // Cheapest first: a merge whose inputs stay within the limit, the
@@ -2924,7 +2916,7 @@ fn pick_blob_files_for_locality(
         candidates.push((blob_file.clone(), depth, blob_file.physical_size()?));
     }
     if candidates.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     }
 
     // A file another table still points into cannot move: its references
@@ -3002,7 +2994,7 @@ fn pick_blob_files_for_locality(
         picked.len(),
     );
     if picked.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     }
 
     // The merge's own tables and stale files are in the room it reserved, so
@@ -3022,24 +3014,26 @@ fn pick_blob_files_for_locality(
         path: &blob_dir,
         bytes: picked_bytes,
     };
-    // Optional work: it takes only room the flush floor leaves.
+    // Optional work: it takes only room the flush floor leaves. Checked and
+    // taken into the merge's room in one step, so no other compaction sharing
+    // the pool takes the room in between.
     let check = super::capacity::Check {
         quota_headroom,
         floor: super::capacity::Floor::Keep,
     };
     if !opts
-        .capacity
-        .would_fit(opts.tree_id, core::slice::from_ref(&extra), check)
+        .outputs
+        .try_reserve_more(&opts.capacity, opts.tree_id, &extra, check)
     {
         log::debug!("Skipping locality relocation: the output would eat into the reserve");
-        return Ok((Vec::new(), 0));
+        return Ok(Vec::new());
     }
 
     log::debug!(
         "Relocating blob files for locality: {:?}",
         picked.iter().map(BlobFile::id).collect::<Vec<_>>(),
     );
-    Ok((picked, picked_bytes))
+    Ok(picked)
 }
 
 fn hidden_guard<T>(

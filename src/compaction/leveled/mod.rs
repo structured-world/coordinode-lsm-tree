@@ -1450,6 +1450,48 @@ impl CompactionStrategy for Strategy {
                 {
                     return Choice::DoNothing;
                 }
+                // The level below already past its target goes on down with
+                // this one in the same merge, as L0 does into a full L1,
+                // rather than being rewritten here and again when it is
+                // chosen.
+                if policy.granularity
+                    == (Granularity::Level {
+                        through_full_next: true,
+                    })
+                    && !next_tiered
+                    && scores
+                        .get(next_level_idx)
+                        .is_some_and(|(score, _)| *score > 1.0)
+                    && let Some(below) = version.level(next_level_idx + 1)
+                    && !version.level_is_busy(next_level_idx + 1, state.hidden_set())
+                {
+                    let mut ids = level.list_ids();
+                    ids.extend(next_level.list_ids());
+                    let mut ranges: Vec<_> = level
+                        .iter()
+                        .chain(next_level.iter())
+                        .flat_map(|run| run.iter())
+                        .map(|table| table.key_range().clone())
+                        .collect();
+                    ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
+                    for interval in &crate::KeyRange::merge_sorted_cmp(ranges, cmp) {
+                        for run in below.iter() {
+                            ids.extend(
+                                run.get_overlapping_cmp(interval, cmp).iter().map(Table::id),
+                            );
+                        }
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "level index is bounded by level count (7, technically 255)"
+                    )]
+                    return Choice::Merge(CompactionInput {
+                        table_ids: ids,
+                        dest_level: (next_level_idx + 1) as u8,
+                        canonical_level: canonical_level + 1,
+                        target_size: self.target_size,
+                    });
+                }
                 let key_range = level.aggregate_key_range_cmp(cmp);
                 let overlapping: Vec<TableId> = next_level
                     .iter()
