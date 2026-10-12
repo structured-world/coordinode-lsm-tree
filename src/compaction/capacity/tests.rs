@@ -21,6 +21,31 @@ fn demand<'a>(fs: &'a MemFs, path: &'a str, bytes: u64) -> Demand<'a> {
     }
 }
 
+/// A folder a compaction writes nothing to takes no part in the check: a full
+/// volume holding only such a folder does not refuse what fits elsewhere.
+#[test]
+fn a_folder_written_nothing_does_not_refuse_a_reservation() {
+    let roomy = MemFs::with_capacity(100 * MIB);
+    let full = MemFs::with_capacity(0);
+    let pool = Arc::new(CapacityPool::default());
+    let keep = Check {
+        quota_headroom: u64::MAX,
+        floor: Floor::Keep,
+    };
+    assert!(
+        pool.reserve(
+            1,
+            &[
+                demand(&roomy, "/tables", 10 * MIB),
+                demand(&full, "/blobs", 0)
+            ],
+            Some(keep),
+        )
+        .is_some(),
+        "the tables fit their volume; the blob folder takes nothing",
+    );
+}
+
 /// Two compactions on one volume cannot both take the same free bytes: the
 /// second is checked against what the first holds, and the room the first
 /// gives back as it goes is the second's again.

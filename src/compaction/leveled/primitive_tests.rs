@@ -268,6 +268,118 @@ fn a_window_into_a_tiered_level_takes_a_window() -> crate::Result<()> {
     Ok(())
 }
 
+/// A window into a tiered level, set to move the hottest data, takes the
+/// table reads touch, not the first one.
+#[test]
+fn a_hottest_window_into_a_tiered_level_takes_the_read_table() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    for from in [0, 1_000, 2_000] {
+        write_keys(&tree, from)?;
+        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    }
+    for _ in 0..3 {
+        for i in 2_000..2_100u64 {
+            tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+        }
+    }
+    let version = tree.current_version();
+    let hot = version
+        .level(1)
+        .expect("L1")
+        .iter()
+        .flat_map(|run| run.iter())
+        .find(|table| table.key_range().min().as_ref() == b"k2000")
+        .expect("the table of k2000..")
+        .id();
+    let strategy = Strategy::default()
+        .with_level_policy(
+            1,
+            LevelPolicy {
+                trigger: Trigger::Shape {
+                    runs: u8::MAX,
+                    tables: 1,
+                },
+                layout: Layout::Leveled,
+                granularity: Granularity::Window,
+                movement: Movement::Hottest,
+            },
+        )
+        .with_level_policy(
+            2,
+            LevelPolicy {
+                trigger: Trigger::Never,
+                layout: Layout::Tiered,
+                granularity: Granularity::Level {
+                    through_full_next: false,
+                },
+                movement: Movement::LeastRewrite { slack: None },
+            },
+        );
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let Choice::Move(input) = choice else {
+        panic!("a move of a window: {choice:?}");
+    };
+    assert_eq!(input.table_ids, core::iter::once(hot).collect());
+    Ok(())
+}
+
+/// Writes keys `from..to` at `round` and flushes them into one table.
+fn write_span(tree: &crate::AnyTree, (from, to): (u64, u64), round: u64) -> crate::Result<()> {
+    for i in from..to {
+        tree.insert(format!("k{i:04}"), format!("v{round}"), round * 1_000 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    Ok(())
+}
+
+/// A window taken out of a level of several runs takes every table of them
+/// that shares a key with it: a newer narrow table goes down only with the
+/// older wide one under it, else reads would stop on the older version left
+/// above.
+#[test]
+fn a_window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_span(&tree, (0, 50), 0)?;
+    write_span(&tree, (50, 100), 0)?;
+    tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    write_span(&tree, (0, 100), 1)?;
+    write_span(&tree, (10, 20), 2)?;
+    let version = tree.current_version();
+    let l0 = version.level(0).expect("L0");
+    assert_eq!(l0.run_count(), 2);
+    let id_of = |min: &[u8], max: &[u8]| {
+        l0.iter()
+            .flat_map(|run| run.iter())
+            .find(|t| t.key_range().min().as_ref() == min && t.key_range().max().as_ref() == max)
+            .expect("the table")
+            .id()
+    };
+    let (wide, narrow) = (id_of(b"k0000", b"k0099"), id_of(b"k0010", b"k0019"));
+    let narrow_size = l0
+        .iter()
+        .flat_map(|run| run.iter())
+        .find(|t| t.id() == narrow)
+        .expect("narrow")
+        .file_size();
+
+    // The bound admits only the narrow table promoted on its own.
+    let (ids, _) = pick_minimal_compaction(
+        l0,
+        version.level(1).expect("L1"),
+        &HiddenSet::default(),
+        0,
+        u64::MAX / 64,
+        Movement::LeastRewrite {
+            slack: Some(narrow_size),
+        },
+        &crate::comparator::DefaultUserComparator,
+    )
+    .expect("a merge");
+    assert!(ids.contains(&narrow), "the narrow window is the cheapest");
+    assert!(ids.contains(&wide), "the older wide version goes along");
+    Ok(())
+}
+
 /// A level set never to trigger starts no compaction however far past its
 /// target it grows.
 #[test]

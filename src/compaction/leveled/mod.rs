@@ -258,25 +258,92 @@ fn pick_minimal_compaction(
         .and_then(|run| run.get(start..end))
         .expect("the chosen window lies in its run");
     let key_range = aggregate_run_key_range(window);
+    let contained: HashSet<_> = curr_level
+        .iter()
+        .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
+        .map(Table::id)
+        .collect();
+    let pulled_in = contained.len();
+    let curr_ids = with_overlapping_runs(curr_level, contained, hidden_set, cmp)?;
     let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    ids.extend(
-        curr_level
-            .iter()
-            .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
-            .map(Table::id),
-    );
+    // What the other runs added may reach past the window: what it overlaps
+    // below goes into the merge too, so the level below stays one run.
+    if curr_ids.len() > pulled_in {
+        for table in curr_level.iter().flat_map(|run| run.iter()) {
+            if !curr_ids.contains(&table.id()) {
+                continue;
+            }
+            for below in next_level
+                .iter()
+                .flat_map(|run| run.get_overlapping_cmp(table.key_range(), cmp))
+            {
+                if ids.insert(below.id()) && hidden_set.is_hidden(below.id()) {
+                    return None;
+                }
+            }
+        }
+    }
+    ids.extend(curr_ids);
     Some((ids, false))
 }
 
+/// `ids`, tables of `level`, with every table of its runs that shares a key
+/// with them, taken in until none is left out; `None` when one is hidden.
+///
+/// The runs of a level hold versions of one key in more than one of them,
+/// and a read stops at the first level that holds the key: a merge that
+/// took the newer version down and left the older above would have reads
+/// return the older.
+fn with_overlapping_runs(
+    level: &Level,
+    mut ids: HashSet<TableId>,
+    hidden_set: &HiddenSet,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Option<HashSet<TableId>> {
+    // The tables of one run share no key.
+    if level.run_count() <= 1 {
+        return Some(ids);
+    }
+    loop {
+        let mut ranges: Vec<_> = level
+            .iter()
+            .flat_map(|run| run.iter())
+            .filter(|table| ids.contains(&table.id()))
+            .map(|table| table.key_range().clone())
+            .collect();
+        ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
+        let mut grew = false;
+        for interval in crate::KeyRange::merge_sorted_cmp(ranges, cmp) {
+            for table in level
+                .iter()
+                .flat_map(|run| run.get_overlapping_cmp(&interval, cmp))
+            {
+                if ids.insert(table.id()) {
+                    if hidden_set.is_hidden(table.id()) {
+                        return None;
+                    }
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return Some(ids);
+        }
+    }
+}
+
 /// The longest window of one run of `curr_level` that overlaps no table of
-/// `next_level` and holds no hidden table, the leftmost of that length and from
-/// the first run that has one: a move that rewrites nothing.
+/// `next_level`, shares no key with the other runs of `curr_level` and holds no
+/// hidden table, the leftmost of that length and from the first run that has
+/// one: a move that rewrites nothing.
 ///
 /// A window's key range is its tables' ranges and the gaps between them, so it
 /// overlaps the level below exactly when one of its tables does or one of its
 /// gaps does. The windows that qualify are therefore the stretches of
 /// neighbouring tables that each qualify with clear gaps between them, and
-/// the longest such stretch is found in one pass.
+/// the longest such stretch is found in one pass. A key of a table the other
+/// runs hold as well stays where it is: a read stops at the first level that
+/// holds it, and the version left above may be the older one.
 fn largest_trivial_move(
     curr_level: &Level,
     next_level: &Level,
@@ -285,21 +352,28 @@ fn largest_trivial_move(
 ) -> Option<HashSet<TableId>> {
     use core::ops::Bound;
 
-    let clear = |bounds: (Bound<&crate::Slice>, Bound<&crate::Slice>)| {
-        next_level.iter().all(|run| {
-            run.range_overlap_indexes_cmp::<crate::Slice, _, _>(&bounds, cmp)
-                .is_none()
+    let free_of = |runs: &[alloc::sync::Arc<crate::version::run::Run<Table>>],
+                   skip: Option<usize>,
+                   bounds: (Bound<&crate::Slice>, Bound<&crate::Slice>)| {
+        runs.iter().enumerate().all(|(index, run)| {
+            Some(index) == skip
+                || run
+                    .range_overlap_indexes_cmp::<crate::Slice, _, _>(&bounds, cmp)
+                    .is_none()
         })
     };
-    for curr_run in curr_level.iter() {
+    let clear = |bounds| free_of(next_level, None, bounds);
+    for (run_index, curr_run) in curr_level.iter().enumerate() {
         // The longest stretch so far, as (start, length), and the current one.
         let mut best: Option<(usize, usize)> = None;
         let (mut stretch_start, mut stretch_len) = (0, 0);
         let mut previous: Option<&Table> = None;
         for (index, table) in curr_run.iter().enumerate() {
             let range = table.key_range();
+            let bounds = (Bound::Included(range.min()), Bound::Included(range.max()));
             let movable = !hidden_set.is_hidden(table.id())
-                && clear((Bound::Included(range.min()), Bound::Included(range.max())));
+                && clear(bounds)
+                && free_of(curr_level, Some(run_index), bounds);
             if !movable {
                 stretch_len = 0;
                 previous = None;
@@ -330,23 +404,79 @@ fn largest_trivial_move(
     None
 }
 
-/// A window of `level` to go into a tiered level below, which takes nothing of
-/// that level in: the leading tables of its first run, none of them hidden,
-/// holding `overshoot` bytes, at least one table.
-fn window_over(level: &Level, hidden_set: &HiddenSet, overshoot: u64) -> Option<HashSet<TableId>> {
-    let run = level.iter().next()?;
-    let mut ids = HashSet::default();
-    let mut bytes = 0u64;
-    for table in run.iter() {
-        if hidden_set.is_hidden(table.id()) {
-            break;
+/// A window of one run of `level` to go into a tiered level below, which
+/// takes nothing of that level in, none of its tables hidden.
+///
+/// Every window rewrites only its own bytes, so least rewrite takes the
+/// leading tables of the first run holding `overshoot` bytes; the hottest
+/// takes the window with the most reads per byte, ranked as a merge into a
+/// leveled level ranks them.
+fn window_over(
+    level: &Level,
+    hidden_set: &HiddenSet,
+    overshoot: u64,
+    movement: Movement,
+    table_base_size: u64,
+) -> Option<HashSet<TableId>> {
+    let (run, start, end) = match movement {
+        Movement::LeastRewrite { .. } => {
+            let run = level.iter().next()?;
+            let mut bytes = 0u64;
+            let mut end = 0;
+            for table in run.iter() {
+                if hidden_set.is_hidden(table.id()) {
+                    break;
+                }
+                end += 1;
+                bytes += table.file_size();
+                if bytes >= overshoot {
+                    break;
+                }
+            }
+            (run, 0, end)
         }
-        ids.insert(table.id());
-        bytes += table.file_size();
-        if bytes >= overshoot {
-            break;
+        Movement::Hottest => {
+            let mut ranking = MergeRanking::new(overshoot, table_base_size, movement);
+            let cap = 50 * table_base_size;
+            for (run_index, run) in level.iter().enumerate() {
+                let bytes = prefix_sums(run.iter().map(Table::file_size));
+                let hidden =
+                    prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
+                let heat = prefix_sums(run.iter().map(Table::reads));
+                'run: for width in 1..=run.len() {
+                    for start in 0..=(run.len() - width) {
+                        let end = start + width;
+                        #[expect(
+                            clippy::indexing_slicing,
+                            reason = "start < end <= run.len(), and the sums hold run.len() + 1 entries"
+                        )]
+                        let (size, hidden, heat) = (
+                            bytes[end] - bytes[start],
+                            hidden[end] - hidden[start],
+                            heat[end] - heat[start],
+                        );
+                        if size > cap {
+                            break 'run;
+                        }
+                        if hidden > 0 {
+                            continue;
+                        }
+                        ranking.offer(
+                            MergeCost {
+                                promoted: size,
+                                total: size,
+                                heat,
+                            },
+                            (run_index, start, end),
+                        );
+                    }
+                }
+            }
+            let ((_, _, (run_index, start, end)), _) = ranking.finish()?;
+            (level.iter().nth(run_index)?, start, end)
         }
-    }
+    };
+    let ids: HashSet<_> = run.get(start..end)?.iter().map(Table::id).collect();
     (!ids.is_empty()).then_some(ids)
 }
 
@@ -1453,7 +1583,22 @@ impl CompactionStrategy for Strategy {
         // nothing of that level taken in: the window of this one that moves
         // as it is, when one does.
         let tiered_window = if policy.granularity == Granularity::Window && next_tiered {
-            window_over(level, state.hidden_set(), overshoot_bytes)
+            match window_over(
+                level,
+                state.hidden_set(),
+                overshoot_bytes,
+                policy.movement,
+                self.target_size,
+            ) {
+                Some(ids) => {
+                    let Some(ids) = with_overlapping_runs(level, ids, state.hidden_set(), cmp)
+                    else {
+                        return Choice::DoNothing;
+                    };
+                    Some(ids)
+                }
+                None => None,
+            }
         } else {
             None
         };

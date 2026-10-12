@@ -24,9 +24,22 @@ fn reference_pick(
     promotion_slack: u64,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
-    for curr_run in curr_level.iter() {
+    let overlap = |a: &Table, b: &Table| {
+        cmp.compare(a.key_range().min(), b.key_range().max()) != core::cmp::Ordering::Greater
+            && cmp.compare(b.key_range().min(), a.key_range().max()) != core::cmp::Ordering::Greater
+    };
+    for (run_index, curr_run) in curr_level.iter().enumerate() {
         if let Some(window) = curr_run.shrinking_windows().find(|window| {
             if hidden_set.is_blocked(window.iter().map(Table::id)) {
+                return false;
+            }
+            let shares_a_key = curr_level
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != run_index)
+                .flat_map(|(_, run)| run.iter())
+                .any(|other| window.iter().any(|table| overlap(table, other)));
+            if shares_a_key {
                 return false;
             }
             if next_level.is_empty() {
@@ -81,7 +94,32 @@ fn reference_pick(
     }
     let ((_, _, window), _) = ranking.finish()?;
     let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    ids.extend(pull_in(window).iter().map(|t| t.id()));
+    // Every table of the level sharing a key with one taken, until none is
+    // left; and what each one so added overlaps below.
+    let mut taken: Vec<&Table> = pull_in(window);
+    let pulled_in = taken.len();
+    let all: Vec<&Table> = curr_level.iter().flat_map(|run| run.iter()).collect();
+    while let Some(next) = all.iter().find(|table| {
+        !taken.iter().any(|t| t.id() == table.id()) && taken.iter().any(|t| overlap(t, table))
+    }) {
+        if hidden_set.is_hidden(next.id()) {
+            return None;
+        }
+        taken.push(next);
+    }
+    if taken.len() > pulled_in {
+        for table in &taken {
+            for below in next_level.iter().flat_map(|run| run.iter()) {
+                if overlap(table, below)
+                    && ids.insert(below.id())
+                    && hidden_set.is_hidden(below.id())
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    ids.extend(taken.iter().map(|t| t.id()));
     Some((ids, false))
 }
 

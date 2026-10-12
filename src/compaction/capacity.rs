@@ -136,16 +136,23 @@ fn fits(bytes: u64, room: u64, floor: Floor) -> bool {
 ///
 /// Called with the account locked: a probe read before it could predate an
 /// output that landed and gave its room back in between, and count that room
-/// free on the volume and free in the account both.
+/// free on the volume and free in the account both. A folder written nothing
+/// is left out: its volume holds none of the output, and a full one must not
+/// refuse what fits where it goes.
 fn gather(demands: &[Demand<'_>], probe: bool) -> (Vec<(Pool, u64, u64)>, u64) {
-    tally(demands.iter().map(|demand| {
-        let free = if probe {
-            demand.fs.available_space(demand.path).unwrap_or(u64::MAX)
-        } else {
-            u64::MAX
-        };
-        (Pool::of(demand.fs, demand.path), demand.bytes, free)
-    }))
+    tally(
+        demands
+            .iter()
+            .filter(|demand| demand.bytes > 0)
+            .map(|demand| {
+                let free = if probe {
+                    demand.fs.available_space(demand.path).unwrap_or(u64::MAX)
+                } else {
+                    u64::MAX
+                };
+                (Pool::of(demand.fs, demand.path), demand.bytes, free)
+            }),
+    )
 }
 
 /// Sums `(pool, bytes, free)` per pool, keeping the least free space any of
