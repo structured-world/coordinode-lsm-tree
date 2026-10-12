@@ -183,9 +183,23 @@ lz4_flex = { version = "0.14.0", optional = true, default-features = false, feat
     "safe-decode",
     "safe-encode",
 ] }
-# Default features carry the runtime-dispatched SIMD decode kernels;
-# `default-features = false` drops them onto the scalar path.
-structured-zstd = { version = "0.0.59", optional = true, features = ["lsm"] }
+# The codec's default features less `dict-builder`: the runtime-dispatched
+# SIMD kernels (dropping them leaves the scalar path), long-distance matching
+# and its hash. The trainer stays out, as the library only consumes finished
+# dictionaries; it would pull `fastrand` into every consumer.
+structured-zstd = { version = "0.2.0", optional = true, default-features = false, features = [
+    "hash",
+    "ldm",
+    "std",
+    "kernel-scalar",
+    "kernel-sse",
+    "kernel-bmi2",
+    "kernel-avx2",
+    "kernel-neon",
+    "kernel-sve",
+    "kernel-simd128",
+    "lsm",
+] }
 # `once_cell::race::OnceBox` — the no-std + alloc one-shot primitive.
 # We pick it over `std::sync::OnceLock` (which has both `set` and the
 # stabilised `get_or_try_init` on our 1.92 MSRV) because OnceLock is
@@ -306,7 +320,7 @@ test-log = "0.2.18"
 # rather than to the normal dependency: a dev-dependency's features do not
 # reach consumers, so none of them pays for `fastrand` (and the `std` it
 # forces) for a capability they do not use.
-structured-zstd = { version = "0.0.59", features = ["dict-builder", "lsm"] }
+structured-zstd = { version = "0.2.0", features = ["dict-builder", "lsm"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
