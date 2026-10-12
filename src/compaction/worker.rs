@@ -416,7 +416,8 @@ fn separate_volumes(
 /// counted apart only on volumes proven apart; otherwise their demands add up
 /// on one volume, since each would fit its free space alone while together
 /// they exhaust it. A level route names a folder, not a mount, so routing
-/// alone proves nothing.
+/// alone proves nothing. A tree that relocates no blob files writes nothing
+/// to the blob folder, and the pool leaves that folder out of the check.
 fn with_merge_demands<T>(
     config: &Config,
     dest_level: u8,
