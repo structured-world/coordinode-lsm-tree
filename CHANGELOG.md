@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.12.1...v5.12.2) - 2026-10-12
+
+### Fixed
+
+- *(range)* take a read bound longer than any key ([#897](https://github.com/structured-world/coordinode-lsm-tree/pull/897))
+
 ## [5.12.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.12.0...v5.12.1) - 2026-10-11
 
 ### Fixed
