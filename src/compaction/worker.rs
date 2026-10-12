@@ -207,10 +207,14 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     // gone.
     opts.outputs
         .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
-    let mut result = result?;
-    result.work = opts.work.report();
+    // Charged whether or not the run succeeded: a tight-space pass that fails
+    // after installing slices leaves them installed, and what they read and
+    // wrote was done.
+    let work = opts.work.report();
     #[cfg(feature = "metrics")]
-    opts.metrics.charge_compaction_work(&result.work);
+    opts.metrics.charge_compaction_work(&work);
+    let mut result = result?;
+    result.work = work;
     Ok(result)
 }
 

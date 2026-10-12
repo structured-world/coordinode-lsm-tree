@@ -657,6 +657,50 @@ fn tight_space_crash_and_reopen(
     .open()
 }
 
+/// A tight-space pass that fails after installing its first slice leaves that
+/// slice installed: the bytes it wrote count in the tree's compaction work,
+/// though the run as a whole returns the failure.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_failed_tight_space_pass_counts_the_work_of_the_slices_it_installed() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()));
+    let failpoint = config.fail_tight_after_first_slice.clone();
+    let crate::AnyTree::Standard(tree) = config.open()? else {
+        panic!("expected Standard tree");
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    mem.set_capacity(tree.storage_stats()?.used_bytes);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    failpoint.store(true, Ordering::SeqCst);
+    assert!(tree.major_compact(64 * 1024 * 1024, 0).is_err());
+    assert!(
+        !failpoint.load(Ordering::SeqCst),
+        "the failure came after the first slice"
+    );
+    assert!(
+        tree.metrics().compaction_work_measured().written > 0,
+        "the installed slice's tables count as written",
+    );
+    Ok(())
+}
+
 /// The post-commit sidecar-write window under MANIFEST LOSS: a committed
 /// slice whose `.restrict-bound` write failed leaves an UNPUNCHED input
 /// beside its slice outputs (the punch never arms without the sidecar).

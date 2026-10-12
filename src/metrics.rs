@@ -472,9 +472,9 @@ impl Metrics {
     /// The work compactions did, summed over every compaction, by kind of
     /// work: the bytes they read, and the bytes of the outputs they
     /// installed. Its `written` is the compaction bytes written, the on-disk
-    /// bytes of the tables they wrote and installed, carried groups included:
-    /// divided by the bytes the tree took in, the write amplification
-    /// compaction adds.
+    /// bytes of the tables they wrote and installed, carried groups included,
+    /// and the value frames of the blob files they wrote: divided by the bytes
+    /// the tree took in, the write amplification compaction adds.
     pub fn compaction_work_measured(&self) -> crate::compaction::Work<u64> {
         self.compaction_work_measured.get()
     }

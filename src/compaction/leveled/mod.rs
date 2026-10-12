@@ -330,6 +330,26 @@ fn largest_trivial_move(
     None
 }
 
+/// A window of `level` to go into a tiered level below, which takes nothing of
+/// that level in: the leading tables of its first run, none of them hidden,
+/// holding `overshoot` bytes, at least one table.
+fn window_over(level: &Level, hidden_set: &HiddenSet, overshoot: u64) -> Option<HashSet<TableId>> {
+    let run = level.iter().next()?;
+    let mut ids = HashSet::default();
+    let mut bytes = 0u64;
+    for table in run.iter() {
+        if hidden_set.is_hidden(table.id()) {
+            break;
+        }
+        ids.insert(table.id());
+        bytes += table.file_size();
+        if bytes >= overshoot {
+            break;
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Prefix sums: entry `i` is the sum of the first `i` items.
 fn prefix_sums(items: impl Iterator<Item = u64>) -> Vec<u64> {
     let mut sums = Vec::with_capacity(items.size_hint().0 + 1);
@@ -1134,10 +1154,15 @@ impl CompactionStrategy for Strategy {
             }
         }
 
-        // Trivial move into L1
+        // Trivial move into L1: free, so taken whatever L0's trigger says,
+        // unless L0 is set never to start a compaction.
         'trivial: {
             let first_level = version.l0();
             let target_level_idx = first_non_empty_level.min(canonical_l1_idx);
+
+            if self.policy(0, level_shift, last).trigger == Trigger::Never {
+                break 'trivial;
+            }
 
             if first_level.run_count() == 1 {
                 if version.level_is_busy(0, state.hidden_set())
@@ -1424,11 +1449,36 @@ impl CompactionStrategy for Strategy {
 
         let policy = self.policy(level_idx_with_highest_score, level_shift, last);
         let next_tiered = self.policy(next_level_idx, level_shift, last).layout == Layout::Tiered;
-        let (table_ids, can_trivial_move) = match policy.granularity {
+        // A window into a tiered level below goes down as a run of its own,
+        // nothing of that level taken in: the window of this one that moves
+        // as it is, when one does.
+        let tiered_window = if policy.granularity == Granularity::Window && next_tiered {
+            window_over(level, state.hidden_set(), overshoot_bytes)
+        } else {
+            None
+        };
+        let (table_ids, can_trivial_move) = match (tiered_window, policy.granularity) {
+            // Moved only where nothing below overlaps it, which a move may not
+            // pass under; merged into a run of its own otherwise.
+            (Some(ids), _) => {
+                if version.level_is_busy(next_level_idx, state.hidden_set()) {
+                    return Choice::DoNothing;
+                }
+                let overlaps = level
+                    .iter()
+                    .flat_map(|run| run.iter())
+                    .filter(|table| ids.contains(&table.id()))
+                    .any(|table| {
+                        next_level
+                            .iter()
+                            .any(|run| !run.get_overlapping_cmp(table.key_range(), cmp).is_empty())
+                    });
+                (ids, !overlaps)
+            }
             // A window of a leveled level below: pick_minimal_compaction scans
             // all runs in both levels, handling transient multi-run states from
             // multi-level compaction (#108, #122).
-            Granularity::Window if !next_tiered => {
+            (None, Granularity::Window) if !next_tiered => {
                 let Some(picked) = pick_minimal_compaction(
                     level,
                     next_level,
@@ -1443,8 +1493,10 @@ impl CompactionStrategy for Strategy {
                 picked
             }
             // The whole level, with what it overlaps of a leveled level
-            // below; into a tiered one it goes as a run of its own.
-            Granularity::Window | Granularity::Level { .. } => {
+            // below; into a tiered one it goes as a run of its own. A window
+            // into a tiered level comes here only when no part of this one
+            // moves as it is.
+            (None, Granularity::Window | Granularity::Level { .. }) => {
                 if version.level_is_busy(level_idx_with_highest_score, state.hidden_set())
                     || version.level_is_busy(next_level_idx, state.hidden_set())
                 {
@@ -1464,6 +1516,9 @@ impl CompactionStrategy for Strategy {
                         .is_some_and(|(score, _)| *score > 1.0)
                     && let Some(below) = version.level(next_level_idx + 1)
                     && !version.level_is_busy(next_level_idx + 1, state.hidden_set())
+                    // An empty level below takes the next one as a trivial
+                    // move instead, which rewrites nothing.
+                    && !below.is_empty()
                 {
                     let mut ids = level.list_ids();
                     ids.extend(next_level.list_ids());

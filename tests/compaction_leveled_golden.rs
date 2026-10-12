@@ -6,6 +6,11 @@
 //! by step, ends in a fingerprint of every compaction it ran and of every
 //! table it left. A change to how the strategy is put together that keeps
 //! its behaviour keeps the fingerprint.
+//!
+//! The fingerprint was taken on a 64-bit target. A 32-bit one writes other
+//! tables for the same stream, so the pinned value says nothing there.
+
+#![cfg(target_pointer_width = "64")]
 
 use lsm_tree::compaction::{CompactionAction, Leveled};
 use lsm_tree::config::CompressionPolicy;

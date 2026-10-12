@@ -106,12 +106,12 @@ impl CompactionStrategy for MergeL0 {
     }
 }
 
-/// A deeper level compacted whole, set to go through a full level below,
-/// takes that level on down with it in one merge, as L0 does into a full
-/// L1, instead of rewriting it now and again when it is chosen.
-#[test]
-fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
-    let (_dir, tree) = tree()?;
+/// L1 three runs and L2 two, both past their one, L1 further; L3 holds a run
+/// first when `with_l3`. L1 goes whole and through a full level below.
+fn full_l1_over_full_l2(
+    with_l3: bool,
+) -> crate::Result<(tempfile::TempDir, crate::AnyTree, Strategy)> {
+    let (dir, tree) = tree()?;
     let shape = |granularity| LevelPolicy {
         trigger: Trigger::Shape {
             runs: 1,
@@ -129,15 +129,27 @@ fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
             }),
         )
         .with_level_policy(2, shape(Granularity::Window));
-    // L2 two runs (past its one), L1 three (further past): L1 is chosen.
-    for (round, level) in [(0, 2), (1, 2), (2, 1), (3, 1), (4, 1)] {
+    let below = with_l3.then_some((5, 3));
+    for (round, level) in below
+        .into_iter()
+        .chain([(0, 2), (1, 2), (2, 1), (3, 1), (4, 1)])
+    {
         write_round(&tree, round)?;
         tree.compact(Arc::new(MergeL0(level)), 0)?;
     }
     let version = tree.current_version();
     assert_eq!(version.level(1).expect("L1").run_count(), 3);
     assert_eq!(version.level(2).expect("L2").run_count(), 2);
+    Ok((dir, tree, strategy))
+}
 
+/// A deeper level compacted whole, set to go through a full level below,
+/// takes that level on down with it in one merge, as L0 does into a full
+/// L1, instead of rewriting it now and again when it is chosen.
+#[test]
+fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
+    let (_dir, tree, strategy) = full_l1_over_full_l2(true)?;
+    let version = tree.current_version();
     let Choice::Merge(input) =
         strategy.choose(&version, tree.tree_config(), &CompactionState::default())
     else {
@@ -146,7 +158,113 @@ fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
     assert_eq!(input.dest_level, 3, "through L2 into L3");
     let mut expected = version.level(1).expect("L1").list_ids();
     expected.extend(version.level(2).expect("L2").list_ids());
-    assert_eq!(input.table_ids, expected, "every table of L1 and L2");
+    expected.extend(version.level(3).expect("L3").list_ids());
+    assert_eq!(
+        input.table_ids, expected,
+        "every table of L1 and L2, and what they overlap of L3"
+    );
+    Ok(())
+}
+
+/// Over an empty level below, the full level is not rewritten on its way
+/// through: it goes there as a trivial move of its own, and the level above
+/// merges into it alone.
+#[test]
+fn a_whole_level_does_not_go_through_into_an_empty_level() -> crate::Result<()> {
+    let (_dir, tree, strategy) = full_l1_over_full_l2(false)?;
+    let version = tree.current_version();
+    let Choice::Merge(input) =
+        strategy.choose(&version, tree.tree_config(), &CompactionState::default())
+    else {
+        panic!("a merge is chosen");
+    };
+    assert_eq!(input.dest_level, 2, "L1 into L2 alone");
+    Ok(())
+}
+
+/// Writes keys `from..from + 100` and flushes them into one table.
+fn write_keys(tree: &crate::AnyTree, from: u64) -> crate::Result<()> {
+    for i in from..from + 100 {
+        tree.insert(format!("k{i:04}"), "v", i);
+    }
+    tree.flush_active_memtable(0)?;
+    Ok(())
+}
+
+/// L0 set never to trigger starts no compaction, not even the free trivial
+/// move into L1 the leveled strategy otherwise takes.
+#[test]
+fn an_l0_set_never_to_trigger_makes_no_trivial_move() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    write_keys(&tree, 1_000)?;
+    let version = tree.current_version();
+    let never = LevelPolicy {
+        trigger: Trigger::Never,
+        layout: Layout::Leveled,
+        granularity: Granularity::Level {
+            through_full_next: false,
+        },
+        movement: Movement::LeastRewrite { slack: None },
+    };
+    assert!(
+        matches!(
+            Strategy::default().choose(&version, tree.tree_config(), &CompactionState::default()),
+            Choice::Move(_)
+        ),
+        "the leveled L0 moves its disjoint run down",
+    );
+    let choice = Strategy::default().with_level_policy(0, never).choose(
+        &version,
+        tree.tree_config(),
+        &CompactionState::default(),
+    );
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+    Ok(())
+}
+
+/// A window into a tiered level below is a window of this level: what is past
+/// its target, not the whole level, and nothing of the level below.
+#[test]
+fn a_window_into_a_tiered_level_takes_a_window() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    for from in [0, 1_000, 2_000] {
+        write_keys(&tree, from)?;
+        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    }
+    let version = tree.current_version();
+    assert_eq!(version.level(1).expect("L1").table_count(), 3);
+    let strategy = Strategy::default()
+        .with_level_policy(
+            1,
+            LevelPolicy {
+                trigger: Trigger::Shape {
+                    runs: u8::MAX,
+                    tables: 1,
+                },
+                layout: Layout::Leveled,
+                granularity: Granularity::Window,
+                movement: Movement::LeastRewrite { slack: None },
+            },
+        )
+        .with_level_policy(
+            2,
+            LevelPolicy {
+                trigger: Trigger::Never,
+                layout: Layout::Tiered,
+                granularity: Granularity::Level {
+                    through_full_next: false,
+                },
+                movement: Movement::LeastRewrite { slack: None },
+            },
+        );
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let Choice::Move(input) = choice else {
+        panic!("a move of a window: {choice:?}");
+    };
+    assert_eq!(input.dest_level, 2);
+    assert_eq!(input.table_ids.len(), 1, "one table of three");
     Ok(())
 }
 
