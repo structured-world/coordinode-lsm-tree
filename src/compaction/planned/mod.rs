@@ -31,6 +31,42 @@
 //! reads the tables recorded: the share of them that are range scans. The
 //! same tree, model and reads give the same plan, however often and in
 //! whichever process it is solved.
+//!
+//! # Compaction budget
+//!
+//! The engine does not cap how fast a tree is written:
+//! [`Config::write_rate_limit`](crate::Config::write_rate_limit) paces writes
+//! only while the tree slows them down for compaction to catch up. What it
+//! does cap, when the deployment asks, is compaction:
+//! [`Config::compaction_rate_limit`](crate::Config::compaction_rate_limit), or
+//! a limiter shared by the trees of one device, gives compaction its share of
+//! the device. That share is the budget, and the deployment sets it: how much
+//! of the device its reads and writes need is not something the tree can see.
+//!
+//! Every written byte is compacted again before it settles, so a budget that
+//! pays for less than the write rate times the write amplification leaves
+//! compaction behind and runs pile up. This strategy reads the budget and
+//! plans a tree it can keep: a round costs the size ratio plus two units of
+//! compaction per unit written, so the size ratio is cut to what the budget
+//! over [`Model::write_rate`] pays for, down to one. Set the model's write
+//! rate to what the tree takes in.
+//!
+//! One measurement, made with db_bench `planned-sustained` (3M rows of
+//! 16-byte keys and 100-byte values, uncompressed, written at 8 MiB/s with
+//! point reads and scans between flushes, two compaction threads per tree;
+//! three runs, planned against [`Leveled`](crate::compaction::Leveled) at the
+//! same budget):
+//!
+//! | Budget | Queries/s | Scan p99 | Point read p99 | Compaction thread time | Mean runs |
+//! |---|---|---|---|---|---|
+//! | 8× the write rate | +7% to +14% | −11% to −21% | −8% to +7% | about a third | 4.7–5.0 vs 6.6–7.0 |
+//! | 2× the write rate | +6% to +13% | −5% to +10% | +7% to +18% | about half | 11.9–12.1 vs 16.0–17.1 |
+//!
+//! At eight times the write rate the planner wrote more compaction bytes per
+//! written byte than leveled (7.6–8.0 vs 7.0–7.3), at two times fewer
+//! (3.6–4.1 vs 4.5–4.6). These are figures of one machine and one workload:
+//! another device, key and value size, read mix or budget can move each of
+//! them either way. Measure the workload that runs, the bench above included.
 
 pub mod dp;
 

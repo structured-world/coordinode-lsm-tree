@@ -2540,6 +2540,14 @@ impl Config {
     /// later through [`AbstractTree::compaction_rate_limiter`](crate::AbstractTree::compaction_rate_limiter).
     /// Ignored when a shared limiter is supplied through
     /// [`Self::compaction_rate_limiter`].
+    ///
+    /// The figure is the share of the device the deployment gives compaction,
+    /// and only the deployment knows it. Below what the write rate times the
+    /// strategy's write amplification needs, compaction falls behind: runs
+    /// pile up and every read visits more of them. The
+    /// [`Planned`](crate::compaction::Planned) strategy reads the limit and
+    /// plans a tree it can keep (see its section on the compaction budget);
+    /// [`Leveled`](crate::compaction::Leveled) keeps its shape and lags.
     #[must_use]
     pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_rate_limit = bytes_per_sec;
