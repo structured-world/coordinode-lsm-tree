@@ -17,6 +17,10 @@
 pub enum Trigger {
     /// When its runs reach `runs`, or its tables reach `tables`: a level of
     /// runs that accumulate, read once per run, compacts by its shape.
+    ///
+    /// Runs are counted as a read meets them: tables that overlap no table of
+    /// a run join it, so batches of disjoint keys make one run, read once.
+    /// `tables` is what bounds such a level's size.
     Shape {
         /// The run count that triggers it.
         runs: u8,
@@ -36,8 +40,10 @@ pub enum Layout {
     /// One run: a compaction into the level merges with the tables of it
     /// that it overlaps.
     Leveled,
-    /// Runs that accumulate: a compaction into the level writes a run of its
-    /// own beside the ones there.
+    /// Runs that accumulate: a compaction into the level takes in nothing of
+    /// it and writes its output beside the runs there. Output overlapping no
+    /// table of a run joins that run, as any level below L0 lays its tables
+    /// out: a read visits disjoint tables once, whichever run holds them.
     Tiered,
 }
 

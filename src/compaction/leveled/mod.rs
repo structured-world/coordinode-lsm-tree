@@ -1637,7 +1637,9 @@ impl CompactionStrategy for Strategy {
                 picked
             }
             // The whole level, with what it overlaps of a leveled level
-            // below; into a tiered one it goes as a run of its own. A window
+            // below; into a tiered one it goes as a run of its own, which
+            // joins a run there it overlaps nothing of: the shape trigger
+            // counts runs as a read meets them. A window
             // into a tiered level comes here only when no part of this one
             // moves as it is.
             (None, Granularity::Window | Granularity::Level { .. }) => {
