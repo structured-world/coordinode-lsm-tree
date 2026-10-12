@@ -415,11 +415,16 @@ impl<'a> LevelStages<'a> {
             ..
         } in self.tables
         {
-            let (table_seqno, blocks, tally) = match read {
+            let (table_seqno, blocks, mut tally) = match read {
                 LevelRead::Staged(read) => read.into_plan(),
                 LevelRead::Planned(table_seqno, blocks, tally) => (table_seqno, blocks, tally),
                 LevelRead::Pending | LevelRead::Serial | LevelRead::Nothing => continue,
             };
+            // Every key a block task reads passed the table's gates.
+            tally.point_reads += blocks
+                .iter()
+                .map(|(_, positions)| positions.len())
+                .sum::<usize>();
             if tally != PlanCounts::default() {
                 probes.push((table, tally));
             }

@@ -326,6 +326,26 @@ fn a_busy_ended_round_is_not_merged_twice() -> crate::Result<()> {
     Ok(())
 }
 
+/// Point reads made in a batch count in the read mix as single ones do, so a
+/// workload of batched reads beside scans is not planned as scans alone.
+#[test]
+fn batched_point_reads_count_in_the_read_mix() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_round(&tree, 0)?;
+    let reads = || -> u64 {
+        tree.current_version()
+            .iter_tables()
+            .map(Table::point_reads)
+            .sum()
+    };
+    assert_eq!(reads(), 0);
+    let keys: Vec<String> = (0..50u64).map(|i| format!("k{i:04}")).collect();
+    let found = tree.multi_get(&keys, SeqNo::MAX)?;
+    assert!(found.iter().all(Option::is_some));
+    assert_eq!(reads(), 50, "one point read per key the table served");
+    Ok(())
+}
+
 /// The same version, model and reads choose the same, on two strategies.
 #[test]
 fn the_choice_is_the_same_for_the_same_inputs() -> crate::Result<()> {

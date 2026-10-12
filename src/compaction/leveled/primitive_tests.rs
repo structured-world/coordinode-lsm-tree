@@ -599,6 +599,36 @@ fn only_a_shape_trigger_triggers_by_shape() -> crate::Result<()> {
     Ok(())
 }
 
+/// An L0 policy set with a lower table count than the strategy's defaults is
+/// the one that decides: L0 past it goes down into L1, not into a merge within
+/// L0 that would coalesce its tables back below the count.
+#[test]
+fn a_configured_l0_shape_sends_l0_down_instead_of_within() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    write_keys(&tree, 50)?;
+    let version = tree.current_version();
+    let l0 = version.level(0).expect("L0");
+    assert_eq!((l0.run_count(), l0.table_count()), (2, 2));
+    let strategy = Strategy::default().with_level_policy(
+        0,
+        LevelPolicy {
+            trigger: Trigger::Shape { runs: 4, tables: 2 },
+            layout: Layout::Tiered,
+            granularity: Granularity::Level {
+                through_full_next: false,
+            },
+            movement: Movement::LeastRewrite { slack: None },
+        },
+    );
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let (Choice::Merge(input) | Choice::Move(input)) = choice else {
+        panic!("L0 goes down: {choice:?}");
+    };
+    assert_eq!(input.dest_level, 1);
+    Ok(())
+}
+
 /// A level set never to trigger starts no compaction however far past its
 /// target it grows.
 #[test]

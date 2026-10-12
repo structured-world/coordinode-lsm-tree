@@ -4851,12 +4851,13 @@ fn compaction_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     Ok(())
 }
 
-/// A merge of columnar segments reads their pages a region at a time while
-/// the limiter steers by latency, each region timed on its own, and those
-/// reads lift a backoff a verification scan left low.
+/// A merge split into ranges reads the row groups of columnar inputs it
+/// rewrites a region at a time while the limiter steers by latency, each
+/// region timed on its own, and those reads lift a backoff a verification
+/// scan left low.
 #[cfg(feature = "columnar")]
 #[test]
-fn columnar_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
+fn columnar_range_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     use crate::AbstractTree;
     use crate::rate_limiter::{LatencyBackoff, RateLimiter};
     use core::time::Duration;
@@ -4865,27 +4866,40 @@ fn columnar_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     shared.set_latency_backoff(Some(
         LatencyBackoff::new(Duration::from_secs(10)).with_period(Duration::ZERO),
     ));
-    for _ in 0..20 {
-        shared.record_read_latency(Duration::from_secs(100));
-    }
-    let left_by_the_scan = shared.effective_rate();
-
     let dir = tempfile::tempdir()?;
     let tree = open_standard(dir.path(), |c| {
         c.compaction_rate_limiter(Arc::clone(&shared))
+            .compaction_threads(4)
+            .subcompaction_min_bytes(0)
     })?;
-    tree.update_runtime_config(|c| c.columnar = true)?;
-    for flush in 0..2u64 {
-        for i in 0..2_000u64 {
+    tree.update_runtime_config(|c| {
+        c.columnar = true;
+        c.data_block_compression_policy =
+            crate::config::CompressionPolicy::all(crate::CompressionType::None);
+    })?;
+    let write = |flush: u64| -> crate::Result<()> {
+        for i in 0..4_000u64 {
             tree.insert(
                 format!("k{i:06}"),
                 format!("value-{flush}-{i}-payload"),
                 flush * 10_000 + i,
             );
         }
-        tree.flush_active_memtable(0)?;
+        tree.flush_active_memtable(0)
+    };
+    // Small outputs, so the bottom level holds several tables to cut the
+    // next merge's ranges at.
+    write(0)?;
+    tree.major_compact(32 * 1024, 0)?;
+    assert!(tree.current_version().iter_tables().count() > 2);
+
+    // Every row changes, so no group is copied: each range reads them.
+    write(1)?;
+    for _ in 0..20 {
+        shared.record_read_latency(Duration::from_secs(100));
     }
-    tree.major_compact(64 * 1024 * 1024, 0)?;
+    let left_by_the_scan = shared.effective_rate();
+    tree.major_compact(32 * 1024, 0)?;
 
     assert!(
         shared.effective_rate() > left_by_the_scan,

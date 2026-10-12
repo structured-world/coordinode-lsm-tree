@@ -6819,8 +6819,15 @@ impl Table {
     /// not inflate the count. Raw counter; the consumer derives a rate / EMA from
     /// successive polls.
     fn record_access(&self) {
+        self.record_accesses(1);
+    }
+
+    /// Records `reads` data-consulting point reads at once, as
+    /// [`Self::record_access`] records one: what a batched read let through
+    /// its gates.
+    pub(crate) fn record_accesses(&self, reads: u64) {
         self.read_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "std")]
         self.last_access_secs.store(
             crate::time::unix_timestamp().as_secs(),
@@ -7420,6 +7427,8 @@ impl Table {
         if passing.is_empty() {
             return Ok(results);
         }
+        // Counted as single reads are, after the seqno-range and filter gates.
+        self.record_accesses(passing.len() as u64);
         // The filter let these keys through; the ones no read below finds are
         // its false positives.
         let count_false_positives = |results: &[Option<InternalValue>]| {
@@ -10127,6 +10136,9 @@ impl Table {
     /// from that plan: the probes, and the filter queries and skips.
     pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
         self.count_probes(counts.probes);
+        if counts.point_reads > 0 {
+            self.record_accesses(counts.point_reads as u64);
+        }
         #[cfg(feature = "metrics")]
         {
             use core::sync::atomic::Ordering::Relaxed;

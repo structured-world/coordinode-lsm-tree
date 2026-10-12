@@ -51,7 +51,7 @@
 //! over [`Model::write_rate`] pays for, down to one. Set the model's write
 //! rate to what the tree takes in.
 //!
-//! One measurement, made with db_bench `planned-sustained` (3M rows of
+//! One measurement, made with `db_bench planned-sustained` (3M rows of
 //! 16-byte keys and 100-byte values, uncompressed, written at 8 MiB/s with
 //! point reads and scans between flushes, two compaction threads per tree;
 //! three runs, planned against [`Leveled`](crate::compaction::Leveled) at the

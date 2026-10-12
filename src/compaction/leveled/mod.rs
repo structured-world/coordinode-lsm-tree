@@ -1342,7 +1342,9 @@ impl CompactionStrategy for Strategy {
 
             // A triggered L0 goes down instead: rewriting it here would clear
             // the debt (a file guard below the run threshold) without moving
-            // anything to L1.
+            // anything to L1. `l0_triggered` reads L0's policy, the one set
+            // for it when one is, so a table count set lower than the
+            // defaults is the one this tests.
             if first_level.run_count() > 1
                 && first_level.table_count() < usize::from(runs.max(1))
                 && !self.l0_triggered(first_level)
