@@ -1641,9 +1641,8 @@ fn run_tight_space_compaction(
                 bytes: slice_blobs,
             },
         ];
-        if let Some(room) = opts.capacity.reserve(opts.tree_id, &demands, None) {
-            opts.outputs.reserve(room);
-        }
+        opts.outputs
+            .reserve(opts.capacity.hold(opts.tree_id, &demands));
     };
 
     // Hide the inputs so the strategy cannot re-select them mid-loop.

@@ -286,6 +286,17 @@ impl CapacityPool {
         })
     }
 
+    /// Reserves `demands` for a compaction of `tree` whatever is free, so that
+    /// checked compactions sharing the pool still count them.
+    pub(crate) fn hold(self: &Arc<Self>, tree: TreeId, demands: &[Demand<'_>]) -> Reservation {
+        #[expect(
+            clippy::expect_used,
+            reason = "a reservation without a check is never refused"
+        )]
+        self.reserve(tree, demands, None)
+            .expect("a reservation without a check is never refused")
+    }
+
     /// Gives `bytes` of `pool` back.
     fn release(&self, pool: Pool, bytes: u64) {
         if bytes == 0 {

@@ -284,7 +284,7 @@ pub fn estimate_merge(plan: &MergePlan<'_>, carries: impl Fn(&Table) -> bool) ->
         carried_ceiling += size;
         // The whole file is read by its scan.
         expected.read += size;
-        if !carries(table) || !unchanged_by_merge(plan, at) {
+        if !carries(table) || !unchanged_by_merge(plan, at, table) {
             continue;
         }
         let groups = table.data_section_len();
@@ -322,12 +322,9 @@ pub fn estimate_merge(plan: &MergePlan<'_>, carries: impl Fn(&Table) -> bool) ->
     }
 }
 
-/// Whether the merge `plan` describes leaves every row of its input `at` as
-/// it is.
-fn unchanged_by_merge(plan: &MergePlan<'_>, at: usize) -> bool {
-    let Some(table) = plan.inputs.get(at) else {
-        return false;
-    };
+/// Whether the merge `plan` describes leaves every row of `table`, its input
+/// `at`, as it is.
+fn unchanged_by_merge(plan: &MergePlan<'_>, at: usize, table: &Table) -> bool {
     let meta = &table.metadata;
     let (min, max) = (meta.key_range.min(), meta.key_range.max());
     let below = |a: &[u8], b: &[u8]| plan.comparator.compare(a, b) == core::cmp::Ordering::Less;

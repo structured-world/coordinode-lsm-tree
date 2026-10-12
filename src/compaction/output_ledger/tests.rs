@@ -6,6 +6,17 @@ fn create(fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// A run holding no room has nothing to charge a finished file to: it does
+/// not even look the file up, and is never out of room.
+#[test]
+fn a_run_without_room_charges_nothing() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let ledger = OutputLedger::default();
+    ledger.landed(&fs, &PathBuf::from("/never/written"))?;
+    assert!(!ledger.out_of_room());
+    Ok(())
+}
+
 /// Every recorded file goes, a table and a blob file alike, and the ledger is
 /// empty afterwards: a second removal has nothing left to touch.
 #[test]

@@ -1175,7 +1175,10 @@ fn as_many_l0_runs_as_the_threshold_trip_the_l0_trigger() -> crate::Result<()> {
     let version = tree.current_version();
     assert_eq!(version.l0().run_count(), usize::from(strategy.l0_threshold));
     assert!(strategy.l0_triggered(version.l0()));
-    assert!(shape_score(strategy.policy(0, 0, 6).trigger, version.l0()) >= 1.0);
+    let Trigger::Shape { runs, tables } = strategy.policy(0, 0, 6).trigger else {
+        panic!("L0 is triggered by its shape");
+    };
+    assert!(shape_score((runs, tables), version.l0()) >= 1.0);
     assert_eq!(
         strategy.pending_compaction_bytes(&version),
         version.l0().size(),
@@ -1311,7 +1314,10 @@ fn zero_l0_thresholds_do_not_trigger_an_empty_l0() -> crate::Result<()> {
         Strategy::default().with_l0_threshold(0),
     ] {
         assert!(!strategy.l0_triggered(version.l0()));
-        assert!(shape_score(strategy.policy(0, 0, 6).trigger, version.l0()).is_finite());
+        let Trigger::Shape { runs, tables } = strategy.policy(0, 0, 6).trigger else {
+            panic!("L0 is triggered by its shape");
+        };
+        assert!(shape_score((runs, tables), version.l0()).is_finite());
         assert_eq!(strategy.pending_compaction_bytes(&version), 0);
     }
     Ok(())

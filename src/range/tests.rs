@@ -56,3 +56,48 @@ fn prefix_to_range_char_max() {
 fn prefix_to_range_char_max_2() {
     test_prefix(&[0, 2, 255], Excluded(&[0, 3]));
 }
+
+/// A scan counts once on every table of a run it reaches, and on no other:
+/// one table, two, or more.
+#[expect(clippy::expect_used, reason = "test code")]
+#[test]
+fn a_scan_counts_on_each_table_it_reaches() -> crate::Result<()> {
+    use crate::version::run::Ranged;
+    use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for from in [0u64, 1_000, 2_000] {
+        for i in from..from + 100 {
+            tree.insert(format!("k{i:04}"), "v", i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(alloc::sync::Arc::new(crate::compaction::MoveDown(0, 1)), 0)?;
+    }
+    let scans = || -> Vec<u64> {
+        let version = tree.current_version();
+        let mut tables: Vec<_> = version
+            .level(1)
+            .expect("L1")
+            .iter()
+            .flat_map(|run| run.iter())
+            .map(|table| (table.key_range().min().clone(), table.scans()))
+            .collect();
+        tables.sort();
+        tables.into_iter().map(|(_, scans)| scans).collect()
+    };
+    assert_eq!(scans(), [0, 0, 0]);
+
+    assert_eq!(tree.range("k0010"..="k0020", SeqNo::MAX, None).count(), 11);
+    assert_eq!(scans(), [1, 0, 0], "one table");
+    assert_eq!(tree.range("k0050"..="k1050", SeqNo::MAX, None).count(), 101);
+    assert_eq!(scans(), [2, 1, 0], "two tables");
+    assert_eq!(tree.iter(SeqNo::MAX, None).count(), 300);
+    assert_eq!(scans(), [3, 2, 1], "every table");
+    Ok(())
+}

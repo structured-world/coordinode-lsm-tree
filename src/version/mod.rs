@@ -1019,11 +1019,10 @@ impl Version {
         let disjoint = moved_runs.len() <= 1 || {
             let mut all: Vec<&Table> = moved_runs.iter().flatten().collect();
             all.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
-            all.windows(2).all(|pair| match pair {
-                [a, b] => comparator
+            all.iter().zip(all.iter().skip(1)).all(|(a, b)| {
+                comparator
                     .compare(a.key_range().max(), b.key_range().min())
-                    .is_lt(),
-                _ => true,
+                    .is_lt()
             })
         };
         if disjoint && moved_runs.len() > 1 {
@@ -1058,11 +1057,12 @@ impl Version {
             if level_idx == dest_level {
                 // Newest first, ahead of the destination's runs: whatever was
                 // moved down sits above what was already there.
-                for (at, tables) in moved_runs.iter().enumerate() {
-                    if let Some(run) = Run::new(tables.clone()) {
-                        runs.insert(at, run);
-                    }
-                }
+                runs.splice(
+                    0..0,
+                    moved_runs
+                        .iter()
+                        .filter_map(|tables| Run::new(tables.clone())),
+                );
             }
 
             let runs = place_runs(level_idx, runs, comparator);

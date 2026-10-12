@@ -233,6 +233,99 @@ fn small_runs_sent_down_by_the_table_count_do_not_end_a_round() -> crate::Result
     Ok(())
 }
 
+/// The pending bytes are what each level holds past its bound: nothing on an
+/// empty tree, the top level past its unit before it comes down, nothing once
+/// it has and the main level is within its round.
+#[test]
+fn pending_bytes_are_what_the_levels_hold_past_their_bounds() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let strategy = strategy(Model::default());
+    assert_eq!(strategy.get_name(), NAME);
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0
+    );
+
+    write_round(&tree, 0)?;
+    write_round(&tree, 1)?;
+    // The budget the strategy last saw is set by a choice.
+    let _ = strategy.choose(
+        &tree.current_version(),
+        tree.tree_config(),
+        &CompactionState::default(),
+    );
+    let version = tree.current_version();
+    let top = version.level(0).expect("L0").size();
+    assert!(top > UNIT, "two rounds hold more than a unit");
+    let pending = strategy.pending_compaction_bytes(&version);
+    assert!(
+        pending > 0 && pending < top,
+        "the top level past its unit: {pending} of {top}"
+    );
+
+    settle(&tree, &strategy)?;
+    assert_eq!(
+        strategy.pending_compaction_bytes(&tree.current_version()),
+        0,
+        "the top level came down and the main level is within its round",
+    );
+    Ok(())
+}
+
+/// A main level being compacted holds the top level up: nothing is chosen
+/// until it is free.
+#[test]
+fn a_busy_main_level_holds_the_top_level_up() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let strategy = strategy(Model::default());
+    write_round(&tree, 0)?;
+    settle(&tree, &strategy)?;
+    write_round(&tree, 1)?;
+    let version = tree.current_version();
+    let config = tree.tree_config();
+    assert!(
+        !matches!(
+            strategy.choose(&version, config, &CompactionState::default()),
+            Choice::DoNothing
+        ),
+        "a free main level takes the top level"
+    );
+    let mut state = CompactionState::default();
+    state
+        .hidden_set_mut()
+        .hide(version.level(1).expect("L1").list_ids());
+    let choice = strategy.choose(&version, config, &state);
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+    Ok(())
+}
+
+/// An ended round being compacted is not merged into the last level again
+/// meanwhile.
+#[test]
+fn a_busy_ended_round_is_not_merged_twice() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let strategy = strategy(Model::default());
+    write_round(&tree, 0)?;
+    settle(&tree, &strategy)?;
+    tree.compact(Arc::new(crate::compaction::MoveDown(1, DRAIN_LEVEL)), 0)?;
+    let version = tree.current_version();
+    let config = tree.tree_config();
+    let last = version.level_count() - 1;
+    let into_last = |choice: &Choice| matches!(choice, Choice::Merge(input) if usize::from(input.dest_level) == last);
+    assert!(into_last(&strategy.choose(
+        &version,
+        config,
+        &CompactionState::default()
+    )));
+    let mut state = CompactionState::default();
+    state
+        .hidden_set_mut()
+        .hide(version.level(DRAIN).expect("drain").list_ids());
+    let choice = strategy.choose(&version, config, &state);
+    assert!(!into_last(&choice), "{choice:?}");
+    Ok(())
+}
+
 /// The same version, model and reads choose the same, on two strategies.
 #[test]
 fn the_choice_is_the_same_for_the_same_inputs() -> crate::Result<()> {

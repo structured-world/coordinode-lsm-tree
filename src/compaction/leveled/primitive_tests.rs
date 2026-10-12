@@ -380,6 +380,225 @@ fn a_window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()
     Ok(())
 }
 
+/// L1 of three disjoint tables, `k0000..`, `k1000..` and `k2000..`.
+fn three_tables_in_l1(tree: &crate::AnyTree) -> crate::Result<()> {
+    for from in [0, 1_000, 2_000] {
+        write_keys(tree, from)?;
+        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    }
+    Ok(())
+}
+
+/// L1 compacting a window as soon as it holds a table, into a tiered L2.
+fn window_into_tiered_l2() -> Strategy {
+    Strategy::default()
+        .with_level_policy(
+            1,
+            LevelPolicy {
+                trigger: Trigger::Shape {
+                    runs: u8::MAX,
+                    tables: 1,
+                },
+                layout: Layout::Leveled,
+                granularity: Granularity::Window,
+                movement: Movement::LeastRewrite { slack: None },
+            },
+        )
+        .with_level_policy(2, tiered_never())
+}
+
+fn tiered_never() -> LevelPolicy {
+    LevelPolicy {
+        trigger: Trigger::Never,
+        layout: Layout::Tiered,
+        granularity: Granularity::Level {
+            through_full_next: false,
+        },
+        movement: Movement::LeastRewrite { slack: None },
+    }
+}
+
+/// A window into a tiered level that holds the same keys is merged into a run
+/// of its own there: nothing of that level is taken in.
+#[test]
+fn a_window_over_a_tiered_level_holding_its_keys_is_merged_alone() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let choice =
+        window_into_tiered_l2().choose(&version, tree.tree_config(), &CompactionState::default());
+    let Choice::Merge(input) = choice else {
+        panic!("a merge of a window: {choice:?}");
+    };
+    assert_eq!(input.dest_level, 2);
+    let l1 = version.level(1).expect("L1").list_ids();
+    assert!(
+        input.table_ids.iter().all(|id| l1.contains(id)),
+        "nothing of L2 taken in"
+    );
+    Ok(())
+}
+
+/// A window does not go into a tiered level being compacted, nor take a table
+/// being compacted.
+#[test]
+fn a_window_into_a_tiered_level_waits_for_busy_tables() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 5_000)?;
+    tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let strategy = window_into_tiered_l2();
+
+    let mut busy_below = CompactionState::default();
+    busy_below
+        .hidden_set_mut()
+        .hide(version.level(2).expect("L2").list_ids());
+    let choice = strategy.choose(&version, tree.tree_config(), &busy_below);
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+
+    let first = version
+        .level(1)
+        .expect("L1")
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(Table::id)
+        .next()
+        .expect("a table");
+    let mut busy_first = CompactionState::default();
+    busy_first.hidden_set_mut().hide([first]);
+    let choice = strategy.choose(&version, tree.tree_config(), &busy_first);
+    assert!(
+        match &choice {
+            Choice::Move(input) | Choice::Merge(input) => !input.table_ids.contains(&first),
+            Choice::DoNothing => true,
+            Choice::Drop(_) => false,
+        },
+        "{choice:?}"
+    );
+    Ok(())
+}
+
+/// A whole level into a tiered level goes as a run of its own, taking in
+/// nothing of what that level holds.
+#[test]
+fn a_whole_level_into_a_tiered_level_takes_nothing_of_it() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let strategy = Strategy::default()
+        .with_level_policy(
+            1,
+            LevelPolicy {
+                trigger: Trigger::Shape {
+                    runs: u8::MAX,
+                    tables: 1,
+                },
+                layout: Layout::Leveled,
+                granularity: Granularity::Level {
+                    through_full_next: false,
+                },
+                movement: Movement::LeastRewrite { slack: None },
+            },
+        )
+        .with_level_policy(2, tiered_never());
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let Choice::Merge(input) = choice else {
+        panic!("a merge of L1: {choice:?}");
+    };
+    assert_eq!(input.dest_level, 2);
+    assert_eq!(input.table_ids, version.level(1).expect("L1").list_ids());
+    Ok(())
+}
+
+/// L0 compacting a window goes into L1, by a window of what it overlaps there.
+#[test]
+fn a_window_of_l0_goes_into_l1() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    write_keys(&tree, 1_000)?;
+    let version = tree.current_version();
+    let strategy = Strategy::default().with_level_policy(
+        0,
+        LevelPolicy {
+            trigger: Trigger::Shape { runs: 1, tables: 1 },
+            layout: Layout::Tiered,
+            granularity: Granularity::Window,
+            movement: Movement::LeastRewrite { slack: None },
+        },
+    );
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let Choice::Merge(input) = choice else {
+        panic!("a merge into L1: {choice:?}");
+    };
+    assert_eq!(input.dest_level, 1);
+    assert_eq!(
+        input.table_ids.len(),
+        2,
+        "the L0 table and the one under it"
+    );
+    Ok(())
+}
+
+/// The hottest movement into a leveled level promotes past the overshoot by
+/// at most a table's size, as least rewrite does by default.
+#[test]
+fn the_hottest_merge_picks_a_window_into_a_leveled_level() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    write_keys(&tree, 1_000)?;
+    let version = tree.current_version();
+    let picked = pick_minimal_compaction(
+        version.level(0).expect("L0"),
+        version.level(1).expect("L1"),
+        &HiddenSet::default(),
+        0,
+        64 * 1_024 * 1_024,
+        Movement::Hottest,
+        &crate::comparator::DefaultUserComparator,
+    );
+    let (ids, moved) = picked.expect("a merge");
+    assert!(!moved);
+    assert_eq!(ids.len(), 2);
+    Ok(())
+}
+
+/// A trigger by size or never is no trigger by shape, however many tables
+/// the level holds; past the last level, a policy set is ignored.
+#[test]
+fn only_a_shape_trigger_triggers_by_shape() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    for from in [0, 1_000, 2_000] {
+        write_keys(&tree, from)?;
+    }
+    let version = tree.current_version();
+    let l0 = version.level(0).expect("L0");
+    assert!(shape_triggered(Trigger::Shape { runs: 1, tables: 1 }, l0));
+    assert!(!shape_triggered(Trigger::Size, l0));
+    assert!(!shape_triggered(Trigger::Never, l0));
+
+    let never = LevelPolicy {
+        trigger: Trigger::Never,
+        ..tiered_never()
+    };
+    assert_eq!(
+        Strategy::default().with_level_policy(7, never).policies,
+        [None; 7]
+    );
+    // L0 set never to trigger owes nothing however many tables it holds.
+    assert_eq!(
+        Strategy::default()
+            .with_level_policy(0, never)
+            .pending_compaction_bytes(&version),
+        0
+    );
+    Ok(())
+}
+
 /// A level set never to trigger starts no compaction however far past its
 /// target it grows.
 #[test]

@@ -2779,6 +2779,34 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
     }
 
+    // Run through a compaction, the narrowed merge is what runs: two of the
+    // run's tables are rewritten, the others stay, and every key still reads.
+    struct Fixed(Input);
+    impl crate::compaction::CompactionStrategy for Fixed {
+        fn get_name(&self) -> &'static str {
+            "FixedTest"
+        }
+        fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
+            Choice::Merge(self.0.clone())
+        }
+    }
+    let ran = tree.compact(Arc::new(Fixed(payload.clone())), 0)?;
+    assert!(ran.work.measured.read > 0, "a merge ran");
+    let after = tree.current_version();
+    let kept = payload
+        .table_ids
+        .iter()
+        .filter(|id| after.iter_tables().any(|table| table.id() == **id))
+        .count();
+    assert_eq!(
+        kept,
+        payload.table_ids.len() - 2,
+        "only the pair was merged"
+    );
+    for i in (0..3_000u64).step_by(97) {
+        assert!(tree.get(format!("k{i:08}"), crate::SeqNo::MAX)?.is_some());
+    }
+
     Ok(())
 }
 
@@ -3384,29 +3412,84 @@ fn tight_space_declines_when_an_input_backend_cannot_punch() -> crate::Result<()
 /// exists to reclaim the constrained volume reclaims nothing at all.
 #[test]
 fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()> {
+    let (_dir, tree, mem) = relocating_tree_on_a_tight_blob_volume()?;
+    tree.major_compact(64 * 1024 * 1024, 4 * RELOC_KEYS)?;
+
+    assert!(
+        mem.punched_bytes() > 0,
+        "the relocation must slice against the blob volume's free space and \
+         reclaim stale blob prefixes there",
+    );
+    assert_relocated_values(&tree)
+}
+
+/// A relocating tight-space pass punches each stale blob file through the
+/// blob volume's own backend: one that cannot punch declines the pass, which
+/// would otherwise leave every relocated prefix allocated beside its copy.
+#[test]
+fn tight_space_declines_when_the_blob_backend_cannot_punch() -> crate::Result<()> {
+    let (_dir, tree, mem) = relocating_tree_on_a_tight_blob_volume()?;
+    mem.set_punch_hole_supported(false);
+    let result = tree.major_compact(64 * 1024 * 1024, 4 * RELOC_KEYS)?;
+
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Nothing,
+        "{result:?}"
+    );
+    assert_eq!(mem.punched_bytes(), 0);
+    assert_relocated_values(&tree)
+}
+
+const RELOC_KEYS: u64 = 4_000;
+
+fn reloc_key(i: u64) -> String {
+    format!("key{i:08}")
+}
+
+/// High-entropy values so the blobs do not compress away and the relocation
+/// transient is real.
+fn reloc_value(i: u64, generation: u8) -> Vec<u8> {
+    let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+    (0..200u32)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "xorshift byte extraction; the high bits are intentionally dropped"
+            )]
+            let byte = (s >> 24) as u8;
+            byte
+        })
+        .collect()
+}
+
+/// Every key reads the generation written last.
+fn assert_relocated_values(tree: &crate::BlobTree) -> crate::Result<()> {
+    for i in 0..RELOC_KEYS {
+        let expected = reloc_value(i, if i % 2 == 0 { 2 } else { 1 });
+        assert_eq!(
+            tree.get(reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i} wrong/lost after the relocating tight-space merge",
+        );
+    }
+    Ok(())
+}
+
+/// A KV-separated tree whose tables live on an ample routed volume and whose
+/// blob files, half stale, live on a volume squeezed so that relocating them
+/// takes the tight-space path.
+fn relocating_tree_on_a_tight_blob_volume()
+-> crate::Result<(tempfile::TempDir, crate::BlobTree, Arc<crate::fs::MemFs>)> {
     use crate::config::LevelRoute;
     use crate::fs::{Fs, MemFs};
 
-    const N: u64 = 4_000;
-    let k = |i: u64| format!("key{i:08}");
-    // High-entropy values so the blobs do not compress away and the relocation
-    // transient is real.
-    let val = |i: u64, generation: u8| -> Vec<u8> {
-        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
-        (0..200u32)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "xorshift byte extraction; the high bits are intentionally dropped"
-                )]
-                let byte = (s >> 24) as u8;
-                byte
-            })
-            .collect()
-    };
+    const N: u64 = RELOC_KEYS;
+    let (k, val) = (reloc_key, reloc_value);
 
     let dir = tempfile::tempdir()?;
     let cold_dir = dir.path().join("cold");
@@ -3468,23 +3551,7 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     tree.index.update_runtime_config(|c| {
         c.tight_space_compaction = true;
     })?;
-
-    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
-
-    assert!(
-        mem.punched_bytes() > 0,
-        "the relocation must slice against the blob volume's free space and \
-         reclaim stale blob prefixes there",
-    );
-    for i in 0..N {
-        let expected = if i % 2 == 0 { val(i, 2) } else { val(i, 1) };
-        assert_eq!(
-            tree.get(k(i).as_bytes(), crate::MAX_SEQNO)?.as_deref(),
-            Some(expected.as_slice()),
-            "key {i} wrong/lost after the relocating tight-space merge",
-        );
-    }
-    Ok(())
+    Ok((dir, tree, mem))
 }
 
 /// Punching an input reclaims space on the INPUT'S volume. Under level routing
@@ -4781,6 +4848,57 @@ fn compaction_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
         shared.effective_rate(),
         shared.rate(),
     );
+    Ok(())
+}
+
+/// A merge of columnar segments reads their pages a region at a time while
+/// the limiter steers by latency, each region timed on its own, and those
+/// reads lift a backoff a verification scan left low.
+#[cfg(feature = "columnar")]
+#[test]
+fn columnar_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::rate_limiter::{LatencyBackoff, RateLimiter};
+    use core::time::Duration;
+
+    let shared = Arc::new(RateLimiter::new(1 << 30));
+    shared.set_latency_backoff(Some(
+        LatencyBackoff::new(Duration::from_secs(10)).with_period(Duration::ZERO),
+    ));
+    for _ in 0..20 {
+        shared.record_read_latency(Duration::from_secs(100));
+    }
+    let left_by_the_scan = shared.effective_rate();
+
+    let dir = tempfile::tempdir()?;
+    let tree = open_standard(dir.path(), |c| {
+        c.compaction_rate_limiter(Arc::clone(&shared))
+    })?;
+    tree.update_runtime_config(|c| c.columnar = true)?;
+    for flush in 0..2u64 {
+        for i in 0..2_000u64 {
+            tree.insert(
+                format!("k{i:06}"),
+                format!("value-{flush}-{i}-payload"),
+                flush * 10_000 + i,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert!(
+        shared.effective_rate() > left_by_the_scan,
+        "the merge's reads did not lift the backoff: {} of {}",
+        shared.effective_rate(),
+        shared.rate(),
+    );
+    for i in (0..2_000u64).step_by(101) {
+        assert_eq!(
+            tree.get(format!("k{i:06}"), crate::SeqNo::MAX)?.as_deref(),
+            Some(format!("value-1-{i}-payload").as_bytes()),
+        );
+    }
     Ok(())
 }
 

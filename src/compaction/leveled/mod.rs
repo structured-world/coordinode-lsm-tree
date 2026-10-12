@@ -729,12 +729,9 @@ fn shape_triggered(trigger: Trigger, level: &Level) -> bool {
     }
 }
 
-/// A shape-triggered level's score: how far past the nearer of its two
-/// counts it is; `0` for a level triggered otherwise.
-fn shape_score(trigger: Trigger, level: &Level) -> f64 {
-    let Trigger::Shape { runs, tables } = trigger else {
-        return 0.0;
-    };
+/// A level's score under a shape trigger of `runs` and `tables`: how far past
+/// the nearer of the two counts it is.
+fn shape_score((runs, tables): (u8, u16), level: &Level) -> f64 {
     #[expect(
         clippy::cast_precision_loss,
         reason = "counts of runs and tables are far below 2^52"
@@ -1375,11 +1372,11 @@ impl CompactionStrategy for Strategy {
                 let trigger = self.policy(idx, level_shift, last).trigger;
                 // A level triggered by its shape scores by it, whether or not
                 // it is empty, as L0 always has.
-                if let Trigger::Shape { .. } = trigger {
+                if let Trigger::Shape { runs, tables } = trigger {
                     if shape_triggered(trigger, level)
                         && let Some(slot) = scores.get_mut(idx)
                     {
-                        *slot = (shape_score(trigger, level), 0);
+                        *slot = (shape_score((runs, tables), level), 0);
                     }
                     continue;
                 }

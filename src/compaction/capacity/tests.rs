@@ -252,6 +252,59 @@ fn room_taken_on_later_is_checked_and_held_until_the_reservation_goes() {
     assert_eq!(pool.quota_held(1), 0);
 }
 
+/// Room taken on later on a volume the reservation held nothing on is a
+/// grant of its own there, given back on drop; nothing taken on is no change.
+#[test]
+fn room_taken_on_another_volume_is_a_grant_of_its_own() {
+    let tables = MemFs::with_capacity(100 * MIB);
+    let blobs = MemFs::with_capacity(100 * MIB);
+    let blob_volume = Pool::Volume(blobs.volume_id(Path::new("/b")).expect("id"));
+    let pool = Arc::new(CapacityPool::default());
+    let room = pool
+        .reserve(1, &[demand(&tables, "/t", 10 * MIB)], Some(check(u64::MAX)))
+        .expect("fits");
+
+    assert!(room.try_add(&demand(&blobs, "/b", 0), check(u64::MAX)));
+    assert_eq!(pool.held(blob_volume), 0, "nothing taken on");
+    assert_eq!(pool.quota_held(1), 10 * MIB);
+
+    assert!(room.try_add(&demand(&blobs, "/b", 30 * MIB), check(u64::MAX)));
+    assert_eq!(pool.held(blob_volume), 30 * MIB);
+    assert_eq!(pool.quota_held(1), 40 * MIB);
+    drop(room);
+    assert_eq!(pool.held(blob_volume), 0);
+    assert_eq!(pool.quota_held(1), 0);
+}
+
+/// A file landed on a volume nothing was reserved on is excess whole: the
+/// quota takes it on while the volume keeps its floor, and it holds nothing
+/// of that volume's account, being written already.
+#[test]
+fn a_file_landed_on_an_unreserved_volume_is_excess() -> crate::Result<()> {
+    let tables = MemFs::with_capacity(100 * MIB);
+    let other = MemFs::with_capacity(100 * MIB);
+    let other_volume = Pool::Volume(other.volume_id(Path::new("/o")).expect("id"));
+    let pool = Arc::new(CapacityPool::default());
+    let room = pool
+        .reserve(1, &[demand(&tables, "/t", 10 * MIB)], Some(check(u64::MAX)))
+        .expect("fits");
+    room.landed(&other, Path::new("/o"), 5 * MIB)?;
+    assert_eq!(pool.quota_held(1), 15 * MIB);
+    assert_eq!(pool.held(other_volume), 0);
+    drop(room);
+    assert_eq!(pool.quota_held(1), 0);
+    Ok(())
+}
+
+/// The pool's debug form names it without dumping the account.
+#[test]
+fn the_pool_debugs_by_name() {
+    assert_eq!(
+        format!("{:?}", CapacityPool::default()),
+        "CapacityPool { .. }"
+    );
+}
+
 /// Folders with no volume id share the unproven pool though they may lie on
 /// volumes apart: each must hold what they take together, so the least free
 /// space any of them reports is the pool's.
