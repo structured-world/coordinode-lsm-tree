@@ -20,6 +20,8 @@ fn strategy(model: Model) -> Arc<Strategy> {
     )
 }
 
+/// A tree written uncompressed whatever codecs are built in: rounds are
+/// counted in bytes, which a codec's default would shrink.
 fn tree() -> crate::Result<(tempfile::TempDir, AnyTree)> {
     let dir = tempfile::tempdir()?;
     let tree = Config::new(
@@ -27,6 +29,7 @@ fn tree() -> crate::Result<(tempfile::TempDir, AnyTree)> {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
     .open()?;
     Ok((dir, tree))
 }
