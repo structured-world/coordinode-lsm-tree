@@ -420,11 +420,21 @@ impl<'a> LevelStages<'a> {
                 LevelRead::Planned(table_seqno, blocks, tally) => (table_seqno, blocks, tally),
                 LevelRead::Pending | LevelRead::Serial | LevelRead::Nothing => continue,
             };
-            // Every key a block task reads passed the table's gates.
-            tally.point_reads += blocks
-                .iter()
-                .map(|(_, positions)| positions.len())
-                .sum::<usize>();
+            // Every key a block task reads passed the table's gates, once
+            // however many blocks it is looked for in: blocks go in key
+            // order, so a key read in two is the last of one and the first of
+            // the next.
+            let mut last = None;
+            for &pos in blocks.iter().flat_map(|(_, positions)| positions) {
+                debug_assert!(
+                    last.is_none_or(|last| last <= pos),
+                    "positions in key order"
+                );
+                if last != Some(pos) {
+                    tally.point_reads += 1;
+                }
+                last = Some(pos);
+            }
             if tally != PlanCounts::default() {
                 probes.push((table, tally));
             }
