@@ -257,7 +257,6 @@ impl CapacityPool {
         demands: &[Demand<'_>],
         check: Option<Check>,
     ) -> Option<Reservation> {
-        let quota = Pool::Quota(tree);
         let mut held = self.held.lock();
         let (volumes, total) = gather(demands, check.is_some());
         if let Some(check) = check
@@ -265,13 +264,52 @@ impl CapacityPool {
         {
             return None;
         }
+        let room = self.take(&mut held, tree, volumes, total, check);
+        drop(held);
+        Some(room)
+    }
+
+    /// Reserves `demands` for a compaction of `tree` when `measured`, the
+    /// share of them its caller found room for, still fits beside what the
+    /// pool holds, checked and taken in one step: a pass sized to room it
+    /// measured earlier stops rather than write over room another compaction
+    /// took since. What it writes past the grant is taken on unchecked, as for
+    /// a reservation made without a check.
+    pub(crate) fn reserve_measured(
+        self: &Arc<Self>,
+        tree: TreeId,
+        demands: &[Demand<'_>],
+        measured: &[Demand<'_>],
+        check: Check,
+    ) -> Option<Reservation> {
+        let mut held = self.held.lock();
+        let (measured_volumes, measured_total) = gather(measured, true);
+        if !admits(&held, tree, &measured_volumes, measured_total, check) {
+            return None;
+        }
+        let (volumes, total) = gather(demands, false);
+        let room = self.take(&mut held, tree, volumes, total, None);
+        drop(held);
+        Some(room)
+    }
+
+    /// Takes `volumes`, `total` bytes in all, into `held`, the account
+    /// locked, as a reservation of `tree` growing under `check`.
+    fn take(
+        self: &Arc<Self>,
+        held: &mut crate::HashMap<Pool, u64>,
+        tree: TreeId,
+        volumes: Vec<(Pool, u64, u64)>,
+        total: u64,
+        check: Option<Check>,
+    ) -> Reservation {
+        let quota = Pool::Quota(tree);
         let released_at_start = self.quota_released(tree);
         for &(pool, bytes, _) in &volumes {
             *held.entry(pool).or_default() += bytes;
         }
         *held.entry(quota).or_default() += total;
-        drop(held);
-        Some(Reservation {
+        Reservation {
             pool: Arc::clone(self),
             check,
             tree,
@@ -288,11 +326,12 @@ impl CapacityPool {
                 quota: (quota, total),
             }),
             refused: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Reserves `demands` for a compaction of `tree` whatever is free, so that
     /// checked compactions sharing the pool still count them.
+    #[cfg(test)]
     pub(crate) fn hold(self: &Arc<Self>, tree: TreeId, demands: &[Demand<'_>]) -> Reservation {
         #[expect(
             clippy::expect_used,

@@ -479,6 +479,36 @@ fn read_mix_with_lookups_of_absent_keys_counts_them() -> crate::Result<()> {
     Ok(())
 }
 
+/// A projected scan counts in the read mix as a row scan does.
+#[cfg(feature = "columnar")]
+#[test]
+fn read_mix_with_a_projected_scan_counts_it() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+
+    let dir = tempfile::tempdir()?;
+    let AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    tree.update_runtime_config(|c| c.columnar = true)?;
+    for i in 0..100u64 {
+        tree.insert(format!("k{i:04}"), "v", i);
+    }
+    tree.flush_active_memtable(0)?;
+    let rows: u32 = tree
+        .columnar_scan(&[COL_USER_KEY][..], None, SeqNo::MAX, ..)?
+        .map(|batch| batch.map(|b| b.row_count))
+        .sum::<crate::Result<u32>>()?;
+    assert_eq!(rows, 100);
+    assert_eq!(tree.current_version().read_mix().counts(), (0, 1));
+    Ok(())
+}
+
 /// The budget a tree's own limiter gives is the live one: a rate changed
 /// after open is the rate the planner sees.
 #[test]

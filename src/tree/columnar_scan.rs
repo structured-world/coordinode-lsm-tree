@@ -318,6 +318,8 @@ impl Tree {
         // since may have dropped the newest seqno, and a cap below a version
         // the pinned tables still hold would surface an older one.
         let super_version = self.get_version_for_snapshot(seqno)?;
+        // A projected scan is a scan of the read mix, as a row-major one is.
+        super_version.version.read_mix().note_scan();
         let highest = super_version
             .active_memtable
             .get_highest_seqno()

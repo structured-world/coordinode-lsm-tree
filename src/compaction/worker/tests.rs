@@ -701,6 +701,56 @@ fn a_failed_tight_space_pass_counts_the_work_of_the_slices_it_installed() -> cra
     Ok(())
 }
 
+/// A tight-space pass reserves each slice against what the pool holds when
+/// the slice starts: room another tree took after the pass measured it is not
+/// written over, and the pass stops before a slice that no longer fits.
+#[test]
+fn tight_space_slice_with_its_room_taken_meanwhile_does_not_run() -> crate::Result<()> {
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()));
+    let squeeze = Arc::clone(&config.tight_slice_squeeze);
+    let crate::AnyTree::Standard(tree) = config.open()? else {
+        panic!("expected Standard tree");
+    };
+    for i in 0..TIGHT_SPACE_KEYS {
+        tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
+    }
+    tree.flush_active_memtable(0)?;
+    // Some room, far below what a whole merge writes: the pass slices.
+    mem.set_capacity(tree.storage_stats()?.used_bytes + 8 * 1_024);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    // Another tree takes far more than the volume holds once the pass has
+    // measured it.
+    squeeze.store(u64::MAX / 4, Ordering::SeqCst);
+    let result = tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Nothing,
+        "{result:?}"
+    );
+    assert_eq!(mem.punched_bytes(), 0, "no slice ran");
+    for i in 0..TIGHT_SPACE_KEYS {
+        assert!(
+            tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .is_some()
+        );
+    }
+    Ok(())
+}
+
 /// The post-commit sidecar-write window under MANIFEST LOSS: a committed
 /// slice whose `.restrict-bound` write failed leaves an UNPUNCHED input
 /// beside its slice outputs (the punch never arms without the sidecar).

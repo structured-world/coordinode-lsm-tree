@@ -456,6 +456,33 @@ fn window_into_a_tiered_level_from_two_runs_takes_both_or_waits() -> crate::Resu
     Ok(())
 }
 
+/// L0 set never to trigger takes no free move to the last level of an empty
+/// tree either.
+#[test]
+fn l0_set_never_to_trigger_over_an_empty_tree_makes_no_move() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    let version = tree.current_version();
+    assert!(
+        matches!(
+            Strategy::default().choose(&version, tree.tree_config(), &CompactionState::default()),
+            Choice::Move(_)
+        ),
+        "the leveled L0 moves its run to the last level",
+    );
+    let never = LevelPolicy {
+        trigger: Trigger::Never,
+        ..tiered_never()
+    };
+    let choice = Strategy::default().with_level_policy(0, never).choose(
+        &version,
+        tree.tree_config(),
+        &CompactionState::default(),
+    );
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+    Ok(())
+}
+
 /// Writes keys `from..to` at `round` and flushes them into one table.
 fn write_span(tree: &crate::AnyTree, (from, to): (u64, u64), round: u64) -> crate::Result<()> {
     for i in from..to {

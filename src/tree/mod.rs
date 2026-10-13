@@ -1876,6 +1876,9 @@ impl AbstractTree for Tree {
         let key = key.as_ref();
 
         let super_version = self.snapshot_for_read(seqno)?;
+        // Counted here, not in the lookup: a columnar scan resolving merge
+        // operands looks keys up too, as part of the scan it counts.
+        super_version.version.read_mix().note_points(1);
 
         Self::resolve_or_passthrough(
             &super_version,
@@ -1892,6 +1895,7 @@ impl AbstractTree for Tree {
     // a separated base is not read.
     fn contains_key<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<bool> {
         let super_version = self.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
         Ok(Self::get_value(
             &super_version,
             key.as_ref(),
@@ -1970,6 +1974,7 @@ impl AbstractTree for Tree {
 
         // For small batches, use the simple per-key path
         if n <= 2 {
+            super_version.version.read_mix().note_points(n as u64);
             return keys
                 .iter()
                 .map(|key| {
@@ -3595,7 +3600,6 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<(ValueType, SeqNo, crate::Slice)>> {
-        super_version.version.read_mix().note_points(1);
         if let Some(entry) = super_version.active_memtable.get(key, seqno) {
             let Some(entry) = ignore_tombstone_value(entry) else {
                 return Ok(None);

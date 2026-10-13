@@ -1201,8 +1201,12 @@ impl CompactionStrategy for Strategy {
         let cmp = config.comparator.as_ref();
         let last = version.level_count() - 1;
 
-        // Trivial move into Lmax
+        // Trivial move into Lmax: free, so taken whatever L0's trigger says,
+        // unless L0 is set never to start a compaction.
         'trivial_lmax: {
+            if self.policy(0, 0, last).trigger == Trigger::Never {
+                break 'trivial_lmax;
+            }
             #[expect(
                 clippy::expect_used,
                 reason = "level 0 is guaranteed to exist in a valid version"

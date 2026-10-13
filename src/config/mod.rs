@@ -1032,6 +1032,12 @@ pub struct Config {
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_after_first_slice: Arc<core::sync::atomic::AtomicBool>,
 
+    /// Test-only: bytes another tree sharing the capacity pool takes on the
+    /// destination volume right before a tight-space pass reserves its first
+    /// slice, after the pass measured the room. Behind `cfg(test)`.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) tight_slice_squeeze: Arc<core::sync::atomic::AtomicU64>,
+
     /// Test-only failpoint: when armed, a tight-space relocation fails at the
     /// restricted-blob reopen step of its current slice — after the slice's
     /// outputs were finalized but before the install — so the pre-install
@@ -1218,6 +1224,8 @@ impl Default for Config {
             )),
             #[cfg(all(test, feature = "std"))]
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            tight_slice_squeeze: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]

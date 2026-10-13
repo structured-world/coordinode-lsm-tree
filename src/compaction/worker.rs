@@ -1572,8 +1572,12 @@ fn run_tight_space_compaction(
     // input block (`tight_slice_boundaries` returns empty, so no reclaim
     // happens at all) or a slice the blob volume cannot hold.
     let blob_dir = opts.config.path.join(BLOBS_FOLDER);
+    let blob_free = if relocating && stale_total_bytes > 0 {
+        opts.capacity.available(&*opts.config.fs, &blob_dir)
+    } else {
+        0
+    };
     let physical_budget = if relocating && stale_total_bytes > 0 {
-        let blob_free = opts.capacity.available(&*opts.config.fs, &blob_dir);
         let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
         // A slice covering `b` SST bytes writes `b` to the SST volume and
         // `b * stale_total / inputs_total` to the blob volume. Separate pools
@@ -1612,10 +1616,16 @@ fn run_tight_space_compaction(
     opts.work.plan(estimate);
 
     // Each slice holds the room one slice takes, so the compactions sharing
-    // the pool count it. Unchecked: the budget was sized to what is free past
-    // what the pool holds, and this is the pass that frees room. A slice
-    // writes at most the inputs' bytes to the tables and their share of the
-    // stale files to the blob folder.
+    // the pool count it. A slice writes at most the inputs' bytes to the
+    // tables and their share of the stale files to the blob folder.
+    //
+    // Checked as each slice starts, in one step with taking it: the budget
+    // was sized to what was free when the pass measured it, and another
+    // compaction sharing the pool may have taken that room since, or between
+    // two slices. A slice that no longer fits ends the pass there, its
+    // installed slices kept; the next compaction picks up the rest. The flush
+    // floor may be taken: this is the pass that frees room. The quota is not
+    // checked again: the budget already keeps every slice within it.
     let slice_tables = slice_budget.min(inputs_total);
     let slice_blobs = if relocating {
         // At most `stale_total_bytes`, so it fits a u64.
@@ -1641,9 +1651,55 @@ fn run_tight_space_compaction(
                 bytes: slice_blobs,
             },
         ];
-        opts.outputs
-            .reserve(opts.capacity.hold(opts.tree_id, &demands));
+        #[cfg(all(test, feature = "std"))]
+        {
+            let squeeze = opts
+                .config
+                .tight_slice_squeeze
+                .swap(0, core::sync::atomic::Ordering::SeqCst);
+            if squeeze > 0 {
+                // Another tree's hold, kept for the life of the pool.
+                core::mem::forget(opts.capacity.hold(
+                    TreeId::MAX,
+                    &[super::capacity::Demand {
+                        fs: &*dest_fs,
+                        path: &dest_path,
+                        bytes: squeeze,
+                    }],
+                ));
+            }
+        }
+        // What the pass measured room for: a slice past it was sized to
+        // writing into what its own inputs free as it goes.
+        let measured = [
+            super::capacity::Demand {
+                fs: &*dest_fs,
+                path: &dest_path,
+                bytes: slice_tables.min(dest_free),
+            },
+            super::capacity::Demand {
+                fs: &*opts.config.fs,
+                path: &blob_dir,
+                bytes: slice_blobs.min(blob_free),
+            },
+        ];
+        let check = super::capacity::Check {
+            quota_headroom: u64::MAX,
+            floor: super::capacity::Floor::MayConsume,
+        };
+        match opts
+            .capacity
+            .reserve_measured(opts.tree_id, &demands, &measured, check)
+        {
+            Some(room) => {
+                opts.outputs.reserve(room);
+                true
+            }
+            None => false,
+        }
     };
+    // Set when a slice no longer fits: the pass ends there.
+    let mut stopped = false;
 
     // Hide the inputs so the strategy cannot re-select them mid-loop.
     compaction_state
@@ -1689,7 +1745,10 @@ fn run_tight_space_compaction(
         let mut tables_out = 0usize;
 
         for boundary in &boundaries {
-            reserve_slice();
+            if !reserve_slice() {
+                stopped = true;
+                return Ok(tables_out);
+            }
             // Merge [lower, boundary) over the surviving (restricted) input views.
             let slice_payload = slice_payload_for(&current_views, payload);
             let version = opts.version_history.read().latest_version();
@@ -2137,7 +2196,10 @@ fn run_tight_space_compaction(
         // Tail [last boundary, hi): merge the remainder, remove the inputs, and
         // drop the now fully-consumed stale blob files (install_merge deletes
         // them outright — the prior slices already punched their prefixes).
-        reserve_slice();
+        if !reserve_slice() {
+            stopped = true;
+            return Ok(tables_out);
+        }
         let slice_payload = slice_payload_for(&current_views, payload);
         let version = opts.version_history.read().latest_version();
         let tail_reloc = if relocating {
@@ -2194,6 +2256,10 @@ fn run_tight_space_compaction(
         .show(payload.table_ids.iter().copied());
 
     let tables_out = result?;
+    if stopped && tables_out == 0 {
+        log::info!("Tight-space compaction stopped: its first slice no longer fits the room left");
+        return Ok(CompactionResult::nothing());
+    }
 
     Ok(CompactionResult {
         action: CompactionAction::Merged,

@@ -57,6 +57,49 @@ fn prefix_to_range_char_max_2() {
     test_prefix(&[0, 2, 255], Excluded(&[0, 3]));
 }
 
+/// A batch scan opened over the whole keyspace counts only the tables its
+/// intervals read, not every table it opened a source over.
+#[test]
+fn batch_scan_counts_only_the_tables_its_intervals_read() -> crate::Result<()> {
+    use crate::version::run::Ranged;
+    use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    // Two overlapping flushes: two runs of one table each.
+    for (from, round) in [(0u64, 0u64), (50, 1)] {
+        for i in from..from + 100 {
+            tree.insert(format!("k{i:04}"), "v", round * 1_000 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let read = tree
+        .batch_range_scan(
+            ["k0000".to_string()..="k0010".to_string()],
+            SeqNo::MAX,
+            None,
+        )
+        .count();
+    assert_eq!(read, 11);
+    let mut scans: Vec<_> = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| (table.key_range().min().clone(), table.scans()))
+        .collect();
+    scans.sort();
+    assert_eq!(
+        scans.into_iter().map(|(_, n)| n).collect::<Vec<_>>(),
+        [1, 0],
+        "the table past the interval was not read"
+    );
+    Ok(())
+}
+
 /// The key up to and including its first ':'.
 struct UpToColon;
 
