@@ -269,25 +269,39 @@ impl CapacityPool {
         Some(room)
     }
 
-    /// Reserves `demands` for a compaction of `tree` when `measured`, the
-    /// share of them its caller found room for, still fits beside what the
-    /// pool holds, checked and taken in one step: a pass sized to room it
-    /// measured earlier stops rather than write over room another compaction
-    /// took since. What it writes past the grant is taken on unchecked, as for
-    /// a reservation made without a check.
-    pub(crate) fn reserve_measured(
+    /// What the reservations sharing the volume of the folder `path` hold.
+    pub(crate) fn held_on(&self, fs: &dyn Fs, path: &Path) -> u64 {
+        held_against(&self.held.lock(), Pool::of(fs, path))
+    }
+
+    /// Reserves `demands` for a compaction of `tree` when, on the volume of
+    /// each, the reservations sharing it hold no more than its `limit`,
+    /// checked and taken in one step: a pass that sized its work to the room
+    /// it measured, leaving the others that much, stops rather than write over
+    /// room another compaction took since. Its own writes are not checked
+    /// here, nor what it writes past the grant, as for a reservation made
+    /// without a check.
+    pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,
-        demands: &[Demand<'_>],
-        measured: &[Demand<'_>],
-        check: Check,
+        demands: &[(Demand<'_>, u64)],
     ) -> Option<Reservation> {
         let mut held = self.held.lock();
-        let (measured_volumes, measured_total) = gather(measured, true);
-        if !admits(&held, tree, &measured_volumes, measured_total, check) {
+        let taken_since = demands.iter().any(|(demand, limit)| {
+            demand.bytes > 0 && held_against(&held, Pool::of(demand.fs, demand.path)) > *limit
+        });
+        if taken_since {
             return None;
         }
-        let (volumes, total) = gather(demands, false);
+        let demands: Vec<Demand<'_>> = demands
+            .iter()
+            .map(|(demand, _)| Demand {
+                fs: demand.fs,
+                path: demand.path,
+                bytes: demand.bytes,
+            })
+            .collect();
+        let (volumes, total) = gather(&demands, false);
         let room = self.take(&mut held, tree, volumes, total, None);
         drop(held);
         Some(room)

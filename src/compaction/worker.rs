@@ -1511,6 +1511,8 @@ fn run_tight_space_compaction(
     let inputs_total: u64 = inputs.iter().map(Table::file_len).sum();
     // What the compactions sharing the pool have still to write is not free.
     let dest_free = opts.capacity.available(&*dest_fs, &dest_path);
+    // What they held then: the slices are sized to the room left past it.
+    let dest_held = opts.capacity.held_on(&*dest_fs, &dest_path);
     if dest_free < inputs_total {
         // Only a PROVEN different volume forfeits the relief; an unproven pair
         // counts as shared, leaving the single-volume default untouched.
@@ -1577,6 +1579,7 @@ fn run_tight_space_compaction(
     } else {
         0
     };
+    let blob_held = opts.capacity.held_on(&*opts.config.fs, &blob_dir);
     let physical_budget = if relocating && stale_total_bytes > 0 {
         let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
         // A slice covering `b` SST bytes writes `b` to the SST volume and
@@ -1620,12 +1623,14 @@ fn run_tight_space_compaction(
     // tables and their share of the stale files to the blob folder.
     //
     // Checked as each slice starts, in one step with taking it: the budget
-    // was sized to what was free when the pass measured it, and another
-    // compaction sharing the pool may have taken that room since, or between
-    // two slices. A slice that no longer fits ends the pass there, its
-    // installed slices kept; the next compaction picks up the rest. The flush
-    // floor may be taken: this is the pass that frees room. The quota is not
-    // checked again: the budget already keeps every slice within it.
+    // was sized to what was free past what the other compactions sharing the
+    // pool held when the pass measured it, and another may have taken that
+    // room since, or between two slices. Only their holds are checked: the
+    // pass's own slices write ahead of the punches that free their inputs, so
+    // its room between slices is not what it measured and is not the
+    // question. A slice the others left no room for ends the pass there, its
+    // installed slices kept; the next compaction picks up the rest. The quota
+    // is not checked again: the budget already keeps every slice within it.
     let slice_tables = slice_budget.min(inputs_total);
     let slice_blobs = if relocating {
         // At most `stale_total_bytes`, so it fits a u64.
@@ -1669,31 +1674,17 @@ fn run_tight_space_compaction(
                 ));
             }
         }
-        // What the pass measured room for: a slice past it was sized to
-        // writing into what its own inputs free as it goes.
-        let measured = [
-            super::capacity::Demand {
-                fs: &*dest_fs,
-                path: &dest_path,
-                bytes: slice_tables.min(dest_free),
-            },
-            super::capacity::Demand {
-                fs: &*opts.config.fs,
-                path: &blob_dir,
-                bytes: slice_blobs.min(blob_free),
-            },
+        // What the others may hold on each volume: what they held when the
+        // pass measured it, and what room a slice left past it then. The slack
+        // is never below none.
+        let [tables, blobs] = demands;
+        let within = [
+            (tables, dest_held + dest_free.saturating_sub(slice_tables)),
+            (blobs, blob_held + blob_free.saturating_sub(slice_blobs)),
         ];
-        let check = super::capacity::Check {
-            quota_headroom: u64::MAX,
-            floor: super::capacity::Floor::MayConsume,
-        };
-        // The slice before is installed: what it held is not this one's to
-        // be checked against.
+        // The slice before is installed: what it held is not the others'.
         opts.outputs.release_room();
-        match opts
-            .capacity
-            .reserve_measured(opts.tree_id, &demands, &measured, check)
-        {
+        match opts.capacity.reserve_within(opts.tree_id, &within) {
             Some(room) => {
                 opts.outputs.reserve(room);
                 true
