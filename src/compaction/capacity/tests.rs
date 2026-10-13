@@ -46,6 +46,33 @@ fn a_folder_written_nothing_does_not_refuse_a_reservation() {
     );
 }
 
+/// A slice reserved within the room it measured is checked against the tree's
+/// quota as it stands: what does not fit it is refused, however much room the
+/// volume keeps.
+#[test]
+fn reservation_within_its_room_is_refused_past_the_quota() {
+    let fs = MemFs::with_capacity(100 * MIB);
+    let pool = Arc::new(CapacityPool::default());
+    assert!(
+        pool.reserve_within(
+            1,
+            &[(demand(&fs, "/tables", MIB), u64::MAX)],
+            check(MIB / 2)
+        )
+        .is_none(),
+        "a MiB does not fit half a MiB of quota",
+    );
+    assert!(
+        pool.reserve_within(
+            1,
+            &[(demand(&fs, "/tables", MIB), u64::MAX)],
+            check(2 * MIB)
+        )
+        .is_some(),
+        "it fits two",
+    );
+}
+
 /// Two compactions on one volume cannot both take the same free bytes: the
 /// second is checked against what the first holds, and the room the first
 /// gives back as it goes is the second's again.

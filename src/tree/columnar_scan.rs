@@ -1101,6 +1101,11 @@ impl ColumnarScan {
             }
         }
         let predicate = predicate.filter(|_| !whole);
+        // Every segment of the scan is opened here once: its table counts the
+        // scan as reaching it, as a row scan's tables do.
+        if let Source::Columnar(table) | Source::RowTable(table) = &seg.source {
+            table.note_scan();
+        }
         let cursor = match &seg.source {
             Source::Columnar(table) => SourceCursor::Columnar(Box::new(table.columnar_cursor(
                 &ids,

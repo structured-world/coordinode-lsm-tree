@@ -287,8 +287,9 @@ impl CapacityPool {
     /// each, the reservations sharing it hold no more than its `limit`,
     /// checked and taken in one step: a pass that sized its work to the room
     /// it measured, leaving the others that much, stops rather than write over
-    /// room another compaction took since. Its own writes are not checked
-    /// here; what it writes past the grant is, against `check`, as it lands.
+    /// room another compaction took since. Its own writes are checked against
+    /// the tree's quota in `check`, not against the volumes' room it measured;
+    /// what it writes past the grant is checked against `check` as it lands.
     pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,
@@ -311,6 +312,16 @@ impl CapacityPool {
             })
             .collect();
         let (volumes, total) = gather(&demands, false);
+        // The quota is the tree's own limit, not room another took: what the
+        // slice writes has to fit what it leaves past the tree's holds, as it
+        // stands now.
+        if total
+            > check
+                .quota_headroom
+                .saturating_sub(held_against(&held, Pool::Quota(tree)))
+        {
+            return None;
+        }
         let room = self.take(&mut held, tree, volumes, total, Some(check));
         drop(held);
         Some(room)

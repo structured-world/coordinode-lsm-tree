@@ -100,6 +100,36 @@ fn batch_scan_counts_only_the_tables_its_intervals_read() -> crate::Result<()> {
     Ok(())
 }
 
+/// A batch scan reading a table whose rows are all past its snapshot counts
+/// on it: it read the table, though it returns none of its rows.
+#[test]
+fn batch_scan_reading_rows_past_its_snapshot_counts_the_table() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..100u64 {
+        tree.insert(format!("k{i:04}"), "v", 1_000 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let read = tree
+        .batch_range_scan(["k0000".to_string()..="k0010".to_string()], 500, None)
+        .count();
+    assert_eq!(read, 0, "every row is past the snapshot");
+    let scans: Vec<u64> = tree
+        .current_version()
+        .iter_tables()
+        .map(crate::table::Table::scans)
+        .collect();
+    assert_eq!(scans, [1]);
+    Ok(())
+}
+
 /// A batch scan whose intervals all fall in one table of a run counts once
 /// on it, as the batch counts once in the read mix.
 #[expect(clippy::expect_used, reason = "test code")]

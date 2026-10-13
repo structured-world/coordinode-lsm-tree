@@ -462,6 +462,28 @@ fn choose_on_two_levels_merges_the_top_into_the_last() -> crate::Result<()> {
     Ok(())
 }
 
+/// A merge that copies its groups reads them through the same limiter as one
+/// that encodes them: under a budget, copying takes as long as the budget
+/// lets it, however fast the model says copying is.
+#[test]
+fn merge_time_of_copied_groups_under_a_budget_is_the_budgets() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_round(&tree, 0)?;
+    let model = Model {
+        copied_share: 1.0,
+        ..Model::default()
+    };
+    let inputs = strategy(model).inputs(&tree.current_version(), UNIT, 1_000);
+    #[expect(clippy::cast_precision_loss, reason = "test arithmetic")]
+    let expected = UNIT as f64 / 1_000.0;
+    assert!(
+        (inputs.merge_secs - expected).abs() < 1e-9,
+        "{} against {expected}",
+        inputs.merge_secs
+    );
+    Ok(())
+}
+
 /// A top level at its table count owes all of it, though its bytes are under
 /// a unit: the strategy sends it down then, and a debt of nothing would say
 /// the tree is caught up.
@@ -594,6 +616,42 @@ fn read_mix_with_blob_point_lookups_counts_each_once() -> crate::Result<()> {
     assert!(tree.get_cells("row", SeqNo::MAX)?.is_some());
     let (points, scans) = tree.current_version().read_mix().counts();
     assert_eq!((points - before, scans), (9, 0));
+    Ok(())
+}
+
+/// A projected scan counts on the table it reads, as a row scan does, so the
+/// hottest window sees the ranges a projecting workload reads.
+#[cfg(feature = "columnar")]
+#[test]
+fn projected_scan_counts_on_the_table_it_reads() -> crate::Result<()> {
+    use crate::table::columnar::COL_USER_KEY;
+
+    let dir = tempfile::tempdir()?;
+    let AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    else {
+        panic!("a standard tree");
+    };
+    tree.update_runtime_config(|c| c.columnar = true)?;
+    for i in 0..100u64 {
+        tree.insert(format!("k{i:04}"), "v", i);
+    }
+    tree.flush_active_memtable(0)?;
+    let rows: u32 = tree
+        .columnar_scan(&[COL_USER_KEY][..], None, SeqNo::MAX, ..)?
+        .map(|batch| batch.map(|b| b.row_count))
+        .sum::<crate::Result<u32>>()?;
+    assert_eq!(rows, 100);
+    let scans: Vec<u64> = tree
+        .current_version()
+        .iter_tables()
+        .map(crate::table::Table::scans)
+        .collect();
+    assert_eq!(scans, [1]);
     Ok(())
 }
 

@@ -263,7 +263,7 @@ impl Strategy {
     /// one set. The rate is the model's, capped by `budget`, the bytes per
     /// second the tree's compactions may use (`0` for no limit).
     fn size_ratio(&self, budget: u64) -> u32 {
-        let paid = encode_rate(self.model.encode_rate, budget) / self.model.write_rate.max(1);
+        let paid = within_budget(self.model.encode_rate, budget) / self.model.write_rate.max(1);
         // Below two units per unit written no ratio is paid for; the floor of
         // one is the cheapest round there is.
         let paid = u32::try_from(paid.saturating_sub(2)).unwrap_or(u32::MAX);
@@ -315,7 +315,9 @@ impl Strategy {
             }
         });
         let model = self.model;
-        let encode_rate = encode_rate(model.encode_rate, budget).max(1);
+        // A copied group is read through the same limiter as an encoded one.
+        let encode_rate = within_budget(model.encode_rate, budget).max(1);
+        let copy_rate = within_budget(model.copy_rate, budget).max(1);
         #[expect(
             clippy::cast_precision_loss,
             reason = "seconds of a unit, approximate by nature"
@@ -323,7 +325,7 @@ impl Strategy {
         let (unit, write_rate, copy_rate, encode_rate) = (
             unit as f64,
             model.write_rate.max(1) as f64,
-            model.copy_rate.max(1) as f64,
+            copy_rate as f64,
             encode_rate as f64,
         );
         let copied = model.copied_share.clamp(0.0, 1.0);
@@ -339,9 +341,9 @@ impl Strategy {
     }
 }
 
-/// The bytes a merge may encode per second: the model's rate, capped by the
-/// tree's compaction `budget` when it has one (`0` for none).
-fn encode_rate(model_rate: u64, budget: u64) -> u64 {
+/// The bytes a merge may encode or copy per second: the model's rate, capped
+/// by the tree's compaction `budget` when it has one (`0` for none).
+fn within_budget(model_rate: u64, budget: u64) -> u64 {
     match budget {
         0 => model_rate,
         budget => model_rate.min(budget),

@@ -1022,9 +1022,9 @@ struct TableLeaf {
     table: crate::table::Table,
     iter: crate::table::iter::Iter,
     seqno: SeqNo,
-    /// Whether the table was counted as reached: on the first row it yields,
-    /// since a source opened over the whole keyspace and repositioned to
-    /// intervals may never be read at all.
+    /// Whether the table was counted as reached: on the first row read from
+    /// it, seen by the snapshot or not, since a source opened over the whole
+    /// keyspace and repositioned to intervals may never be read at all.
     noted: bool,
 }
 
@@ -1039,7 +1039,7 @@ impl TableLeaf {
         }
     }
 
-    /// Counts the scan on the table the first time it yields a row.
+    /// Counts the scan on the table the first time a row is read from it.
     fn note_read(&mut self) {
         if !self.noted {
             self.table.note_scan();
@@ -1050,11 +1050,12 @@ impl TableLeaf {
     fn next_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => {
+                Ok(value) => {
                     self.note_read();
-                    return Some(Ok(value));
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1063,11 +1064,12 @@ impl TableLeaf {
     fn next_back_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next_back()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => {
+                Ok(value) => {
                     self.note_read();
-                    return Some(Ok(value));
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => return Some(Err(e)),
             }
         }
