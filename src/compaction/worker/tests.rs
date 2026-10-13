@@ -1884,6 +1884,10 @@ fn a_relocation_retry_resumes_at_the_committed_blob_frontier() -> crate::Result<
     }
 
     let punched_before = mem.punched_bytes();
+    // Less room than what is left to relocate, so the retry runs in slices
+    // too rather than in one go.
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 16);
     tree.index.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
