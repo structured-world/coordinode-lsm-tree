@@ -47,12 +47,18 @@ impl CompactionStrategy for Merge {
     }
 
     fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
-        Choice::Merge(Input {
+        Choice::Merge(self.input())
+    }
+}
+
+impl Merge {
+    fn input(&self) -> Input {
+        Input {
             table_ids: self.0.iter().copied().collect(),
             dest_level: self.1,
             canonical_level: self.1,
             target_size: OUTPUT_TARGET,
-        })
+        }
     }
 }
 
@@ -535,17 +541,28 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
     let inputs = tables(&tree, 1);
     assert_eq!(inputs.len(), 1, "the merge reads one table");
     let boundaries = boundaries_of(&tables(&tree, 3));
-    // Free space unknown, so the quota caps the slices, as in the pass.
+    // The slices as the pass cuts them: free space unknown, so the quota caps
+    // them, and their outputs cut on the level below at the merge's target.
+    let merge = Merge(inputs.iter().map(Table::id).collect(), 2);
+    let payload = merge.input();
+    let opts = super::Options::from_tree(&tree, Arc::new(Merge(merge.0.clone(), merge.1)));
+    let cut_keys =
+        crate::compaction::flavour::output_cut_keys(&tree.current_version(), &opts, &payload);
     let caps = super::SliceCaps {
         tables: u64::MAX,
         blobs: u64::MAX,
         total: HEADROOM,
     };
-    let slice_ends: Vec<u32> = super::tight_slices(&inputs, caps, None, &tree.config.comparator)?
-        .iter()
-        .filter_map(|slice| slice.end.as_ref())
-        .map(|end| index(end))
-        .collect();
+    let outputs = super::SliceOutputs {
+        target_size: OUTPUT_TARGET,
+        cut_keys: &cut_keys,
+    };
+    let slice_ends: Vec<u32> =
+        super::tight_slices(&inputs, caps, &outputs, None, &tree.config.comparator)?
+            .iter()
+            .filter_map(|slice| slice.end.as_ref())
+            .map(|end| index(end))
+            .collect();
     assert!(
         slice_ends.len() > 2,
         "the pass runs in slices: {slice_ends:?}"

@@ -187,6 +187,20 @@ pub(super) fn plan_filters(
 /// the next one, in key order, starts above; tables that overlap, in a level
 /// holding several runs, have none between them, since an output reaching
 /// either reaches both.
+/// The keys a merge of `payload` ends its outputs on, past the target size:
+/// the boundaries of the level below it meets, in key order.
+#[cfg(feature = "std")]
+pub(super) fn output_cut_keys(
+    version: &Version,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> Vec<crate::UserKey> {
+    next_level_boundaries(version, opts, payload, inputs_span(version, opts, payload))
+        .iter()
+        .map(|boundary| boundary.key.clone())
+        .collect()
+}
+
 fn next_level_boundaries(
     version: &Version,
     opts: &Options,

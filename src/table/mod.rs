@@ -891,6 +891,24 @@ impl Table {
         self.regions.filter.map(|x| x.size()).unwrap_or_default()
     }
 
+    /// The bytes of the sections that grow with the table's data: its index,
+    /// filter and their top-level blocks.
+    #[cfg(feature = "std")]
+    pub(crate) fn data_scaled_section_bytes(&self) -> u64 {
+        let regions = &self.regions;
+        [
+            Some(regions.tli),
+            regions.tli_tail,
+            regions.index,
+            regions.filter,
+            regions.filter_tli,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|handle| u64::from(handle.size()))
+        .sum()
+    }
+
     #[must_use]
     pub fn pinned_filter_size(&self) -> usize {
         self.pinned_filter_block

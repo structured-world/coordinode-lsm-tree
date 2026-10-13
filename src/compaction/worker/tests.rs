@@ -1821,8 +1821,10 @@ fn a_tight_space_slice_reclaims_stale_frames_no_pointer_claims() -> crate::Resul
         *gen1.first().expect("the first generation's blob file")
     };
 
+    // Less room than the live quarter's frames, so the pass relocates them in
+    // slices, the dead frames' keys first.
     let used = tree.storage_stats()?.used_bytes;
-    mem.set_capacity(used + used / 4);
+    mem.set_capacity(used + used / 16);
     tree.index.update_runtime_config(|c| {
         c.tight_space_compaction = true;
     })?;

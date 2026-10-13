@@ -1364,6 +1364,14 @@ struct SliceCaps {
     total: u64,
 }
 
+/// The tables a slice writes: one is opened for every `target_size` bytes,
+/// and one more on every key of `cut_keys` (in key order) the slice passes.
+#[cfg(feature = "std")]
+struct SliceOutputs<'a> {
+    target_size: u64,
+    cut_keys: &'a [UserKey],
+}
+
 /// What a relocating pass moves: the frames its inputs point at in the
 /// `stale` blob files, written into files of `target_size` bytes, a file for
 /// each of `file_groups` codecs and lifetime classes at once.
@@ -1425,15 +1433,17 @@ fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate
 /// and, in a relocating pass, the frames its entries point at in the stale
 /// blob files, which the slice relocates: values are not spread evenly over
 /// the keys, so a share of the table's bytes says nothing of a share of
-/// theirs. A slice ends before the block that would take it past a cap, on
-/// the last key of the block before. The keys it ends before go to the next
-/// slice, so that one counts the blocks ending on it again. A block of a
-/// restricted input below its restriction is punched and writes nothing. A
-/// single slice means nothing to cut: the pass reclaims nothing on the way.
+/// theirs. A slice's tables weigh their blocks and the bytes each table it
+/// opens holds past them, as `outputs` counts them. A slice ends before the
+/// block that would take it past a cap, on the last key of the block
+/// before. The keys it ends before go to the next slice, so that one counts
+/// the blocks ending on it again. A block of a restricted input below its
+/// restriction is punched and writes nothing.
 #[cfg(feature = "std")]
 fn tight_slices(
     inputs: &[Table],
     caps: SliceCaps,
+    outputs: &SliceOutputs<'_>,
     relocated: Option<&Relocated<'_>>,
     comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<Vec<TightSlice>> {
@@ -1446,12 +1456,25 @@ fn tight_slices(
     let cmp = comparator.as_ref();
     let mut blocks: Vec<Block> = Vec::new();
     let mut longest_key = 0u64;
+    // What a table holds past its blocks and the sections that grow with
+    // them, at the least the inputs show: the bytes every table takes
+    // however few blocks it holds. The rest of a table's bytes go with its
+    // blocks, in each block's share of the file.
+    let mut fixed: Option<u64> = None;
     for input in inputs {
         let handles = input
             .maintenance_index_walk()
             .collect::<crate::Result<Vec<_>>>()?;
         // Bounded by the file's length.
         let data_bytes: u64 = handles.iter().map(|h| u64::from(h.size())).sum();
+        // A file shorter than its sections says nothing of the rest.
+        if let Some(past_blocks) = input
+            .file_len()
+            .checked_sub(data_bytes)
+            .and_then(|past| past.checked_sub(input.data_scaled_section_bytes()))
+        {
+            fixed = Some(fixed.map_or(past_blocks, |least| least.min(past_blocks)));
+        }
         for handle in handles {
             let end_key = handle.end_key().clone();
             if input
@@ -1485,12 +1508,27 @@ fn tight_slices(
         }
     }
     blocks.sort_by(|a, b| cmp.compare(&a.end_key, &b.end_key));
+    let fixed = fixed.unwrap_or(0);
+    // A table opened on a cut key weighs on the block that passes it.
+    let mut cut_keys = outputs.cut_keys.iter().peekable();
+    for block in &mut blocks {
+        while cut_keys
+            .next_if(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Greater)
+            .is_some()
+        {
+            block.tables += fixed;
+        }
+    }
 
-    // Every sum is bounded by the inputs' and the stale files' bytes.
+    // Every sum is bounded by the inputs' and the stale files' bytes. The
+    // first table of a slice and every one past a target's worth of blocks
+    // weigh their fixed bytes too.
+    let with_tables = |tables: u64| tables + fixed * (1 + tables / outputs.target_size.max(1));
     let past = |acc: (u64, u64), block: &Block| {
-        acc.0 + block.tables > caps.tables
+        let tables = with_tables(acc.0 + block.tables);
+        tables > caps.tables
             || acc.1 + block.blobs > caps.blobs
-            || acc.0 + acc.1 + block.tables + block.blobs > caps.total
+            || tables + acc.1 + block.blobs > caps.total
     };
     let mut slices = Vec::new();
     let mut acc = (0u64, 0u64);
@@ -1507,7 +1545,7 @@ fn tight_slices(
             {
                 slices.push(TightSlice {
                     end: Some(key.clone()),
-                    tables: acc.0,
+                    tables: with_tables(acc.0),
                     blobs: acc.1,
                 });
                 acc = on_last_key;
@@ -1520,7 +1558,7 @@ fn tight_slices(
     }
     slices.push(TightSlice {
         end: None,
-        tables: acc.0,
+        tables: with_tables(acc.0),
         blobs: acc.1,
     });
 
@@ -1712,6 +1750,7 @@ fn run_tight_space_compaction(
             .saturating_sub(opts.capacity.quota_held(opts.tree_id)),
         None => u64::MAX,
     };
+    let cut_keys = super::flavour::output_cut_keys(&latest.version, opts, payload);
 
     drop(latest);
     drop(version_history_lock);
@@ -1772,11 +1811,23 @@ fn run_tight_space_compaction(
                 .as_ref()
                 .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
     });
-    let slices = tight_slices(&inputs, caps, relocated.as_ref(), &comparator)?;
-    let Some((tail, slices)) = slices.split_last().filter(|(_, cut)| !cut.is_empty()) else {
-        // Indivisible (one slice across all inputs) — no incremental reclaim.
+    let outputs = SliceOutputs {
+        target_size: payload.target_size,
+        cut_keys: &cut_keys,
+    };
+    let slices = tight_slices(&inputs, caps, &outputs, relocated.as_ref(), &comparator)?;
+    let Some((tail, slices)) = slices.split_last() else {
         return Ok(CompactionResult::nothing());
     };
+    // One slice past the caps cannot be cut any finer: it would write past
+    // the room the pass found. One within them is the whole merge, in one go.
+    if slices.is_empty()
+        && (tail.tables > caps.tables
+            || tail.blobs > caps.blobs
+            || tail.tables + tail.blobs > caps.total)
+    {
+        return Ok(CompactionResult::nothing());
+    }
 
     opts.work.plan(estimate);
 
