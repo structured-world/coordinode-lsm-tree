@@ -1443,6 +1443,16 @@ impl Table {
         self.load_data_block_charged(handle, ReadCharge::Foreground)
     }
 
+    /// [`Self::load_data_block`] for maintenance that sizes a rewrite of the
+    /// table: not counted as a read.
+    #[cfg(feature = "std")]
+    pub(crate) fn load_data_block_for_maintenance(
+        &self,
+        handle: &BlockHandle,
+    ) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_charged(handle, ReadCharge::Maintenance)
+    }
+
     /// [`Self::load_data_block`] charged as `charge` says, for a read that is
     /// not a caller's.
     fn load_data_block_charged(

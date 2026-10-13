@@ -1343,47 +1343,201 @@ pub(super) fn cancelled_compaction() -> crate::Error {
     ))
 }
 
-/// Key-range boundaries that split the combined data of `inputs` into slices of
-/// roughly `slice_budget` bytes each. Block end keys from every input are merged
-/// in comparator order and a boundary is emitted each time the accumulated block
-/// size crosses the budget. The global maximum end key is never a boundary (its
-/// keys are the rewrite's tail, handled by the final removal), so a set of
-/// single-block inputs yields no boundaries (nothing to reclaim incrementally).
+/// One slice of a tight-space pass: the key it ends before (`None` for the
+/// last, which runs to the end of the inputs), and the bytes it writes to
+/// the tables and to the blob files.
 #[cfg(feature = "std")]
-fn tight_slice_boundaries(
-    inputs: &[Table],
-    slice_budget: u64,
-    cmp: &dyn crate::comparator::UserComparator,
-) -> crate::Result<Vec<UserKey>> {
-    let mut entries: Vec<(UserKey, u32)> = Vec::new();
-    for input in inputs {
-        for handle in input.maintenance_index_walk() {
-            let handle = handle?;
-            entries.push((handle.end_key().clone(), handle.size()));
-        }
-    }
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    entries.sort_by(|a, b| cmp.compare(&a.0, &b.0));
-    let global_max = entries.last().map(|(k, _)| k.clone());
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TightSlice {
+    end: Option<UserKey>,
+    tables: u64,
+    blobs: u64,
+}
 
-    let mut boundaries = Vec::new();
-    let mut acc = 0u64;
-    for (end_key, size) in &entries {
-        // `size` is a u32 block length and `acc` resets each boundary; the
-        // running sum is bounded by the inputs' on-disk size, so a plain add
-        // cannot overflow u64.
-        acc += u64::from(*size);
-        if acc >= slice_budget
-            && global_max.as_ref() != Some(end_key)
-            && boundaries.last() != Some(end_key)
-        {
-            boundaries.push(end_key.clone());
-            acc = 0;
+/// The most bytes a slice may write: to the tables, to the blob files, and
+/// to both together (a volume they share, and the tree's quota).
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug)]
+struct SliceCaps {
+    tables: u64,
+    blobs: u64,
+    total: u64,
+}
+
+/// What a relocating pass moves: the frames its inputs point at in the
+/// `stale` blob files, written into files of `target_size` bytes, a file for
+/// each of `file_groups` codecs and lifetime classes at once.
+#[cfg(feature = "std")]
+struct Relocated<'a> {
+    stale: &'a HashSet<BlobFileId>,
+    target_size: u64,
+    file_groups: u64,
+}
+
+/// A blob file's metadata past its frames, short of its two keys: the block
+/// that holds its counts, codec, version and the like.
+#[cfg(feature = "std")]
+const BLOB_META_BYTES: u64 = 1_024;
+
+/// The bytes a relocated frame of `value` under `key` takes in a blob file.
+#[cfg(feature = "std")]
+fn frame_bytes(key: &[u8], on_disk_size: u32) -> u64 {
+    crate::vlog::blob_file::writer::BLOB_HEADER_LEN as u64
+        + key.len() as u64
+        + u64::from(on_disk_size)
+}
+
+/// The bytes of the blob frames `item` points at in the `stale` files, which
+/// a relocation copies: its own value, or the references among its cells.
+#[cfg(feature = "std")]
+fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate::Result<u64> {
+    use crate::blob_tree::field_row::{RowCell, decode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::coding::Decode;
+
+    let key = &item.key.user_key;
+    if item.key.value_type.is_indirection() {
+        let indirection = BlobIndirection::decode_from(&mut &item.value[..])?;
+        return Ok(if stale.contains(&indirection.vhandle.blob_file_id) {
+            frame_bytes(key, indirection.vhandle.on_disk_size)
+        } else {
+            0
+        });
+    }
+    if item.key.value_type.is_cell_row() {
+        let mut bytes = 0;
+        for field in decode_row(&item.value)? {
+            if let RowCell::Ref { indirection, .. } = field.cell
+                && stale.contains(&indirection.vhandle.blob_file_id)
+            {
+                bytes += frame_bytes(key, indirection.vhandle.on_disk_size);
+            }
+        }
+        return Ok(bytes);
+    }
+    Ok(0)
+}
+
+/// The slices a tight-space pass of `inputs` runs in, each within `caps`
+/// as far as its blocks allow, and what each writes.
+///
+/// A block weighs its share of its table's file, index and filter included,
+/// and, in a relocating pass, the frames its entries point at in the stale
+/// blob files, which the slice relocates: values are not spread evenly over
+/// the keys, so a share of the table's bytes says nothing of a share of
+/// theirs. A slice ends before the block that would take it past a cap, on
+/// the last key of the block before. The keys it ends before go to the next
+/// slice, so that one counts the blocks ending on it again. A block of a
+/// restricted input below its restriction is punched and writes nothing. A
+/// single slice means nothing to cut: the pass reclaims nothing on the way.
+#[cfg(feature = "std")]
+fn tight_slices(
+    inputs: &[Table],
+    caps: SliceCaps,
+    relocated: Option<&Relocated<'_>>,
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::Result<Vec<TightSlice>> {
+    struct Block {
+        end_key: UserKey,
+        tables: u64,
+        blobs: u64,
+    }
+
+    let cmp = comparator.as_ref();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut longest_key = 0u64;
+    for input in inputs {
+        let handles = input
+            .maintenance_index_walk()
+            .collect::<crate::Result<Vec<_>>>()?;
+        // Bounded by the file's length.
+        let data_bytes: u64 = handles.iter().map(|h| u64::from(h.size())).sum();
+        for handle in handles {
+            let end_key = handle.end_key().clone();
+            if input
+                .restrict_lower_bound()
+                .is_some_and(|bound| cmp.compare(&end_key, bound) == core::cmp::Ordering::Less)
+            {
+                continue;
+            }
+            // The block's share of the file: at most the file's length.
+            let tables = u64::try_from(
+                u128::from(handle.size()) * u128::from(input.file_len())
+                    / u128::from(data_bytes.max(1)),
+            )
+            .unwrap_or(u64::MAX);
+            let mut blobs = 0u64;
+            if let Some(relocated) = relocated
+                && let Some(block) = input.load_data_block_for_maintenance(handle.as_ref())?
+            {
+                block.try_for_each_entry(comparator.clone(), |item| {
+                    longest_key = longest_key.max(item.key.user_key.len() as u64);
+                    // Bounded by the stale files' bytes.
+                    blobs += stale_frame_bytes(&item, relocated.stale)?;
+                    Ok(())
+                })?;
+            }
+            blocks.push(Block {
+                end_key,
+                tables,
+                blobs,
+            });
         }
     }
-    Ok(boundaries)
+    blocks.sort_by(|a, b| cmp.compare(&a.end_key, &b.end_key));
+
+    // Every sum is bounded by the inputs' and the stale files' bytes.
+    let past = |acc: (u64, u64), block: &Block| {
+        acc.0 + block.tables > caps.tables
+            || acc.1 + block.blobs > caps.blobs
+            || acc.0 + acc.1 + block.tables + block.blobs > caps.total
+    };
+    let mut slices = Vec::new();
+    let mut acc = (0u64, 0u64);
+    // What the blocks ending on the last key seen weigh.
+    let mut on_last_key = (0u64, 0u64);
+    let mut last_key: Option<UserKey> = None;
+    for block in &blocks {
+        let next_key = last_key
+            .as_ref()
+            .is_none_or(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Equal);
+        if next_key {
+            if let Some(key) = &last_key
+                && past(acc, block)
+            {
+                slices.push(TightSlice {
+                    end: Some(key.clone()),
+                    tables: acc.0,
+                    blobs: acc.1,
+                });
+                acc = on_last_key;
+            }
+            on_last_key = (0, 0);
+            last_key = Some(block.end_key.clone());
+        }
+        acc = (acc.0 + block.tables, acc.1 + block.blobs);
+        on_last_key = (on_last_key.0 + block.tables, on_last_key.1 + block.blobs);
+    }
+    slices.push(TightSlice {
+        end: None,
+        tables: acc.0,
+        blobs: acc.1,
+    });
+
+    // Each output blob file closes with its metadata, its first and last keys
+    // among it: a file per target's worth of frames, and one more for each
+    // codec and lifetime class the slice's frames may go to.
+    if let Some(relocated) = relocated {
+        let per_file = BLOB_META_BYTES + 2 * longest_key;
+        for slice in &mut slices {
+            if slice.blobs > 0 {
+                let files =
+                    slice.blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
+                slice.blobs += files * per_file;
+            }
+        }
+    }
+    Ok(slices)
 }
 
 /// Builds a per-slice compaction payload over the still-surviving input ids,
@@ -1480,6 +1634,14 @@ fn run_tight_space_compaction(
     // the pass is sure to run, below.
     let estimate = merge_estimate(opts, &latest.version, payload, &inputs, &stale_files, None);
     let stale_ids: Vec<BlobFileId> = stale_files.iter().map(BlobFile::id).collect();
+    // A relocation writes a file for each codec of its sources.
+    let mut codecs: Vec<crate::CompressionType> = Vec::new();
+    for bf in &stale_files {
+        if !codecs.contains(&bf.compression()) {
+            codecs.push(bf.compression());
+        }
+    }
+    let stale_codecs = codecs.len() as u64;
     drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
@@ -1559,101 +1721,96 @@ fn run_tight_space_compaction(
     let tables_in = inputs.len();
 
     let comparator = opts.config.comparator.clone();
-    // Slice boundaries are derived from SST block sizes, but on a KV-separated
-    // relocating merge the transient is dominated by the RELOCATED blob payload,
-    // not the (tiny, handle-only) SSTs. Scale the SST-space budget so a slice
-    // covering `b` SST bytes relocates roughly `b * stale_total / inputs_total`
-    // blob bytes ≈ the free space: without this, a few small SST blocks would map
-    // to the whole blob payload in one slice and overflow the very disk the gate
-    // already flagged as too tight.
-    //
-    // That payload lands on the BLOB volume, which level routing can separate
-    // from the SST destination. Budgeting it against the destination's free
-    // space then scales by the wrong pool in both directions: an ample
-    // destination beside a full `blobs/` yields a budget larger than every
-    // input block (`tight_slice_boundaries` returns empty, so no reclaim
-    // happens at all) or a slice the blob volume cannot hold.
+    // A relocating merge writes the RELOCATED blob payload as well as the
+    // (handle-only, small) tables, and that payload lands on the BLOB volume,
+    // which level routing can separate from the SST destination: each is
+    // capped by the room on its own volume, or both together by the room on
+    // one they share. Whatever the volumes allow, a slice has to fit the
+    // quota too: a tree-wide logical limit, not a property of one volume.
+    // Without it a quota-only deployment slices nothing (an unbounded cap
+    // cuts no slice) and never leaves read-only, which is the state that
+    // engaged the pass.
     let blob_dir = opts.config.path.join(BLOBS_FOLDER);
-    let blob_free = if relocating && stale_total_bytes > 0 {
+    let relocating_blobs = relocating && stale_total_bytes > 0;
+    let blob_free = if relocating_blobs {
         opts.capacity.available(&*opts.config.fs, &blob_dir)
     } else {
         0
     };
     let blob_held = opts.capacity.held_on(&*opts.config.fs, &blob_dir);
-    let physical_budget = if relocating && stale_total_bytes > 0 {
-        let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
-        // A slice covering `b` SST bytes writes `b` to the SST volume and
-        // `b * stale_total / inputs_total` to the blob volume. Separate pools
-        // bound each share on its own volume; a shared pool must hold the SUM,
-        // so the budget solves `b * (inputs_total + stale_total) <= free`
-        // against the tighter probe.
-        let (pool, share) = if independent {
-            (blob_free, stale_total_bytes)
-        } else {
-            (
-                dest_free.min(blob_free),
-                inputs_total.max(1) + stale_total_bytes,
-            )
-        };
-        // Both factors are u64, so their u128 product is at most
-        // (2^64-1)^2 < u128::MAX — plain multiply cannot overflow.
-        let scaled = u128::from(pool) * u128::from(inputs_total.max(1)) / u128::from(share);
-        let by_blob = u64::try_from(scaled).unwrap_or(u64::MAX).max(1);
-        // The SST side still has to fit its own slice on its own volume.
-        by_blob.min(dest_free.max(1))
+    let caps = if !relocating_blobs {
+        SliceCaps {
+            tables: dest_free.max(1),
+            blobs: u64::MAX,
+            total: quota_headroom.max(1),
+        }
+    } else if separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir) {
+        SliceCaps {
+            tables: dest_free.max(1),
+            blobs: blob_free.max(1),
+            total: quota_headroom.max(1),
+        }
     } else {
-        dest_free.max(1)
+        SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: dest_free.min(blob_free).min(quota_headroom).max(1),
+        }
     };
-    // Whatever the physical pools allow, a slice's output has to fit the quota
-    // too: it is a tree-wide logical limit, not a property of one volume, so it
-    // caps the budget on both paths. Without this a quota-only deployment
-    // slices nothing (an unbounded budget yields no interior boundary) and
-    // never leaves read-only, which is the state that engaged the pass.
-    let slice_budget = physical_budget.min(quota_headroom.max(1));
-    let boundaries = tight_slice_boundaries(&inputs, slice_budget, comparator.as_ref())?;
-    if boundaries.is_empty() {
-        // Indivisible (single block across all inputs) — no incremental reclaim.
+    let stale_set: HashSet<BlobFileId> = stale_ids.iter().copied().collect();
+    let relocated = relocating_blobs.then(|| Relocated {
+        stale: &stale_set,
+        target_size: opts
+            .config
+            .kv_separation_opts
+            .as_ref()
+            .map_or(u64::MAX, |blob_opts| blob_opts.file_target_size),
+        file_groups: stale_codecs
+            * opts
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .map_or(1, |blob_opts| u64::from(blob_opts.lifetime_groups.get())),
+    });
+    let slices = tight_slices(&inputs, caps, relocated.as_ref(), &comparator)?;
+    let Some((tail, slices)) = slices.split_last().filter(|(_, cut)| !cut.is_empty()) else {
+        // Indivisible (one slice across all inputs) — no incremental reclaim.
         return Ok(CompactionResult::nothing());
-    }
+    };
 
     opts.work.plan(estimate);
 
-    // Each slice holds the room one slice takes, so the compactions sharing
-    // the pool count it. A slice writes at most the inputs' bytes to the
-    // tables and their share of the stale files to the blob folder.
+    // Each slice holds the room it takes, so the compactions sharing the pool
+    // count it: the tables its blocks rewrite and the stale frames they
+    // relocate, as the slices were cut.
     //
-    // Checked as each slice starts, in one step with taking it: the budget
-    // was sized to what was free past what the other compactions sharing the
-    // pool held when the pass measured it, and another may have taken that
-    // room since, or between two slices. Only their holds are checked: the
-    // pass's own slices write ahead of the punches that free their inputs, so
-    // its room between slices is not what it measured and is not the
-    // question. A slice the others left no room for ends the pass there, its
-    // installed slices kept; the next compaction picks up the rest. The quota
-    // is not checked again: the budget already keeps every slice within it.
-    let slice_tables = slice_budget.min(inputs_total);
-    let slice_blobs = if relocating {
-        // At most `stale_total_bytes`, so it fits a u64.
-        u64::try_from(
-            u128::from(slice_tables) * u128::from(stale_total_bytes)
-                / u128::from(inputs_total.max(1)),
-        )
-        .unwrap_or(stale_total_bytes)
-        .min(stale_total_bytes)
-    } else {
-        0
-    };
-    let reserve_slice = || {
+    // Checked as each slice starts, in one step with taking it: the caps were
+    // what was free past what the other compactions sharing the pool held
+    // when the pass measured it, and another may have taken that room since,
+    // or between two slices. Only their holds are checked: the pass's own
+    // slices write ahead of the punches that free their inputs, so its room
+    // between slices is not what it measured and is not the question. A slice
+    // the others left no room for ends the pass there, its installed slices
+    // kept; the next compaction picks up the rest. What a slice writes past
+    // its room it takes on as it lands, under the quota as it stands then and
+    // short of the flush floor, or the pass stops.
+    let reserve_slice = |slice: &TightSlice| -> crate::Result<bool> {
+        let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
+            Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(
+                &opts.version_history.read().latest_version().version,
+            )?),
+            None => u64::MAX,
+        };
         let demands = [
             super::capacity::Demand {
                 fs: &*dest_fs,
                 path: &dest_path,
-                bytes: slice_tables,
+                bytes: slice.tables,
             },
             super::capacity::Demand {
                 fs: &*opts.config.fs,
                 path: &blob_dir,
-                bytes: slice_blobs,
+                bytes: slice.blobs,
             },
         ];
         #[cfg(all(test, feature = "std"))]
@@ -1679,18 +1836,24 @@ fn run_tight_space_compaction(
         // is never below none.
         let [tables, blobs] = demands;
         let within = [
-            (tables, dest_held + dest_free.saturating_sub(slice_tables)),
-            (blobs, blob_held + blob_free.saturating_sub(slice_blobs)),
+            (tables, dest_held + dest_free.saturating_sub(slice.tables)),
+            (blobs, blob_held + blob_free.saturating_sub(slice.blobs)),
         ];
         // The slice before is installed: what it held is not the others'.
         opts.outputs.release_room();
-        match opts.capacity.reserve_within(opts.tree_id, &within) {
-            Some(room) => {
-                opts.outputs.reserve(room);
-                true
-            }
-            None => false,
-        }
+        let check = super::capacity::Check {
+            quota_headroom,
+            floor: super::capacity::Floor::MayConsume,
+        };
+        Ok(
+            match opts.capacity.reserve_within(opts.tree_id, &within, check) {
+                Some(room) => {
+                    opts.outputs.reserve(room);
+                    true
+                }
+                None => false,
+            },
+        )
     };
     // Set when a slice no longer fits: the pass ends there.
     let mut stopped = false;
@@ -1738,8 +1901,12 @@ fn run_tight_space_compaction(
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
 
-        for boundary in &boundaries {
-            if !reserve_slice() {
+        for slice in slices {
+            // Every slice but the tail ends before a key.
+            let Some(boundary) = &slice.end else {
+                break;
+            };
+            if !reserve_slice(slice)? {
                 stopped = true;
                 return Ok(tables_out);
             }
@@ -2190,7 +2357,7 @@ fn run_tight_space_compaction(
         // Tail [last boundary, hi): merge the remainder, remove the inputs, and
         // drop the now fully-consumed stale blob files (install_merge deletes
         // them outright — the prior slices already punched their prefixes).
-        if !reserve_slice() {
+        if !reserve_slice(tail)? {
             stopped = true;
             return Ok(tables_out);
         }

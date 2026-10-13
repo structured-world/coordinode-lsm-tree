@@ -3473,6 +3473,96 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     assert_relocated_values(&tree)
 }
 
+/// Live blob bytes are not spread over the keys as the table bytes are: here
+/// the first tenth of the keys holds most of them. A slice cut by its share
+/// of the tables relocates far more than that share of the blob files, past
+/// the room on the blob volume; each slice is cut by the frames it moves.
+#[test]
+fn tight_space_relocation_of_values_gathered_on_few_keys_fits_each_slice() -> crate::Result<()> {
+    use crate::config::LevelRoute;
+    use crate::fs::{Fs, MemFs};
+
+    const N: u64 = 4_000;
+    let value = |i: u64, generation: u8| {
+        let len = if i < N / 10 { 4_000 } else { 70 };
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (u64::from(generation) << 1);
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s.to_le_bytes()[3]
+            })
+            .collect::<Vec<u8>>()
+    };
+
+    let dir = tempfile::tempdir()?;
+    let cold_dir = dir.path().join("cold");
+    let cold = Arc::new(MemFs::with_capacity(u64::MAX));
+    cold.create_dir_all(&cold_dir)?;
+    let mem = Arc::new(MemFs::with_capacity(u64::MAX));
+    let cold_fs: Arc<dyn Fs> = cold;
+    let tree = match Config::new(
+        &dir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(mem.clone())
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: cold_dir,
+        fs: cold_fs,
+    }])
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(64)
+            .age_cutoff(1.0)
+            .staleness_threshold(0.1)
+            .file_target_size(48 * 1024),
+    ))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..N {
+        tree.insert(reloc_key(i).as_bytes(), value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..N).step_by(2) {
+        tree.insert(reloc_key(i).as_bytes(), value(i, 2), N + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let gc_watermark = 4 * N;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+
+    const PROBE: u64 = 1 << 40;
+    mem.set_capacity(PROBE);
+    let blob_stored = PROBE - mem.available_space(dir.path())?;
+    mem.set_capacity(blob_stored + blob_stored / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
+    assert!(mem.punched_bytes() > 0, "the pass reclaimed in slices");
+    for i in 0..N {
+        let generation = if i % 2 == 0 { 2 } else { 1 };
+        assert_eq!(
+            tree.get(reloc_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(value(i, generation).as_slice()),
+            "key {i}",
+        );
+    }
+    Ok(())
+}
+
 /// A relocating tight-space pass punches each stale blob file through the
 /// blob volume's own backend: one that cannot punch declines the pass, which
 /// would otherwise leave every relocated prefix allocated beside its copy.

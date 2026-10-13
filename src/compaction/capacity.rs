@@ -279,12 +279,12 @@ impl CapacityPool {
     /// checked and taken in one step: a pass that sized its work to the room
     /// it measured, leaving the others that much, stops rather than write over
     /// room another compaction took since. Its own writes are not checked
-    /// here, nor what it writes past the grant, as for a reservation made
-    /// without a check.
+    /// here; what it writes past the grant is, against `check`, as it lands.
     pub(crate) fn reserve_within(
         self: &Arc<Self>,
         tree: TreeId,
         demands: &[(Demand<'_>, u64)],
+        check: Check,
     ) -> Option<Reservation> {
         let mut held = self.held.lock();
         let taken_since = demands.iter().any(|(demand, limit)| {
@@ -302,7 +302,7 @@ impl CapacityPool {
             })
             .collect();
         let (volumes, total) = gather(&demands, false);
-        let room = self.take(&mut held, tree, volumes, total, None);
+        let room = self.take(&mut held, tree, volumes, total, Some(check));
         drop(held);
         Some(room)
     }

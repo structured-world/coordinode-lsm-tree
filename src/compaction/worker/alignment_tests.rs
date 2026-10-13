@@ -535,14 +535,17 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
     let inputs = tables(&tree, 1);
     assert_eq!(inputs.len(), 1, "the merge reads one table");
     let boundaries = boundaries_of(&tables(&tree, 3));
-    let slice_ends: Vec<u32> = super::tight_slice_boundaries(
-        &inputs,
-        HEADROOM,
-        &crate::comparator::DefaultUserComparator,
-    )?
-    .iter()
-    .map(|end| index(end))
-    .collect();
+    // Free space unknown, so the quota caps the slices, as in the pass.
+    let caps = super::SliceCaps {
+        tables: u64::MAX,
+        blobs: u64::MAX,
+        total: HEADROOM,
+    };
+    let slice_ends: Vec<u32> = super::tight_slices(&inputs, caps, None, &tree.config.comparator)?
+        .iter()
+        .filter_map(|slice| slice.end.as_ref())
+        .map(|end| index(end))
+        .collect();
     assert!(
         slice_ends.len() > 2,
         "the pass runs in slices: {slice_ends:?}"
