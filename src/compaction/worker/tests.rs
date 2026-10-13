@@ -682,7 +682,9 @@ fn a_failed_tight_space_pass_counts_the_work_of_the_slices_it_installed() -> cra
         tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
     }
     tree.flush_active_memtable(0)?;
-    mem.set_capacity(tree.storage_stats()?.used_bytes);
+    // Room for a slice, not for the whole merge.
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 8);
     tree.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
@@ -3559,7 +3561,9 @@ fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crat
         &tree.index.config.comparator,
     )?;
     drop(version);
-    let first = slices.first().expect("a slice");
+    let Some(first) = slices.first() else {
+        panic!("a pass cuts at least one slice");
+    };
     let (tables, blobs) = (first.tables, first.blobs);
     assert!(
         slices.len() > 1 && tables.min(blobs) >= 2,
@@ -3742,7 +3746,9 @@ fn tight_space_pass_stops_before_a_slice_past_its_room() -> crate::Result<()> {
     tree.major_compact(64 * 1024 * 1024, 0)?;
     assert!(mem.punched_bytes() > 0, "the slices before it ran");
     assert!(
-        !tree.current_version().level(0).expect("L0").is_empty(),
+        tree.current_version()
+            .level(0)
+            .is_some_and(|level| !level.is_empty()),
         "the inputs from the slice past the room on stay in place",
     );
     for i in 0..TIGHT_SPACE_KEYS {

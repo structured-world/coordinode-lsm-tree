@@ -3,9 +3,9 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::{BoxedIterator, InternalValue, Table, UserKey, version::Run};
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 use core::ops::{Bound, Deref, RangeBounds};
 
 type OwnedRange = (Bound<UserKey>, Bound<UserKey>);

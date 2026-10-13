@@ -1521,6 +1521,21 @@ fn tight_slices(
         }
     }
     blocks.sort_by(|a, b| cmp.compare(&a.end_key, &b.end_key));
+    // Blocks ending on one key go into one slice together: a slice ends on a
+    // key, not between the inputs that hold it.
+    let mut grouped: Vec<Block> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        match grouped.last_mut() {
+            Some(group)
+                if cmp.compare(&group.end_key, &block.end_key) == core::cmp::Ordering::Equal =>
+            {
+                group.tables += block.tables;
+                group.blobs += block.blobs;
+            }
+            _ => grouped.push(block),
+        }
+    }
+    let mut blocks = grouped;
     let fixed = fixed.unwrap_or(0);
     // A table opened on a cut key weighs on the block that passes it.
     let mut cut_keys = outputs.cut_keys.iter().peekable();
@@ -1554,29 +1569,21 @@ fn tight_slices(
     };
     let mut slices = Vec::new();
     let mut acc = (0u64, 0u64);
-    // What the blocks ending on the last key seen weigh.
-    let mut on_last_key = (0u64, 0u64);
-    let mut last_key: Option<UserKey> = None;
+    // The blocks ending on the key the slice so far ends on.
+    let mut last: Option<&Block> = None;
     for block in &blocks {
-        let next_key = last_key
-            .as_ref()
-            .is_none_or(|key| cmp.compare(key, &block.end_key) != core::cmp::Ordering::Equal);
-        if next_key {
-            if let Some(key) = &last_key
-                && past(acc, block)
-            {
-                slices.push(TightSlice {
-                    end: Some(key.clone()),
-                    tables: with_tables(acc.0),
-                    blobs: with_blobs(acc.1),
-                });
-                acc = on_last_key;
-            }
-            on_last_key = (0, 0);
-            last_key = Some(block.end_key.clone());
+        if let Some(previous) = last
+            && past(acc, block)
+        {
+            slices.push(TightSlice {
+                end: Some(previous.end_key.clone()),
+                tables: with_tables(acc.0),
+                blobs: with_blobs(acc.1),
+            });
+            acc = (previous.tables, previous.blobs);
         }
         acc = (acc.0 + block.tables, acc.1 + block.blobs);
-        on_last_key = (on_last_key.0 + block.tables, on_last_key.1 + block.blobs);
+        last = Some(block);
     }
     slices.push(TightSlice {
         end: None,
