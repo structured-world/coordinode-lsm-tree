@@ -1352,10 +1352,15 @@ impl MultiWriter {
         old_writer.own_blob_objects(core::mem::take(&mut self.owned_objects));
 
         // The install that names the tables syncs their folder once.
+        let path = old_writer.path.clone();
         if let Some((table_id, checksum)) =
             old_writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
         {
             self.results.push((table_id, checksum));
+            // Before the next output takes more room.
+            if let Some(outputs) = &self.outputs {
+                outputs.landed(&*self.fs, &path)?;
+            }
         }
 
         Ok(())
@@ -2056,11 +2061,15 @@ impl MultiWriter {
         self.writer
             .own_blob_objects(core::mem::take(&mut self.owned_objects));
 
+        let path = self.writer.path.clone();
         if let Some((table_id, checksum)) = self
             .writer
             .finish_deferring_dir_sync(self.inherited_age.as_mut())?
         {
             self.results.push((table_id, checksum));
+            if let Some(outputs) = &self.outputs {
+                outputs.landed(&*self.fs, &path)?;
+            }
         }
 
         Ok(self.results)

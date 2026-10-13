@@ -606,6 +606,11 @@ impl TreeIter {
                     })
             };
 
+            // A scan reaches every table it reads; a point read merging
+            // operands goes through here too, and counts as a point read.
+            // The scan is counted as made once, on the first table it reaches.
+            let scanning = lock.key_hash.is_none();
+            let mut start_noted = !scanning;
             for run in candidates {
                 let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
                     .into_iter()
@@ -625,11 +630,21 @@ impl TreeIter {
                 // first, which is read on its own to count a pass that finds
                 // nothing; the others' passes are no false positives.
                 let (first, answer) = surviving.remove(0);
+                if scanning {
+                    first.note_scan();
+                    if !start_noted {
+                        first.note_scan_start();
+                        start_noted = true;
+                    }
+                }
                 iters.push(table_reader(answer, first, user_range.clone(), seqno));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
+                            if scanning {
+                                table.note_scan();
+                            }
                             iters.push(table_reader(answer, table, user_range.clone(), seqno));
                         }
                     }
@@ -651,6 +666,10 @@ impl TreeIter {
                 if let Some(reader) =
                     RunReader::new_cmp(run, user_range.clone(), lock.comparator.as_ref())
                 {
+                    if !start_noted {
+                        reader.note_scan_start();
+                        start_noted = true;
+                    }
                     iters.push(Box::new(reader.filter(move |item| match item {
                         Ok(item) => seqno_filter(item.key.seqno, seqno),
                         Err(_) => true,
@@ -1014,6 +1033,7 @@ struct TableLeaf {
 
 impl TableLeaf {
     fn new(table: crate::table::Table, user_range: UserBounds, seqno: SeqNo) -> Self {
+        table.note_scan();
         let iter = table.range_iter(user_range);
         Self { table, iter, seqno }
     }
@@ -1243,7 +1263,13 @@ fn build_seek_pipeline<'a>(
             seqno,
         )));
     }
+    // The scan is counted as made once, on the first table it reaches.
+    let mut start_noted = false;
     for table in &collected.single_tables {
+        if !start_noted {
+            table.note_scan_start();
+            start_noted = true;
+        }
         sources.push(SeekableLeaf::Table(Box::new(TableLeaf::new(
             table.clone(),
             user_range.clone(),
@@ -1257,6 +1283,10 @@ fn build_seek_pipeline<'a>(
             seqno,
             state.comparator.clone(),
         ) {
+            if !start_noted {
+                leaf.reader.note_scan_start();
+                start_noted = true;
+            }
             sources.push(SeekableLeaf::Run(Box::new(leaf)));
         }
     }

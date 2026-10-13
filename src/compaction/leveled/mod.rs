@@ -16,6 +16,14 @@ mod test;
 #[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
 mod picker_tests;
 
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod primitive_tests;
+
+mod primitives;
+
+pub use primitives::{Granularity, Layout, LevelPolicy, Movement, Trigger};
+
 use super::{Choice, CompactionStrategy, Input as CompactionInput};
 use crate::{
     HashSet, TableId,
@@ -29,11 +37,13 @@ use alloc::vec::Vec;
 
 /// A merge candidate's cost: the bytes it moves down a level (`promoted`) and
 /// every byte it reads and rewrites to do so (`total`, the promoted bytes
-/// plus those it pulls in from the level below).
+/// plus those it pulls in from the level below), and the reads its tables
+/// served (`heat`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MergeCost {
     promoted: u64,
     total: u64,
+    heat: u64,
 }
 
 impl MergeCost {
@@ -46,21 +56,38 @@ impl MergeCost {
         u128::from(self.total) * u128::from(other.promoted)
             < u128::from(other.total) * u128::from(self.promoted)
     }
+
+    /// Whether `movement` prefers `self` to `other`: the least rewrite per
+    /// promoted byte, or the most reads per byte rewritten with the least
+    /// rewrite breaking a tie. Cross-multiplied in `u128` as
+    /// [`Self::cheaper_than`] is.
+    fn better_than(self, other: Self, movement: Movement) -> bool {
+        match movement {
+            Movement::LeastRewrite { .. } => self.cheaper_than(other),
+            Movement::Hottest => {
+                let ours = u128::from(self.heat) * u128::from(other.total);
+                let theirs = u128::from(other.heat) * u128::from(self.total);
+                ours > theirs || (ours == theirs && self.cheaper_than(other))
+            }
+        }
+    }
 }
 
-/// Streams merge candidates and keeps the one that pays down a level's debt at
-/// the least rewriting per promoted byte.
+/// Streams merge candidates and keeps the one that pays down a level's debt
+/// best by the level's [`Movement`]: by default at the least rewriting per
+/// promoted byte.
 ///
 /// Ranking by the total input alone prefers a small merge that promotes little
 /// into a dense level below, which has to be repeated many times to retire the
 /// same debt; the ratio ranks how much each promoted byte costs. Among the
-/// candidates that promote no more than `overshoot + slack`, the cheapest one
+/// candidates that promote no more than `overshoot + slack`, the best one
 /// wins, so a level is not asked to push down far more than it owes; when none
-/// is that small, the cheapest overall still makes progress. Ties go to the
+/// is that small, the best overall still makes progress. Ties go to the
 /// earliest candidate, so the choice is the same on every call.
 ///
 /// Only the two leaders are held, whatever the number of candidates offered.
 struct MergeRanking<T> {
+    movement: Movement,
     bound: u64,
     offered: usize,
     /// The cheapest candidate within the bound, with its offer index.
@@ -72,8 +99,9 @@ struct MergeRanking<T> {
 }
 
 impl<T: Copy> MergeRanking<T> {
-    fn new(overshoot: u64, slack: u64) -> Self {
+    fn new(overshoot: u64, slack: u64, movement: Movement) -> Self {
         Self {
+            movement,
             // A bound past `u64::MAX` admits every candidate, which is what
             // clamping to `u64::MAX` means: no promoted byte count exceeds it.
             bound: overshoot.saturating_add(slack),
@@ -86,18 +114,22 @@ impl<T: Copy> MergeRanking<T> {
 
     fn offer(&mut self, cost: MergeCost, candidate: T) {
         let index = self.offered;
+        let movement = self.movement;
         self.offered += 1;
         if cost.promoted <= self.bound
             && self
                 .within
                 .as_ref()
-                .is_none_or(|(_, best, _)| cost.cheaper_than(*best))
+                .is_none_or(|(_, best, _)| cost.better_than(*best, movement))
         {
             self.within = Some((index, cost, candidate));
         }
         match &self.any {
-            Some((_, best, _)) if !cost.cheaper_than(*best) => {
-                if self.second.is_none_or(|second| cost.cheaper_than(second)) {
+            Some((_, best, _)) if !cost.better_than(*best, movement) => {
+                if self
+                    .second
+                    .is_none_or(|second| cost.better_than(second, movement))
+                {
                     self.second = Some(cost);
                 }
             }
@@ -133,9 +165,13 @@ fn pick_minimal_compaction(
     hidden_set: &HiddenSet,
     overshoot: u64,
     table_base_size: u64,
-    promotion_slack: u64,
+    movement: Movement,
     cmp: &dyn crate::comparator::UserComparator,
 ) -> Option<(HashSet<TableId>, bool)> {
+    let promotion_slack = match movement {
+        Movement::LeastRewrite { slack } => slack.unwrap_or(table_base_size),
+        Movement::Hottest => table_base_size,
+    };
     if let Some(ids) = largest_trivial_move(curr_level, next_level, hidden_set, cmp) {
         return Some((ids, true));
     }
@@ -150,12 +186,13 @@ fn pick_minimal_compaction(
     // Candidates are ranked as they are enumerated, holding only a window's
     // place and its cost for the leaders; the winner's tables are collected at
     // the end.
-    let mut ranking = MergeRanking::new(overshoot, promotion_slack);
+    let mut ranking = MergeRanking::new(overshoot, promotion_slack, movement);
     let cap = 50 * table_base_size;
     for (run_index, run) in next_level.iter().enumerate() {
         let window_bytes = prefix_sums(run.iter().map(Table::file_size));
         let window_hidden =
             prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
+        let window_heat = prefix_sums(run.iter().map(Table::reads));
         let pull_ins: Vec<PullIn> = curr_level
             .iter()
             .map(|curr_run| PullIn::new(curr_run, run, hidden_set, cmp))
@@ -170,9 +207,10 @@ fn pick_minimal_compaction(
                     clippy::indexing_slicing,
                     reason = "start < end <= run.len(), and the sums hold run.len() + 1 entries"
                 )]
-                let (next_level_size, next_hidden) = (
+                let (next_level_size, next_hidden, next_heat) = (
                     window_bytes[end] - window_bytes[start],
                     window_hidden[end] - window_hidden[start],
+                    window_heat[end] - window_heat[start],
                 );
                 if next_level_size > cap {
                     break 'run;
@@ -181,10 +219,12 @@ fn pick_minimal_compaction(
                     continue;
                 }
                 let mut promoted = 0;
+                let mut heat = next_heat;
                 let mut blocked = false;
                 for pull_in in &pull_ins {
-                    let (bytes, hidden) = pull_in.contained(start, end - 1);
+                    let (bytes, hidden, reads) = pull_in.contained(start, end - 1);
                     promoted += bytes;
+                    heat += reads;
                     blocked |= hidden > 0;
                 }
                 if promoted == 0 || blocked {
@@ -194,6 +234,7 @@ fn pick_minimal_compaction(
                     MergeCost {
                         promoted,
                         total: promoted + next_level_size,
+                        heat,
                     },
                     (run_index, start, end),
                 );
@@ -217,25 +258,92 @@ fn pick_minimal_compaction(
         .and_then(|run| run.get(start..end))
         .expect("the chosen window lies in its run");
     let key_range = aggregate_run_key_range(window);
+    let contained: HashSet<_> = curr_level
+        .iter()
+        .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
+        .map(Table::id)
+        .collect();
+    let pulled_in = contained.len();
+    let curr_ids = with_overlapping_runs(curr_level, contained, hidden_set, cmp)?;
     let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    ids.extend(
-        curr_level
-            .iter()
-            .flat_map(|run| run.get_contained_cmp(&key_range, cmp))
-            .map(Table::id),
-    );
+    // What the other runs added may reach past the window: what it overlaps
+    // below goes into the merge too, so the level below stays one run.
+    if curr_ids.len() > pulled_in {
+        for table in curr_level.iter().flat_map(|run| run.iter()) {
+            if !curr_ids.contains(&table.id()) {
+                continue;
+            }
+            for below in next_level
+                .iter()
+                .flat_map(|run| run.get_overlapping_cmp(table.key_range(), cmp))
+            {
+                if ids.insert(below.id()) && hidden_set.is_hidden(below.id()) {
+                    return None;
+                }
+            }
+        }
+    }
+    ids.extend(curr_ids);
     Some((ids, false))
 }
 
+/// `ids`, tables of `level`, with every table of its runs that shares a key
+/// with them, taken in until none is left out; `None` when one is hidden.
+///
+/// The runs of a level hold versions of one key in more than one of them,
+/// and a read stops at the first level that holds the key: a merge that
+/// took the newer version down and left the older above would have reads
+/// return the older.
+fn with_overlapping_runs(
+    level: &Level,
+    mut ids: HashSet<TableId>,
+    hidden_set: &HiddenSet,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Option<HashSet<TableId>> {
+    // The tables of one run share no key.
+    if level.run_count() <= 1 {
+        return Some(ids);
+    }
+    loop {
+        let mut ranges: Vec<_> = level
+            .iter()
+            .flat_map(|run| run.iter())
+            .filter(|table| ids.contains(&table.id()))
+            .map(|table| table.key_range().clone())
+            .collect();
+        ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
+        let mut grew = false;
+        for interval in crate::KeyRange::merge_sorted_cmp(ranges, cmp) {
+            for table in level
+                .iter()
+                .flat_map(|run| run.get_overlapping_cmp(&interval, cmp))
+            {
+                if ids.insert(table.id()) {
+                    if hidden_set.is_hidden(table.id()) {
+                        return None;
+                    }
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            return Some(ids);
+        }
+    }
+}
+
 /// The longest window of one run of `curr_level` that overlaps no table of
-/// `next_level` and holds no hidden table, the leftmost of that length and from
-/// the first run that has one: a move that rewrites nothing.
+/// `next_level`, shares no key with the other runs of `curr_level` and holds no
+/// hidden table, the leftmost of that length and from the first run that has
+/// one: a move that rewrites nothing.
 ///
 /// A window's key range is its tables' ranges and the gaps between them, so it
 /// overlaps the level below exactly when one of its tables does or one of its
 /// gaps does. The windows that qualify are therefore the stretches of
 /// neighbouring tables that each qualify with clear gaps between them, and
-/// the longest such stretch is found in one pass.
+/// the longest such stretch is found in one pass. A key of a table the other
+/// runs hold as well stays where it is: a read stops at the first level that
+/// holds it, and the version left above may be the older one.
 fn largest_trivial_move(
     curr_level: &Level,
     next_level: &Level,
@@ -244,21 +352,28 @@ fn largest_trivial_move(
 ) -> Option<HashSet<TableId>> {
     use core::ops::Bound;
 
-    let clear = |bounds: (Bound<&crate::Slice>, Bound<&crate::Slice>)| {
-        next_level.iter().all(|run| {
-            run.range_overlap_indexes_cmp::<crate::Slice, _, _>(&bounds, cmp)
-                .is_none()
+    let free_of = |runs: &[alloc::sync::Arc<crate::version::run::Run<Table>>],
+                   skip: Option<usize>,
+                   bounds: (Bound<&crate::Slice>, Bound<&crate::Slice>)| {
+        runs.iter().enumerate().all(|(index, run)| {
+            Some(index) == skip
+                || run
+                    .range_overlap_indexes_cmp::<crate::Slice, _, _>(&bounds, cmp)
+                    .is_none()
         })
     };
-    for curr_run in curr_level.iter() {
+    let clear = |bounds| free_of(next_level, None, bounds);
+    for (run_index, curr_run) in curr_level.iter().enumerate() {
         // The longest stretch so far, as (start, length), and the current one.
         let mut best: Option<(usize, usize)> = None;
         let (mut stretch_start, mut stretch_len) = (0, 0);
         let mut previous: Option<&Table> = None;
         for (index, table) in curr_run.iter().enumerate() {
             let range = table.key_range();
+            let bounds = (Bound::Included(range.min()), Bound::Included(range.max()));
             let movable = !hidden_set.is_hidden(table.id())
-                && clear((Bound::Included(range.min()), Bound::Included(range.max())));
+                && clear(bounds)
+                && free_of(curr_level, Some(run_index), bounds);
             if !movable {
                 stretch_len = 0;
                 previous = None;
@@ -289,6 +404,82 @@ fn largest_trivial_move(
     None
 }
 
+/// A window of one run of `level` to go into a tiered level below, which
+/// takes nothing of that level in, none of its tables hidden.
+///
+/// Every window rewrites only its own bytes, so least rewrite takes the
+/// leading tables of the first run holding `overshoot` bytes; the hottest
+/// takes the window with the most reads per byte, ranked as a merge into a
+/// leveled level ranks them.
+fn window_over(
+    level: &Level,
+    hidden_set: &HiddenSet,
+    overshoot: u64,
+    movement: Movement,
+    table_base_size: u64,
+) -> Option<HashSet<TableId>> {
+    let (run, start, end) = match movement {
+        Movement::LeastRewrite { .. } => {
+            let run = level.iter().next()?;
+            let mut bytes = 0u64;
+            let mut end = 0;
+            for table in run.iter() {
+                if hidden_set.is_hidden(table.id()) {
+                    break;
+                }
+                end += 1;
+                bytes += table.file_size();
+                if bytes >= overshoot {
+                    break;
+                }
+            }
+            (run, 0, end)
+        }
+        Movement::Hottest => {
+            let mut ranking = MergeRanking::new(overshoot, table_base_size, movement);
+            let cap = 50 * table_base_size;
+            for (run_index, run) in level.iter().enumerate() {
+                let bytes = prefix_sums(run.iter().map(Table::file_size));
+                let hidden =
+                    prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
+                let heat = prefix_sums(run.iter().map(Table::reads));
+                'run: for width in 1..=run.len() {
+                    for start in 0..=(run.len() - width) {
+                        let end = start + width;
+                        #[expect(
+                            clippy::indexing_slicing,
+                            reason = "start < end <= run.len(), and the sums hold run.len() + 1 entries"
+                        )]
+                        let (size, hidden, heat) = (
+                            bytes[end] - bytes[start],
+                            hidden[end] - hidden[start],
+                            heat[end] - heat[start],
+                        );
+                        if size > cap {
+                            break 'run;
+                        }
+                        if hidden > 0 {
+                            continue;
+                        }
+                        ranking.offer(
+                            MergeCost {
+                                promoted: size,
+                                total: size,
+                                heat,
+                            },
+                            (run_index, start, end),
+                        );
+                    }
+                }
+            }
+            let ((_, _, (run_index, start, end)), _) = ranking.finish()?;
+            (level.iter().nth(run_index)?, start, end)
+        }
+    };
+    let ids: HashSet<_> = run.get(start..end)?.iter().map(Table::id).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 /// Prefix sums: entry `i` is the sum of the first `i` items.
 fn prefix_sums(items: impl Iterator<Item = u64>) -> Vec<u64> {
     let mut sums = Vec::with_capacity(items.size_hint().0 + 1);
@@ -316,9 +507,11 @@ struct PullIn {
     /// For each table of the window run, the number of tables of this run
     /// ending at or before its max key.
     end_through: Vec<usize>,
-    /// Prefix sums of this run's table sizes and of its hidden tables.
+    /// Prefix sums of this run's table sizes, of its hidden tables and of the
+    /// reads its tables served.
     bytes: Vec<u64>,
     hidden: Vec<u64>,
+    reads: Vec<u64>,
 }
 
 impl PullIn {
@@ -359,24 +552,26 @@ impl PullIn {
             end_through,
             bytes: prefix_sums(run.iter().map(Table::file_size)),
             hidden: prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id())))),
+            reads: prefix_sums(run.iter().map(Table::reads)),
         }
     }
 
-    /// The bytes and the hidden tables of what the window from the window
-    /// run's table `first` to its table `last` pulls in.
+    /// The bytes, the hidden tables and the reads of what the window from
+    /// the window run's table `first` to its table `last` pulls in.
     #[expect(
         clippy::indexing_slicing,
         reason = "first and last index the window run, and the stretch ends lie in 0..=run.len()"
     )]
-    fn contained(&self, first: usize, last: usize) -> (u64, u64) {
+    fn contained(&self, first: usize, last: usize) -> (u64, u64, u64) {
         let (from, through) = (self.first_from[first], self.end_through[last]);
         if from < through {
             (
                 self.bytes[through] - self.bytes[from],
                 self.hidden[through] - self.hidden[from],
+                self.reads[through] - self.reads[from],
             )
         } else {
-            (0, 0)
+            (0, 0, 0)
         }
     }
 }
@@ -431,6 +626,9 @@ pub struct Strategy {
     /// be preferred on its cost per promoted byte. `None` = one target table
     /// size, the smallest step a merge can take.
     promotion_slack: Option<u64>,
+
+    /// The choices set for a level in place of the leveled ones, by level.
+    policies: [Option<LevelPolicy>; 7],
 }
 
 impl Default for Strategy {
@@ -443,6 +641,7 @@ impl Default for Strategy {
             dynamic: false,
             multi_level: false,
             promotion_slack: None,
+            policies: [None; 7],
         }
     }
 }
@@ -512,20 +711,36 @@ impl Strategy {
     /// Whether L0's shape alone calls for a merge into L1: its run count or
     /// its table count has reached its threshold.
     fn l0_triggered(&self, l0: &Level) -> bool {
-        l0.run_count() >= usize::from(self.l0_threshold)
-            || l0.table_count() >= usize::from(self.l0_file_threshold)
+        // L0 is never the last level of a tree that compacts.
+        shape_triggered(self.policy(0, 0, usize::MAX).trigger, l0)
     }
+}
 
-    /// L0's score: how far past the nearer of its two thresholds it is.
-    fn l0_score(&self, l0: &Level) -> f64 {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "counts of runs and tables are far below 2^52"
-        )]
-        let (runs, tables) = (l0.run_count() as f64, l0.table_count() as f64);
-        (runs / f64::from(self.l0_threshold)).max(tables / f64::from(self.l0_file_threshold))
+/// Whether a level's shape alone calls for compacting it: it is triggered by
+/// its shape, and its run count or its table count has reached its count.
+/// A count of `0` is taken as `1`, since no count is below zero.
+fn shape_triggered(trigger: Trigger, level: &Level) -> bool {
+    match trigger {
+        Trigger::Shape { runs, tables } => {
+            level.run_count() >= usize::from(runs.max(1))
+                || level.table_count() >= usize::from(tables.max(1))
+        }
+        Trigger::Size | Trigger::Never => false,
     }
+}
 
+/// A level's score under a shape trigger of `runs` and `tables`: how far past
+/// the nearer of the two counts it is.
+fn shape_score((runs, tables): (u8, u16), level: &Level) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "counts of runs and tables are far below 2^52"
+    )]
+    let (run_count, table_count) = (level.run_count() as f64, level.table_count() as f64);
+    (run_count / f64::from(runs.max(1))).max(table_count / f64::from(tables.max(1)))
+}
+
+impl Strategy {
     /// Sets the table target size on disk (possibly compressed).
     ///
     /// Same as `target_file_size_base` in `RocksDB`.
@@ -589,6 +804,99 @@ impl Strategy {
     pub fn with_promotion_slack(mut self, bytes: u64) -> Self {
         self.promotion_slack = Some(bytes);
         self
+    }
+
+    /// Sets the four choices for level `level` in place of the leveled ones:
+    /// when it compacts, how it holds its data, how much one compaction out
+    /// of it takes and which data that is. A level index past the tree's last
+    /// level is ignored.
+    ///
+    /// The leveled defaults are: L0 triggered by its shape (see
+    /// [`Self::with_l0_threshold`] and [`Self::with_l0_file_threshold`]),
+    /// tiered and compacted whole (through L1 when
+    /// [`Self::with_multi_level`] is on); every other level leveled,
+    /// triggered by its size, and compacted a window at a time chosen by the
+    /// least rewrite per promoted byte (see [`Self::with_promotion_slack`]);
+    /// the last level never triggered.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::compaction::{Granularity, Layout, LevelPolicy, Leveled, Movement, Trigger};
+    ///
+    /// // L1 accumulates runs and goes down whole once it holds four.
+    /// let strategy = Leveled::default().with_level_policy(
+    ///     1,
+    ///     LevelPolicy {
+    ///         trigger: Trigger::Shape { runs: 4, tables: u16::MAX },
+    ///         layout: Layout::Tiered,
+    ///         granularity: Granularity::Level { through_full_next: false },
+    ///         movement: Movement::LeastRewrite { slack: None },
+    ///     },
+    /// );
+    /// # let _ = strategy;
+    /// ```
+    #[must_use]
+    pub fn with_level_policy(mut self, level: u8, policy: LevelPolicy) -> Self {
+        if let Some(slot) = self.policies.get_mut(usize::from(level)) {
+            *slot = Some(policy);
+        }
+        self
+    }
+
+    /// The choices for the level at `physical`, `level_shift` levels below
+    /// its place while the tree is small, of a tree whose last level is
+    /// `last`: the ones set for its place, or the leveled ones. A level is
+    /// set by its place, L1 being the first level holding data below L0.
+    fn policy(&self, physical: usize, level_shift: usize, last: usize) -> LevelPolicy {
+        let level = if physical == 0 {
+            0
+        } else {
+            physical.saturating_sub(level_shift).max(1)
+        };
+        let policy = self
+            .policies
+            .get(level)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| self.leveled_policy(level));
+        // The last level only receives compactions, whatever its place.
+        if physical == last && physical > 0 {
+            return LevelPolicy {
+                trigger: Trigger::Never,
+                ..policy
+            };
+        }
+        policy
+    }
+
+    /// The leveled choices for the level at place `level`.
+    fn leveled_policy(&self, level: usize) -> LevelPolicy {
+        LevelPolicy {
+            trigger: if level == 0 {
+                Trigger::Shape {
+                    runs: self.l0_threshold,
+                    tables: self.l0_file_threshold,
+                }
+            } else {
+                Trigger::Size
+            },
+            layout: if level == 0 {
+                Layout::Tiered
+            } else {
+                Layout::Leveled
+            },
+            granularity: if level == 0 {
+                Granularity::Level {
+                    through_full_next: self.multi_level,
+                }
+            } else {
+                Granularity::Window
+            },
+            movement: Movement::LeastRewrite {
+                slack: self.promotion_slack,
+            },
+        }
     }
 
     /// Calculates the size of L1.
@@ -658,8 +966,7 @@ impl Strategy {
     ) -> [u64; 7] {
         let mut targets = [u64::MAX; 7];
 
-        // L0 target is not size-based (it's count-based), so leave at MAX
-        targets[0] = u64::MAX;
+        targets[0] = self.l0_size_target();
 
         if self.dynamic {
             // Find the last non-empty level (Lmax) and its actual size.
@@ -753,8 +1060,20 @@ impl Strategy {
     }
 
     /// Computes static (exponential) level targets.
+    /// L0's size target: none (`u64::MAX`) for an L0 triggered by its shape,
+    /// which no size serves; L1's base size for one set to trigger by size, as
+    /// L0's size score in `RocksDB`'s leveled compaction measures it.
+    fn l0_size_target(&self) -> u64 {
+        if self.policy(0, 0, usize::MAX).trigger == Trigger::Size {
+            self.level_base_size()
+        } else {
+            u64::MAX
+        }
+    }
+
     fn compute_static_targets(&self, level_shift: usize) -> [u64; 7] {
         let mut targets = [u64::MAX; 7];
+        targets[0] = self.l0_size_target();
 
         for (idx, slot) in targets.iter_mut().enumerate().skip(1) {
             if idx <= level_shift {
@@ -830,22 +1149,36 @@ impl CompactionStrategy for Strategy {
         // Read-only snapshot: an empty compaction state (nothing hidden) so the
         // targets reflect the full current footprint; no level shift.
         let targets = self.compute_level_targets(version, 0, &CompactionState::default());
+        let last = version.level_count() - 1;
         let mut debt = 0u64;
         for (idx, level) in version.iter_levels().enumerate() {
             // Each term is at most one level's on-disk size, so the running sum is
             // bounded by the tree's total footprint (disk capacity) and cannot
             // overflow u64 — plain addition.
-            if idx == 0 {
-                // L0 is shape-triggered: once its runs or its tables reach their
-                // threshold, its whole size is pending a merge into L1, the same
-                // predicate `choose` acts on.
-                if self.l0_triggered(level) {
-                    debt += level.size();
+            // The figure is read with no level shift, as the targets are.
+            match self.policy(idx, 0, last).trigger {
+                // A shape-triggered level: once its runs or its tables reach
+                // their count, its whole size is pending, the same predicate
+                // `choose` acts on.
+                trigger @ Trigger::Shape { .. } => {
+                    if shape_triggered(trigger, level) {
+                        debt += level.size();
+                    }
                 }
-            } else if let Some(&target) = targets.get(idx) {
-                // max(0, size - target): the bytes above this level's target are
-                // the work that must be rewritten downward.
-                debt += level.size().saturating_sub(target);
+                // A level set never to trigger owes nothing: no compaction of
+                // this strategy drains it, and a debt nothing pays would hold
+                // writes back for good. The last level owes the bytes past its
+                // target, as it does in a static tree.
+                Trigger::Never if idx != last => {}
+                // A level triggered by size owes the bytes past its target; L0
+                // has one only when it is set so.
+                Trigger::Size | Trigger::Never => {
+                    if let Some(&target) = targets.get(idx) {
+                        // max(0, size - target): the bytes above this level's
+                        // target are the work that must be rewritten downward.
+                        debt += level.size().saturating_sub(target);
+                    }
+                }
             }
         }
         debt
@@ -866,6 +1199,7 @@ impl CompactionStrategy for Strategy {
             config.level_count,
         );
         let cmp = config.comparator.as_ref();
+        let last = version.level_count() - 1;
 
         // Trivial move into Lmax
         'trivial_lmax: {
@@ -961,10 +1295,15 @@ impl CompactionStrategy for Strategy {
             }
         }
 
-        // Trivial move into L1
+        // Trivial move into L1: free, so taken whatever L0's trigger says,
+        // unless L0 is set never to start a compaction.
         'trivial: {
             let first_level = version.l0();
             let target_level_idx = first_non_empty_level.min(canonical_l1_idx);
+
+            if self.policy(0, level_shift, last).trigger == Trigger::Never {
+                break 'trivial;
+            }
 
             if first_level.run_count() == 1 {
                 if version.level_is_busy(0, state.hidden_set())
@@ -1010,14 +1349,18 @@ impl CompactionStrategy for Strategy {
         // only on a small L0: on runs of many tables it would fire after every
         // flush, keep the run count under the trigger and never let L0 go
         // down, rewriting an ever larger L0 each time.
-        {
+        // Only an L0 triggered by its run count compacts within itself: the
+        // merge keeps its runs few.
+        if let Trigger::Shape { runs, .. } = self.policy(0, level_shift, last).trigger {
             let first_level = version.l0();
 
             // A triggered L0 goes down instead: rewriting it here would clear
             // the debt (a file guard below the run threshold) without moving
-            // anything to L1.
+            // anything to L1. `l0_triggered` reads L0's policy, the one set
+            // for it when one is, so a table count set lower than the
+            // defaults is the one this tests.
             if first_level.run_count() > 1
-                && first_level.table_count() < usize::from(self.l0_threshold)
+                && first_level.table_count() < usize::from(runs.max(1))
                 && !self.l0_triggered(first_level)
                 && !version.level_is_busy(0, state.hidden_set())
             {
@@ -1041,16 +1384,22 @@ impl CompactionStrategy for Strategy {
             // `Table::weak_tombstone_reclaimable` when computing level scores so rewrite
             // decisions can prioritize tables that would free the most reclaimable values.
 
-            // Score first level
-            let first_level = version.l0();
-
-            if self.l0_triggered(first_level) {
-                scores[0] = (self.l0_score(first_level), 0);
-            }
-
-            // Score L1+
-            for (idx, level) in version.iter_levels().enumerate().skip(1) {
-                if level.is_empty() {
+            for (idx, level) in version.iter_levels().enumerate() {
+                let trigger = self.policy(idx, level_shift, last).trigger;
+                // A level triggered by its shape scores by it, whether or not
+                // it is empty, as L0 always has.
+                if let Trigger::Shape { runs, tables } = trigger {
+                    if shape_triggered(trigger, level)
+                        && let Some(slot) = scores.get_mut(idx)
+                    {
+                        *slot = (shape_score((runs, tables), level), 0);
+                    }
+                    continue;
+                }
+                // The last level, and any level set so, receives compactions
+                // and never starts one. L0 reaches here only set to trigger by
+                // size, against the target its policy gives it.
+                if trigger == Trigger::Never || level.is_empty() {
                     continue;
                 }
 
@@ -1088,11 +1437,6 @@ impl CompactionStrategy for Strategy {
                     }
                 }
             }
-
-            // NOTE: Never score Lmax
-            {
-                scores[6] = (0.0, 0);
-            }
         }
 
         // Choose compaction
@@ -1111,8 +1455,11 @@ impl CompactionStrategy for Strategy {
             return Choice::DoNothing;
         }
 
-        // We choose L0->L1 compaction
-        if level_idx_with_highest_score == 0 {
+        // We choose L0->L1 compaction, the whole of L0
+        let l0_policy = self.policy(0, level_shift, last);
+        if let (0, Granularity::Level { through_full_next }) =
+            (level_idx_with_highest_score, l0_policy.granularity)
+        {
             let Some(first_level) = version.level(0) else {
                 return Choice::DoNothing;
             };
@@ -1138,7 +1485,13 @@ impl CompactionStrategy for Strategy {
                 .map(Table::id)
                 .collect();
 
-            table_ids.extend(&target_level_overlapping_table_ids);
+            // A leveled L1 takes the merge into its run; a tiered one takes
+            // its output as a run of its own.
+            let l1_tiered =
+                self.policy(canonical_l1_idx, level_shift, last).layout == Layout::Tiered;
+            if !l1_tiered {
+                table_ids.extend(&target_level_overlapping_table_ids);
+            }
 
             // Multi-level compaction: if L1 is already oversized, skip it
             // and compact L0+L1 directly into L2 in one pass.
@@ -1146,7 +1499,7 @@ impl CompactionStrategy for Strategy {
             // improvement could use projected post-compaction bytes to also
             // catch cases where L1 is close to its target and this batch
             // would push it over.
-            if self.multi_level {
+            if through_full_next && !l1_tiered {
                 let l1_score = scores.get(canonical_l1_idx).map_or(0.0, |(s, _)| *s);
                 let l2_idx = canonical_l1_idx + 1;
 
@@ -1217,44 +1570,162 @@ impl CompactionStrategy for Strategy {
             return Choice::Merge(choice);
         }
 
-        // We choose L1+ compaction instead
+        // We choose L1+ compaction instead, or a window of L0
 
+        // L0 goes into the canonical L1, a deeper level into the one below.
+        let next_level_idx = if level_idx_with_highest_score == 0 {
+            canonical_l1_idx
+        } else {
+            level_idx_with_highest_score + 1
+        };
         // NOTE: Level count is 255 max
         #[expect(clippy::cast_possible_truncation)]
-        let curr_level_index = level_idx_with_highest_score as u8;
-
-        let next_level_index = curr_level_index + 1;
+        let (next_level_index, canonical_level) =
+            (next_level_idx as u8, (next_level_idx - level_shift) as u8);
 
         let Some(level) = version.level(level_idx_with_highest_score) else {
             return Choice::DoNothing;
         };
 
-        let Some(next_level) = version.level(next_level_index as usize) else {
+        let Some(next_level) = version.level(next_level_idx) else {
             return Choice::DoNothing;
         };
 
-        // pick_minimal_compaction scans all runs in both levels, handling
-        // transient multi-run states from multi-level compaction (#108, #122).
-        let Some((table_ids, can_trivial_move)) = pick_minimal_compaction(
-            level,
-            next_level,
-            state.hidden_set(),
-            overshoot_bytes,
-            self.target_size,
-            self.promotion_slack.unwrap_or(self.target_size),
-            cmp,
-        ) else {
-            return Choice::DoNothing;
+        let policy = self.policy(level_idx_with_highest_score, level_shift, last);
+        let next_tiered = self.policy(next_level_idx, level_shift, last).layout == Layout::Tiered;
+        // A window into a tiered level below goes down as a run of its own,
+        // nothing of that level taken in: the window of this one that moves
+        // as it is, when one does.
+        let tiered_window = if policy.granularity == Granularity::Window && next_tiered {
+            match window_over(
+                level,
+                state.hidden_set(),
+                overshoot_bytes,
+                policy.movement,
+                self.target_size,
+            ) {
+                Some(ids) => {
+                    let Some(ids) = with_overlapping_runs(level, ids, state.hidden_set(), cmp)
+                    else {
+                        return Choice::DoNothing;
+                    };
+                    Some(ids)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (table_ids, can_trivial_move) = match (tiered_window, policy.granularity) {
+            // Moved only where nothing below overlaps it, which a move may not
+            // pass under; merged into a run of its own otherwise.
+            (Some(ids), _) => {
+                if version.level_is_busy(next_level_idx, state.hidden_set()) {
+                    return Choice::DoNothing;
+                }
+                let overlaps = level
+                    .iter()
+                    .flat_map(|run| run.iter())
+                    .filter(|table| ids.contains(&table.id()))
+                    .any(|table| {
+                        next_level
+                            .iter()
+                            .any(|run| !run.get_overlapping_cmp(table.key_range(), cmp).is_empty())
+                    });
+                (ids, !overlaps)
+            }
+            // A window of a leveled level below: pick_minimal_compaction scans
+            // all runs in both levels, handling transient multi-run states from
+            // multi-level compaction (#108, #122).
+            (None, Granularity::Window) if !next_tiered => {
+                let Some(picked) = pick_minimal_compaction(
+                    level,
+                    next_level,
+                    state.hidden_set(),
+                    overshoot_bytes,
+                    self.target_size,
+                    policy.movement,
+                    cmp,
+                ) else {
+                    return Choice::DoNothing;
+                };
+                picked
+            }
+            // The whole level, with what it overlaps of a leveled level
+            // below; into a tiered one it goes as a run of its own, which
+            // joins a run there it overlaps nothing of: the shape trigger
+            // counts runs as a read meets them. A window
+            // into a tiered level comes here only when no part of this one
+            // moves as it is.
+            (None, Granularity::Window | Granularity::Level { .. }) => {
+                if version.level_is_busy(level_idx_with_highest_score, state.hidden_set())
+                    || version.level_is_busy(next_level_idx, state.hidden_set())
+                {
+                    return Choice::DoNothing;
+                }
+                // The level below already past its target goes on down with
+                // this one in the same merge, as L0 does into a full L1,
+                // rather than being rewritten here and again when it is
+                // chosen.
+                if policy.granularity
+                    == (Granularity::Level {
+                        through_full_next: true,
+                    })
+                    && !next_tiered
+                    && scores
+                        .get(next_level_idx)
+                        .is_some_and(|(score, _)| *score > 1.0)
+                    && let Some(below) = version.level(next_level_idx + 1)
+                    && !version.level_is_busy(next_level_idx + 1, state.hidden_set())
+                    // An empty level below takes the next one as a trivial
+                    // move instead, which rewrites nothing.
+                    && !below.is_empty()
+                {
+                    let mut ids = level.list_ids();
+                    ids.extend(next_level.list_ids());
+                    let mut ranges: Vec<_> = level
+                        .iter()
+                        .chain(next_level.iter())
+                        .flat_map(|run| run.iter())
+                        .map(|table| table.key_range().clone())
+                        .collect();
+                    ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
+                    for interval in &crate::KeyRange::merge_sorted_cmp(ranges, cmp) {
+                        for run in below.iter() {
+                            ids.extend(
+                                run.get_overlapping_cmp(interval, cmp).iter().map(Table::id),
+                            );
+                        }
+                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "level index is bounded by level count (7, technically 255)"
+                    )]
+                    return Choice::Merge(CompactionInput {
+                        table_ids: ids,
+                        dest_level: (next_level_idx + 1) as u8,
+                        canonical_level: canonical_level + 1,
+                        target_size: self.target_size,
+                    });
+                }
+                let key_range = level.aggregate_key_range_cmp(cmp);
+                let overlapping: Vec<TableId> = next_level
+                    .iter()
+                    .flat_map(|run| run.get_overlapping_cmp(&key_range, cmp))
+                    .map(Table::id)
+                    .collect();
+                let mut ids = level.list_ids();
+                if !next_tiered {
+                    ids.extend(&overlapping);
+                }
+                (ids, overlapping.is_empty())
+            }
         };
 
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "level shift is bounded by level count (7, technically 255)"
-        )]
         let choice = CompactionInput {
             table_ids,
             dest_level: next_level_index,
-            canonical_level: next_level_index - (level_shift as u8),
+            canonical_level,
             target_size: self.target_size,
         };
 

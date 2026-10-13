@@ -127,11 +127,19 @@ pub struct Options {
     /// throttled.
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
+    /// The pool the tree's compactions reserve the room for their outputs
+    /// in, which other trees may share.
+    pub(crate) capacity: Arc<crate::CapacityPool>,
+
     /// The files this run has created that no installed version names yet,
     /// removed by [`do_compaction`] when the run returns. [`do_compaction`]
     /// gives each run its own; the clones a run hands its sub-compactions
     /// share it.
     pub(crate) outputs: super::output_ledger::OutputLedger,
+
+    /// The work this run did, against the estimate it was planned against.
+    /// [`do_compaction`] gives each run its own, as it does `outputs`.
+    pub(crate) work: Arc<super::work::WorkLedger>,
 
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
@@ -162,7 +170,9 @@ impl Options {
             // The tree's one budget, not a fresh one: see
             // `TreeInner::compaction_rate_limiter`.
             rate_limiter: Arc::clone(&tree.compaction_rate_limiter),
+            capacity: Arc::clone(&tree.compaction_capacity),
             outputs: super::output_ledger::OutputLedger::default(),
+            work: Arc::default(),
 
             #[cfg(feature = "metrics")]
             metrics: tree.metrics.clone(),
@@ -174,19 +184,38 @@ impl Options {
 ///
 /// This will block until the compactor is fully finished.
 pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    // A ledger of this run's own: the caller may share its options with runs
-    // that overlap this one, and their outputs are theirs to install.
+    // Ledgers of this run's own: the caller may share its options with runs
+    // that overlap this one, and their outputs and work are theirs.
     let opts = &Options {
         outputs: super::output_ledger::OutputLedger::default(),
+        work: Arc::default(),
         ..opts.clone()
     };
     let result = run_compaction(opts);
+    // A run its room stopped declined, as one the gate skips does: its
+    // inputs are as they were, and only its outputs go, below.
+    let result = match result {
+        Err(e) if opts.outputs.out_of_room() => {
+            log::info!("Compaction stopped: its outputs outgrew the room left for them ({e})");
+            Ok(CompactionResult::nothing())
+        }
+        result => result,
+    };
     // Every file the run created that it did not install goes now, whichever
     // writer made it and wherever the run stopped: the handles on them
-    // dropped as the run returned.
+    // dropped as the run returned. The run's room goes back once they are
+    // gone.
     opts.outputs
         .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
-    result
+    // Charged whether or not the run succeeded: a tight-space pass that fails
+    // after installing slices leaves them installed, and what they read and
+    // wrote was done.
+    let work = opts.work.report();
+    #[cfg(feature = "metrics")]
+    opts.metrics.charge_compaction_work(&work);
+    let mut result = result?;
+    result.work = work;
+    Ok(result)
 }
 
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
@@ -226,45 +255,7 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
 
     match choice {
         Choice::Merge(payload) => {
-            // Space-admission gate (opt-in). A merge transiently needs room for
-            // its output while the inputs still exist, so on a near-full disk a
-            // naive run can hit ENOSPC. Gating merges like user writes would
-            // deadlock (compaction is what frees space), so the gate keeps an
-            // emergency reserve and narrows rather than blanket-skips. `Move` /
-            // `Drop` are zero / negative space and always run (below).
-            let decision = {
-                let super_version = version_history_lock.latest_version();
-                space_gate_for_merge(&super_version.version, opts, &payload)?
-            };
-            match decision {
-                SpaceGate::Run => {
-                    merge_tables(compaction_state, version_history_lock, opts, &payload)
-                }
-                SpaceGate::Narrowed(narrowed) => {
-                    log::debug!(
-                        "Compaction space gate: narrowed merge from {} to {} tables to fit free space",
-                        payload.table_ids.len(),
-                        narrowed.table_ids.len(),
-                    );
-                    merge_tables(compaction_state, version_history_lock, opts, &narrowed)
-                }
-                SpaceGate::Skip => {
-                    #[cfg(feature = "std")]
-                    if opts.runtime_config.load().tight_space_compaction {
-                        return run_tight_space_compaction(
-                            compaction_state,
-                            version_history_lock,
-                            opts,
-                            &payload,
-                        );
-                    }
-                    log::info!(
-                        "Compaction space gate: skipping {}-table merge — free space cannot cover the transient output and no fitting subset exists (opt-in tight-space reclaim handles this)",
-                        payload.table_ids.len(),
-                    );
-                    Ok(CompactionResult::nothing())
-                }
-            }
+            gated_merge(compaction_state, version_history_lock, opts, &payload)
         }
         Choice::Move(payload) => {
             // Checked before the cross-folder conversion below, not after: that
@@ -304,7 +295,7 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                     .any(|t| t.path.parent() != Some(dst_folder.as_path()));
                 if cross_folder {
                     log::debug!("Converting trivial move to merge: cross-folder level routing");
-                    return merge_tables(compaction_state, version_history_lock, opts, &payload);
+                    return gated_merge(compaction_state, version_history_lock, opts, &payload);
                 }
             }
 
@@ -318,22 +309,7 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
                 &payload,
             )? {
                 log::debug!("Converting trivial move to merge: blob locality relocation");
-                return merge_tables(compaction_state, version_history_lock, opts, &payload);
-            }
-
-            // Only a real trivial move has to answer this one: the rewrites
-            // above consolidate the same inputs into one sorted output, which
-            // is the repair rather than the problem.
-            if !moved_tables_can_share_a_run(
-                &version_history_lock.latest_version_ref().version,
-                &payload,
-                opts.config.comparator.as_ref(),
-            ) {
-                log::warn!(
-                    "Compaction task created by {:?} would move overlapping tables into one run, losing the keys of all but the first - declining to run it",
-                    opts.strategy.get_name(),
-                );
-                return Ok(CompactionResult::nothing());
+                return gated_merge(compaction_state, version_history_lock, opts, &payload);
             }
 
             drop(version_history_lock);
@@ -353,46 +329,65 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     }
 }
 
-/// Outcome of the compaction space-admission gate for a [`Choice::Merge`].
+/// Where a merge stands once it asked for the room its outputs take.
 enum SpaceGate {
-    /// Run the merge as chosen (admission off, backend can't report free space,
-    /// or the inputs fit the available space).
-    Run,
+    /// Run the merge as chosen, in the room reserved for it.
+    Run(super::capacity::Reservation),
     /// Run a smaller fitting subset (a minimal reclaiming merge) instead of the
-    /// chosen one, which did not fit.
-    Narrowed(CompactionPayload),
+    /// chosen one, which did not fit, in the room reserved for it.
+    Narrowed(CompactionPayload, super::capacity::Reservation),
     /// No fitting subset exists; skip this cycle. The truly-too-big single merge
     /// is the opt-in tight-space mode's domain; meanwhile `Drop` / `Move` cycles
     /// still reclaim and reorganize.
     Skip,
 }
 
-/// The two-layer space model shared by the compaction gate and the
-/// `storage_stats` forward-looking status, so the reported availability matches
-/// what the gate will actually admit.
-///
-/// **Layer 1 (logical partition quota).** The configured `storage_limit_bytes`
-/// caps the tree's total footprint regardless of which volume the bytes land on.
-/// `quota_headroom` is `max(0, limit - used)`, or `u64::MAX` when no quota is
-/// set. The total new bytes (`sst_bytes + blob_bytes`) must fit it.
-///
-/// **Layer 2 (physical free space, per destination volume).** SST output lands
-/// in `sst_dest_level`'s volume; KV-separated blob relocation lands in the
-/// primary blobs volume. The two are budgeted **independently only when they are
-/// proven to be on different physical volumes** ([`Fs::volume_id`](crate::fs::Fs::volume_id) reports
-/// distinct device ids) — then a full cold-tier route never stalls a hot-level
-/// merge. Otherwise (same volume, or independence not proven) their transient
-/// peak is the **combined sum** on the tighter volume: checking them
-/// independently would over-admit, since each fits the free space alone while
-/// together they exhaust it and the merge hits `ENOSPC`. `level_routes` maps
-/// levels to paths but does NOT prove a separate mount (a route may point at the
-/// same filesystem), so routing alone is not treated as independence. Each
-/// volume leaves the reserved flush floor when ample, or consumes it (raw free)
-/// to break the no-space-to-free-space deadlock.
-///
-/// A volume that cannot report free space contributes `u64::MAX`, so a probe
-/// failure never fabricates disk pressure. With no quota and every volume
-/// unbounded, the result is unconditionally `true` (nothing constrains).
+/// Runs the merge of `payload` in the room its outputs take, a smaller merge
+/// that fits, or the tight-space pass, or skips it. A merge a move turned into,
+/// to rewrite its tables elsewhere, asks for its room here as any other does.
+fn gated_merge(
+    compaction_state: CompactionGuard<'_>,
+    version_history_lock: VersionsReadGuard<'_>,
+    opts: &Options,
+    payload: &CompactionPayload,
+) -> crate::Result<CompactionResult> {
+    let decision = {
+        let super_version = version_history_lock.latest_version();
+        space_gate_for_merge(&super_version.version, opts, payload)?
+    };
+    match decision {
+        SpaceGate::Run(room) => {
+            opts.outputs.reserve(room);
+            merge_tables(compaction_state, version_history_lock, opts, payload)
+        }
+        SpaceGate::Narrowed(narrowed, room) => {
+            log::debug!(
+                "Compaction space gate: narrowed merge from {} to {} tables to fit free space",
+                payload.table_ids.len(),
+                narrowed.table_ids.len(),
+            );
+            opts.outputs.reserve(room);
+            merge_tables(compaction_state, version_history_lock, opts, &narrowed)
+        }
+        SpaceGate::Skip => {
+            #[cfg(feature = "std")]
+            if opts.runtime_config.load().tight_space_compaction {
+                return run_tight_space_compaction(
+                    compaction_state,
+                    version_history_lock,
+                    opts,
+                    payload,
+                );
+            }
+            log::info!(
+                "Compaction space gate: skipping {}-table merge — free space cannot cover the transient output and no fitting subset exists (opt-in tight-space reclaim handles this)",
+                payload.table_ids.len(),
+            );
+            Ok(CompactionResult::nothing())
+        }
+    }
+}
+
 /// Whether two paths sit on PROVABLY separate free-space pools: both backends
 /// report a volume id AND the ids differ.
 ///
@@ -413,101 +408,87 @@ fn separate_volumes(
     }
 }
 
-// `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
-// redundant restriction since the module itself is already crate-scoped.
-pub fn space_fits_two_layer(
+/// The bytes a merge into `dest_level` writing `sst_bytes` of tables and
+/// `blob_bytes` of relocated blob files takes, folder by folder: the tables in
+/// the level's folder, the blob files in the tree's blob folder.
+///
+/// Each folder belongs to the volume its backend reports. Two folders are
+/// counted apart only on volumes proven apart; otherwise their demands add up
+/// on one volume, since each would fit its free space alone while together
+/// they exhaust it. A level route names a folder, not a mount, so routing
+/// alone proves nothing. A tree that relocates no blob files writes nothing
+/// to the blob folder, and the pool leaves that folder out of the check.
+fn with_merge_demands<T>(
     config: &Config,
-    quota_headroom: u64,
-    sst_bytes: u64,
-    sst_dest_level: u8,
-    blob_bytes: u64,
-) -> bool {
-    space_fits(
-        config,
-        quota_headroom,
-        sst_bytes,
-        sst_dest_level,
-        blob_bytes,
-        Reserve::MayConsume,
-    )
-}
-
-/// Whether a merge may eat into the reserved flush floor to fit.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Reserve {
-    /// Only where the reserve stays intact: work that is optional.
-    Keep,
-    /// Also into the reserve, which breaks the no-space-to-free-space
-    /// deadlock for a merge that frees space.
-    MayConsume,
-}
-
-/// [`space_fits_two_layer`], with the reserve policy explicit.
-fn space_fits(
-    config: &Config,
-    quota_headroom: u64,
-    sst_bytes: u64,
-    sst_dest_level: u8,
-    blob_bytes: u64,
-    reserve: Reserve,
-) -> bool {
-    const RESERVE: u64 = crate::tree::MIN_RESERVED_HEADROOM;
-
-    // Layer 1: logical partition quota on the total new bytes. The sum of two
-    // on-disk byte counts is bounded by filesystem capacity and cannot overflow.
-    if sst_bytes + blob_bytes > quota_headroom {
-        return false;
-    }
-
-    // Layer 2: physical free space per destination volume. A volume's demand
-    // fits when it leaves the reserved flush floor (ample) or, to break the
-    // no-space-to-free-space deadlock, when it fits raw free (emergency,
-    // consuming the reserve). `>= RESERVE` guards the subtraction.
-    let volume_fits = |demand: u64, free: u64| -> bool {
-        (free >= RESERVE && demand <= free - RESERVE)
-            || (reserve == Reserve::MayConsume && demand <= free)
-    };
-
-    let (sst_path, sst_fs) = config.tables_folder_for_level(sst_dest_level);
-    let sst_free = sst_fs.available_space(&sst_path).unwrap_or(u64::MAX);
+    dest_level: u8,
+    (sst_bytes, blob_bytes): (u64, u64),
+    f: impl FnOnce(&[super::capacity::Demand<'_>]) -> T,
+) -> T {
+    let (sst_path, sst_fs) = config.tables_folder_for_level(dest_level);
     let blob_dir = config.path.join(BLOBS_FOLDER);
-    let blob_free = config.fs.available_space(&blob_dir).unwrap_or(u64::MAX);
-
-    let independent = separate_volumes(&*sst_fs, &sst_path, &*config.fs, &blob_dir);
-
-    if independent {
-        volume_fits(sst_bytes, sst_free) && volume_fits(blob_bytes, blob_free)
-    } else {
-        // Same (or unproven-distinct) volume: the transient peak is the combined
-        // sum against the tighter free probe.
-        volume_fits(sst_bytes + blob_bytes, sst_free.min(blob_free))
-    }
+    f(&[
+        super::capacity::Demand {
+            fs: &*sst_fs,
+            path: &sst_path,
+            bytes: sst_bytes,
+        },
+        super::capacity::Demand {
+            fs: &*config.fs,
+            path: &blob_dir,
+            bytes: blob_bytes,
+        },
+    ])
 }
 
-/// Decides whether a chosen merge fits the available space, narrowing it to a
-/// minimal reclaiming subset when it does not.
+/// Whether a merge into `dest_level` writing `sst_bytes` of tables and
+/// `blob_bytes` of relocated blob files fits under `quota_headroom` and the
+/// free space of the volumes it writes to, past what the compactions sharing
+/// `pool` have still to write, taking the flush floor if it must. The storage
+/// statistics ask it of a full compaction, so that what they report is what
+/// the gate admits.
+pub fn merge_would_fit(
+    pool: &crate::CapacityPool,
+    tree: TreeId,
+    config: &Config,
+    quota_headroom: u64,
+    (sst_bytes, blob_bytes): (u64, u64),
+    dest_level: u8,
+) -> bool {
+    with_merge_demands(config, dest_level, (sst_bytes, blob_bytes), |demands| {
+        pool.would_fit(
+            tree,
+            demands,
+            super::capacity::Check {
+                quota_headroom,
+                floor: super::capacity::Floor::MayConsume,
+            },
+        )
+    })
+}
+
+/// Reserves the room the merge of `payload` takes, narrowing it to a minimal
+/// reclaiming subset when it does not fit.
 ///
-/// The merge's transient output is checked through [`space_fits_two_layer`]: the
-/// logical partition quota bounds the total new bytes, and the physical free
-/// space is checked per destination volume (SST output volume + primary blob
-/// volume, combined onto one budget when they share a filesystem).
+/// The room is reserved in the tree's pool whether or not storage admission
+/// is on, so that the compactions sharing the pool count it; only admission
+/// refuses a merge. A merge is checked against the logical quota for the
+/// bytes it writes in all, and against the free space of each volume it
+/// writes to past what the other compactions in the pool have still to
+/// write, consuming the flush floor if it must, which breaks the deadlock of
+/// a merge that frees space and has none to start in.
 ///
-/// The SST bound is `Σ input live_file_size` (a tight-space-restricted input
-/// contributes only its live suffix — the punched prefix is superseded and never
-/// rewritten); the blob bound is the physical on-disk
-/// size of the stale blob files selected for relocation. This is a best-effort
-/// estimate: a merge operator / compaction filter that *grows* values can still
-/// write more than the inputs, so a mid-merge `ENOSPC` remains possible — that
-/// case is handled by the atomic-commit guarantee (orphan output, intact inputs,
-/// unchanged manifest, retried later), not by this gate. The gate's job is to
-/// keep the common doomed merge from starting.
+/// The tables are bounded by the bytes of the inputs' files (a tight-space
+/// restricted input by its live suffix: the punched prefix is superseded and
+/// never rewritten), the blob files by the physical size of the stale ones
+/// selected for relocation. A compaction filter or merge operator may write
+/// more: the merge takes the excess on as its outputs land, or stops (see
+/// [`super::capacity::Reservation::landed`]).
 ///
-/// - Admission off → [`SpaceGate::Run`].
-/// - The chosen merge fits both layers → [`SpaceGate::Run`].
+/// - It fits (or admission is off) → [`SpaceGate::Run`].
 /// - It does not fit, but a run-adjacent pair does → [`SpaceGate::Narrowed`].
 ///   Candidates are tried in ascending SST size; a larger pair with fewer stale
-///   blob rewrites can fit where the smallest does not, so each is re-checked
-///   through the full two-layer budget (its own relocation set included).
+///   blob rewrites can fit where the smallest does not, so each is reserved
+///   for in full (its own relocation set included).
 /// - No fitting subset exists → [`SpaceGate::Skip`].
 fn space_gate_for_merge(
     version: &Version,
@@ -515,26 +496,29 @@ fn space_gate_for_merge(
     payload: &CompactionPayload,
 ) -> crate::Result<SpaceGate> {
     let rc = opts.runtime_config.load_full();
-    if !rc.storage_admission_check {
-        return Ok(SpaceGate::Run);
-    }
-
-    // Layer 1 headroom (tree-wide). `max(0, limit - used)`: an operator quota set
-    // below the live footprint leaves zero headroom — the clamp-to-zero is the
-    // intended min-semantics (not masking). The footprint stat is propagated, not
-    // swallowed (an undercounted `used` would overstate the headroom).
-    let quota_headroom = match rc.storage_limit_bytes {
-        Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(version)?),
-        None => u64::MAX,
+    let check = if rc.storage_admission_check {
+        // `max(0, limit - used)`: an operator quota set below the live
+        // footprint leaves zero headroom — the clamp-to-zero is the intended
+        // min-semantics (not masking). The footprint stat is propagated, not
+        // swallowed (an undercounted `used` would overstate the headroom).
+        let quota_headroom = match rc.storage_limit_bytes {
+            Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(version)?),
+            None => u64::MAX,
+        };
+        Some(super::capacity::Check {
+            quota_headroom,
+            floor: super::capacity::Floor::MayConsume,
+        })
+    } else {
+        None
     };
 
-    // Per-payload transient demand. Recomputed per payload because narrowing
-    // changes both the SST input set AND (via `pick_blob_files_to_rewrite` on the
-    // actual payload) the stale blob relocation set, so a narrowed merge can fit
-    // where the full one did not. Stat failures propagate (a silent 0 would
-    // undercount and admit the very rewrite this gate must block).
-    let fits = |p: &CompactionPayload| -> crate::Result<bool> {
-        // SST input bound (output never exceeds the inputs for a pure compaction).
+    // Per-payload demand. Recomputed per payload because narrowing changes both
+    // the SST input set AND (via `pick_blob_files_to_rewrite` on the actual
+    // payload) the stale blob relocation set, so a narrowed merge can fit where
+    // the full one did not. Stat failures propagate (a silent 0 would undercount
+    // and admit the very rewrite this gate must block).
+    let reserve = |p: &CompactionPayload| -> crate::Result<Option<super::capacity::Reservation>> {
         let sst_sigma: u64 = p
             .table_ids
             .iter()
@@ -546,25 +530,24 @@ fn space_gate_for_merge(
                 .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?,
             None => 0,
         };
-        Ok(space_fits_two_layer(
+        Ok(with_merge_demands(
             &opts.config,
-            quota_headroom,
-            sst_sigma,
             p.dest_level,
-            blob_sigma,
+            (sst_sigma, blob_sigma),
+            |demands| opts.capacity.reserve(opts.tree_id, demands, check),
         ))
     };
 
-    if fits(payload)? {
-        return Ok(SpaceGate::Run);
+    if let Some(room) = reserve(payload)? {
+        return Ok(SpaceGate::Run(room));
     }
 
     // Constrained: try the run-adjacent narrowing candidates in ascending SST
-    // size and run the first that fits the full two-layer budget. Skip only when
-    // none fit (a truly-too-big single merge is the opt-in tight-space domain).
+    // size and run the first that fits. Skip only when none fit (a truly-too-big
+    // single merge is the opt-in tight-space domain).
     for narrowed in narrow_merge_candidates(version, payload)? {
-        if fits(&narrowed)? {
-            return Ok(SpaceGate::Narrowed(narrowed));
+        if let Some(room) = reserve(&narrowed)? {
+            return Ok(SpaceGate::Narrowed(narrowed, room));
         }
     }
     Ok(SpaceGate::Skip)
@@ -643,32 +626,69 @@ fn pick_run_indexes(run: &Run<Table>, to_compact: &[TableId]) -> Option<(usize, 
     Some((lo, hi))
 }
 
-/// What a compaction tells its rate limiter about the reads of its inputs:
-/// how long they take, for a latency backoff on the limiter to steer by. A
-/// limiter shared with a verification scan would otherwise keep a rate the
-/// scan lowered after the scan ends, since only reads report latency.
-#[cfg_attr(
-    feature = "std",
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "a no-std build times no reads and has no pacer to give"
-    )
-)]
-fn input_pacer(
-    limiter: &Arc<crate::rate_limiter::RateLimiter>,
-) -> Option<crate::table::util::Pacer> {
-    // no-std: reads are timed only with std (see `ReadPacer::read_took`)
-    #[cfg(feature = "std")]
-    {
-        Some(Arc::new(crate::table::util::LatencyPacer(Arc::clone(
-            limiter,
-        ))))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = limiter;
+/// The pacer of the run's input reads: it tells the rate limiter how long
+/// they take, for a latency backoff on the limiter to steer by, and counts
+/// what they return to the run's work. A limiter shared with a verification
+/// scan would otherwise keep a rate the scan lowered after the scan ends,
+/// since only reads report latency.
+fn input_pacer(opts: &Options) -> crate::table::util::Pacer {
+    Arc::new(super::work::InputPacer::new(&opts.rate_limiter, &opts.work))
+}
+
+/// The work a merge of `tables` into `payload`'s level is expected to cost,
+/// relocating `blob_files` and applying the range tombstones of `rt_plan`.
+fn merge_estimate(
+    opts: &Options,
+    version: &Version,
+    payload: &CompactionPayload,
+    tables: &[Table],
+    blob_files: &[BlobFile],
+    rt_plan: Option<&(
+        Vec<crate::range_tombstone::RangeTombstone>,
+        RangeTombstoneUse,
+    )>,
+) -> super::work::WorkEstimate {
+    // The groups are recorded as the merge records them: a merge relocating
+    // blob files writes every row itself.
+    #[cfg(feature = "columnar")]
+    let carry = if blob_files.is_empty() {
+        super::carry::plan(
+            &opts.config,
+            &opts.runtime_config.load(),
+            payload.canonical_level.into(),
+            tables,
+        )
+    } else {
         None
-    }
+    };
+    #[cfg(not(feature = "columnar"))]
+    let _ = payload;
+    // Only a deleting tombstone changes the rows it covers; a boundary one
+    // ends an operand chain, which a merge operator's rows answer for.
+    let deleting = match rt_plan {
+        Some((tombstones, RangeTombstoneUse::Delete)) => tombstones.as_slice(),
+        _ => &[],
+    };
+    super::work::estimate_merge(
+        &super::work::MergePlan {
+            inputs: tables,
+            blob_files,
+            gc_stats: version.gc_stats(),
+            user_code: opts.config.compaction_filter_factory.is_some()
+                || opts.config.merge_operator.is_some(),
+            range_tombstones: deleting,
+            comparator: opts.config.comparator.as_ref(),
+        },
+        |table| {
+            #[cfg(feature = "columnar")]
+            return carry.as_ref().is_some_and(|carry| carry.takes(table));
+            #[cfg(not(feature = "columnar"))]
+            {
+                let _ = table;
+                false
+            }
+        },
+    )
 }
 
 fn create_compaction_stream<'a>(
@@ -965,13 +985,12 @@ fn zeroing_tombstones_from(
 ///
 /// A move rewrites nothing: it just relabels which level the tables sit on. The
 /// read path walks levels from the top and stops at the first one holding the
-/// key, taking "higher" to mean "newer", and below L0 it also takes the runs of
-/// one level to be disjoint (it breaks at the first run whose range covers the
-/// key). A move that drops tables underneath an overlapping table breaks both
-/// readings at once: the older copy above now answers the read, and a key that
-/// lives only in the moved table can be missed entirely because the covering
-/// run above it does not hold it. Neither shows up as corruption, since both
-/// tables are intact on disk.
+/// key, taking "higher" to mean "newer". A move that drops tables underneath an
+/// overlapping table breaks that reading: the older copy above now answers the
+/// read. It does not show up as corruption, since both tables are intact on
+/// disk. Within the destination itself the moved runs go ahead of the ones
+/// already there, which is correct for tables newer than them; an overlap there
+/// is still refused, as the move cannot prove the moved tables are the newer.
 ///
 /// This condition is per table rather than over the moved set as a whole, so
 /// that a move spanning a gap is not refused for an overlap that falls inside
@@ -1095,42 +1114,6 @@ fn any_overlap(
     }
 
     false
-}
-
-/// Whether the tables this task hands over can share one run, which is where a
-/// trivial move puts them: below L0 the read path takes the first table of a run
-/// whose range covers the key and looks no further, so a run holding two
-/// overlapping tables loses whatever lives only in the second.
-///
-/// Only a trivial move needs this. A cross-folder task carrying the same inputs
-/// is rewritten instead, and the rewrite reads all of them and emits one sorted
-/// output, which is exactly the repair.
-fn moved_tables_can_share_a_run(
-    version: &Version,
-    payload: &CompactionPayload,
-    comparator: &dyn crate::comparator::UserComparator,
-) -> bool {
-    use crate::version::run::Ranged as _;
-
-    let mut moved: Vec<&Table> = moved_tables(version, payload)
-        .into_iter()
-        .map(|(_, table)| table)
-        .collect();
-    sort_by_min_key(&mut moved, comparator);
-
-    // Sorted by where they start, neighbours are enough: if two tables overlap,
-    // so does every pair between them, because a table starting inside the
-    // first one's range and before the second's start lies within the first.
-    // That is what keeps a whole-level move from costing its table count
-    // squared.
-    !moved.windows(2).any(|pair| {
-        let [a, b] = pair else {
-            return false;
-        };
-        comparator
-            .compare(b.key_range().min(), a.key_range().max())
-            .is_le()
-    })
 }
 
 /// The tables this task moves, each with the level it currently sits on.
@@ -1467,34 +1450,37 @@ fn run_tight_space_compaction(
     // IDs, not the `BlobFile` handles: retaining an Arc would pin the stale
     // `Inner` and block its punch-on-drop. Each slice re-fetches the current
     // handle from the version.
-    let (stale_ids, stale_total_bytes): (Vec<BlobFileId>, u64) =
-        match &opts.config.kv_separation_opts {
-            Some(blob_opts) => {
-                let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
-                let files = pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?;
-                // Sum of on-disk blob-file sizes; bounded by filesystem capacity,
-                // so it cannot overflow u64 (matches the gate's `acc + size`).
-                let mut total = 0u64;
-                for bf in &files {
-                    total += bf.physical_size()?;
-                }
-                // Each stale file is punched through its OWN backend, which a
-                // separately backed `blobs/` can refuse.
-                if let Some(bf) = files
-                    .iter()
-                    .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
-                {
-                    log::info!(
-                        "Tight-space compaction unavailable: the backend of blob file {} \
-                         lacks punch_hole, so its relocated prefix would stay allocated",
-                        bf.0.path.display(),
-                    );
-                    return Ok(CompactionResult::nothing());
-                }
-                (files.iter().map(BlobFile::id).collect(), total)
-            }
-            None => (Vec::new(), 0),
-        };
+    let stale_files = match &opts.config.kv_separation_opts {
+        Some(blob_opts) => {
+            let picked: HashSet<TableId> = payload.table_ids.iter().copied().collect();
+            pick_blob_files_to_rewrite(&picked, &latest.version, blob_opts)?
+        }
+        None => Vec::new(),
+    };
+    // Each stale file is punched through its OWN backend, which a separately
+    // backed `blobs/` can refuse.
+    if let Some(bf) = stale_files
+        .iter()
+        .find(|bf| !bf.0.fs.capabilities(&bf.0.path).punch_hole)
+    {
+        log::info!(
+            "Tight-space compaction unavailable: the backend of blob file {} \
+             lacks punch_hole, so its relocated prefix would stay allocated",
+            bf.0.path.display(),
+        );
+        return Ok(CompactionResult::nothing());
+    }
+    // Sum of on-disk blob-file sizes; bounded by filesystem capacity, so it
+    // cannot overflow u64 (matches the gate's `acc + size`).
+    let mut stale_total_bytes = 0u64;
+    for bf in &stale_files {
+        stale_total_bytes += bf.physical_size()?;
+    }
+    // Slices apply no range tombstone, so none is planned for. Recorded once
+    // the pass is sure to run, below.
+    let estimate = merge_estimate(opts, &latest.version, payload, &inputs, &stale_files, None);
+    let stale_ids: Vec<BlobFileId> = stale_files.iter().map(BlobFile::id).collect();
+    drop(stale_files);
     let relocating = !stale_ids.is_empty();
 
     // The reclaim runs through each INPUT's own backend, not the destination's:
@@ -1522,8 +1508,9 @@ fn run_tight_space_compaction(
     // it. When the destination can hold the whole merge it is not the
     // constrained pool (the gate skipped for the blob volume instead) and the
     // reclaim landing elsewhere is fine.
-    let inputs_total: u64 = inputs.iter().map(Table::file_size).sum();
-    let dest_free = dest_fs.available_space(&dest_path).unwrap_or(u64::MAX);
+    let inputs_total: u64 = inputs.iter().map(Table::file_len).sum();
+    // What the compactions sharing the pool have still to write is not free.
+    let dest_free = opts.capacity.available(&*dest_fs, &dest_path);
     if dest_free < inputs_total {
         // Only a PROVEN different volume forfeits the relief; an unproven pair
         // counts as shared, leaving the single-volume default untouched.
@@ -1537,7 +1524,7 @@ fn run_tight_space_compaction(
         let remote_total: u64 = inputs
             .iter()
             .filter(|t| separate_volumes(&*t.fs, &t.path, &*dest_fs, &dest_path))
-            .map(Table::file_size)
+            .map(Table::file_len)
             .sum();
         if dest_free < remote_total {
             log::info!(
@@ -1556,9 +1543,9 @@ fn run_tight_space_compaction(
     // clamp-to-zero matches the gate's min-semantics (a quota set below the
     // live footprint leaves no headroom).
     let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
-        Some(limit) => {
-            limit.saturating_sub(crate::storage_stats::compute_used_bytes(&latest.version)?)
-        }
+        Some(limit) => limit
+            .saturating_sub(crate::storage_stats::compute_used_bytes(&latest.version)?)
+            .saturating_sub(opts.capacity.quota_held(opts.tree_id)),
         None => u64::MAX,
     };
 
@@ -1584,13 +1571,9 @@ fn run_tight_space_compaction(
     // destination beside a full `blobs/` yields a budget larger than every
     // input block (`tight_slice_boundaries` returns empty, so no reclaim
     // happens at all) or a slice the blob volume cannot hold.
+    let blob_dir = opts.config.path.join(BLOBS_FOLDER);
     let physical_budget = if relocating && stale_total_bytes > 0 {
-        let blob_dir = opts.config.path.join(BLOBS_FOLDER);
-        let blob_free = opts
-            .config
-            .fs
-            .available_space(&blob_dir)
-            .unwrap_or(u64::MAX);
+        let blob_free = opts.capacity.available(&*opts.config.fs, &blob_dir);
         let independent = separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
         // A slice covering `b` SST bytes writes `b` to the SST volume and
         // `b * stale_total / inputs_total` to the blob volume. Separate pools
@@ -1625,6 +1608,42 @@ fn run_tight_space_compaction(
         // Indivisible (single block across all inputs) — no incremental reclaim.
         return Ok(CompactionResult::nothing());
     }
+
+    opts.work.plan(estimate);
+
+    // Each slice holds the room one slice takes, so the compactions sharing
+    // the pool count it. Unchecked: the budget was sized to what is free past
+    // what the pool holds, and this is the pass that frees room. A slice
+    // writes at most the inputs' bytes to the tables and their share of the
+    // stale files to the blob folder.
+    let slice_tables = slice_budget.min(inputs_total);
+    let slice_blobs = if relocating {
+        // At most `stale_total_bytes`, so it fits a u64.
+        u64::try_from(
+            u128::from(slice_tables) * u128::from(stale_total_bytes)
+                / u128::from(inputs_total.max(1)),
+        )
+        .unwrap_or(stale_total_bytes)
+        .min(stale_total_bytes)
+    } else {
+        0
+    };
+    let reserve_slice = || {
+        let demands = [
+            super::capacity::Demand {
+                fs: &*dest_fs,
+                path: &dest_path,
+                bytes: slice_tables,
+            },
+            super::capacity::Demand {
+                fs: &*opts.config.fs,
+                path: &blob_dir,
+                bytes: slice_blobs,
+            },
+        ];
+        opts.outputs
+            .reserve(opts.capacity.hold(opts.tree_id, &demands));
+    };
 
     // Hide the inputs so the strategy cannot re-select them mid-loop.
     compaction_state
@@ -1670,6 +1689,7 @@ fn run_tight_space_compaction(
         let mut tables_out = 0usize;
 
         for boundary in &boundaries {
+            reserve_slice();
             // Merge [lower, boundary) over the surviving (restricted) input views.
             let slice_payload = slice_payload_for(&current_views, payload);
             let version = opts.version_history.read().latest_version();
@@ -1765,6 +1785,7 @@ fn run_tight_space_compaction(
             // Charged once this slice is installed, below.
             let relocated_bytes = produced.relocated_bytes();
             let carried = produced.carried();
+            let installed_work = produced.installed_work();
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -1990,13 +2011,9 @@ fn run_tight_space_compaction(
             // The version names this slice's outputs now: a later slice's failure
             // must not remove them.
             opts.outputs.installed();
+            opts.work.installed(installed_work);
             #[cfg(feature = "metrics")]
-            super::flavour::charge_installed(
-                &opts.metrics,
-                relocated_bytes,
-                carried,
-                outputs.iter().map(Table::file_size).sum(),
-            );
+            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the
@@ -2120,6 +2137,7 @@ fn run_tight_space_compaction(
         // Tail [last boundary, hi): merge the remainder, remove the inputs, and
         // drop the now fully-consumed stale blob files (install_merge deletes
         // them outright — the prior slices already punched their prefixes).
+        reserve_slice();
         let slice_payload = slice_payload_for(&current_views, payload);
         let version = opts.version_history.read().latest_version();
         let tail_reloc = if relocating {
@@ -2182,6 +2200,7 @@ fn run_tight_space_compaction(
         dest_level: Some(payload.dest_level),
         tables_in,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -2309,7 +2328,7 @@ fn run_subcompaction(
                 .collect::<Vec<_>>(),
         )
     };
-    let pace = input_pacer(&opts.rate_limiter);
+    let pace = input_pacer(opts);
 
     let Some(mut merge_iter) = create_bounded_compaction_stream(
         version,
@@ -2318,7 +2337,7 @@ fn run_subcompaction(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        pace.as_ref(),
+        Some(&pace),
         #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
@@ -2463,7 +2482,7 @@ fn run_subcompaction(
                     .iter()
                     .map(|bf| {
                         let from = reloc.resume_offsets.get(&bf.id()).copied().unwrap_or(0);
-                        open_blob_scanner_at_frontier(bf, from, &opts.rate_limiter)
+                        open_blob_scanner_at_frontier(bf, from, opts)
                     })
                     .collect::<crate::Result<Vec<_>>>()?,
                 opts.config.comparator.clone(),
@@ -2531,7 +2550,7 @@ fn run_subcompaction(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
-    let read_pace = pace.as_deref();
+    let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
         if let Some(matcher) = matcher.as_mut()
@@ -2646,6 +2665,11 @@ fn move_tables(
 
     let table_count = payload.table_ids.len();
     let table_ids = payload.table_ids.iter().copied().collect::<Vec<_>>();
+    let estimate = {
+        let version = &version_history_lock.latest_version().version;
+        super::work::estimate_move(table_ids.iter().filter_map(|&id| version.get_table(id)))
+    };
+    opts.work.plan(estimate);
 
     version_history_lock.upgrade_version(
         &opts.config.path,
@@ -2667,12 +2691,15 @@ fn move_tables(
         // A trivial move rewrites nothing: every version survives as-is.
         crate::version::RetentionEffect::Keep,
     )?;
+    // The estimate of a move is the move.
+    opts.work.moved(estimate.expected.moved);
 
     Ok(CompactionResult {
         action: CompactionAction::Moved,
         dest_level: Some(payload.dest_level),
         tables_in: table_count,
         tables_out: table_count,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -2680,8 +2707,8 @@ fn move_tables(
 /// files a compaction of `picked_tables` would relocate. Also the basis for the
 /// `storage_stats` blob-relocation estimate, so the reported status budgets the
 /// SAME stale subset the gate does (not every live blob file).
-// `pub` (not `pub(crate)`) inside this crate-private module — see
-// `space_fits_two_layer`.
+// `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
+// redundant restriction since the module itself is already crate-scoped.
 pub fn pick_blob_files_to_rewrite(
     picked_tables: &HashSet<TableId>,
     current_version: &Version,
@@ -2810,18 +2837,18 @@ fn pick_blob_files_for_merge(
 fn open_blob_scanner_at_frontier(
     bf: &BlobFile,
     from: u64,
-    limiter: &Arc<crate::rate_limiter::RateLimiter>,
+    opts: &Options,
 ) -> crate::Result<BlobFileScanner> {
     let off = from.max(bf.live_data_start());
     // The relocation reads the blob files of its inputs, their trailer and
     // table of contents included: they report their latency as the table
-    // reads do.
+    // reads do, and count to the run's work.
     BlobFileScanner::open_paced(
         &bf.0.path,
         &*bf.0.fs,
         bf.id(),
         (off != 0).then_some(off),
-        input_pacer(limiter),
+        Some(input_pacer(opts)),
     )
 }
 
@@ -2847,6 +2874,8 @@ fn moves_into_locality_relocation(
         return Ok(false);
     };
     let stale = pick_blob_files_to_rewrite(&payload.table_ids, version, blob_opts)?;
+    // No room is reserved before the move is decided, so the pick only
+    // checks the pool here.
     Ok(
         !pick_blob_files_for_locality(opts, version, payload, &tables, locality, &stale)?
             .is_empty(),
@@ -2862,7 +2891,7 @@ fn moves_into_locality_relocation(
 /// on-disk byte while reading and writing them fits the budget. Only whole
 /// files that no table outside the merge references are eligible, and
 /// nothing is picked when the output would not leave the reserved free space
-/// intact.
+/// intact. What is picked is taken into the run's room, when it holds one.
 fn pick_blob_files_for_locality(
     opts: &Options,
     version: &Version,
@@ -2911,7 +2940,7 @@ fn pick_blob_files_for_locality(
     let mut table_bytes = 0u64;
     let mut stale_written = 0u64;
     for table in tables {
-        let len = table.fs.metadata(&table.path)?.len;
+        let len = table.file_len();
         table_bytes += len.checked_sub(table.punch_offset()?).unwrap_or(len);
         for link in table.blob_links()? {
             if stale.iter().any(|bf| bf.id() == link.blob_file_id) {
@@ -2972,12 +3001,9 @@ fn pick_blob_files_for_locality(
         return Ok(Vec::new());
     }
 
-    // The space check charges the whole length of every file relocated: the
-    // demand is not known more closely before the merge runs.
-    let mut stale_bytes = 0u64;
-    for bf in stale {
-        stale_bytes += bf.physical_size()?;
-    }
+    // The merge's own tables and stale files are in the room it reserved, so
+    // the files picked here are what it adds: each charged its whole length,
+    // since the demand is not known more closely before the merge runs.
     let picked_bytes: u64 = picked.iter().map(|(_, size)| size).sum();
     let picked: Vec<BlobFile> = picked.into_iter().map(|(bf, _)| bf).collect();
 
@@ -2986,14 +3012,23 @@ fn pick_blob_files_for_locality(
         Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(version)?),
         None => u64::MAX,
     };
-    if !space_fits(
-        &opts.config,
+    let blob_dir = opts.config.path.join(BLOBS_FOLDER);
+    let extra = super::capacity::Demand {
+        fs: &*opts.config.fs,
+        path: &blob_dir,
+        bytes: picked_bytes,
+    };
+    // Optional work: it takes only room the flush floor leaves. Checked and
+    // taken into the merge's room in one step, so no other compaction sharing
+    // the pool takes the room in between.
+    let check = super::capacity::Check {
         quota_headroom,
-        table_bytes,
-        payload.dest_level,
-        stale_bytes + picked_bytes,
-        Reserve::Keep,
-    ) {
+        floor: super::capacity::Floor::Keep,
+    };
+    if !opts
+        .outputs
+        .try_reserve_more(&opts.capacity, opts.tree_id, &extra, check)
+    {
         log::debug!("Skipping locality relocation: the output would eat into the reserve");
         return Ok(Vec::new());
     }
@@ -3039,7 +3074,7 @@ fn plan_merge_on_read(
     payload: &CompactionPayload,
     tables: &[Table],
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
-    pace: Option<&crate::table::util::Pacer>,
+    pace: &crate::table::util::Pacer,
 ) -> crate::Result<Option<(Table, crate::table::delete_bitmap::DeleteBitmap)>> {
     let dst_lvl: usize = payload.canonical_level.into();
     let strategy = opts.runtime_config.load_full().delete_strategy.get(dst_lvl);
@@ -3079,7 +3114,7 @@ fn plan_merge_on_read(
     // seqno per row, dropping each scanned value so planning does not retain a
     // whole segment's values in memory.
     let keys = source
-        .scan_paced(pace)?
+        .scan_paced(Some(pace))?
         .map(|entry| {
             let entry = entry?;
             Ok((entry.key.user_key, entry.key.seqno))
@@ -3124,7 +3159,7 @@ fn run_merge_on_read_relocation(
     payload: &CompactionPayload,
     source: &Table,
     bitmap: &crate::table::delete_bitmap::DeleteBitmap,
-    pace: Option<&crate::table::util::Pacer>,
+    pace: &crate::table::util::Pacer,
 ) -> crate::Result<CompactionResult> {
     let dst_lvl: usize = payload.canonical_level.into();
     let new_id = opts.table_id_generator.next();
@@ -3133,18 +3168,20 @@ fn run_merge_on_read_relocation(
 
     // Write the relocated SST through the DESTINATION level's filesystem (the
     // same one that recovers and installs it below), not the source table's.
-    let checksum = source.relocate_columnar_with_deletes(
-        &new_path,
-        &*level_fs,
-        new_id,
-        bitmap,
-        opts.config.sync_mode,
-        pace,
-    )?;
+    let crate::table::relocate::Relocated { checksum, copied } = source
+        .relocate_columnar_with_deletes(
+            &new_path,
+            &*level_fs,
+            new_id,
+            bitmap,
+            opts.config.sync_mode,
+            Some(pace),
+        )?;
     // Recorded once finished: the relocation unlinks its own file on a
     // failure before that.
     opts.outputs
         .record_table(new_id, new_path.clone(), Arc::clone(&level_fs));
+    opts.outputs.landed(&*level_fs, &new_path)?;
 
     let relocated = {
         let mut params = crate::table::RecoverParams::new(
@@ -3180,7 +3217,8 @@ fn run_merge_on_read_relocation(
         .hidden_set_mut()
         .hide(payload.table_ids.iter().copied());
 
-    let produced = super::flavour::ProducedOutput::for_relocation(relocated, source.clone());
+    let produced =
+        super::flavour::ProducedOutput::for_relocation(relocated, source.clone(), copied);
     let result = super::flavour::install_merge(
         &mut opts.version_history.write(),
         opts,
@@ -3200,6 +3238,7 @@ fn run_merge_on_read_relocation(
         dest_level: Some(payload.dest_level),
         tables_in: 1,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -3261,9 +3300,21 @@ fn merge_tables(
     let blob_rewrite =
         pick_blob_files_for_merge(opts, &current_super_version.version, payload, &tables)?;
 
+    let is_last_level = payload.dest_level == opts.config.level_count - 1;
+    // Gathered once, for the estimate and for the serial merge below.
+    let rt_plan = range_tombstone_plan(&current_super_version.version, is_last_level, &opts.config);
+    opts.work.plan(merge_estimate(
+        opts,
+        &current_super_version.version,
+        payload,
+        &tables,
+        &blob_rewrite.files,
+        rt_plan.as_ref(),
+    ));
+
     // Every read of the inputs, on the fast path as on the merge, reports its
-    // latency to the limiter (see `input_pacer`).
-    let pace = input_pacer(&opts.rate_limiter);
+    // latency to the limiter and counts to the run's work (see `input_pacer`).
+    let pace = input_pacer(opts);
 
     // Merge-on-read fast path: a lone columnar segment whose own range
     // tombstones (below the watermark) delete some of its rows is relocated (its
@@ -3276,13 +3327,8 @@ fn merge_tables(
     // its blob links, and with them the interleaving.
     #[cfg(feature = "std")]
     if !blob_rewrite.for_locality
-        && let Some((source, bitmap)) = plan_merge_on_read(
-            opts,
-            payload,
-            &tables,
-            &input_range_tombstones,
-            pace.as_ref(),
-        )?
+        && let Some((source, bitmap)) =
+            plan_merge_on_read(opts, payload, &tables, &input_range_tombstones, &pace)?
     {
         drop(current_super_version);
         drop(version_history_lock);
@@ -3292,7 +3338,7 @@ fn merge_tables(
             payload,
             &source,
             &bitmap,
-            pace.as_ref(),
+            &pace,
         );
     }
     let blob_files_to_rewrite = blob_rewrite.files;
@@ -3306,7 +3352,6 @@ fn merge_tables(
     {
         let threads = opts.config.compaction_threads;
         let dst_lvl: usize = payload.canonical_level.into();
-        let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
         // Only KV-separated trees with blob files to relocate get here with a
         // non-empty set; that path is not split.
@@ -3505,6 +3550,7 @@ fn merge_tables(
                 dest_level: Some(payload.dest_level),
                 tables_in,
                 tables_out,
+                work: super::WorkReport::default(),
             });
         }
     }
@@ -3546,7 +3592,7 @@ fn merge_tables(
         opts.gc_watermark,
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
-        pace.as_ref(),
+        Some(&pace),
         #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
@@ -3558,7 +3604,6 @@ fn merge_tables(
     };
 
     let dst_lvl = payload.canonical_level.into();
-    let is_last_level = payload.dest_level == opts.config.level_count - 1;
 
     // See `holds_every_surviving_version`: the destination level alone does not
     // prove that a key missing from the inputs is missing from the tree.
@@ -3574,12 +3619,11 @@ fn merge_tables(
         .zero_seqnos(false);
 
     // Whole-version tombstones for compaction-time RT application (drop covered
-    // KVs in the merge) and the bottommost seqno-zeroing gate; gathered from
-    // every level so coverage outside this compaction is respected. The scan and
-    // the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
+    // KVs in the merge) and the bottommost seqno-zeroing gate, gathered above
+    // from every level so coverage outside this compaction is respected. The
+    // scan and the seqno-zeroer wrapper are `core` + `alloc`, so the bottommost
     // RT-application + zeroing runs on the `no_std` serial path too (see the
     // zeroer wrap below).
-    let rt_plan = range_tombstone_plan(&current_super_version.version, is_last_level, &opts.config);
     if let Some((tombstones, rt_use)) = &rt_plan {
         merge_iter = merge_iter.with_range_tombstones(
             tombstones.clone(),
@@ -3686,7 +3730,7 @@ fn merge_tables(
                 let scanner = BlobFileMergeScanner::new(
                     blob_files_to_rewrite
                         .iter()
-                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, &opts.rate_limiter))
+                        .map(|bf| open_blob_scanner_at_frontier(bf, 0, opts))
                         .collect::<crate::Result<Vec<_>>>()?,
                     opts.config.comparator.clone(),
                 );
@@ -3771,7 +3815,7 @@ fn merge_tables(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     #[cfg(feature = "columnar")]
-    let read_pace = pace.as_deref();
+    let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
     let mut emit = |row: InternalValue| -> crate::Result<()> {
         #[cfg(feature = "columnar")]
         if let Some(matcher) = matcher.as_mut()
@@ -3983,6 +4027,7 @@ fn merge_tables(
         dest_level: Some(payload.dest_level),
         tables_in,
         tables_out,
+        work: super::WorkReport::default(),
     })
 }
 
@@ -4150,6 +4195,8 @@ fn drop_tables(
         dest_level: None,
         tables_in: tables_dropped,
         tables_out: 0,
+        // A drop reads and writes nothing, and moves nothing.
+        work: super::WorkReport::default(),
     })
 }
 
@@ -4159,3 +4206,7 @@ mod tests;
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code")]
 mod alignment_tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod move_tests;

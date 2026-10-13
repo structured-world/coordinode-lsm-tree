@@ -612,6 +612,12 @@ pub(super) struct ProducedOutput {
     /// pages, and the on-disk bytes copied, charged to the tree's metrics
     /// once the output is installed.
     carried: (u64, u64, u64),
+    /// The bytes a relocated segment's file copied from its source as they
+    /// lay.
+    segment_copied: u64,
+    /// The bytes of blob frames this output read by their handles, outside
+    /// the paced reads of the run's inputs.
+    frames_read: u64,
 }
 
 #[cfg_attr(
@@ -691,13 +697,32 @@ impl ProducedOutput {
         self.carried
     }
 
+    /// What installing this output puts in the version, as the run's work
+    /// counts it: the bytes of its tables and of its blob files' frames, the
+    /// part of them copied rather than encoded, and the frames read by
+    /// handle.
+    pub(super) fn installed_work(&self) -> super::work::Installed {
+        let tables: u64 = self.created_tables.iter().map(Table::file_len).sum();
+        let frames: u64 = self
+            .created_blob_files
+            .iter()
+            .map(|file| file.meta().total_compressed_bytes)
+            .sum();
+        super::work::Installed {
+            written: tables + frames,
+            carried: self.carried.2 + self.segment_copied + self.relocated_bytes,
+            read: self.frames_read,
+        }
+    }
+
     /// Builds the output for a merge-on-read relocation: the `created` segment
-    /// (the source's blocks reused verbatim plus a delete-bitmap) replaces the
-    /// `deleted` source segment, with no blob files and no fragmentation. Lets
-    /// the relocation path reuse [`install_merge`]'s atomic version edit instead
+    /// (the source's blocks reused verbatim plus a delete-bitmap, `copied`
+    /// bytes of it taken from the source as they lay) replaces the `deleted`
+    /// source segment, with no blob files and no fragmentation. Lets the
+    /// relocation path reuse [`install_merge`]'s atomic version edit instead
     /// of hand-rolling one.
     #[cfg(feature = "std")]
-    pub(super) fn for_relocation(created: Table, deleted: Table) -> Self {
+    pub(super) fn for_relocation(created: Table, deleted: Table, copied: u64) -> Self {
         Self {
             created_tables: vec![created],
             created_blob_files: Vec::new(),
@@ -719,6 +744,8 @@ impl ProducedOutput {
             released_objects: Vec::new(),
             relocated_bytes: 0,
             carried: (0, 0, 0),
+            segment_copied: copied,
+            frames_read: 0,
         }
     }
 }
@@ -751,20 +778,16 @@ pub(super) trait CompactionFlavour {
 }
 
 /// Charges the counters an installed output moves: the blob bytes its
-/// relocation copied, the groups, partly copied groups and bytes it copied
-/// instead of encoding, and the bytes of the tables it wrote. Every path that
-/// installs an output calls it once the version edit is published.
+/// relocation copied, and the groups, partly copied groups and bytes it
+/// copied instead of encoding. Every path that installs an output calls it
+/// once the version edit is published.
 #[cfg(feature = "metrics")]
 pub(super) fn charge_installed(
     metrics: &crate::metrics::Metrics,
     relocated_bytes: u64,
     carried: (u64, u64, u64),
-    written_bytes: u64,
 ) {
     use core::sync::atomic::Ordering::Relaxed;
-    metrics
-        .compaction_bytes_written
-        .fetch_add(written_bytes, Relaxed);
     metrics
         .blob_bytes_relocated
         .fetch_add(relocated_bytes, Relaxed);
@@ -814,7 +837,12 @@ pub(super) fn install_merge(
 
     let mut released_objects = Vec::new();
     let mut carried = (0u64, 0u64, 0u64);
+    let mut work = super::work::Installed::default();
     for out in outputs {
+        let installed = out.installed_work();
+        work.written += installed.written;
+        work.carried += installed.carried;
+        work.read += installed.read;
         released_objects.extend(out.released_objects);
         relocated_bytes += out.relocated_bytes;
         carried = (
@@ -843,7 +871,6 @@ pub(super) fn install_merge(
     );
 
     let tables_out = created_tables.len();
-    let written_bytes: u64 = created_tables.iter().map(Table::file_size).sum();
 
     // Install the tree-wide sinks on every output BEFORE the version edit makes
     // it visible. A flush registers these via `register_tables`; a compaction
@@ -987,6 +1014,7 @@ pub(super) fn install_merge(
     )?;
     // The version names the outputs now, so the run must not remove them.
     opts.outputs.installed();
+    opts.work.installed(work);
     // Still under the write lock that published the version: a reference read
     // from an older version names an object this run let go of.
     if !released_objects.is_empty() {
@@ -996,9 +1024,9 @@ pub(super) fn install_merge(
             .record(published, released_objects, []);
     }
     #[cfg(feature = "metrics")]
-    charge_installed(&opts.metrics, relocated_bytes, carried, written_bytes);
+    charge_installed(&opts.metrics, relocated_bytes, carried);
     #[cfg(not(feature = "metrics"))]
-    let _ = (relocated_bytes, carried, written_bytes);
+    let _ = (relocated_bytes, carried);
 
     // NOTE: If the application were to crash >here< it's fine — the tables /
     // blob files are not referenced anymore and are cleaned up upon recovery.
@@ -1112,6 +1140,9 @@ pub struct RelocatingCompaction {
     /// On-disk bytes of the frames copied into the new blob file so far,
     /// whole values and cell-row objects alike.
     relocated_bytes: u64,
+    /// The bytes of the records read by handle for cell rows so far, outside
+    /// the paced scan of the rewritten files.
+    frames_read: u64,
 }
 
 impl RelocatingCompaction {
@@ -1153,6 +1184,7 @@ impl RelocatingCompaction {
             cell_copies: crate::HashMap::default(),
             cell_copies_key: None,
             relocated_bytes: 0,
+            frames_read: 0,
         }
     }
 
@@ -1248,6 +1280,9 @@ impl RelocatingCompaction {
         let (stored, uncompressed_len) =
             crate::vlog::blob_file::reader::Reader::new(blob_file, file.as_ref())
                 .read_raw(key, &indirection.vhandle)?;
+        // The read took the record whole, its header and key included.
+        self.frames_read +=
+            crate::vlog::blob_file::reader::record_len(key.len(), &indirection.vhandle)? as u64;
 
         // Paced like a matched frame: see the whole-value path in `write`.
         let _ = self
@@ -1536,6 +1571,8 @@ impl CompactionFlavour for RelocatingCompaction {
             relocated_bytes: self.relocated_bytes,
             // A relocating run writes its rows; it copies no group.
             carried: (0, 0, 0),
+            segment_copied: 0,
+            frames_read: self.frames_read,
         })
     }
 }
@@ -1830,6 +1867,8 @@ impl CompactionFlavour for StandardCompaction {
             relocated_bytes: 0,
             // The producer owns the carry matcher and sets this after.
             carried: (0, 0, 0),
+            segment_copied: 0,
+            frames_read: 0,
         })
     }
 }

@@ -943,12 +943,16 @@ impl GroupRead<'_> {
         if self.pace.is_some_and(crate::table::util::ReadPacer::active) {
             return regions
                 .iter()
-                .map(
-                    |&(offset, len)| Ok(self.request(|| crate::file::read_exact(fd, offset, len))?),
-                )
+                .map(|&(offset, len)| {
+                    let bytes = self.request(|| crate::file::read_exact(fd, offset, len))?;
+                    self.took(len);
+                    Ok(bytes)
+                })
                 .collect();
         }
-        Ok(crate::file::read_exact_many(fd, &regions)?)
+        let bytes = crate::file::read_exact_many(fd, &regions)?;
+        self.took(ranges.iter().map(|&(_, len)| len).sum());
+        Ok(bytes)
     }
 
     /// Makes one request to the file, telling the pacer, when it is active
@@ -999,7 +1003,17 @@ impl GroupRead<'_> {
         }
         #[cfg(not(feature = "metrics"))]
         let _ = role;
-        Ok(self.request(|| crate::file::read_exact(fd, *self.group.offset() + at as u64, len))?)
+        let bytes =
+            self.request(|| crate::file::read_exact(fd, *self.group.offset() + at as u64, len))?;
+        self.took(len);
+        Ok(bytes)
+    }
+
+    /// Tells the pacer the bytes a read of the group returned.
+    fn took(&self, len: usize) {
+        if let Some(pace) = self.pace {
+            pace.read_bytes(len as u64);
+        }
     }
 
     /// Fills the empty slots of `pages` with the blocks the cache already

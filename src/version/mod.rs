@@ -985,23 +985,54 @@ impl Version {
         let comparator = ctx.comparator;
         let id = self.id + 1;
 
-        let mut affected_tables = self
-            .iter_tables()
-            .filter(|x| ids.contains(&x.id()))
-            .cloned()
-            .collect::<Vec<_>>();
+        // The moved tables of each source run, in the walk's order: levels top
+        // down and each level's runs newest first, so every group is newer
+        // than the groups after it. Overlapping runs moved together keep that
+        // order in the destination; one group per run, they are not mixed.
+        let mut moved_runs: Vec<Vec<Table>> = Vec::new();
+        for run in self.levels.iter().flat_map(|level| level.iter()) {
+            let mut moved: Vec<Table> = run
+                .iter()
+                .filter(|table| ids.contains(&table.id()))
+                .cloned()
+                .collect();
+            if moved.is_empty() {
+                continue;
+            }
+            // A run's tables are in key order already, but one taken from L0
+            // is a set of tables ordered by age: a run is searched by binary
+            // search over minimum keys, so it is sorted into comparator order.
+            moved.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            moved_runs.push(moved);
+        }
 
-        assert_eq!(affected_tables.len(), ids.len(), "invalid table IDs");
+        assert_eq!(
+            moved_runs.iter().map(Vec::len).sum::<usize>(),
+            ids.len(),
+            "invalid table IDs"
+        );
 
-        // The tables arrive in level-walk order, which says nothing about their
-        // keys: a table from a higher level comes first even when its range
-        // sorts after. They are about to become one run, and a run is searched
-        // by binary search over minimum keys, so sort them into comparator
-        // order first. `optimize_runs` below re-sorts only when it has to split
-        // the level into several runs, so a move into an empty level would
-        // otherwise keep whatever order the walk produced.
-        affected_tables
-            .sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+        // Tables from several source runs that do not overlap each other go
+        // into the destination as one run, as before: sorted into comparator
+        // order, since `optimize_runs` below re-sorts only when it has to
+        // split the level into several runs.
+        let disjoint = moved_runs.len() <= 1 || {
+            let mut all: Vec<&Table> = moved_runs.iter().flatten().collect();
+            all.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            all.iter().zip(all.iter().skip(1)).all(|(a, b)| {
+                comparator
+                    .compare(a.key_range().max(), b.key_range().min())
+                    .is_lt()
+            })
+        };
+        if disjoint && moved_runs.len() > 1 {
+            let mut all: Vec<Table> = core::mem::take(&mut moved_runs)
+                .into_iter()
+                .flatten()
+                .collect();
+            all.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            moved_runs.push(all);
+        }
 
         let mut levels = vec![];
 
@@ -1023,10 +1054,15 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            if level_idx == dest_level
-                && let Some(run) = Run::new(affected_tables.clone())
-            {
-                runs.insert(0, run);
+            if level_idx == dest_level {
+                // Newest first, ahead of the destination's runs: whatever was
+                // moved down sits above what was already there.
+                runs.splice(
+                    0..0,
+                    moved_runs
+                        .iter()
+                        .filter_map(|tables| Run::new(tables.clone())),
+                );
             }
 
             let runs = place_runs(level_idx, runs, comparator);

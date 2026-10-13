@@ -31,7 +31,7 @@ pub(crate) mod multi_writer;
 pub(crate) mod probe_stats;
 pub(crate) mod regions;
 #[cfg(feature = "std")]
-mod relocate;
+pub(crate) mod relocate;
 #[cfg(feature = "columnar")]
 pub(crate) mod row_group;
 mod scanner;
@@ -2296,11 +2296,62 @@ impl Table {
         )
     )]
     pub(crate) fn live_file_size(&self) -> crate::Result<u64> {
-        let size = self.file_size();
+        // The file's length: the recorded `file_size` leaves out the sections
+        // written after the metadata, which a rewrite writes too.
+        let size = self.file_len();
         // The punch offset is a data-block offset inside this same file, so the
         // subtraction cannot underflow; falling back to the whole size keeps a
         // space gate conservative if the two ever disagreed.
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
+    }
+
+    /// The reads that consulted this table's data since it was written:
+    /// point reads that passed its filter, and range scans that reached it.
+    pub(crate) fn reads(&self) -> u64 {
+        self.point_reads() + self.scans()
+    }
+
+    /// The point reads that passed this table's filter since it was written.
+    pub(crate) fn point_reads(&self) -> u64 {
+        self.read_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The range scans that reached this table since it was written.
+    pub(crate) fn scans(&self) -> u64 {
+        self.scan_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records a range scan reaching this table: one `Relaxed` bump per scan
+    /// and table, beside the scan's own reads of the table.
+    pub(crate) fn note_scan(&self) {
+        self.scan_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The range scans this table was the one to count as made.
+    pub(crate) fn scan_starts(&self) -> u64 {
+        self.scan_start_count
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts a range scan as made: called on one table of every scan that
+    /// reaches the tree's tables, so the scans made are the sum over them.
+    pub(crate) fn note_scan_start(&self) {
+        self.scan_start_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bytes the file holds: what a whole read of it takes, and what
+    /// writing it took.
+    pub(crate) fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// The bytes of the data section: every data block or row group as it lies
+    /// on disk. It opens the file, and the index follows it, or the top-level
+    /// index where the index is not partitioned.
+    pub(crate) fn data_section_len(&self) -> u64 {
+        self.regions.index.unwrap_or(self.regions.tli).offset().0
     }
 
     /// The blocks one data index entry covers, each with the ROLE its writer
@@ -6781,8 +6832,15 @@ impl Table {
     /// not inflate the count. Raw counter; the consumer derives a rate / EMA from
     /// successive polls.
     fn record_access(&self) {
+        self.record_accesses(1);
+    }
+
+    /// Records `reads` data-consulting point reads at once, as
+    /// [`Self::record_access`] records one: what a batched read let through
+    /// its gates.
+    pub(crate) fn record_accesses(&self, reads: u64) {
         self.read_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "std")]
         self.last_access_secs.store(
             crate::time::unix_timestamp().as_secs(),
@@ -7382,6 +7440,8 @@ impl Table {
         if passing.is_empty() {
             return Ok(results);
         }
+        // Counted as single reads are, after the seqno-range and filter gates.
+        self.record_accesses(passing.len() as u64);
         // The filter let these keys through; the ones no read below finds are
         // its false positives.
         let count_false_positives = |results: &[Option<InternalValue>]| {
@@ -8620,6 +8680,7 @@ impl Table {
         log::debug!("Recovering table from file {}", file_path.display());
         let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
         let file_path = Arc::new(file_path);
+        let file_len = file.metadata()?.len;
 
         #[cfg(feature = "metrics")]
         metrics
@@ -9498,6 +9559,7 @@ impl Table {
                 tree_id,
 
                 metadata,
+                file_len,
                 l0_recency,
                 regions,
 
@@ -9525,6 +9587,8 @@ impl Table {
 
                 blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
+                scan_count: AtomicU64::new(0),
+                scan_start_count: AtomicU64::new(0),
                 last_access_secs: AtomicU64::new(0),
                 probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,
@@ -10086,6 +10150,9 @@ impl Table {
     /// from that plan: the probes, and the filter queries and skips.
     pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
         self.count_probes(counts.probes);
+        if counts.point_reads > 0 {
+            self.record_accesses(counts.point_reads as u64);
+        }
         #[cfg(feature = "metrics")]
         {
             use core::sync::atomic::Ordering::Relaxed;

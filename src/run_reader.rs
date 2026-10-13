@@ -124,6 +124,16 @@ impl RunReader {
         }
     }
 
+    /// Counts the scan this reader serves as made, on the first table of
+    /// the run it reaches; nothing when it reaches none.
+    pub fn note_scan_start(&self) {
+        if !self.lo_initialized
+            && let Some(table) = self.run.get(self.lo)
+        {
+            table.note_scan_start();
+        }
+    }
+
     fn ensure_lo_initialized(&mut self) {
         if !self.lo_initialized {
             #[expect(
@@ -131,6 +141,7 @@ impl RunReader {
                 reason = "we trust the caller to pass valid indexes"
             )]
             let lo_table = self.run.deref().get(self.lo).expect("should exist");
+            lo_table.note_scan();
             self.lo_reader = Some(Box::new(lo_table.range(self.range.clone())));
             self.lo_initialized = true;
         }
@@ -143,6 +154,7 @@ impl RunReader {
                 reason = "we trust the caller to pass valid indexes"
             )]
             let hi_table = self.run.deref().get(self.hi).expect("should exist");
+            hi_table.note_scan();
             self.hi_reader = Some(Box::new(hi_table.range(self.range.clone())));
             self.hi_initialized = true;
         }
@@ -170,13 +182,13 @@ impl Iterator for RunReader {
                 // table.range() to respect the range end bound). `.iter()` is
                 // only used for middle tables that are fully consumed.
                 if self.lo < self.hi {
-                    self.lo_reader = Some(Box::new(
-                        #[expect(
-                            clippy::expect_used,
-                            reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
-                        )]
-                        self.run.get(self.lo).expect("should exist").iter(),
-                    ));
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
+                    )]
+                    let table = self.run.get(self.lo).expect("should exist");
+                    table.note_scan();
+                    self.lo_reader = Some(Box::new(table.iter()));
                 }
             } else {
                 // Lo exhausted — initialize hi reader if needed and consume from it
@@ -206,13 +218,13 @@ impl DoubleEndedIterator for RunReader {
                 self.hi -= 1;
 
                 if self.lo < self.hi {
-                    self.hi_reader = Some(Box::new(
-                        #[expect(
-                            clippy::expect_used,
-                            reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
-                        )]
-                        self.run.get(self.hi).expect("should exist").iter(),
-                    ));
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
+                    )]
+                    let table = self.run.get(self.hi).expect("should exist");
+                    table.note_scan();
+                    self.hi_reader = Some(Box::new(table.iter()));
                 }
             } else {
                 // Hi exhausted — initialize lo reader if needed and consume from it

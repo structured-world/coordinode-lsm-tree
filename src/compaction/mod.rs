@@ -4,6 +4,7 @@
 
 //! Contains compaction strategies
 
+pub(crate) mod capacity;
 #[cfg(feature = "columnar")]
 pub(crate) mod carry;
 pub(crate) mod fifo;
@@ -19,18 +20,23 @@ pub(crate) mod major;
 pub(crate) mod movedown;
 pub(crate) mod output_ledger;
 pub(crate) mod ownership;
+pub mod planned;
 pub(crate) mod pulldown;
 pub(crate) mod seqno_zeroer;
 pub(crate) mod state;
 pub(crate) mod stream;
 pub(crate) mod tiered;
+pub(crate) mod work;
 pub(crate) mod worker;
 
 pub use fifo::Strategy as Fifo;
 pub use filter::{CompactionFilter, Factory, ItemAccessor, Verdict};
 pub use heal::Strategy as EccHeal;
 pub use leveled::Strategy as Leveled;
+pub use leveled::{Granularity, Layout, LevelPolicy, Movement, Trigger};
+pub use planned::Strategy as Planned;
 pub use tiered::Strategy as SizeTiered;
+pub use work::{Work, WorkEstimate, WorkReport};
 
 pub use {
     fifo::NAME as FIFO_COMPACTION_NAME, leveled::NAME as LEVELED_COMPACTION_NAME,
@@ -85,6 +91,10 @@ pub struct CompactionResult {
 
     /// Number of output tables produced.
     pub tables_out: usize,
+
+    /// The work the compaction was estimated to cost before it ran, and the
+    /// work it did, by kind of work.
+    pub work: WorkReport,
 }
 
 impl CompactionResult {
@@ -96,6 +106,7 @@ impl CompactionResult {
             dest_level: None,
             tables_in: 0,
             tables_out: 0,
+            work: WorkReport::default(),
         }
     }
 }
