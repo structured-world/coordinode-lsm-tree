@@ -1919,8 +1919,10 @@ fn run_tight_space_compaction(
         if past_caps(slice) {
             return Ok(false);
         }
+        // The prefixes the pass's installed slices consumed count free here,
+        // though their punch may still wait on readers of the older views.
         let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
-            Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(
+            Some(limit) => limit.saturating_sub(crate::storage_stats::compute_live_used_bytes(
                 &opts.version_history.read().latest_version().version,
             )?),
             None => u64::MAX,
