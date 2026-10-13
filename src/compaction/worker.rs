@@ -1449,9 +1449,9 @@ fn stale_frame_bytes(item: &InternalValue, stale: &HashSet<BlobFileId>) -> crate
 /// theirs. A slice's tables weigh their blocks and the bytes each table it
 /// opens holds past them, as `outputs` counts them. A slice ends before the
 /// block that would take it past a cap, on the last key of the block
-/// before. The keys it ends before go to the next slice, so that one counts
-/// the blocks ending on it again. A block of a restricted input below its
-/// restriction is punched and writes nothing.
+/// before. The key it ends on goes to the next slice, so that one counts the
+/// entries of that key again, read from the blocks ending on it. A block of
+/// a restricted input below its restriction is punched and writes nothing.
 #[cfg(feature = "std")]
 fn tight_slices(
     inputs: &[Table],
@@ -1460,11 +1460,18 @@ fn tight_slices(
     relocated: Option<&Relocated<'_>>,
     comparator: &crate::comparator::SharedComparator,
 ) -> crate::Result<Vec<TightSlice>> {
+    /// The blocks ending on one key: what they write, and where they lie as
+    /// the input, the block and the input's bytes per data byte.
     struct Block {
         end_key: UserKey,
         tables: u64,
         blobs: u64,
+        sources: Vec<(usize, crate::table::BlockHandle, (u64, u64))>,
     }
+
+    /// The bytes a table writes for an entry, at the most: its key and value
+    /// and what frames them in a block.
+    const ENTRY_FRAMING: u64 = 32;
 
     let cmp = comparator.as_ref();
     let mut blocks: Vec<Block> = Vec::new();
@@ -1474,7 +1481,7 @@ fn tight_slices(
     // however few blocks it holds. The rest of a table's bytes go with its
     // blocks, in each block's share of the file.
     let mut fixed: Option<u64> = None;
-    for input in inputs {
+    for (input_index, input) in inputs.iter().enumerate() {
         let handles = input
             .maintenance_index_walk()
             .collect::<crate::Result<Vec<_>>>()?;
@@ -1517,6 +1524,11 @@ fn tight_slices(
                 end_key,
                 tables,
                 blobs,
+                sources: alloc::vec![(
+                    input_index,
+                    *handle.as_ref(),
+                    (input.file_len(), data_bytes.max(1)),
+                )],
             });
         }
     }
@@ -1531,6 +1543,7 @@ fn tight_slices(
             {
                 group.tables += block.tables;
                 group.blobs += block.blobs;
+                group.sources.extend(block.sources);
             }
             _ => grouped.push(block),
         }
@@ -1567,6 +1580,35 @@ fn tight_slices(
         let blobs = with_blobs(acc.1 + block.blobs);
         tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
     };
+    // What the entries of the key the blocks of `group` end on write: the
+    // next slice's, once a slice ends on that key.
+    let key_weight = |group: &Block| -> crate::Result<(u64, u64)> {
+        let mut weight = (0u64, 0u64);
+        for &(input_index, handle, (file_len, data_bytes)) in &group.sources {
+            let Some(input) = inputs.get(input_index) else {
+                continue;
+            };
+            let Some(block) = input.load_data_block_for_maintenance(&handle)? else {
+                continue;
+            };
+            block.try_for_each_entry(comparator.clone(), |item| {
+                if cmp.compare(&item.key.user_key, &group.end_key) != core::cmp::Ordering::Equal {
+                    return Ok(());
+                }
+                let raw = item.key.user_key.len() as u64 + item.value.len() as u64 + ENTRY_FRAMING;
+                // The entry's share of the file, as a block's is: bounded by
+                // the file's length.
+                weight.0 +=
+                    u64::try_from(u128::from(raw) * u128::from(file_len) / u128::from(data_bytes))
+                        .unwrap_or(u64::MAX);
+                if let Some(relocated) = relocated {
+                    weight.1 += stale_frame_bytes(&item, relocated.stale)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(weight)
+    };
     let mut slices = Vec::new();
     let mut acc = (0u64, 0u64);
     // The blocks ending on the key the slice so far ends on.
@@ -1580,7 +1622,7 @@ fn tight_slices(
                 tables: with_tables(acc.0),
                 blobs: with_blobs(acc.1),
             });
-            acc = (previous.tables, previous.blobs);
+            acc = key_weight(previous)?;
         }
         acc = (acc.0 + block.tables, acc.1 + block.blobs);
         last = Some(block);
