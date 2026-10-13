@@ -99,7 +99,6 @@ fn a_missing_file_does_not_stop_the_rest() -> crate::Result<()> {
 fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> {
     use crate::compaction::capacity::{CapacityPool, Demand};
     use crate::fs::{Fault, FaultOp, FaultRule};
-    use crate::io::Write as _;
 
     let fault = FaultFs::new(MemFs::new());
     let injector = fault.injector();
@@ -115,17 +114,17 @@ fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> 
 
     let tree_id = 4;
     let pool = Arc::new(CapacityPool::default());
-    let room = pool
-        .reserve(
-            tree_id,
-            &[Demand {
-                fs: &*fs,
-                path: &folder,
-                bytes: 500,
-            }],
-            None,
-        )
-        .expect("an unchecked reservation is never refused");
+    let Some(room) = pool.reserve(
+        tree_id,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 500,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
     let ledger = OutputLedger::default();
     ledger.reserve(room);
     for (id, path) in [(1, &stuck), (2, &removed)] {
