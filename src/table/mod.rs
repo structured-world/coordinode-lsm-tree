@@ -2311,6 +2311,20 @@ impl Table {
         self.point_reads() + self.scans()
     }
 
+    /// How hot the table is now: its [`Self::reads`] per thousand seconds
+    /// since it began counting them, so a table read long ago does not
+    /// outrank one read often since it was written.
+    pub(crate) fn heat(&self) -> u64 {
+        let now = crate::time::unix_timestamp().as_secs();
+        // A clock stepped back, or no clock at all under `no_std`, reads as
+        // the table's first second: its reads rank as they stand. Floored at
+        // zero by design, since an age is never negative.
+        let age = now.saturating_sub(self.counting_since_secs).max(1);
+        let per_kilosecond = u128::from(self.reads()) * 1_000 / u128::from(age);
+        // Below `reads() * 1000`, far within `u64` for any count of reads.
+        u64::try_from(per_kilosecond).unwrap_or(u64::MAX)
+    }
+
     /// The point reads that passed this table's filter since it was written.
     pub(crate) fn point_reads(&self) -> u64 {
         self.read_count.load(core::sync::atomic::Ordering::Relaxed)
@@ -2325,19 +2339,6 @@ impl Table {
     /// and table, beside the scan's own reads of the table.
     pub(crate) fn note_scan(&self) {
         self.scan_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// The range scans this table was the one to count as made.
-    pub(crate) fn scan_starts(&self) -> u64 {
-        self.scan_start_count
-            .load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Counts a range scan as made: called on one table of every scan that
-    /// reaches the tree's tables, so the scans made are the sum over them.
-    pub(crate) fn note_scan_start(&self) {
-        self.scan_start_count
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -9588,7 +9589,7 @@ impl Table {
                 blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
                 scan_count: AtomicU64::new(0),
-                scan_start_count: AtomicU64::new(0),
+                counting_since_secs: crate::time::unix_timestamp().as_secs(),
                 last_access_secs: AtomicU64::new(0),
                 probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,

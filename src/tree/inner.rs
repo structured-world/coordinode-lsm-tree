@@ -310,7 +310,7 @@ pub struct TreeInner {
 
 impl TreeInner {
     pub(crate) fn create_new(
-        config: Config,
+        mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
         // manifest probe; held for the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
@@ -344,6 +344,9 @@ impl TreeInner {
         let sync_mode = config.sync_mode;
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        // A strategy reads the compaction budget from the config: given the
+        // live limiter, it sees a rate changed after open.
+        config.compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
         let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;

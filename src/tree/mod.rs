@@ -3332,6 +3332,7 @@ impl Tree {
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
+        super_version.version.read_mix().note_points(1);
         // Check memtables first — always Owned
         if let Some(entry) = super_version.active_memtable.get(key, seqno) {
             return Self::resolve_pinned_entry(
@@ -3518,6 +3519,7 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
+        super_version.version.read_mix().note_points(1);
         // Search order: active → sealed → SST (newest first). A point
         // tombstone in a newer source is authoritative — no older source
         // can contain a newer value, so returning None is correct.
@@ -3593,6 +3595,7 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<(ValueType, SeqNo, crate::Slice)>> {
+        super_version.version.read_mix().note_points(1);
         if let Some(entry) = super_version.active_memtable.get(key, seqno) {
             let Some(entry) = ignore_tombstone_value(entry) else {
                 return Ok(None);
@@ -3988,6 +3991,11 @@ impl Tree {
     pub(crate) fn read_many<K: AsRef<[u8]>>(
         ctx: &read_job::ReadCtx<K>,
     ) -> crate::Result<Vec<Option<UserValue>>> {
+        // Each key of the batch is a point lookup of the read mix.
+        ctx.super_version
+            .version
+            .read_mix()
+            .note_points(ctx.keys.len() as u64);
         let mut read = multi_get_read::MultiGetRead::new(ctx);
         Self::drive(&mut read, ctx)
     }
@@ -5385,6 +5393,9 @@ impl Tree {
         let sync_mode = config.sync_mode;
         // Same reason: built before the move.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        // A strategy reads the compaction budget from the config: given the
+        // live limiter, it sees a rate changed after open.
+        config.compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
         let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;

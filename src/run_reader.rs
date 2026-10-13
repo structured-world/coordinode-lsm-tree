@@ -124,16 +124,6 @@ impl RunReader {
         }
     }
 
-    /// Counts the scan this reader serves as made, on the first table of
-    /// the run it reaches; nothing when it reaches none.
-    pub fn note_scan_start(&self) {
-        if !self.lo_initialized
-            && let Some(table) = self.run.get(self.lo)
-        {
-            table.note_scan_start();
-        }
-    }
-
     fn ensure_lo_initialized(&mut self) {
         if !self.lo_initialized {
             #[expect(

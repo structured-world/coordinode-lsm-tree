@@ -4855,7 +4855,7 @@ fn compaction_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
 /// rewrites a region at a time while the limiter steers by latency, each
 /// region timed on its own, and those reads lift a backoff a verification
 /// scan left low.
-#[cfg(feature = "columnar")]
+#[cfg(all(feature = "columnar", feature = "lz4"))]
 #[test]
 fn columnar_range_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     use crate::AbstractTree;
@@ -4893,8 +4893,13 @@ fn columnar_range_merge_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<
     tree.major_compact(32 * 1024, 0)?;
     assert!(tree.current_version().iter_tables().count() > 2);
 
-    // Every row changes, so no group is copied: each range reads them.
+    // Every row changes and the output codec differs, so no group is copied:
+    // each range reads them, page by page.
     write(1)?;
+    tree.update_runtime_config(|c| {
+        c.data_block_compression_policy =
+            crate::config::CompressionPolicy::all(crate::CompressionType::Lz4);
+    })?;
     for _ in 0..20 {
         shared.record_read_latency(Duration::from_secs(100));
     }

@@ -192,7 +192,7 @@ fn pick_minimal_compaction(
         let window_bytes = prefix_sums(run.iter().map(Table::file_size));
         let window_hidden =
             prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
-        let window_heat = prefix_sums(run.iter().map(Table::reads));
+        let window_heat = prefix_sums(run.iter().map(Table::heat));
         let pull_ins: Vec<PullIn> = curr_level
             .iter()
             .map(|curr_run| PullIn::new(curr_run, run, hidden_set, cmp))
@@ -442,7 +442,7 @@ fn window_over(
                 let bytes = prefix_sums(run.iter().map(Table::file_size));
                 let hidden =
                     prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
-                let heat = prefix_sums(run.iter().map(Table::reads));
+                let heat = prefix_sums(run.iter().map(Table::heat));
                 'run: for width in 1..=run.len() {
                     for start in 0..=(run.len() - width) {
                         let end = start + width;
@@ -552,7 +552,7 @@ impl PullIn {
             end_through,
             bytes: prefix_sums(run.iter().map(Table::file_size)),
             hidden: prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id())))),
-            reads: prefix_sums(run.iter().map(Table::reads)),
+            reads: prefix_sums(run.iter().map(Table::heat)),
         }
     }
 
@@ -1173,11 +1173,11 @@ impl CompactionStrategy for Strategy {
                 // A level triggered by size owes the bytes past its target; L0
                 // has one only when it is set so.
                 Trigger::Size | Trigger::Never => {
-                    if let Some(&target) = targets.get(idx) {
-                        // max(0, size - target): the bytes above this level's
-                        // target are the work that must be rewritten downward.
-                        debt += level.size().saturating_sub(target);
-                    }
+                    // max(0, size - target): the bytes above this level's
+                    // target are the work that must be rewritten downward; a
+                    // level past the targets there are has none.
+                    let target = targets.get(idx).copied().unwrap_or(u64::MAX);
+                    debt += level.size().saturating_sub(target);
                 }
             }
         }

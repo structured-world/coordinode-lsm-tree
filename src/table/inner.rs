@@ -123,11 +123,10 @@ pub struct Inner {
     /// run they cross. Reset to `0` only when the segment is created.
     pub(crate) scan_count: AtomicU64,
 
-    /// Cumulative range scans this segment was the one table to count as
-    /// made: each scan reaching the tree's tables marks exactly one of them,
-    /// so the sum over a version's tables is the scans made, however many
-    /// runs each reached. Reset to `0` only when the segment is created.
-    pub(crate) scan_start_count: AtomicU64,
+    /// Unix seconds when this segment began counting its reads in this
+    /// process, when it was written or opened: [`Self::read_count`] and
+    /// [`Self::scan_count`] are reads since then, which a rate divides by.
+    pub(crate) counting_since_secs: u64,
 
     /// Unix seconds of the most recent data-consulting read (same gating as
     /// [`Self::read_count`]), or `0` if never read. Maintained only on `std`

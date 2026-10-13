@@ -277,6 +277,81 @@ pub struct VersionInner {
     /// installs, or reopening with zstd again would find tables whose
     /// dictionary the tree has forgotten.
     dicts: Arc<[crate::file::DictId]>,
+
+    /// The queries the tree served since it opened, by kind, shared by every
+    /// version derived from this one: the read mix a compaction plans for.
+    /// Not persisted.
+    read_mix: Arc<ReadMix>,
+}
+
+/// The queries a tree served since it opened: point lookups, each key of a
+/// batch one, and scans, each one however many runs it reaches.
+///
+/// Every read bumps it, from every thread: the counts are spread over
+/// stripes a cache line apart, so readers on different cores do not take one
+/// line from each other on every lookup.
+#[derive(Default, Debug)]
+pub struct ReadMix {
+    stripes: [ReadMixStripe; READ_MIX_STRIPES],
+}
+
+const READ_MIX_STRIPES: usize = 16;
+// `ReadMix::stripe` takes the stripe from the top four bits of a product.
+const _: () = assert!(READ_MIX_STRIPES == 1 << 4);
+
+/// One stripe of a [`ReadMix`], a cache line of its own on every target
+/// that reads it from several cores.
+#[derive(Default, Debug)]
+#[repr(align(128))]
+struct ReadMixStripe {
+    points: portable_atomic::AtomicU64,
+    scans: portable_atomic::AtomicU64,
+}
+
+impl ReadMix {
+    /// The stripe the calling thread counts into. Threads run on stacks of
+    /// their own, megabytes apart, so a stack address tells them apart at
+    /// no cost and with no thread-local state. The stacks differ in their
+    /// high bits and agree in the low ones at one call depth, so the address
+    /// is mixed by a Fibonacci multiply and the stripe taken from the top of
+    /// the product, which every bit of the address reaches. Two threads
+    /// sharing a stripe only share its line.
+    fn stripe(&self) -> &ReadMixStripe {
+        let marker = 0u8;
+        let at = core::ptr::from_ref(&marker) as usize as u64;
+        // The top four bits of the product: below sixteen, the stripe count.
+        let mixed = usize::try_from(at.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60).unwrap_or(0);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "the top four bits of the product index sixteen stripes"
+        )]
+        &self.stripes[mixed]
+    }
+
+    /// Counts `keys` point lookups.
+    pub(crate) fn note_points(&self, keys: u64) {
+        self.stripe()
+            .points
+            .fetch_add(keys, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Counts a scan.
+    pub(crate) fn note_scan(&self) {
+        self.stripe()
+            .scans
+            .fetch_add(1, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// The point lookups and the scans counted so far.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.stripes.iter().fold((0, 0), |(points, scans), stripe| {
+            // Bounded by the reads a tree serves.
+            (
+                points + stripe.points.load(portable_atomic::Ordering::Relaxed),
+                scans + stripe.scans.load(portable_atomic::Ordering::Relaxed),
+            )
+        })
+    }
 }
 
 /// A version is an immutable, point-in-time view of a tree's structure
@@ -311,6 +386,11 @@ impl Version {
         &self.gc_stats
     }
 
+    /// The queries the tree served since it opened, by kind.
+    pub(crate) fn read_mix(&self) -> &ReadMix {
+        &self.read_mix
+    }
+
     /// Highest snapshot seqno this version can no longer serve after a
     /// reopen; see [`VersionInner::retention_floor`].
     #[must_use]
@@ -335,6 +415,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -464,6 +545,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: Arc::from(dicts),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -515,6 +597,7 @@ impl Version {
                 gc_stats: Arc::default(),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                read_mix: Arc::default(),
             }),
         }
     }
@@ -630,6 +713,7 @@ impl Version {
                 gc_stats: Arc::new(gc_stats),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                read_mix: Arc::default(),
             }),
         }
     }
@@ -751,6 +835,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -871,6 +956,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         })
     }
@@ -972,6 +1058,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -1079,6 +1166,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -1136,6 +1224,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         })
     }
@@ -1247,6 +1336,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }

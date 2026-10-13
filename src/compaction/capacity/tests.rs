@@ -328,6 +328,28 @@ fn an_unproven_pool_takes_the_least_free_space_of_its_folders() {
     );
 }
 
+/// A compaction of the same tree that starts and is installed while another
+/// runs is counted too, though it was neither held when the other started nor
+/// is held when the other grows.
+#[test]
+fn quota_growth_counts_a_compaction_started_and_installed_meanwhile() {
+    let fs = MemFs::with_capacity(u64::MAX);
+    let pool = Arc::new(CapacityPool::default());
+    let first = pool
+        .reserve(1, &[demand(&fs, "/t", 30 * MIB)], Some(check(100 * MIB)))
+        .expect("30 of a 100 MiB quota");
+    let second = pool
+        .reserve(1, &[demand(&fs, "/t", 50 * MIB)], Some(check(100 * MIB)))
+        .expect("80 of a 100 MiB quota");
+    // Installed: its 50 MiB are in the footprint now, held no longer.
+    drop(second);
+
+    let err = first
+        .landed(&fs, Path::new("/t"), 60 * MIB)
+        .expect_err("50 installed and 60 written are past the 100 MiB quota");
+    assert!(matches!(err, crate::Error::StorageFull { .. }), "{err:?}");
+}
+
 /// A compaction of the same tree installed while another runs puts its bytes
 /// into the footprint the other's quota headroom predates: the other may not
 /// count them free when its outputs outgrow its grant.

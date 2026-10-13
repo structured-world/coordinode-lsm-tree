@@ -105,7 +105,10 @@ const DRAIN_LEVEL: u8 = DRAIN as u8;
 /// What the planner knows of the machine a tree runs on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
-    /// Bytes per second the tree takes in, which its flushes write.
+    /// Bytes per second the tree takes in, which its flushes write. With a
+    /// compaction limiter shared by several trees, the rate they all take in
+    /// together: the budget is theirs together, so each plans what the shared
+    /// budget pays for over the shared writes.
     pub write_rate: u64,
     /// Bytes per second a merge in the main level encodes. The tree's
     /// compaction rate limit caps it, when one is set: what a merge may use
@@ -290,15 +293,9 @@ impl Strategy {
     /// per second the tree's compactions may use, `0` for no limit.
     fn inputs(&self, version: &Version, unit: u64, budget: u64) -> dp::Inputs {
         let scan_share = self.scan_share.unwrap_or_else(|| {
-            // Each counter read once: a scan between two reads of one would
-            // count it in one and not the other.
-            // A point read is counted by the table holding its key, a scan by
-            // the one table it counted as made, however many runs it reached.
-            let (mut points, mut scans) = (0u64, 0u64);
-            for table in version.iter_tables() {
-                scans += table.scan_starts();
-                points += table.point_reads();
-            }
+            // Queries as the tree served them: a lookup whatever the filters
+            // answered, a scan however many runs it reached.
+            let (points, scans) = version.read_mix().counts();
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a share of read counts, approximate by nature"
@@ -351,7 +348,10 @@ fn encode_rate(model_rate: u64, budget: u64) -> u64 {
     }
 }
 
-/// The tree's compaction budget in bytes per second, `0` for no limit.
+/// The tree's compaction budget in bytes per second, `0` for no limit: the
+/// live rate of its limiter. A limiter shared by several trees gives each the
+/// whole rate, which is why [`Model::write_rate`] is then their writes
+/// together.
 fn budget(config: &Config) -> u64 {
     config
         .compaction_rate_limiter
@@ -418,17 +418,27 @@ impl CompactionStrategy for Strategy {
         }
         let hidden = state.hidden_set();
         let busy = |index: usize| version.level_is_busy(index, hidden);
-        let (Some(top), Some(main), Some(last_level)) =
-            (version.level(0), version.level(1), version.level(last))
-        else {
-            return Choice::DoNothing;
-        };
+        #[expect(
+            clippy::expect_used,
+            reason = "levels 0 to the last exist in every version, and the last is past 0"
+        )]
+        let (top, main, last_level) = (
+            version.level(0).expect("L0"),
+            version.level(1).expect("L1"),
+            version.level(last).expect("the last level"),
+        );
         let budget = budget(config);
         self.budget_seen.store(budget, Ordering::Relaxed);
         let unit = self.unit(last_level.size(), budget);
         let runs = main_runs(main);
         // The units come down so far, counted by bytes: runs the L0 table
         // count sent down before they held a unit count for what they hold.
+        // Counted from the version, not from arrivals kept beside it, so the
+        // plan is the same in every process: a round ends once the main level
+        // holds a round of units, as a leveled level within its target never
+        // goes down; overwrites a main-level merge collapses stay there,
+        // merged as reads ask, and tombstones, which only the last level drops,
+        // fill the round.
         let units = runs.iter().map(|(_, bytes)| bytes).sum::<u64>() / unit;
         #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
         let last_index = last as u8;

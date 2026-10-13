@@ -415,6 +415,22 @@ fn choose_on_three_levels_merges_an_ended_round_into_the_last() -> crate::Result
     Ok(())
 }
 
+/// A tree of one level has no level to compact into: nothing is chosen, and
+/// nothing is owed.
+#[test]
+fn choose_on_one_level_does_nothing_and_owes_nothing() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_round(&tree, 0)?;
+    let version = first_levels(&tree, 1);
+    let strategy = strategy(Model::default());
+    assert!(matches!(
+        strategy.choose(&version, tree.tree_config(), &CompactionState::default()),
+        Choice::DoNothing
+    ));
+    assert_eq!(strategy.pending_compaction_bytes(&version), 0);
+    Ok(())
+}
+
 /// A tree of two levels has no main level apart from the last: the top level
 /// goes into it whole, and the top level is all it owes.
 #[test]
@@ -425,6 +441,13 @@ fn choose_on_two_levels_merges_the_top_into_the_last() -> crate::Result<()> {
     tree.compact(Arc::new(crate::compaction::MoveDown(0, 1)), 0)?;
     let version = first_levels(&tree, 2);
     assert_eq!(strategy.pending_compaction_bytes(&version), 0);
+    assert!(
+        matches!(
+            strategy.choose(&version, tree.tree_config(), &CompactionState::default()),
+            Choice::DoNothing
+        ),
+        "an empty top level has nothing to send"
+    );
     write_round(&tree, 1)?;
     let version = first_levels(&tree, 2);
     let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
@@ -436,6 +459,41 @@ fn choose_on_two_levels_merges_the_top_into_the_last() -> crate::Result<()> {
     expected.extend(version.level(1).expect("L1").list_ids());
     assert_eq!(input.table_ids, expected);
     assert!(strategy.pending_compaction_bytes(&version) > 0);
+    Ok(())
+}
+
+/// A lookup of an absent key counts in the read mix though no filter lets it
+/// through: one scan beside three such lookups is a quarter of the reads.
+#[test]
+fn read_mix_with_lookups_of_absent_keys_counts_them() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_round(&tree, 0)?;
+    assert_eq!(tree.range("k0010"..="k0020", SeqNo::MAX, None).count(), 11);
+    for key in ["absent-a", "absent-b", "absent-c"] {
+        assert!(tree.get(key, SeqNo::MAX)?.is_none());
+    }
+    let share = strategy(Model::default())
+        .inputs(&tree.current_version(), UNIT, 0)
+        .scan_share;
+    assert!((share - 0.25).abs() < 1e-9, "{share}");
+    Ok(())
+}
+
+/// The budget a tree's own limiter gives is the live one: a rate changed
+/// after open is the rate the planner sees.
+#[test]
+fn budget_after_a_rate_change_is_the_new_rate() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .compaction_rate_limit(1_000)
+    .open()?;
+    assert_eq!(budget(tree.tree_config()), 1_000);
+    tree.compaction_rate_limiter().set_rate(5_000);
+    assert_eq!(budget(tree.tree_config()), 5_000);
     Ok(())
 }
 

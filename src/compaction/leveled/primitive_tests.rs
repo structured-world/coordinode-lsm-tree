@@ -43,7 +43,7 @@ fn settle(tree: &crate::AnyTree, strategy: &Arc<Strategy>) -> crate::Result<()> 
 /// rewriting what it holds, and goes down whole once its runs reach their
 /// count; every key reads its newest value throughout.
 #[test]
-fn a_tiered_l1_accumulates_runs_then_goes_down_whole() -> crate::Result<()> {
+fn tiered_l1_with_runs_at_its_count_goes_down_whole() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     let strategy = Arc::new(Strategy::default().with_l0_threshold(1).with_level_policy(
         1,
@@ -147,7 +147,7 @@ fn full_l1_over_full_l2(
 /// takes that level on down with it in one merge, as L0 does into a full
 /// L1, instead of rewriting it now and again when it is chosen.
 #[test]
-fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
+fn whole_level_over_a_full_level_goes_through_it() -> crate::Result<()> {
     let (_dir, tree, strategy) = full_l1_over_full_l2(true)?;
     let version = tree.current_version();
     let Choice::Merge(input) =
@@ -170,7 +170,7 @@ fn a_whole_level_goes_through_a_full_level_below() -> crate::Result<()> {
 /// through: it goes there as a trivial move of its own, and the level above
 /// merges into it alone.
 #[test]
-fn a_whole_level_does_not_go_through_into_an_empty_level() -> crate::Result<()> {
+fn whole_level_over_an_empty_level_stops_at_the_next() -> crate::Result<()> {
     let (_dir, tree, strategy) = full_l1_over_full_l2(false)?;
     let version = tree.current_version();
     let Choice::Merge(input) =
@@ -194,7 +194,7 @@ fn write_keys(tree: &crate::AnyTree, from: u64) -> crate::Result<()> {
 /// L0 set never to trigger starts no compaction, not even the free trivial
 /// move into L1 the leveled strategy otherwise takes.
 #[test]
-fn an_l0_set_never_to_trigger_makes_no_trivial_move() -> crate::Result<()> {
+fn l0_set_never_to_trigger_makes_no_trivial_move() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_keys(&tree, 0)?;
     tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
@@ -227,7 +227,7 @@ fn an_l0_set_never_to_trigger_makes_no_trivial_move() -> crate::Result<()> {
 /// A window into a tiered level below is a window of this level: what is past
 /// its target, not the whole level, and nothing of the level below.
 #[test]
-fn a_window_into_a_tiered_level_takes_a_window() -> crate::Result<()> {
+fn window_into_a_tiered_level_takes_one_table_of_three() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     for from in [0, 1_000, 2_000] {
         write_keys(&tree, from)?;
@@ -271,7 +271,7 @@ fn a_window_into_a_tiered_level_takes_a_window() -> crate::Result<()> {
 /// A window into a tiered level, set to move the hottest data, takes the
 /// table reads touch, not the first one.
 #[test]
-fn a_hottest_window_into_a_tiered_level_takes_the_read_table() -> crate::Result<()> {
+fn hottest_window_into_a_tiered_level_takes_the_read_table() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     for from in [0, 1_000, 2_000] {
         write_keys(&tree, from)?;
@@ -323,6 +323,139 @@ fn a_hottest_window_into_a_tiered_level_takes_the_read_table() -> crate::Result<
     Ok(())
 }
 
+/// The hottest window is the one read most often, not the one read most since
+/// it was written: a table written ten seconds ago and read a hundred times
+/// outranks one written a thousand seconds ago and read three hundred.
+#[test]
+fn hottest_window_with_an_old_well_read_table_takes_the_newly_hot_one() -> crate::Result<()> {
+    crate::time::with_test_clock(|clock| {
+        let (_dir, tree) = tree()?;
+        clock.set_secs(1_000);
+        for from in [0, 1_000] {
+            write_keys(&tree, from)?;
+            tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+        }
+        for _ in 0..3 {
+            for i in 0..100u64 {
+                tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+            }
+        }
+        clock.set_secs(1_990);
+        write_keys(&tree, 2_000)?;
+        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+        for i in 2_000..2_100u64 {
+            tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+        }
+        clock.set_secs(2_000);
+
+        let version = tree.current_version();
+        let hot = version
+            .level(1)
+            .expect("L1")
+            .iter()
+            .flat_map(|run| run.iter())
+            .find(|table| table.key_range().min().as_ref() == b"k2000")
+            .expect("the table of k2000..")
+            .id();
+        let strategy = Strategy::default()
+            .with_level_policy(
+                1,
+                LevelPolicy {
+                    trigger: Trigger::Shape {
+                        runs: u8::MAX,
+                        tables: 1,
+                    },
+                    layout: Layout::Leveled,
+                    granularity: Granularity::Window,
+                    movement: Movement::Hottest,
+                },
+            )
+            .with_level_policy(2, tiered_never());
+        let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+        let Choice::Move(input) = choice else {
+            panic!("a move of a window: {choice:?}");
+        };
+        assert_eq!(input.table_ids, core::iter::once(hot).collect());
+        Ok(())
+    })
+}
+
+/// A window over a tiered level: least rewrite takes the whole first run when
+/// the overshoot is past it, the hottest skips a hidden table and takes no
+/// window past fifty tables' worth of bytes.
+#[test]
+fn window_over_with_bounds_and_hidden_tables_stays_within_them() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    let ids: Vec<TableId> = l1
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(Table::id)
+        .collect();
+    let none = HiddenSet::default();
+
+    let whole = window_over(
+        l1,
+        &none,
+        u64::MAX,
+        Movement::LeastRewrite { slack: None },
+        1,
+    )
+    .expect("the first run");
+    assert_eq!(whole.len(), 3, "an overshoot past the run takes all of it");
+
+    let first = *ids.first().expect("a table");
+    let mut first_hidden = HiddenSet::default();
+    first_hidden.hide([first]);
+    let hottest = window_over(l1, &first_hidden, 0, Movement::Hottest, u64::MAX / 64)
+        .expect("a window of the visible tables");
+    assert!(!hottest.contains(&first), "the hidden table is not taken");
+
+    assert_eq!(
+        window_over(l1, &none, 0, Movement::Hottest, 1),
+        None,
+        "every window is past fifty one-byte tables"
+    );
+    Ok(())
+}
+
+/// A window into a tiered level out of a level of two runs takes the other
+/// run's versions of its keys along, and waits while one of them is being
+/// compacted.
+#[test]
+fn window_into_a_tiered_level_from_two_runs_takes_both_or_waits() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_round(&tree, 0)?;
+    tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    write_round(&tree, 1)?;
+    tree.compact(Arc::new(MergeL0(1)), 0)?;
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    assert_eq!(l1.run_count(), 2);
+    let ids = l1.list_ids();
+    let strategy = window_into_tiered_l2();
+
+    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+    let (Choice::Move(input) | Choice::Merge(input)) = choice else {
+        panic!("a window goes down: {choice:?}");
+    };
+    assert_eq!(input.table_ids, ids, "both versions of every key");
+
+    let older = l1
+        .iter()
+        .last()
+        .and_then(|run| run.iter().next())
+        .expect("a table of the older run")
+        .id();
+    let mut busy = CompactionState::default();
+    busy.hidden_set_mut().hide([older]);
+    let choice = strategy.choose(&version, tree.tree_config(), &busy);
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+    Ok(())
+}
+
 /// Writes keys `from..to` at `round` and flushes them into one table.
 fn write_span(tree: &crate::AnyTree, (from, to): (u64, u64), round: u64) -> crate::Result<()> {
     for i in from..to {
@@ -337,16 +470,21 @@ fn write_span(tree: &crate::AnyTree, (from, to): (u64, u64), round: u64) -> crat
 /// older wide one under it, else reads would stop on the older version left
 /// above.
 #[test]
-fn a_window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()> {
+fn window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_span(&tree, (0, 50), 0)?;
     write_span(&tree, (50, 100), 0)?;
+    write_span(&tree, (200, 250), 0)?;
     tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
     write_span(&tree, (0, 100), 1)?;
     write_span(&tree, (10, 20), 2)?;
+    // Far from the window, over a table of L1 so it cannot move as it is,
+    // and dearer per byte than the narrow window: no table the merge takes
+    // shares a key with it.
+    write_span(&tree, (200, 205), 3)?;
     let version = tree.current_version();
     let l0 = version.level(0).expect("L0");
-    assert_eq!(l0.run_count(), 2);
+    assert!(l0.run_count() >= 2);
     let id_of = |min: &[u8], max: &[u8]| {
         l0.iter()
             .flat_map(|run| run.iter())
@@ -362,21 +500,42 @@ fn a_window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()
         .expect("narrow")
         .file_size();
 
+    let far = id_of(b"k0200", b"k0204");
+    let l1 = version.level(1).expect("L1");
+    let upper = l1
+        .iter()
+        .flat_map(|run| run.iter())
+        .find(|t| t.key_range().min().as_ref() == b"k0050")
+        .expect("the upper L1 table")
+        .id();
+
     // The bound admits only the narrow table promoted on its own.
-    let (ids, _) = pick_minimal_compaction(
-        l0,
-        version.level(1).expect("L1"),
-        &HiddenSet::default(),
-        0,
-        u64::MAX / 64,
-        Movement::LeastRewrite {
-            slack: Some(narrow_size),
-        },
-        &crate::comparator::DefaultUserComparator,
-    )
-    .expect("a merge");
+    let pick = |hidden: &HiddenSet| {
+        pick_minimal_compaction(
+            l0,
+            l1,
+            hidden,
+            0,
+            u64::MAX / 64,
+            Movement::LeastRewrite {
+                slack: Some(narrow_size),
+            },
+            &crate::comparator::DefaultUserComparator,
+        )
+    };
+    let (ids, _) = pick(&HiddenSet::default()).expect("a merge");
     assert!(ids.contains(&narrow), "the narrow window is the cheapest");
     assert!(ids.contains(&wide), "the older wide version goes along");
+    assert!(ids.contains(&upper), "with what it overlaps below");
+    assert!(!ids.contains(&far), "nothing that shares no key with them");
+
+    // A table the closure needs being compacted holds the merge back, in
+    // the level and below it.
+    for busy in [wide, upper] {
+        let mut hidden = HiddenSet::default();
+        hidden.hide([busy]);
+        assert_eq!(pick(&hidden), None);
+    }
     Ok(())
 }
 
@@ -421,7 +580,7 @@ fn tiered_never() -> LevelPolicy {
 /// A window into a tiered level that holds the same keys is merged into a run
 /// of its own there: nothing of that level is taken in.
 #[test]
-fn a_window_over_a_tiered_level_holding_its_keys_is_merged_alone() -> crate::Result<()> {
+fn window_over_a_tiered_level_holding_its_keys_merges_alone() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_keys(&tree, 0)?;
     tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
@@ -444,7 +603,7 @@ fn a_window_over_a_tiered_level_holding_its_keys_is_merged_alone() -> crate::Res
 /// A window does not go into a tiered level being compacted, nor take a table
 /// being compacted.
 #[test]
-fn a_window_into_a_tiered_level_waits_for_busy_tables() -> crate::Result<()> {
+fn window_into_a_tiered_level_with_busy_tables_waits() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_keys(&tree, 5_000)?;
     tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
@@ -484,7 +643,7 @@ fn a_window_into_a_tiered_level_waits_for_busy_tables() -> crate::Result<()> {
 /// A whole level into a tiered level goes as a run of its own, taking in
 /// nothing of what that level holds.
 #[test]
-fn a_whole_level_into_a_tiered_level_takes_nothing_of_it() -> crate::Result<()> {
+fn whole_level_into_a_tiered_level_takes_nothing_of_it() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_keys(&tree, 0)?;
     tree.compact(Arc::new(MoveDown(0, 2)), 0)?;
@@ -517,7 +676,7 @@ fn a_whole_level_into_a_tiered_level_takes_nothing_of_it() -> crate::Result<()> 
 
 /// L0 compacting a window goes into L1, by a window of what it overlaps there.
 #[test]
-fn a_window_of_l0_goes_into_l1() -> crate::Result<()> {
+fn window_of_l0_over_l1_goes_into_l1() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     three_tables_in_l1(&tree)?;
     write_keys(&tree, 1_000)?;
@@ -547,7 +706,7 @@ fn a_window_of_l0_goes_into_l1() -> crate::Result<()> {
 /// The hottest movement into a leveled level promotes past the overshoot by
 /// at most a table's size, as least rewrite does by default.
 #[test]
-fn the_hottest_merge_picks_a_window_into_a_leveled_level() -> crate::Result<()> {
+fn hottest_merge_into_a_leveled_level_picks_a_window() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     three_tables_in_l1(&tree)?;
     write_keys(&tree, 1_000)?;
@@ -570,7 +729,7 @@ fn the_hottest_merge_picks_a_window_into_a_leveled_level() -> crate::Result<()> 
 /// A trigger by size or never is no trigger by shape, however many tables
 /// the level holds; past the last level, a policy set is ignored.
 #[test]
-fn only_a_shape_trigger_triggers_by_shape() -> crate::Result<()> {
+fn shape_trigger_by_size_or_never_never_fires() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     for from in [0, 1_000, 2_000] {
         write_keys(&tree, from)?;
@@ -603,7 +762,7 @@ fn only_a_shape_trigger_triggers_by_shape() -> crate::Result<()> {
 /// the one that decides: L0 past it goes down into L1, not into a merge within
 /// L0 that would coalesce its tables back below the count.
 #[test]
-fn a_configured_l0_shape_sends_l0_down_instead_of_within() -> crate::Result<()> {
+fn l0_past_a_configured_shape_goes_down_not_within() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     write_keys(&tree, 0)?;
     write_keys(&tree, 50)?;
@@ -690,7 +849,7 @@ fn l0_set_to_trigger_by_size_past_its_target_goes_down() -> crate::Result<()> {
 /// A level set never to trigger starts no compaction however far past its
 /// target it grows.
 #[test]
-fn a_level_set_never_to_trigger_starts_no_compaction() -> crate::Result<()> {
+fn level_set_never_to_trigger_past_its_target_starts_nothing() -> crate::Result<()> {
     let (_dir, tree) = tree()?;
     let never = LevelPolicy {
         trigger: Trigger::Never,
@@ -727,7 +886,7 @@ fn a_level_set_never_to_trigger_starts_no_compaction() -> crate::Result<()> {
 /// The hottest movement takes the window its reads touch most per byte it
 /// rewrites, where the leveled one takes the cheapest per promoted byte.
 #[test]
-fn the_hottest_movement_prefers_reads_to_a_cheap_rewrite() {
+fn hottest_movement_with_a_cheap_cold_rewrite_prefers_reads() {
     let cheap_cold = MergeCost {
         promoted: 100,
         total: 150,

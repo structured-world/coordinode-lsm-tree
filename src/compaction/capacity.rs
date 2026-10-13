@@ -92,6 +92,10 @@ pub enum Floor {
 #[derive(Default)]
 pub struct CapacityPool {
     held: Mutex<crate::HashMap<Pool, u64>>,
+    /// The quota bytes each tree's reservations gave back, ever: what its
+    /// compactions installed into its footprint, or abandoned, counted as
+    /// installed. Locked inside `held`, never on its own before it.
+    quota_released: Mutex<crate::HashMap<TreeId, u64>>,
 }
 
 impl core::fmt::Debug for CapacityPool {
@@ -261,7 +265,7 @@ impl CapacityPool {
         {
             return None;
         }
-        let others = held_against(&held, quota);
+        let released_at_start = self.quota_released(tree);
         for &(pool, bytes, _) in &volumes {
             *held.entry(pool).or_default() += bytes;
         }
@@ -270,7 +274,8 @@ impl CapacityPool {
         Some(Reservation {
             pool: Arc::clone(self),
             check,
-            others_at_start: others,
+            tree,
+            released_at_start,
             grants: Mutex::new(Grants {
                 volumes: volumes
                     .into_iter()
@@ -298,6 +303,10 @@ impl CapacityPool {
     }
 
     /// Gives `bytes` of `pool` back.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "a quota hold and its count of releases change under the account's lock, so a reservation reads them in agreement"
+    )]
     fn release(&self, pool: Pool, bytes: u64) {
         if bytes == 0 {
             return;
@@ -309,7 +318,17 @@ impl CapacityPool {
             if *slot == 0 {
                 held.remove(&pool);
             }
+            if let Pool::Quota(tree) = pool {
+                // Bounded by the bytes the tree's compactions ever wrote.
+                *self.quota_released.lock().entry(tree).or_default() += bytes;
+            }
         }
+    }
+
+    /// The quota bytes `tree`'s reservations gave back, ever. Read with the
+    /// account locked, so that it agrees with what the account holds.
+    fn quota_released(&self, tree: TreeId) -> u64 {
+        self.quota_released.lock().get(&tree).copied().unwrap_or(0)
     }
 
     /// What `pool` holds now.
@@ -339,11 +358,13 @@ struct Grants {
 pub struct Reservation {
     pool: Arc<CapacityPool>,
     check: Option<Check>,
-    /// What the other compactions of its tree held of the quota when it was
-    /// made. Its quota headroom was measured then, before what they hold was
-    /// installed: once installed, their bytes count in the tree's footprint
-    /// though they no longer hold them here.
-    others_at_start: u64,
+    /// The tree whose quota it holds.
+    tree: TreeId,
+    /// What the tree's reservations had given back of the quota when it was
+    /// made. Its quota headroom was measured then: what the others give back
+    /// since, installed, counts in the tree's footprint though nobody holds it
+    /// here, whether they held it then or started and finished since.
+    released_at_start: u64,
     grants: Mutex<Grants>,
     refused: AtomicBool,
 }
@@ -387,10 +408,9 @@ impl Reservation {
     /// bytes included, against `headroom` measured when it was made or
     /// since.
     ///
-    /// The others' holds then are counted as taken, whether they still hold
-    /// them or have installed them into the footprint the headroom predates,
-    /// and so are the others' holds now, which include compactions started
-    /// since. A hold present at both times is counted twice: the room is
+    /// The others' holds now are counted as taken, and so is every byte they
+    /// gave back since it was made, installed into the footprint the headroom
+    /// predates. A hold given back without an install counts too: the room is
     /// never more than the quota leaves, and sometimes less.
     fn quota_room(
         &self,
@@ -398,10 +418,12 @@ impl Reservation {
         (quota, granted): (Pool, u64),
         headroom: u64,
     ) -> u64 {
-        // Its own grant is among what its quota holds.
+        // Its own grant is among what its quota holds, and it gives nothing
+        // back before it goes, so what was given back since is the others'.
         let others_now = held_against(held, quota) - granted;
+        let released_since = self.pool.quota_released(self.tree) - self.released_at_start;
         // A quota the others fill leaves none: no room, not an error.
-        headroom.saturating_sub(self.others_at_start + others_now)
+        headroom.saturating_sub(others_now + released_since)
     }
 
     /// A file of `len` bytes was written into the folder `path` of `fs`.
