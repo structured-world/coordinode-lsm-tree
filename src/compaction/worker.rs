@@ -1807,12 +1807,21 @@ fn run_tight_space_compaction(
     // physically unbounded, so nothing else is left to reject a merge. The
     // clamp-to-zero matches the gate's min-semantics (a quota set below the
     // live footprint leaves no headroom).
-    let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
+    let quota_limit = opts.runtime_config.load().storage_limit_bytes;
+    let used_at_start = crate::storage_stats::compute_used_bytes(&latest.version)?;
+    let quota_headroom = match quota_limit {
         Some(limit) => limit
-            .saturating_sub(crate::storage_stats::compute_used_bytes(&latest.version)?)
+            .saturating_sub(used_at_start)
             .saturating_sub(opts.capacity.quota_held(opts.tree_id)),
         None => u64::MAX,
     };
+    // What the pass reads and writes, and the footprint of all else when it
+    // starts: a slice is checked against the quota less what all else has
+    // grown by since. The pass's own growth is what its slices were cut for.
+    let mut own_tables: HashSet<TableId> = payload.table_ids.iter().copied().collect();
+    let mut own_blobs: HashSet<BlobFileId> = stale_ids.iter().copied().collect();
+    let others_at_start =
+        crate::storage_stats::compute_used_bytes_but(&latest.version, &own_tables, &own_blobs)?;
     let cut_keys = super::flavour::output_cut_keys(&latest.version, opts, payload);
 
     drop(latest);
@@ -1914,17 +1923,29 @@ fn run_tight_space_compaction(
     // the others left no room for ends the pass there, its installed slices
     // kept; the next compaction picks up the rest. What a slice writes past
     // its room it takes on as it lands, under the quota as it stands then and
-    // short of the flush floor, or the pass stops.
-    let reserve_slice = |slice: &TightSlice| -> crate::Result<bool> {
+    // short of the flush floor, or the pass stops. The quota a slice is
+    // checked against is the one the pass was cut for, less what the files
+    // it neither reads nor writes (`own_tables`, `own_blobs`) have grown by
+    // since: a flush, another compaction.
+    let reserve_slice = |slice: &TightSlice,
+                         own_tables: &HashSet<TableId>,
+                         own_blobs: &HashSet<BlobFileId>|
+     -> crate::Result<bool> {
         if past_caps(slice) {
             return Ok(false);
         }
-        // The prefixes the pass's installed slices consumed count free here,
-        // though their punch may still wait on readers of the older views.
-        let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
-            Some(limit) => limit.saturating_sub(crate::storage_stats::compute_live_used_bytes(
-                &opts.version_history.read().latest_version().version,
-            )?),
+        let quota_headroom = match quota_limit {
+            Some(limit) => {
+                let others = crate::storage_stats::compute_used_bytes_but(
+                    &opts.version_history.read().latest_version().version,
+                    own_tables,
+                    own_blobs,
+                )?;
+                // What all else grew by: none when it shrank.
+                limit
+                    .saturating_sub(used_at_start)
+                    .saturating_sub(others.saturating_sub(others_at_start))
+            }
             None => u64::MAX,
         };
         let demands = [
@@ -2039,7 +2060,7 @@ fn run_tight_space_compaction(
             let Some(boundary) = &slice.end else {
                 break;
             };
-            if !reserve_slice(slice)? {
+            if !reserve_slice(slice, &own_tables, &own_blobs)? {
                 stopped = true;
                 return Ok(tables_out);
             }
@@ -2099,6 +2120,8 @@ fn run_tight_space_compaction(
             drop(version);
 
             let outputs: Vec<Table> = produced.created_tables().to_vec();
+            own_tables.extend(outputs.iter().map(Table::id));
+            own_blobs.extend(produced.created_blob_files().iter().map(BlobFile::id));
             // Install the tree-wide sinks on each slice output before the
             // version edit makes it visible (mirrors `install_merge`): the
             // deletion pause, so a later in-place heal cannot race a
@@ -2490,7 +2513,7 @@ fn run_tight_space_compaction(
         // Tail [last boundary, hi): merge the remainder, remove the inputs, and
         // drop the now fully-consumed stale blob files (install_merge deletes
         // them outright — the prior slices already punched their prefixes).
-        if !reserve_slice(tail)? {
+        if !reserve_slice(tail, &own_tables, &own_blobs)? {
             stopped = true;
             return Ok(tables_out);
         }

@@ -972,35 +972,31 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     Ok(used_bytes)
 }
 
-/// [`compute_used_bytes`] with the prefix a tight-space pass consumed counted
-/// free from the moment its slice installs: each file is charged the lesser
-/// of the bytes it occupies and its live part.
-///
-/// The punch that frees a consumed prefix waits for the readers of the view
-/// it was restricted from, so the bytes a file occupies keep that prefix for
-/// a while after the version stopped serving it. A pass checking each slice
-/// against the quota as it stands would see its own installed outputs beside
-/// prefixes already freed in the version, and stop on a footprint that is not
-/// the tree's.
+/// [`compute_used_bytes`] of every file of `version` but `tables` and
+/// `blobs`: the footprint of what a tight-space pass neither reads nor
+/// writes, whose growth while the pass runs is others' (a flush, another
+/// compaction) and comes out of the quota the pass was cut for.
 ///
 /// # Errors
 ///
 /// Propagates the stat failures of the tables and blob files.
 #[cfg(feature = "std")]
-pub(crate) fn compute_live_used_bytes(version: &Version) -> crate::Result<u64> {
+pub(crate) fn compute_used_bytes_but(
+    version: &Version,
+    tables: &crate::HashSet<crate::TableId>,
+    blobs: &crate::HashSet<crate::vlog::BlobFileId>,
+) -> crate::Result<u64> {
     // Bounded by the filesystem capacity, as `compute_used_bytes` is.
     let mut used_bytes = 0u64;
     for table in version.iter_tables() {
-        used_bytes += table_on_disk_bytes(table)?.min(table.live_file_size()?);
+        if !tables.contains(&table.id()) {
+            used_bytes += table_on_disk_bytes(table)?;
+        }
     }
     for blob in version.blob_files.iter() {
-        let occupied = blob_on_disk_bytes(blob)?;
-        // The data below the frontier was relocated by a slice.
-        let live = blob
-            .physical_size()?
-            .checked_sub(blob.live_data_start())
-            .unwrap_or(occupied);
-        used_bytes += occupied.min(live);
+        if !blobs.contains(&blob.id()) {
+            used_bytes += blob_on_disk_bytes(blob)?;
+        }
     }
     Ok(used_bytes)
 }
