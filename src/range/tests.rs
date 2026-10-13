@@ -100,6 +100,58 @@ fn batch_scan_counts_only_the_tables_its_intervals_read() -> crate::Result<()> {
     Ok(())
 }
 
+/// A batch scan whose intervals all fall in one table of a run counts once
+/// on it, as the batch counts once in the read mix.
+#[expect(clippy::expect_used, reason = "test code")]
+#[test]
+fn batch_scan_of_many_intervals_in_one_table_of_a_run_counts_it_once() -> crate::Result<()> {
+    use crate::version::run::Ranged;
+    use crate::{AbstractTree, Config, SeqNo, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for from in [0u64, 1_000, 2_000] {
+        for i in from..from + 100 {
+            tree.insert(format!("k{i:04}"), "v", i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(alloc::sync::Arc::new(crate::compaction::MoveDown(0, 1)), 0)?;
+    }
+    assert_eq!(
+        tree.current_version().level(1).expect("L1").run_count(),
+        1,
+        "the fixture needs one run of three tables"
+    );
+    let read = tree
+        .batch_range_scan(
+            [
+                "k0001".to_string()..="k0002".to_string(),
+                "k0010".to_string()..="k0011".to_string(),
+                "k0020".to_string()..="k0021".to_string(),
+            ],
+            SeqNo::MAX,
+            None,
+        )
+        .count();
+    assert_eq!(read, 6);
+    let mut scans: Vec<_> = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| (table.key_range().min().clone(), table.scans()))
+        .collect();
+    scans.sort();
+    assert_eq!(
+        scans.into_iter().map(|(_, n)| n).collect::<Vec<_>>(),
+        [1, 0, 0]
+    );
+    Ok(())
+}
+
 /// The key up to and including its first ':'.
 struct UpToColon;
 

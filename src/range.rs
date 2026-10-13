@@ -1091,7 +1091,9 @@ impl RunLeaf {
         seqno: SeqNo,
         comparator: SharedComparator,
     ) -> Option<Self> {
-        let reader = RunReader::new_cmp(run, user_range, comparator.as_ref())?;
+        // Repositioned over every range of a batch, which counts as one scan.
+        let reader =
+            RunReader::new_cmp(run, user_range, comparator.as_ref())?.counting_each_table_once();
         Some(Self {
             reader,
             comparator,

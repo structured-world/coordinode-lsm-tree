@@ -272,20 +272,25 @@ fn pick_minimal_compaction(
     let pulled_in = contained.len();
     let curr_ids = with_overlapping_runs(curr_level, contained, hidden_set, cmp)?;
     let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    // What the other runs added may reach past the window: what it overlaps
-    // below goes into the merge too, so the level below stays one run.
-    if curr_ids.len() > pulled_in {
-        for table in curr_level.iter().flat_map(|run| run.iter()) {
-            if !curr_ids.contains(&table.id()) {
-                continue;
-            }
-            for below in next_level
+    // What the other runs added may reach past the window: every table below
+    // within the span of the merge goes into it too, so the level below stays
+    // one run and its tables taken lie side by side, none left between them.
+    if curr_ids.len() > pulled_in
+        && let Some(span) = span_of(
+            curr_level
                 .iter()
-                .flat_map(|run| run.get_overlapping_cmp(table.key_range(), cmp))
-            {
-                if ids.insert(below.id()) && hidden_set.is_hidden(below.id()) {
-                    return None;
-                }
+                .flat_map(|run| run.iter())
+                .filter(|table| curr_ids.contains(&table.id()))
+                .chain(window.iter()),
+            cmp,
+        )
+    {
+        for below in next_level
+            .iter()
+            .flat_map(|run| run.get_overlapping_cmp(&span, cmp))
+        {
+            if ids.insert(below.id()) && hidden_set.is_hidden(below.id()) {
+                return None;
             }
         }
     }
@@ -293,13 +298,44 @@ fn pick_minimal_compaction(
     Some((ids, false))
 }
 
-/// `ids`, tables of `level`, with every table of its runs that shares a key
-/// with them, taken in until none is left out; `None` when one is hidden.
+/// The key range from the least key of `tables` to the greatest.
+fn span_of<'a>(
+    tables: impl Iterator<Item = &'a Table>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> Option<crate::KeyRange> {
+    use core::cmp::Ordering;
+
+    let mut span: Option<(crate::UserKey, crate::UserKey)> = None;
+    for table in tables {
+        let range = table.key_range();
+        span = Some(match span {
+            None => (range.min().clone(), range.max().clone()),
+            Some((min, max)) => (
+                if cmp.compare(range.min(), &min) == Ordering::Less {
+                    range.min().clone()
+                } else {
+                    min
+                },
+                if cmp.compare(range.max(), &max) == Ordering::Greater {
+                    range.max().clone()
+                } else {
+                    max
+                },
+            ),
+        });
+    }
+    span.map(crate::KeyRange::new)
+}
+
+/// `ids`, tables of `level`, with every table of its runs within their span,
+/// taken in until none is left out; `None` when one is hidden.
 ///
 /// The runs of a level hold versions of one key in more than one of them,
 /// and a read stops at the first level that holds the key: a merge that
 /// took the newer version down and left the older above would have reads
-/// return the older.
+/// return the older. The span, not only the keys shared, so that the tables
+/// taken of each run lie side by side, as a merge reads a run, none left
+/// between them.
 fn with_overlapping_runs(
     level: &Level,
     mut ids: HashSet<TableId>,
@@ -311,25 +347,25 @@ fn with_overlapping_runs(
         return Some(ids);
     }
     loop {
-        let mut ranges: Vec<_> = level
-            .iter()
-            .flat_map(|run| run.iter())
-            .filter(|table| ids.contains(&table.id()))
-            .map(|table| table.key_range().clone())
-            .collect();
-        ranges.sort_by(|a, b| cmp.compare(a.min(), b.min()));
-        let mut grew = false;
-        for interval in crate::KeyRange::merge_sorted_cmp(ranges, cmp) {
-            for table in level
+        let Some(span) = span_of(
+            level
                 .iter()
-                .flat_map(|run| run.get_overlapping_cmp(&interval, cmp))
-            {
-                if ids.insert(table.id()) {
-                    if hidden_set.is_hidden(table.id()) {
-                        return None;
-                    }
-                    grew = true;
+                .flat_map(|run| run.iter())
+                .filter(|table| ids.contains(&table.id())),
+            cmp,
+        ) else {
+            return Some(ids);
+        };
+        let mut grew = false;
+        for table in level
+            .iter()
+            .flat_map(|run| run.get_overlapping_cmp(&span, cmp))
+        {
+            if ids.insert(table.id()) {
+                if hidden_set.is_hidden(table.id()) {
+                    return None;
                 }
+                grew = true;
             }
         }
         if !grew {

@@ -462,6 +462,37 @@ fn choose_on_two_levels_merges_the_top_into_the_last() -> crate::Result<()> {
     Ok(())
 }
 
+/// A top level at its table count owes all of it, though its bytes are under
+/// a unit: the strategy sends it down then, and a debt of nothing would say
+/// the tree is caught up.
+#[test]
+fn debt_of_a_top_level_at_its_table_count_is_all_of_it() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    for round in 0..2u64 {
+        for i in 0..5u64 {
+            tree.insert(format!("k{i:04}"), "v", round * 10 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let strategy = Strategy::default()
+        .with_round(16)
+        .with_size_ratio(3)
+        .with_table_target_size(UNIT)
+        .with_l0_file_threshold(2);
+    let version = tree.current_version();
+    let top = version.level(0).expect("L0").size();
+    assert!(top > 0 && top < UNIT, "the fixture needs a small top level");
+    assert!(
+        !matches!(
+            strategy.choose(&version, tree.tree_config(), &CompactionState::default()),
+            Choice::DoNothing
+        ),
+        "the top level goes down at its table count"
+    );
+    assert_eq!(strategy.pending_compaction_bytes(&version), top);
+    Ok(())
+}
+
 /// A lookup of an absent key counts in the read mix though no filter lets it
 /// through: one scan beside three such lookups is a quarter of the reads.
 #[test]

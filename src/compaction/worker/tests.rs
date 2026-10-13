@@ -3479,6 +3479,288 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
     assert_relocated_values(&tree)
 }
 
+/// A relocating pass whose tables and blob files share one volume checks a
+/// slice against the room both of its demands take there: another tree that
+/// took less than that room since, but more than it leaves past the two
+/// together, stops the slice before it writes.
+#[test]
+fn tight_slice_on_a_shared_volume_counts_both_demands_against_its_room() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use core::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let config = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()))
+    .with_kv_separation(Some(blob_reloc_kv_options()));
+    let squeeze = Arc::clone(&config.tight_slice_squeeze);
+    let tree = match config.open()? {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..BLOB_RELOC_KEYS {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..BLOB_RELOC_KEYS).step_by(2) {
+        tree.insert(
+            blob_reloc_key(i).as_bytes(),
+            blob_reloc_value(i, 2),
+            BLOB_RELOC_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    tree.index.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.storage_limit_bytes = None;
+    })?;
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    let used = tree.storage_stats()?.used_bytes;
+    mem.set_capacity(used + used / 4);
+    tree.index.update_runtime_config(|c| {
+        c.tight_space_compaction = true;
+    })?;
+
+    // The first slice as the pass cuts it.
+    let version = tree.index.current_version();
+    let inputs: Vec<Table> = version.iter_tables().cloned().collect();
+    let ids: crate::HashSet<TableId> = inputs.iter().map(Table::id).collect();
+    let stale_files = super::pick_blob_files_to_rewrite(&ids, &version, &blob_reloc_kv_options())?;
+    let stale: crate::HashSet<_> = stale_files.iter().map(crate::vlog::BlobFile::id).collect();
+    let mut codecs = Vec::new();
+    for file in &stale_files {
+        if !codecs.contains(&file.compression()) {
+            codecs.push(file.compression());
+        }
+    }
+    let free = mem.available_space(dir.path())?;
+    let relocated = super::Relocated {
+        stale: &stale,
+        target_size: 48 * 1024,
+        file_groups: codecs.len() as u64 * u64::from(blob_reloc_kv_options().lifetime_groups.get()),
+    };
+    let slices = super::tight_slices(
+        &inputs,
+        super::SliceCaps {
+            tables: u64::MAX,
+            blobs: u64::MAX,
+            total: free,
+        },
+        &super::SliceOutputs {
+            target_size: 64 * 1024 * 1024,
+            cut_keys: &[],
+        },
+        Some(&relocated),
+        &tree.index.config.comparator,
+    )?;
+    drop(version);
+    let first = slices.first().expect("a slice");
+    let (tables, blobs) = (first.tables, first.blobs);
+    assert!(
+        slices.len() > 1 && tables.min(blobs) >= 2,
+        "the fixture needs a pass in slices writing both: {slices:?}"
+    );
+
+    // Past the room the two leave together, short of what either leaves.
+    squeeze.store(
+        free - (tables + blobs) + tables.min(blobs) / 2,
+        Ordering::SeqCst,
+    );
+    let punched = mem.punched_bytes();
+    let result = tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    assert_eq!(
+        result.action,
+        crate::compaction::CompactionAction::Nothing,
+        "{result:?}"
+    );
+    assert_eq!(mem.punched_bytes(), punched, "no slice ran");
+    Ok(())
+}
+
+/// A strategy's merge naming a table the version does not hold is declined,
+/// in a tree whose merges reckon the room of the blob files they rewrite as
+/// in any other.
+#[test]
+fn merge_of_a_missing_table_in_a_blob_tree_is_declined() -> crate::Result<()> {
+    use crate::compaction::{Choice, CompactionStrategy, Input, state::CompactionState};
+
+    struct MergeMissing(Vec<TableId>);
+
+    impl CompactionStrategy for MergeMissing {
+        fn get_name(&self) -> &'static str {
+            "MergeMissingTest"
+        }
+
+        fn choose(&self, _: &crate::version::Version, _: &Config, _: &CompactionState) -> Choice {
+            Choice::Merge(Input {
+                table_ids: self.0.iter().copied().collect(),
+                dest_level: 1,
+                canonical_level: 1,
+                target_size: u64::MAX,
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..10 {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    let mut ids = tree.index.current_version().l0().list_ids();
+    ids.insert(TableId::MAX);
+
+    let result = tree.compact(Arc::new(MergeMissing(ids.into_iter().collect())), 0)?;
+    assert_eq!(result.action, crate::compaction::CompactionAction::Nothing);
+    Ok(())
+}
+
+/// A merge that relocates blob values counts the blob files it wrote as they
+/// lie on disk, their framing and metadata with the values, as it counts its
+/// tables.
+#[test]
+fn relocating_merge_counts_its_blob_files_whole_as_written() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_kv_separation(Some(blob_reloc_kv_options()))
+    .open()?
+    {
+        crate::AnyTree::Blob(t) => t,
+        crate::AnyTree::Standard(_) => panic!("expected Blob tree"),
+    };
+    for i in 0..BLOB_RELOC_KEYS {
+        tree.insert(blob_reloc_key(i).as_bytes(), blob_reloc_value(i, 1), i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..BLOB_RELOC_KEYS).step_by(2) {
+        tree.insert(
+            blob_reloc_key(i).as_bytes(),
+            blob_reloc_value(i, 2),
+            BLOB_RELOC_KEYS + i,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    // The first merge learns which frames died; the second relocates.
+    tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    let before: crate::HashSet<_> = tree
+        .index
+        .current_version()
+        .blob_files
+        .iter()
+        .map(crate::vlog::BlobFile::id)
+        .collect();
+
+    let result = tree.major_compact(64 * 1024 * 1024, BLOB_RELOC_WATERMARK)?;
+    let version = tree.index.current_version();
+    let mut created = 0;
+    let mut relocated = false;
+    for file in version.blob_files.iter() {
+        if !before.contains(&file.id()) {
+            relocated = true;
+            created += file.physical_size()?;
+        }
+    }
+    assert!(relocated, "the fixture needs the merge to relocate");
+    let tables: u64 = version.iter_tables().map(Table::file_len).sum();
+    assert_eq!(result.work.measured.written, tables + created);
+    Ok(())
+}
+
+/// A block alone past the room the pass found makes a slice no cut can bring
+/// within it. The pass runs the slices before it and stops there, the rest
+/// of its inputs left in place, rather than write past the room.
+#[test]
+fn tight_space_pass_stops_before_a_slice_past_its_room() -> crate::Result<()> {
+    const ROOM: u64 = 48 * 1_024;
+    let big = |i: u64| -> Vec<u8> {
+        let mut s = (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..4 * ROOM)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s.to_le_bytes()[3]
+            })
+            .collect()
+    };
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .with_shared_fs(Arc::new(mem.clone()))
+    .open()?
+    else {
+        panic!("expected Standard tree");
+    };
+    // Two overlapping flushes, so the major compaction merges them.
+    for round in 0..2u64 {
+        for i in 0..TIGHT_SPACE_KEYS {
+            let value = if i == TIGHT_SPACE_KEYS / 2 {
+                big(round)
+            } else {
+                vec![0xCD; 64]
+            };
+            tree.insert(
+                tight_space_key(i).as_bytes(),
+                value,
+                round * TIGHT_SPACE_KEYS + i,
+            );
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    mem.set_capacity(tree.storage_stats()?.used_bytes + ROOM);
+    tree.update_runtime_config(|c| {
+        c.storage_admission_check = true;
+        c.tight_space_compaction = true;
+    })?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    assert!(mem.punched_bytes() > 0, "the slices before it ran");
+    assert!(
+        !tree.current_version().level(0).expect("L0").is_empty(),
+        "the inputs from the slice past the room on stay in place",
+    );
+    for i in 0..TIGHT_SPACE_KEYS {
+        let expected = if i == TIGHT_SPACE_KEYS / 2 {
+            big(1)
+        } else {
+            vec![0xCD; 64]
+        };
+        assert_eq!(
+            tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
+                .as_deref(),
+            Some(expected.as_slice()),
+            "key {i}",
+        );
+    }
+    Ok(())
+}
+
 /// Live blob bytes are not spread over the keys as the table bytes are: here
 /// the first tenth of the keys holds most of them. A slice cut by its share
 /// of the tables relocates far more than that share of the blob files, past

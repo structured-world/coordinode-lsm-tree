@@ -575,14 +575,25 @@ impl Reservation {
         })
     }
 
-    /// Keeps `bytes` of its quota held once it goes: an output it covered
-    /// could not be removed and stays on disk until the tree's next open
-    /// sweeps it, unseen by a quota counted from the installed version. A
-    /// tree opens under a new id, so the hold ends with the tree that left it.
-    pub(crate) fn strand(&self, bytes: u64) {
+    /// Keeps `bytes` of its tree's quota held once it goes, or the whole of
+    /// its grant when they are not known: outputs it covered could not be
+    /// removed and stay on disk until the tree's next open sweeps them,
+    /// unseen by a quota counted from the installed version. An output that
+    /// outgrew the grant, refused or not, is held whole, past the grant too.
+    /// A tree opens under a new id, so the hold ends with the tree that left
+    /// it.
+    pub(crate) fn strand(&self, bytes: Option<u64>) {
         let mut grants = self.grants.lock();
-        let kept = bytes.min(grants.quota.1);
-        grants.quota.1 -= kept;
+        let (quota, granted) = grants.quota;
+        let kept = bytes.unwrap_or(granted);
+        let from_grant = kept.min(granted);
+        grants.quota.1 -= from_grant;
+        let past_grant = kept - from_grant;
+        drop(grants);
+        if past_grant > 0 {
+            // Bounded by the bytes the outputs take on disk.
+            *self.pool.held.lock().entry(quota).or_default() += past_grant;
+        }
     }
 
     /// Whether the reservation stopped its compaction.

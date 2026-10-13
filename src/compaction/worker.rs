@@ -353,6 +353,19 @@ fn gated_merge(
 ) -> crate::Result<CompactionResult> {
     let decision = {
         let super_version = version_history_lock.latest_version();
+        // A strategy's choice naming a table the version does not hold is
+        // declined before its room is reckoned, as the merge would decline it.
+        if payload
+            .table_ids
+            .iter()
+            .any(|&id| super_version.version.get_table(id).is_none())
+        {
+            log::warn!(
+                "Compaction task created by {:?} contained tables not referenced in the level manifest",
+                opts.strategy.get_name(),
+            );
+            return Ok(CompactionResult::nothing());
+        }
         space_gate_for_merge(&super_version.version, opts, payload)?
     };
     match decision {
@@ -1524,11 +1537,20 @@ fn tight_slices(
     // first table of a slice and every one past a target's worth of blocks
     // weigh their fixed bytes too.
     let with_tables = |tables: u64| tables + fixed * (1 + tables / outputs.target_size.max(1));
+    // Each output blob file closes with its metadata, its first and last keys
+    // among it: a file per target's worth of frames, and one more for each
+    // codec and lifetime class the slice's frames may go to.
+    let with_blobs = |blobs: u64| match relocated {
+        Some(relocated) if blobs > 0 => {
+            let files = blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
+            blobs + files * (BLOB_META_BYTES + 2 * longest_key)
+        }
+        _ => blobs,
+    };
     let past = |acc: (u64, u64), block: &Block| {
         let tables = with_tables(acc.0 + block.tables);
-        tables > caps.tables
-            || acc.1 + block.blobs > caps.blobs
-            || tables + acc.1 + block.blobs > caps.total
+        let blobs = with_blobs(acc.1 + block.blobs);
+        tables > caps.tables || blobs > caps.blobs || tables + blobs > caps.total
     };
     let mut slices = Vec::new();
     let mut acc = (0u64, 0u64);
@@ -1546,7 +1568,7 @@ fn tight_slices(
                 slices.push(TightSlice {
                     end: Some(key.clone()),
                     tables: with_tables(acc.0),
-                    blobs: acc.1,
+                    blobs: with_blobs(acc.1),
                 });
                 acc = on_last_key;
             }
@@ -1559,22 +1581,8 @@ fn tight_slices(
     slices.push(TightSlice {
         end: None,
         tables: with_tables(acc.0),
-        blobs: acc.1,
+        blobs: with_blobs(acc.1),
     });
-
-    // Each output blob file closes with its metadata, its first and last keys
-    // among it: a file per target's worth of frames, and one more for each
-    // codec and lifetime class the slice's frames may go to.
-    if let Some(relocated) = relocated {
-        let per_file = BLOB_META_BYTES + 2 * longest_key;
-        for slice in &mut slices {
-            if slice.blobs > 0 {
-                let files =
-                    slice.blobs.div_ceil(relocated.target_size.max(1)) + relocated.file_groups;
-                slice.blobs += files * per_file;
-            }
-        }
-    }
     Ok(slices)
 }
 
@@ -1777,13 +1785,16 @@ fn run_tight_space_compaction(
         0
     };
     let blob_held = opts.capacity.held_on(&*opts.config.fs, &blob_dir);
+    // The tables and the relocated blob files take their room from one volume.
+    let shared_volume =
+        relocating_blobs && !separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir);
     let caps = if !relocating_blobs {
         SliceCaps {
             tables: dest_free.max(1),
             blobs: u64::MAX,
             total: quota_headroom.max(1),
         }
-    } else if separate_volumes(&*dest_fs, &dest_path, &*opts.config.fs, &blob_dir) {
+    } else if !shared_volume {
         SliceCaps {
             tables: dest_free.max(1),
             blobs: blob_free.max(1),
@@ -1819,13 +1830,17 @@ fn run_tight_space_compaction(
     let Some((tail, slices)) = slices.split_last() else {
         return Ok(CompactionResult::nothing());
     };
-    // One slice past the caps cannot be cut any finer: it would write past
-    // the room the pass found. One within them is the whole merge, in one go.
-    if slices.is_empty()
-        && (tail.tables > caps.tables
-            || tail.blobs > caps.blobs
-            || tail.tables + tail.blobs > caps.total)
-    {
+    // A slice past the caps (a block, or the blocks of one key, alone past
+    // them) cannot be cut any finer: it would write past the room the pass
+    // found. The pass runs the slices before it, which free room as they go,
+    // and stops there; one that comes first leaves the pass nothing to run.
+    // A single slice within them is the whole merge, in one go.
+    let past_caps = |slice: &TightSlice| {
+        slice.tables > caps.tables
+            || slice.blobs > caps.blobs
+            || slice.tables + slice.blobs > caps.total
+    };
+    if past_caps(slices.first().unwrap_or(tail)) {
         return Ok(CompactionResult::nothing());
     }
 
@@ -1846,6 +1861,9 @@ fn run_tight_space_compaction(
     // its room it takes on as it lands, under the quota as it stands then and
     // short of the flush floor, or the pass stops.
     let reserve_slice = |slice: &TightSlice| -> crate::Result<bool> {
+        if past_caps(slice) {
+            return Ok(false);
+        }
         let quota_headroom = match opts.runtime_config.load().storage_limit_bytes {
             Some(limit) => limit.saturating_sub(crate::storage_stats::compute_used_bytes(
                 &opts.version_history.read().latest_version().version,
@@ -1883,12 +1901,19 @@ fn run_tight_space_compaction(
             }
         }
         // What the others may hold on each volume: what they held when the
-        // pass measured it, and what room a slice left past it then. The slack
-        // is never below none.
+        // pass measured it, and what room a slice left past it then, both of
+        // its demands taken from a volume they share. The slack is never
+        // below none.
+        let (tables_room, blobs_room) = if shared_volume {
+            let both = slice.tables + slice.blobs;
+            (both, both)
+        } else {
+            (slice.tables, slice.blobs)
+        };
         let [tables, blobs] = demands;
         let within = [
-            (tables, dest_held + dest_free.saturating_sub(slice.tables)),
-            (blobs, blob_held + blob_free.saturating_sub(slice.blobs)),
+            (tables, dest_held + dest_free.saturating_sub(tables_room)),
+            (blobs, blob_held + blob_free.saturating_sub(blobs_room)),
         ];
         // The slice before is installed: what it held is not the others'.
         opts.outputs.release_room();
@@ -2056,7 +2081,7 @@ fn run_tight_space_compaction(
             // Charged once this slice is installed, below.
             let relocated_bytes = produced.relocated_bytes();
             let carried = produced.carried();
-            let installed_work = produced.installed_work();
+            let installed_work = produced.installed_work()?;
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside

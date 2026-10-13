@@ -712,21 +712,25 @@ impl ProducedOutput {
     }
 
     /// What installing this output puts in the version, as the run's work
-    /// counts it: the bytes of its tables and of its blob files' frames, the
-    /// part of them copied rather than encoded, and the frames read by
-    /// handle.
-    pub(super) fn installed_work(&self) -> super::work::Installed {
+    /// counts it: the bytes of its tables and of its blob files, framing and
+    /// metadata included as they lie on disk, the part of them copied rather
+    /// than encoded, and the frames read by handle.
+    ///
+    /// # Errors
+    ///
+    /// Any error reading the length of a blob file it wrote.
+    pub(super) fn installed_work(&self) -> crate::Result<super::work::Installed> {
         let tables: u64 = self.created_tables.iter().map(Table::file_len).sum();
-        let frames: u64 = self
-            .created_blob_files
-            .iter()
-            .map(|file| file.meta().total_compressed_bytes)
-            .sum();
-        super::work::Installed {
-            written: tables + frames,
+        let mut blob_files = 0u64;
+        for file in &self.created_blob_files {
+            // Bounded by the bytes the run wrote.
+            blob_files += file.physical_size()?;
+        }
+        Ok(super::work::Installed {
+            written: tables + blob_files,
             carried: self.carried.2 + self.segment_copied + self.relocated_bytes,
             read: self.frames_read,
-        }
+        })
     }
 
     /// Builds the output for a merge-on-read relocation: the `created` segment
@@ -853,7 +857,7 @@ pub(super) fn install_merge(
     let mut carried = (0u64, 0u64, 0u64);
     let mut work = super::work::Installed::default();
     for out in outputs {
-        let installed = out.installed_work();
+        let installed = out.installed_work()?;
         work.written += installed.written;
         work.carried += installed.carried;
         work.read += installed.read;

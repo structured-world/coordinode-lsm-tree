@@ -385,11 +385,21 @@ impl CompactionStrategy for Strategy {
         let last_bytes = version.level(last).map_or(0, Level::size);
         // The budget the last choice saw: the version alone does not say it.
         let unit = self.unit(last_bytes, self.budget_seen.load(Ordering::Relaxed));
-        let top = version.level(0).map_or(0, Level::size);
+        let top_level = version.level(0);
+        let top = top_level.map_or(0, Level::size);
+        // The top level past its unit owes the bytes past it; one past its
+        // table count owes all of it, as `choose` sends it all down then.
+        let top_owed = if top_level
+            .is_some_and(|level| level.table_count() >= usize::from(self.l0_file_threshold))
+        {
+            top
+        } else {
+            top.saturating_sub(unit)
+        };
         // A tree of two levels owes only its top level: the main level is the
         // last, which nothing drains.
         if last < DRAIN {
-            return top.saturating_sub(unit);
+            return top_owed;
         }
         let main = version.level(1).map_or(0, Level::size);
         let draining: u64 = (DRAIN..last)
@@ -399,7 +409,7 @@ impl CompactionStrategy for Strategy {
         // The top level past its unit, the main level past its round, and an
         // ended round still to go into the last: a level within its bound
         // owes nothing, not less than nothing.
-        top.saturating_sub(unit) + main.saturating_sub(unit * u64::from(self.round())) + draining
+        top_owed + main.saturating_sub(unit * u64::from(self.round())) + draining
     }
 
     fn next_merge_level(&self, version: &Version, dest_level: u8) -> Option<usize> {

@@ -147,6 +147,55 @@ fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> 
     Ok(())
 }
 
+/// An output that outgrew its run's room and cannot be removed keeps all of
+/// its bytes held, past the room the run reserved too.
+#[test]
+fn an_output_past_its_room_that_cannot_be_removed_keeps_all_of_it_held() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let stuck = PathBuf::from("/tree/tables/1");
+    let mut file = fs.open(&stuck, &FsOpenOptions::new().write(true).create_new(true))?;
+    file.write_all(&[7u8; 150])?;
+    drop(file);
+
+    let tree_id = 5;
+    let pool = Arc::new(CapacityPool::default());
+    let Some(room) = pool.reserve(
+        tree_id,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 100,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    ledger.record_table(1, stuck.clone(), fs.clone());
+    ledger.landed(&*fs, &stuck)?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("tables/1"),
+    );
+    ledger.remove_uninstalled(tree_id, None);
+    injector.clear();
+
+    assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");
+    assert_eq!(pool.quota_held(tree_id), 150);
+    Ok(())
+}
+
 /// A cached descriptor keeps the file open, and a backend that refuses to
 /// unlink an open file (as Windows does) would leave it behind: the
 /// descriptor is evicted first, for a table and a blob file alike.

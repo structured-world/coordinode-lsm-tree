@@ -140,7 +140,8 @@ impl OutputLedger {
         let outputs = core::mem::take(&mut *self.0.files.lock());
         // Given back once the files it covered are gone, below.
         let room = self.0.room.lock().take();
-        let mut stranded = 0u64;
+        // `None` once a file's length cannot be read.
+        let mut stranded = Some(0u64);
         for output in outputs {
             let global_id = GlobalTableId::from((tree_id, output.id));
             if let Some(descriptors) = descriptor_table {
@@ -163,8 +164,10 @@ impl OutputLedger {
                     );
                     // A length that cannot be read holds the whole grant: the
                     // quota is a limit, and the file may take all of it.
-                    let len = output.fs.metadata(&output.path).map_or(u64::MAX, |m| m.len);
-                    stranded = stranded.saturating_add(len);
+                    // Bounded by the bytes the run wrote.
+                    stranded = stranded
+                        .zip(output.fs.metadata(&output.path).ok())
+                        .map(|(sum, metadata)| sum + metadata.len);
                 }
             }
         }

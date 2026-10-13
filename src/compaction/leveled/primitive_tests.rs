@@ -566,6 +566,50 @@ fn merge_past_a_large_first_table_takes_the_window_it_overlaps() -> crate::Resul
     Ok(())
 }
 
+/// The tables of a run taken along for the keys they share lie side by side:
+/// a run whose two tables share keys with the ends of another run takes the
+/// table between those ends too, which a merge reads as it reads the run.
+#[test]
+fn overlapping_runs_take_the_tables_between_the_ones_they_share_keys_with() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    for from in [50, 2_050] {
+        for i in from..from + 10 {
+            tree.insert(format!("k{i:04}"), "w", 10_000 + i);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(MergeL0(1)), 0)?;
+    }
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    let runs: Vec<Vec<TableId>> = l1
+        .iter()
+        .map(|run| run.iter().map(Table::id).collect())
+        .collect();
+    assert_eq!(runs.len(), 2, "the fixture needs two runs in L1: {runs:?}");
+    let newer = runs
+        .iter()
+        .find(|run| run.len() == 2)
+        .expect("the fixture needs a run of the two new tables");
+    let older = runs
+        .iter()
+        .find(|run| run.len() == 3)
+        .expect("the fixture needs the run of the three first tables");
+
+    let ids = with_overlapping_runs(
+        l1,
+        newer.iter().copied().collect(),
+        &HiddenSet::default(),
+        &crate::comparator::DefaultUserComparator,
+    )
+    .expect("nothing hidden");
+    assert!(
+        older.iter().all(|id| ids.contains(id)),
+        "the older run's middle table is taken too: {ids:?} of {older:?}"
+    );
+    Ok(())
+}
+
 /// A window into a tiered level out of a level of two runs takes the other
 /// run's versions of its keys along, and waits while one of them is being
 /// compacted.
