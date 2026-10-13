@@ -30,7 +30,8 @@ pub enum Trigger {
     /// When its bytes pass the target the level's place in the tree gives
     /// it, by how far past.
     Size,
-    /// Never on its own: the level only receives compactions.
+    /// Never on its own: the level only receives compactions. It takes no
+    /// free move either, into the level below or into the last.
     Never,
 }
 

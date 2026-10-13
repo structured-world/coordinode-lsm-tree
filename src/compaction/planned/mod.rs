@@ -294,7 +294,7 @@ impl Strategy {
     fn inputs(&self, version: &Version, unit: u64, budget: u64) -> dp::Inputs {
         let scan_share = self.scan_share.unwrap_or_else(|| {
             // Queries as the tree served them: a lookup whatever the filters
-            // answered, a scan however many runs it reached.
+            // answered, a scan, row or projected, however many runs it reached.
             let (points, scans) = version.read_mix().counts();
             #[expect(
                 clippy::cast_precision_loss,
