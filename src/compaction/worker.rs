@@ -1563,8 +1563,14 @@ fn tight_slices(
 
     // Every sum is bounded by the inputs' and the stale files' bytes. The
     // first table of a slice and every one past a target's worth of blocks
-    // weigh their fixed bytes too.
-    let with_tables = |tables: u64| tables + fixed * (1 + tables / outputs.target_size.max(1));
+    // weigh their fixed bytes too. The destination level encodes the blocks
+    // its own way (codec, filter, where blocks end), which an input's share
+    // of its file does not bound: a sixteenth more is kept for it. The blob
+    // frames go across as they lie and need none.
+    let with_tables = |tables: u64| {
+        let tables = tables + tables / 16;
+        tables + fixed * (1 + tables / outputs.target_size.max(1))
+    };
     // Each output blob file closes with its metadata, its first and last keys
     // among it: a file per target's worth of frames, and one more for each
     // codec and lifetime class the slice's frames may go to.
