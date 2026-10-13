@@ -73,6 +73,14 @@ impl OutputLedger {
         drop(replaced);
     }
 
+    /// Gives the room of a finished slice back before the next one is checked,
+    /// so the next is not checked against room its predecessor no longer
+    /// needs.
+    pub fn release_room(&self) {
+        let released = self.0.room.lock().take();
+        drop(released);
+    }
+
     /// The run's room, if it holds one.
     fn room(&self) -> Option<Arc<super::capacity::Reservation>> {
         self.0.room.lock().clone()

@@ -1687,6 +1687,9 @@ fn run_tight_space_compaction(
             quota_headroom: u64::MAX,
             floor: super::capacity::Floor::MayConsume,
         };
+        // The slice before is installed: what it held is not this one's to
+        // be checked against.
+        opts.outputs.release_room();
         match opts
             .capacity
             .reserve_measured(opts.tree_id, &demands, &measured, check)
