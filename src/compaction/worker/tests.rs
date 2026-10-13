@@ -3476,7 +3476,8 @@ fn tight_space_budgets_blob_relocation_on_the_blob_volume() -> crate::Result<()>
 /// Live blob bytes are not spread over the keys as the table bytes are: here
 /// the first tenth of the keys holds most of them. A slice cut by its share
 /// of the tables relocates far more than that share of the blob files, past
-/// the room on the blob volume; each slice is cut by the frames it moves.
+/// the room it holds on the blob volume; each slice is cut by the frames it
+/// moves, and none writes there past its room.
 #[test]
 fn tight_space_relocation_of_values_gathered_on_few_keys_fits_each_slice() -> crate::Result<()> {
     use crate::config::LevelRoute;
@@ -3502,12 +3503,14 @@ fn tight_space_relocation_of_values_gathered_on_few_keys_fits_each_slice() -> cr
     cold.create_dir_all(&cold_dir)?;
     let mem = Arc::new(MemFs::with_capacity(u64::MAX));
     let cold_fs: Arc<dyn Fs> = cold;
+    let pool = Arc::new(crate::CapacityPool::default());
     let tree = match Config::new(
         &dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .data_block_size_policy(BlockSizePolicy::all(512))
+    .compaction_capacity(Arc::clone(&pool))
     .with_shared_fs(mem.clone())
     .level_routes(vec![LevelRoute {
         levels: 0..7,
@@ -3549,8 +3552,15 @@ fn tight_space_relocation_of_values_gathered_on_few_keys_fits_each_slice() -> cr
         c.tight_space_compaction = true;
     })?;
 
+    let blob_dir = dir.path().join(crate::file::BLOBS_FOLDER);
+    let before = pool.excess_on(&*mem, &blob_dir);
     tree.major_compact(64 * 1024 * 1024, gc_watermark)?;
     assert!(mem.punched_bytes() > 0, "the pass reclaimed in slices");
+    assert_eq!(
+        pool.excess_on(&*mem, &blob_dir) - before,
+        0,
+        "a slice relocated past the room it held on the blob volume",
+    );
     for i in 0..N {
         let generation = if i % 2 == 0 { 2 } else { 1 };
         assert_eq!(

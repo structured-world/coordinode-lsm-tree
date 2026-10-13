@@ -96,6 +96,9 @@ pub struct CapacityPool {
     /// compactions installed into its footprint, or abandoned, counted as
     /// installed. Locked inside `held`, never on its own before it.
     quota_released: Mutex<crate::HashMap<TreeId, u64>>,
+    /// The bytes that landed past the reservations covering them, by pool.
+    #[cfg(test)]
+    excess: Mutex<crate::HashMap<Pool, u64>>,
 }
 
 impl core::fmt::Debug for CapacityPool {
@@ -264,7 +267,13 @@ impl CapacityPool {
         {
             return None;
         }
-        let room = self.take(&mut held, tree, volumes, total, check);
+        // What it writes past its estimate leaves the flush floor, whatever
+        // the estimate itself was let to take.
+        let growth = check.map(|check| Check {
+            floor: Floor::Keep,
+            ..check
+        });
+        let room = self.take(&mut held, tree, volumes, total, growth);
         drop(held);
         Some(room)
     }
@@ -384,6 +393,17 @@ impl CapacityPool {
         self.quota_released.lock().get(&tree).copied().unwrap_or(0)
     }
 
+    /// The bytes that landed in the folder `path` of `fs`, or a folder on its
+    /// volume, past the reservations covering them.
+    #[cfg(test)]
+    pub(crate) fn excess_on(&self, fs: &dyn Fs, path: &Path) -> u64 {
+        self.excess
+            .lock()
+            .get(&Pool::of(fs, path))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// What `pool` holds now.
     #[cfg(test)]
     fn held(&self, pool: Pool) -> u64 {
@@ -485,7 +505,8 @@ impl Reservation {
     /// the grant does not cover takes the excess on; a checked reservation
     /// then stops its compaction when the volume, past what the other
     /// reservations on it have still to write, keeps no more than the flush
-    /// floor, or the tree's quota has no room for the excess.
+    /// floor (no room at all, for one its check lets into the floor), or the
+    /// tree's quota has no room for the excess.
     ///
     /// # Errors
     ///
@@ -513,6 +534,10 @@ impl Reservation {
         if excess == 0 {
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            *self.pool.excess.lock().entry(pool).or_default() += excess;
+        }
         self.grow(fs, path, pool, excess)
     }
 
@@ -530,7 +555,13 @@ impl Reservation {
         // volume keeps the floor beside it and what the others still write.
         let room = free.saturating_sub(held_against(&held, pool));
         let quota_room = self.quota_room(&held, grants.quota, check.quota_headroom);
-        if fits(0, room, Floor::Keep) && granted + excess <= quota_room {
+        // A reservation let into the floor stops only once nothing is left
+        // past what the others have still to write.
+        let keeps_room = match check.floor {
+            Floor::Keep => fits(0, room, Floor::Keep),
+            Floor::MayConsume => room > 0,
+        };
+        if keeps_room && granted + excess <= quota_room {
             *held.entry(quota).or_default() += excess;
             grants.quota.1 += excess;
             return Ok(());
