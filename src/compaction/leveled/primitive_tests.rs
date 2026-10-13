@@ -421,6 +421,64 @@ fn window_over_with_bounds_and_hidden_tables_stays_within_them() -> crate::Resul
     Ok(())
 }
 
+/// While the tree is small its data lies deeper than its place, and the
+/// choices of its place decide its debt, as they decide what `choose` does: a
+/// shape trigger set for L5 is not the one of data playing L1 there.
+#[test]
+fn debt_of_data_below_its_place_follows_the_policy_of_its_place() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_keys(&tree, 0)?;
+    tree.compact(Arc::new(MoveDown(0, 5)), 0)?;
+    let version = tree.current_version();
+    assert!(!version.level(5).expect("L5").is_empty());
+    let strategy = Strategy::default().with_level_policy(
+        5,
+        LevelPolicy {
+            trigger: Trigger::Shape { runs: 1, tables: 1 },
+            ..tiered_never()
+        },
+    );
+    assert!(
+        matches!(
+            strategy.choose(&version, tree.tree_config(), &CompactionState::default()),
+            Choice::DoNothing
+        ),
+        "the data plays L1, which is within its target"
+    );
+    assert_eq!(strategy.pending_compaction_bytes(&version), 0);
+    Ok(())
+}
+
+/// A least-rewrite window over a run whose first table is being compacted
+/// takes the tables after it, not none.
+#[test]
+fn least_rewrite_window_past_a_hidden_first_table_takes_the_rest() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    assert_eq!(l1.run_count(), 1, "the fixture needs the tables in one run");
+    let ids: Vec<TableId> = l1
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(Table::id)
+        .collect();
+    let [first, second, third] = ids[..] else {
+        panic!("three tables in L1: {ids:?}");
+    };
+    let mut first_hidden = HiddenSet::default();
+    first_hidden.hide([first]);
+    let window = window_over(
+        l1,
+        &first_hidden,
+        u64::MAX,
+        Movement::LeastRewrite { slack: None },
+        1,
+    );
+    assert_eq!(window, Some([second, third].into_iter().collect()));
+    Ok(())
+}
+
 /// One run in L1: a table of incompressible values over `k0000..`, then two
 /// tables of short ones over `k1000..` and `k2000..`; the last is read. The
 /// first table's size, a fiftieth of it less one, puts the cap below it and

@@ -414,9 +414,10 @@ fn largest_trivial_move(
 /// takes nothing of that level in, none of its tables hidden.
 ///
 /// Every window rewrites only its own bytes, so least rewrite takes the
-/// leading tables of the first run holding `overshoot` bytes; the hottest
-/// takes the window with the most reads per byte, ranked as a merge into a
-/// leveled level ranks them.
+/// tables holding `overshoot` bytes from the first one not hidden, in the
+/// first run that has one: a compaction under way on the front of a run
+/// leaves the rest to go. The hottest takes the window with the most reads
+/// per byte, ranked as a merge into a leveled level ranks them.
 fn window_over(
     level: &Level,
     hidden_set: &HiddenSet,
@@ -425,11 +426,13 @@ fn window_over(
     table_base_size: u64,
 ) -> Option<HashSet<TableId>> {
     let (run, start, end) = match movement {
-        Movement::LeastRewrite { .. } => {
-            let run = level.iter().next()?;
+        Movement::LeastRewrite { .. } => level.iter().find_map(|run| {
+            let start = run
+                .iter()
+                .position(|table| !hidden_set.is_hidden(table.id()))?;
             let mut bytes = 0u64;
-            let mut end = 0;
-            for table in run.iter() {
+            let mut end = start;
+            for table in run.iter().skip(start) {
                 if hidden_set.is_hidden(table.id()) {
                     break;
                 }
@@ -439,8 +442,8 @@ fn window_over(
                     break;
                 }
             }
-            (run, 0, end)
-        }
+            Some((run, start, end))
+        })?,
         Movement::Hottest => {
             let mut ranking = MergeRanking::new(overshoot, table_base_size, movement);
             let cap = 50 * table_base_size;
@@ -857,6 +860,59 @@ impl Strategy {
         self
     }
 
+    /// The first level below L0 holding data, the physical level that plays
+    /// L1, and the levels it lies below L1: while the tree is small its data
+    /// starts deeper, and moves up a level once every level holding it is
+    /// past its target. Tables `state` hides are left out of those sizes.
+    fn canonical_l1(&self, version: &Version, state: &CompactionState) -> (usize, usize, usize) {
+        #[expect(clippy::map_unwrap_or)]
+        let first_non_empty_level = version
+            .iter_levels()
+            .enumerate()
+            .skip(1)
+            .find(|(_, lvl)| !lvl.is_empty())
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| version.level_count() - 1);
+
+        let mut canonical_l1_idx = first_non_empty_level;
+
+        // Number of levels we have to shift to get from the actual level idx to the canonical
+        let mut level_shift = canonical_l1_idx - 1;
+
+        if canonical_l1_idx > 1 && version.iter_levels().skip(1).any(|lvl| !lvl.is_empty()) {
+            let need_new_l1 = version
+                .iter_levels()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, lvl)| !lvl.is_empty())
+                .all(|(idx, level)| {
+                    let level_size = level
+                        .iter()
+                        .flat_map(|x| x.iter())
+                        // NOTE: Take bytes that are already being compacted into account,
+                        // otherwise we may be overcompensating
+                        .filter(|x| !state.hidden_set().is_hidden(x.id()))
+                        .map(Table::file_size)
+                        .sum::<u64>();
+
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "level index is bounded by level count (7, technically 255)"
+                    )]
+                    let target_size = self.level_target_size((idx - level_shift) as u8);
+
+                    level_size > target_size
+                });
+
+            // Move up L1 one level if all current levels are at capacity
+            if need_new_l1 {
+                canonical_l1_idx -= 1;
+                level_shift -= 1;
+            }
+        }
+        (first_non_empty_level, canonical_l1_idx, level_shift)
+    }
+
     /// The choices for the level at `physical`, `level_shift` levels below
     /// its place while the tree is small, of a tree whose last level is
     /// `last`: the ones set for its place, or the leveled ones. A level is
@@ -1161,15 +1217,19 @@ impl CompactionStrategy for Strategy {
     fn pending_compaction_bytes(&self, version: &Version) -> u64 {
         // Read-only snapshot: an empty compaction state (nothing hidden) so the
         // targets reflect the full current footprint; no level shift.
-        let targets = self.compute_level_targets(version, 0, &CompactionState::default());
+        let state = CompactionState::default();
+        let targets = self.compute_level_targets(version, 0, &state);
         let last = version.level_count() - 1;
+        // A level's choices are those of its place, as `choose` finds it: a
+        // level set never to trigger and lying deeper while the tree is small
+        // owes nothing there either.
+        let (_, _, level_shift) = self.canonical_l1(version, &state);
         let mut debt = 0u64;
         for (idx, level) in version.iter_levels().enumerate() {
             // Each term is at most one level's on-disk size, so the running sum is
             // bounded by the tree's total footprint (disk capacity) and cannot
             // overflow u64 — plain addition.
-            // The figure is read with no level shift, as the targets are.
-            match self.policy(idx, 0, last).trigger {
+            match self.policy(idx, level_shift, last).trigger {
                 // A shape-triggered level: once its runs or its tables reach
                 // their count, its whole size is pending, the same predicate
                 // `choose` acts on.
@@ -1265,52 +1325,8 @@ impl CompactionStrategy for Strategy {
             }
         }
 
-        // Find the level that corresponds to L1
-        #[expect(clippy::map_unwrap_or)]
-        let first_non_empty_level = version
-            .iter_levels()
-            .enumerate()
-            .skip(1)
-            .find(|(_, lvl)| !lvl.is_empty())
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| version.level_count() - 1);
-
-        let mut canonical_l1_idx = first_non_empty_level;
-
-        // Number of levels we have to shift to get from the actual level idx to the canonical
-        let mut level_shift = canonical_l1_idx - 1;
-
-        if canonical_l1_idx > 1 && version.iter_levels().skip(1).any(|lvl| !lvl.is_empty()) {
-            let need_new_l1 = version
-                .iter_levels()
-                .enumerate()
-                .skip(1)
-                .filter(|(_, lvl)| !lvl.is_empty())
-                .all(|(idx, level)| {
-                    let level_size = level
-                        .iter()
-                        .flat_map(|x| x.iter())
-                        // NOTE: Take bytes that are already being compacted into account,
-                        // otherwise we may be overcompensating
-                        .filter(|x| !state.hidden_set().is_hidden(x.id()))
-                        .map(Table::file_size)
-                        .sum::<u64>();
-
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "level index is bounded by level count (7, technically 255)"
-                    )]
-                    let target_size = self.level_target_size((idx - level_shift) as u8);
-
-                    level_size > target_size
-                });
-
-            // Move up L1 one level if all current levels are at capacity
-            if need_new_l1 {
-                canonical_l1_idx -= 1;
-                level_shift -= 1;
-            }
-        }
+        let (first_non_empty_level, canonical_l1_idx, level_shift) =
+            self.canonical_l1(version, state);
 
         // Trivial move into L1: free, so taken whatever L0's trigger says,
         // unless L0 is set never to start a compaction.
