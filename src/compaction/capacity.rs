@@ -544,6 +544,16 @@ impl Reservation {
         })
     }
 
+    /// Keeps `bytes` of its quota held once it goes: an output it covered
+    /// could not be removed and stays on disk until the tree's next open
+    /// sweeps it, unseen by a quota counted from the installed version. A
+    /// tree opens under a new id, so the hold ends with the tree that left it.
+    pub(crate) fn strand(&self, bytes: u64) {
+        let mut grants = self.grants.lock();
+        let kept = bytes.min(grants.quota.1);
+        grants.quota.1 -= kept;
+    }
+
     /// Whether the reservation stopped its compaction.
     pub(crate) fn refused(&self) -> bool {
         self.refused.load(Relaxed)

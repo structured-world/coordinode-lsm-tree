@@ -421,6 +421,93 @@ fn window_over_with_bounds_and_hidden_tables_stays_within_them() -> crate::Resul
     Ok(())
 }
 
+/// One run in L1: a table of incompressible values over `k0000..`, then two
+/// tables of short ones over `k1000..` and `k2000..`; the last is read. The
+/// first table's size, a fiftieth of it less one, puts the cap below it and
+/// above the others.
+fn a_large_table_before_a_hot_small_one(
+    tree: &crate::AnyTree,
+) -> crate::Result<(Version, TableId, u64)> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for i in 0..100u64 {
+        let value: Vec<u8> = (0..2_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        tree.insert(format!("k{i:04}"), value, i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    for from in [1_000, 2_000] {
+        write_keys(tree, from)?;
+        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    }
+    for i in 2_000..2_100u64 {
+        tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+    }
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    assert_eq!(l1.run_count(), 1, "the fixture needs the tables in one run");
+    let tables: Vec<&Table> = l1.iter().flat_map(|run| run.iter()).collect();
+    let [large, small, hot] = tables[..] else {
+        panic!("three tables in L1: {}", tables.len());
+    };
+    let base = large.file_size() / 50 - 1;
+    assert!(
+        small.file_size() + hot.file_size() <= 50 * base,
+        "the fixture needs the small tables under the cap",
+    );
+    let hot = hot.id();
+    Ok((version, hot, base))
+}
+
+/// A window past the cap leaves the rest of its width to be ranked: the
+/// hottest window over a tiered level whose first table is past the cap is
+/// the small table reads touch, not none.
+#[test]
+fn hottest_window_past_a_large_first_table_takes_the_read_one() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let (version, hot, base) = a_large_table_before_a_hot_small_one(&tree)?;
+    let window = window_over(
+        version.level(1).expect("L1"),
+        &HiddenSet::default(),
+        0,
+        Movement::Hottest,
+        base,
+    );
+    assert_eq!(window, Some(core::iter::once(hot).collect()));
+    Ok(())
+}
+
+/// A merge into a leveled level ranks the windows of its width past one over
+/// the cap: L0 over the keys of the small table merges with it, though the
+/// level's first table is past the cap.
+#[test]
+fn merge_past_a_large_first_table_takes_the_window_it_overlaps() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    let (_, hot, base) = a_large_table_before_a_hot_small_one(&tree)?;
+    write_keys(&tree, 2_000)?;
+    let version = tree.current_version();
+    let picked = pick_minimal_compaction(
+        version.level(0).expect("L0"),
+        version.level(1).expect("L1"),
+        &HiddenSet::default(),
+        0,
+        base,
+        Movement::LeastRewrite { slack: None },
+        &crate::comparator::DefaultUserComparator,
+    );
+    let (ids, moved) = picked.expect("a merge with the small table");
+    assert!(!moved);
+    assert!(ids.contains(&hot), "{ids:?}");
+    assert_eq!(ids.len(), 2);
+    Ok(())
+}
+
 /// A window into a tiered level out of a level of two runs takes the other
 /// run's versions of its keys along, and waits while one of them is being
 /// compacted.

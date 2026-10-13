@@ -606,6 +606,7 @@ impl BlobTree {
         seqno: SeqNo,
     ) -> crate::Result<Option<field_row::RowCells>> {
         let read = self.cell_read(seqno)?;
+        read.version.version.read_mix().note_points(1);
         let Some(item) = crate::Tree::get_internal_entry_from_version(
             &read.version,
             key.as_ref(),
@@ -1509,15 +1510,34 @@ impl AbstractTree for BlobTree {
     // NOTE: We skip reading from the value log
     // because the vHandles already store the value size
     fn size_of<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<Option<u32>> {
-        let Some(item) = self.index.get_internal_entry(key.as_ref(), seqno)? else {
+        let key = key.as_ref();
+        let super_version = self.index.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
+        let Some(item) = crate::Tree::get_internal_entry_from_version(
+            &super_version,
+            key,
+            seqno,
+            self.index.config.comparator.as_ref(),
+        )?
+        else {
             return Ok(None);
         };
 
         // An operand's size is not the key's: the value is the operands
-        // merged onto the base, which only the merge itself knows.
-        if item.key.value_type.is_merge_operand() && self.index.config.merge_operator.is_some() {
+        // merged onto the base, which only the merge itself knows. Merged from
+        // the same read, which counted this lookup already.
+        if item.key.value_type.is_merge_operand()
+            && let Some(merge_operator) = &self.index.config.merge_operator
+        {
             #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
-            return Ok(self.get(key, seqno)?.map(|value| value.len() as u32));
+            return Ok(crate::Tree::resolve_point_merge(
+                &super_version,
+                key,
+                seqno,
+                merge_operator,
+                Some(&self.blob_source()),
+            )?
+            .map(|value| value.len() as u32));
         }
 
         Ok(Some(if item.key.value_type.is_indirection() {
@@ -2024,6 +2044,7 @@ impl AbstractTree for BlobTree {
         // `super_version`, never through the current one, so the pointer and the
         // blob file it names cannot come from different points in time.
         let super_version = self.index.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
         self.resolve_key(&super_version, key.as_ref(), seqno)
     }
 
@@ -2045,6 +2066,7 @@ impl AbstractTree for BlobTree {
 
         // For small batches, use the simple per-key path
         if n <= 2 {
+            super_version.version.read_mix().note_points(n as u64);
             return keys
                 .iter()
                 .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))

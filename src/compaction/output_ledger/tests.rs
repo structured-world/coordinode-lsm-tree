@@ -92,6 +92,62 @@ fn a_missing_file_does_not_stop_the_rest() -> crate::Result<()> {
     Ok(())
 }
 
+/// An output the run cannot remove stays on disk, which a quota counted from
+/// the installed version does not see: its bytes stay held in the tree's
+/// quota, while the room of one removed is given back.
+#[test]
+fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+    use crate::io::Write as _;
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let stuck = PathBuf::from("/tree/tables/1");
+    let removed = PathBuf::from("/tree/tables/2");
+    for (path, len) in [(&stuck, 300), (&removed, 200)] {
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(&vec![7u8; len])?;
+    }
+
+    let tree_id = 4;
+    let pool = Arc::new(CapacityPool::default());
+    let room = pool
+        .reserve(
+            tree_id,
+            &[Demand {
+                fs: &*fs,
+                path: &folder,
+                bytes: 500,
+            }],
+            None,
+        )
+        .expect("an unchecked reservation is never refused");
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    for (id, path) in [(1, &stuck), (2, &removed)] {
+        ledger.record_table(id, path.clone(), fs.clone());
+        ledger.landed(&*fs, path)?;
+    }
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("tables/1"),
+    );
+    ledger.remove_uninstalled(tree_id, None);
+    injector.clear();
+
+    assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");
+    assert!(!fs.exists(&removed)?);
+    assert_eq!(pool.quota_held(tree_id), 300);
+    Ok(())
+}
+
 /// A cached descriptor keeps the file open, and a backend that refuses to
 /// unlink an open file (as Windows does) would leave it behind: the
 /// descriptor is evicted first, for a table and a blob file alike.

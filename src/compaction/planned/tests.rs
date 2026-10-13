@@ -509,6 +509,63 @@ fn read_mix_with_a_projected_scan_counts_it() -> crate::Result<()> {
     Ok(())
 }
 
+/// Every point lookup of a blob tree counts once in the read mix, the size of
+/// a merge operand's key among them, which merges the operands too.
+#[test]
+fn read_mix_with_blob_point_lookups_counts_each_once() -> crate::Result<()> {
+    use crate::blob_tree::field_row::Field;
+
+    struct Concat;
+
+    impl crate::merge_operator::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> crate::Result<crate::UserValue> {
+            let mut value = base.unwrap_or_default().to_vec();
+            for operand in operands {
+                value.extend_from_slice(operand);
+            }
+            Ok(value.into())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let AnyTree::Blob(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .open()?
+    else {
+        panic!("a blob tree");
+    };
+    tree.insert("base", vec![b'x'; 64], 0);
+    tree.merge("base", "+", 1);
+    tree.insert("plain", "v", 2);
+    tree.insert_cells("row", &[Field::bytes(3, b"cell")], 3)?;
+    tree.flush_active_memtable(0)?;
+
+    let (before, _) = tree.current_version().read_mix().counts();
+    assert_eq!(tree.size_of("base", SeqNo::MAX)?, Some(65));
+    assert_eq!(tree.size_of("plain", SeqNo::MAX)?, Some(1));
+    assert!(tree.get("base", SeqNo::MAX)?.is_some());
+    assert!(tree.get_pinned("base", SeqNo::MAX)?.is_some());
+    assert!(tree.contains_key("plain", SeqNo::MAX)?);
+    assert_eq!(tree.multi_get(["base", "plain"], SeqNo::MAX)?.len(), 2);
+    assert!(tree.get_internal_entry(b"plain", SeqNo::MAX)?.is_some());
+    assert!(tree.get_cells("row", SeqNo::MAX)?.is_some());
+    let (points, scans) = tree.current_version().read_mix().counts();
+    assert_eq!((points - before, scans), (9, 0));
+    Ok(())
+}
+
 /// The budget a tree's own limiter gives is the live one: a rate changed
 /// after open is the rate the planner sees.
 #[test]

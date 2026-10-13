@@ -590,6 +590,9 @@ impl AbstractTree for Tree {
 
     fn get_internal_entry(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
         let super_version = self.snapshot_for_read(seqno)?;
+        // Counted where a caller asks, not in the lookup, which a read that
+        // counts itself makes as well.
+        super_version.version.read_mix().note_points(1);
 
         Self::get_internal_entry_from_version(
             &super_version,
@@ -1946,6 +1949,7 @@ impl AbstractTree for Tree {
         let key = key.as_ref();
 
         let super_version = self.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
 
         Self::resolve_or_passthrough_pinned(
             &super_version,
@@ -3337,7 +3341,6 @@ impl Tree {
     ) -> crate::Result<Option<crate::PinnableSlice>> {
         use crate::PinnableSlice;
 
-        super_version.version.read_mix().note_points(1);
         // Check memtables first — always Owned
         if let Some(entry) = super_version.active_memtable.get(key, seqno) {
             return Self::resolve_pinned_entry(
@@ -3524,7 +3527,6 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<InternalValue>> {
-        super_version.version.read_mix().note_points(1);
         // Search order: active → sealed → SST (newest first). A point
         // tombstone in a newer source is authoritative — no older source
         // can contain a newer value, so returning None is correct.

@@ -197,10 +197,12 @@ fn pick_minimal_compaction(
             .iter()
             .map(|curr_run| PullIn::new(curr_run, run, hidden_set, cmp))
             .collect();
-        // Windows by width, then by start, the order that decides ties; the
-        // first window past the cap ends the run's candidates, whatever the
-        // width of those after it.
-        'run: for width in 1..=run.len() {
+        // Windows by width, then by start, the order that decides ties. Table
+        // sizes vary, so a window past the cap leaves the others of its width
+        // to be looked at; once every window of a width is past it, so is
+        // every wider one, which holds one of them.
+        for width in 1..=run.len() {
+            let mut within_cap = false;
             for start in 0..=(run.len() - width) {
                 let end = start + width;
                 #[expect(
@@ -213,8 +215,9 @@ fn pick_minimal_compaction(
                     window_heat[end] - window_heat[start],
                 );
                 if next_level_size > cap {
-                    break 'run;
+                    continue;
                 }
+                within_cap = true;
                 if next_hidden > 0 {
                     continue;
                 }
@@ -238,6 +241,9 @@ fn pick_minimal_compaction(
                     },
                     (run_index, start, end),
                 );
+            }
+            if !within_cap {
+                break;
             }
         }
     }
@@ -443,7 +449,10 @@ fn window_over(
                 let hidden =
                     prefix_sums(run.iter().map(|t| u64::from(hidden_set.is_hidden(t.id()))));
                 let heat = prefix_sums(run.iter().map(Table::heat));
-                'run: for width in 1..=run.len() {
+                // As a merge into a leveled level looks at them: a window past
+                // the cap ends a width only once every window of it is.
+                for width in 1..=run.len() {
+                    let mut within_cap = false;
                     for start in 0..=(run.len() - width) {
                         let end = start + width;
                         #[expect(
@@ -456,8 +465,9 @@ fn window_over(
                             heat[end] - heat[start],
                         );
                         if size > cap {
-                            break 'run;
+                            continue;
                         }
+                        within_cap = true;
                         if hidden > 0 {
                             continue;
                         }
@@ -469,6 +479,9 @@ fn window_over(
                             },
                             (run_index, start, end),
                         );
+                    }
+                    if !within_cap {
+                        break;
                     }
                 }
             }

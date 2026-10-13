@@ -134,11 +134,13 @@ impl OutputLedger {
     /// left: each one's cached descriptor is evicted first, since a backend
     /// can refuse to unlink an open file. A file already gone (a writer that
     /// removed its own empty output, a rolled-back handle) is skipped; one
-    /// that cannot be removed stays for the orphan sweep of the next open.
+    /// that cannot be removed stays for the orphan sweep of the next open, and
+    /// keeps its bytes held in the tree's quota until then.
     pub fn remove_uninstalled(&self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
         let outputs = core::mem::take(&mut *self.0.files.lock());
         // Given back once the files it covered are gone, below.
         let room = self.0.room.lock().take();
+        let mut stranded = 0u64;
         for output in outputs {
             let global_id = GlobalTableId::from((tree_id, output.id));
             if let Some(descriptors) = descriptor_table {
@@ -153,12 +155,21 @@ impl OutputLedger {
                     output.path.display(),
                 ),
                 Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                Err(e) => log::warn!(
-                    "Could not remove uninstalled compaction output {} ({e}); it stays until \
-                     the next open's orphan sweep",
-                    output.path.display(),
-                ),
+                Err(e) => {
+                    log::warn!(
+                        "Could not remove uninstalled compaction output {} ({e}); it stays until \
+                         the next open's orphan sweep",
+                        output.path.display(),
+                    );
+                    // A length that cannot be read holds the whole grant: the
+                    // quota is a limit, and the file may take all of it.
+                    let len = output.fs.metadata(&output.path).map_or(u64::MAX, |m| m.len);
+                    stranded = stranded.saturating_add(len);
+                }
             }
+        }
+        if let Some(room) = &room {
+            room.strand(stranded);
         }
         drop(room);
     }
