@@ -27,8 +27,12 @@ fn config(num: u64) -> BenchConfig {
 #[test]
 fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
-    let (planned, leveled) =
-        super::run_arms(base.path(), &config(1_000), super::COMPACTION_RATES[0])?;
+    let (planned, leveled) = super::run_arms(
+        base.path(),
+        &config(1_000),
+        super::COMPACTION_RATES[0],
+        true,
+    )?;
     for arm in [&planned, &leveled] {
         assert!(arm.written > 0);
         assert_eq!(arm.steps, 1, "the writes are one step");
@@ -40,12 +44,17 @@ fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()
 }
 
 /// Several steps keep sampling the queries each step asks for, not more, at
-/// every compaction budget the workload runs.
+/// every compaction budget the workload runs, whichever tree drains first.
 #[test]
 fn every_step_takes_its_share_of_queries() -> lsm_tree::Result<()> {
-    for compaction_rate in super::COMPACTION_RATES {
+    for (run, compaction_rate) in super::COMPACTION_RATES.into_iter().enumerate() {
         let base = tempfile::tempdir()?;
-        let (planned, leveled) = super::run_arms(base.path(), &config(30_000), compaction_rate)?;
+        let (planned, leveled) = super::run_arms(
+            base.path(),
+            &config(30_000),
+            compaction_rate,
+            run.is_multiple_of(2),
+        )?;
         for arm in [&planned, &leveled] {
             assert!(arm.steps > 1, "{} steps", arm.steps);
             assert_eq!(arm.points.len(), super::POINTS_PER_FLUSH * arm.steps);
