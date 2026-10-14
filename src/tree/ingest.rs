@@ -516,6 +516,9 @@ impl<'a> Ingestion<'a> {
                     .descriptor_table
                     .clone_from(&self.tree.config.descriptor_table);
                 params.encryption.clone_from(&self.tree.config.encryption);
+                params
+                    .prefix_extractor
+                    .clone_from(&self.tree.config.prefix_extractor);
                 #[cfg(zstd_any)]
                 {
                     params.zstd_dictionaries = self.tree.config.current_zstd_dictionaries();
