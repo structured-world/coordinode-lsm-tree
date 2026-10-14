@@ -6474,3 +6474,48 @@ fn recover_salvage_degrades_a_persistent_filter_index_read() -> crate::Result<()
     );
     Ok(())
 }
+
+/// A restricted view is the same file under the same meta, so a prefix scan
+/// keeps skipping by its filter after tight-space compaction reopens it.
+#[test]
+fn a_restricted_view_keeps_its_prefix_filter() -> crate::Result<()> {
+    /// The first four key bytes.
+    struct FirstFour;
+    impl crate::prefix::PrefixExtractor for FirstFour {
+        fn name(&self) -> &'static str {
+            "fixed-4"
+        }
+
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            Box::new(key.get(..4).into_iter())
+        }
+    }
+
+    let dir = tempdir()?;
+    let file = dir.path().join("0");
+    let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FirstFour);
+    let mut writer = Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?
+        .use_data_block_size(128)
+        .use_prefix_extractor(Some(Arc::clone(&extractor)));
+    for i in 0u64..200 {
+        writer.write(InternalValue::from_components(
+            format!("key{i:05}").into_bytes(),
+            b"v".to_vec(),
+            i + 1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let checksum = writer.finish()?.expect("the SST is non-empty").1;
+
+    let mut params = test_recover_params(file, checksum);
+    params.prefix_extractor = Some(extractor);
+    let table = Table::recover(params)?;
+    assert!(table.has_prefix_filter());
+
+    let restricted = table.reopen_restricted(crate::UserKey::from(&b"key00100"[..]))?;
+    assert!(
+        restricted.has_prefix_filter(),
+        "the restricted view asks its filter as the table did"
+    );
+    Ok(())
+}

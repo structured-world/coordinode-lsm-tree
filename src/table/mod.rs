@@ -8320,10 +8320,9 @@ impl Table {
         // Decided once, here: the tree's extractor is fixed for the life of
         // an open tree, and a filter indexes only the prefixes of the one it
         // was built under.
-        let prefix_filter = matches!(
-            (&metadata.prefix_extractor, &prefix_extractor),
-            (Some(recorded), Some(current)) if &**recorded == current.name().as_bytes()
-        );
+        let prefix_filter = prefix_extractor.filter(|current| {
+            metadata.prefix_extractor.as_deref() == Some(current.name().as_bytes())
+        });
 
         Ok(Self(
             Arc::new(Inner {
@@ -8496,6 +8495,9 @@ impl Table {
             params.pin_filter = self.pinned_filter_size() > 0;
             params.pin_index = self.pinned_block_index_size() > 0;
             params.encryption.clone_from(&self.encryption);
+            // The same file under the same meta: its filter indexes the
+            // prefixes it did, of the extractor the table was opened under.
+            params.prefix_extractor.clone_from(&self.prefix_filter);
             #[cfg(zstd_any)]
             {
                 // Reopening THIS table, so the only dictionary the recovery can
@@ -9099,7 +9101,7 @@ impl Table {
     /// filter indexes another extractor's prefixes, or none, cannot rule the
     /// prefix out and answers `Ok(true)`.
     pub(crate) fn maybe_contains_prefix(&self, prefix_hash: u64) -> crate::Result<bool> {
-        if !self.prefix_filter {
+        if self.prefix_filter.is_none() {
             return Ok(true);
         }
         self.bloom_may_contain_hash(prefix_hash)
@@ -9110,7 +9112,7 @@ impl Table {
     /// under.
     #[cfg(test)]
     pub(crate) fn has_prefix_filter(&self) -> bool {
-        self.prefix_filter
+        self.prefix_filter.is_some()
     }
 
     /// Checks the bloom filter for a precomputed key hash.
