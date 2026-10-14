@@ -333,13 +333,15 @@ pub struct KvSeparationOptions {
 /// seeded by [`Config::blob_cache_fill`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlobCacheFill {
-    /// Every value read from a blob file is cached.
-    #[default]
+    /// Every value read from a blob file is cached, and a scan reads its
+    /// values ahead into the cache.
     Always,
-    /// No value read from a blob file is cached, and a scan reads no values
-    /// ahead, since what it read ahead would have nowhere to wait: for large
-    /// values read mostly once, which would otherwise evict the index,
-    /// filter and data blocks of every tree sharing the cache.
+    /// No value read from a blob file is cached: values large enough to be
+    /// separated are mostly read once, and cached they would evict the index,
+    /// filter and data blocks of every tree sharing the cache. A scan still
+    /// reads its values ahead, into a store of its own holding at most one
+    /// coalesced read, from which it hands them out.
+    #[default]
     Never,
 }
 
@@ -2091,7 +2093,7 @@ impl Config {
     }
 
     /// Sets whether a KV-separated tree starts caching the values it reads
-    /// from blob files.
+    /// from blob files. It does not by default.
     ///
     /// The initial value of
     /// [`RuntimeConfig::blob_cache_fill`](crate::runtime_config::RuntimeConfig::blob_cache_fill),
@@ -2106,7 +2108,7 @@ impl Config {
     /// # let folder = tempfile::tempdir()?;
     /// let config = Config::new(&folder, SequenceNumberCounter::default(), SequenceNumberCounter::default())
     ///     .with_kv_separation(Some(KvSeparationOptions::default()))
-    ///     .blob_cache_fill(BlobCacheFill::Never);
+    ///     .blob_cache_fill(BlobCacheFill::Always);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[must_use]

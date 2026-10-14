@@ -120,6 +120,62 @@ fn blob_cache_fill_flips_on_a_live_tree() -> crate::Result<()> {
     Ok(())
 }
 
+/// By default a scan caches no value it reads from blob files, yet still
+/// reads them ahead, into a store of its own: the values come back as
+/// written, in far fewer reads than values, and the cache holds none of them.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_scan_not_caching_reads_ahead_into_its_own_store() -> crate::Result<()> {
+    use crate::{AbstractTree, Guard as _};
+
+    const KEYS: u32 = 256;
+
+    let folder = crate::get_tmp_folder();
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024 * 1_024));
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .use_cache(Arc::clone(&cache))
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(1),
+    ))
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    assert_eq!(
+        tree.index.runtime_config.load().blob_cache_fill,
+        crate::config::BlobCacheFill::Never,
+        "values are not cached by default"
+    );
+    let value = |i: u32| format!("value-{i:06}-{}", "x".repeat(400)).into_bytes();
+    for i in 0..KEYS {
+        tree.insert(format!("k{i:04}"), value(i), u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let scan = |tree: &BlobTree| -> crate::Result<()> {
+        for (i, item) in (0..KEYS).zip(tree.iter(crate::SeqNo::MAX, None)) {
+            assert_eq!(&*item.into_inner()?.1, value(i).as_slice());
+        }
+        Ok(())
+    };
+    scan(&tree)?;
+    let warm = cache.size();
+    let reads = tree.metrics().blob_read_count();
+    scan(&tree)?;
+    assert_eq!(cache.size(), warm, "the scan cached no value");
+    let second = tree.metrics().blob_read_count() - reads;
+    assert!(
+        second * 8 < KEYS as usize,
+        "{second} reads for {KEYS} values: the read-ahead coalesced them"
+    );
+    assert!(tree.metrics().blob_bytes_prefetched() > 0);
+    Ok(())
+}
+
 /// An indirection naming a blob file the version does not hold is damage:
 /// resolving it is an error the caller can handle, never a panic and never
 /// an empty value.
@@ -155,6 +211,7 @@ fn a_dangling_indirection_resolves_to_an_error() -> crate::Result<()> {
         tree.id(),
         &tree.index.config.cache,
         crate::config::BlobCacheFill::Always,
+        &[],
         &version,
         #[cfg(feature = "metrics")]
         tree.metrics(),

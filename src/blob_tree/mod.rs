@@ -40,6 +40,9 @@ pub struct Guard {
     /// Whether resolving the value caches it, as the tree said when the scan
     /// began.
     fill: crate::config::BlobCacheFill,
+    /// The values of this item the scan read ahead for it, when it does not
+    /// cache them: resolved from here, not read again.
+    prefetched: Vec<(crate::vlog::ValueHandle, UserValue)>,
     kv: crate::Result<InternalValue>,
     /// Present when this guard came from a scan that can read ahead; resolving
     /// a value through it is what arms that read-ahead.
@@ -66,6 +69,7 @@ impl IterGuard for Guard {
                 self.tree.id(),
                 &self.tree.index.config.cache,
                 self.fill,
+                &self.prefetched,
                 &self.version,
                 #[cfg(feature = "metrics")]
                 self.tree.metrics(),
@@ -103,6 +107,7 @@ impl IterGuard for Guard {
             self.tree.id(),
             &self.tree.index.config.cache,
             self.fill,
+            &self.prefetched,
             &self.version,
             #[cfg(feature = "metrics")]
             self.tree.metrics(),
@@ -111,10 +116,27 @@ impl IterGuard for Guard {
     }
 }
 
+/// The value `prefetched` holds for `vhandle`: read ahead for this very item,
+/// under its key, so its place and declared size are what identify it.
+fn prefetched_value(
+    prefetched: &[(crate::vlog::ValueHandle, UserValue)],
+    vhandle: &crate::vlog::ValueHandle,
+) -> Option<UserValue> {
+    prefetched
+        .iter()
+        .find(|(held, _)| {
+            held.blob_file_id == vhandle.blob_file_id
+                && held.offset == vhandle.offset
+                && held.on_disk_size == vhandle.on_disk_size
+        })
+        .map(|(_, value)| value.clone())
+}
+
 pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
     cache: &crate::Cache,
     fill: crate::config::BlobCacheFill,
+    prefetched: &[(crate::vlog::ValueHandle, UserValue)],
     version: &Version,
     #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
@@ -127,6 +149,9 @@ pub(crate) fn resolve_value_handle(
             Some(metrics),
         );
         let value = field_row::resolve_row(&item.value, |vptr| {
+            if let Some(value) = prefetched_value(prefetched, &vptr.vhandle) {
+                return Ok(value);
+            }
             // A reference to an object the version no longer holds is damage,
             // reported as such rather than read as an empty field.
             accessor
@@ -140,6 +165,9 @@ pub(crate) fn resolve_value_handle(
     if item.key.value_type.is_indirection() {
         let mut cursor = crate::io::Cursor::new(item.value);
         let vptr = BlobIndirection::decode_from(&mut cursor)?;
+        if let Some(value) = prefetched_value(prefetched, &vptr.vhandle) {
+            return Ok((item.key.user_key, value));
+        }
 
         // Resolve indirection using value log. No dictionary passed: each blob
         // file carries the one its own descriptor names, pinned for as long as
@@ -187,6 +215,7 @@ impl BlobSource {
             self.tree_id,
             &self.cache,
             self.fill,
+            &[],
             version,
             #[cfg(feature = "metrics")]
             &self.metrics,
@@ -221,17 +250,40 @@ impl BlobSource {
         ))
     }
 
+    /// [`Self::object`], taken from `local` when [`Self::prefetch`] read it
+    /// ahead there.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn object_prefetched(
+        &self,
+        version: &Version,
+        key: &[u8],
+        indirection: &BlobIndirection,
+        local: &mut crate::vlog::Prefetched,
+    ) -> crate::Result<UserValue> {
+        match local.take(key, &indirection.vhandle) {
+            Some(object) => Ok(object),
+            None => self.object(version, key, indirection),
+        }
+    }
+
     /// Reads the objects `items` name (each its key, handle and a slot the
-    /// read fills) into the cache in as few requests as their places in the
-    /// blob files allow, for [`Self::object`] to find them there: a run of
-    /// objects close together in one file is one read. Best effort: an
-    /// object it does not read is read on its own when asked for.
+    /// read fills) in as few requests as their places in the blob files
+    /// allow, for [`Self::object_prefetched`] to find them: into the cache
+    /// when the read caches what it reads, else into `local`. A run of objects
+    /// close together in one file is one read. Best effort: an object it does
+    /// not read is read on its own when asked for.
     #[cfg(feature = "columnar")]
     pub(crate) fn prefetch(
         &self,
         version: &Version,
         items: &mut Vec<(&[u8], crate::vlog::ValueHandle, usize)>,
+        local: &mut crate::vlog::Prefetched,
     ) {
+        let into = if self.fill.fills() {
+            crate::vlog::PrefetchInto::Cache
+        } else {
+            crate::vlog::PrefetchInto::Local(local)
+        };
         Accessor::new(
             &version.blob_files,
             self.fill,
@@ -244,6 +296,7 @@ impl BlobSource {
             &self.cache,
             PREFETCH_MAX_GAP,
             PREFETCH_MAX_READ,
+            into,
         );
     }
 }
@@ -349,6 +402,7 @@ impl BlobTree {
             self.id(),
             &self.index.config.cache,
             self.blob_cache_fill(),
+            &[],
             &super_version.version,
             #[cfg(feature = "metrics")]
             self.metrics(),
@@ -388,6 +442,7 @@ impl BlobTree {
                     self.id(),
                     &self.index.config.cache,
                     fill,
+                    &[],
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -479,6 +534,7 @@ impl BlobTree {
                     self.id(),
                     &self.index.config.cache,
                     fill,
+                    &[],
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -872,17 +928,12 @@ impl BlobTree {
     /// Read-ahead state for one scan, seeded from the tree's configuration.
     fn scan_prefetch_state(&self) -> Arc<ScanPrefetch> {
         let fill = self.blob_cache_fill();
-        // A read-ahead only warms the cache: with the cache not to be filled,
-        // the window is off.
-        let window = if fill.fills() {
-            self.index
-                .config
-                .kv_separation_opts
-                .as_ref()
-                .map_or(0, |o| o.scan_prefetch as usize)
-        } else {
-            0
-        };
+        let window = self
+            .index
+            .config
+            .kv_separation_opts
+            .as_ref()
+            .map_or(0, |o| o.scan_prefetch as usize);
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
@@ -892,6 +943,39 @@ impl BlobTree {
             max_read: PREFETCH_MAX_READ,
         })
     }
+}
+
+/// The values `kv` reads from blob files that a scan read ahead into `local`,
+/// taken out of it for `kv`'s guard: its own value, or its cells' objects.
+fn take_prefetched(
+    local: &mut crate::vlog::Prefetched,
+    kv: &InternalValue,
+) -> Vec<(crate::vlog::ValueHandle, UserValue)> {
+    let key = &kv.key.user_key;
+    if kv.key.value_type.is_cell_row() {
+        let Ok(refs) = field_row::row_refs(&kv.value) else {
+            return Vec::new();
+        };
+        return refs
+            .into_iter()
+            .filter_map(|(vptr, _)| {
+                local
+                    .take(key, &vptr.vhandle)
+                    .map(|value| (vptr.vhandle, value))
+            })
+            .collect();
+    }
+    if !kv.key.value_type.is_indirection() {
+        return Vec::new();
+    }
+    let mut cursor = crate::io::Cursor::new(&kv.value[..]);
+    let Ok(vptr) = BlobIndirection::decode_from(&mut cursor) else {
+        return Vec::new();
+    };
+    local
+        .take(key, &vptr.vhandle)
+        .map(|value| alloc::vec![(vptr.vhandle, value)])
+        .unwrap_or_default()
 }
 
 /// Maps a raw merge-pipeline item into a KV-separated iterator guard that
@@ -906,6 +990,7 @@ fn blob_guard(
         tree: tree.clone(),
         version: version.clone(),
         fill,
+        prefetched: Vec::new(),
         kv: item,
         prefetch: None,
     })
@@ -924,7 +1009,7 @@ fn blob_guard(
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
     /// Whether the scan caches the values it reads, as the tree said when the
-    /// scan began.
+    /// scan began; when it does not, it keeps what it reads ahead itself.
     fill: crate::config::BlobCacheFill,
     /// How many upcoming items to gather per read-ahead.
     window: usize,
@@ -970,11 +1055,17 @@ struct PrefetchScan<I> {
     state: Arc<ScanPrefetch>,
     tree: crate::BlobTree,
     version: Version,
+    /// The values of the window read ahead when the scan does not cache
+    /// them, until the guards of their items take them.
+    local: crate::vlog::Prefetched,
 }
 
 impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
     /// Pulls the next window into `buf` and warms the values it points at.
     fn fill(&mut self) {
+        // What the window before left untaken (an item whose guard was
+        // dropped, a value it held twice) is no use to this one.
+        self.local.clear();
         // Sized here rather than at construction: a scan that never resolves a
         // value never refills, and should not pay for a window it will not use.
         // After the first refill the capacity persists, so this is a no-op.
@@ -1030,20 +1121,33 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             Some(self.tree.metrics()),
         );
 
+        // Into the cache when the scan caches what it reads, else into its own
+        // store, where the guards of the window's items take their values.
+        let into = if self.state.fill.fills() {
+            crate::vlog::PrefetchInto::Cache
+        } else {
+            crate::vlog::PrefetchInto::Local(&mut self.local)
+        };
         accessor.prefetch(
             self.tree.id(),
             &mut handles,
             &self.tree.index.config.cache,
             self.state.max_gap,
             self.state.max_read,
+            into,
         );
     }
 
-    fn guard(&self, item: crate::Result<InternalValue>) -> IterGuardImpl {
+    fn guard(&mut self, item: crate::Result<InternalValue>) -> IterGuardImpl {
+        let prefetched = match &item {
+            Ok(kv) if !self.local.is_empty() => take_prefetched(&mut self.local, kv),
+            _ => Vec::new(),
+        };
         IterGuardImpl::Blob(Guard {
             tree: self.tree.clone(),
             version: self.version.clone(),
             fill: self.state.fill,
+            prefetched,
             kv: item,
             // Only until the read-ahead is armed, and never with the window
             // disabled. The guards exist to report the FIRST resolution; once
@@ -1372,6 +1476,7 @@ impl AbstractTree for BlobTree {
             state: self.scan_prefetch_state(),
             version: super_version.version,
             tree,
+            local: crate::vlog::Prefetched::default(),
         })
     }
 
@@ -1408,6 +1513,7 @@ impl AbstractTree for BlobTree {
             state,
             version: super_version.version,
             tree,
+            local: crate::vlog::Prefetched::default(),
         })
     }
 
@@ -1465,6 +1571,7 @@ impl AbstractTree for BlobTree {
             state: self.scan_prefetch_state(),
             version,
             tree,
+            local: crate::vlog::Prefetched::default(),
         })
     }
 

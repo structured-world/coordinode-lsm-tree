@@ -7,10 +7,12 @@ pub mod blob_file;
 mod handle;
 
 pub use {
-    accessor::Accessor, blob_file::BlobFile,
+    accessor::{Accessor, PrefetchInto, Prefetched},
+    blob_file::BlobFile,
     blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
-    blob_file::scanner::Scanner as BlobFileScanner, handle::ValueHandle,
+    blob_file::scanner::Scanner as BlobFileScanner,
+    handle::ValueHandle,
 };
 
 use crate::path::{Path, PathBuf};

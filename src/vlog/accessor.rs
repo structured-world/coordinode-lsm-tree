@@ -13,6 +13,48 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::{string::ToString, vec::Vec};
 
+/// Values a read fetched ahead for itself, held by that read instead of the
+/// shared cache: what a scan reads ahead when blob values are not cached.
+///
+/// Kept by place in the blob files, with the key and the declared on-disk size
+/// each was read for, so a handle taking one out is proven to be the handle it
+/// was read for, as a cache lookup proves it.
+#[derive(Default)]
+pub struct Prefetched {
+    values: crate::HashMap<(crate::vlog::BlobFileId, u64), (crate::UserKey, u32, UserValue)>,
+}
+
+impl Prefetched {
+    /// Takes out the value read ahead for `vhandle` under `key`, if any.
+    pub(crate) fn take(&mut self, key: &[u8], vhandle: &ValueHandle) -> Option<UserValue> {
+        let place = (vhandle.blob_file_id, vhandle.offset);
+        match self.values.get(&place) {
+            Some((read_key, size, _)) if &**read_key == key && *size == vhandle.on_disk_size => {
+                self.values.remove(&place).map(|(_, _, value)| value)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether it holds nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Drops what it holds.
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+}
+
+/// Where a read-ahead puts what it reads.
+pub enum PrefetchInto<'p> {
+    /// The shared cache, for every read to find.
+    Cache,
+    /// The read's own store, bounded by the read-ahead's own budget.
+    Local(&'p mut Prefetched),
+}
+
 /// Reads separated values out of the blob files a version names.
 ///
 /// Takes no dictionary: a `ZstdDict` blob file carries its own, pinned on the
@@ -180,6 +222,10 @@ impl<'a> Accessor<'a> {
     /// `max_gap` is how many wasted bytes between two records are worth
     /// swallowing to merge their reads; `max_read` caps a single coalesced
     /// read.
+    ///
+    /// `into` says where the values go: the shared cache, or the read's own
+    /// store when blob values are not cached, which then holds at most one
+    /// coalesced read's worth.
     pub fn prefetch(
         &self,
         tree_id: TreeId,
@@ -187,16 +233,16 @@ impl<'a> Accessor<'a> {
         cache: &Cache,
         max_gap: u64,
         max_read: usize,
+        mut into: PrefetchInto<'_>,
     ) {
-        // What it reads goes nowhere but the cache: with the cache not to be
-        // filled, there is nothing to read ahead into.
-        if !self.fill.fills() {
-            return;
-        }
-        // Warm at most half the (shared) cache, so a prefetch cannot evict more
-        // than it contributes. Mirrors the block prewarm's bound.
-        let capacity = cache.capacity();
-        if capacity == 0 {
+        // Into the cache, warm at most half of it, so a prefetch cannot evict
+        // more than it contributes; mirrors the block prewarm's bound. Into
+        // the read's own store, what one coalesced read may hold.
+        let half = match into {
+            PrefetchInto::Cache => cache.capacity() / 2,
+            PrefetchInto::Local(_) => max_read as u64,
+        };
+        if half == 0 {
             return;
         }
 
@@ -211,7 +257,6 @@ impl<'a> Accessor<'a> {
         // Nor is it the admission budget: a compressed blob file stores less
         // than the cache will charge for the decoded value, so that is enforced
         // separately in `warm_span` against the weight the cache sees.
-        let half = capacity / 2;
         let mut record_bytes: u64 = 0;
         let mut full = false;
         items.retain_mut(|(key, vhandle, len)| {
@@ -290,6 +335,7 @@ impl<'a> Accessor<'a> {
                     first.offset,
                     span_end,
                     cache,
+                    &mut into,
                     &mut admit_budget,
                 );
             }
@@ -298,12 +344,16 @@ impl<'a> Accessor<'a> {
     }
 
     /// Reads one coalesced span and parses every record it covers into the
-    /// cache. Any failure returns early: those values stay cold and the read
-    /// walk fetches them normally.
+    /// cache, or into the read's own store. Any failure returns early: those
+    /// values stay cold and the read walk fetches them normally.
     ///
-    /// `admit_budget` is how many bytes of cache weight this prefetch may still
-    /// hand over, decremented by what each value actually weighs, and stopping
-    /// the walk when it runs out.
+    /// `admit_budget` is how many bytes this prefetch may still hand over,
+    /// decremented by what each value actually weighs, and stopping the walk
+    /// when it runs out.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one span: its records and extent, and where its values go under which budget"
+    )]
     fn warm_span(
         &self,
         tree_id: TreeId,
@@ -311,6 +361,7 @@ impl<'a> Accessor<'a> {
         span_start: u64,
         span_end: u64,
         cache: &Cache,
+        into: &mut PrefetchInto<'_>,
         admit_budget: &mut u64,
     ) {
         let Some((_, first, _)) = records.first() else {
@@ -362,7 +413,11 @@ impl<'a> Accessor<'a> {
         // its own bytes, exactly as it does on the one-record read path. The
         // compressed paths decompress into a fresh buffer already, so there the
         // view is dropped with this function and copying would be pure waste.
-        let aliases_input = matches!(blob_file.0.meta.compression, crate::CompressionType::None);
+        // The read's own store holds the values only until the read takes
+        // them, the span no longer than one read: views there pin nothing
+        // past the read, and are not copied.
+        let aliases_input = matches!(blob_file.0.meta.compression, crate::CompressionType::None)
+            && matches!(into, PrefetchInto::Cache);
 
         for &(key, vhandle, len) in records {
             if *admit_budget == 0 {
@@ -407,7 +462,7 @@ impl<'a> Accessor<'a> {
                 // resident (the cache refuses it), so inserting it would
                 // spend admission budget on nothing. Skip it and keep
                 // warming the span's other records.
-                if weight > cache.max_entry_weight() {
+                if matches!(into, PrefetchInto::Cache) && weight > cache.max_entry_weight() {
                     continue;
                 }
                 if weight > *admit_budget {
@@ -415,8 +470,21 @@ impl<'a> Accessor<'a> {
                     return;
                 }
                 *admit_budget -= weight;
-                let detached = cache.insert_blob(tree_id, &vhandle, key, value);
-                self.count_gather(detached);
+                match into {
+                    PrefetchInto::Cache => {
+                        let detached = cache.insert_blob(tree_id, &vhandle, key, value);
+                        self.count_gather(detached);
+                    }
+                    PrefetchInto::Local(store) => {
+                        // The key goes with the value as the cache keeps it:
+                        // a copy, charged as the gather it is.
+                        self.count_gather(key.len());
+                        store.values.insert(
+                            (vhandle.blob_file_id, vhandle.offset),
+                            (crate::UserKey::from(key), vhandle.on_disk_size, value),
+                        );
+                    }
+                }
             }
         }
     }
