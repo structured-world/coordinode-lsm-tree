@@ -1064,6 +1064,20 @@ fn the_size_hint_counts_the_extractor_name_the_meta_records() -> crate::Result<(
         hint >= size && hint * 10 <= size * 11,
         "hint {hint} for a {size}-byte table without a filter",
     );
+
+    // A partitioned filter indexes no prefix and names no extractor either.
+    let path = dir.path().join("3");
+    let mut writer = Writer::new(path.clone(), 3, 0, Arc::new(StdFs))?
+        .use_partitioned_filter()
+        .use_prefix_extractor(Some(Arc::new(LongName("x".repeat(64 * 1_024)))));
+    write_long_keys(&mut writer, 3, 8)?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(
+        hint >= size && hint * 10 <= size * 11,
+        "hint {hint} for a {size}-byte table with a partitioned filter",
+    );
     Ok(())
 }
 

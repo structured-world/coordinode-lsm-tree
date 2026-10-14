@@ -580,6 +580,9 @@ pub struct Writer {
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
+    /// Whether the filter is partitioned, which indexes no prefix.
+    partitioned_filter: bool,
+
     /// Value type of the previously written item (merge-operand ordering
     /// checks in the columnar path).
     previous_type: Option<ValueType>,
@@ -1253,6 +1256,7 @@ impl Writer {
             filter_sizing: None,
 
             prefix_extractor: None,
+            partitioned_filter: false,
 
             previous_type: None,
             previous_weak_tombstone_key: None,
@@ -1602,14 +1606,19 @@ impl Writer {
     fn meta_payload_len_without_keys(&self) -> crate::Result<u64> {
         let mut params = self.meta_section_params(&[], &[], (0, 0), 0, (0, 0), 0);
         // From above: a filter this writer builds is not built yet, so its
-        // entries are counted as if it were, under fixed-width counts,
-        // partitioned and naming its extractor both, whichever it turns out to
-        // be. A writer that builds none writes none of them.
+        // entries are counted as if it were, under fixed-width counts. A
+        // partitioned one records its partitions and names no extractor, a
+        // full one the reverse; a writer that builds none writes none of them.
         if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
             params.filter_hashes = params.filter_hashes.max(1);
-            params.filter_partition_hashes = params.filter_partition_hashes.max(1);
-            params.prefix_extractor =
-                indexed_extractor(self.prefix_extractor.as_deref(), self.carries_filter, 0);
+            if self.partitioned_filter {
+                params.filter_partition_hashes = params.filter_partition_hashes.max(1);
+            }
+            params.prefix_extractor = indexed_extractor(
+                self.prefix_extractor.as_deref(),
+                self.carries_filter,
+                self.partitioned_filter,
+            );
         }
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
@@ -1903,6 +1912,7 @@ impl Writer {
         #[cfg(feature = "std")]
         let filter_writer = filter_writer.use_parallel(self.parallel_settings.clone());
         self.filter_writer = filter_writer;
+        self.partitioned_filter = true;
         self
     }
 
@@ -5101,7 +5111,7 @@ impl Writer {
         meta_params.prefix_extractor = indexed_extractor(
             self.prefix_extractor.as_deref(),
             self.carries_filter,
-            self.meta.filter_partition_hashes,
+            self.partitioned_filter,
         );
 
         // MID meta copy — defends against torn-write at the file tail
@@ -5359,16 +5369,16 @@ fn write_back_tail(
 }
 
 /// The name of the extractor whose prefixes a table's filter indexes. Only a
-/// full filter built by the table's own writer does: a partitioned one
-/// (`partition_hashes > 0`) never indexes prefixes, and a carried one indexes
-/// whatever its source's extractor emitted, which the writer cannot name.
+/// full filter built by the table's own writer does: a partitioned one never
+/// indexes prefixes, and a carried one indexes whatever its source's extractor
+/// emitted, which the writer cannot name.
 fn indexed_extractor(
     extractor: Option<&dyn PrefixExtractor>,
     carries_filter: bool,
-    partition_hashes: u64,
+    partitioned: bool,
 ) -> Option<&str> {
     extractor
-        .filter(|_| !carries_filter && partition_hashes == 0)
+        .filter(|_| !carries_filter && !partitioned)
         .map(PrefixExtractor::name)
 }
 
