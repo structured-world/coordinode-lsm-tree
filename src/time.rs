@@ -7,10 +7,12 @@ use core::time::Duration;
 /// A source of wall-clock time.
 ///
 /// The engine reads wall-clock time (for the `created_at` stamp on tables and
-/// blob files, and for FIFO TTL expiry) through this trait. Under `std` the
-/// built-in [`SystemClock`] is used automatically. Under `no_std` there is no
-/// ambient system clock, so a consumer (e.g. a WASM host exposing `Date.now()`)
-/// injects one once via `set_clock` before opening a tree.
+/// blob files, and for FIFO TTL expiry) through this trait. A tree reads the
+/// clock its config names ([`Config::with_clock`](crate::Config::with_clock)),
+/// and the process clock without one: under `std` the built-in
+/// [`SystemClock`], under `no_std`, where there is no ambient system clock,
+/// the one a consumer (e.g. a WASM host exposing `Date.now()`) registers once
+/// via `set_clock` before opening a tree.
 ///
 /// # Examples
 ///
