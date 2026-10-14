@@ -5016,6 +5016,20 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> crate::Result<crate::range::SeekableTreeIter> {
+        self.create_seekable_range_bounds_with(lo, hi, seqno, ephemeral, self.blob_source())
+    }
+
+    /// [`Self::create_seekable_range_bounds`], reading values kept in the
+    /// value log through `blob_source`, the one its caller took as the read
+    /// began.
+    pub(crate) fn create_seekable_range_bounds_with(
+        &self,
+        lo: Bound<UserKey>,
+        hi: Bound<UserKey>,
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+        blob_source: Option<crate::blob_tree::BlobSource>,
+    ) -> crate::Result<crate::range::SeekableTreeIter> {
         use crate::range::{IterState, SeekableTreeIter};
 
         let super_version = self.get_version_for_snapshot(seqno)?;
@@ -5024,7 +5038,7 @@ impl Tree {
             version: super_version,
             ephemeral,
             merge_operator: self.config.merge_operator.clone(),
-            blob_source: self.blob_source(),
+            blob_source,
             comparator: self.config.comparator.clone(),
             prefix_hash: None,
             #[cfg(feature = "metrics")]

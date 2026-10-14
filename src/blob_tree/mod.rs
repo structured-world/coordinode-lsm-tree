@@ -367,10 +367,13 @@ impl BlobTree {
         })
     }
 
-    /// Resolves a single key against a pre-acquired [`SuperVersion`](crate::version::SuperVersion).
+    /// Resolves a single key against a pre-acquired [`SuperVersion`](crate::version::SuperVersion),
+    /// reading its value through `source`, taken as the read began, so every
+    /// key of one read caches as the tree said then.
     fn resolve_key(
         &self,
         super_version: &crate::version::SuperVersion,
+        source: &BlobSource,
         key: &[u8],
         seqno: SeqNo,
     ) -> crate::Result<Option<UserValue>> {
@@ -394,22 +397,11 @@ impl BlobTree {
                 key,
                 seqno,
                 merge_operator,
-                Some(&self.blob_source()),
+                Some(source),
             );
         }
 
-        let (_, v) = resolve_value_handle(
-            self.id(),
-            &self.index.config.cache,
-            self.blob_cache_fill(),
-            &[],
-            &super_version.version,
-            #[cfg(feature = "metrics")]
-            self.metrics(),
-            item,
-        )?;
-
-        Ok(Some(v))
+        source.value(&super_version.version, item).map(Some)
     }
 
     /// Iterate change events with `seqno >= target_seqno`, resolving
@@ -474,6 +466,9 @@ impl BlobTree {
             .version
             .read_mix()
             .note_points(u64::try_from(keys.len()).unwrap_or(u64::MAX));
+        // One source for the whole read: every key caches as the tree said
+        // when the read began.
+        let source = self.blob_source();
         Ok(crate::resumable::ResumableMultiGet::start(
             crate::tree::read_job::ReadCtx {
                 super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
@@ -481,8 +476,8 @@ impl BlobTree {
                 seqno,
                 comparator: Arc::clone(&self.index.config.comparator),
                 merge_operator: self.index.config.merge_operator.clone(),
-                merge_base: Some(self.blob_source()),
-                values: crate::tree::read_job::Values::Blob(self.blob_source()),
+                merge_base: Some(source.clone()),
+                values: crate::tree::read_job::Values::Blob(source),
                 metadata_budget: self.index.config.multi_get_metadata_budget,
             },
         ))
@@ -925,9 +920,9 @@ const PREFETCH_MAX_GAP: u64 = 4 * 1_024;
 const PREFETCH_MAX_READ: usize = 4 * 1_024 * 1_024;
 
 impl BlobTree {
-    /// Read-ahead state for one scan, seeded from the tree's configuration.
-    fn scan_prefetch_state(&self) -> Arc<ScanPrefetch> {
-        let fill = self.blob_cache_fill();
+    /// Read-ahead state for one scan, seeded from the tree's configuration,
+    /// caching under `fill` as the scan's source does.
+    fn scan_prefetch_state(&self, fill: crate::config::BlobCacheFill) -> Arc<ScanPrefetch> {
         let window = self
             .index
             .config
@@ -1456,6 +1451,10 @@ impl AbstractTree for BlobTree {
             Err(e) => return Box::new(core::iter::once(crate::tree::error_guard(e))),
         };
         let tree = self.clone();
+        // One source for the scan: its read-ahead and its merges cache as the
+        // tree said when it began.
+        let source = self.blob_source();
+        let state = self.scan_prefetch_state(source.fill);
 
         let range = prefix_to_range(prefix_bytes);
 
@@ -1468,12 +1467,12 @@ impl AbstractTree for BlobTree {
                 self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
                 prefix_hash,
-                Some(self.blob_source()),
+                Some(source),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
             armed: false,
-            state: self.scan_prefetch_state(),
+            state,
             version: super_version.version,
             tree,
             local: crate::vlog::Prefetched::default(),
@@ -1494,7 +1493,9 @@ impl AbstractTree for BlobTree {
             Err(e) => return Box::new(core::iter::once(crate::tree::error_guard(e))),
         };
         let tree = self.clone();
-        let state = self.scan_prefetch_state();
+        // One source for the scan, as in `prefix` above.
+        let source = self.blob_source();
+        let state = self.scan_prefetch_state(source.fill);
 
         Box::new(PrefetchScan {
             inner: crate::Tree::create_internal_range_with_prefix_hash(
@@ -1505,7 +1506,7 @@ impl AbstractTree for BlobTree {
                 self.index.config.merge_operator.clone(),
                 self.index.config.comparator.clone(),
                 None,
-                Some(self.blob_source()),
+                Some(source),
             ),
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
@@ -1524,19 +1525,23 @@ impl AbstractTree for BlobTree {
         index: Option<(Arc<Memtable>, SeqNo)>,
     ) -> Box<dyn crate::iter_guard::SeekableGuardIter + 'static> {
         let (lo, hi) = crate::tree::range_to_user_bounds(&range);
-        let inner = match self
-            .index
-            .create_seekable_range_bounds(lo, hi, seqno, index)
-        {
-            Ok(inner) => inner,
-            Err(e) => return Box::new(crate::iter_guard::FailedSeekable::new(e)),
-        };
+        // One source for the iterator, its merges and its values alike.
+        let source = self.blob_source();
+        let fill = source.fill;
+        let inner =
+            match self
+                .index
+                .create_seekable_range_bounds_with(lo, hi, seqno, index, Some(source))
+            {
+                Ok(inner) => inner,
+                Err(e) => return Box::new(crate::iter_guard::FailedSeekable::new(e)),
+            };
         let version = inner.version();
         Box::new(BlobSeekable {
             inner,
             tree: self.clone(),
             version,
-            fill: self.blob_cache_fill(),
+            fill,
         })
     }
 
@@ -1549,11 +1554,15 @@ impl AbstractTree for BlobTree {
     where
         I::IntoIter: Send + 'static,
     {
-        let inner = match self.index.create_seekable_range_bounds(
+        // One source for the scan, as in `prefix` above.
+        let source = self.blob_source();
+        let state = self.scan_prefetch_state(source.fill);
+        let inner = match self.index.create_seekable_range_bounds_with(
             core::ops::Bound::Unbounded,
             core::ops::Bound::Unbounded,
             seqno,
             index,
+            Some(source),
         ) {
             Ok(inner) => inner,
             Err(e) => return Box::new(core::iter::once(crate::tree::error_guard(e))),
@@ -1568,7 +1577,7 @@ impl AbstractTree for BlobTree {
             buf: alloc::collections::VecDeque::new(),
             inner_back_done: false,
             armed: false,
-            state: self.scan_prefetch_state(),
+            state,
             version,
             tree,
             local: crate::vlog::Prefetched::default(),
@@ -2202,7 +2211,7 @@ impl AbstractTree for BlobTree {
         // blob file it names cannot come from different points in time.
         let super_version = self.index.snapshot_for_read(seqno)?;
         super_version.version.read_mix().note_points(1);
-        self.resolve_key(&super_version, key.as_ref(), seqno)
+        self.resolve_key(&super_version, &self.blob_source(), key.as_ref(), seqno)
     }
 
     fn multi_get<K: AsRef<[u8]>>(
@@ -2227,22 +2236,25 @@ impl AbstractTree for BlobTree {
                 .version
                 .read_mix()
                 .note_points(u64::try_from(n).unwrap_or(u64::MAX));
+            let source = self.blob_source();
             return keys
                 .iter()
-                .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))
+                .map(|key| self.resolve_key(&super_version, &source, key.as_ref(), seqno))
                 .collect();
         }
 
         // The read shared with `Tree::multi_get`, which follows a blob
-        // indirection into this version's value log.
+        // indirection into this version's value log. One source for the whole
+        // read, so every key caches as the tree said when it began.
+        let source = self.blob_source();
         crate::Tree::read_many(&crate::tree::read_job::ReadCtx {
             super_version,
             keys,
             seqno,
             comparator: Arc::clone(&self.index.config.comparator),
             merge_operator: self.index.config.merge_operator.clone(),
-            merge_base: Some(self.blob_source()),
-            values: crate::tree::read_job::Values::Blob(self.blob_source()),
+            merge_base: Some(source.clone()),
+            values: crate::tree::read_job::Values::Blob(source),
             metadata_budget: self.index.config.multi_get_metadata_budget,
         })
     }
