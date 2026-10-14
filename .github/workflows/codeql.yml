@@ -5,6 +5,10 @@ name: CodeQL
 # `pull_request` event. The default setup skips those heads, so the required
 # `Analyze (actions)` check never reported on a Dependabot pull request; this
 # workflow runs on `pull_request` and reports it there too.
+#
+# The run on a Dependabot update's squash merge keeps a writable token: the
+# auto-merge workflow arms the merge with the release App's token, so that push
+# is the App's, not Dependabot's, and the read-only restriction does not apply.
 on:
   push:
     branches:
@@ -24,7 +28,9 @@ permissions:
 
 jobs:
   analyze:
-    # The ruleset requires this check by name.
+    # The ruleset requires this check by name. A pull request that edits this
+    # file runs its own version, as one editing the CI workflow does for
+    # `ci-passed`; a change to either is in the diff a maintainer merges.
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     permissions:

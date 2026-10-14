@@ -1,0 +1,11 @@
+# Action pinning: GitHub-owned actions track their major tag, since a hash
+# pin adds no isolation from the platform that runs them; every other action
+# is pinned to a full commit hash.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "actions/*": ref-pin
+        "github/*": ref-pin
+        "dependabot/*": ref-pin
+        "*": hash-pin
