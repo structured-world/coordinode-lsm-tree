@@ -6307,6 +6307,34 @@ fn batch_get_empty_input_returns_empty_results() -> crate::Result<()> {
     )
 }
 
+/// A batched read counts each key the gates let through as a point read of
+/// the table, as a single read does: the read mix sees batched traffic.
+#[test]
+fn batch_get_counts_each_key_it_reads_as_a_point_read() -> crate::Result<()> {
+    let items: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|k| {
+            crate::InternalValue::from_components(k.as_bytes(), b"v", 0, crate::ValueType::Value)
+        })
+        .collect();
+    test_with_table(
+        &items,
+        |table| {
+            let before = table.point_reads();
+            let batch: Vec<(&[u8], u64)> = vec![
+                (b"a", hash64(b"a")),
+                (b"b", hash64(b"b")),
+                (b"c", hash64(b"c")),
+            ];
+            table.batch_get(&batch, SeqNo::MAX)?;
+            assert_eq!(table.point_reads() - before, 3);
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Result<()> {
@@ -7822,8 +7850,9 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(1);
     bitmap.insert(3);
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .checksum;
     let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
 
     // Point path: masked rows read absent; survivors reconstruct their sub-cells.

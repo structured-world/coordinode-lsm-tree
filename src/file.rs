@@ -412,16 +412,22 @@ pub(crate) fn read_exact_paced(
 /// offset and length handed to `pace` just before it is read, so a rate
 /// limiter's waits and the reads they pay for alternate instead of one wait
 /// and then one read of the whole. A pacer that is not active now, as a
-/// limiter at rate zero, leaves the read whole.
+/// limiter at rate zero, leaves the read whole. Either way `pace` is told the
+/// bytes each read returned.
 pub(crate) fn read_at_paced(
     file: &dyn FsFile,
     buf: &mut [u8],
     offset: u64,
     pace: Option<&dyn crate::table::util::ReadPacer>,
 ) -> crate::io::Result<usize> {
-    let Some(pace) = pace.filter(|pace| pace.active()) else {
+    let Some(pace) = pace else {
         return file.read_at(buf, offset);
     };
+    if !pace.active() {
+        let read = file.read_at(buf, offset)?;
+        pace.read_bytes(read as u64);
+        return Ok(read);
+    }
     let mut read = 0usize;
     for portion in buf.chunks_mut(crate::table::util::PACE_PORTION) {
         // A corrupt handle may name an offset this read would carry past
@@ -440,6 +446,7 @@ pub(crate) fn read_at_paced(
         #[cfg(feature = "std")]
         pace.read_took(started.elapsed());
         let got = got?;
+        pace.read_bytes(got as u64);
         read += got;
         if got < portion.len() {
             break;

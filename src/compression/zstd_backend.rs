@@ -505,8 +505,8 @@ impl CompressionProvider for ZstdProvider {
     }
 
     fn decompress(data: &[u8], capacity: usize) -> crate::Result<Vec<u8>> {
-        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data)
-            .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+        // A malformed frame header surfaces on the first read.
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(data);
         bounded_read(&mut decoder, capacity)
     }
 
@@ -668,9 +668,9 @@ impl ZstdProvider {
 
         TLS_DECODER.with(|cell| {
             let mut decoder = cell.borrow_mut();
+            // A malformed frame header surfaces on the first read.
             let mut stream =
-                StreamingDecoder::new_with_decoder(std::io::Cursor::new(data), &mut *decoder)
-                    .map_err(|e| crate::Error::Io(crate::io::Error::other(e.to_string())))?;
+                StreamingDecoder::new_with_decoder(std::io::Cursor::new(data), &mut *decoder);
             bounded_read_into(&mut stream, dest)
         })
     }

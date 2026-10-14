@@ -47,12 +47,18 @@ impl CompactionStrategy for Merge {
     }
 
     fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
-        Choice::Merge(Input {
+        Choice::Merge(self.input())
+    }
+}
+
+impl Merge {
+    fn input(&self) -> Input {
+        Input {
             table_ids: self.0.iter().copied().collect(),
             dest_level: self.1,
             canonical_level: self.1,
             target_size: OUTPUT_TARGET,
-        })
+        }
     }
 }
 
@@ -406,11 +412,12 @@ fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate:
     Ok(())
 }
 
-/// The compaction byte counter grows by the bytes of the tables a merge
-/// installs, and a move, which writes none, leaves it as it was.
+/// The written work of a merge is the bytes of the tables it installs, in its
+/// own report and in the tree's counter, and a move, which writes none,
+/// leaves the counter as it was.
 #[cfg(feature = "metrics")]
 #[test]
-fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
+fn compaction_work_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open(Config::new(
         folder.path(),
@@ -420,15 +427,16 @@ fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Resul
     let mut seqno = 1;
     flush_into(&tree, 0..1_000, 1_000, 1, &mut seqno)?;
     assert_eq!(
-        tree.metrics().compaction_bytes_written(),
+        tree.metrics().compaction_work_measured().written,
         0,
         "a move writes nothing"
     );
     let ids = tables(&tree, 1).iter().map(Table::id).collect();
-    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
-    let installed: u64 = tables(&tree, 2).iter().map(Table::file_size).sum();
+    let result = tree.compact(Arc::new(Merge(ids, 2)), 0)?;
+    let installed: u64 = tables(&tree, 2).iter().map(Table::file_len).sum();
     assert!(installed > 0);
-    assert_eq!(tree.metrics().compaction_bytes_written(), installed);
+    assert_eq!(result.work.measured.written, installed);
+    assert_eq!(tree.metrics().compaction_work_measured().written, installed);
     Ok(())
 }
 
@@ -533,12 +541,32 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
     let inputs = tables(&tree, 1);
     assert_eq!(inputs.len(), 1, "the merge reads one table");
     let boundaries = boundaries_of(&tables(&tree, 3));
-    let slice_ends: Vec<u32> = super::tight_slice_boundaries(
+    // The slices as the pass cuts them: free space unknown, so the quota caps
+    // them, and their outputs cut on the level below at the merge's target.
+    let merge = Merge(inputs.iter().map(Table::id).collect(), 2);
+    let payload = merge.input();
+    let opts = super::Options::from_tree(&tree, Arc::new(Merge(merge.0.clone(), merge.1)));
+    let cut_keys =
+        crate::compaction::flavour::output_cut_keys(&tree.current_version(), &opts, &payload);
+    let caps = super::SliceCaps {
+        tables: u64::MAX,
+        blobs: u64::MAX,
+        total: HEADROOM,
+    };
+    let outputs = super::SliceOutputs {
+        target_size: OUTPUT_TARGET,
+        cut_keys: &cut_keys,
+    };
+    let slice_ends: Vec<u32> = super::tight_slices(
         &inputs,
-        HEADROOM,
-        &crate::comparator::DefaultUserComparator,
+        caps,
+        &outputs,
+        None,
+        &tree.config.comparator,
+        &super::input_pacer(&opts),
     )?
     .iter()
+    .filter_map(|slice| slice.end.as_ref())
     .map(|end| index(end))
     .collect();
     assert!(
@@ -552,10 +580,11 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
         cfg.tight_space_compaction = true;
         cfg.storage_limit_bytes = Some(used + HEADROOM);
     })?;
-    tree.compact(
-        Arc::new(Merge(inputs.iter().map(Table::id).collect(), 2)),
-        0,
-    )?;
+    // Held through the pass, the input would keep each slice's consumed
+    // prefix from being reclaimed, and the pass would stop after one.
+    let input_ids = inputs.iter().map(Table::id).collect();
+    drop(inputs);
+    tree.compact(Arc::new(Merge(input_ids, 2)), 0)?;
     assert!(
         mem.punched_bytes() > 0,
         "the merge ran as a tight-space pass"

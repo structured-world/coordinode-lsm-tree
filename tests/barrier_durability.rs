@@ -157,8 +157,11 @@ impl Fs for NestedFs {
     fn exists(&self, path: &std::path::Path) -> lsm_tree::io::Result<bool> {
         self.inner.exists(path)
     }
+    // The nested folder and every file in it lie on the volume apart.
     fn volume_id(&self, path: &std::path::Path) -> Option<u64> {
-        Some(u64::from(path.ends_with(self.nested)))
+        Some(u64::from(
+            path.ancestors().any(|folder| folder.ends_with(self.nested)),
+        ))
     }
     fn sync_device(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
         self.flushed

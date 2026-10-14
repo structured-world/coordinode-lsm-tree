@@ -31,7 +31,7 @@ pub(crate) mod multi_writer;
 pub(crate) mod probe_stats;
 pub(crate) mod regions;
 #[cfg(feature = "std")]
-mod relocate;
+pub(crate) mod relocate;
 #[cfg(feature = "columnar")]
 pub(crate) mod row_group;
 mod scanner;
@@ -89,7 +89,7 @@ use iter::Iter;
 
 use crate::path::PathBuf;
 use portable_atomic::AtomicU64;
-use util::{ReadCharge, load_block};
+use util::ReadCharge;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -891,6 +891,33 @@ impl Table {
         self.regions.filter.map(|x| x.size()).unwrap_or_default()
     }
 
+    /// The bytes of the sections that grow with the table's data, past its
+    /// data blocks: every section but its metadata and the framing that holds
+    /// the file together.
+    #[cfg(feature = "std")]
+    pub(crate) fn data_scaled_section_bytes(&self) -> u64 {
+        let regions = &self.regions;
+        [
+            Some(regions.tli),
+            regions.tli_tail,
+            regions.index,
+            regions.filter,
+            regions.filter_tli,
+            regions.range_tombstones,
+            regions.block_layout,
+            regions.locator,
+            regions.seqno_bounds,
+            regions.zone_map,
+            regions.delete_bitmap,
+            regions.owned_blob_objects,
+            regions.linked_blob_files,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|handle| u64::from(handle.size()))
+        .sum()
+    }
+
     #[must_use]
     pub fn pinned_filter_size(&self) -> usize {
         self.pinned_filter_block
@@ -1190,11 +1217,12 @@ impl Table {
             #[cfg(zstd_any)]
             zstd_dict,
             ReadCharge::Foreground,
+            None,
         )
     }
 
     /// [`Self::load_block`] charged as `charge` says, for a read that is not a
-    /// caller's.
+    /// caller's, and told to `pace` when given.
     fn load_block_charged(
         &self,
         handle: &BlockHandle,
@@ -1202,8 +1230,9 @@ impl Table {
         compression: CompressionType,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
         charge: ReadCharge,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<Block> {
-        load_block(
+        crate::table::util::load_block_paced(
             self.global_id(),
             &self.path,
             &self.file_accessor,
@@ -1219,6 +1248,7 @@ impl Table {
             #[cfg(feature = "metrics")]
             &self.metrics,
             charge,
+            pace,
         )
     }
 
@@ -1443,6 +1473,18 @@ impl Table {
         self.load_data_block_charged(handle, ReadCharge::Foreground)
     }
 
+    /// [`Self::load_data_block`] for maintenance that sizes a rewrite of the
+    /// table: not counted as a read, and told to `pace`, the rewrite's own,
+    /// as the rewrite's reads are.
+    #[cfg(feature = "std")]
+    pub(crate) fn load_data_block_for_maintenance(
+        &self,
+        handle: &BlockHandle,
+        pace: &dyn crate::table::util::ReadPacer,
+    ) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_paced(handle, ReadCharge::Maintenance, Some(pace))
+    }
+
     /// [`Self::load_data_block`] charged as `charge` says, for a read that is
     /// not a caller's.
     fn load_data_block_charged(
@@ -1450,11 +1492,21 @@ impl Table {
         handle: &BlockHandle,
         charge: ReadCharge,
     ) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_paced(handle, charge, None)
+    }
+
+    /// [`Self::load_data_block_charged`], told to `pace` when given.
+    fn load_data_block_paced(
+        &self,
+        handle: &BlockHandle,
+        charge: ReadCharge,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_data_block(handle, charge);
+            return self.load_columnar_data_block(handle, charge, pace);
         }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
@@ -1468,6 +1520,7 @@ impl Table {
             #[cfg(zstd_any)]
             self.zstd_dictionary.as_deref(),
             charge,
+            pace,
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
@@ -1547,10 +1600,14 @@ impl Table {
         &self,
         handle: &BlockHandle,
         charge: ReadCharge,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<Option<DataBlock>> {
-        let batch = self
-            .load_row_group(handle, &crate::table::row_group::PageWant::ALL, charge)?
-            .batches;
+        let blocks = crate::table::row_group::GroupRead {
+            pace,
+            ..self.group_read(handle, charge)
+        }
+        .load(&crate::table::row_group::PageWant::ALL)?;
+        let batch = self.row_pages(&blocks, charge)?.batches;
         let restart = self.metadata.data_block_restart_interval;
         // The segment has materialized deletes and this block has a recorded
         // start position: drop the deleted rows during reconstruction. The
@@ -2296,11 +2353,63 @@ impl Table {
         )
     )]
     pub(crate) fn live_file_size(&self) -> crate::Result<u64> {
-        let size = self.file_size();
+        // The file's length: the recorded `file_size` leaves out the sections
+        // written after the metadata, which a rewrite writes too.
+        let size = self.file_len();
         // The punch offset is a data-block offset inside this same file, so the
         // subtraction cannot underflow; falling back to the whole size keeps a
         // space gate conservative if the two ever disagreed.
         Ok(size.checked_sub(self.punch_offset()?).unwrap_or(size))
+    }
+
+    /// The reads that consulted this table's data since it was written:
+    /// point reads that passed its filter, and range scans that reached it.
+    pub(crate) fn reads(&self) -> u64 {
+        self.point_reads() + self.scans()
+    }
+
+    /// How hot the table is now: its [`Self::reads`] per thousand seconds
+    /// since it began counting them, so a table read long ago does not
+    /// outrank one read often since it was written.
+    pub(crate) fn heat(&self) -> u64 {
+        let now = crate::time::unix_timestamp().as_secs();
+        // A clock stepped back, or no clock at all under `no_std`, reads as
+        // the table's first second: its reads rank as they stand. Floored at
+        // zero by design, since an age is never negative.
+        let age = now.saturating_sub(self.counting_since_secs).max(1);
+        let per_kilosecond = u128::from(self.reads()) * 1_000 / u128::from(age);
+        // Below `reads() * 1000`, far within `u64` for any count of reads.
+        u64::try_from(per_kilosecond).unwrap_or(u64::MAX)
+    }
+
+    /// The point reads that passed this table's filter since it was written.
+    pub(crate) fn point_reads(&self) -> u64 {
+        self.read_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The range scans that reached this table since it was written.
+    pub(crate) fn scans(&self) -> u64 {
+        self.scan_count.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records a range scan reaching this table: one `Relaxed` bump per scan
+    /// and table, beside the scan's own reads of the table.
+    pub(crate) fn note_scan(&self) {
+        self.scan_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bytes the file holds: what a whole read of it takes, and what
+    /// writing it took.
+    pub(crate) fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// The bytes of the data section: every data block or row group as it lies
+    /// on disk. It opens the file, and the index follows it, or the top-level
+    /// index where the index is not partitioned.
+    pub(crate) fn data_section_len(&self) -> u64 {
+        self.regions.index.unwrap_or(self.regions.tli).offset().0
     }
 
     /// The blocks one data index entry covers, each with the ROLE its writer
@@ -6781,8 +6890,15 @@ impl Table {
     /// not inflate the count. Raw counter; the consumer derives a rate / EMA from
     /// successive polls.
     fn record_access(&self) {
+        self.record_accesses(1);
+    }
+
+    /// Records `reads` data-consulting point reads at once, as
+    /// [`Self::record_access`] records one: what a batched read let through
+    /// its gates.
+    pub(crate) fn record_accesses(&self, reads: u64) {
         self.read_count
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .fetch_add(reads, core::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "std")]
         self.last_access_secs.store(
             crate::time::unix_timestamp().as_secs(),
@@ -7382,6 +7498,8 @@ impl Table {
         if passing.is_empty() {
             return Ok(results);
         }
+        // Counted as single reads are, after the seqno-range and filter gates.
+        self.record_accesses(passing.len() as u64);
         // The filter let these keys through; the ones no read below finds are
         // its false positives.
         let count_false_positives = |results: &[Option<InternalValue>]| {
@@ -8620,6 +8738,7 @@ impl Table {
         log::debug!("Recovering table from file {}", file_path.display());
         let mut file = fs.open(&file_path, &FsOpenOptions::new().read(true))?;
         let file_path = Arc::new(file_path);
+        let file_len = file.metadata()?.len;
 
         #[cfg(feature = "metrics")]
         metrics
@@ -9498,6 +9617,7 @@ impl Table {
                 tree_id,
 
                 metadata,
+                file_len,
                 l0_recency,
                 regions,
 
@@ -9525,6 +9645,8 @@ impl Table {
 
                 blob_links: once_cell::race::OnceBox::new(),
                 read_count: AtomicU64::new(0),
+                scan_count: AtomicU64::new(0),
+                counting_since_secs: crate::time::unix_timestamp().as_secs(),
                 last_access_secs: AtomicU64::new(0),
                 probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,
@@ -9739,6 +9861,13 @@ impl Table {
         self.0
             .punch_on_drop
             .store(offset, core::sync::atomic::Ordering::Release);
+    }
+
+    /// A handle that tells whether this view's file is still held: its
+    /// punch or deletion runs only once no handle is left.
+    #[cfg(feature = "std")]
+    pub(crate) fn downgrade(&self) -> alloc::sync::Weak<inner::Inner> {
+        Arc::downgrade(&self.0)
     }
 
     /// Byte offset of the first data block whose last key reaches `key`. Punching
@@ -10086,6 +10215,9 @@ impl Table {
     /// from that plan: the probes, and the filter queries and skips.
     pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
         self.count_probes(counts.probes);
+        if counts.point_reads > 0 {
+            self.record_accesses(counts.point_reads as u64);
+        }
         #[cfg(feature = "metrics")]
         {
             use core::sync::atomic::Ordering::Relaxed;

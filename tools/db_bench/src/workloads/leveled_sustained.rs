@@ -168,7 +168,7 @@ impl ArmRun {
         // nothing to compact are not saved up for one long step later.
         let budget = COMPACTION_BYTES_PER_FLUSHED_BYTE * i64::try_from(flushed).unwrap_or(i64::MAX);
         self.allowance = (self.allowance + budget).min(budget);
-        let bytes_before = self.tree.metrics().compaction_bytes_written();
+        let bytes_before = self.tree.metrics().compaction_work_measured().written;
         compact(
             &self.tree,
             &self.strategy,
@@ -179,9 +179,9 @@ impl ArmRun {
         let nanos = u64::try_from(step.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.arm.steps.saturating_record(nanos);
         self.arm.steps_total += nanos;
-        self.arm
-            .step_bytes
-            .saturating_record(self.tree.metrics().compaction_bytes_written() - bytes_before);
+        self.arm.step_bytes.saturating_record(
+            self.tree.metrics().compaction_work_measured().written - bytes_before,
+        );
         let debt = self
             .strategy
             .pending_compaction_bytes(&self.tree.current_version());
@@ -204,7 +204,7 @@ impl ArmRun {
     fn finish(mut self, seqno: u64) -> lsm_tree::Result<Arm> {
         compact(&self.tree, &self.strategy, seqno, None, &mut self.arm)?;
         // A fresh tree: everything its compactions wrote is this run's.
-        self.arm.compacted = self.tree.metrics().compaction_bytes_written();
+        self.arm.compacted = self.tree.metrics().compaction_work_measured().written;
         Ok(self.arm)
     }
 }
@@ -281,11 +281,9 @@ fn compact(
     arm: &mut Arm,
 ) -> lsm_tree::Result<()> {
     while allowance.as_deref().is_none_or(|left| *left > 0) {
-        let before = tree.metrics().compaction_bytes_written();
         let result = tree.compact(Arc::clone(strategy), seqno)?;
         if let Some(left) = allowance.as_deref_mut() {
-            let written = tree.metrics().compaction_bytes_written() - before;
-            *left -= i64::try_from(written).unwrap_or(i64::MAX);
+            *left -= i64::try_from(result.work.measured.written).unwrap_or(i64::MAX);
         }
         match result.action {
             CompactionAction::Nothing => break,

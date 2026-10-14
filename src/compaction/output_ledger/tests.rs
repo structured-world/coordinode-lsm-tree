@@ -6,6 +6,17 @@ fn create(fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// A run holding no room has nothing to charge a finished file to: it does
+/// not even look the file up, and is never out of room.
+#[test]
+fn a_run_without_room_charges_nothing() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let ledger = OutputLedger::default();
+    ledger.landed(&fs, &PathBuf::from("/never/written"))?;
+    assert!(!ledger.out_of_room());
+    Ok(())
+}
+
 /// Every recorded file goes, a table and a blob file alike, and the ledger is
 /// empty afterwards: a second removal has nothing left to touch.
 #[test]
@@ -78,6 +89,110 @@ fn a_missing_file_does_not_stop_the_rest() -> crate::Result<()> {
     ledger.remove_uninstalled(0, None);
 
     assert!(!fs.exists(&present)?, "the file after the missing one goes");
+    Ok(())
+}
+
+/// An output the run cannot remove stays on disk, which a quota counted from
+/// the installed version does not see: its bytes stay held in the tree's
+/// quota, while the room of one removed is given back.
+#[test]
+fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let stuck = PathBuf::from("/tree/tables/1");
+    let removed = PathBuf::from("/tree/tables/2");
+    for (path, len) in [(&stuck, 300), (&removed, 200)] {
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(&vec![7u8; len])?;
+    }
+
+    let tree_id = 4;
+    let pool = Arc::new(CapacityPool::default());
+    let Some(room) = pool.reserve(
+        tree_id,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 500,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    for (id, path) in [(1, &stuck), (2, &removed)] {
+        ledger.record_table(id, path.clone(), fs.clone());
+        ledger.landed(&*fs, path)?;
+    }
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("tables/1"),
+    );
+    ledger.remove_uninstalled(tree_id, None);
+    injector.clear();
+
+    assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");
+    assert!(!fs.exists(&removed)?);
+    assert_eq!(pool.quota_held(tree_id), 300);
+    Ok(())
+}
+
+/// An output that outgrew its run's room and cannot be removed keeps all of
+/// its bytes held, past the room the run reserved too.
+#[test]
+fn an_output_past_its_room_that_cannot_be_removed_keeps_all_of_it_held() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let stuck = PathBuf::from("/tree/tables/1");
+    let mut file = fs.open(&stuck, &FsOpenOptions::new().write(true).create_new(true))?;
+    file.write_all(&[7u8; 150])?;
+    drop(file);
+
+    let tree_id = 5;
+    let pool = Arc::new(CapacityPool::default());
+    let Some(room) = pool.reserve(
+        tree_id,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 100,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    ledger.record_table(1, stuck.clone(), fs.clone());
+    ledger.landed(&*fs, &stuck)?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("tables/1"),
+    );
+    ledger.remove_uninstalled(tree_id, None);
+    injector.clear();
+
+    assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");
+    assert_eq!(pool.quota_held(tree_id), 150);
     Ok(())
 }
 

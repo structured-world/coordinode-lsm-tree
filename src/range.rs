@@ -606,6 +606,12 @@ impl TreeIter {
                     })
             };
 
+            // A scan reaches every table it reads; a point read merging
+            // operands goes through here too, and counts as a point read.
+            let scanning = lock.key_hash.is_none();
+            if scanning {
+                lock.version.version.read_mix().note_scan();
+            }
             for run in candidates {
                 let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
                     .into_iter()
@@ -625,11 +631,17 @@ impl TreeIter {
                 // first, which is read on its own to count a pass that finds
                 // nothing; the others' passes are no false positives.
                 let (first, answer) = surviving.remove(0);
+                if scanning {
+                    first.note_scan();
+                }
                 iters.push(table_reader(answer, first, user_range.clone(), seqno));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
+                            if scanning {
+                                table.note_scan();
+                            }
                             iters.push(table_reader(answer, table, user_range.clone(), seqno));
                         }
                     }
@@ -1010,19 +1022,40 @@ struct TableLeaf {
     table: crate::table::Table,
     iter: crate::table::iter::Iter,
     seqno: SeqNo,
+    /// Whether the table was counted as reached: on the first row read from
+    /// it, seen by the snapshot or not, since a source opened over the whole
+    /// keyspace and repositioned to intervals may never be read at all.
+    noted: bool,
 }
 
 impl TableLeaf {
     fn new(table: crate::table::Table, user_range: UserBounds, seqno: SeqNo) -> Self {
         let iter = table.range_iter(user_range);
-        Self { table, iter, seqno }
+        Self {
+            table,
+            iter,
+            seqno,
+            noted: false,
+        }
+    }
+
+    /// Counts the scan on the table the first time a row is read from it.
+    fn note_read(&mut self) {
+        if !self.noted {
+            self.table.note_scan();
+            self.noted = true;
+        }
     }
 
     fn next_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
-                Ok(_) => {}
+                Ok(value) => {
+                    self.note_read();
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1031,8 +1064,12 @@ impl TableLeaf {
     fn next_back_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next_back()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
-                Ok(_) => {}
+                Ok(value) => {
+                    self.note_read();
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1056,7 +1093,9 @@ impl RunLeaf {
         seqno: SeqNo,
         comparator: SharedComparator,
     ) -> Option<Self> {
-        let reader = RunReader::new_cmp(run, user_range, comparator.as_ref())?;
+        // Repositioned over every range of a batch, which counts as one scan.
+        let reader =
+            RunReader::new_cmp(run, user_range, comparator.as_ref())?.counting_each_table_once();
         Some(Self {
             reader,
             comparator,
@@ -1243,6 +1282,8 @@ fn build_seek_pipeline<'a>(
             seqno,
         )));
     }
+    // Built once per iterator: the scan is counted here, once.
+    state.version.version.read_mix().note_scan();
     for table in &collected.single_tables {
         sources.push(SeekableLeaf::Table(Box::new(TableLeaf::new(
             table.clone(),
