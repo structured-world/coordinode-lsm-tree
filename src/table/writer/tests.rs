@@ -1023,6 +1023,34 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table names the extractor its filter indexes in both copies of its meta
+/// block, and a parameterised extractor's name has no bound: the hint counts
+/// it, and the filter's other meta entries, before the filter is built.
+#[test]
+fn the_size_hint_counts_the_extractor_name_the_meta_records() -> crate::Result<()> {
+    struct LongName(String);
+    impl crate::prefix::PrefixExtractor for LongName {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            Box::new(key.get(..1).into_iter())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_prefix_extractor(Some(Arc::new(LongName("x".repeat(64 * 1_024)))));
+    write_long_keys(&mut writer, 3, 8)?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(hint >= size, "hint {hint} for a {size}-byte table");
+    Ok(())
+}
+
 /// A table may close before its first block is cut, when what the multi-writer
 /// adds at rotation fills it: the tail is counted from the first key on.
 #[test]

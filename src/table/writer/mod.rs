@@ -1601,8 +1601,11 @@ impl Writer {
     /// key bounds. The lineage markers `finish` may still add are counted.
     fn meta_payload_len_without_keys(&self) -> crate::Result<u64> {
         let mut params = self.meta_section_params(&[], &[], (0, 0), 0, (0, 0), 0);
-        // From above: the partitions are not known yet, so a partitioned
-        // filter is counted as if it recorded the name too.
+        // From above: the filter is not built yet, so its entries are counted
+        // as if it were, under fixed-width counts, partitioned and naming its
+        // extractor both, whichever it turns out to be.
+        params.filter_hashes = params.filter_hashes.max(1);
+        params.filter_partition_hashes = params.filter_partition_hashes.max(1);
         params.prefix_extractor =
             indexed_extractor(self.prefix_extractor.as_deref(), self.carries_filter, 0);
         let has_lineage = params.lineage.is_some();
