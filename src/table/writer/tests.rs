@@ -969,6 +969,10 @@ fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
 fn a_prefix_shared_by_every_key_is_built_once() -> crate::Result<()> {
     struct UpToColon;
     impl crate::prefix::PrefixExtractor for UpToColon {
+        fn name(&self) -> &'static str {
+            "up-to-colon"
+        }
+
         fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             let end = key.iter().position(|b| *b == b':').map_or(0, |i| i + 1);
             Box::new(key.get(..end).into_iter())
@@ -1016,6 +1020,66 @@ fn the_size_hint_counts_the_tail_every_table_writes() -> crate::Result<()> {
             "hint {hint} for a {size}-byte table, filter slack {slack}",
         );
     }
+    Ok(())
+}
+
+/// A table names the extractor its filter indexes in both copies of its meta
+/// block, and a parameterised extractor's name has no bound: the hint counts
+/// it, and the filter's other meta entries, before the filter is built.
+#[test]
+fn the_size_hint_counts_the_extractor_name_the_meta_records() -> crate::Result<()> {
+    struct LongName(String);
+    impl crate::prefix::PrefixExtractor for LongName {
+        fn name(&self) -> &str {
+            &self.0
+        }
+
+        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            Box::new(key.get(..1).into_iter())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("1");
+    let mut writer = Writer::new(path.clone(), 1, 0, Arc::new(StdFs))?
+        .use_prefix_extractor(Some(Arc::new(LongName("x".repeat(64 * 1_024)))));
+    write_long_keys(&mut writer, 3, 8)?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(hint >= size, "hint {hint} for a {size}-byte table");
+
+    // Without a filter the meta names no extractor, and the hint counts
+    // none: an unbounded name it never writes would make every table look
+    // full long before it is.
+    let path = dir.path().join("2");
+    let mut writer = Writer::new(path.clone(), 2, 0, Arc::new(StdFs))?
+        .use_bloom_policy(crate::config::BloomConstructionPolicy::BitsPerKey(0.0))
+        .use_prefix_extractor(Some(Arc::new(LongName("x".repeat(64 * 1_024)))));
+    write_long_keys(&mut writer, 3, 8)?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(
+        hint >= size && hint * 10 <= size * 11,
+        "hint {hint} for a {size}-byte table without a filter",
+    );
+
+    // A partitioned filter indexes no prefix and names no extractor either.
+    // Its other estimates run above a table this small, so what is checked is
+    // that the hint does not carry the name.
+    let path = dir.path().join("3");
+    let mut writer = Writer::new(path.clone(), 3, 0, Arc::new(StdFs))?
+        .use_partitioned_filter()
+        .use_prefix_extractor(Some(Arc::new(LongName("x".repeat(64 * 1_024)))));
+    write_long_keys(&mut writer, 3, 8)?;
+    let hint = writer.output_size_hint();
+    writer.finish()?;
+    let size = std::fs::metadata(&path)?.len();
+    assert!(
+        hint >= size && hint - size < 64 * 1_024,
+        "hint {hint} for a {size}-byte table with a partitioned filter",
+    );
     Ok(())
 }
 
@@ -1480,6 +1544,10 @@ fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Res
 struct AllPrefixes;
 
 impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn name(&self) -> &'static str {
+        "all-prefixes"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
     }

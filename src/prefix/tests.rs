@@ -6,6 +6,10 @@ use test_log::test;
 struct ColonSeparatedPrefix;
 
 impl PrefixExtractor for ColonSeparatedPrefix {
+    fn name(&self) -> &'static str {
+        "colon-separated"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(
             key.iter()
@@ -83,6 +87,10 @@ fn is_valid_scan_boundary_empty() {
 struct FixedLengthPrefix;
 
 impl PrefixExtractor for FixedLengthPrefix {
+    fn name(&self) -> &'static str {
+        "fixed-4"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         if let Some(prefix) = key.get(..4) {
             Box::new(std::iter::once(prefix))

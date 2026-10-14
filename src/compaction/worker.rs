@@ -3613,6 +3613,9 @@ fn run_merge_on_read_relocation(
         params.pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
         params.pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
         params.encryption.clone_from(&opts.config.encryption);
+        params
+            .prefix_extractor
+            .clone_from(&opts.config.prefix_extractor);
         #[cfg(zstd_any)]
         {
             params.zstd_dictionaries = opts.config.current_zstd_dictionaries();

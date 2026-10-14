@@ -31,6 +31,10 @@ use alloc::boxed::Box;
 /// struct ColonSeparatedPrefix;
 ///
 /// impl PrefixExtractor for ColonSeparatedPrefix {
+///     fn name(&self) -> &'static str {
+///         "colon-separated"
+///     }
+///
 ///     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
 ///         Box::new(
 ///             key.iter()
@@ -44,6 +48,22 @@ use alloc::boxed::Box;
 pub trait PrefixExtractor:
     Send + Sync + core::panic::UnwindSafe + core::panic::RefUnwindSafe
 {
+    /// A stable identifier of the prefixes this extractor emits.
+    ///
+    /// Every table records the name of the extractor its filter was built
+    /// with, and a prefix scan consults a table's filter only when that name
+    /// is the current extractor's: a table written without an extractor, or
+    /// under another one, never indexed the current prefixes, and is read
+    /// rather than skipped. Two extractors that emit different prefixes for
+    /// some key must have different names, so a parameterised extractor names
+    /// its parameters (`"fixed-4"`, not `"fixed"`). Keep the name across
+    /// releases as long as the prefixes stay the same.
+    //
+    // Intentionally required (no default impl): a shared fallback name would
+    // let a table indexed under one extractor pass for another's, and its
+    // filter would skip it on prefixes it never indexed.
+    fn name(&self) -> &str;
+
     /// Returns an iterator of prefixes to index for the given key.
     ///
     /// Each yielded prefix will be hashed and inserted into the segment's

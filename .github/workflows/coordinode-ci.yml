@@ -299,7 +299,11 @@ jobs:
     # runs the real tests rather than inheriting the default
     # needs-gating skip.
     if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
-    timeout-minutes: 20
+    # Windows runs the suite in 12-15 min where Linux and macOS take 4-6, and
+    # its file-heavy tests vary threefold between runners (one writing 2,000
+    # tables took 90 s on one and over 240 s on another): it gets the room a
+    # slow runner needs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 20 }}
     strategy:
       fail-fast: true
       matrix:
@@ -557,7 +561,10 @@ jobs:
   cross:
     needs: [changes, lint, cross-matrix]
     if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
-    timeout-minutes: 15
+    # A cold release build of the crate and its tests takes ~10.5 min on
+    # aarch64 before ~2.5 min of tests: a run without a usable cache (a new
+    # lockfile, an evicted entry) needs the room. A cached run takes far less.
+    timeout-minutes: 25
     strategy:
       fail-fast: true
       matrix:
@@ -575,8 +582,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: stable
-      - name: Install cross
-        run: cargo install cross
+      # One cache per target: cross builds into ./target/<target>, which the
+      # cache keeps like any other build.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: ubuntu-cargo-cross
+          key: ${{ matrix.target }}
+      # A released binary instead of a build of cross from source; the same
+      # GitHub-Releases outage exposure as nextest, the same fallback.
+      - uses: taiki-e/install-action@519337945e58281259ed45b2d4f70886f026ee6a  # cross
+        id: install-cross
+        continue-on-error: true
+      - name: Install cross from crates.io (fallback)
+        if: steps.install-cross.outcome == 'failure'
+        run: cargo install cross --locked --force
       - name: Cross test
         # proptest cases: 32 hardcoded in ProptestConfig
         run: cross test -r --features lz4 --target ${{ matrix.target }}

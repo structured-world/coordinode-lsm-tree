@@ -23,6 +23,12 @@ const PREFIX_LEN: usize = 2;
 struct FixedPrefixExtractor;
 
 impl PrefixExtractor for FixedPrefixExtractor {
+    fn name(&self) -> &'static str {
+        // The prefix length is part of what it emits, so part of its name.
+        const _: () = assert!(PREFIX_LEN == 2, "rename along with the length");
+        "fixed-2"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         if let Some(prefix) = key.get(..PREFIX_LEN) {
             Box::new(std::iter::once(prefix))

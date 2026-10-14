@@ -95,6 +95,10 @@ fn u64_of(n: usize) -> u64 {
 struct UpToColon;
 
 impl crate::PrefixExtractor for UpToColon {
+    fn name(&self) -> &'static str {
+        "up-to-colon"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(
             key.iter()
@@ -839,6 +843,10 @@ fn a_flush_counts_its_filter_hashes_as_the_writer_deduplicates_them() {
     struct Repeating;
 
     impl crate::PrefixExtractor for Repeating {
+        fn name(&self) -> &'static str {
+            "repeating"
+        }
+
         fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             let first = key.get(..1).unwrap_or(key);
             Box::new([key, first, first].into_iter())
@@ -1544,6 +1552,10 @@ fn a_prefix_reaching_a_table_by_a_range_tombstone_counts_its_miss() -> crate::Re
     /// filter lets the prefix `x:` through without holding a key under it.
     struct WithDecoy;
     impl crate::PrefixExtractor for WithDecoy {
+        fn name(&self) -> &'static str {
+            "up-to-colon-with-decoy"
+        }
+
         fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             if key.starts_with(b"w") {
                 return Box::new(core::iter::once(&b"x:"[..]));

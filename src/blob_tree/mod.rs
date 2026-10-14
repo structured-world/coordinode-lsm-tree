@@ -2065,6 +2065,9 @@ impl AbstractTree for BlobTree {
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;
                 params.encryption.clone_from(&self.index.config.encryption);
+                params
+                    .prefix_extractor
+                    .clone_from(&self.index.config.prefix_extractor);
                 #[cfg(zstd_any)]
                 {
                     params.zstd_dictionaries = self.index.config.current_zstd_dictionaries();

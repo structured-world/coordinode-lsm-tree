@@ -1645,6 +1645,9 @@ impl StandardCompaction {
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;
                 params.encryption.clone_from(&opts.config.encryption);
+                params
+                    .prefix_extractor
+                    .clone_from(&opts.config.prefix_extractor);
                 #[cfg(zstd_any)]
                 {
                     params.zstd_dictionaries = opts.config.current_zstd_dictionaries();
