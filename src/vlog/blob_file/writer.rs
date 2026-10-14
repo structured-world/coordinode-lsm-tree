@@ -17,7 +17,6 @@ use crate::{
     Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
     checksum::ChecksummedWriter,
     fs::{Fs, FsFile, FsOpenOptions, SyncMode},
-    time::unix_timestamp,
     vlog::BlobFileId,
 };
 #[cfg(feature = "std")]
@@ -142,6 +141,10 @@ pub struct Writer {
     /// rebuilt from another store.
     pub(crate) created_at: Option<u128>,
 
+    /// The tree's clock, read for the age when `created_at` does not set it;
+    /// `None` reads the process clock.
+    clock: Option<alloc::sync::Arc<dyn crate::Clock>>,
+
     /// Durability level for the final blob-file fsync. Default
     /// [`SyncMode::Normal`]; wired from `Config::sync_mode` via
     /// [`Self::use_sync_mode`].
@@ -228,6 +231,7 @@ impl Writer {
             metadata_compression_override: None,
             lifetime_class: 0,
             created_at: None,
+            clock: None,
             sync_mode: SyncMode::Normal,
             writeback_bytes: 0,
             written_back: 0,
@@ -248,6 +252,13 @@ impl Writer {
     #[must_use]
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
+        self
+    }
+
+    /// Reads the time on `clock`, the tree's own, instead of the process clock.
+    #[must_use]
+    pub(crate) fn use_clock(mut self, clock: Option<alloc::sync::Arc<dyn crate::Clock>>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -540,7 +551,7 @@ impl Writer {
             version: META_VERSION,
             created_at: self
                 .created_at
-                .unwrap_or_else(|| unix_timestamp().as_nanos()),
+                .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos()),
             item_count: self.item_count,
             total_compressed_bytes: self.written_blob_bytes,
             total_uncompressed_bytes: self.uncompressed_bytes,

@@ -1134,6 +1134,7 @@ impl AbstractTree for Tree {
 
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
         table_writer = table_writer.use_encryption(self.config.encryption.clone());
+        table_writer = table_writer.use_clock(self.config.clock.clone());
         // ECC scheme from the live runtime snapshot (same as `seqno_in_index`
         // / `kv_checksums` below), so a flush after a scheme change writes the
         // SST with the current scheme rather than the startup one.

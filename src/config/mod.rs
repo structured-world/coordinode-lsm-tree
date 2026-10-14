@@ -890,6 +890,10 @@ pub struct Config {
     /// using this provider after compression and before checksumming.
     pub(crate) encryption: Option<Arc<dyn EncryptionProvider>>,
 
+    /// The wall clock of this tree; `None` reads the process clock (see
+    /// [`Config::with_clock`]).
+    pub(crate) clock: Option<Arc<dyn crate::Clock>>,
+
     /// Policy governing what `Tree::open` does when the on-disk
     /// MANIFEST contains corrupt records. Defaults to
     /// [`ManifestRecoveryMode::AbsoluteConsistency`], the only
@@ -1224,6 +1228,7 @@ impl Default for Config {
 
             comparator: comparator::default_comparator(),
             encryption: None,
+            clock: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
             writeback_bytes: 1_024 * 1_024,
@@ -2462,6 +2467,45 @@ impl Config {
     #[must_use]
     pub fn with_encryption(mut self, encryption: Option<Arc<dyn EncryptionProvider>>) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    /// Sets the wall clock this tree reads: the creation time stamped on its
+    /// tables and blob files, and the time FIFO compaction measures TTL
+    /// against.
+    ///
+    /// Without one the tree reads the process clock: [`SystemClock`](crate::SystemClock)
+    /// under `std`, or the clock registered with `set_clock` under `no_std`.
+    ///
+    /// A fixed clock makes the files a tree writes reproducible: two trees
+    /// given the same fixed clock, the same writes in the same order and the
+    /// same configuration write byte-identical tables and blob files, wherever
+    /// their folders are. Encryption breaks that, since every sealed block
+    /// takes a fresh nonce.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{Clock, Config, SequenceNumberCounter};
+    /// # use std::{sync::Arc, time::Duration};
+    /// struct Epoch;
+    /// impl Clock for Epoch {
+    ///     fn unix_time(&self) -> Duration {
+    ///         Duration::from_secs(1_700_000_000)
+    ///     }
+    /// }
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .with_clock(Arc::new(Epoch));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn crate::Clock>) -> Self {
+        self.clock = Some(clock);
         self
     }
 

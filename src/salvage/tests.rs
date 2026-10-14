@@ -44,6 +44,41 @@ fn reconcile_clean(
     }
 }
 
+/// A salvaged copy holds its source's data, so it keeps the source's age: a
+/// copy stamped with the time of the salvage would restart FIFO's TTL for
+/// data that was already old.
+#[cfg(feature = "std")]
+#[test]
+fn salvage_copy_keeps_the_source_age() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    let age = 1_000_000_000_000u128;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?.use_created_at(age);
+    for i in 0u64..16 {
+        writer.write(InternalValue::from_components(
+            format!("key-{i:03}").into_bytes(),
+            b"v".to_vec(),
+            i + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let report = salvage_sst(&source, dest, &fs)?;
+    let Some(salvaged) = report.salvaged_path else {
+        panic!("every entry is intact: {report:?}");
+    };
+    assert_eq!(
+        crate::inspect::read_table_properties(&salvaged)?.created_at_nanos,
+        age,
+        "the copy took a new age",
+    );
+    Ok(())
+}
+
 /// Rot in a frame's length field is caught by the header CRC, after which the
 /// consumed lengths cannot locate the next frame: the salvage walk resyncs at
 /// the next magic instead of stopping. But the resync magic may be an original

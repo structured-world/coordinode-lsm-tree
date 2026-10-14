@@ -88,6 +88,12 @@ pub fn unix_timestamp() -> Duration {
     }
 }
 
+/// The time on `clock`, a tree's own clock, or on the process clock
+/// ([`unix_timestamp`]) when the tree has none.
+pub fn now_on(clock: Option<&alloc::sync::Arc<dyn Clock>>) -> Duration {
+    clock.map_or_else(unix_timestamp, |clock| clock.unix_time())
+}
+
 /// Monotonic instant used for elapsed-time logging on the compaction / flush
 /// paths.
 ///

@@ -34,7 +34,6 @@ use crate::{
             index::FullIndexWriter,
         },
     },
-    time::unix_timestamp,
     vlog::BlobFileId,
 };
 use alloc::sync::Arc;
@@ -846,6 +845,10 @@ pub struct Writer {
     /// every table the engine writes itself.
     created_at: Option<u128>,
 
+    /// The tree's clock, read for the age when nothing above sets it; `None`
+    /// reads the process clock.
+    clock: Option<Arc<dyn crate::Clock>>,
+
     /// The key range to record instead of the rows' own, set by a caller that
     /// ordered it under the tree's comparator; `None` for every table the
     /// engine writes itself.
@@ -865,14 +868,16 @@ pub struct Writer {
     #[cfg(feature = "columnar")]
     group_tags: crate::HashSet<u64>,
 
-    /// Tag of the first row group encoded here: a hash of the table's path,
-    /// id and creation time, in the lower half of `u64` so the increments
-    /// after it never run out, and never zero. Starting every table at its own point is what
+    /// Tag of the first row group encoded here: a hash of the table's id and
+    /// age, in the lower half of `u64` so the increments after it never run
+    /// out, and never zero. Starting every table at its own point is what
     /// makes a page's stamp name its table as well as its group: a page's
     /// values are apart from their keys, so a page taken for another table's
-    /// would serve that table's value under this table's key.
+    /// would serve that table's value under this table's key. Nothing outside
+    /// the tree enters it, so a tree on a fixed clock writes the same tags
+    /// wherever its folder is. `None` until the first group derives it.
     #[cfg(feature = "columnar")]
-    group_tag_base: u64,
+    group_tag_base: Option<u64>,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -1164,15 +1169,6 @@ impl Writer {
             return Err(e.into());
         }
 
-        #[cfg(feature = "columnar")]
-        let group_tag_base = {
-            let mut seed = alloc::format!("{}", path.display()).into_bytes();
-            seed.extend_from_slice(&table_id.to_le_bytes());
-            seed.extend_from_slice(&crate::time::unix_timestamp().as_nanos().to_le_bytes());
-            // Never zero: the index names a group by a non-zero tag.
-            (crate::hash::hash64(&seed) >> 1).max(1)
-        };
-
         Ok(Self {
             fs,
             initial_level,
@@ -1239,7 +1235,7 @@ impl Writer {
             #[cfg(feature = "columnar")]
             group_tags: crate::HashSet::default(),
             #[cfg(feature = "columnar")]
-            group_tag_base,
+            group_tag_base: None,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -1285,6 +1281,7 @@ impl Writer {
             lineage_transformed: false,
             lineage_last: false,
             created_at: None,
+            clock: None,
             key_range_cover: None,
 
             #[cfg(zstd_any)]
@@ -2260,6 +2257,9 @@ impl Writer {
             .use_lineage_prev(meta.lineage_prev)
             .use_lineage_transformed(meta.lineage_transformed)
             .use_lineage_last(meta.lineage_last)
+            // The copy holds the source's data, so it is as old: FIFO keeps
+            // judging it by the age the source had.
+            .use_created_at(meta.created_at.into())
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
@@ -2554,6 +2554,19 @@ impl Writer {
         self.assert_not_started("use_created_at");
         self.created_at = Some(created_at);
         self
+    }
+
+    /// Reads the time on `clock`, the tree's own, instead of the process clock.
+    #[must_use]
+    pub(crate) fn use_clock(mut self, clock: Option<Arc<dyn crate::Clock>>) -> Self {
+        self.assert_not_started("use_clock");
+        self.clock = clock;
+        self
+    }
+
+    /// The age this table records when nothing set it: now, on its clock.
+    fn now_nanos(&self) -> u128 {
+        crate::time::now_on(self.clock.as_ref()).as_nanos()
     }
 
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
@@ -3168,14 +3181,14 @@ impl Writer {
         // out where the pages are. Both are encrypted and ECC-protected exactly
         // like data.
         check_group_column_count(batch)?;
-        let page_transform = self.data_transform(self.data_block_compression)?;
-        let directory_transform = self.data_transform(crate::CompressionType::None)?;
         // A group copying another's pages keeps that group's tag, which every
         // copied page's stamp names.
         let group_tag = match carry {
             Some(carry) => carry.tag,
             None => self.next_group_tag()?,
         };
+        let page_transform = self.data_transform(self.data_block_compression)?;
+        let directory_transform = self.data_transform(crate::CompressionType::None)?;
 
         // The group's rows are cut into row pages shared by every column, and
         // each column gets one page per row page, all of one column's pages
@@ -4304,18 +4317,34 @@ impl Writer {
     #[cfg(feature = "columnar")]
     pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
         if self.last_encoded_tag.is_none() && tag != 0 {
-            self.group_tag_base = tag;
+            self.group_tag_base = Some(tag);
         }
+    }
+
+    /// The tag the first group encoded here starts from (see
+    /// [`Self::group_tag_base`]).
+    #[cfg(feature = "columnar")]
+    fn group_tag_base(&mut self) -> u64 {
+        *self.group_tag_base.get_or_insert_with(|| {
+            let age = self
+                .created_at
+                .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos());
+            let mut seed = [0u8; 24];
+            seed[..8].copy_from_slice(&self.table_id.to_le_bytes());
+            seed[8..].copy_from_slice(&age.to_le_bytes());
+            // Never zero: the index names a group by a non-zero tag.
+            (crate::hash::hash64(&seed) >> 1).max(1)
+        })
     }
 
     /// The tag for the next row group encoded here: the first tag past the
     /// last one encoded, or the base before any, that no group of the table
     /// took. Never zero, since the base is not and the increments are checked.
     #[cfg(feature = "columnar")]
-    fn next_group_tag(&self) -> crate::Result<u64> {
+    fn next_group_tag(&mut self) -> crate::Result<u64> {
         let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
         let mut tag = match self.last_encoded_tag {
-            None => self.group_tag_base,
+            None => self.group_tag_base(),
             Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
         };
         while self.group_tags.contains(&tag) {
@@ -5077,7 +5106,7 @@ impl Writer {
         let created_at_nanos = self
             .created_at
             .or_else(|| ages.and_then(|ages| ages.age_of(first_key, last_key)))
-            .unwrap_or_else(|| unix_timestamp().as_nanos());
+            .unwrap_or_else(|| self.now_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
             last_key,

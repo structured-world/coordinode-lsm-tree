@@ -5,7 +5,7 @@
 use super::{Choice, CompactionStrategy};
 use crate::{
     HashMap, HashSet, KvPair, TableId, compaction::state::CompactionState, config::Config,
-    table::Table, time::unix_timestamp, version::Version, vlog::BlobFileId,
+    table::Table, time::now_on, version::Version, vlog::BlobFileId,
 };
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -34,8 +34,9 @@ pub const NAME: &str = "FifoCompaction";
 /// strategy) can, and FIFO applies its limit and TTL to those outputs by the
 /// age they carry.
 ///
-/// Additionally, a (lazy) TTL can be configured to drop old tables. It is off
-/// while the clock reads zero, which is no clock.
+/// Additionally, a (lazy) TTL can be configured to drop old tables, measured on
+/// the tree's clock ([`Config::with_clock`]). It is off while the clock reads
+/// zero, which is no clock.
 ///
 /// ###### Caution
 ///
@@ -87,7 +88,7 @@ impl CompactionStrategy for Strategy {
         ]
     }
 
-    fn choose(&self, version: &Version, _: &Config, state: &CompactionState) -> Choice {
+    fn choose(&self, version: &Version, config: &Config, state: &CompactionState) -> Choice {
         // Early return avoids unnecessary work and keeps FIFO a no-op when there is nothing to do.
         if version.iter_tables().next().is_none() {
             return Choice::DoNothing;
@@ -105,7 +106,7 @@ impl CompactionStrategy for Strategy {
 
         // Compute TTL cutoff once and perform a single pass to mark expired tables and
         // accumulate their sizes. Also collect non-expired tables for possible size-based drops.
-        let now = unix_timestamp();
+        let now = now_on(config.clock.as_ref());
         let ttl_cutoff = match self.ttl_seconds {
             // A clock at zero is no clock (a `no_std` build before one is
             // registered): TTL is off then, as tables written meanwhile carry

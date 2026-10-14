@@ -86,6 +86,9 @@ pub struct MultiWriter {
     tree_id: TreeId,
     descriptor_table: Option<Arc<DescriptorTable>>,
 
+    /// The tree's clock, handed to every blob file writer.
+    clock: Option<Arc<dyn crate::Clock>>,
+
     /// Where a compaction learns of every blob file this writer creates, so
     /// it can remove the ones it never installs. `None` outside compaction.
     outputs: Option<crate::compaction::output_ledger::OutputLedger>,
@@ -139,6 +142,7 @@ impl MultiWriter {
 
             tree_id,
             descriptor_table,
+            clock: None,
             fs,
             outputs: None,
             landed: 0,
@@ -167,6 +171,14 @@ impl MultiWriter {
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.active_writer.sync_mode = sync_mode;
+        self
+    }
+
+    /// Reads the time on the tree's `clock` in every blob file written.
+    #[must_use]
+    pub(crate) fn use_clock(mut self, clock: Option<Arc<dyn crate::Clock>>) -> Self {
+        self.active_writer = self.active_writer.use_clock(clock.clone());
+        self.clock = clock;
         self
     }
 
@@ -293,7 +305,8 @@ impl MultiWriter {
         let mut w = w
             .use_compression(self.compression)
             .use_sync_mode(self.sync_mode)
-            .use_writeback_bytes(self.writeback_bytes);
+            .use_writeback_bytes(self.writeback_bytes)
+            .use_clock(self.clock.clone());
         // Carry the passthrough metadata codec onto the new writer so every
         // file in a relocation records the real compression.
         if passthrough != CompressionType::None {
@@ -474,7 +487,7 @@ impl MultiWriter {
                 meta: Metadata {
                     id: blob_file_id,
                     version: metadata.version,
-                    created_at: crate::time::unix_timestamp().as_nanos(),
+                    created_at: metadata.created_at,
                     item_count: metadata.item_count,
                     total_compressed_bytes: metadata.total_compressed_bytes,
                     total_uncompressed_bytes: metadata.total_uncompressed_bytes,
