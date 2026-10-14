@@ -325,6 +325,32 @@ pub struct KvSeparationOptions {
     pub zstd_dictionary: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
 }
 
+/// Whether a value read from a blob file goes into the shared cache.
+///
+/// Lookups are the same either way: a value already cached is served from
+/// it. Set on a live tree through
+/// [`RuntimeConfig::blob_cache_fill`](crate::runtime_config::RuntimeConfig::blob_cache_fill),
+/// seeded by [`Config::blob_cache_fill`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlobCacheFill {
+    /// Every value read from a blob file is cached.
+    #[default]
+    Always,
+    /// No value read from a blob file is cached, and a scan reads no values
+    /// ahead, since what it read ahead would have nowhere to wait: for large
+    /// values read mostly once, which would otherwise evict the index,
+    /// filter and data blocks of every tree sharing the cache.
+    Never,
+}
+
+impl BlobCacheFill {
+    /// Whether a value read now goes into the cache.
+    #[must_use]
+    pub const fn fills(self) -> bool {
+        matches!(self, Self::Always)
+    }
+}
+
 /// When and how much a compaction relocates blob files to restore scan
 /// locality. Set through [`KvSeparationOptions::relocate_for_locality`].
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -2061,6 +2087,31 @@ impl Config {
     #[must_use]
     pub fn blob_compression(mut self, compression: CompressionType) -> Self {
         self.initial_runtime_config.blob_compression = compression;
+        self
+    }
+
+    /// Sets whether a KV-separated tree starts caching the values it reads
+    /// from blob files.
+    ///
+    /// The initial value of
+    /// [`RuntimeConfig::blob_cache_fill`](crate::runtime_config::RuntimeConfig::blob_cache_fill),
+    /// which a live tree changes with [`crate::BlobTree::update_runtime_config`].
+    /// A standard tree ignores it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, KvSeparationOptions, SequenceNumberCounter, config::BlobCacheFill};
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// let config = Config::new(&folder, SequenceNumberCounter::default(), SequenceNumberCounter::default())
+    ///     .with_kv_separation(Some(KvSeparationOptions::default()))
+    ///     .blob_cache_fill(BlobCacheFill::Never);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn blob_cache_fill(mut self, fill: BlobCacheFill) -> Self {
+        self.initial_runtime_config.blob_cache_fill = fill;
         self
     }
 

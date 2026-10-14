@@ -113,6 +113,7 @@ impl AccessorShared<'_> {
         // read counters leave compaction's input out.
         let accessor = Accessor::new(
             &self.version.blob_files,
+            self.opts.runtime_config.load().blob_cache_fill,
             #[cfg(feature = "metrics")]
             None,
         );

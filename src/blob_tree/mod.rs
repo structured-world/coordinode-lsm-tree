@@ -37,6 +37,9 @@ use handle::BlobIndirection;
 pub struct Guard {
     tree: crate::BlobTree,
     version: Version,
+    /// Whether resolving the value caches it, as the tree said when the scan
+    /// began.
+    fill: crate::config::BlobCacheFill,
     kv: crate::Result<InternalValue>,
     /// Present when this guard came from a scan that can read ahead; resolving
     /// a value through it is what arms that read-ahead.
@@ -62,6 +65,7 @@ impl IterGuard for Guard {
             resolve_value_handle(
                 self.tree.id(),
                 &self.tree.index.config.cache,
+                self.fill,
                 &self.version,
                 #[cfg(feature = "metrics")]
                 self.tree.metrics(),
@@ -98,6 +102,7 @@ impl IterGuard for Guard {
         resolve_value_handle(
             self.tree.id(),
             &self.tree.index.config.cache,
+            self.fill,
             &self.version,
             #[cfg(feature = "metrics")]
             self.tree.metrics(),
@@ -109,6 +114,7 @@ impl IterGuard for Guard {
 pub(crate) fn resolve_value_handle(
     tree_id: TreeId,
     cache: &crate::Cache,
+    fill: crate::config::BlobCacheFill,
     version: &Version,
     #[cfg(feature = "metrics")] metrics: &crate::metrics::Metrics,
     item: InternalValue,
@@ -116,6 +122,7 @@ pub(crate) fn resolve_value_handle(
     if item.key.value_type.is_cell_row() {
         let accessor = Accessor::new(
             &version.blob_files,
+            fill,
             #[cfg(feature = "metrics")]
             Some(metrics),
         );
@@ -139,6 +146,7 @@ pub(crate) fn resolve_value_handle(
         // this version keeps the file alive.
         let accessor = Accessor::new(
             &version.blob_files,
+            fill,
             #[cfg(feature = "metrics")]
             Some(metrics),
         );
@@ -164,6 +172,9 @@ pub(crate) fn resolve_value_handle(
 pub(crate) struct BlobSource {
     pub(crate) tree_id: TreeId,
     pub(crate) cache: Arc<crate::Cache>,
+    /// Whether the values read through it go into the cache, as the tree's
+    /// runtime config said when the read began.
+    pub(crate) fill: crate::config::BlobCacheFill,
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
 }
@@ -175,6 +186,7 @@ impl BlobSource {
         resolve_value_handle(
             self.tree_id,
             &self.cache,
+            self.fill,
             version,
             #[cfg(feature = "metrics")]
             &self.metrics,
@@ -199,6 +211,7 @@ impl BlobSource {
     ) -> crate::Result<UserValue> {
         Accessor::new(
             &version.blob_files,
+            self.fill,
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         )
@@ -221,6 +234,7 @@ impl BlobSource {
     ) {
         Accessor::new(
             &version.blob_files,
+            self.fill,
             #[cfg(feature = "metrics")]
             Some(&self.metrics),
         )
@@ -334,6 +348,7 @@ impl BlobTree {
         let (_, v) = resolve_value_handle(
             self.id(),
             &self.index.config.cache,
+            self.blob_cache_fill(),
             &super_version.version,
             #[cfg(feature = "metrics")]
             self.metrics(),
@@ -365,12 +380,14 @@ impl BlobTree {
         &self,
         target_seqno: SeqNo,
     ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<>> {
+        let fill = self.blob_cache_fill();
         self.index
             .scan_since_seqno_with(target_seqno, true, |version, entry| {
                 let seqno = entry.key.seqno;
                 let (key, value) = resolve_value_handle(
                     self.id(),
                     &self.index.config.cache,
+                    fill,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -416,11 +433,18 @@ impl BlobTree {
         ))
     }
 
+    /// Whether a read beginning now caches the values it reads from blob
+    /// files.
+    fn blob_cache_fill(&self) -> crate::config::BlobCacheFill {
+        self.index.runtime_config.load().blob_cache_fill
+    }
+
     /// Where this tree's values kept in the value log are read from.
     fn blob_source(&self) -> BlobSource {
         BlobSource {
             tree_id: self.id(),
             cache: Arc::clone(&self.index.config.cache),
+            fill: self.blob_cache_fill(),
             #[cfg(feature = "metrics")]
             metrics: Arc::clone(self.metrics()),
         }
@@ -445,6 +469,7 @@ impl BlobTree {
         range: R,
     ) -> crate::Result<impl Iterator<Item = ScanSinceEvent> + use<K, R>> {
         let bounds = crate::tree::range_to_user_bounds(&range);
+        let fill = self.blob_cache_fill();
         self.index.scan_since_seqno_scoped(
             target_seqno,
             true,
@@ -453,6 +478,7 @@ impl BlobTree {
                 let (key, value) = resolve_value_handle(
                     self.id(),
                     &self.index.config.cache,
+                    fill,
                     version,
                     #[cfg(feature = "metrics")]
                     self.metrics(),
@@ -845,15 +871,22 @@ const PREFETCH_MAX_READ: usize = 4 * 1_024 * 1_024;
 impl BlobTree {
     /// Read-ahead state for one scan, seeded from the tree's configuration.
     fn scan_prefetch_state(&self) -> Arc<ScanPrefetch> {
-        let window = self
-            .index
-            .config
-            .kv_separation_opts
-            .as_ref()
-            .map_or(0, |o| o.scan_prefetch as usize);
+        let fill = self.blob_cache_fill();
+        // A read-ahead only warms the cache: with the cache not to be filled,
+        // the window is off.
+        let window = if fill.fills() {
+            self.index
+                .config
+                .kv_separation_opts
+                .as_ref()
+                .map_or(0, |o| o.scan_prefetch as usize)
+        } else {
+            0
+        };
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
+            fill,
             window,
             max_gap: PREFETCH_MAX_GAP,
             max_read: PREFETCH_MAX_READ,
@@ -866,11 +899,13 @@ impl BlobTree {
 fn blob_guard(
     tree: &crate::BlobTree,
     version: &Version,
+    fill: crate::config::BlobCacheFill,
     item: crate::Result<InternalValue>,
 ) -> IterGuardImpl {
     IterGuardImpl::Blob(Guard {
         tree: tree.clone(),
         version: version.clone(),
+        fill,
         kv: item,
         prefetch: None,
     })
@@ -888,6 +923,9 @@ fn blob_guard(
 /// for the first.
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
+    /// Whether the scan caches the values it reads, as the tree said when the
+    /// scan began.
+    fill: crate::config::BlobCacheFill,
     /// How many upcoming items to gather per read-ahead.
     window: usize,
     /// Wasted bytes between two records worth swallowing to merge their reads.
@@ -987,6 +1025,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
 
         let accessor = Accessor::new(
             &self.version.blob_files,
+            self.state.fill,
             #[cfg(feature = "metrics")]
             Some(self.tree.metrics()),
         );
@@ -1004,6 +1043,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
         IterGuardImpl::Blob(Guard {
             tree: self.tree.clone(),
             version: self.version.clone(),
+            fill: self.state.fill,
             kv: item,
             // Only until the read-ahead is armed, and never with the window
             // disabled. The guards exist to report the FIRST resolution; once
@@ -1076,6 +1116,8 @@ struct BlobSeekable {
     inner: crate::range::SeekableTreeIter,
     tree: crate::BlobTree,
     version: Version,
+    /// Whether its values are cached, as the tree said when it was opened.
+    fill: crate::config::BlobCacheFill,
 }
 
 impl Iterator for BlobSeekable {
@@ -1084,7 +1126,7 @@ impl Iterator for BlobSeekable {
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .next()
-            .map(|item| blob_guard(&self.tree, &self.version, item))
+            .map(|item| blob_guard(&self.tree, &self.version, self.fill, item))
     }
 }
 
@@ -1092,7 +1134,7 @@ impl DoubleEndedIterator for BlobSeekable {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner
             .next_back()
-            .map(|item| blob_guard(&self.tree, &self.version, item))
+            .map(|item| blob_guard(&self.tree, &self.version, self.fill, item))
     }
 }
 
@@ -1388,6 +1430,7 @@ impl AbstractTree for BlobTree {
             inner,
             tree: self.clone(),
             version,
+            fill: self.blob_cache_fill(),
         })
     }
 

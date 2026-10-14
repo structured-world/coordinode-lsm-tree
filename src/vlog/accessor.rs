@@ -6,6 +6,7 @@
 use crate::metrics::Metrics;
 use crate::{
     Cache, GlobalTableId, TreeId, UserValue,
+    config::BlobCacheFill,
     version::BlobFileList,
     vlog::{ValueHandle, blob_file::reader::Reader},
 };
@@ -19,6 +20,8 @@ use alloc::{string::ToString, vec::Vec};
 /// hold.
 pub struct Accessor<'a> {
     blob_files: &'a BlobFileList,
+    /// Whether the values this accessor reads from disk go into the cache.
+    fill: BlobCacheFill,
     /// Where this accessor's reads are counted. A blob read is a read of the
     /// filesystem like any other, so it lands in the same `bytes_read` /
     /// `bytes_decoded` pair the block path reports through. `None` for a
@@ -31,10 +34,12 @@ pub struct Accessor<'a> {
 impl<'a> Accessor<'a> {
     pub fn new(
         blob_files: &'a BlobFileList,
+        fill: BlobCacheFill,
         #[cfg(feature = "metrics")] metrics: Option<&'a Metrics>,
     ) -> Self {
         Self {
             blob_files,
+            fill,
             #[cfg(feature = "metrics")]
             metrics,
         }
@@ -127,8 +132,10 @@ impl<'a> Accessor<'a> {
         let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
         self.count_decoded(decoded);
         let value = parsed?;
-        let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
-        self.count_gather(detached);
+        if self.fill.fills() {
+            let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
+            self.count_gather(detached);
+        }
 
         Ok(Some(value))
     }
@@ -181,6 +188,11 @@ impl<'a> Accessor<'a> {
         max_gap: u64,
         max_read: usize,
     ) {
+        // What it reads goes nowhere but the cache: with the cache not to be
+        // filled, there is nothing to read ahead into.
+        if !self.fill.fills() {
+            return;
+        }
         // Warm at most half the (shared) cache, so a prefetch cannot evict more
         // than it contributes. Mirrors the block prewarm's bound.
         let capacity = cache.capacity();

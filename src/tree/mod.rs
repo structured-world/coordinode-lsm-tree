@@ -3427,6 +3427,7 @@ impl Tree {
             .then(|| crate::blob_tree::BlobSource {
                 tree_id: self.id,
                 cache: Arc::clone(&self.config.cache),
+                fill: self.runtime_config.load().blob_cache_fill,
                 #[cfg(feature = "metrics")]
                 metrics: Arc::clone(&self.0.metrics),
             })
