@@ -47,6 +47,24 @@ pub struct Guard {
     /// Present when this guard came from a scan that can read ahead; resolving
     /// a value through it is what arms that read-ahead.
     prefetch: Option<Arc<ScanPrefetch>>,
+    /// Counts `prefetched` against its scan's read-ahead bound until this
+    /// guard is resolved or dropped: held for its drop alone.
+    _held: Option<HeldReadAhead>,
+}
+
+/// Bytes of read-ahead values a guard holds, released with the guard: what
+/// lets a scan see that the guards it handed out still hold a read's worth.
+struct HeldReadAhead {
+    state: Arc<ScanPrefetch>,
+    bytes: u64,
+}
+
+impl Drop for HeldReadAhead {
+    fn drop(&mut self) {
+        self.state
+            .held
+            .fetch_sub(self.bytes, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl IterGuard for Guard {
@@ -932,6 +950,7 @@ impl BlobTree {
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
+            held: core::sync::atomic::AtomicU64::new(0),
             fill,
             window,
             max_gap: PREFETCH_MAX_GAP,
@@ -988,6 +1007,7 @@ fn blob_guard(
         prefetched: Vec::new(),
         kv: item,
         prefetch: None,
+        _held: None,
     })
 }
 
@@ -1003,6 +1023,9 @@ fn blob_guard(
 /// for the first.
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
+    /// Bytes of values read ahead into the scan's own store that guards it
+    /// handed out still hold, unresolved.
+    held: core::sync::atomic::AtomicU64,
     /// Whether the scan caches the values it reads, as the tree said when the
     /// scan began; when it does not, it keeps what it reads ahead itself.
     fill: crate::config::BlobCacheFill,
@@ -1118,8 +1141,16 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
 
         // Into the cache when the scan caches what it reads, else into its own
         // store, where the guards of the window's items take their values.
+        // While the guards handed out still hold a read's worth unresolved (a
+        // caller keeping them, say), the scan reads nothing more ahead: its
+        // memory stays bounded by two reads, not by the scan, and the guards
+        // that follow read their values when resolved.
         let into = if self.state.fill.fills() {
             crate::vlog::PrefetchInto::Cache
+        } else if self.state.held.load(core::sync::atomic::Ordering::Relaxed)
+            >= self.state.max_read as u64
+        {
+            return;
         } else {
             crate::vlog::PrefetchInto::Local(&mut self.local)
         };
@@ -1138,11 +1169,22 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             Ok(kv) if !self.local.is_empty() => take_prefetched(&mut self.local, kv),
             _ => Vec::new(),
         };
+        let held = (!prefetched.is_empty()).then(|| {
+            let bytes = prefetched.iter().map(|(_, value)| value.len() as u64).sum();
+            self.state
+                .held
+                .fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
+            HeldReadAhead {
+                state: Arc::clone(&self.state),
+                bytes,
+            }
+        });
         IterGuardImpl::Blob(Guard {
             tree: self.tree.clone(),
             version: self.version.clone(),
             fill: self.state.fill,
             prefetched,
+            _held: held,
             kv: item,
             // Only until the read-ahead is armed, and never with the window
             // disabled. The guards exist to report the FIRST resolution; once

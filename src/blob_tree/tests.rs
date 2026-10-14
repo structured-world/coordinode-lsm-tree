@@ -215,6 +215,59 @@ fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
     assert!(store.is_empty(), "taken out, not copied");
 }
 
+/// A scan that does not cache hands each guard the values read ahead for it.
+/// A caller that keeps the guards without resolving them (collecting the rest
+/// of a scan, say) must not make the scan read the whole value log into them:
+/// once the guards hold a read's worth, the scan stops reading ahead, and the
+/// guards it hands out after that read their values when resolved.
+#[cfg(feature = "metrics")]
+#[test]
+fn guards_kept_unresolved_hold_no_more_than_the_read_ahead_bound() -> crate::Result<()> {
+    use crate::{AbstractTree, Guard as _};
+
+    const KEYS: u32 = 512;
+    const VALUE: usize = 64 * 1_024;
+
+    let folder = crate::get_tmp_folder();
+    let crate::AnyTree::Blob(tree) = crate::Config::new(
+        folder.path(),
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+    .blob_compression(crate::CompressionType::None)
+    .blob_cache_fill(crate::config::BlobCacheFill::Never)
+    .open()?
+    else {
+        panic!("a tree with kv separation opens as a blob tree");
+    };
+    for i in 0..KEYS {
+        tree.insert(format!("k{i:04}"), vec![b'v'; VALUE], u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let mut iter = tree.iter(crate::SeqNo::MAX, None);
+    // Resolving one value is what arms the read-ahead.
+    let Some(first) = iter.next() else {
+        panic!("the scan yields a row");
+    };
+    let first = first.into_inner()?;
+    assert_eq!(first.1.len(), VALUE);
+    let before = tree.metrics().blob_bytes_prefetched();
+    let kept: Vec<_> = iter.collect();
+    let read_ahead = tree.metrics().blob_bytes_prefetched() - before;
+    assert_eq!(kept.len(), KEYS as usize - 1);
+    assert!(
+        read_ahead < 3 * PREFETCH_MAX_READ as u64,
+        "{read_ahead} bytes read ahead into guards nobody resolved, of {} in the scan",
+        u64::from(KEYS) * VALUE as u64,
+    );
+    for guard in kept {
+        assert_eq!(guard.into_inner()?.1.len(), VALUE);
+    }
+    Ok(())
+}
+
 /// An indirection naming a blob file the version does not hold is damage:
 /// resolving it is an error the caller can handle, never a panic and never
 /// an empty value.
