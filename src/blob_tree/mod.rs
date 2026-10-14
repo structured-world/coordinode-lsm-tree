@@ -56,7 +56,7 @@ pub struct Guard {
 /// lets a scan see that the guards it handed out still hold a read's worth.
 struct HeldReadAhead {
     state: Arc<ScanPrefetch>,
-    bytes: u64,
+    bytes: usize,
 }
 
 impl Drop for HeldReadAhead {
@@ -950,7 +950,7 @@ impl BlobTree {
 
         Arc::new(ScanPrefetch {
             resolving: core::sync::atomic::AtomicBool::new(false),
-            held: core::sync::atomic::AtomicU64::new(0),
+            held: core::sync::atomic::AtomicUsize::new(0),
             fill,
             window,
             max_gap: PREFETCH_MAX_GAP,
@@ -1024,8 +1024,9 @@ fn blob_guard(
 pub(crate) struct ScanPrefetch {
     resolving: core::sync::atomic::AtomicBool,
     /// Bytes of values read ahead into the scan's own store that guards it
-    /// handed out still hold, unresolved.
-    held: core::sync::atomic::AtomicU64,
+    /// handed out still hold, unresolved. Within two reads, so a `usize`
+    /// holds it on every target, 32-bit ones without 64-bit atomics too.
+    held: core::sync::atomic::AtomicUsize,
     /// Whether the scan caches the values it reads, as the tree said when the
     /// scan began; when it does not, it keeps what it reads ahead itself.
     fill: crate::config::BlobCacheFill,
@@ -1147,8 +1148,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
         // that follow read their values when resolved.
         let into = if self.state.fill.fills() {
             crate::vlog::PrefetchInto::Cache
-        } else if self.state.held.load(core::sync::atomic::Ordering::Relaxed)
-            >= self.state.max_read as u64
+        } else if self.state.held.load(core::sync::atomic::Ordering::Relaxed) >= self.state.max_read
         {
             return;
         } else {
@@ -1170,7 +1170,7 @@ impl<I: Iterator<Item = crate::Result<InternalValue>>> PrefetchScan<I> {
             _ => Vec::new(),
         };
         let held = (!prefetched.is_empty()).then(|| {
-            let bytes = prefetched.iter().map(|(_, value)| value.len() as u64).sum();
+            let bytes = prefetched.iter().map(|(_, value)| value.len()).sum();
             self.state
                 .held
                 .fetch_add(bytes, core::sync::atomic::Ordering::Relaxed);
