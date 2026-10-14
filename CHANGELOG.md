@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.3](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.12.2...v5.12.3) - 2026-10-14
+
+### Fixed
+
+- *(filter)* skip by a table's prefix filter only under its own extractor (5.x) ([#907](https://github.com/structured-world/coordinode-lsm-tree/pull/907))
+
 ## [5.12.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.12.1...v5.12.2) - 2026-10-12
 
 ### Fixed
