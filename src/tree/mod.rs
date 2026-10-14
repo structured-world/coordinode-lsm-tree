@@ -1982,6 +1982,9 @@ impl AbstractTree for Tree {
                 .version
                 .read_mix()
                 .note_points(u64::try_from(n).unwrap_or(u64::MAX));
+            // One blob source for every key of the batch, taken when a merge
+            // first needs it, so both keys read under one fill policy.
+            let blob_source = core::cell::OnceCell::new();
             return keys
                 .iter()
                 .map(|key| {
@@ -1991,7 +1994,7 @@ impl AbstractTree for Tree {
                         seqno,
                         merge_operator,
                         comparator,
-                        || self.blob_source(),
+                        || blob_source.get_or_init(|| self.blob_source()).clone(),
                     )
                 })
                 .collect();

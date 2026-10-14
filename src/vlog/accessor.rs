@@ -406,18 +406,15 @@ impl<'a> Accessor<'a> {
         let reader = Reader::new(blob_file, file.as_ref());
 
         // An uncompressed value is returned as a VIEW into the buffer it was
-        // parsed from. Sub-slicing the span would therefore make every cached
-        // value pin the whole coalesced read: the cache would account for one
-        // record and retain the entire window until the last of them is
-        // evicted. Copy each record out instead, so a cached value owns exactly
-        // its own bytes, exactly as it does on the one-record read path. The
-        // compressed paths decompress into a fresh buffer already, so there the
-        // view is dropped with this function and copying would be pure waste.
-        // The read's own store holds the values only until the read takes
-        // them, the span no longer than one read: views there pin nothing
-        // past the read, and are not copied.
-        let aliases_input = matches!(blob_file.0.meta.compression, crate::CompressionType::None)
-            && matches!(into, PrefetchInto::Cache);
+        // parsed from, here the whole coalesced read. Handed on as it is, every
+        // value would pin that read for as long as anyone holds it: the cache
+        // until the last of the window is evicted, a scan's caller for as long
+        // as it keeps the value. So such a value is copied out, once it is
+        // known to be handed on, and then owns exactly its own bytes, as on the
+        // one-record read path. The compressed paths decompress into a fresh
+        // buffer already, so there the span is dropped with this function and
+        // copying would be pure waste.
+        let aliases_span = matches!(blob_file.0.meta.compression, crate::CompressionType::None);
 
         for &(key, vhandle, len) in records {
             if *admit_budget == 0 {
@@ -432,17 +429,10 @@ impl<'a> Accessor<'a> {
             let Some(record_end) = rel.checked_add(len) else {
                 continue;
             };
-            let Some(bytes) = span.get(rel..record_end) else {
+            if record_end > span.len() {
                 continue;
-            };
-
-            let record = if aliases_input {
-                // A copy out of the span: charged as the gather it is.
-                self.count_gather(bytes.len());
-                crate::Slice::from(bytes)
-            } else {
-                span.slice(rel..record_end)
-            };
+            }
+            let record = span.slice(rel..record_end);
             // Decoded only: the span's bytes were charged once above. Charged
             // whether or not the record is then accepted.
             let mut decoded = 0;
@@ -470,6 +460,13 @@ impl<'a> Accessor<'a> {
                     return;
                 }
                 *admit_budget -= weight;
+                let value = if aliases_span {
+                    // A copy out of the span: charged as the gather it is.
+                    self.count_gather(value.len());
+                    UserValue::new(&value)
+                } else {
+                    value
+                };
                 match into {
                     PrefetchInto::Cache => {
                         let detached = cache.insert_blob(tree_id, &vhandle, key, value);

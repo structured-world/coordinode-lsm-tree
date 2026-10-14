@@ -343,12 +343,15 @@ impl Tree {
                 .map_or(seqno, |next: SeqNo| seqno.min(next)),
             None => 0,
         };
+        // One blob source for the whole scan: a merge's base and a projected
+        // value are read under the one fill policy the scan began with.
+        let blob_source = self.blob_source();
         // Operands are resolved in that same version, so a version installed
         // mid-scan changes no row the scan returns.
         let resolver = self.config.merge_operator.clone().map(|operator| Resolver {
             version: super_version.clone(),
             operator,
-            blob_source: self.blob_source(),
+            blob_source: blob_source.clone(),
         });
         // The index of a blob tree: its rows' fields are read by the engine,
         // out of rows written as cells and the objects they reference, and
@@ -357,7 +360,7 @@ impl Tree {
         // by id alone, or a predicate on one no field declares, would read a
         // stored representation (a cell row, an indirection) rather than a
         // value, so a field is declared with its type.
-        let cells = self.blob_source().map(|source| cells::CellSource {
+        let cells = blob_source.map(|source| cells::CellSource {
             version: super_version.clone(),
             source,
         });

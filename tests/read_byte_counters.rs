@@ -662,26 +662,27 @@ fn uncompressed_blob_tree(fill: BlobCacheFill) -> (TempDir, AnyTree) {
 }
 
 #[test]
-fn an_uncached_blob_prefetch_hands_out_its_records_uncopied() {
-    // Not cached, a scan's read-ahead holds its values only until the scan
-    // takes them, out of one read no larger than the bound: an uncompressed
-    // record is handed out as a view of that read, and the only bytes the
-    // scan copies are the keys its store keeps them under.
+fn an_uncached_blob_prefetch_detaches_the_values_it_hands_out() {
+    // Not cached, a scan's read-ahead still hands its values to the caller,
+    // who may keep them as long as it likes. An uncompressed value handed out
+    // as a view of the coalesced read would pin that whole read for as long
+    // as the caller keeps it, so each value is copied out: a copy the gather
+    // counter has to show.
     let (_folder, tree) = uncompressed_blob_tree(BlobCacheFill::Never);
+    let value_len = 8_192_usize;
     let m = tree.metrics();
     let before = m.bytes_copied();
     let mut rows = 0_u32;
     for guard in tree.iter(SeqNo::MAX, None) {
         let (_, value) = guard.into_inner().expect("row");
-        assert_eq!(value.len(), 8_192);
+        assert_eq!(value.len(), value_len);
         rows += 1;
     }
     assert_eq!(rows, 50);
     assert!(m.blob_bytes_prefetched() > 0, "the scan read ahead");
-    let keys: u64 = (0..50).map(|i| key(i).len() as u64).sum();
     assert!(
-        m.bytes_copied() - before <= keys,
-        "the read-ahead copied {} B, more than the {keys} B of keys",
+        m.bytes_copied() - before >= value_len as u64,
+        "the read-ahead handed out views of its span, copying only {} B",
         m.bytes_copied() - before,
     );
 }
