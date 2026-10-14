@@ -64,6 +64,10 @@ pub struct Inner {
     /// Pinned AMQ filter
     pub pinned_filter_block: Option<FilterBlock>,
 
+    /// Whether the filter indexes the prefixes of the extractor this table
+    /// was opened under, so a prefix scan may skip the table on its answer.
+    pub(super) prefix_filter: bool,
+
     /// True when the table was compacted away or dropped
     ///
     /// May be kept alive until all Arcs to the table have been dropped (to facilitate snapshots)

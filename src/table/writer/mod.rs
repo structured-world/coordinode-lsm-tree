@@ -333,6 +333,9 @@ pub struct Writer {
     /// Stored so `use_partitioned_filter()` can re-apply it to the new writer
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
+    /// Whether the filter is partitioned, which indexes no prefix.
+    partitioned_filter: bool,
+
     /// Value type of the previously written item (merge-operand ordering
     /// checks in the columnar path).
     previous_type: Option<ValueType>,
@@ -711,6 +714,7 @@ impl Writer {
             bloom_policy: BloomConstructionPolicy::default(),
 
             prefix_extractor: None,
+            partitioned_filter: false,
 
             previous_type: None,
             previous_weak_tombstone_key: None,
@@ -976,6 +980,9 @@ impl Writer {
             weak_tombstone_count: self.meta.weak_tombstone_count as u64,
             weak_tombstone_reclaimable: self.meta.weak_tombstone_reclaimable_count as u64,
             key_count: self.meta.key_count as u64,
+            // Borrowed from the writer, which the caller still writes through:
+            // set by the caller, see `indexed_extractor`.
+            prefix_extractor: None,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
             uncompressed_size: self.meta.uncompressed_size,
@@ -1030,6 +1037,10 @@ impl Writer {
     /// key bounds. The lineage markers `finish` may still add are counted.
     fn meta_payload_len_without_keys(&self) -> crate::Result<u64> {
         let mut params = self.meta_section_params(&[], &[], (0, 0), 0, (0, 0), 0);
+        // From above: whether a filter is written is not known yet, so one is
+        // counted as if it were.
+        params.prefix_extractor =
+            indexed_extractor(self.prefix_extractor.as_deref(), self.partitioned_filter, 1);
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
         params.lineage_last |= has_lineage;
@@ -1313,6 +1324,7 @@ impl Writer {
         #[cfg(zstd_any)]
         let filter_writer = filter_writer.use_zstd_two_pass_seed(self.zstd_two_pass_seed);
         self.filter_writer = filter_writer;
+        self.partitioned_filter = true;
         self
     }
 
@@ -3340,6 +3352,11 @@ impl Writer {
             },
             created_at_nanos,
         );
+        meta_params.prefix_extractor = indexed_extractor(
+            self.prefix_extractor.as_deref(),
+            self.partitioned_filter,
+            filter_block_count,
+        );
 
         // MID meta copy — defends against torn-write at the file tail
         // (incomplete fsync). Written at the current writer cursor,
@@ -3521,6 +3538,19 @@ impl Writer {
     }
 }
 
+/// The name of the extractor whose prefixes a table's filter indexes. Only a
+/// full filter (`filter_blocks > 0`, not partitioned) built under an
+/// extractor does: a partitioned one never indexes prefixes.
+fn indexed_extractor(
+    extractor: Option<&dyn PrefixExtractor>,
+    partitioned: bool,
+    filter_blocks: usize,
+) -> Option<&str> {
+    extractor
+        .filter(|_| !partitioned && filter_blocks > 0)
+        .map(PrefixExtractor::name)
+}
+
 /// Parameters bundle for [`write_meta_section`]. Free-standing struct
 /// (not a `Writer` method) because `finish()` calls this AFTER
 /// `index_writer.finish()` / `filter_writer.finish()` have consumed
@@ -3547,6 +3577,9 @@ struct MetaSectionParams<'a> {
     weak_tombstone_count: u64,
     weak_tombstone_reclaimable: u64,
     key_count: u64,
+    /// Name of the extractor whose prefixes the table's full filter indexes;
+    /// `None` when it indexes none.
+    prefix_extractor: Option<&'a str>,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
     uncompressed_size: u64,
@@ -3839,6 +3872,14 @@ fn encode_meta_payload(
     // all along.
     if let Some(recency) = p.recency {
         meta_items.push(meta("recency", &recency.to_le_bytes()));
+    }
+
+    // Whose prefixes the filter indexes: a prefix scan consults it only under
+    // that extractor, and reads the table under any other. Absent on a table
+    // from before this key existed, which is read too: what it indexed is
+    // unknown.
+    if let Some(name) = p.prefix_extractor {
+        meta_items.push(meta("prefix_extractor", name.as_bytes()));
     }
 
     // Compaction lineage: the sorted input ids this output merges, as

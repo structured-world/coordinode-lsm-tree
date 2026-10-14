@@ -169,6 +169,10 @@ pub struct RecoverParams {
     pub zstd_dictionaries: crate::compression::ZstdDictionaries,
     /// The tree's key ordering.
     pub comparator: SharedComparator,
+    /// The tree's prefix extractor. A prefix scan consults the table's filter
+    /// only when the table's filter indexes this extractor's prefixes; `None`
+    /// never consults it.
+    pub prefix_extractor: Option<Arc<dyn crate::prefix::PrefixExtractor>>,
     /// Metrics sink.
     #[cfg(feature = "metrics")]
     pub metrics: Arc<Metrics>,
@@ -203,6 +207,7 @@ impl RecoverParams {
             #[cfg(zstd_any)]
             zstd_dictionaries: crate::compression::ZstdDictionaries::new(),
             comparator,
+            prefix_extractor: None,
             #[cfg(feature = "metrics")]
             metrics: Arc::new(Metrics::default()),
         }
@@ -4887,7 +4892,14 @@ impl Table {
             // so the probe reads each partition once.
             partitions: alloc::collections::BTreeMap::new(),
             prev_key: None,
-            prefix_extractor: prefix_extractor.cloned(),
+            // Only the extractor the filter was built under emitted the
+            // prefixes it holds: probed under another, a healthy filter
+            // reports them absent.
+            prefix_extractor: prefix_extractor
+                .filter(|extractor| {
+                    self.metadata.prefix_extractor.as_deref() == Some(extractor.name().as_bytes())
+                })
+                .cloned(),
         }))
     }
 
@@ -7486,6 +7498,7 @@ impl Table {
             #[cfg(zstd_any)]
             zstd_dictionaries,
             comparator,
+            prefix_extractor,
             #[cfg(feature = "metrics")]
             metrics,
         } = params;
@@ -8304,6 +8317,14 @@ impl Table {
             file_path.display(),
         );
 
+        // Decided once, here: the tree's extractor is fixed for the life of
+        // an open tree, and a filter indexes only the prefixes of the one it
+        // was built under.
+        let prefix_filter = matches!(
+            (&metadata.prefix_extractor, &prefix_extractor),
+            (Some(recorded), Some(current)) if &**recorded == current.name().as_bytes()
+        );
+
         Ok(Self(
             Arc::new(Inner {
                 path: file_path,
@@ -8322,6 +8343,8 @@ impl Table {
                 pinned_filter_index,
 
                 pinned_filter_block,
+
+                prefix_filter,
 
                 is_deleted: AtomicBool::default(),
                 punch_on_drop: AtomicU64::new(u64::MAX),
@@ -9072,9 +9095,22 @@ impl Table {
     ///
     /// This is used by prefix scans to skip segments that contain no keys
     /// with a matching prefix. The prefix must have been indexed at write
-    /// time via a [`PrefixExtractor`](crate::PrefixExtractor).
+    /// time via a [`PrefixExtractor`](crate::PrefixExtractor): a table whose
+    /// filter indexes another extractor's prefixes, or none, cannot rule the
+    /// prefix out and answers `Ok(true)`.
     pub(crate) fn maybe_contains_prefix(&self, prefix_hash: u64) -> crate::Result<bool> {
+        if !self.prefix_filter {
+            return Ok(true);
+        }
         self.bloom_may_contain_hash(prefix_hash)
+    }
+
+    /// Whether [`Self::maybe_contains_prefix`] asks the filter at all: the
+    /// filter indexes the prefixes of the extractor the table was opened
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn has_prefix_filter(&self) -> bool {
+        self.prefix_filter
     }
 
     /// Checks the bloom filter for a precomputed key hash.

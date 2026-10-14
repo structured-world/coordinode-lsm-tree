@@ -71,6 +71,12 @@ pub struct ParsedMeta {
     /// (duplicate versions assumed).
     pub key_count: Option<u64>,
 
+    /// Name of the [`PrefixExtractor`](crate::PrefixExtractor) whose prefixes
+    /// the table's full filter indexes (the `prefix_extractor` meta key).
+    /// `None` when it indexes none, or for a table written before this field
+    /// was persisted: what such a filter indexed is unknown.
+    pub prefix_extractor: Option<crate::Slice>,
+
     pub tombstone_count: u64,
 
     /// Number of RANGE tombstones the writer emitted into the
@@ -593,6 +599,9 @@ impl ParsedMeta {
         let delete_bitmap_len = read_opt_u64(b"descriptor#delete_bitmap_len")?;
         let delete_bitmap_hash = read_opt_u128(b"descriptor#delete_bitmap_hash")?;
         let key_count = read_opt_u64(b"key_count")?;
+        let prefix_extractor = block
+            .point_read(b"prefix_extractor", SeqNo::MAX, &cmp)?
+            .map(|item| item.value);
         let recency = read_opt_u64(b"recency")?;
         // Compaction lineage: consecutive little-endian input ids. A payload
         // that is not a whole number of ids is corrupt meta.
@@ -634,6 +643,7 @@ impl ParsedMeta {
             file_size,
             item_count,
             key_count,
+            prefix_extractor,
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,

@@ -1643,6 +1643,13 @@ impl Config {
     /// When configured, bloom filters will index key prefixes returned by
     /// the extractor. Prefix scans can then skip segments whose bloom
     /// filter reports no match for the scan prefix.
+    ///
+    /// The extractor may be added or replaced on reopen. A table records the
+    /// [`name`](PrefixExtractor::name) of the extractor its filter indexes,
+    /// and a prefix scan skips by a table's filter only when that is the
+    /// configured extractor: tables written without it, under another, or
+    /// before tables recorded it, are read instead, until compaction
+    /// rewrites them.
     #[must_use]
     pub fn prefix_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
         self.prefix_extractor = Some(extractor);
