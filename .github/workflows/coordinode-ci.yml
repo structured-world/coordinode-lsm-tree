@@ -299,7 +299,11 @@ jobs:
     # runs the real tests rather than inheriting the default
     # needs-gating skip.
     if: ${{ always() && !cancelled() && needs.lint.result == 'success' && needs.changes.outputs.code != 'false' }}
-    timeout-minutes: 20
+    # Windows runs the suite in 12-15 min where Linux and macOS take 4-6, and
+    # its file-heavy tests vary threefold between runners (one writing 2,000
+    # tables took 90 s on one and over 240 s on another): it gets the room a
+    # slow runner needs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 30 || 20 }}
     strategy:
       fail-fast: true
       matrix:
