@@ -891,7 +891,7 @@ const MIB: u64 = 1_024 * 1_024;
 
 /// The index the streaming ranking chooses among `candidates`, offered in order.
 fn rank_by_promoted_ratio(candidates: &[MergeCost], overshoot: u64, slack: u64) -> Option<usize> {
-    let mut ranking = MergeRanking::new(overshoot, slack);
+    let mut ranking = MergeRanking::new(overshoot, slack, LEAST_REWRITE);
     for (index, cost) in candidates.iter().enumerate() {
         ranking.offer(*cost, index);
     }
@@ -906,7 +906,7 @@ fn the_ranking_reports_the_cheapest_candidate_it_did_not_choose() {
     let within = cost(20 * MIB, 60 * MIB);
     let cheaper_past_bound = cost(1_000 * MIB, 100 * MIB);
     let dearer = cost(10 * MIB, 90 * MIB);
-    let mut ranking = MergeRanking::new(20 * MIB, 64 * MIB);
+    let mut ranking = MergeRanking::new(20 * MIB, 64 * MIB, LEAST_REWRITE);
     for (index, c) in [dearer, cheaper_past_bound, within].into_iter().enumerate() {
         ranking.offer(c, index);
     }
@@ -916,7 +916,7 @@ fn the_ranking_reports_the_cheapest_candidate_it_did_not_choose() {
     assert_eq!(chosen, 2);
     assert_eq!(runner_up, Some(cheaper_past_bound));
 
-    let mut ranking = MergeRanking::new(u64::MAX, 0);
+    let mut ranking = MergeRanking::new(u64::MAX, 0, LEAST_REWRITE);
     for (index, c) in [dearer, within, cheaper_past_bound].into_iter().enumerate() {
         ranking.offer(c, index);
     }
@@ -927,10 +927,14 @@ fn the_ranking_reports_the_cheapest_candidate_it_did_not_choose() {
     assert_eq!(runner_up, Some(within));
 }
 
+/// The leveled movement, with the slack the ranking is given apart.
+const LEAST_REWRITE: Movement = Movement::LeastRewrite { slack: None };
+
 fn cost(promoted: u64, pulled_in: u64) -> MergeCost {
     MergeCost {
         promoted,
         total: promoted + pulled_in,
+        heat: 0,
     }
 }
 
@@ -987,10 +991,12 @@ fn ratios_are_compared_exactly_near_the_top_of_the_range() {
     let exact = MergeCost {
         promoted: big,
         total: big,
+        heat: 0,
     };
     let slightly_worse = MergeCost {
         promoted: big - 1,
         total: big,
+        heat: 0,
     };
     assert!(
         (u128::from(exact.total) * u128::from(slightly_worse.promoted)) > u128::from(u64::MAX),
@@ -1079,7 +1085,9 @@ fn the_picker_chooses_the_merge_with_the_least_rewriting_per_promoted_byte() -> 
         &HiddenSet::default(),
         u64::MAX,
         64 * 1_024 * 1_024,
-        64 * 1_024 * 1_024,
+        Movement::LeastRewrite {
+            slack: Some(64 * 1_024 * 1_024),
+        },
         &crate::comparator::DefaultUserComparator,
     ) else {
         panic!("a merge candidate exists");
@@ -1167,7 +1175,8 @@ fn as_many_l0_runs_as_the_threshold_trip_the_l0_trigger() -> crate::Result<()> {
     let version = tree.current_version();
     assert_eq!(version.l0().run_count(), usize::from(strategy.l0_threshold));
     assert!(strategy.l0_triggered(version.l0()));
-    assert!(strategy.l0_score(version.l0()) >= 1.0);
+    let counts = (strategy.l0_threshold, strategy.l0_file_threshold);
+    assert!(shape_score(counts, version.l0()) >= 1.0);
     assert_eq!(
         strategy.pending_compaction_bytes(&version),
         version.l0().size(),
@@ -1303,7 +1312,8 @@ fn zero_l0_thresholds_do_not_trigger_an_empty_l0() -> crate::Result<()> {
         Strategy::default().with_l0_threshold(0),
     ] {
         assert!(!strategy.l0_triggered(version.l0()));
-        assert!(strategy.l0_score(version.l0()).is_finite());
+        let counts = (strategy.l0_threshold, strategy.l0_file_threshold);
+        assert!(shape_score(counts, version.l0()).is_finite());
         assert_eq!(strategy.pending_compaction_bytes(&version), 0);
     }
     Ok(())

@@ -97,6 +97,9 @@ pub struct PlanCounts {
     pub filter_queries: usize,
     /// Lookups a filter answered absent, which read nothing.
     pub filter_skips: usize,
+    /// Lookups that passed the table's gates into one of its data blocks:
+    /// its point reads.
+    pub point_reads: usize,
 }
 
 /// The counts a table covering `first..=last` inherits from `inputs`, the

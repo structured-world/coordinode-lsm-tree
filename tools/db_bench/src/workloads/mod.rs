@@ -7,6 +7,8 @@ pub mod mixed;
 #[cfg(feature = "counters")]
 pub mod mixed_layout;
 pub mod overwrite;
+#[cfg(feature = "counters")]
+pub mod planned_sustained;
 pub mod prefixscan;
 pub mod readrandom;
 pub mod readseq;
@@ -162,6 +164,10 @@ define_workloads! {
     // counter, so only in a `counters` build.
     #[cfg(feature = "counters")]
     "leveled-sustained" => leveled_sustained::LeveledSustained,
+    // The planner for query throughput against leveled compaction at the
+    // same compaction budget, under writes with point reads and scans.
+    #[cfg(feature = "counters")]
+    "planned-sustained" => planned_sustained::PlannedSustained,
     "fillseq" => fillseq::FillSeq,
     "fillrandom" => fillrandom::FillRandom,
     "readrandom" => readrandom::ReadRandom,

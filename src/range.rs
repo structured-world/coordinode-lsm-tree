@@ -126,20 +126,6 @@ pub struct IterState {
     /// hash will be skipped entirely during the scan.
     pub(crate) prefix_hash: Option<u64>,
 
-    /// Optional key hash for standard bloom filter pre-filtering.
-    ///
-    /// When set (typically for single-key point-read pipelines), segments
-    /// whose bloom filter reports no match for this hash will be skipped.
-    pub(crate) key_hash: Option<u64>,
-
-    /// Optional user key for partition-aware bloom filter seeking.
-    ///
-    /// When set alongside `key_hash`, enables partitioned/TLI bloom filters
-    /// to seek directly to the relevant partition instead of returning the
-    /// conservative `Ok(true)` fallback. Only set for single-key reads (the
-    /// merge of a point read).
-    pub(crate) bloom_key: Option<UserKey>,
-
     /// Optional metrics handle for recording prefix-related statistics (e.g. bloom skips).
     ///
     /// `None` when the caller does not wish to record metrics; this is
@@ -160,12 +146,13 @@ impl IterState {
             })
     }
 
-    /// What this read asks each table's filters.
+    /// What this read asks each table's filters: a scan asks by its prefix,
+    /// never by one key, which a point read asks through its own path.
     fn filter_query(&self) -> FilterQuery<'_> {
         FilterQuery {
             prefix_hash: self.prefix_hash,
-            key_hash: self.key_hash,
-            bloom_key: self.bloom_key.as_deref(),
+            key_hash: None,
+            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: self.metrics.as_ref(),
         }
@@ -173,11 +160,15 @@ impl IterState {
 }
 
 /// What a read asks each table's filters: the prefix it scans, or the key it
-/// reads. See the fields of [`IterState`] of the same names.
+/// reads.
 #[derive(Clone, Copy)]
 pub(crate) struct FilterQuery<'a> {
+    /// The hash of the prefix a scan reads, for prefix filters.
     pub(crate) prefix_hash: Option<u64>,
+    /// The hash of the key a point read resolves, for key filters.
     pub(crate) key_hash: Option<u64>,
+    /// That key, for a partitioned filter to seek to its partition; set only
+    /// alongside `key_hash`.
     pub(crate) bloom_key: Option<&'a [u8]>,
     #[cfg(feature = "metrics")]
     pub(crate) metrics: Option<&'a Arc<crate::Metrics>>,
@@ -538,11 +529,9 @@ impl TreeIter {
                             );
                         }
 
-                        // If a prefix or key hash is available, filter individual
-                        // tables within the multi-table run using their bloom
-                        // filters. This covers both prefix scans (prefix_hash)
-                        // and point-read merge pipelines (key_hash).
-                        if lock.prefix_hash.is_some() || lock.key_hash.is_some() {
+                        // A prefix scan filters the tables of the run one by
+                        // one by their prefix filters.
+                        if lock.prefix_hash.is_some() {
                             let bounds = (
                                 user_range.0.as_ref().map(core::convert::AsRef::as_ref),
                                 user_range.1.as_ref().map(core::convert::AsRef::as_ref),
@@ -606,6 +595,8 @@ impl TreeIter {
                     })
             };
 
+            // A scan, counted once, and on every table it reads.
+            lock.version.version.read_mix().note_scan();
             for run in candidates {
                 let mut surviving: Vec<(crate::table::Table, FilterAnswer)> = run
                     .into_iter()
@@ -625,11 +616,13 @@ impl TreeIter {
                 // first, which is read on its own to count a pass that finds
                 // nothing; the others' passes are no false positives.
                 let (first, answer) = surviving.remove(0);
+                first.note_scan();
                 iters.push(table_reader(answer, first, user_range.clone(), seqno));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
+                            table.note_scan();
                             iters.push(table_reader(answer, table, user_range.clone(), seqno));
                         }
                     }
@@ -650,6 +643,7 @@ impl TreeIter {
             for run in multi_runs {
                 if let Some(reader) =
                     RunReader::new_cmp(run, user_range.clone(), lock.comparator.as_ref())
+                        .map(RunReader::counting_scans)
                 {
                     iters.push(Box::new(reader.filter(move |item| match item {
                         Ok(item) => seqno_filter(item.key.seqno, seqno),
@@ -1010,19 +1004,40 @@ struct TableLeaf {
     table: crate::table::Table,
     iter: crate::table::iter::Iter,
     seqno: SeqNo,
+    /// Whether the table was counted as reached: on the first row read from
+    /// it, seen by the snapshot or not, since a source opened over the whole
+    /// keyspace and repositioned to intervals may never be read at all.
+    noted: bool,
 }
 
 impl TableLeaf {
     fn new(table: crate::table::Table, user_range: UserBounds, seqno: SeqNo) -> Self {
         let iter = table.range_iter(user_range);
-        Self { table, iter, seqno }
+        Self {
+            table,
+            iter,
+            seqno,
+            noted: false,
+        }
+    }
+
+    /// Counts the scan on the table the first time a row is read from it.
+    fn note_read(&mut self) {
+        if !self.noted {
+            self.table.note_scan();
+            self.noted = true;
+        }
     }
 
     fn next_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
-                Ok(_) => {}
+                Ok(value) => {
+                    self.note_read();
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1031,8 +1046,12 @@ impl TableLeaf {
     fn next_back_filtered(&mut self) -> Option<IterItem> {
         loop {
             match self.iter.next_back()? {
-                Ok(value) if seqno_filter(value.key.seqno, self.seqno) => return Some(Ok(value)),
-                Ok(_) => {}
+                Ok(value) => {
+                    self.note_read();
+                    if seqno_filter(value.key.seqno, self.seqno) {
+                        return Some(Ok(value));
+                    }
+                }
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1056,7 +1075,9 @@ impl RunLeaf {
         seqno: SeqNo,
         comparator: SharedComparator,
     ) -> Option<Self> {
-        let reader = RunReader::new_cmp(run, user_range, comparator.as_ref())?;
+        // Repositioned over every range of a batch, which counts as one scan.
+        let reader =
+            RunReader::new_cmp(run, user_range, comparator.as_ref())?.counting_each_table_once();
         Some(Self {
             reader,
             comparator,
@@ -1243,6 +1264,8 @@ fn build_seek_pipeline<'a>(
             seqno,
         )));
     }
+    // Built once per iterator: the scan is counted here, once.
+    state.version.version.read_mix().note_scan();
     for table in &collected.single_tables {
         sources.push(SeekableLeaf::Table(Box::new(TableLeaf::new(
             table.clone(),

@@ -47,12 +47,18 @@ impl CompactionStrategy for Merge {
     }
 
     fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
-        Choice::Merge(Input {
+        Choice::Merge(self.input())
+    }
+}
+
+impl Merge {
+    fn input(&self) -> Input {
+        Input {
             table_ids: self.0.iter().copied().collect(),
             dest_level: self.1,
             canonical_level: self.1,
             target_size: OUTPUT_TARGET,
-        })
+        }
     }
 }
 
@@ -65,6 +71,17 @@ fn index(key: &[u8]) -> u32 {
         .ok()
         .and_then(|digits| digits.parse().ok())
         .unwrap_or(u32::MAX)
+}
+
+/// A tree's configuration at `folder`, its files kept in memory: these tests
+/// flush and move a hundred tables, which a real disk's syncs make slow.
+fn in_memory(folder: &tempfile::TempDir) -> Config {
+    Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(crate::fs::MemFs::new()))
 }
 
 fn open(config: Config) -> crate::Result<crate::Tree> {
@@ -175,12 +192,7 @@ fn merge_above_a_level(config: Config) -> crate::Result<(Vec<u32>, Vec<u32>, Vec
 #[test]
 fn a_serial_merge_ends_its_outputs_on_the_level_below() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let config = Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .compaction_threads(1);
+    let config = in_memory(&folder).compaction_threads(1);
     let (outputs, boundaries, _) = merge_above_a_level(config)?;
     assert!(outputs.len() > 3, "{} outputs", outputs.len());
     let (_, cut) = outputs.split_last().unwrap();
@@ -201,14 +213,7 @@ fn a_serial_merge_ends_its_outputs_on_the_level_below() -> crate::Result<()> {
 fn a_merge_above_an_empty_level_ends_its_outputs_on_the_next_level_holding_tables()
 -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let tree = open(
-        Config::new(
-            folder.path(),
-            SequenceNumberCounter::default(),
-            SequenceNumberCounter::default(),
-        )
-        .compaction_threads(1),
-    )?;
+    let tree = open(in_memory(&folder).compaction_threads(1))?;
     let mut seqno = 1;
     flush_into(&tree, 0..3_000, 700, 3, &mut seqno)?;
     flush_into(&tree, 0..3_000, 1_000, 1, &mut seqno)?;
@@ -240,13 +245,9 @@ fn a_size_tiered_merge_is_not_aligned_to_the_levels_below() -> crate::Result<()>
     let run = |aligned: bool| -> crate::Result<Vec<u32>> {
         let folder = tempfile::tempdir()?;
         let tree = open(
-            Config::new(
-                folder.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .compaction_threads(1)
-            .compaction_output_alignment(aligned),
+            in_memory(&folder)
+                .compaction_threads(1)
+                .compaction_output_alignment(aligned),
         )?;
         let mut seqno = 1;
         flush_into(&tree, 0..3_000, 700, 3, &mut seqno)?;
@@ -281,11 +282,7 @@ fn a_size_tiered_merge_is_not_aligned_to_the_levels_below() -> crate::Result<()>
 #[test]
 fn overlapping_runs_give_no_boundary_inside_a_table_of_either() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let tree = open(Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    ))?;
+    let tree = open(in_memory(&folder))?;
     // Two flushes stay in L0 as two runs over overlapping keys.
     let mut seqno = 1;
     for keys in [0..1_800, 1_200..3_000] {
@@ -340,11 +337,7 @@ fn overlapping_runs_give_no_boundary_inside_a_table_of_either() -> crate::Result
 #[test]
 fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let tree = open(Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    ))?;
+    let tree = open(in_memory(&folder))?;
     let mut seqno = 1;
     for keys in [0..1_800, 1_200..3_000] {
         for i in keys {
@@ -406,29 +399,27 @@ fn a_boundary_before_overlapping_runs_carries_every_table_it_reaches() -> crate:
     Ok(())
 }
 
-/// The compaction byte counter grows by the bytes of the tables a merge
-/// installs, and a move, which writes none, leaves it as it was.
+/// The written work of a merge is the bytes of the tables it installs, in its
+/// own report and in the tree's counter, and a move, which writes none,
+/// leaves the counter as it was.
 #[cfg(feature = "metrics")]
 #[test]
-fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
+fn compaction_work_written_counts_the_tables_a_merge_installs() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let tree = open(Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    ))?;
+    let tree = open(in_memory(&folder))?;
     let mut seqno = 1;
     flush_into(&tree, 0..1_000, 1_000, 1, &mut seqno)?;
     assert_eq!(
-        tree.metrics().compaction_bytes_written(),
+        tree.metrics().compaction_work_measured().written,
         0,
         "a move writes nothing"
     );
     let ids = tables(&tree, 1).iter().map(Table::id).collect();
-    tree.compact(Arc::new(Merge(ids, 2)), 0)?;
-    let installed: u64 = tables(&tree, 2).iter().map(Table::file_size).sum();
+    let result = tree.compact(Arc::new(Merge(ids, 2)), 0)?;
+    let installed: u64 = tables(&tree, 2).iter().map(Table::file_len).sum();
     assert!(installed > 0);
-    assert_eq!(tree.metrics().compaction_bytes_written(), installed);
+    assert_eq!(result.work.measured.written, installed);
+    assert_eq!(tree.metrics().compaction_work_measured().written, installed);
     Ok(())
 }
 
@@ -439,13 +430,9 @@ fn compaction_bytes_written_counts_the_tables_a_merge_installs() -> crate::Resul
 #[test]
 fn a_split_merge_ends_its_outputs_on_the_level_below_or_its_range() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let config = Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .compaction_threads(4)
-    .subcompaction_min_bytes(0);
+    let config = in_memory(&folder)
+        .compaction_threads(4)
+        .subcompaction_min_bytes(0);
     let (outputs, boundaries, seams) = merge_above_a_level(config)?;
     let (_, cut) = outputs.split_last().unwrap();
     let mut at_boundaries = 0;
@@ -476,13 +463,9 @@ fn a_split_merge_ends_its_outputs_on_the_level_below_or_its_range() -> crate::Re
 #[test]
 fn without_alignment_outputs_end_off_the_level_below() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
-    let config = Config::new(
-        folder.path(),
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .compaction_threads(1)
-    .compaction_output_alignment(false);
+    let config = in_memory(&folder)
+        .compaction_threads(1)
+        .compaction_output_alignment(false);
     let (outputs, boundaries, _) = merge_above_a_level(config)?;
     let (_, cut) = outputs.split_last().unwrap();
     assert!(
@@ -533,12 +516,32 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
     let inputs = tables(&tree, 1);
     assert_eq!(inputs.len(), 1, "the merge reads one table");
     let boundaries = boundaries_of(&tables(&tree, 3));
-    let slice_ends: Vec<u32> = super::tight_slice_boundaries(
+    // The slices as the pass cuts them: free space unknown, so the quota caps
+    // them, and their outputs cut on the level below at the merge's target.
+    let merge = Merge(inputs.iter().map(Table::id).collect(), 2);
+    let payload = merge.input();
+    let opts = super::Options::from_tree(&tree, Arc::new(Merge(merge.0.clone(), merge.1)));
+    let cut_keys =
+        crate::compaction::flavour::output_cut_keys(&tree.current_version(), &opts, &payload);
+    let caps = super::SliceCaps {
+        tables: u64::MAX,
+        blobs: u64::MAX,
+        total: HEADROOM,
+    };
+    let outputs = super::SliceOutputs {
+        target_size: OUTPUT_TARGET,
+        cut_keys: &cut_keys,
+    };
+    let slice_ends: Vec<u32> = super::tight_slices(
         &inputs,
-        HEADROOM,
-        &crate::comparator::DefaultUserComparator,
+        caps,
+        &outputs,
+        None,
+        &tree.config.comparator,
+        &super::input_pacer(&opts),
     )?
     .iter()
+    .filter_map(|slice| slice.end.as_ref())
     .map(|end| index(end))
     .collect();
     assert!(
@@ -552,10 +555,11 @@ fn tight_space_slices_end_their_outputs_on_the_level_below() -> crate::Result<()
         cfg.tight_space_compaction = true;
         cfg.storage_limit_bytes = Some(used + HEADROOM);
     })?;
-    tree.compact(
-        Arc::new(Merge(inputs.iter().map(Table::id).collect(), 2)),
-        0,
-    )?;
+    // Held through the pass, the input would keep each slice's consumed
+    // prefix from being reclaimed, and the pass would stop after one.
+    let input_ids = inputs.iter().map(Table::id).collect();
+    drop(inputs);
+    tree.compact(Arc::new(Merge(input_ids, 2)), 0)?;
     assert!(
         mem.punched_bytes() > 0,
         "the merge ran as a tight-space pass"
@@ -599,14 +603,10 @@ fn a_group_holding_a_boundary_is_written_so_the_output_ends_on_it() -> crate::Re
     let run = |aligned: bool| -> crate::Result<(u64, u64, Vec<u32>, Vec<u32>)> {
         let folder = tempfile::tempdir()?;
         let tree = open(
-            Config::new(
-                folder.path(),
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .columnar_row_group_size_policy(BlockSizePolicy::all(4 * 1_024))
-            .compaction_threads(1)
-            .compaction_output_alignment(aligned),
+            in_memory(&folder)
+                .columnar_row_group_size_policy(BlockSizePolicy::all(4 * 1_024))
+                .compaction_threads(1)
+                .compaction_output_alignment(aligned),
         )?;
         tree.update_runtime_config(|cfg| {
             cfg.columnar = true;

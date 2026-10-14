@@ -32,12 +32,23 @@ use alloc::vec::Vec;
 /// data section never has to be buffered whole.
 const COPY_CHUNK: usize = 256 * 1024;
 
+/// A relocated segment's file, as written.
+#[derive(Debug)]
+pub struct Relocated {
+    /// The file's checksum, for [`Table::recover`].
+    pub checksum: Checksum,
+    /// The bytes copied from the source as they lay: every section but the
+    /// two meta blocks, encoded again, and the delete bitmap.
+    pub copied: u64,
+}
+
 impl Table {
     /// Writes a new SST at `new_path` that reuses this columnar segment's data
     /// blocks verbatim, re-points the on-disk table id to `new_table_id`, and
     /// adds `delete_bitmap` as a positional row mask. Returns the new file's
-    /// checksum (for [`Table::recover`]); the caller installs and recovers it.
-    /// `pace` is told how long each read of this segment takes.
+    /// checksum (for [`Table::recover`]) and the bytes it copied; the caller
+    /// installs and recovers it. `pace` is told how long each read of this
+    /// segment takes.
     ///
     /// # Errors
     ///
@@ -56,7 +67,7 @@ impl Table {
         delete_bitmap: &DeleteBitmap,
         sync_mode: SyncMode,
         pace: Option<&super::util::Pacer>,
-    ) -> crate::Result<Checksum> {
+    ) -> crate::Result<Relocated> {
         // Verbatim block reuse is sound only for a non-encrypted, non-ECC
         // columnar segment that already carries a zone map (the bitmap's
         // positional mask resolves each block's start row from the zone-map row
@@ -103,10 +114,11 @@ impl Table {
         // Once the output file exists, any later failure (section copy, bitmap
         // write, sync, directory fsync) must not leave a partial, uninstalled SST
         // behind. Best-effort remove it before propagating the error.
-        let result = (|| -> crate::Result<Checksum> {
+        let result = (|| -> crate::Result<Relocated> {
             let out = BufWriter::with_capacity(u16::MAX.into(), out);
             let out = ChecksummedWriter::new(out);
             let mut writer = crate::sfa::Writer::from_writer(out);
+            let mut copied = 0;
 
             let meta_identity = BlockIdentity {
                 table_id: new_table_id,
@@ -142,6 +154,7 @@ impl Table {
                     )?;
                 } else if RAW_SECTIONS.contains(&name) {
                     copy_section(&*src, &mut writer, (entry.pos(), entry.len()), pace)?;
+                    copied += entry.len();
                 } else {
                     copy_blocks(
                         &*src,
@@ -150,6 +163,7 @@ impl Table {
                         (self.metadata.id, new_table_id),
                         pace,
                     )?;
+                    copied += entry.len();
                 }
             }
 
@@ -185,7 +199,7 @@ impl Table {
                 out_fs,
                 sync_mode,
             )?;
-            Ok(checksum)
+            Ok(Relocated { checksum, copied })
         })();
 
         if result.is_err() {

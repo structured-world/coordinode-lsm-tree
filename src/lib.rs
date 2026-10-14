@@ -580,6 +580,8 @@ pub use metrics::{CacheStats, Metrics};
 pub use backpressure::WriteBufferBudget;
 pub use backpressure::{Backpressure, BackpressureSignals, BackpressureThresholds};
 
+pub use compaction::capacity::CapacityPool;
+
 #[cfg(feature = "std")]
 #[doc(hidden)]
 #[must_use]

@@ -411,6 +411,13 @@ impl BlobFile {
             .store(offset, core::sync::atomic::Ordering::Release);
     }
 
+    /// A handle that tells whether this view's file is still held: its
+    /// punch runs only once no handle is left.
+    #[cfg(feature = "std")]
+    pub(crate) fn downgrade(&self) -> alloc::sync::Weak<Inner> {
+        Arc::downgrade(&self.0)
+    }
+
     /// Re-opens this blob file as a DISTINCT [`Inner`] (its own file handle and
     /// a fresh punch-on-drop atomic) restricted to `[frontier, end)`: the
     /// tight-space relocation loop installs this view in the new version and

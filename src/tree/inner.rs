@@ -216,6 +216,13 @@ pub struct TreeInner {
     /// the rate correct once a caller-provided clock is wired in.
     pub(crate) compaction_rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 
+    /// The pool this tree's compactions reserve the room for their outputs
+    /// in: the one supplied through
+    /// [`Config::compaction_capacity`](crate::Config::compaction_capacity),
+    /// which other trees may hold too, or one of its own. Held here, as the
+    /// rate limiter is, so every compaction of the tree reserves in one pool.
+    pub(crate) compaction_capacity: Arc<crate::CapacityPool>,
+
     /// The budget writes paced under backpressure slowdown draw on: the
     /// limiter supplied through
     /// [`Config::write_rate_limiter`](crate::Config::write_rate_limiter), or
@@ -303,7 +310,7 @@ pub struct TreeInner {
 
 impl TreeInner {
     pub(crate) fn create_new(
-        config: Config,
+        mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
         // manifest probe; held for the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
@@ -337,6 +344,10 @@ impl TreeInner {
         let sync_mode = config.sync_mode;
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        // A strategy reads the compaction budget from the config: given the
+        // live limiter, it sees a rate changed after open.
+        config.live_compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
+        let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
         // dropping the tree has to wake it.
@@ -386,6 +397,7 @@ impl TreeInner {
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             filter_budget,
             compaction_rate_limiter,
+            compaction_capacity,
             write_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(kv_digest_at_insert_gate(
                 &initial_runtime,
@@ -442,5 +454,9 @@ impl Drop for TreeInner {
 
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
+
+        // A pool shared by trees that come and go would keep every one's
+        // account otherwise.
+        self.compaction_capacity.forget(self.id);
     }
 }

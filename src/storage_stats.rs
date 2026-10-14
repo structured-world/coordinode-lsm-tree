@@ -972,6 +972,35 @@ pub(crate) fn compute_used_bytes(version: &Version) -> crate::Result<u64> {
     Ok(used_bytes)
 }
 
+/// [`compute_used_bytes`] of every file of `version` but `tables` and
+/// `blobs`: the footprint of what a tight-space pass neither reads nor
+/// writes, whose growth while the pass runs is others' (a flush, another
+/// compaction) and comes out of the quota the pass was cut for.
+///
+/// # Errors
+///
+/// Propagates the stat failures of the tables and blob files.
+#[cfg(feature = "std")]
+pub(crate) fn compute_used_bytes_but(
+    version: &Version,
+    tables: &crate::HashSet<crate::TableId>,
+    blobs: &crate::HashSet<crate::vlog::BlobFileId>,
+) -> crate::Result<u64> {
+    // Bounded by the filesystem capacity, as `compute_used_bytes` is.
+    let mut used_bytes = 0u64;
+    for table in version.iter_tables() {
+        if !tables.contains(&table.id()) {
+            used_bytes += table_on_disk_bytes(table)?;
+        }
+    }
+    for blob in version.blob_files.iter() {
+        if !blobs.contains(&blob.id()) {
+            used_bytes += blob_on_disk_bytes(blob)?;
+        }
+    }
+    Ok(used_bytes)
+}
+
 /// The physical bytes a live blob file occupies.
 ///
 /// Blob files are punched in place by the same tight-space reclaim as SSTs, so

@@ -45,6 +45,11 @@ pub struct Inner {
     #[doc(hidden)]
     pub metadata: ParsedMeta,
 
+    /// The bytes the file holds, as the table was opened: its whole length,
+    /// unlike the metadata's `file_size`, which stops where the metadata was
+    /// written and leaves out the sections after it.
+    pub(crate) file_len: u64,
+
     /// Parsed region block handles
     #[doc(hidden)]
     pub regions: ParsedRegions,
@@ -110,6 +115,18 @@ pub struct Inner {
     /// rate: a tiering consumer derives a read-rate / EMA from successive polls
     /// (delta over elapsed time). Reset to `0` only when the segment is created.
     pub(crate) read_count: AtomicU64,
+
+    /// Cumulative range scans that opened a reader over this segment, bumped
+    /// (`Relaxed`) once per scan as it reaches the segment. Beside
+    /// [`Self::read_count`] it tells how a segment is read: by point reads,
+    /// whose cost a filter keeps to one run, or by scans, which read every
+    /// run they cross. Reset to `0` only when the segment is created.
+    pub(crate) scan_count: AtomicU64,
+
+    /// Unix seconds when this segment began counting its reads in this
+    /// process, when it was written or opened: [`Self::read_count`] and
+    /// [`Self::scan_count`] are reads since then, which a rate divides by.
+    pub(crate) counting_since_secs: u64,
 
     /// Unix seconds of the most recent data-consulting read (same gating as
     /// [`Self::read_count`]), or `0` if never read. Maintained only on `std`

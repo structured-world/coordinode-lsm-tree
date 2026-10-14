@@ -590,6 +590,9 @@ impl AbstractTree for Tree {
 
     fn get_internal_entry(&self, key: &[u8], seqno: SeqNo) -> crate::Result<Option<InternalValue>> {
         let super_version = self.snapshot_for_read(seqno)?;
+        // Counted where a caller asks, not in the lookup, which a read that
+        // counts itself makes as well.
+        super_version.version.read_mix().note_points(1);
 
         Self::get_internal_entry_from_version(
             &super_version,
@@ -723,12 +726,13 @@ impl AbstractTree for Tree {
             // level index; the clamp only guards a degenerate zero-level config.
             let sst_dest_level = self.0.config.level_count.saturating_sub(1);
             let quota_headroom = self.quota_headroom(stats.used_bytes);
-            let full_fits = crate::compaction::worker::space_fits_two_layer(
+            let full_fits = crate::compaction::worker::merge_would_fit(
+                &self.0.compaction_capacity,
+                self.0.id,
                 &self.0.config,
                 quota_headroom,
-                sst_need,
+                (sst_need, 0),
                 sst_dest_level,
-                0,
             );
             stats.status = if full_fits {
                 crate::StorageStatus::FullCompactionAvailable
@@ -1875,6 +1879,9 @@ impl AbstractTree for Tree {
         let key = key.as_ref();
 
         let super_version = self.snapshot_for_read(seqno)?;
+        // Counted here, not in the lookup: a columnar scan resolving merge
+        // operands looks keys up too, as part of the scan it counts.
+        super_version.version.read_mix().note_points(1);
 
         Self::resolve_or_passthrough(
             &super_version,
@@ -1891,6 +1898,7 @@ impl AbstractTree for Tree {
     // a separated base is not read.
     fn contains_key<K: AsRef<[u8]>>(&self, key: K, seqno: SeqNo) -> crate::Result<bool> {
         let super_version = self.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
         Ok(Self::get_value(
             &super_version,
             key.as_ref(),
@@ -1941,6 +1949,7 @@ impl AbstractTree for Tree {
         let key = key.as_ref();
 
         let super_version = self.snapshot_for_read(seqno)?;
+        super_version.version.read_mix().note_points(1);
 
         Self::resolve_or_passthrough_pinned(
             &super_version,
@@ -1969,6 +1978,10 @@ impl AbstractTree for Tree {
 
         // For small batches, use the simple per-key path
         if n <= 2 {
+            super_version
+                .version
+                .read_mix()
+                .note_points(u64::try_from(n).unwrap_or(u64::MAX));
             return keys
                 .iter()
                 .map(|key| {
@@ -3185,9 +3198,16 @@ impl Tree {
     ) -> crate::Result<resumable::Step> {
         let snapshot = self.snapshot_for_read(seqno)?;
         let seqno = Self::read_ceiling(&snapshot, seqno);
+        let keys: Vec<UserKey> = keys.into_iter().map(Into::into).collect();
+        // Each key a point lookup, counted once as the read starts, not on
+        // every resume.
+        snapshot
+            .version
+            .read_mix()
+            .note_points(u64::try_from(keys.len()).unwrap_or(u64::MAX));
         Ok(resumable::ResumableMultiGet::start(read_job::ReadCtx {
             super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
-            keys: keys.into_iter().map(Into::into).collect(),
+            keys,
             seqno,
             comparator: Arc::clone(&self.config.comparator),
             merge_operator: self.config.merge_operator.clone(),
@@ -3502,8 +3522,6 @@ impl Tree {
             blob_source,
             comparator,
             prefix_hash,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: None,
         };
@@ -3775,10 +3793,10 @@ impl Tree {
     /// `level` key by key, run by run, and returns the versions found by key
     /// index and the keys left for the levels below, still sorted.
     ///
-    /// On level 0 every run is checked and the highest seqno per key kept; a
-    /// key found at the read's ceiling skips the later runs, which cannot
-    /// beat it. On a deeper level the runs do not overlap, so a covering run
-    /// answers a key for the whole level.
+    /// On level 0, and on a deeper level of several runs, every run is
+    /// checked and the highest seqno per key kept; a key found at the read's
+    /// ceiling skips the later runs, which cannot beat it. On a level of one
+    /// run, the table covering a key answers it for the whole level.
     ///
     /// # Errors
     ///
@@ -3795,7 +3813,10 @@ impl Tree {
         seqno: SeqNo,
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<tables_read::SerialLevel> {
-        if level_zero {
+        // A deeper level a tiered layout leaves overlapping runs in is read as
+        // L0 is: a key's covering table in one run may miss it while an older
+        // run holds it.
+        if level_zero || level.run_count() > 1 {
             // L0: must check ALL runs, keep highest seqno per key. Track keys
             // at the seqno ceiling (seqno + 1 == read_seqno): no other L0 run
             // can beat them, so skip them in subsequent runs. Both are dense
@@ -3984,6 +4005,11 @@ impl Tree {
     pub(crate) fn read_many<K: AsRef<[u8]>>(
         ctx: &read_job::ReadCtx<K>,
     ) -> crate::Result<Vec<Option<UserValue>>> {
+        // Each key of the batch is a point lookup of the read mix.
+        ctx.super_version
+            .version
+            .read_mix()
+            .note_points(u64::try_from(ctx.keys.len()).unwrap_or(u64::MAX));
         let mut read = multi_get_read::MultiGetRead::new(ctx);
         Self::drive(&mut read, ctx)
     }
@@ -4254,8 +4280,9 @@ impl Tree {
 
     /// Generic level-walk for point reads, monomorphized over the lookup result type.
     ///
-    /// L0: check ALL runs, keep highest seqno (runs may not be newest-first).
-    /// L1+: at most one run contains the key — return on first match.
+    /// A level of several runs (always L0, and a deeper level a tiered
+    /// layout leaves overlapping runs in): check ALL runs, keep highest seqno.
+    /// A level of one run: at most one table covers the key.
     /// Once a level yields a match, lower levels cannot have newer data.
     fn find_in_tables<T: TablePointLookup>(
         version: &Version,
@@ -4265,7 +4292,7 @@ impl Tree {
         comparator: &dyn crate::comparator::UserComparator,
     ) -> crate::Result<Option<T>> {
         for (level_idx, level) in version.iter_levels().enumerate() {
-            if level_idx == 0 {
+            if level_idx == 0 || level.run_count() > 1 {
                 let mut best: Option<T> = None;
 
                 for run in level.iter() {
@@ -4290,18 +4317,14 @@ impl Tree {
                 if let Some(entry) = best {
                     return Ok(entry.filter_tombstone());
                 }
-            } else {
-                // L1+ runs have non-overlapping key ranges. Once we find the
-                // covering run (get_for_key_cmp returns Some), no other run in
-                // this level can contain the key — break regardless of hit/miss.
-                for run in level.iter() {
-                    if let Some(table) = run.get_for_key_cmp(key, comparator) {
-                        if let Some(item) = T::lookup(table, key, seqno, key_hash)? {
-                            return Ok(item.filter_tombstone());
-                        }
-                        break;
-                    }
-                }
+            } else if let Some(table) = level
+                .iter()
+                .next()
+                .and_then(|run| run.get_for_key_cmp(key, comparator))
+                && let Some(item) = T::lookup(table, key, seqno, key_hash)?
+            {
+                // One run: the table covering the key answers for the level.
+                return Ok(item.filter_tombstone());
             }
         }
 
@@ -4746,8 +4769,8 @@ impl Tree {
     /// The logical partition-quota headroom for the two-layer space model:
     /// `max(0, storage_limit_bytes - used)`, or `u64::MAX` when no quota is set.
     ///
-    /// This is Layer 1 (volume-agnostic) of [`crate::compaction::worker::space_fits_two_layer`];
-    /// the physical free-space probe is Layer 2. An operator quota set below the
+    /// The quota half of [`crate::compaction::worker::merge_would_fit`]; the
+    /// free space of each volume is the other. An operator quota set below the
     /// live footprint leaves zero headroom — the clamp-to-zero is the intended
     /// min-semantics, not masking.
     pub(crate) fn quota_headroom(&self, used: u64) -> u64 {
@@ -5003,8 +5026,6 @@ impl Tree {
             blob_source: self.blob_source(),
             comparator: self.config.comparator.clone(),
             prefix_hash: None,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: Some(self.0.metrics.clone()),
         };
@@ -5073,8 +5094,6 @@ impl Tree {
             blob_source,
             comparator: self.config.comparator.clone(),
             prefix_hash,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: Some(self.0.metrics.clone()),
         };
@@ -5384,6 +5403,10 @@ impl Tree {
         let sync_mode = config.sync_mode;
         // Same reason: built before the move.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
+        // A strategy reads the compaction budget from the config: given the
+        // live limiter, it sees a rate changed after open.
+        config.live_compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
+        let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
         // dropping the tree has to wake it.
@@ -5428,6 +5451,7 @@ impl Tree {
             heal_hints: Arc::clone(&heal_hints),
             filter_budget,
             compaction_rate_limiter,
+            compaction_capacity,
             write_rate_limiter,
             kv_digest_at_insert: portable_atomic::AtomicU8::new(inner::kv_digest_at_insert_gate(
                 &initial_runtime,
@@ -6566,3 +6590,7 @@ mod filter_advisor_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod clear_race_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod overlapping_runs_tests;

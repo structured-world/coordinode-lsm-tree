@@ -3,9 +3,9 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::{BoxedIterator, InternalValue, Table, UserKey, version::Run};
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 use core::ops::{Bound, Deref, RangeBounds};
 
 type OwnedRange = (Bound<UserKey>, Bound<UserKey>);
@@ -38,6 +38,19 @@ pub struct RunReader {
     hi_reader: Option<BoxedIterator<'static>>,
     lo_initialized: bool,
     hi_initialized: bool,
+    /// Whether, and how, the tables it opens count a scan.
+    scans: ScanCount,
+}
+
+/// How a [`RunReader`] counts a scan on the tables it opens.
+enum ScanCount {
+    /// Not at all: a point read merging operands reads through it too.
+    Off,
+    /// On every table it opens.
+    EachOpen,
+    /// Once on each table, for a reader repositioned over many ranges as one
+    /// scan: the tables of the run counted so far.
+    EachTableOnce(Vec<bool>),
 }
 
 impl RunReader {
@@ -89,6 +102,37 @@ impl RunReader {
             hi_reader: None,
             lo_initialized: false,
             hi_initialized: lo >= hi,
+            scans: ScanCount::Off,
+        }
+    }
+
+    /// Counts a scan on every table it opens: the reader serves a scan.
+    #[must_use]
+    pub(crate) fn counting_scans(mut self) -> Self {
+        self.scans = ScanCount::EachOpen;
+        self
+    }
+
+    /// Counts the scan once on each table, however many of the ranges it is
+    /// repositioned over reach it.
+    #[must_use]
+    pub(crate) fn counting_each_table_once(mut self) -> Self {
+        self.scans = ScanCount::EachTableOnce(alloc::vec![false; self.run.len()]);
+        self
+    }
+
+    /// Counts the scan on the table at `index`, as the reader counts them.
+    fn note_scan(&mut self, index: usize) {
+        match &mut self.scans {
+            ScanCount::Off => return,
+            ScanCount::EachOpen => {}
+            ScanCount::EachTableOnce(scanned) => match scanned.get_mut(index) {
+                Some(counted) if !*counted => *counted = true,
+                _ => return,
+            },
+        }
+        if let Some(table) = self.run.get(index) {
+            table.note_scan();
         }
     }
 
@@ -126,6 +170,7 @@ impl RunReader {
 
     fn ensure_lo_initialized(&mut self) {
         if !self.lo_initialized {
+            self.note_scan(self.lo);
             #[expect(
                 clippy::expect_used,
                 reason = "we trust the caller to pass valid indexes"
@@ -138,6 +183,7 @@ impl RunReader {
 
     fn ensure_hi_initialized(&mut self) {
         if !self.hi_initialized {
+            self.note_scan(self.hi);
             #[expect(
                 clippy::expect_used,
                 reason = "we trust the caller to pass valid indexes"
@@ -170,13 +216,13 @@ impl Iterator for RunReader {
                 // table.range() to respect the range end bound). `.iter()` is
                 // only used for middle tables that are fully consumed.
                 if self.lo < self.hi {
-                    self.lo_reader = Some(Box::new(
-                        #[expect(
-                            clippy::expect_used,
-                            reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
-                        )]
-                        self.run.get(self.lo).expect("should exist").iter(),
-                    ));
+                    self.note_scan(self.lo);
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
+                    )]
+                    let table = self.run.get(self.lo).expect("should exist");
+                    self.lo_reader = Some(Box::new(table.iter()));
                 }
             } else {
                 // Lo exhausted — initialize hi reader if needed and consume from it
@@ -206,13 +252,13 @@ impl DoubleEndedIterator for RunReader {
                 self.hi -= 1;
 
                 if self.lo < self.hi {
-                    self.hi_reader = Some(Box::new(
-                        #[expect(
-                            clippy::expect_used,
-                            reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
-                        )]
-                        self.run.get(self.hi).expect("should exist").iter(),
-                    ));
+                    self.note_scan(self.hi);
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
+                    )]
+                    let table = self.run.get(self.hi).expect("should exist");
+                    self.hi_reader = Some(Box::new(table.iter()));
                 }
             } else {
                 // Hi exhausted — initialize lo reader if needed and consume from it
