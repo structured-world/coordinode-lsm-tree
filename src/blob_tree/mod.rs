@@ -398,7 +398,10 @@ impl BlobTree {
         let keys: Vec<UserKey> = keys.into_iter().map(Into::into).collect();
         // Each key a point lookup, counted once as the read starts, not on
         // every resume.
-        snapshot.version.read_mix().note_points(keys.len() as u64);
+        snapshot
+            .version
+            .read_mix()
+            .note_points(u64::try_from(keys.len()).unwrap_or(u64::MAX));
         Ok(crate::resumable::ResumableMultiGet::start(
             crate::tree::read_job::ReadCtx {
                 super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
@@ -2070,7 +2073,10 @@ impl AbstractTree for BlobTree {
 
         // For small batches, use the simple per-key path
         if n <= 2 {
-            super_version.version.read_mix().note_points(n as u64);
+            super_version
+                .version
+                .read_mix()
+                .note_points(u64::try_from(n).unwrap_or(u64::MAX));
             return keys
                 .iter()
                 .map(|key| self.resolve_key(&super_version, key.as_ref(), seqno))

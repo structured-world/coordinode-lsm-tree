@@ -279,6 +279,7 @@ fn pick_minimal_compaction(
     // span would read as older than what the merge wrote. The tables taken
     // of each run lie side by side, none left between them.
     if curr_ids.len() > pulled_in || next_level.run_count() > 1 {
+        #[expect(clippy::expect_used, reason = "the window holds a table")]
         let span = span_of(
             curr_level
                 .iter()
@@ -286,7 +287,8 @@ fn pick_minimal_compaction(
                 .filter(|table| curr_ids.contains(&table.id()))
                 .chain(window.iter()),
             cmp,
-        )?;
+        )
+        .expect("a span over the window");
         for table in next_level
             .iter()
             .flat_map(|run| run.get_overlapping_cmp(&span, cmp))

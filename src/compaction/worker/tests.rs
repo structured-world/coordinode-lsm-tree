@@ -709,6 +709,17 @@ fn a_failed_tight_space_pass_counts_the_work_of_the_slices_it_installed() -> cra
 /// readable, and the next compaction finishes once the room is back.
 #[test]
 fn tight_space_pass_stops_while_a_reader_holds_what_a_slice_consumed() -> crate::Result<()> {
+    // Room for a few slices, and room for one slice and the tail, which the
+    // pass stops before too.
+    for (part, of) in [(1, 4), (3, 5)] {
+        reader_holds_a_slices_inputs((part, of))?;
+    }
+    Ok(())
+}
+
+/// [`tight_space_pass_stops_while_a_reader_holds_what_a_slice_consumed`] with
+/// `part / of` of the tree's footprint free.
+fn reader_holds_a_slices_inputs((part, of): (u64, u64)) -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
     let mem = crate::fs::MemFs::with_capacity(u64::MAX);
     let crate::AnyTree::Standard(tree) = Config::new(
@@ -726,11 +737,11 @@ fn tight_space_pass_stops_while_a_reader_holds_what_a_slice_consumed() -> crate:
         tree.insert(tight_space_key(i).as_bytes(), vec![0xCDu8; 64], i);
     }
     tree.flush_active_memtable(0)?;
-    // Room for a few slices, not for the whole merge: each slice's outputs
-    // hold a table's fixed bytes beside what it consumed, and too little
-    // room leaves a pass that only grows.
+    // Room for slices, not for the whole merge: each slice's outputs hold a
+    // table's fixed bytes beside what it consumed, and too little room leaves
+    // a pass that only grows.
     let used = tree.storage_stats()?.used_bytes;
-    mem.set_capacity(used + used / 4);
+    mem.set_capacity(used + used * part / of);
     tree.update_runtime_config(|c| {
         c.storage_admission_check = true;
         c.tight_space_compaction = true;
@@ -743,7 +754,10 @@ fn tight_space_pass_stops_while_a_reader_holds_what_a_slice_consumed() -> crate:
 
     let reader = tree.current_version();
     tree.major_compact(64 * 1024 * 1024, 0)?;
-    assert!(restricted(&tree), "the pass stopped after its first slice");
+    assert!(
+        restricted(&tree),
+        "the pass stopped after its first slice, {part}/{of} free"
+    );
     for i in 0..TIGHT_SPACE_KEYS {
         assert!(
             tree.get(tight_space_key(i).as_bytes(), crate::MAX_SEQNO)?
@@ -754,7 +768,10 @@ fn tight_space_pass_stops_while_a_reader_holds_what_a_slice_consumed() -> crate:
 
     drop(reader);
     tree.major_compact(64 * 1024 * 1024, 0)?;
-    assert!(!restricted(&tree), "the next pass finishes the merge");
+    assert!(
+        !restricted(&tree),
+        "the next pass finishes the merge, {part}/{of} free"
+    );
     Ok(())
 }
 
@@ -5190,6 +5207,46 @@ fn open_standard(
         crate::AnyTree::Standard(t) => Ok(t),
         crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
     }
+}
+
+/// A row written as cells relocates the frames of the cells it references in
+/// a stale file, and only those: a cell kept inline and a reference into a
+/// live file move nothing, and a plain value moves nothing either.
+#[test]
+fn stale_frame_bytes_of_a_cell_row_are_its_references_into_stale_files() -> crate::Result<()> {
+    use crate::blob_tree::field_row::{RowCell, RowField, encode_row};
+    use crate::blob_tree::handle::BlobIndirection;
+    use crate::vlog::ValueHandle;
+    use crate::{InternalValue, vlog::BlobFileId};
+
+    let reference = |blob_file_id: u64, size: u32| RowCell::Ref {
+        indirection: BlobIndirection {
+            vhandle: ValueHandle {
+                blob_file_id,
+                offset: 0,
+                on_disk_size: size,
+            },
+            size,
+        },
+        owner: true,
+    };
+    let row = encode_row(&[
+        RowField::bytes(3, RowCell::Value(b"inline")),
+        RowField::bytes(4, reference(7, 100)),
+        RowField::bytes(5, reference(8, 300)),
+        RowField::bytes(6, reference(7, 40)),
+    ])?;
+    let stale: crate::HashSet<BlobFileId> = core::iter::once(7).collect();
+    let key = b"row-key";
+
+    let item = InternalValue::from_components(*key, row, 1, crate::ValueType::CellRow);
+    assert_eq!(
+        super::stale_frame_bytes(&item, &stale)?,
+        super::frame_bytes(key, 100) + super::frame_bytes(key, 40),
+    );
+    let plain = InternalValue::from_components(*key, b"v".to_vec(), 2, crate::ValueType::Value);
+    assert_eq!(super::stale_frame_bytes(&plain, &stale)?, 0);
+    Ok(())
 }
 
 /// The blocks a tight-space pass reads to cut its slices are the run's reads:

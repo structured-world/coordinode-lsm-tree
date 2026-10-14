@@ -38,9 +38,19 @@ pub struct RunReader {
     hi_reader: Option<BoxedIterator<'static>>,
     lo_initialized: bool,
     hi_initialized: bool,
-    /// The tables of the run a scan was counted on, for a reader repositioned
-    /// over many ranges as one scan; `None` counts every table it opens.
-    scanned: Option<Vec<bool>>,
+    /// Whether, and how, the tables it opens count a scan.
+    scans: ScanCount,
+}
+
+/// How a [`RunReader`] counts a scan on the tables it opens.
+enum ScanCount {
+    /// Not at all: a point read merging operands reads through it too.
+    Off,
+    /// On every table it opens.
+    EachOpen,
+    /// Once on each table, for a reader repositioned over many ranges as one
+    /// scan: the tables of the run counted so far.
+    EachTableOnce(Vec<bool>),
 }
 
 impl RunReader {
@@ -92,25 +102,34 @@ impl RunReader {
             hi_reader: None,
             lo_initialized: false,
             hi_initialized: lo >= hi,
-            scanned: None,
+            scans: ScanCount::Off,
         }
+    }
+
+    /// Counts a scan on every table it opens: the reader serves a scan.
+    #[must_use]
+    pub(crate) fn counting_scans(mut self) -> Self {
+        self.scans = ScanCount::EachOpen;
+        self
     }
 
     /// Counts the scan once on each table, however many of the ranges it is
     /// repositioned over reach it.
     #[must_use]
     pub(crate) fn counting_each_table_once(mut self) -> Self {
-        self.scanned = Some(alloc::vec![false; self.run.len()]);
+        self.scans = ScanCount::EachTableOnce(alloc::vec![false; self.run.len()]);
         self
     }
 
-    /// Counts the scan on the table at `index`, unless it was counted already.
+    /// Counts the scan on the table at `index`, as the reader counts them.
     fn note_scan(&mut self, index: usize) {
-        if let Some(scanned) = &mut self.scanned {
-            match scanned.get_mut(index) {
+        match &mut self.scans {
+            ScanCount::Off => return,
+            ScanCount::EachOpen => {}
+            ScanCount::EachTableOnce(scanned) => match scanned.get_mut(index) {
                 Some(counted) if !*counted => *counted = true,
                 _ => return,
-            }
+            },
         }
         if let Some(table) = self.run.get(index) {
             table.note_scan();

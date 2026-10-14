@@ -1978,7 +1978,10 @@ impl AbstractTree for Tree {
 
         // For small batches, use the simple per-key path
         if n <= 2 {
-            super_version.version.read_mix().note_points(n as u64);
+            super_version
+                .version
+                .read_mix()
+                .note_points(u64::try_from(n).unwrap_or(u64::MAX));
             return keys
                 .iter()
                 .map(|key| {
@@ -3198,7 +3201,10 @@ impl Tree {
         let keys: Vec<UserKey> = keys.into_iter().map(Into::into).collect();
         // Each key a point lookup, counted once as the read starts, not on
         // every resume.
-        snapshot.version.read_mix().note_points(keys.len() as u64);
+        snapshot
+            .version
+            .read_mix()
+            .note_points(u64::try_from(keys.len()).unwrap_or(u64::MAX));
         Ok(resumable::ResumableMultiGet::start(read_job::ReadCtx {
             super_version: crate::version::SnapshotRef::Owned((*snapshot).clone()),
             keys,
@@ -3516,8 +3522,6 @@ impl Tree {
             blob_source,
             comparator,
             prefix_hash,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: None,
         };
@@ -4005,7 +4009,7 @@ impl Tree {
         ctx.super_version
             .version
             .read_mix()
-            .note_points(ctx.keys.len() as u64);
+            .note_points(u64::try_from(ctx.keys.len()).unwrap_or(u64::MAX));
         let mut read = multi_get_read::MultiGetRead::new(ctx);
         Self::drive(&mut read, ctx)
     }
@@ -5022,8 +5026,6 @@ impl Tree {
             blob_source: self.blob_source(),
             comparator: self.config.comparator.clone(),
             prefix_hash: None,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: Some(self.0.metrics.clone()),
         };
@@ -5092,8 +5094,6 @@ impl Tree {
             blob_source,
             comparator: self.config.comparator.clone(),
             prefix_hash,
-            key_hash: None,
-            bloom_key: None,
             #[cfg(feature = "metrics")]
             metrics: Some(self.0.metrics.clone()),
         };

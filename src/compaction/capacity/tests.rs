@@ -46,6 +46,21 @@ fn a_folder_written_nothing_does_not_refuse_a_reservation() {
     );
 }
 
+/// A reservation that goes after its tree left the pool gives back what the
+/// volume still holds for it and nothing of the forgotten quota, leaving no
+/// account of the tree behind.
+#[test]
+fn a_reservation_dropped_after_its_tree_left_restores_no_account() {
+    let fs = MemFs::with_capacity(100 * MIB);
+    let pool = Arc::new(CapacityPool::default());
+    let room = pool.hold(3, &[demand(&fs, "/tables", MIB)]);
+    pool.forget(3);
+    assert_eq!(pool.held_on(&fs, Path::new("/tables")), MIB);
+    drop(room);
+    assert_eq!(pool.held_on(&fs, Path::new("/tables")), 0);
+    assert!(!pool.accounts(3));
+}
+
 /// A slice reserved within the room it measured is checked against the tree's
 /// quota as it stands: what does not fit it is refused, however much room the
 /// volume keeps.

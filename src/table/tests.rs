@@ -8661,6 +8661,67 @@ fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
     Ok(())
 }
 
+/// A projected read of a row group under an active pacer reads the pages
+/// past the group's prefix one region at a time, each timed on its own, and
+/// decodes what the read without a pacer decodes.
+#[cfg(all(feature = "columnar", feature = "std"))]
+#[test]
+fn a_paced_projection_times_each_page_region_on_its_own() -> crate::Result<()> {
+    use crate::table::columnar::COL_VALUE;
+    use crate::table::row_group::{GroupRead, PageWant};
+    use crate::table::util::ReadPacer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the reads it times.
+    struct Timed(AtomicUsize);
+    impl ReadPacer for Timed {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {}
+        fn read_took(&self, _elapsed: core::time::Duration) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // The value page of a 64 KiB group lies wholly past its 4 KiB prefix.
+    let checksum = columnar_table_file(&file, 400, 32, 96, 64 * 1_024)?;
+    let fresh = || Table::recover(test_recover_params(file.clone(), checksum));
+    let want = PageWant {
+        columns: Some(&[COL_VALUE][..]),
+        ..PageWant::ALL
+    };
+    let group = {
+        let first = fresh()?
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        *first.as_ref()
+    };
+    let unpaced = fresh()?
+        .load_row_group(&group, &want, ReadCharge::Foreground)?
+        .into_batch()?;
+
+    let timed = Timed(AtomicUsize::new(0));
+    let table = fresh()?;
+    let blocks = GroupRead {
+        pace: Some(&timed),
+        ..table.group_read(&group, ReadCharge::Foreground)
+    }
+    .load(&want)?;
+    let paced = table
+        .row_pages(&blocks, ReadCharge::Foreground)?
+        .into_batch()?;
+    assert_eq!(paced.columns, unpaced.columns);
+    assert!(
+        timed.0.load(Ordering::Relaxed) > 1,
+        "the prefix and the pages past it are timed apart"
+    );
+    Ok(())
+}
+
 /// An index entry whose directory is longer than the row group it spans is
 /// refused before any byte of the group is read as the directory.
 #[cfg(feature = "columnar")]

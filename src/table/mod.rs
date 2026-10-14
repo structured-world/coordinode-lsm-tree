@@ -7499,7 +7499,7 @@ impl Table {
             return Ok(results);
         }
         // Counted as single reads are, after the seqno-range and filter gates.
-        self.record_accesses(passing.len() as u64);
+        self.record_accesses(u64::try_from(passing.len()).unwrap_or(u64::MAX));
         // The filter let these keys through; the ones no read below finds are
         // its false positives.
         let count_false_positives = |results: &[Option<InternalValue>]| {
@@ -10216,7 +10216,7 @@ impl Table {
     pub(crate) fn count_plan(&self, counts: crate::table::probe_stats::PlanCounts) {
         self.count_probes(counts.probes);
         if counts.point_reads > 0 {
-            self.record_accesses(counts.point_reads as u64);
+            self.record_accesses(u64::try_from(counts.point_reads).unwrap_or(u64::MAX));
         }
         #[cfg(feature = "metrics")]
         {

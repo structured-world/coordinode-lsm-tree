@@ -607,6 +607,48 @@ fn overlapping_runs_take_the_tables_between_the_ones_they_share_keys_with() -> c
         older.iter().all(|id| ids.contains(id)),
         "the older run's middle table is taken too: {ids:?} of {older:?}"
     );
+    // Nothing taken spans nothing, and takes nothing along.
+    assert_eq!(
+        with_overlapping_runs(
+            l1,
+            HashSet::default(),
+            &HiddenSet::default(),
+            &crate::comparator::DefaultUserComparator,
+        ),
+        Some(HashSet::default())
+    );
+    Ok(())
+}
+
+/// A window of least rewrite ends before a table being compacted, however
+/// much it has still to take: the tables it takes lie side by side.
+#[test]
+fn window_over_ends_before_a_hidden_table() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    three_tables_in_l1(&tree)?;
+    let version = tree.current_version();
+    let l1 = version.level(1).expect("L1");
+    let run: Vec<TableId> = l1
+        .iter()
+        .next()
+        .expect("a run")
+        .iter()
+        .map(Table::id)
+        .collect();
+    let [first, middle, _] = run.as_slice() else {
+        panic!("the fixture needs one run of three tables: {run:?}");
+    };
+    let mut hidden = HiddenSet::default();
+    hidden.hide([*middle]);
+    let ids = window_over(
+        l1,
+        &hidden,
+        u64::MAX,
+        Movement::LeastRewrite { slack: None },
+        64 * 1_024 * 1_024,
+    )
+    .expect("a window");
+    assert_eq!(ids, core::iter::once(*first).collect());
     Ok(())
 }
 
@@ -641,6 +683,13 @@ fn window_into_a_tiered_level_from_two_runs_takes_both_or_waits() -> crate::Resu
     let mut busy = CompactionState::default();
     busy.hidden_set_mut().hide([older]);
     let choice = strategy.choose(&version, tree.tree_config(), &busy);
+    assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
+
+    // Every table of it being compacted leaves no window, and the level
+    // waits whole as well.
+    let mut all_busy = CompactionState::default();
+    all_busy.hidden_set_mut().hide(ids.iter().copied());
+    let choice = strategy.choose(&version, tree.tree_config(), &all_busy);
     assert!(matches!(choice, Choice::DoNothing), "{choice:?}");
     Ok(())
 }

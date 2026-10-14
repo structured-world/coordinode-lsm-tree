@@ -114,7 +114,9 @@ impl OutputLedger {
         let Some(room) = self.room() else {
             return Ok(());
         };
-        room.landed(fs, path, fs.metadata(path)?.len)
+        // Charged to the folder, which the room was reserved for: a backend
+        // may tell the folder's volume and not the file's.
+        room.landed(fs, path.parent().unwrap_or(path), fs.metadata(path)?.len)
     }
 
     /// Whether the run's room stopped it: its outputs outgrew the room and

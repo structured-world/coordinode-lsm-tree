@@ -147,6 +147,56 @@ fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> 
     Ok(())
 }
 
+/// A finished file lands on the volume its folder's room was reserved on,
+/// even where the backend cannot tell the file's own volume: the folder's
+/// room takes the bytes, not a pool the reservation holds nothing in.
+#[test]
+fn a_file_lands_on_the_room_reserved_for_its_folder() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let output = PathBuf::from("/tree/tables/1");
+    let mut file = fs.open(&output, &FsOpenOptions::new().write(true).create_new(true))?;
+    file.write_all(&[7u8; 300])?;
+    drop(file);
+
+    let pool = Arc::new(CapacityPool::default());
+    let Some(room) = pool.reserve(
+        6,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 500,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    injector.arm(
+        FaultRule::new(
+            FaultOp::VolumeId,
+            Fault::Error(crate::io::ErrorKind::Unsupported),
+        )
+        .on_path("tables/1"),
+    );
+    ledger.landed(&*fs, &output)?;
+    injector.clear();
+
+    assert_eq!(
+        pool.held_on(&*fs, &folder),
+        200,
+        "the folder's room took it"
+    );
+    Ok(())
+}
+
 /// An output that outgrew its run's room and cannot be removed keeps all of
 /// its bytes held, past the room the run reserved too.
 #[test]

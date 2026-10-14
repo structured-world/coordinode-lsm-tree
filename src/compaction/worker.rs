@@ -2071,11 +2071,11 @@ fn run_tight_space_compaction(
     let result = (|| -> crate::Result<usize> {
         let mut tables_out = 0usize;
 
-        for slice in slices {
-            // Every slice but the tail ends before a key.
-            let Some(boundary) = &slice.end else {
-                break;
-            };
+        // Every slice but the tail ends before a key.
+        for (slice, boundary) in slices
+            .iter()
+            .filter_map(|slice| slice.end.as_ref().map(|end| (slice, end)))
+        {
             if reclaim_deferred || !reserve_slice(slice, &own_tables, &own_blobs)? {
                 stopped = true;
                 return Ok(tables_out);

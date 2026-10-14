@@ -273,7 +273,8 @@ impl Strategy {
     /// The unit of a tree whose last level holds `last_bytes`, compacting
     /// within `budget`.
     fn unit(&self, last_bytes: u64, budget: u64) -> u64 {
-        (last_bytes / u64::from(self.size_ratio(budget) * self.round())).max(self.target_size)
+        (last_bytes / (u64::from(self.size_ratio(budget)) * u64::from(self.round())))
+            .max(self.target_size)
     }
 
     /// The plan for `inputs`, solved once for the same inputs.

@@ -293,17 +293,19 @@ fn compact_in_background(
             Arc::clone(strategy),
             background.watermark.load(Ordering::Relaxed),
         )?;
+        // Every call counts, one that finds nothing to do as well: choosing
+        // is compaction work, and the planner's choice is its plan. The wait
+        // after an idle one does not.
+        background.nanos.fetch_add(
+            u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         match result.action {
             CompactionAction::Nothing => std::thread::sleep(IDLE_WAIT),
-            action => {
-                background.nanos.fetch_add(
-                    u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                if action == CompactionAction::Merged {
-                    background.merges.fetch_add(1, Ordering::Relaxed);
-                }
+            CompactionAction::Merged => {
+                background.merges.fetch_add(1, Ordering::Relaxed);
             }
+            CompactionAction::Moved | CompactionAction::Dropped => {}
         }
     }
     Ok(())
@@ -337,6 +339,7 @@ fn run_arms(
     base: &Path,
     config: &BenchConfig,
     compaction_rate: u64,
+    planned_drains_first: bool,
 ) -> lsm_tree::Result<(Arm, Arm)> {
     let mut arms = [
         ArmRun::open(base, config, planned(compaction_rate), compaction_rate)?,
@@ -403,8 +406,16 @@ fn run_arms(
     for arm in &mut arms {
         arm.stop_workers()?;
     }
+    // The drains take turns going first across the runs, as the steps do
+    // within one: the second drains on a warmer cache.
     let [planned, leveled] = arms;
-    Ok((planned.finish(seqno)?, leveled.finish(seqno)?))
+    if planned_drains_first {
+        let planned = planned.finish(seqno)?;
+        Ok((planned, leveled.finish(seqno)?))
+    } else {
+        let leveled = leveled.finish(seqno)?;
+        Ok((planned.finish(seqno)?, leveled))
+    }
 }
 
 /// Publishes `arm`'s series, compacted at `compaction_rate`, under `name`.
@@ -521,8 +532,13 @@ impl Workload for PlannedSustained {
         // The harness's tree holds no data; its directory is where `--db` put
         // the run, so both trees are built beneath it, on the device asked for.
         reporter.start();
-        for compaction_rate in COMPACTION_RATES {
-            let (planned, leveled) = run_arms(&tree.tree_config().path, config, compaction_rate)?;
+        for (run, compaction_rate) in COMPACTION_RATES.into_iter().enumerate() {
+            let (planned, leveled) = run_arms(
+                &tree.tree_config().path,
+                config,
+                compaction_rate,
+                run.is_multiple_of(2),
+            )?;
             publish(reporter, "planned", &planned, config, compaction_rate);
             publish(reporter, "leveled", &leveled, config, compaction_rate);
         }

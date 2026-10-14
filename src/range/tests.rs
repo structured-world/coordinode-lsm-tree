@@ -130,6 +130,40 @@ fn batch_scan_reading_rows_past_its_snapshot_counts_the_table() -> crate::Result
     Ok(())
 }
 
+/// A seekable scan read backward past rows newer than its snapshot yields
+/// only the rows the snapshot sees, and counts the scan on the table it
+/// reads them from.
+#[test]
+fn seekable_scan_read_backward_past_its_snapshot_counts_the_table() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..100u64 {
+        tree.insert(format!("k{i:04}"), "v", 1_000 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    // The upper half of the keys is newer than the snapshot, and a backward
+    // read meets it first.
+    let read = tree
+        .range_seekable::<&str, _>(.., 1_050, None)
+        .rev()
+        .count();
+    assert_eq!(read, 50);
+    let scans: Vec<u64> = tree
+        .current_version()
+        .iter_tables()
+        .map(crate::table::Table::scans)
+        .collect();
+    assert_eq!(scans, [1]);
+    Ok(())
+}
+
 /// A batch scan whose intervals all fall in one table of a run counts once
 /// on it, as the batch counts once in the read mix.
 #[expect(clippy::expect_used, reason = "test code")]
