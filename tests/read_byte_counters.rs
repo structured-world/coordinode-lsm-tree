@@ -29,7 +29,9 @@ use lsm_tree::table::columnar::{
 use lsm_tree::table::columnar_predicate::{ColumnRangePredicate, PredicateApply};
 use lsm_tree::{
     AbstractTree, AnyTree, CompressionType, Config, Guard, InternalValue, SeqNo,
-    SequenceNumberCounter, Tree, UserKey, ValueType, config::CompressionPolicy, get_tmp_folder,
+    SequenceNumberCounter, Tree, UserKey, ValueType,
+    config::{BlobCacheFill, CompressionPolicy},
+    get_tmp_folder,
 };
 use tempfile::TempDir;
 use test_log::test;
@@ -187,6 +189,8 @@ fn resolving_a_separated_value_counts_the_blob_it_read() {
     )
     .data_block_compression_policy(CompressionPolicy::all(CompressionType::None))
     .with_kv_separation(Some(Default::default()))
+    // The second pass below reads from the blob cache.
+    .blob_cache_fill(BlobCacheFill::Always)
     .open()
     .expect("open");
     for i in 0..n {
@@ -554,8 +558,9 @@ fn a_blob_prefetch_the_filesystem_refuses_still_counts_its_span() {
 }
 
 /// A key-value-separated tree of `n` 8 KiB values, blob files written with
-/// `compression`, over a cache with the row cache off, so the only thing a
-/// lookup can detach is the key it hands the blob cache.
+/// `compression`, caching what it reads from them over a cache with the row
+/// cache off, so the only thing a lookup can detach is the key it hands the
+/// blob cache.
 fn blob_tree_without_row_cache(
     n: u32,
     compression: CompressionType,
@@ -571,6 +576,7 @@ fn blob_tree_without_row_cache(
     ))
     .blob_compression(compression)
     .with_kv_separation(Some(Default::default()))
+    .blob_cache_fill(BlobCacheFill::Always)
     .open()?;
     for i in 0..n {
         tree.insert(key(i), vec![b'v'; 8_192], u64::from(i));
@@ -634,12 +640,9 @@ fn a_blob_prefetch_counts_the_keys_it_detaches() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-#[test]
-fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
-    // A scan's read-ahead reads a run of neighbouring records in one buffer.
-    // An uncompressed record would otherwise be handed out as a view that pins
-    // the whole run in the cache, so each is copied into a buffer of its own:
-    // a copy the scan performed, and one the gather counter has to show.
+/// A tree of 50 values of 8 KiB, blob files uncompressed, reading with
+/// `fill`.
+fn uncompressed_blob_tree(fill: BlobCacheFill) -> (TempDir, AnyTree) {
     let folder = get_tmp_folder();
     let tree = Config::new(
         folder.path(),
@@ -648,13 +651,50 @@ fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
     )
     .blob_compression(CompressionType::None)
     .with_kv_separation(Some(Default::default()))
+    .blob_cache_fill(fill)
     .open()
     .expect("open");
-    let value_len = 8_192_usize;
     for i in 0..50 {
-        tree.insert(key(i), vec![b'v'; value_len], u64::from(i));
+        tree.insert(key(i), vec![b'v'; 8_192], u64::from(i));
     }
     tree.flush_active_memtable(0).expect("flush");
+    (folder, tree)
+}
+
+#[test]
+fn an_uncached_blob_prefetch_detaches_the_values_it_hands_out() {
+    // Not cached, a scan's read-ahead still hands its values to the caller,
+    // who may keep them as long as it likes. An uncompressed value handed out
+    // as a view of the coalesced read would pin that whole read for as long
+    // as the caller keeps it, so each value is copied out: a copy the gather
+    // counter has to show.
+    let (_folder, tree) = uncompressed_blob_tree(BlobCacheFill::Never);
+    let value_len = 8_192_usize;
+    let m = tree.metrics();
+    let before = m.bytes_copied();
+    let mut rows = 0_u32;
+    for guard in tree.iter(SeqNo::MAX, None) {
+        let (_, value) = guard.into_inner().expect("row");
+        assert_eq!(value.len(), value_len);
+        rows += 1;
+    }
+    assert_eq!(rows, 50);
+    assert!(m.blob_bytes_prefetched() > 0, "the scan read ahead");
+    assert!(
+        m.bytes_copied() - before >= value_len as u64,
+        "the read-ahead handed out views of its span, copying only {} B",
+        m.bytes_copied() - before,
+    );
+}
+
+#[test]
+fn an_uncompressed_blob_prefetch_counts_the_records_it_copies_out() {
+    // A scan's read-ahead reads a run of neighbouring records in one buffer.
+    // An uncompressed record would otherwise be handed out as a view that pins
+    // the whole run in the cache, so each is copied into a buffer of its own:
+    // a copy the scan performed, and one the gather counter has to show.
+    let (_folder, tree) = uncompressed_blob_tree(BlobCacheFill::Always);
+    let value_len = 8_192_usize;
 
     let m = tree.metrics();
     let before = m.bytes_copied();

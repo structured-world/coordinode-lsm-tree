@@ -897,6 +897,12 @@ pub struct RuntimeConfig {
     /// without the `lz4` feature.
     pub blob_compression: crate::CompressionType,
 
+    /// Whether the values a KV-separated tree reads from blob files go into
+    /// the shared cache. Lookups are unchanged either way, so values already
+    /// cached keep serving hits. Takes effect on the next read. Unused by a
+    /// standard tree. Default: [`crate::config::BlobCacheFill::Never`].
+    pub blob_cache_fill: crate::config::BlobCacheFill,
+
     /// Index-size threshold (bytes) at or below which an SST's block index
     /// is written single-level; above it the index spills to a two-level
     /// (partitioned) layout. A single-level index is one block reached by a
@@ -1034,6 +1040,7 @@ impl Default for RuntimeConfig {
             blob_compression: crate::CompressionType::Lz4,
             #[cfg(not(feature = "lz4"))]
             blob_compression: crate::CompressionType::None,
+            blob_cache_fill: crate::config::BlobCacheFill::Never,
             index_partition_spill_threshold: crate::table::writer::DEFAULT_SPILL_THRESHOLD,
             disable_cow_on_sst_files: true,
             use_reflink_for_checkpoint: true,

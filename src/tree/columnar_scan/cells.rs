@@ -397,20 +397,26 @@ fn read_objects(cells: &CellSource, rows: &mut Rows, mut fetches: Vec<Fetch>) ->
         )
     });
     // Objects close together in one file are read in one request first;
-    // each is then taken from the cache.
+    // each is then taken from the cache, or from what this read kept.
+    let mut prefetched = crate::vlog::Prefetched::default();
     if fetches.len() > 1 {
         let mut items = Vec::with_capacity(fetches.len());
         for fetch in &fetches {
             let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
             items.push((&**key, fetch.indirection.vhandle, 0));
         }
-        cells.source.prefetch(&cells.version.version, &mut items);
+        cells
+            .source
+            .prefetch(&cells.version.version, &mut items, &mut prefetched);
     }
     for fetch in fetches {
         let key = rows.keys.get(fetch.row).ok_or(MISSING_BATCH_COLUMN)?;
-        let object = cells
-            .source
-            .object(&cells.version.version, key, &fetch.indirection)?;
+        let object = cells.source.object_prefetched(
+            &cells.version.version,
+            key,
+            &fetch.indirection,
+            &mut prefetched,
+        )?;
         if object.len() != fetch.indirection.size as usize {
             return Err(Error::InvalidHeader(
                 "columnar_scan: a referenced object differs from its recorded size",

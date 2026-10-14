@@ -1982,6 +1982,9 @@ impl AbstractTree for Tree {
                 .version
                 .read_mix()
                 .note_points(u64::try_from(n).unwrap_or(u64::MAX));
+            // One blob source for every key of the batch, taken when a merge
+            // first needs it, so both keys read under one fill policy.
+            let blob_source = core::cell::OnceCell::new();
             return keys
                 .iter()
                 .map(|key| {
@@ -1991,7 +1994,7 @@ impl AbstractTree for Tree {
                         seqno,
                         merge_operator,
                         comparator,
-                        || self.blob_source(),
+                        || blob_source.get_or_init(|| self.blob_source()).clone(),
                     )
                 })
                 .collect();
@@ -3427,6 +3430,7 @@ impl Tree {
             .then(|| crate::blob_tree::BlobSource {
                 tree_id: self.id,
                 cache: Arc::clone(&self.config.cache),
+                fill: self.runtime_config.load().blob_cache_fill,
                 #[cfg(feature = "metrics")]
                 metrics: Arc::clone(&self.0.metrics),
             })
@@ -5015,6 +5019,20 @@ impl Tree {
         seqno: SeqNo,
         ephemeral: Option<(Arc<Memtable>, SeqNo)>,
     ) -> crate::Result<crate::range::SeekableTreeIter> {
+        self.create_seekable_range_bounds_with(lo, hi, seqno, ephemeral, self.blob_source())
+    }
+
+    /// [`Self::create_seekable_range_bounds`], reading values kept in the
+    /// value log through `blob_source`, the one its caller took as the read
+    /// began.
+    pub(crate) fn create_seekable_range_bounds_with(
+        &self,
+        lo: Bound<UserKey>,
+        hi: Bound<UserKey>,
+        seqno: SeqNo,
+        ephemeral: Option<(Arc<Memtable>, SeqNo)>,
+        blob_source: Option<crate::blob_tree::BlobSource>,
+    ) -> crate::Result<crate::range::SeekableTreeIter> {
         use crate::range::{IterState, SeekableTreeIter};
 
         let super_version = self.get_version_for_snapshot(seqno)?;
@@ -5023,7 +5041,7 @@ impl Tree {
             version: super_version,
             ephemeral,
             merge_operator: self.config.merge_operator.clone(),
-            blob_source: self.blob_source(),
+            blob_source,
             comparator: self.config.comparator.clone(),
             prefix_hash: None,
             #[cfg(feature = "metrics")]
