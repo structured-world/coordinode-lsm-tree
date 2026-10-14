@@ -2257,9 +2257,6 @@ impl Writer {
             .use_lineage_prev(meta.lineage_prev)
             .use_lineage_transformed(meta.lineage_transformed)
             .use_lineage_last(meta.lineage_last)
-            // The copy holds the source's data, so it is as old: FIFO keeps
-            // judging it by the age the source had.
-            .use_created_at(meta.created_at.into())
             .use_zone_map(has_zone_map)
             // A source with a seqno_bounds section keeps its seqno-scoped
             // block-skip: the writer re-derives the per-block ranges from
