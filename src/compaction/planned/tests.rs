@@ -21,7 +21,9 @@ fn strategy(model: Model) -> Arc<Strategy> {
 }
 
 /// A tree written uncompressed whatever codecs are built in: rounds are
-/// counted in bytes, which a codec's default would shrink.
+/// counted in bytes, which a codec's default would shrink. Kept in memory:
+/// a test flushes and compacts dozens of tables, which a real disk's syncs
+/// make slow.
 fn tree() -> crate::Result<(tempfile::TempDir, AnyTree)> {
     let dir = tempfile::tempdir()?;
     let tree = Config::new(
@@ -29,6 +31,7 @@ fn tree() -> crate::Result<(tempfile::TempDir, AnyTree)> {
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .with_shared_fs(Arc::new(crate::fs::MemFs::new()))
     .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
     .open()?;
     Ok((dir, tree))

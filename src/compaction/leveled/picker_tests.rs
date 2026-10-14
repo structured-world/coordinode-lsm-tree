@@ -182,11 +182,14 @@ impl Draws {
 /// over random key ranges and value sizes; a level moved into more than once
 /// may hold several runs.
 fn random_layout(dir: &std::path::Path, draws: &mut Draws) -> crate::Result<crate::AnyTree> {
+    // In memory: a layout flushes and moves dozens of tables, which a real
+    // disk's syncs make slow.
     let tree = Config::new(
         dir,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .with_shared_fs(Arc::new(crate::fs::MemFs::new()))
     .table_target_size(4 * 1_024)
     .data_block_compression_policy(crate::config::CompressionPolicy::disabled())
     .open()?;

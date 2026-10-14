@@ -43,12 +43,14 @@ fn fold(hash: u64, bytes: &[u8]) -> u64 {
 fn fingerprint(strategy: &Arc<Leveled>) -> u64 {
     let folder = get_tmp_folder();
     // Uncompressed whatever codecs are built in: a codec's default changes
-    // the tables' sizes, so where they are cut.
+    // the tables' sizes, so where they are cut. In memory: the stream flushes
+    // and compacts a few hundred tables, which a real disk's syncs make slow.
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .with_shared_fs(Arc::new(lsm_tree::fs::MemFs::new()))
     .data_block_compression_policy(CompressionPolicy::disabled())
     .open()
     .expect("open") else {
