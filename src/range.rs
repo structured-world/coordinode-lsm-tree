@@ -257,7 +257,10 @@ fn bloom_passes(state: &IterState, table: &crate::table::Table) -> bool {
 /// they answer (see [`FilterAnswer`]).
 fn filter_answer(query: FilterQuery<'_>, table: &crate::table::Table) -> FilterAnswer {
     let mut answer = FilterAnswer::Unanswered;
-    if let Some(prefix_hash) = query.prefix_hash {
+    // A filter indexing another extractor's prefixes, or none, is not asked.
+    if let Some(prefix_hash) = query.prefix_hash
+        && table.has_prefix_filter()
+    {
         // A prefix answer counts as a key's does: the filter holds the
         // prefix's hash beside the keys'.
         use crate::table::probe_stats::ProbeCounts;

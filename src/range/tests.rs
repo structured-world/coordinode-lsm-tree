@@ -220,6 +220,10 @@ fn batch_scan_of_many_intervals_in_one_table_of_a_run_counts_it_once() -> crate:
 struct UpToColon;
 
 impl crate::PrefixExtractor for UpToColon {
+    fn name(&self) -> &'static str {
+        "up-to-colon"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(
             key.iter()

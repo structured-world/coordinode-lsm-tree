@@ -1223,6 +1223,9 @@ impl AbstractTree for Tree {
                 params.pin_filter = pin_filter;
                 params.pin_index = pin_index;
                 params.encryption.clone_from(&self.config.encryption);
+                params
+                    .prefix_extractor
+                    .clone_from(&self.config.prefix_extractor);
                 #[cfg(zstd_any)]
                 {
                     params.zstd_dictionaries = self.config.current_zstd_dictionaries();
@@ -6057,6 +6060,7 @@ impl Tree {
                         params.pin_filter = pin_filter;
                         params.pin_index = pin_index;
                         params.encryption.clone_from(&config.encryption);
+                        params.prefix_extractor.clone_from(&config.prefix_extractor);
                         #[cfg(zstd_any)]
                         {
                             params.zstd_dictionaries = config.current_zstd_dictionaries();

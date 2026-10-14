@@ -2117,27 +2117,44 @@ fn verify_locator_rejects_a_no_answer_locator() -> crate::Result<()> {
     Ok(())
 }
 
+/// First four key bytes (keys are `keyNNNNN`, so the prefix is `key0`).
+struct FixedLengthPrefix;
+
+impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
+    fn name(&self) -> &'static str {
+        "fixed-4"
+    }
+
+    fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        key.get(..4).map_or_else(
+            || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
+            |p| Box::new(std::iter::once(p)),
+        )
+    }
+
+    fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
+        prefix.len() == 4
+    }
+}
+
 /// `verify_filter` must probe the extractor's PREFIX hashes, not only
-/// complete-key hashes: a full filter built WITHOUT the configured
-/// extractor (a salvage that dropped it, or a forge) still answers every
-/// complete-key probe, yet `maybe_contains_prefix` treats the table as
-/// definitely absent and prefix scans silently omit its rows. No forge is
-/// needed — a `Writer` run without the extractor produces exactly the
-/// filter that lacks the prefix hashes.
+/// complete-key hashes: a full filter that claims an extractor's prefixes
+/// yet holds none of them still answers every complete-key probe, while a
+/// prefix scan under that extractor trusts it to rule the prefixes out and
+/// silently omits the table's rows. The writer is given an extractor under
+/// the real one's name that emits no prefix, which builds exactly that
+/// filter.
 #[test]
 fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
-    /// First four key bytes (keys are `keyNNNNN`, so the prefix is `key0`).
-    struct FixedLengthPrefix;
-    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
-        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
-            key.get(..4).map_or_else(
-                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
-                |p| Box::new(std::iter::once(p)),
-            )
+    /// Claims the real extractor's name, emits nothing.
+    struct Mute;
+    impl crate::prefix::PrefixExtractor for Mute {
+        fn name(&self) -> &'static str {
+            "fixed-4"
         }
 
-        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
-            prefix.len() == 4
+        fn prefixes<'a>(&self, _: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+            Box::new(std::iter::empty())
         }
     }
 
@@ -2146,9 +2163,8 @@ fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
     let fs: Arc<dyn Fs> = Arc::new(StdFs);
     let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FixedLengthPrefix);
 
-    // Written WITHOUT the extractor: the full filter holds only complete-key
-    // hashes, exactly the state a salvage-without-extractor leaves behind.
-    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_prefix_extractor(Some(Arc::new(Mute)));
     for i in 0u32..100 {
         writer.write(iv(i))?;
     }
@@ -2157,8 +2173,9 @@ fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
     let table = open(source, &fs)?;
     // Without an extractor the gate only probes complete keys and passes.
     reconcile_clean(&table, None);
-    // WITH the extractor it probes each key's prefix hash, which the filter
-    // never indexed — a false negative on an existing key's prefix.
+    // WITH the extractor it claims, it probes each key's prefix hash, which
+    // the filter never indexed — a false negative on an existing key's
+    // prefix.
     let err = reconcile_error(
         &table,
         crate::table::ReconcileGate::Filter,
@@ -2173,6 +2190,28 @@ fn verify_filter_rejects_missing_prefix_hashes() -> crate::Result<()> {
         ),
         "the missing prefix hash must be the rejection reason, got {err:?}",
     );
+    Ok(())
+}
+
+/// A filter written without an extractor indexes no prefix, and says so: the
+/// gate does not probe it for the prefixes of an extractor configured later,
+/// which it was never asked to hold, so a healthy table is not judged corrupt
+/// when a tree gains an extractor.
+#[test]
+fn verify_filter_accepts_a_table_written_before_the_extractor() -> crate::Result<()> {
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let extractor: Arc<dyn crate::prefix::PrefixExtractor> = Arc::new(FixedLengthPrefix);
+
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0u32..100 {
+        writer.write(iv(i))?;
+    }
+    assert!(writer.finish()?.is_some(), "source SST is non-empty");
+
+    let table = open(source, &fs)?;
+    reconcile_clean(&table, Some(&extractor));
     Ok(())
 }
 
@@ -2323,30 +2362,13 @@ fn salvage_refuses_a_corrupt_filter_index_that_may_hide_a_deletion() -> crate::R
     Ok(())
 }
 
-/// The rebuilt filter must carry the source's PREFIX hashes: the extractor
-/// is configuration (not persisted in the SST), so the salvage writer can
-/// only index prefixes when the caller threads the tree's extractor
-/// through [`SalvageOptions::prefix_extractor`]. Without it the salvaged
-/// copy's filter holds complete-key hashes only, `maybe_contains_prefix`
-/// reports every indexed prefix as definitely absent, and the copy's rows
-/// silently vanish from prefix scans.
+/// The rebuilt filter must carry the source's PREFIX hashes: the SST names
+/// its extractor but cannot run it, so the salvage writer can only index
+/// prefixes when the caller threads the tree's extractor through
+/// [`SalvageOptions::prefix_extractor`]. With it, the salvaged copy indexes
+/// and names the same prefixes, so a prefix scan keeps skipping by it.
 #[test]
 fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
-    /// First four key bytes, mirroring the tree-level extractor fixtures.
-    struct FixedLengthPrefix;
-    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
-        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
-            key.get(..4).map_or_else(
-                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
-                |p| Box::new(std::iter::once(p)),
-            )
-        }
-
-        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
-            prefix.len() == 4
-        }
-    }
-
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -2364,7 +2386,8 @@ fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
     // `key000NN`, so the indexed 4-byte prefixes are `key0`).
     let prefix_hash = crate::hash::hash64(b"key0");
     {
-        let table = open(source.clone(), &fs)?;
+        let table = open_under(source.clone(), &fs, &extractor)?;
+        assert!(table.has_prefix_filter(), "the source filter is asked");
         assert!(
             table.maybe_contains_prefix(prefix_hash)?,
             "the source filter indexes the prefix",
@@ -2383,7 +2406,11 @@ fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
 
     // A missing prefix hash is a DEFINITE-absent answer from the rebuilt
     // filter — the salvaged copy would silently vanish from prefix scans.
-    let table = open(dest, &fs)?;
+    let table = open_under(dest, &fs, &extractor)?;
+    assert!(
+        table.has_prefix_filter(),
+        "the salvaged copy's filter indexes the extractor's prefixes, and says so"
+    );
     assert!(
         table.maybe_contains_prefix(prefix_hash)?,
         "the salvaged copy's filter must keep the source's prefix hashes",
@@ -2391,31 +2418,13 @@ fn salvage_preserves_prefix_filter_hashes() -> crate::Result<()> {
     Ok(())
 }
 
-/// Without a prefix extractor, salvage must NOT emit a filter at all. The
-/// extractor is not persisted in the SST and cannot be inferred, so a filter
-/// rebuilt from complete-key hashes only would answer `maybe_contains_prefix`
-/// with a DEFINITE-absent for a source that came from a prefix-indexed tree,
-/// silently dropping every recovered row from prefix scans once the copy is
-/// reinstalled. Omitting the filter answers "maybe present" (a full block read),
-/// which is always correct; the point-lookup speedup is sacrificed for
-/// correctness because the source's indexing intent is unknowable here.
+/// Without a prefix extractor, salvage rebuilds a filter of the keys alone
+/// and names no extractor: point reads keep their filter, and a prefix scan
+/// under the tree's extractor reads the copy instead of trusting a filter
+/// that holds none of its prefixes, so no recovered row drops out of it.
 #[test]
-fn salvage_omits_the_filter_without_a_prefix_extractor() -> crate::Result<()> {
-    /// First four key bytes, mirroring the tree-level extractor fixtures.
-    struct FixedLengthPrefix;
-    impl crate::prefix::PrefixExtractor for FixedLengthPrefix {
-        fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
-            key.get(..4).map_or_else(
-                || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = &'a [u8]>>,
-                |p| Box::new(std::iter::once(p)),
-            )
-        }
-
-        fn is_valid_scan_boundary(&self, prefix: &[u8]) -> bool {
-            prefix.len() == 4
-        }
-    }
-
+fn salvage_without_a_prefix_extractor_keeps_a_key_filter_prefix_scans_read_past()
+-> crate::Result<()> {
     let dir = tempdir()?;
     let source = dir.path().join("source");
     let dest = dir.path().join("salvaged");
@@ -2439,12 +2448,20 @@ fn salvage_omits_the_filter_without_a_prefix_extractor() -> crate::Result<()> {
         "all rows recovered: {report:?}"
     );
 
-    // The recovered copy must NOT answer a prefix probe definitely-absent: with
-    // no extractor the safe rebuilt filter is none, so `maybe_contains_prefix`
-    // falls back to "maybe present" instead of a false negative that would hide
-    // every recovered row from a prefix scan.
     let prefix_hash = crate::hash::hash64(b"key0");
-    let table = open(dest, &fs)?;
+    let table = open_under(dest, &fs, &extractor)?;
+    assert_eq!(
+        table.metadata.filter_hashes,
+        Some(100),
+        "the copy keeps a filter of its keys"
+    );
+    assert_eq!(table.metadata.prefix_extractor, None, "naming no extractor");
+    assert!(
+        !table.has_prefix_filter(),
+        "so a prefix scan does not ask it"
+    );
+    // Its filter holds no prefix: asked, it would rule `key0` out and hide
+    // every recovered row from a prefix scan.
     assert!(
         table.maybe_contains_prefix(prefix_hash)?,
         "without the extractor the salvaged copy must not report a prefix as definitely absent",
@@ -2839,6 +2856,26 @@ fn open_with_id(
         Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
     );
     params.descriptor_table = Some(Arc::new(crate::descriptor_table::DescriptorTable::new(8)));
+    Table::recover(params)
+}
+
+/// As [`open`] but under a tree's prefix extractor, so a prefix probe asks a
+/// filter that indexes its prefixes.
+fn open_under(
+    path: std::path::PathBuf,
+    fs: &Arc<dyn Fs>,
+    extractor: &Arc<dyn crate::prefix::PrefixExtractor>,
+) -> crate::Result<Table> {
+    let checksum = crate::Checksum::from_raw(crate::repair::compute_table_checksum(&**fs, &path)?);
+    let mut params = crate::table::RecoverParams::new(
+        path,
+        checksum,
+        0,
+        Arc::clone(fs),
+        default_comparator(),
+        Arc::new(crate::cache::Cache::with_capacity_bytes(1 << 20)),
+    );
+    params.prefix_extractor = Some(Arc::clone(extractor));
     Table::recover(params)
 }
 

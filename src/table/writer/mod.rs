@@ -1536,6 +1536,9 @@ impl Writer {
             filter_bits: (!self.carries_filter)
                 .then(|| crate::filter_budget::bits_of(self.bloom_policy)),
             filter_partition_hashes: self.meta.filter_partition_hashes,
+            // Borrowed from the writer, which the caller still writes through:
+            // set by the caller, see `indexed_extractor`.
+            prefix_extractor: None,
             sum_user_key_bytes: self.meta.sum_user_key_bytes,
             sum_value_bytes: self.meta.sum_value_bytes,
             uncompressed_size: self.meta.uncompressed_size,
@@ -1598,6 +1601,10 @@ impl Writer {
     /// key bounds. The lineage markers `finish` may still add are counted.
     fn meta_payload_len_without_keys(&self) -> crate::Result<u64> {
         let mut params = self.meta_section_params(&[], &[], (0, 0), 0, (0, 0), 0);
+        // From above: the partitions are not known yet, so a partitioned
+        // filter is counted as if it recorded the name too.
+        params.prefix_extractor =
+            indexed_extractor(self.prefix_extractor.as_deref(), self.carries_filter, 0);
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
         params.lineage_last |= has_lineage;
@@ -5085,6 +5092,11 @@ impl Writer {
             },
             created_at_nanos,
         );
+        meta_params.prefix_extractor = indexed_extractor(
+            self.prefix_extractor.as_deref(),
+            self.carries_filter,
+            self.meta.filter_partition_hashes,
+        );
 
         // MID meta copy — defends against torn-write at the file tail
         // (incomplete fsync). Written at the current writer cursor,
@@ -5340,6 +5352,20 @@ fn write_back_tail(
     Ok(())
 }
 
+/// The name of the extractor whose prefixes a table's filter indexes. Only a
+/// full filter built by the table's own writer does: a partitioned one
+/// (`partition_hashes > 0`) never indexes prefixes, and a carried one indexes
+/// whatever its source's extractor emitted, which the writer cannot name.
+fn indexed_extractor(
+    extractor: Option<&dyn PrefixExtractor>,
+    carries_filter: bool,
+    partition_hashes: u64,
+) -> Option<&str> {
+    extractor
+        .filter(|_| !carries_filter && partition_hashes == 0)
+        .map(PrefixExtractor::name)
+}
+
 /// Parameters bundle for [`write_meta_section`]. Free-standing struct
 /// (not a `Writer` method) because `finish()` calls this AFTER
 /// `index_writer.finish()` / `filter_writer.finish()` have consumed
@@ -5375,6 +5401,9 @@ struct MetaSectionParams<'a> {
     filter_bits: Option<u8>,
     /// Hashes of the largest filter partition, zero for a full filter.
     filter_partition_hashes: u64,
+    /// Name of the extractor whose prefixes the table's full filter indexes,
+    /// written with `filter_hashes`; `None` when it indexes none.
+    prefix_extractor: Option<&'a str>,
     sum_user_key_bytes: u64,
     sum_value_bytes: u64,
     uncompressed_size: u64,
@@ -5707,6 +5736,11 @@ fn encode_meta_payload(
         // in does not tell either: a table keeps its filter through a move.
         if let Some(bits) = p.filter_bits {
             meta_items.push(meta("filter_bits", &[bits]));
+        }
+        // Whose prefixes the filter indexes: a prefix scan consults it only
+        // under that extractor, and reads the table under any other.
+        if let Some(name) = p.prefix_extractor {
+            meta_items.push(meta("prefix_extractor", name.as_bytes()));
         }
         if p.filter_partition_hashes > 0 {
             meta_items.push(meta(

@@ -39,6 +39,10 @@ struct ColonPrefixes;
 
 #[cfg(feature = "lz4")]
 impl PrefixExtractor for ColonPrefixes {
+    fn name(&self) -> &'static str {
+        "colon-separated"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new(
             key.iter()

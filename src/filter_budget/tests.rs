@@ -674,6 +674,10 @@ fn a_filter_is_counted_by_the_hashes_it_holds() -> crate::Result<()> {
     /// The key less its last byte, and less its last two.
     struct TwoPrefixes;
     impl PrefixExtractor for TwoPrefixes {
+        fn name(&self) -> &'static str {
+            "two-shortened"
+        }
+
         fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             let len = key.len();
             Box::new(

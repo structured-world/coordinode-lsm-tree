@@ -969,6 +969,10 @@ fn the_size_hint_counts_the_mirrored_index() -> crate::Result<()> {
 fn a_prefix_shared_by_every_key_is_built_once() -> crate::Result<()> {
     struct UpToColon;
     impl crate::prefix::PrefixExtractor for UpToColon {
+        fn name(&self) -> &'static str {
+            "up-to-colon"
+        }
+
         fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             let end = key.iter().position(|b| *b == b':').map_or(0, |i| i + 1);
             Box::new(key.get(..end).into_iter())
@@ -1480,6 +1484,10 @@ fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Res
 struct AllPrefixes;
 
 impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn name(&self) -> &'static str {
+        "all-prefixes"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
     }

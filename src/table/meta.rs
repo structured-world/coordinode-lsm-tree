@@ -189,6 +189,12 @@ pub struct ParsedMeta {
     /// written under (the `filter_bits` meta key). `None` without a filter.
     pub filter_bits: Option<u8>,
 
+    /// Name of the [`PrefixExtractor`](crate::PrefixExtractor) whose prefixes
+    /// the table's full filter indexes (the `prefix_extractor` meta key).
+    /// `None` when it indexes none: no extractor, a partitioned or carried
+    /// filter, or no filter.
+    pub prefix_extractor: Option<crate::Slice>,
+
     pub tombstone_count: u64,
 
     /// Number of RANGE tombstones the writer emitted into the
@@ -802,6 +808,9 @@ impl ParsedMeta {
             },
             None => None,
         };
+        let prefix_extractor = block
+            .point_read(b"prefix_extractor", SeqNo::MAX, &cmp)?
+            .map(|item| item.value);
         // Required: L0 is ordered by it, and a table id is no stand-in for a
         // compaction output's age. No released version wrote V6 tables
         // without it, so there is no older V6 shape to fall back for; V5
@@ -850,6 +859,7 @@ impl ParsedMeta {
             filter_hashes,
             filter_partition_hashes,
             filter_bits,
+            prefix_extractor,
             tombstone_count,
             range_tombstone_count,
             delete_bitmap_len,

@@ -1086,6 +1086,10 @@ fn a_flush_counts_a_first_start_group_past_its_records() -> crate::Result<()> {
 struct AllPrefixes;
 
 impl crate::prefix::PrefixExtractor for AllPrefixes {
+    fn name(&self) -> &'static str {
+        "all-prefixes"
+    }
+
     fn prefixes<'a>(&self, key: &'a [u8]) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
         Box::new((1..=key.len()).filter_map(|end| key.get(..end)))
     }
