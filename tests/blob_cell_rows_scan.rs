@@ -11,6 +11,7 @@ use lsm_tree::{
     Absent, AbstractTree, AnyTree, BlobTree, Config, KvSeparationOptions, ProjectedField,
     ProjectedRow, Projection, SeqNo, SequenceNumberCounter, ValueProjector,
     blob_tree::field_row::{Cell, FIRST_FIELD_COLUMN, Field, TypeTag},
+    config::BlobCacheFill,
     get_tmp_folder,
     table::column_type::{ByteOrder, Number, NumberKind},
     table::columnar::{COL_USER_KEY, ColumnBatch},
@@ -30,6 +31,15 @@ fn u32_le() -> TypeTag {
 }
 
 fn open(path: &std::path::Path, columnar: bool) -> lsm_tree::Result<(AnyTree, BlobTree)> {
+    open_with(path, columnar, BlobCacheFill::default())
+}
+
+/// [`open`], reading blob values under `fill`.
+fn open_with(
+    path: &std::path::Path,
+    columnar: bool,
+    fill: BlobCacheFill,
+) -> lsm_tree::Result<(AnyTree, BlobTree)> {
     let any = Config::new(
         path,
         SequenceNumberCounter::default(),
@@ -39,6 +49,7 @@ fn open(path: &std::path::Path, columnar: bool) -> lsm_tree::Result<(AnyTree, Bl
         KvSeparationOptions::default().separation_threshold(THRESHOLD),
     ))
     .blob_compression(lsm_tree::CompressionType::None)
+    .blob_cache_fill(fill)
     .open()?;
     let AnyTree::Blob(tree) = &any else {
         panic!("a tree with kv separation opens as a blob tree");
@@ -167,6 +178,59 @@ fn compact_fields_are_read_without_any_blob_read() -> lsm_tree::Result<()> {
                 .collect::<Rows>(),
             "columnar={columnar}"
         );
+    }
+    Ok(())
+}
+
+/// A scan of the body reads its objects ahead: into the cache when blob
+/// values are cached, so the next scan reads no blob file at all, and into a
+/// store of its own when they are not, so the next scan reads them again.
+#[test]
+fn a_scan_reads_its_objects_ahead_into_the_cache_only_when_caching() -> lsm_tree::Result<()> {
+    for columnar in [false, true] {
+        for fill in [BlobCacheFill::Always, BlobCacheFill::Never] {
+            let folder = get_tmp_folder();
+            let (any, tree) = open_with(folder.path(), columnar, fill)?;
+            let body = |i: u32| vec![b'a' + (i % 26) as u8; 500];
+            for i in 0..64 {
+                insert(&tree, &format!("k{i:03}"), b"s", i, &body(i), u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+            let with_body = || {
+                Projection::new()
+                    .column(COL_USER_KEY)
+                    .field(field(BODY, TypeTag::Bytes))
+            };
+            let m = any.metrics();
+            let expect: Rows = (0..64)
+                .map(|i| (format!("k{i:03}").into_bytes(), vec![Some(body(i))]))
+                .collect();
+
+            assert_eq!(
+                rows(any.columnar_scan(with_body(), None, SeqNo::MAX, ..)?)?,
+                expect
+            );
+            assert!(
+                m.blob_bytes_prefetched() > 0,
+                "columnar={columnar} {fill:?}: the scan read ahead"
+            );
+            let before = m.blob_read_count();
+            assert_eq!(
+                rows(any.columnar_scan(with_body(), None, SeqNo::MAX, ..)?)?,
+                expect
+            );
+            let again = m.blob_read_count() - before;
+            match fill {
+                BlobCacheFill::Always => assert_eq!(
+                    again, 0,
+                    "columnar={columnar}: every object read ahead is in the cache"
+                ),
+                BlobCacheFill::Never => assert!(
+                    again > 0,
+                    "columnar={columnar}: no object read ahead went to the cache"
+                ),
+            }
+        }
     }
     Ok(())
 }

@@ -45,6 +45,15 @@ impl Prefetched {
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }
+
+    /// Holds `value` as read ahead for `vhandle` under `key`.
+    #[cfg(test)]
+    pub(crate) fn hold(&mut self, key: &[u8], vhandle: &ValueHandle, value: UserValue) {
+        self.values.insert(
+            (vhandle.blob_file_id, vhandle.offset),
+            (crate::UserKey::from(key), vhandle.on_disk_size, value),
+        );
+    }
 }
 
 /// Where a read-ahead puts what it reads.

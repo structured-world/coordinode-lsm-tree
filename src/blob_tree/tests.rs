@@ -176,6 +176,45 @@ fn a_scan_not_caching_reads_ahead_into_its_own_store() -> crate::Result<()> {
     Ok(())
 }
 
+/// A row's guard takes out of the scan's store exactly the values its row
+/// names: an indirection takes its value, and a row whose indirection or cell
+/// references do not decode takes nothing, leaving its resolution, and the
+/// report of the damage, to the read of the row itself.
+#[test]
+fn a_row_takes_only_what_its_handles_name_from_the_scan_store() {
+    let vhandle = ValueHandle {
+        blob_file_id: 3,
+        offset: 128,
+        on_disk_size: 40,
+    };
+    let indirection = BlobIndirection { vhandle, size: 32 };
+    let mut store = crate::vlog::Prefetched::default();
+    store.hold(b"k", &vhandle, crate::UserValue::from(b"value".as_slice()));
+
+    let damaged = |value_type| InternalValue::from_components("k", vec![0xff_u8; 3], 0, value_type);
+    for value_type in [crate::ValueType::Indirection, crate::ValueType::CellRow] {
+        assert!(
+            take_prefetched(&mut store, &damaged(value_type)).is_empty(),
+            "{value_type:?} that does not decode takes nothing"
+        );
+    }
+    assert!(!store.is_empty(), "the value stays for its own row");
+
+    let row = InternalValue::from_components(
+        "k",
+        indirection.encode_into_vec(),
+        0,
+        crate::ValueType::Indirection,
+    );
+    let taken = take_prefetched(&mut store, &row);
+    let [(handle, value)] = taken.as_slice() else {
+        panic!("one value taken, got {}", taken.len());
+    };
+    assert_eq!(*handle, vhandle);
+    assert_eq!(&**value, b"value");
+    assert!(store.is_empty(), "taken out, not copied");
+}
+
 /// An indirection naming a blob file the version does not hold is damage:
 /// resolving it is an error the caller can handle, never a panic and never
 /// an empty value.
