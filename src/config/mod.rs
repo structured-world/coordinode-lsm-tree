@@ -950,6 +950,17 @@ pub struct Config {
     /// holds. Set via [`Config::compaction_rate_limiter`].
     pub(crate) compaction_rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
 
+    /// The limiter the open tree throttles its compactions with, set at open
+    /// for a strategy to read the live rate. Apart from
+    /// [`Self::compaction_rate_limiter`], so a copy of the tree's
+    /// configuration opened as another tree does not share it.
+    pub(crate) live_compaction_rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
+
+    /// Optional pool compactions reserve their room in, shared with other
+    /// trees. `None` (default) = the tree keeps a pool of its own. Set via
+    /// [`Config::compaction_capacity`].
+    pub(crate) compaction_capacity: Option<Arc<crate::CapacityPool>>,
+
     /// Bytes per second writes are paced to while the backpressure verdict is
     /// in its slowdown tier; `0` (the default) leaves the slowdown delay to
     /// the ramp. Set via [`Config::write_rate_limit`].
@@ -1026,6 +1037,12 @@ pub struct Config {
     /// `cfg(test)`, never compiled into release builds.
     #[cfg(all(test, feature = "std"))]
     pub(crate) fail_tight_after_first_slice: Arc<core::sync::atomic::AtomicBool>,
+
+    /// Test-only: bytes another tree sharing the capacity pool takes on the
+    /// destination volume right before a tight-space pass reserves its first
+    /// slice, after the pass measured the room. Behind `cfg(test)`.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) tight_slice_squeeze: Arc<core::sync::atomic::AtomicU64>,
 
     /// Test-only failpoint: when armed, a tight-space relocation fails at the
     /// restricted-blob reopen step of its current slice — after the slice's
@@ -1190,6 +1207,8 @@ impl Default for Config {
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
             compaction_rate_limiter: None,
+            live_compaction_rate_limiter: None,
+            compaction_capacity: None,
             write_rate_limit: 0,
             write_rate_limiter: None,
             #[cfg(feature = "std")]
@@ -1212,6 +1231,8 @@ impl Default for Config {
             )),
             #[cfg(all(test, feature = "std"))]
             fail_tight_after_first_slice: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(test, feature = "std"))]
+            tight_slice_squeeze: Arc::new(core::sync::atomic::AtomicU64::new(0)),
             #[cfg(all(test, feature = "std"))]
             fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
@@ -2534,6 +2555,14 @@ impl Config {
     /// later through [`AbstractTree::compaction_rate_limiter`](crate::AbstractTree::compaction_rate_limiter).
     /// Ignored when a shared limiter is supplied through
     /// [`Self::compaction_rate_limiter`].
+    ///
+    /// The figure is the share of the device the deployment gives compaction,
+    /// and only the deployment knows it. Below what the write rate times the
+    /// strategy's write amplification needs, compaction falls behind: runs
+    /// pile up and every read visits more of them. The
+    /// [`Planned`](crate::compaction::Planned) strategy reads the limit and
+    /// plans a tree it can keep (see its section on the compaction budget);
+    /// [`Leveled`](crate::compaction::Leveled) keeps its shape and lags.
     #[must_use]
     pub fn compaction_rate_limit(mut self, bytes_per_sec: u64) -> Self {
         self.compaction_rate_limit = bytes_per_sec;
@@ -2576,6 +2605,25 @@ impl Config {
     ) -> Self {
         self.compaction_rate_limiter = Some(limiter);
         self
+    }
+
+    /// Supplies the pool this tree's compactions reserve the room for their
+    /// outputs in, shared with other trees, in place of a pool of its own.
+    ///
+    /// Hand the same `Arc` to every tree whose files share volumes: each
+    /// compaction then reserves against what the others have still to write,
+    /// rather than two of them counting on the same free bytes. See
+    /// [`CapacityPool`](crate::CapacityPool).
+    #[must_use]
+    pub fn compaction_capacity(mut self, pool: Arc<crate::CapacityPool>) -> Self {
+        self.compaction_capacity = Some(pool);
+        self
+    }
+
+    /// The pool a tree opened with this configuration reserves its
+    /// compactions' room in: the shared one if supplied, else its own.
+    pub(crate) fn tree_compaction_capacity(&self) -> Arc<crate::CapacityPool> {
+        self.compaction_capacity.clone().unwrap_or_default()
     }
 
     /// Sets the byte rate writes are paced to while the tree's backpressure

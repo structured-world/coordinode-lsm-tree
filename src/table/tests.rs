@@ -6307,6 +6307,34 @@ fn batch_get_empty_input_returns_empty_results() -> crate::Result<()> {
     )
 }
 
+/// A batched read counts each key the gates let through as a point read of
+/// the table, as a single read does: the read mix sees batched traffic.
+#[test]
+fn batch_get_counts_each_key_it_reads_as_a_point_read() -> crate::Result<()> {
+    let items: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|k| {
+            crate::InternalValue::from_components(k.as_bytes(), b"v", 0, crate::ValueType::Value)
+        })
+        .collect();
+    test_with_table(
+        &items,
+        |table| {
+            let before = table.point_reads();
+            let batch: Vec<(&[u8], u64)> = vec![
+                (b"a", hash64(b"a")),
+                (b"b", hash64(b"b")),
+                (b"c", hash64(b"c")),
+            ];
+            table.batch_get(&batch, SeqNo::MAX)?;
+            assert_eq!(table.point_reads() - before, 3);
+            Ok(())
+        },
+        None,
+        Some(|x| x),
+    )
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn batch_get_single_block_multiple_keys_returns_in_input_order() -> crate::Result<()> {
@@ -7822,8 +7850,9 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(1);
     bitmap.insert(3);
-    let out_checksum =
-        source.relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?;
+    let out_checksum = source
+        .relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .checksum;
     let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
 
     // Point path: masked rows read absent; survivors reconstruct their sub-cells.
@@ -8629,6 +8658,66 @@ fn a_projection_decodes_the_same_columns_as_a_full_read() -> crate::Result<()> {
             "projection {projection:?} must decode what the full read decodes",
         );
     }
+    Ok(())
+}
+
+/// A projected read of a row group under an active pacer reads the pages
+/// past the group's prefix one region at a time, each timed, and decodes
+/// what the read without a pacer decodes.
+#[cfg(all(feature = "columnar", feature = "std"))]
+#[test]
+fn a_paced_projection_times_each_page_region_on_its_own() -> crate::Result<()> {
+    use crate::table::columnar::COL_VALUE;
+    use crate::table::row_group::{GroupRead, PageWant, RowPageSelect};
+    use crate::table::util::ReadPacer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the reads it times.
+    struct Timed(AtomicUsize);
+    impl ReadPacer for Timed {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {}
+        fn read_took(&self, _elapsed: core::time::Duration) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let dir = tempdir()?;
+    let file = dir.path().join("table");
+    // The value page of a 64 KiB group lies wholly past its 4 KiB prefix.
+    let checksum = columnar_table_file(&file, 400, 32, 96, 64 * 1_024)?;
+    let fresh = || Table::recover(test_recover_params(file.clone(), checksum));
+    // Projected, not whole: the directory is read alone, and the value page
+    // after it as a request of its own.
+    let want = PageWant::projected(&[COL_VALUE], RowPageSelect::All);
+    let group = {
+        let first = fresh()?
+            .data_block_handles()
+            .next()
+            .expect("the table has a row group")?;
+        *first.as_ref()
+    };
+    let unpaced = fresh()?
+        .load_row_group(&group, &want, ReadCharge::Foreground)?
+        .into_batch()?;
+
+    let timed = Timed(AtomicUsize::new(0));
+    let table = fresh()?;
+    let blocks = GroupRead {
+        pace: Some(&timed),
+        ..table.group_read(&group, ReadCharge::Foreground)
+    }
+    .load(&want)?;
+    let paced = table
+        .row_pages(&blocks, ReadCharge::Foreground)?
+        .into_batch()?;
+    assert_eq!(paced.columns, unpaced.columns);
+    assert!(
+        timed.0.load(Ordering::Relaxed) > 0,
+        "the pages past the prefix are read under the pacer"
+    );
     Ok(())
 }
 

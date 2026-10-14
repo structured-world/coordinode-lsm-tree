@@ -1026,6 +1026,24 @@ impl DataBlock {
         )
     }
 
+    /// Hands every entry of the block to `f`, in block order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a block-decode failure from [`try_iter`](Self::try_iter)
+    /// and the first error `f` returns.
+    #[cfg(feature = "std")]
+    pub(crate) fn try_for_each_entry(
+        &self,
+        comparator: crate::comparator::SharedComparator,
+        mut f: impl FnMut(InternalValue) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for item in self.try_iter(comparator)? {
+            f(item.materialize(&self.inner.data))?;
+        }
+        Ok(())
+    }
+
     /// The user key of the block's FIRST (lowest) entry, or `None` when the block
     /// decodes to no entries. Repair uses it to derive a resurrection-mode
     /// restriction that keeps the whole first readable (straddling) block.

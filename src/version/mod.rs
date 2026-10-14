@@ -277,6 +277,81 @@ pub struct VersionInner {
     /// installs, or reopening with zstd again would find tables whose
     /// dictionary the tree has forgotten.
     dicts: Arc<[crate::file::DictId]>,
+
+    /// The queries the tree served since it opened, by kind, shared by every
+    /// version derived from this one: the read mix a compaction plans for.
+    /// Not persisted.
+    read_mix: Arc<ReadMix>,
+}
+
+/// The queries a tree served since it opened: point lookups, each key of a
+/// batch one, and scans, each one however many runs it reaches.
+///
+/// Every read bumps it, from every thread: the counts are spread over
+/// stripes a cache line apart, so readers on different cores do not take one
+/// line from each other on every lookup.
+#[derive(Default, Debug)]
+pub struct ReadMix {
+    stripes: [ReadMixStripe; READ_MIX_STRIPES],
+}
+
+const READ_MIX_STRIPES: usize = 16;
+// `ReadMix::stripe` takes the stripe from the top four bits of a product.
+const _: () = assert!(READ_MIX_STRIPES == 1 << 4);
+
+/// One stripe of a [`ReadMix`], a cache line of its own on every target
+/// that reads it from several cores.
+#[derive(Default, Debug)]
+#[repr(align(128))]
+struct ReadMixStripe {
+    points: portable_atomic::AtomicU64,
+    scans: portable_atomic::AtomicU64,
+}
+
+impl ReadMix {
+    /// The stripe the calling thread counts into. Threads run on stacks of
+    /// their own, megabytes apart, so a stack address tells them apart at
+    /// no cost and with no thread-local state. The stacks differ in their
+    /// high bits and agree in the low ones at one call depth, so the address
+    /// is mixed by a Fibonacci multiply and the stripe taken from the top of
+    /// the product, which every bit of the address reaches. Two threads
+    /// sharing a stripe only share its line.
+    fn stripe(&self) -> &ReadMixStripe {
+        let marker = 0u8;
+        let at = core::ptr::from_ref(&marker) as usize as u64;
+        // The top four bits of the product: below sixteen, the stripe count.
+        let mixed = usize::try_from(at.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60).unwrap_or(0);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "the top four bits of the product index sixteen stripes"
+        )]
+        &self.stripes[mixed]
+    }
+
+    /// Counts `keys` point lookups.
+    pub(crate) fn note_points(&self, keys: u64) {
+        self.stripe()
+            .points
+            .fetch_add(keys, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// Counts a scan.
+    pub(crate) fn note_scan(&self) {
+        self.stripe()
+            .scans
+            .fetch_add(1, portable_atomic::Ordering::Relaxed);
+    }
+
+    /// The point lookups and the scans counted so far.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.stripes.iter().fold((0, 0), |(points, scans), stripe| {
+            // Bounded by the reads a tree serves.
+            (
+                points + stripe.points.load(portable_atomic::Ordering::Relaxed),
+                scans + stripe.scans.load(portable_atomic::Ordering::Relaxed),
+            )
+        })
+    }
 }
 
 /// A version is an immutable, point-in-time view of a tree's structure
@@ -311,6 +386,11 @@ impl Version {
         &self.gc_stats
     }
 
+    /// The queries the tree served since it opened, by kind.
+    pub(crate) fn read_mix(&self) -> &ReadMix {
+        &self.read_mix
+    }
+
     /// Highest snapshot seqno this version can no longer serve after a
     /// reopen; see [`VersionInner::retention_floor`].
     #[must_use]
@@ -335,6 +415,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -464,6 +545,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: Arc::from(dicts),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -515,6 +597,7 @@ impl Version {
                 gc_stats: Arc::default(),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                read_mix: Arc::default(),
             }),
         }
     }
@@ -630,6 +713,7 @@ impl Version {
                 gc_stats: Arc::new(gc_stats),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                read_mix: Arc::default(),
             }),
         }
     }
@@ -751,6 +835,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -871,6 +956,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         })
     }
@@ -972,6 +1058,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -985,23 +1072,54 @@ impl Version {
         let comparator = ctx.comparator;
         let id = self.id + 1;
 
-        let mut affected_tables = self
-            .iter_tables()
-            .filter(|x| ids.contains(&x.id()))
-            .cloned()
-            .collect::<Vec<_>>();
+        // The moved tables of each source run, in the walk's order: levels top
+        // down and each level's runs newest first, so every group is newer
+        // than the groups after it. Overlapping runs moved together keep that
+        // order in the destination; one group per run, they are not mixed.
+        let mut moved_runs: Vec<Vec<Table>> = Vec::new();
+        for run in self.levels.iter().flat_map(|level| level.iter()) {
+            let mut moved: Vec<Table> = run
+                .iter()
+                .filter(|table| ids.contains(&table.id()))
+                .cloned()
+                .collect();
+            if moved.is_empty() {
+                continue;
+            }
+            // A run's tables are in key order already, but one taken from L0
+            // is a set of tables ordered by age: a run is searched by binary
+            // search over minimum keys, so it is sorted into comparator order.
+            moved.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            moved_runs.push(moved);
+        }
 
-        assert_eq!(affected_tables.len(), ids.len(), "invalid table IDs");
+        assert_eq!(
+            moved_runs.iter().map(Vec::len).sum::<usize>(),
+            ids.len(),
+            "invalid table IDs"
+        );
 
-        // The tables arrive in level-walk order, which says nothing about their
-        // keys: a table from a higher level comes first even when its range
-        // sorts after. They are about to become one run, and a run is searched
-        // by binary search over minimum keys, so sort them into comparator
-        // order first. `optimize_runs` below re-sorts only when it has to split
-        // the level into several runs, so a move into an empty level would
-        // otherwise keep whatever order the walk produced.
-        affected_tables
-            .sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+        // Tables from several source runs that do not overlap each other go
+        // into the destination as one run, as before: sorted into comparator
+        // order, since `optimize_runs` below re-sorts only when it has to
+        // split the level into several runs.
+        let disjoint = moved_runs.len() <= 1 || {
+            let mut all: Vec<&Table> = moved_runs.iter().flatten().collect();
+            all.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            all.iter().zip(all.iter().skip(1)).all(|(a, b)| {
+                comparator
+                    .compare(a.key_range().max(), b.key_range().min())
+                    .is_lt()
+            })
+        };
+        if disjoint && moved_runs.len() > 1 {
+            let mut all: Vec<Table> = core::mem::take(&mut moved_runs)
+                .into_iter()
+                .flatten()
+                .collect();
+            all.sort_by(|a, b| comparator.compare(a.key_range().min(), b.key_range().min()));
+            moved_runs.push(all);
+        }
 
         let mut levels = vec![];
 
@@ -1023,10 +1141,15 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            if level_idx == dest_level
-                && let Some(run) = Run::new(affected_tables.clone())
-            {
-                runs.insert(0, run);
+            if level_idx == dest_level {
+                // Newest first, ahead of the destination's runs: whatever was
+                // moved down sits above what was already there.
+                runs.splice(
+                    0..0,
+                    moved_runs
+                        .iter()
+                        .filter_map(|tables| Run::new(tables.clone())),
+                );
             }
 
             let runs = place_runs(level_idx, runs, comparator);
@@ -1043,6 +1166,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }
@@ -1100,6 +1224,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         })
     }
@@ -1211,6 +1336,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                read_mix: Arc::clone(&self.read_mix),
             }),
         }
     }

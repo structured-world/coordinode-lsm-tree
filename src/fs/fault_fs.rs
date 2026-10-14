@@ -125,6 +125,10 @@ pub enum FaultOp {
     /// [`FsFile::start_writeback`] — the writeback hint a writer gives as it
     /// goes. Failing it models a backend or kernel that refuses the hint.
     StartWriteback,
+    /// [`Fs::volume_id`] — the volume a path lies on. Any fault armed on it
+    /// makes the probe answer `None`, as a backend that cannot tell the
+    /// volume of that path does.
+    VolumeId,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -647,6 +651,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn volume_id(&self, path: &Path) -> Option<u64> {
+        if self.injector.check(FaultOp::VolumeId, Some(path)).is_some() {
+            return None;
+        }
         self.inner.volume_id(path)
     }
 

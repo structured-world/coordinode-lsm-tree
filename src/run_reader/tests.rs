@@ -41,6 +41,42 @@ fn run_reader_skip() -> crate::Result<()> {
     Ok(())
 }
 
+/// A run reader counts a scan on the tables it opens only when it serves a
+/// scan: a point read merging operands reads through one too, and must not
+/// heat the tables as a scan would.
+#[test]
+#[expect(clippy::unwrap_used)]
+fn run_reader_counts_scans_only_when_asked() -> crate::Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        &tempdir,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for batch in [["a", "b", "c"], ["d", "e", "f"], ["g", "h", "i"]] {
+        for id in batch {
+            tree.insert(id, vec![], 0);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tables = tree
+        .current_version()
+        .iter_tables()
+        .cloned()
+        .collect::<Vec<_>>();
+    let level = Arc::new(Run::new(tables.clone()).unwrap());
+    let scans = || tables.iter().map(Table::scans).sum::<u64>();
+
+    assert_eq!(RunReader::new(level.clone(), ..).unwrap().count(), 9);
+    assert_eq!(scans(), 0, "a reader not serving a scan counts none");
+
+    let read = RunReader::new(level, ..).unwrap().counting_scans().count();
+    assert_eq!(read, 9);
+    assert_eq!(scans(), 3, "a scan counts on every table it opens");
+    Ok(())
+}
+
 #[test]
 #[expect(clippy::unwrap_used)]
 fn run_reader_basic() -> crate::Result<()> {
