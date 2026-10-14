@@ -356,8 +356,9 @@ fn within_budget(model_rate: u64, budget: u64) -> u64 {
 /// together.
 fn budget(config: &Config) -> u64 {
     config
-        .compaction_rate_limiter
+        .live_compaction_rate_limiter
         .as_ref()
+        .or(config.compaction_rate_limiter.as_ref())
         .map_or(config.compaction_rate_limit, |limiter| limiter.rate())
 }
 

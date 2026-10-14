@@ -271,29 +271,33 @@ fn pick_minimal_compaction(
         .collect();
     let pulled_in = contained.len();
     let curr_ids = with_overlapping_runs(curr_level, contained, hidden_set, cmp)?;
-    let mut ids: HashSet<_> = window.iter().map(Table::id).collect();
-    // What the other runs added may reach past the window: every table below
-    // within the span of the merge goes into it too, so the level below stays
-    // one run and its tables taken lie side by side, none left between them.
-    if curr_ids.len() > pulled_in
-        && let Some(span) = span_of(
+    let mut below: HashSet<_> = window.iter().map(Table::id).collect();
+    // Every table below within the span of the merge goes into it too, from
+    // every run there and whether or not the level above added any: the
+    // window may lie in an older run of the level below, and its output
+    // becomes that level's front run, so a newer version left out under the
+    // span would read as older than what the merge wrote. The tables taken
+    // of each run lie side by side, none left between them.
+    if curr_ids.len() > pulled_in || next_level.run_count() > 1 {
+        let span = span_of(
             curr_level
                 .iter()
                 .flat_map(|run| run.iter())
                 .filter(|table| curr_ids.contains(&table.id()))
                 .chain(window.iter()),
             cmp,
-        )
-    {
-        for below in next_level
+        )?;
+        for table in next_level
             .iter()
             .flat_map(|run| run.get_overlapping_cmp(&span, cmp))
         {
-            if ids.insert(below.id()) && hidden_set.is_hidden(below.id()) {
+            if below.insert(table.id()) && hidden_set.is_hidden(table.id()) {
                 return None;
             }
         }
+        below = with_overlapping_runs(next_level, below, hidden_set, cmp)?;
     }
+    let mut ids = below;
     ids.extend(curr_ids);
     Some((ids, false))
 }

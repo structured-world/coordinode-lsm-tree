@@ -74,6 +74,34 @@ fn admit(tree: &crate::Tree) {
         .expect("admission");
 }
 
+/// A tree that leaves a shared pool takes its account along: what its
+/// compactions gave back of its quota, and what an output that could not be
+/// removed kept held, end with the tree, so trees opened and dropped over a
+/// long-lived pool leave nothing behind in it.
+#[test]
+fn a_dropped_tree_leaves_nothing_in_the_shared_pool() {
+    let dir = tempfile::tempdir().expect("dir");
+    let fs = MemFs::with_capacity(64 * MIB);
+    let pool = Arc::new(CapacityPool::default());
+    let tree = standard(config(dir.path(), &fs, &pool));
+    let mut seqno = 1;
+    flush(&tree, 0..500, 512, &mut seqno);
+    flush(&tree, 250..750, 512, &mut seqno);
+    tree.major_compact(64 * MIB, 0).expect("compact");
+    let id = tree.id;
+    // An output left on disk keeps part of the quota held past its
+    // reservation.
+    let stranded = pool.hold(id, &[demand(&fs, dir.path(), 4_096)]);
+    stranded.strand(None);
+    drop(stranded);
+    assert!(pool.accounts(id), "the tree's compaction gave quota back");
+    assert_eq!(pool.quota_held(id), 4_096);
+
+    drop(tree);
+    assert!(!pool.accounts(id), "nothing of the dropped tree is kept");
+    assert_eq!(pool.quota_held(id), 0);
+}
+
 /// A tree's merge does not count on the free bytes another tree's compaction
 /// in the same pool has still to write: it is skipped while they are held and
 /// runs once they are given back, and it gives its own back as it returns.

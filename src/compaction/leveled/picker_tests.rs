@@ -119,6 +119,43 @@ fn reference_pick(
             }
         }
     }
+    // Below a level of several runs, every table there sharing a key with
+    // the span of those taken, until none is left.
+    if next_level.run_count() > 1 {
+        let below: Vec<&Table> = next_level.iter().flat_map(|run| run.iter()).collect();
+        loop {
+            let within: Vec<&Table> = below
+                .iter()
+                .filter(|b| ids.contains(&b.id()))
+                .copied()
+                .chain(taken.iter().copied())
+                .collect();
+            // The window is among them, so both ends are there.
+            let (Some(min), Some(max)) = (
+                within
+                    .iter()
+                    .map(|t| t.key_range().min())
+                    .min_by(|a, b| cmp.compare(a, b)),
+                within
+                    .iter()
+                    .map(|t| t.key_range().max())
+                    .max_by(|a, b| cmp.compare(a, b)),
+            ) else {
+                break;
+            };
+            let Some(next) = below.iter().find(|t| {
+                !ids.contains(&t.id())
+                    && cmp.compare(t.key_range().min(), max) != core::cmp::Ordering::Greater
+                    && cmp.compare(min, t.key_range().max()) != core::cmp::Ordering::Greater
+            }) else {
+                break;
+            };
+            if hidden_set.is_hidden(next.id()) {
+                return None;
+            }
+            ids.insert(next.id());
+        }
+    }
     ids.extend(taken.iter().map(|t| t.id()));
     Some((ids, false))
 }

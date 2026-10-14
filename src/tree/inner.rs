@@ -346,7 +346,7 @@ impl TreeInner {
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
         // A strategy reads the compaction budget from the config: given the
         // live limiter, it sees a rate changed after open.
-        config.compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
+        config.live_compaction_rate_limiter = Some(Arc::clone(&compaction_rate_limiter));
         let compaction_capacity = config.tree_compaction_capacity();
         let write_rate_limiter = config.tree_write_rate_limiter();
         // A compaction throttled by the limiter sleeps until its deadline;
@@ -454,5 +454,9 @@ impl Drop for TreeInner {
 
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
+
+        // A pool shared by trees that come and go would keep every one's
+        // account otherwise.
+        self.compaction_capacity.forget(self.id);
     }
 }

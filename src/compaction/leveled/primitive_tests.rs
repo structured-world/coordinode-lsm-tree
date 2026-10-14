@@ -755,6 +755,77 @@ fn window_of_several_runs_takes_the_older_versions_along() -> crate::Result<()> 
     Ok(())
 }
 
+/// A window of an older run of the level below takes the newer run's tables
+/// over its span along, though nothing above it shares a key with more than
+/// the one table it promotes: the merge's output becomes the level's front
+/// run, and a newer version left behind under it would read as the older.
+#[test]
+fn window_of_an_older_run_below_takes_the_newer_runs_over_it() -> crate::Result<()> {
+    let (_dir, tree) = tree()?;
+    write_span(&tree, (0, 100), 0)?;
+    tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
+    write_span(&tree, (0, 1_000), 1)?;
+    tree.compact(Arc::new(MergeL0(1)), 0)?;
+    write_span(&tree, (10, 20), 2)?;
+    let version = tree.current_version();
+    let (l0, l1) = (version.level(0).expect("L0"), version.level(1).expect("L1"));
+    let runs: Vec<Vec<TableId>> = l1
+        .iter()
+        .map(|run| run.iter().map(Table::id).collect())
+        .collect();
+    let [newer, older] = runs.as_slice() else {
+        panic!("the fixture needs two runs in L1: {runs:?}");
+    };
+    let promoted = l0.list_ids();
+    let promoted_size: u64 = l0
+        .iter()
+        .flat_map(|run| run.iter())
+        .map(Table::file_size)
+        .sum();
+
+    let (ids, moved) = pick_minimal_compaction(
+        l0,
+        l1,
+        &HiddenSet::default(),
+        0,
+        u64::MAX / 64,
+        Movement::LeastRewrite {
+            slack: Some(promoted_size),
+        },
+        &crate::comparator::DefaultUserComparator,
+    )
+    .expect("a merge");
+    assert!(!moved);
+    assert!(promoted.iter().all(|id| ids.contains(id)), "{ids:?}");
+    assert!(
+        older.iter().all(|id| ids.contains(id)),
+        "the older run's narrow window is the cheapest: {ids:?}"
+    );
+    assert!(
+        newer.iter().all(|id| ids.contains(id)),
+        "the newer run's versions over the window go along: {ids:?} of {newer:?}"
+    );
+
+    // The newer table being compacted holds the merge back.
+    let mut hidden = HiddenSet::default();
+    hidden.hide(newer.iter().copied());
+    assert_eq!(
+        pick_minimal_compaction(
+            l0,
+            l1,
+            &hidden,
+            0,
+            u64::MAX / 64,
+            Movement::LeastRewrite {
+                slack: Some(promoted_size),
+            },
+            &crate::comparator::DefaultUserComparator,
+        ),
+        None
+    );
+    Ok(())
+}
+
 /// L1 of three disjoint tables, `k0000..`, `k1000..` and `k2000..`.
 fn three_tables_in_l1(tree: &crate::AnyTree) -> crate::Result<()> {
     for from in [0, 1_000, 2_000] {

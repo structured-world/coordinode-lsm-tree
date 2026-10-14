@@ -404,6 +404,23 @@ impl CapacityPool {
         self.quota_released.lock().get(&tree).copied().unwrap_or(0)
     }
 
+    /// Drops the account of `tree`, which left the pool: its reservations went
+    /// with the compactions that held the tree, and a tree opens under a new
+    /// id, so nothing reads the account again.
+    pub(crate) fn forget(&self, tree: TreeId) {
+        let mut held = self.held.lock();
+        held.remove(&Pool::Quota(tree));
+        self.quota_released.lock().remove(&tree);
+        drop(held);
+    }
+
+    /// Whether the pool keeps any account of `tree`.
+    #[cfg(test)]
+    pub(crate) fn accounts(&self, tree: TreeId) -> bool {
+        self.held.lock().contains_key(&Pool::Quota(tree))
+            || self.quota_released.lock().contains_key(&tree)
+    }
+
     /// The bytes that landed in the folder `path` of `fs`, or a folder on its
     /// volume, past the reservations covering them.
     #[cfg(test)]

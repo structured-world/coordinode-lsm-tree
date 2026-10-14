@@ -5239,6 +5239,32 @@ fn a_retune_through_one_tree_binds_every_tree_sharing_the_limiter() -> crate::Re
     Ok(())
 }
 
+/// A tree opened without a shared limiter keeps its own: a copy of its
+/// configuration opened as another tree, at a rate of its own, gets a limiter
+/// of its own at that rate, and a retune of either leaves the other as it was.
+#[test]
+fn a_copy_of_a_trees_config_opens_with_a_limiter_of_its_own() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use core::time::Duration;
+
+    let (a_dir, b_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let a = open_standard(a_dir.path(), |c| c.compaction_rate_limit(1_000))?;
+    let mut copy = a.tree_config().clone();
+    copy.path = b_dir.path().to_path_buf();
+    let b = copy.compaction_rate_limit(5_000).open()?;
+
+    assert_eq!(a.compaction_rate_limiter().rate(), 1_000);
+    assert_eq!(
+        b.compaction_rate_limiter().rate(),
+        5_000,
+        "the copy's own rate"
+    );
+    a.compaction_rate_limiter()
+        .set_rate_at(2_000, Duration::ZERO);
+    assert_eq!(b.compaction_rate_limiter().rate(), 5_000, "not shared");
+    Ok(())
+}
+
 /// A verification scan that ends while the device is congested leaves the
 /// latency backoff of a limiter it shares with compaction low, and only read
 /// latencies move it: a compaction on that limiter reports how long its input
