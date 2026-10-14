@@ -70,9 +70,10 @@ pub struct Inner {
     /// Pinned AMQ filter
     pub pinned_filter_block: Option<FilterBlock>,
 
-    /// Whether the filter indexes the prefixes of the extractor this table
-    /// was opened under, so a prefix scan may skip the table on its answer.
-    pub(super) prefix_filter: bool,
+    /// The extractor this table was opened under, held only when its filter
+    /// indexes that extractor's prefixes, so a prefix scan may skip the table
+    /// on its answer. A view reopened over the same file carries it on.
+    pub(super) prefix_filter: Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
 
     /// True when the table was compacted away or dropped
     ///
