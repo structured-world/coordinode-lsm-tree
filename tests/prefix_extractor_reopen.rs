@@ -137,6 +137,34 @@ fn a_prefix_scan_under_the_same_extractor_still_skips_tables() {
     );
 }
 
+/// Tables written under one extractor, checked under another: their filters
+/// hold the old extractor's prefixes, which is no damage, so neither a scrub
+/// nor a repair reports or drops anything.
+#[test]
+fn scrub_and_repair_after_changing_the_extractor_keep_every_table() {
+    let folder = tempfile::tempdir().expect("tempdir");
+    write(&folder, Some(Arc::new(ColonPrefix)));
+
+    {
+        let tree = config(&folder, Some(Arc::new(SlashPrefix)))
+            .open()
+            .expect("open");
+        let report = lsm_tree::scrub::patrol_scrub(&tree, &Default::default());
+        assert!(report.is_ok(), "the scrub found damage: {report:?}");
+    }
+
+    let config = config(&folder, Some(Arc::new(SlashPrefix)));
+    let report = config.repair().expect("repair");
+    assert_eq!(
+        report.unreadable, 0,
+        "healthy tables were judged corrupt: {:?}",
+        report.unreadable_files
+    );
+    let tree = config.open().expect("open");
+    let all = keys(tree.iter(SeqNo::MAX, None).map(lsm_tree::Guard::into_inner));
+    assert_eq!(all.len(), 40, "rows lost to the repair");
+}
+
 #[test]
 fn repair_after_adding_an_extractor_keeps_every_table() {
     let folder = tempfile::tempdir().expect("tempdir");
