@@ -212,6 +212,100 @@ fn serde_roundtrip_preserves_storage() {
     assert_eq!(filter.params().seed, decoded.params().seed);
 }
 
+/// The repr's serialised shape, written out by hand: a struct of named fields,
+/// `Mode` as its variant name.
+#[cfg(feature = "ribbon-serde")]
+const REPR_JSON: &str = r#"{"version":1,"params":{"m":3,"w":16,"r":8,"mode":"Homogeneous","seed":42,"retry_limit":8,"grow_limit":2},"z":[1,2,3]}"#;
+
+#[cfg(feature = "ribbon-serde")]
+fn sample_repr() -> super::RibbonFilterRepr {
+    super::RibbonFilterRepr {
+        version: 1,
+        params: Params {
+            m: 3,
+            w: 16,
+            r: 8,
+            mode: Mode::Homogeneous,
+            seed: 42,
+            retry_limit: 8,
+            grow_limit: 2,
+        },
+        z: vec![1, 2, 3],
+    }
+}
+
+#[cfg(feature = "ribbon-serde")]
+fn assert_sample(repr: &super::RibbonFilterRepr) {
+    let sample = sample_repr();
+    assert_eq!(repr.version, sample.version);
+    assert_eq!(repr.params, sample.params);
+    assert_eq!(repr.z, sample.z);
+}
+
+#[cfg(feature = "ribbon-serde")]
+#[test]
+fn serde_repr_serialises_to_named_fields() {
+    let encoded = serde_json::to_string(&sample_repr()).expect("serialize should succeed");
+    assert_eq!(encoded, REPR_JSON);
+}
+
+#[cfg(feature = "ribbon-serde")]
+#[test]
+fn serde_repr_deserialises_from_map_and_sequence() {
+    let repr: super::RibbonFilterRepr =
+        serde_json::from_str(REPR_JSON).expect("the map form should deserialize");
+    assert_sample(&repr);
+
+    // A format may hand a struct over as a sequence of its fields in
+    // declaration order.
+    let repr: super::RibbonFilterRepr =
+        serde_json::from_str(r#"[1,[3,16,8,"Homogeneous",42,8,2],[1,2,3]]"#)
+            .expect("the sequence form should deserialize");
+    assert_sample(&repr);
+}
+
+#[cfg(feature = "ribbon-serde")]
+#[test]
+fn serde_repr_ignores_unknown_fields() {
+    let repr: super::RibbonFilterRepr = serde_json::from_str(
+        r#"{"extra":[0],"version":1,"params":{"m":3,"w":16,"r":8,"mode":"Homogeneous","seed":42,"retry_limit":8,"grow_limit":2,"note":"x"},"z":[1,2,3]}"#,
+    )
+    .expect("unknown fields should be skipped");
+    assert_sample(&repr);
+}
+
+#[cfg(feature = "ribbon-serde")]
+#[test]
+fn serde_repr_rejects_malformed_input() {
+    let cases = [
+        (
+            r#"{"version":1,"version":1,"params":{"m":3,"w":16,"r":8,"mode":"Homogeneous","seed":42,"retry_limit":8,"grow_limit":2},"z":[]}"#,
+            "duplicate field `version`",
+        ),
+        (
+            r#"{"version":1,"params":{"m":3,"w":16,"r":8,"mode":"Homogeneous","seed":42,"retry_limit":8},"z":[]}"#,
+            "missing field `grow_limit`",
+        ),
+        (
+            r#"{"version":1,"params":{"m":3,"w":16,"r":8,"mode":"Sideways","seed":42,"retry_limit":8,"grow_limit":2},"z":[]}"#,
+            "unknown variant `Sideways`, expected `Standard` or `Homogeneous`",
+        ),
+        (
+            r#"[1,[3,16,8,"Homogeneous",42,8,2]]"#,
+            "invalid length 2, expected struct RibbonFilterRepr with 3 elements",
+        ),
+    ];
+    for (input, expected) in cases {
+        let err = serde_json::from_str::<super::RibbonFilterRepr>(input)
+            .err()
+            .unwrap_or_else(|| panic!("{input} should be refused"));
+        assert!(
+            err.to_string().starts_with(expected),
+            "{input}: got {err}, expected {expected}"
+        );
+    }
+}
+
 #[cfg(feature = "ribbon-serde")]
 #[test]
 fn serde_rejects_unknown_filter_version() {
