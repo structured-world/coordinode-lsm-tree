@@ -2471,8 +2471,8 @@ impl Config {
     }
 
     /// Sets the wall clock this tree reads: the creation time stamped on its
-    /// tables and blob files, and the time FIFO compaction measures TTL
-    /// against.
+    /// tables and blob files, those a repair salvages included, and the time
+    /// FIFO compaction measures TTL against.
     ///
     /// Without one the tree reads the process clock: [`SystemClock`](crate::SystemClock)
     /// under `std`, or the clock registered with `set_clock` under `no_std`.
