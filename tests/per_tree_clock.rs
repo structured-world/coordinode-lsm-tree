@@ -51,21 +51,18 @@ fn config(folder: &Path, clock: Arc<dyn Clock>) -> Config {
 }
 
 /// Every file of `sub` under `folder`, by name.
-fn files(folder: &Path, sub: &str) -> BTreeMap<String, Vec<u8>> {
-    let Ok(entries) = std::fs::read_dir(folder.join(sub)) else {
-        return BTreeMap::new();
-    };
-    entries
-        .map(|entry| {
-            let entry = entry.expect("entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            (name, std::fs::read(entry.path()).expect("read"))
-        })
-        .collect()
+fn files(folder: &Path, sub: &str) -> lsm_tree::Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    for entry in std::fs::read_dir(folder.join(sub))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        files.insert(name, std::fs::read(entry.path())?);
+    }
+    Ok(files)
 }
 
 /// Three flushes of overlapping keys, then a major compaction.
-fn write(tree: &AnyTree) {
+fn write(tree: &AnyTree) -> lsm_tree::Result<()> {
     let mut seqno = 0;
     for round in 0..3u32 {
         for i in 0..400u32 {
@@ -78,13 +75,14 @@ fn write(tree: &AnyTree) {
             tree.insert(key, value, seqno);
             seqno += 1;
         }
-        tree.flush_active_memtable(0).expect("flush");
+        tree.flush_active_memtable(0)?;
     }
-    tree.major_compact(u64::MAX, seqno).expect("compact");
+    tree.major_compact(u64::MAX, seqno)?;
+    Ok(())
 }
 
-fn assert_same_files(a: &Path, b: &Path, sub: &str) {
-    let (a, b) = (files(a, sub), files(b, sub));
+fn assert_same_files(a: &Path, b: &Path, sub: &str) -> lsm_tree::Result<()> {
+    let (a, b) = (files(a, sub)?, files(b, sub)?);
     assert!(!a.is_empty(), "no {sub} written");
     assert_eq!(
         a.keys().collect::<Vec<_>>(),
@@ -94,53 +92,47 @@ fn assert_same_files(a: &Path, b: &Path, sub: &str) {
     for (name, bytes) in &a {
         assert!(bytes == &b[name], "{sub}/{name} differs between the trees");
     }
+    Ok(())
 }
 
 #[test]
-fn trees_with_the_same_fixed_clock_write_identical_tables() {
+fn trees_with_the_same_fixed_clock_write_identical_tables() -> lsm_tree::Result<()> {
     let (first, second) = (get_tmp_folder(), get_tmp_folder());
     for folder in [&first, &second] {
-        let tree = config(folder.path(), ManualClock::at(1_000))
-            .open()
-            .expect("open");
-        write(&tree);
+        let tree = config(folder.path(), ManualClock::at(1_000)).open()?;
+        write(&tree)?;
     }
-    assert_same_files(first.path(), second.path(), TABLES_FOLDER);
+    assert_same_files(first.path(), second.path(), TABLES_FOLDER)
 }
 
 #[cfg(feature = "columnar")]
 #[test]
-fn trees_with_the_same_fixed_clock_write_identical_columnar_tables() {
+fn trees_with_the_same_fixed_clock_write_identical_columnar_tables() -> lsm_tree::Result<()> {
     let (first, second) = (get_tmp_folder(), get_tmp_folder());
     for folder in [&first, &second] {
-        let tree = config(folder.path(), ManualClock::at(1_000))
-            .open()
-            .expect("open");
+        let tree = config(folder.path(), ManualClock::at(1_000)).open()?;
         let AnyTree::Standard(standard) = &tree else {
             panic!("expected a standard tree");
         };
-        standard
-            .update_runtime_config(|cfg| cfg.columnar = true)
-            .expect("enable columnar");
-        write(&tree);
+        standard.update_runtime_config(|cfg| cfg.columnar = true)?;
+        write(&tree)?;
     }
-    assert_same_files(first.path(), second.path(), TABLES_FOLDER);
+    assert_same_files(first.path(), second.path(), TABLES_FOLDER)
 }
 
 #[test]
-fn trees_with_the_same_fixed_clock_write_identical_blob_files() {
+fn trees_with_the_same_fixed_clock_write_identical_blob_files() -> lsm_tree::Result<()> {
     let (first, second) = (get_tmp_folder(), get_tmp_folder());
     for folder in [&first, &second] {
         let tree = config(folder.path(), ManualClock::at(1_000))
             .with_kv_separation(Some(
                 KvSeparationOptions::default().separation_threshold(64),
             ))
-            .open()
-            .expect("open");
-        write(&tree);
+            .open()?;
+        write(&tree)?;
     }
-    assert_same_files(first.path(), second.path(), TABLES_FOLDER);
-    assert_same_files(first.path(), second.path(), BLOBS_FOLDER);
+    assert_same_files(first.path(), second.path(), TABLES_FOLDER)?;
+    assert_same_files(first.path(), second.path(), BLOBS_FOLDER)
 }
 
 /// A table repair salvages is stamped on the tree's clock, as every table the
@@ -172,21 +164,22 @@ fn repair_salvage_stamps_the_configured_clock() -> lsm_tree::Result<()> {
 }
 
 #[test]
-fn fifo_ttl_expires_tables_by_the_configured_clock() {
+fn fifo_ttl_expires_tables_by_the_configured_clock() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let clock = ManualClock::at(1_000);
-    let tree = config(folder.path(), clock.clone()).open().expect("open");
+    let tree = config(folder.path(), clock.clone()).open()?;
     for i in 0..3u64 {
         tree.insert(format!("k{i}"), "v", i);
-        tree.flush_active_memtable(0).expect("flush");
+        tree.flush_active_memtable(0)?;
     }
 
     let fifo = Arc::new(Fifo::new(u64::MAX, Some(60)));
     clock.set(1_059);
-    tree.compact(fifo.clone(), 3).expect("compact");
+    tree.compact(fifo.clone(), 3)?;
     assert_eq!(3, tree.table_count(), "tables expired before their TTL");
 
     clock.set(1_061);
-    tree.compact(fifo, 3).expect("compact");
+    tree.compact(fifo, 3)?;
     assert_eq!(0, tree.table_count(), "tables outlived their TTL");
+    Ok(())
 }
