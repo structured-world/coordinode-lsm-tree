@@ -10,7 +10,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use super::util::{ReadCharge, admit_read_block, build_block_transform};
+use super::util::{LookupFd, ReadCharge, admit_read_block, build_block_transform};
 #[cfg(feature = "metrics")]
 use super::util::{record_block_decoded, record_block_load_cached, record_block_read};
 use super::{Block, BlockHandle, BlockOffset, GlobalTableId};
@@ -354,6 +354,8 @@ pub struct GroupRead<'a> {
     pub budget: crate::config::ReadBudget,
     /// Told how long each request to the file took, when it is active then.
     pub pace: Option<&'a dyn crate::table::util::ReadPacer>,
+    /// The table file, shared with the other block reads of the same lookup.
+    pub fd: &'a LookupFd,
 }
 
 impl GroupRead<'_> {
@@ -400,7 +402,6 @@ impl GroupRead<'_> {
             check_group_extent(self.group, directory_len, &directory)?;
             check_head_zones_len(self.group, &directory)?;
             self.check_group_tag(&directory)?;
-            let mut fd = None;
             // A directory cached by a read that did not select by its head
             // zone block's column lacks those zones: the first read that does
             // reads the block and caches the directory with them.
@@ -408,8 +409,7 @@ impl GroupRead<'_> {
                 .zone_column()
                 .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
             {
-                let directory =
-                    self.with_head_zones(&mut fd, &directory, directory_len, &Slice::empty())?;
+                let directory = self.with_head_zones(&directory, directory_len, &Slice::empty())?;
                 if self.charge.touches_cache() {
                     self.cache.insert_directory(
                         self.table_id,
@@ -424,7 +424,6 @@ impl GroupRead<'_> {
             };
             let zones = match want.zone_block_column(&directory) {
                 Some(column_id) => Some(self.zone_block(
-                    &mut fd,
                     &directory,
                     directory_len,
                     column_id,
@@ -444,12 +443,8 @@ impl GroupRead<'_> {
                     pages,
                 });
             }
-            let fd = match fd {
-                Some(fd) => fd,
-                None => self.open()?,
-            };
             let pages = self.fetch_missing(
-                fd.as_ref(),
+                self.open()?,
                 &directory,
                 directory_len,
                 &Slice::empty(),
@@ -462,8 +457,7 @@ impl GroupRead<'_> {
             });
         }
 
-        let fd = self.open()?;
-        self.read_selective(fd, want)
+        self.read_selective(want)
     }
 
     /// Loads the pages `want` selects in the group `earlier` read, [`load`]
@@ -485,10 +479,8 @@ impl GroupRead<'_> {
     ) -> crate::Result<RowGroupBlocks> {
         let directory = Arc::clone(&earlier.directory);
         let directory_len = indexed_directory_len(self.group)?;
-        let mut fd = None;
         let zones = match want.zone_block_column(&directory) {
             Some(column_id) => Some(self.zone_block(
-                &mut fd,
                 &directory,
                 directory_len,
                 column_id,
@@ -512,12 +504,8 @@ impl GroupRead<'_> {
         let pages = if pages.iter().all(|slot| slot.block.is_some()) {
             pages
         } else {
-            let fd = match fd {
-                Some(fd) => fd,
-                None => self.open()?,
-            };
             self.fetch_missing(
-                fd.as_ref(),
+                self.open()?,
                 &directory,
                 directory_len,
                 &Slice::empty(),
@@ -536,7 +524,6 @@ impl GroupRead<'_> {
     /// group's first bytes when an earlier read brought them in.
     fn with_head_zones(
         &self,
-        fd: &mut Option<Arc<dyn FsFile>>,
         directory: &Arc<PageDirectory>,
         directory_len: u32,
         front: &Slice,
@@ -545,7 +532,7 @@ impl GroupRead<'_> {
             return Ok(Arc::clone(directory));
         };
         // Kept decoded on the directory, so the block itself is not cached.
-        let zones = self.zone_block(fd, directory, directory_len, head.column_id, front, false)?;
+        let zones = self.zone_block(directory, directory_len, head.column_id, front, false)?;
         Ok(Arc::new(
             PageDirectory::clone(directory).with_head_zones(zones)?,
         ))
@@ -554,11 +541,9 @@ impl GroupRead<'_> {
     /// The group's zone block, from the cache or read, verified and admitted
     /// like a page, decoded and checked against `directory`, and cached when
     /// `cache` says so. `front` holds the group's first bytes when an earlier
-    /// read brought them in; `fd` is opened here when the block has to be
-    /// read and it is not yet.
+    /// read brought them in.
     fn zone_block(
         &self,
-        fd: &mut Option<Arc<dyn FsFile>>,
         directory: &PageDirectory,
         directory_len: u32,
         column_id: u16,
@@ -586,11 +571,7 @@ impl GroupRead<'_> {
             front.slice(start..end)
         } else {
             self.check_block_len(length)?;
-            let fd = match fd {
-                Some(fd) => fd,
-                None => fd.insert(self.open()?),
-            };
-            self.read(fd.as_ref(), start, end - start, BlockType::ColumnZones)?
+            self.read(self.open()?, start, end - start, BlockType::ColumnZones)?
         };
         let block = self.verify_and_admit(
             &bytes,
@@ -633,11 +614,8 @@ impl GroupRead<'_> {
     /// pages are served from it; any other read takes exactly the directory,
     /// with the head zone block after it when it selects by the key column,
     /// whose zones a writer puts there.
-    fn read_selective(
-        &self,
-        fd: Arc<dyn FsFile>,
-        want: &PageWant<'_>,
-    ) -> crate::Result<RowGroupBlocks> {
+    fn read_selective(&self, want: &PageWant<'_>) -> crate::Result<RowGroupBlocks> {
+        let fd = self.open()?;
         let group_len = self.group.size() as usize;
         let io_buffer = self.budget.io_buffer() as usize;
         let directory_len = indexed_directory_len(self.group)?;
@@ -668,34 +646,24 @@ impl GroupRead<'_> {
             directory_len as usize
         };
         let prefix = if want.whole && group_len <= io_buffer {
-            self.read(fd.as_ref(), 0, group_len, BlockType::ColumnPage)?
+            self.read(fd, 0, group_len, BlockType::ColumnPage)?
         } else {
-            self.read(fd.as_ref(), 0, head_end, BlockType::ColumnPageDirectory)?
+            self.read(fd, 0, head_end, BlockType::ColumnPageDirectory)?
         };
         let directory = self.admit_directory(&prefix, directory_len)?;
-        let mut fd = Some(fd);
         let directory = if want
             .zone_column()
             .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
         {
-            self.with_head_zones(&mut fd, &directory, directory_len, &prefix)?
+            self.with_head_zones(&directory, directory_len, &prefix)?
         } else {
             directory
         };
         let zones = match want.zone_block_column(&directory) {
-            Some(column_id) => Some(self.zone_block(
-                &mut fd,
-                &directory,
-                directory_len,
-                column_id,
-                &prefix,
-                true,
-            )?),
+            Some(column_id) => {
+                Some(self.zone_block(&directory, directory_len, column_id, &prefix, true)?)
+            }
             None => None,
-        };
-        let fd = match fd {
-            Some(fd) => fd,
-            None => self.open()?,
         };
         let wanted = want.resolve(&directory, zones.as_ref())?;
         let mut pages = wanted.slots(&directory);
@@ -705,7 +673,7 @@ impl GroupRead<'_> {
             let found = self.fill_cached(&directory, directory_len, &mut pages)?;
             self.count_cached(false, found);
         }
-        let pages = self.fetch_missing(fd.as_ref(), &directory, directory_len, &prefix, pages)?;
+        let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages)?;
         // Cached only now that the blocks it named carried the stamps it
         // implies: another group's directory read in this one's place fails
         // the read without staying behind to refuse every healthy page later.
@@ -1075,35 +1043,17 @@ impl GroupRead<'_> {
         let _ = (directory, pages);
     }
 
-    /// Opens the table's file, leaving the descriptor cache as it found it
-    /// for a read that must leave no trace, as `load_block` does.
-    fn open(&self) -> crate::Result<Arc<dyn FsFile>> {
-        let (fd, cache_event) = if self.charge.touches_cache() {
-            self.file_accessor
-                .get_or_open_table(&self.table_id, self.path)?
-        } else {
-            (
-                self.file_accessor
-                    .peek_or_open_table(&self.table_id, self.path)?,
-                None,
-            )
-        };
-        #[cfg(feature = "metrics")]
-        if let Some(hit) = cache_event
-            && self.charge.is_counted()
-        {
-            use core::sync::atomic::Ordering::Relaxed;
-            if hit {
-                self.metrics.table_file_opened_cached.fetch_add(1, Relaxed);
-            } else {
-                self.metrics
-                    .table_file_opened_uncached
-                    .fetch_add(1, Relaxed);
-            }
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = cache_event;
-        Ok(fd)
+    /// The table's file, taken through the lookup's [`LookupFd`] as
+    /// `load_block` takes it.
+    fn open(&self) -> crate::Result<&dyn FsFile> {
+        Ok(self.fd.resolve(
+            self.file_accessor,
+            &self.table_id,
+            self.path,
+            self.charge,
+            #[cfg(feature = "metrics")]
+            self.metrics,
+        )?)
     }
 
     /// Verifies one block's on-disk `bytes` and admits it. `with_dict` says

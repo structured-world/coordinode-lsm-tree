@@ -21,7 +21,7 @@ use crate::table::block_index::{BlockIndex, BlockIndexIter, BlockIndexIterImpl};
 use crate::table::columnar::ColumnBatch;
 use crate::table::columnar_predicate::{ColumnRangePredicate, PredicateSupport};
 use crate::table::row_group::{PageWant, RowGroupBlocks, RowPageSelect, RowPageSet};
-use crate::table::util::ReadCharge;
+use crate::table::util::{LookupFd, ReadCharge};
 use crate::{SeqNo, Table, UserKey};
 
 /// Where a batch a [`ColumnarCursor`] yielded was read from: its row page,
@@ -292,7 +292,7 @@ impl ColumnarCursor {
             // read with it, is what the later runs are sized over.
             let first = self
                 .table
-                .group_read(&handle, ReadCharge::Foreground)
+                .group_read(&handle, ReadCharge::Foreground, &LookupFd::default())
                 .load(&PageWant::projected(
                     &self.decode_projection,
                     RowPageSelect::Range(0..1),
@@ -346,7 +346,7 @@ impl ColumnarCursor {
         }
         let blocks = self
             .table
-            .group_read(&group.handle, ReadCharge::Foreground)
+            .group_read(&group.handle, ReadCharge::Foreground, &LookupFd::default())
             .load_after(
                 &group.directory,
                 &PageWant::projected(&self.decode_projection, RowPageSelect::Range(start..end)),
@@ -431,7 +431,7 @@ impl ColumnarCursor {
         };
         let blocks = self
             .table
-            .group_read(handle, ReadCharge::Foreground)
+            .group_read(handle, ReadCharge::Foreground, &LookupFd::default())
             .load(&PageWant {
                 columns: Some(&self.decode_projection),
                 row_pages: select(),
@@ -743,12 +743,12 @@ impl Table {
     ) -> crate::Result<Vec<crate::table::columnar::Column>> {
         use crate::table::columnar::DecodeBudget;
 
-        let blocks =
-            self.group_read(&at.group, ReadCharge::Foreground)
-                .load(&PageWant::projected(
-                    columns,
-                    RowPageSelect::Range(at.ordinal..at.ordinal + 1),
-                ))?;
+        let blocks = self
+            .group_read(&at.group, ReadCharge::Foreground, &LookupFd::default())
+            .load(&PageWant::projected(
+                columns,
+                RowPageSelect::Range(at.ordinal..at.ordinal + 1),
+            ))?;
         let mut budget = DecodeBudget::default();
         let mut pages = blocks.page_columns(|_| true, &mut budget)?;
         let Some(page) = pages.pop().filter(|page| page.ordinal == at.ordinal) else {

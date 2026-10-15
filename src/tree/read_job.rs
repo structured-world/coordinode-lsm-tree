@@ -186,7 +186,10 @@ impl Job {
                 block: table
                     .table(version)
                     .ok_or_else(misplaced)
-                    .and_then(|table| table.load_data_block(&handle)),
+                    // One block per job: nothing else of the lookup shares its file here.
+                    .and_then(|table| {
+                        table.load_data_block(&handle, &crate::table::util::LookupFd::default())
+                    }),
             },
             Self::Serial { level, remaining } => JobDone::Serial {
                 result: version.level(level).ok_or_else(misplaced).and_then(|on| {

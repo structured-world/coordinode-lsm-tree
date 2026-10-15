@@ -575,6 +575,7 @@ impl Iter {
                     charge: self.charge,
                     budget: self.read_budget,
                     pace: self.pace.as_deref(),
+                    fd: &crate::table::util::LookupFd::default(),
                 }
                 .load(&crate::table::row_group::PageWant::ALL)?;
                 // What decoding the pages copied out of them, plus the values
@@ -638,6 +639,7 @@ impl Iter {
             &self.metrics,
             self.charge,
             self.pace.as_deref(),
+            &crate::table::util::LookupFd::default(),
         )?;
         DataBlock::from_loaded(raw, self.has_kv_footer).map(|db| Some(BlockSource::Row(db)))
     }

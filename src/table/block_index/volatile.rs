@@ -12,7 +12,7 @@ use crate::{
         BlockHandle, IndexBlock,
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::{ReadCharge, load_block_paced},
+        util::{LookupFd, ReadCharge, load_block_paced},
     },
 };
 use alloc::sync::Arc;
@@ -117,8 +117,8 @@ impl Iter {
     ///
     /// On `Ok(None)` (empty range) the iterator is marked exhausted so
     /// subsequent `next()` / `next_back()` calls return `None` without
-    /// re-loading the block from disk.
-    fn init_inner(&mut self) -> crate::Result<Option<OwnedIndexBlockIter>> {
+    /// re-loading the block from disk. The block is read through `fd`.
+    fn init_inner(&mut self, fd: &LookupFd) -> crate::Result<Option<OwnedIndexBlockIter>> {
         let block = load_block_paced(
             self.table_id,
             &self.path,
@@ -140,6 +140,7 @@ impl Iter {
             &self.metrics,
             self.charge,
             self.pace.as_deref(),
+            fd,
         )?;
         let index_block = IndexBlock::new(block);
         let lo = self.lo.as_ref().map(|(k, s)| (k.as_ref(), *s));
@@ -159,6 +160,28 @@ impl Iter {
 
         Ok(iter)
     }
+
+    /// [`Iterator::next`], the index block read through `fd`, which the
+    /// lookup's other block reads share.
+    pub(crate) fn next_with(&mut self, fd: &LookupFd) -> Option<crate::Result<KeyedBlockHandle>> {
+        if self.poisoned {
+            return None;
+        }
+
+        if let Some(inner) = &mut self.inner {
+            inner.next().map(Ok)
+        } else {
+            let mut iter = match self.init_inner(fd) {
+                Ok(Some(it)) => it,
+                Ok(None) => return None,
+                Err(e) => return self.poison(e),
+            };
+
+            let next_item = iter.next().map(Ok);
+            self.inner = Some(iter);
+            next_item
+        }
+    }
 }
 
 impl BlockIndexIter for Iter {
@@ -177,23 +200,7 @@ impl Iterator for Iter {
     type Item = crate::Result<KeyedBlockHandle>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.poisoned {
-            return None;
-        }
-
-        if let Some(inner) = &mut self.inner {
-            inner.next().map(Ok)
-        } else {
-            let mut iter = match self.init_inner() {
-                Ok(Some(it)) => it,
-                Ok(None) => return None,
-                Err(e) => return self.poison(e),
-            };
-
-            let next_item = iter.next().map(Ok);
-            self.inner = Some(iter);
-            next_item
-        }
+        self.next_with(&LookupFd::default())
     }
 }
 
@@ -206,7 +213,7 @@ impl DoubleEndedIterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next_back().map(Ok)
         } else {
-            let mut iter = match self.init_inner() {
+            let mut iter = match self.init_inner(&LookupFd::default()) {
                 Ok(Some(it)) => it,
                 Ok(None) => return None,
                 Err(e) => return self.poison(e),

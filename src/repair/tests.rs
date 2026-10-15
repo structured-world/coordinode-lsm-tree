@@ -3558,7 +3558,7 @@ fn a_read_into_a_punched_extent_reports_it_as_excised() -> crate::Result<()> {
     let first: &crate::table::BlockHandle = keyed.as_ref();
     memfs.punch_hole(&sst, first.offset().0, u64::from(first.size()))?;
 
-    let Err(err) = table.load_data_block(first) else {
+    let Err(err) = table.load_data_block(first, &crate::table::util::LookupFd::default()) else {
         panic!("a punched block cannot load");
     };
     assert!(

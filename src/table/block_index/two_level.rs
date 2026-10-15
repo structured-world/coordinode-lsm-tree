@@ -12,7 +12,7 @@ use crate::{
     table::{
         block::BlockType,
         block_index::{BlockIndexIter, iter::OwnedIndexBlockIter},
-        util::{ReadCharge, load_block_paced},
+        util::{LookupFd, ReadCharge, load_block_paced},
     },
 };
 use alloc::sync::Arc;
@@ -144,6 +144,14 @@ impl Iterator for Iter {
     type Item = crate::Result<KeyedBlockHandle>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with(&LookupFd::default())
+    }
+}
+
+impl Iter {
+    /// [`Iterator::next`], the index partitions read through `fd`, which the
+    /// lookup's other block reads share.
+    pub(crate) fn next_with(&mut self, fd: &LookupFd) -> Option<crate::Result<KeyedBlockHandle>> {
         if self.poisoned {
             return None;
         }
@@ -190,6 +198,7 @@ impl Iterator for Iter {
                     &self.metrics,
                     self.charge,
                     self.pace.as_deref(),
+                    fd,
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),
@@ -250,6 +259,9 @@ impl DoubleEndedIterator for Iter {
             }
         }
 
+        // The partitions this one step reads, until it finds an entry, share
+        // the file.
+        let fd = LookupFd::default();
         if let Some(tli) = &mut self.tli {
             loop {
                 let Some(handle) = tli.next_back() else {
@@ -278,6 +290,7 @@ impl DoubleEndedIterator for Iter {
                     &self.metrics,
                     self.charge,
                     self.pace.as_deref(),
+                    &fd,
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),

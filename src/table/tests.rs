@@ -4392,6 +4392,7 @@ fn a_paced_block_read_paces_each_portion_it_reads_from_the_file() -> crate::Resu
             &table.metrics,
             crate::table::util::ReadCharge::Foreground,
             Some(&pace),
+            &crate::table::util::LookupFd::default(),
         )
     };
 
@@ -5348,7 +5349,9 @@ fn excised_probe_counts_the_bytes_it_reads() -> crate::Result<()> {
     table.file_accessor.remove_for_table(&table.global_id());
 
     let before = metrics.bytes_read();
-    let err = table.load_data_block(&handle).err();
+    let err = table
+        .load_data_block(&handle, &crate::table::util::LookupFd::default())
+        .err();
     assert!(
         matches!(err, Some(crate::Error::Excised { .. })),
         "a zeroed extent must read as excised, got {err:?}",
@@ -8705,9 +8708,10 @@ fn a_paced_projection_times_each_page_region_on_its_own() -> crate::Result<()> {
 
     let timed = Timed(AtomicUsize::new(0));
     let table = fresh()?;
+    let fd = crate::table::util::LookupFd::default();
     let blocks = GroupRead {
         pace: Some(&timed),
-        ..table.group_read(&group, ReadCharge::Foreground)
+        ..table.group_read(&group, ReadCharge::Foreground, &fd)
     }
     .load(&want)?;
     let paced = table
