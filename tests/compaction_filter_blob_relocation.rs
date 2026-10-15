@@ -190,23 +190,22 @@ fn relocating_compaction_separates_inline_value_above_lowered_threshold() -> lsm
         tree.get("early", SeqNo::MAX)?.as_deref(),
         Some(early.as_slice())
     );
-    let live = written(b"big-a", 1).len() + written(b"big-b", 0).len();
-    let blob_bytes: u64 = tree
+    // `big-a`'s newest version, `big-b`, and the early value, now separated:
+    // the relocated file and the stale `big-a` it held are gone.
+    let blob_values: u64 = tree
         .current_version()
         .blob_files
         .iter()
         .map(lsm_tree::BlobFile::len)
         .sum();
-    assert!(
-        blob_bytes >= (live + early.len()) as u64,
-        "{blob_bytes} blob bytes hold the {live} live separated bytes and not the early value"
-    );
+    assert_eq!(blob_values, 3, "the early value was not separated");
     Ok(())
 }
 
-/// Rounds of overwrites and major compactions, every one of them relocating
-/// what went stale: a filter that rewrites values in each round leaves no more
-/// blob files behind than the same rounds without it.
+/// Rounds that each overwrite one key and compact, so every compaction
+/// relocates the file the round before left stale, while the filter rewrites
+/// the same values in every one of them: the rewrites leave no more blob files
+/// behind than the same rounds without the filter.
 #[test]
 fn filter_heavy_churn_with_relocation_keeps_blob_file_count() -> lsm_tree::Result<()> {
     let churn = |filter: bool| -> lsm_tree::Result<usize> {
@@ -217,18 +216,24 @@ fn filter_heavy_churn_with_relocation_keeps_blob_file_count() -> lsm_tree::Resul
         filter_on.store(filter, Ordering::Relaxed);
         let mut seqno = 2;
         for round in 2..8 {
-            for key in KEYS {
-                tree.insert(key, written(key, round), seqno);
-                seqno += 1;
-            }
+            tree.insert(KEYS[0], written(KEYS[0], round), seqno);
+            seqno += 1;
             tree.flush_active_memtable(0)?;
             tree.major_compact(64_000_000, seqno)?;
         }
+        assert_eq!(
+            tree.get(KEYS[0], SeqNo::MAX)?.as_deref(),
+            Some(written(KEYS[0], 7).as_slice())
+        );
+        assert_eq!(
+            tree.get(KEYS[1], SeqNo::MAX)?.as_deref(),
+            Some(written(KEYS[1], 0).as_slice())
+        );
         for key in &KEYS[2..] {
             let expected = if filter {
                 rewritten(key)
             } else {
-                written(key, 7)
+                written(key, 0)
             };
             assert_eq!(
                 tree.get(key, SeqNo::MAX)?.as_deref(),
