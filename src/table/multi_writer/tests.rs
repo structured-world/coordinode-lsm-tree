@@ -508,6 +508,7 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
         CompressionType::None,
         #[cfg(zstd_any)]
         None,
+        &crate::table::util::LookupFd::default(),
     )?;
     let section_bytes: &[u8] = &block.data;
     let num_blocks = table.metadata.data_block_count;

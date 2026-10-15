@@ -57,6 +57,19 @@ impl BlockIndexIterImpl {
         }
         self
     }
+
+    /// [`Iterator::next`], an index block read from the file taken through
+    /// `fd`, which the lookup's other block reads share.
+    pub(crate) fn next_with(
+        &mut self,
+        fd: &crate::table::util::LookupFd,
+    ) -> Option<crate::Result<KeyedBlockHandle>> {
+        match self {
+            Self::Full(i) => i.next(),
+            Self::Volatile(i) => i.next_with(fd),
+            Self::TwoLevel(i) => i.next_with(fd),
+        }
+    }
 }
 
 impl BlockIndexIter for BlockIndexIterImpl {
@@ -111,13 +124,16 @@ pub enum PointReadIterImpl<'a> {
     Owned(BlockIndexIterImpl),
 }
 
-impl Iterator for PointReadIterImpl<'_> {
-    type Item = crate::Result<KeyedBlockHandle>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl PointReadIterImpl<'_> {
+    /// The next block handle, an index block read from the file taken through
+    /// `fd`, which the lookup's other block reads share.
+    pub(crate) fn next_with(
+        &mut self,
+        fd: &crate::table::util::LookupFd,
+    ) -> Option<crate::Result<KeyedBlockHandle>> {
         match self {
             Self::Full(i) => i.next(),
-            Self::Owned(i) => i.next(),
+            Self::Owned(i) => i.next_with(fd),
         }
     }
 }

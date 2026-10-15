@@ -56,6 +56,10 @@ pub(crate) mod zone_map;
 )]
 mod tests;
 
+#[cfg(all(test, feature = "std", feature = "metrics"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod lookup_fd_tests;
+
 pub use block::{Block, BlockOffset};
 pub use data_block::DataBlock;
 pub use id::{GlobalTableId, TableId};
@@ -89,7 +93,7 @@ use iter::Iter;
 
 use crate::path::PathBuf;
 use portable_atomic::AtomicU64;
-use util::ReadCharge;
+use util::{LookupFd, ReadCharge};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -1118,7 +1122,9 @@ impl Table {
         want: &crate::table::row_group::PageWant<'_>,
         charge: ReadCharge,
     ) -> crate::Result<crate::table::row_group::RowPages> {
-        let blocks = self.group_read(handle, charge).load(want)?;
+        let blocks = self
+            .group_read(handle, charge, &LookupFd::default())
+            .load(want)?;
         self.row_pages(&blocks, charge)
     }
 
@@ -1140,7 +1146,7 @@ impl Table {
         for (group, handle) in (0u64..).zip(self.data_block_handles()) {
             let handle = handle?;
             let blocks = self
-                .group_read(handle.as_ref(), ReadCharge::Untraced)
+                .group_read(handle.as_ref(), ReadCharge::Untraced, &LookupFd::default())
                 .load(&crate::table::row_group::PageWant::ALL)?;
             for page in blocks.page_encodings()? {
                 out.push(crate::inspect::PageEncoding {
@@ -1158,12 +1164,13 @@ impl Table {
     }
 
     /// The context a read of the row group `handle` names needs, charged as
-    /// `charge` says.
+    /// `charge` says, the file taken through `fd`.
     #[cfg(feature = "columnar")]
     fn group_read<'a>(
         &'a self,
         handle: &'a BlockHandle,
         charge: ReadCharge,
+        fd: &'a LookupFd,
     ) -> crate::table::row_group::GroupRead<'a> {
         crate::table::row_group::GroupRead {
             table_id: self.global_id(),
@@ -1182,6 +1189,7 @@ impl Table {
             charge,
             budget: self.read_budget(),
             pace: None,
+            fd,
         }
     }
 
@@ -1214,6 +1222,7 @@ impl Table {
         block_type: BlockType,
         compression: CompressionType,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
+        fd: &LookupFd,
     ) -> crate::Result<Block> {
         self.load_block_charged(
             handle,
@@ -1223,11 +1232,19 @@ impl Table {
             zstd_dict,
             ReadCharge::Foreground,
             None,
+            fd,
         )
     }
 
     /// [`Self::load_block`] charged as `charge` says, for a read that is not a
     /// caller's, and told to `pace` when given.
+    #[cfg_attr(
+        zstd_any,
+        expect(
+            clippy::too_many_arguments,
+            reason = "the block's read context: handle, role, codec, dictionary, charge, pacer and file"
+        )
+    )]
     fn load_block_charged(
         &self,
         handle: &BlockHandle,
@@ -1236,6 +1253,7 @@ impl Table {
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
         charge: ReadCharge,
         pace: Option<&dyn crate::table::util::ReadPacer>,
+        fd: &LookupFd,
     ) -> crate::Result<Block> {
         crate::table::util::load_block_paced(
             self.global_id(),
@@ -1254,6 +1272,7 @@ impl Table {
             &self.metrics,
             charge,
             pace,
+            fd,
         )
     }
 
@@ -1474,8 +1493,15 @@ impl Table {
     /// `pub(crate)` so the repair tests can load one block of a table they
     /// damaged; the salvage walk reads through its own loader,
     /// [`Table::salvage_load_block`].
-    pub(crate) fn load_data_block(&self, handle: &BlockHandle) -> crate::Result<Option<DataBlock>> {
-        self.load_data_block_charged(handle, ReadCharge::Foreground)
+    ///
+    /// The file is taken through `fd`, which the lookup's other block reads
+    /// share.
+    pub(crate) fn load_data_block(
+        &self,
+        handle: &BlockHandle,
+        fd: &LookupFd,
+    ) -> crate::Result<Option<DataBlock>> {
+        self.load_data_block_paced(handle, ReadCharge::Foreground, None, fd)
     }
 
     /// [`Self::load_data_block`] for maintenance that sizes a rewrite of the
@@ -1487,7 +1513,12 @@ impl Table {
         handle: &BlockHandle,
         pace: &dyn crate::table::util::ReadPacer,
     ) -> crate::Result<Option<DataBlock>> {
-        self.load_data_block_paced(handle, ReadCharge::Maintenance, Some(pace))
+        self.load_data_block_paced(
+            handle,
+            ReadCharge::Maintenance,
+            Some(pace),
+            &LookupFd::default(),
+        )
     }
 
     /// [`Self::load_data_block`] charged as `charge` says, for a read that is
@@ -1497,21 +1528,23 @@ impl Table {
         handle: &BlockHandle,
         charge: ReadCharge,
     ) -> crate::Result<Option<DataBlock>> {
-        self.load_data_block_paced(handle, charge, None)
+        self.load_data_block_paced(handle, charge, None, &LookupFd::default())
     }
 
-    /// [`Self::load_data_block_charged`], told to `pace` when given.
+    /// [`Self::load_data_block_charged`], told to `pace` when given, the file
+    /// taken through `fd`.
     fn load_data_block_paced(
         &self,
         handle: &BlockHandle,
         charge: ReadCharge,
         pace: Option<&dyn crate::table::util::ReadPacer>,
+        fd: &LookupFd,
     ) -> crate::Result<Option<DataBlock>> {
         // Columnar SSTs store each data block as a PAX `ColumnBatch`; reconstruct
         // the row entries on load so every row read path works unchanged.
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_data_block(handle, charge, pace);
+            return self.load_columnar_data_block(handle, charge, pace, fd);
         }
         // `from_loaded` transparently strips the per-KV checksum footer when
         // this SST carries one. Footer presence is a per-SST property
@@ -1526,6 +1559,7 @@ impl Table {
             self.zstd_dictionary.as_deref(),
             charge,
             pace,
+            fd,
         )
         .and_then(|block| DataBlock::from_loaded(block, has_kv_footer))
         .map(Some)
@@ -1606,10 +1640,11 @@ impl Table {
         handle: &BlockHandle,
         charge: ReadCharge,
         pace: Option<&dyn crate::table::util::ReadPacer>,
+        fd: &LookupFd,
     ) -> crate::Result<Option<DataBlock>> {
         let blocks = crate::table::row_group::GroupRead {
             pace,
-            ..self.group_read(handle, charge)
+            ..self.group_read(handle, charge, fd)
         }
         .load(&crate::table::row_group::PageWant::ALL)?;
         let batch = self.row_pages(&blocks, charge)?.batches;
@@ -2170,6 +2205,7 @@ impl Table {
         &self,
         handle: &BlockHandle,
         needle: &[u8],
+        fd: &LookupFd,
     ) -> crate::Result<Option<DataBlock>> {
         use crate::table::columnar::{COL_USER_KEY, TypeTag};
         use crate::table::row_group::{PageWant, RowPageSelect};
@@ -2177,7 +2213,7 @@ impl Table {
         // A key equal to the needle is the needle's bytes (the comparator
         // contract makes equality byte equality), so it lies within the
         // byte-wise zone of the row page holding it, whatever the key order.
-        let group = self.group_read(handle, ReadCharge::Foreground);
+        let group = self.group_read(handle, ReadCharge::Foreground, fd);
         let key_blocks = group.load(&PageWant::projected(
             &[COL_USER_KEY],
             RowPageSelect::Zone {
@@ -2295,18 +2331,20 @@ impl Table {
     /// Loads the data block to point-read for `needle`: for a columnar SST the
     /// key-aware fast path that rebuilds only the matching key's rows; for a row
     /// SST the whole block. `Ok(None)` means the block carries no row for `needle`
-    /// (columnar: absent / wholly deleted), so the caller moves on.
+    /// (columnar: absent / wholly deleted), so the caller moves on. The file is
+    /// taken through `fd`, the lookup's.
     fn load_point_block(
         &self,
         handle: &BlockHandle,
         needle: &[u8],
+        fd: &LookupFd,
     ) -> crate::Result<Option<DataBlock>> {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
-            return self.load_columnar_point_block(handle, needle);
+            return self.load_columnar_point_block(handle, needle, fd);
         }
         let _ = needle;
-        self.load_data_block(handle)
+        self.load_data_block(handle, fd)
     }
 
     /// Loads a columnar data block and decodes only the projected columns of
@@ -6805,8 +6843,9 @@ impl Table {
     /// nothing.
     ///
     /// Returns `Ok(BloomResult::Skip)` if the bloom filter says the key is definitely absent,
-    /// `Ok(BloomResult::Proceed { has_filter })` otherwise.
-    fn judge_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
+    /// `Ok(BloomResult::Proceed { has_filter })` otherwise. A filter block read
+    /// from the file is read through `fd`, the lookup's.
+    fn judge_bloom(&self, key: &[u8], key_hash: u64, fd: &LookupFd) -> crate::Result<BloomResult> {
         debug_assert_eq!(
             key_hash,
             crate::hash::hash64(key),
@@ -6823,6 +6862,7 @@ impl Table {
                     CompressionType::None,
                     #[cfg(zstd_any)]
                     None,
+                    fd,
                 )?;
                 Self::answer_bloom(Some(&FilterBlock::new(block)), key_hash)
             }
@@ -6832,8 +6872,8 @@ impl Table {
 
     /// [`Self::judge_bloom`], counted at once in the global metrics, as a
     /// point read counts its filter answers.
-    fn check_bloom(&self, key: &[u8], key_hash: u64) -> crate::Result<BloomResult> {
-        let answer = self.judge_bloom(key, key_hash)?;
+    fn check_bloom(&self, key: &[u8], key_hash: u64, fd: &LookupFd) -> crate::Result<BloomResult> {
+        let answer = self.judge_bloom(key, key_hash, fd)?;
         #[cfg(feature = "metrics")]
         if answer.should_skip() {
             use core::sync::atomic::Ordering::Relaxed;
@@ -6945,7 +6985,9 @@ impl Table {
             return Ok(None);
         }
 
-        let bloom = self.check_bloom(key, key_hash)?;
+        // The filter, index and data blocks this lookup reads share the file.
+        let fd = LookupFd::default();
+        let bloom = self.check_bloom(key, key_hash, &fd)?;
         self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
@@ -6973,7 +7015,7 @@ impl Table {
             }
         }
 
-        let item = self.point_read(key, seqno, key_hash)?;
+        let item = self.point_read(key, seqno, key_hash, &fd)?;
 
         // Populate the row cache only when this read could see the SST's newest
         // version (`seqno > max`, exclusive), so the resolved value is the SST's
@@ -7053,7 +7095,9 @@ impl Table {
             return Ok(None);
         }
 
-        let bloom = self.check_bloom(key, key_hash)?;
+        // The filter, index and data blocks this lookup reads share the file.
+        let fd = LookupFd::default();
+        let bloom = self.check_bloom(key, key_hash, &fd)?;
         self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
@@ -7074,7 +7118,7 @@ impl Table {
             }
         }
 
-        let item = self.point_read_value(key, seqno, key_hash)?;
+        let item = self.point_read_value(key, seqno, key_hash, &fd)?;
 
         // Populate only when this read could see the SST's newest version
         // (`seqno > max`, exclusive), mirroring `Table::get`. The value path does
@@ -7118,12 +7162,13 @@ impl Table {
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
+        fd: &LookupFd,
     ) -> crate::Result<Option<(crate::ValueType, SeqNo, crate::Slice)>> {
         // Fast path: retrieval-ribbon locator (see `point_read_inner` for the
         // MVCC-correctness argument). A located-block miss falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key)?
+            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
         {
             // A columnar block is narrowed to this key's rows by load_point_block,
             // so the full-block slot hint does not apply.
@@ -7143,18 +7188,18 @@ impl Table {
             }
         }
 
-        let Some(iter) = self.block_index.point_read_reader(key, seqno) else {
+        let Some(mut iter) = self.block_index.point_read_reader(key, seqno) else {
             return Ok(None);
         };
 
-        for block_handle in iter {
+        while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
             // A columnar block carrying no row for this key (absent / wholly
             // deleted) returns None here; still honor the end-key cutoff before
             // skipping, so an absent key below this block's end key stops the
             // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
+            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
                 if self.comparator.compare(block_handle.end_key(), key)
                     == core::cmp::Ordering::Greater
                 {
@@ -7206,7 +7251,9 @@ impl Table {
             return Ok(None);
         }
 
-        let bloom = self.check_bloom(key, key_hash)?;
+        // The filter, index and data blocks this lookup reads share the file.
+        let fd = LookupFd::default();
+        let bloom = self.check_bloom(key, key_hash, &fd)?;
         self.count_probe(&bloom);
         if bloom.should_skip() {
             return Ok(None);
@@ -7215,7 +7262,7 @@ impl Table {
         // Access accounting after the seqno-range + bloom gates (mirrors `Table::get`).
         self.record_access();
 
-        let result = self.point_read_with_block(key, seqno, key_hash)?;
+        let result = self.point_read_with_block(key, seqno, key_hash, &fd)?;
 
         // Translate table-local seqno back to global coordinate (see Table::get).
         let result = result.map(|(mut iv, block)| {
@@ -7259,6 +7306,7 @@ impl Table {
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
+        fd: &LookupFd,
     ) -> crate::Result<Option<(InternalValue, DataBlock)>> {
         // Fast path: a retrieval-ribbon locator resolves the key to its data
         // block in O(1), skipping the index-block binary search. The located
@@ -7267,7 +7315,7 @@ impl Table {
         // visible version lives in a later block) safely falls through to the
         // index walk below.
         if let Some((handle, hint)) = self.locator_block(key_hash)?
-            && let Some(data_block) = self.load_point_block(&handle, key)?
+            && let Some(data_block) = self.load_point_block(&handle, key, fd)?
         {
             // A columnar block is narrowed to this key's rows by load_point_block,
             // so the full-block slot hint does not apply.
@@ -7286,18 +7334,18 @@ impl Table {
         // Borrowing point-read seek: avoids cloning the index block + reuses
         // the trailer metadata parsed at table open (see
         // `BlockIndexImpl::point_read_reader`).
-        let Some(iter) = self.block_index.point_read_reader(key, seqno) else {
+        let Some(mut iter) = self.block_index.point_read_reader(key, seqno) else {
             return Ok(None);
         };
 
-        for block_handle in iter {
+        while let Some(block_handle) = iter.next_with(fd) {
             let block_handle = block_handle?;
 
             // A columnar block carrying no row for this key (absent / wholly
             // deleted) returns None here; still honor the end-key cutoff before
             // skipping, so an absent key below this block's end key stops the
             // scan instead of probing every later candidate block.
-            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key)? else {
+            let Some(data_block) = self.load_point_block(block_handle.as_ref(), key, fd)? else {
                 if self.comparator.compare(block_handle.end_key(), key)
                     == core::cmp::Ordering::Greater
                 {
@@ -7326,8 +7374,9 @@ impl Table {
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
+        fd: &LookupFd,
     ) -> crate::Result<Option<InternalValue>> {
-        self.point_read_inner(key, seqno, key_hash)
+        self.point_read_inner(key, seqno, key_hash, fd)
             .map(|opt| opt.map(|(iv, _)| iv))
     }
 
@@ -7341,8 +7390,9 @@ impl Table {
         key: &[u8],
         seqno: SeqNo,
         key_hash: u64,
+        fd: &LookupFd,
     ) -> crate::Result<Option<(InternalValue, Block)>> {
-        self.point_read_inner(key, seqno, key_hash)
+        self.point_read_inner(key, seqno, key_hash, fd)
             .map(|opt| opt.map(|(iv, db)| (iv, db.inner)))
     }
 
@@ -7493,12 +7543,14 @@ impl Table {
         // it through the table-internal cache.
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
         let mut had_filter = false;
+        // Every filter, index and data block the batch reads shares the file.
+        let fd = LookupFd::default();
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
             // Below a tight-space restriction, as for a point read.
             if self.is_below_restriction(key) {
                 continue;
             }
-            let bloom = self.check_bloom(key, *hash)?;
+            let bloom = self.check_bloom(key, *hash, &fd)?;
             self.count_probe(&bloom);
             if !bloom.should_skip() {
                 passing.push(i);
@@ -7562,7 +7614,7 @@ impl Table {
         // per pair.
         let mut p = 0_usize;
         while p < passing.len() {
-            let Some(handle_result) = block_iter.next() else {
+            let Some(handle_result) = block_iter.next_with(&fd) else {
                 break;
             };
             let block_handle = handle_result?;
@@ -7591,7 +7643,7 @@ impl Table {
             }
 
             // A wholly-deleted columnar block carries no keys; skip it.
-            let Some(data_block) = self.load_data_block(block_handle.as_ref())? else {
+            let Some(data_block) = self.load_data_block(block_handle.as_ref(), &fd)? else {
                 continue;
             };
 
@@ -7693,7 +7745,8 @@ impl Table {
     /// `None`.
     ///
     /// The filter answers are added to `tally` when one is given, for the
-    /// caller to count once it answers from this plan.
+    /// caller to count once it answers from this plan. Filter blocks are read
+    /// through `fd`, the caller's lookup.
     #[expect(
         clippy::indexing_slicing,
         reason = "passing[0] is valid after the emptiness check"
@@ -7703,6 +7756,7 @@ impl Table {
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
         tally: &mut crate::table::probe_stats::PlanCounts,
+        fd: &LookupFd,
     ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
             return Ok(None);
@@ -7722,7 +7776,7 @@ impl Table {
             }
             // Counted with the plan, not here: a level handed to the serial
             // resolve is probed and counted there.
-            let bloom = self.judge_bloom(key, *hash)?;
+            let bloom = self.judge_bloom(key, *hash, fd)?;
             Self::tally_bloom(tally, &bloom);
             if !bloom.should_skip() {
                 passing.push(i);
@@ -7799,25 +7853,21 @@ impl Table {
     ///
     /// Propagates a failure to open the file.
     pub(crate) fn open_file(&self) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
-        let (file, cache_event) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
-        // Counted as the load path counts the file it opens; a pinned
-        // descriptor is no cache event.
-        #[cfg(feature = "metrics")]
-        if let Some(hit) = cache_event {
-            use core::sync::atomic::Ordering::Relaxed;
-            if hit {
-                self.metrics.table_file_opened_cached.fetch_add(1, Relaxed);
-            } else {
-                self.metrics
-                    .table_file_opened_uncached
-                    .fetch_add(1, Relaxed);
-            }
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = cache_event;
-        Ok(file)
+        self.lookup_file(LookupFd::default())
+    }
+
+    /// The file `fd` resolved for a lookup, or this table's file taken now,
+    /// owned for a caller that reads the lookup's blocks itself. Counted as the
+    /// load path counts the file it opens.
+    fn lookup_file(&self, fd: LookupFd) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
+        Ok(fd.into_file(
+            &self.file_accessor,
+            &self.global_id(),
+            &self.path,
+            ReadCharge::Foreground,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )?)
     }
 
     /// Whether this table's data blocks need the special load path rather than a
@@ -7870,8 +7920,11 @@ impl Table {
         seqno: SeqNo,
         tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<BlockTaskPlan>> {
+        // The filter and index blocks the plan reads, and the file the planned
+        // blocks are read through after it, share one descriptor access.
+        let fd = LookupFd::default();
         let Some((passing, mut block_iter, table_seqno)) =
-            self.plan_block_walk_setup(sorted_keys, seqno, tally)?
+            self.plan_block_walk_setup(sorted_keys, seqno, tally, &fd)?
         else {
             return Ok(None);
         };
@@ -7883,7 +7936,7 @@ impl Table {
             // PROPAGATED, not treated as end-of-index. Swallowing it would skip
             // the rest of this table and let a lower level answer a key the
             // failed table actually covers (same `?` contract as `batch_get`).
-            let Some(handle_result) = block_iter.next() else {
+            let Some(handle_result) = block_iter.next_with(&fd) else {
                 break;
             };
             let block_handle = handle_result?;
@@ -7932,9 +7985,8 @@ impl Table {
             return Ok(None);
         }
 
-        // Counted as every descriptor lookup is; the blocks are read through
-        // this file, with no second lookup.
-        let file = self.open_file()?;
+        // The blocks are read through this file, with no second lookup.
+        let file = self.lookup_file(fd)?;
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
@@ -8438,7 +8490,7 @@ impl Table {
         }
 
         // A wholly-deleted columnar block carries no keys; skip it.
-        let Some(block) = self.load_data_block(handle.as_ref())? else {
+        let Some(block) = self.load_data_block(handle.as_ref(), &LookupFd::default())? else {
             return Ok(());
         };
         let data = &block.inner.data;
@@ -10645,6 +10697,7 @@ impl Table {
                 CompressionType::None, // NOTE: Filter blocks are never compressed (crate invariant)
                 #[cfg(zstd_any)]
                 None,
+                &LookupFd::default(),
             )?;
             let block = FilterBlock::new(block);
             return block.maybe_contains_hash(hash);
@@ -10746,6 +10799,7 @@ impl Table {
                     CompressionType::None,
                     #[cfg(zstd_any)]
                     None,
+                    &LookupFd::default(),
                 )?;
                 let block = FilterBlock::new(block);
                 return block.maybe_contains_hash(key_hash).map(by_hash);

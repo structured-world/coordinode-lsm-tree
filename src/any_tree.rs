@@ -17,6 +17,10 @@ use alloc::sync::Arc;
 use alloc::{boxed::Box, vec::Vec};
 use core::ops::RangeBounds;
 
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod tests;
+
 /// May be a standard [`Tree`] or a [`BlobTree`]
 #[derive(Clone)]
 pub enum AnyTree {

@@ -152,6 +152,99 @@ pub(crate) const PACE_PORTION: usize = 64 * 1024;
 #[cfg(not(feature = "std"))]
 pub(crate) const PACE_PORTION: usize = usize::MAX;
 
+/// The table file one read takes its blocks from: taken from the descriptor
+/// cache (or opened) at the first block the read has to fetch from the file,
+/// and reused by every later one, so a lookup that reads its filter, index and
+/// data blocks pays one descriptor-cache access instead of one per block.
+///
+/// Scoped to one read of one table under one [`ReadCharge`]: it holds the
+/// descriptor only while the read runs.
+#[derive(Default)]
+pub(crate) struct LookupFd(core::cell::OnceCell<alloc::sync::Arc<dyn crate::fs::FsFile>>);
+
+impl LookupFd {
+    /// The table's file, resolved on the first call. An untraced read leaves
+    /// the descriptor cache as it found it, as it leaves the block cache.
+    pub(crate) fn resolve(
+        &self,
+        file_accessor: &FileAccessor,
+        table_id: &GlobalTableId,
+        path: &Path,
+        charge: ReadCharge,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::io::Result<&dyn crate::fs::FsFile> {
+        if let Some(fd) = self.0.get() {
+            return Ok(fd.as_ref());
+        }
+        let fd = Self::open(
+            file_accessor,
+            table_id,
+            path,
+            charge,
+            #[cfg(feature = "metrics")]
+            metrics,
+        )?;
+        Ok(self.0.get_or_init(|| fd).as_ref())
+    }
+
+    /// The table's file, owned: the one this read resolved, or else taken now,
+    /// for a caller that keeps reading through it after the read.
+    pub(crate) fn into_file(
+        self,
+        file_accessor: &FileAccessor,
+        table_id: &GlobalTableId,
+        path: &Path,
+        charge: ReadCharge,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::io::Result<alloc::sync::Arc<dyn crate::fs::FsFile>> {
+        match self.0.into_inner() {
+            Some(fd) => Ok(fd),
+            None => Self::open(
+                file_accessor,
+                table_id,
+                path,
+                charge,
+                #[cfg(feature = "metrics")]
+                metrics,
+            ),
+        }
+    }
+
+    /// Takes the table's file from the descriptor cache, or opens it, counting
+    /// the access.
+    fn open(
+        file_accessor: &FileAccessor,
+        table_id: &GlobalTableId,
+        path: &Path,
+        charge: ReadCharge,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::io::Result<alloc::sync::Arc<dyn crate::fs::FsFile>> {
+        let (fd, cache_event) = if charge.touches_cache() {
+            file_accessor.get_or_open_table(table_id, path)?
+        } else {
+            (file_accessor.peek_or_open_table(table_id, path)?, None)
+        };
+
+        // Only descriptor-table accesses are cache events; a pinned FD (None)
+        // is not.
+        #[cfg(feature = "metrics")]
+        if let Some(hit) = cache_event
+            && charge.is_counted()
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            if hit {
+                metrics.table_file_opened_cached.fetch_add(1, Relaxed);
+            } else {
+                metrics.table_file_opened_uncached.fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = cache_event;
+
+        Ok(fd)
+    }
+}
+
 /// Loads a block from disk or block cache, if cached.
 ///
 /// Also handles file descriptor opening and caching.
@@ -205,11 +298,13 @@ pub fn load_block(
         metrics,
         charge,
         None,
+        &LookupFd::default(),
     )
 }
 
 /// [`load_block`], with `pace`, when given, told the offset and length of
-/// each portion of the read just before that portion is read from the file.
+/// each portion of the read just before that portion is read from the file,
+/// and the file taken through `fd`, which the read's other blocks share.
 #[expect(
     clippy::too_many_arguments,
     reason = "block loading requires table id, path, file accessor, cache, handle, block type, compression, and heal context"
@@ -229,10 +324,8 @@ pub(crate) fn load_block_paced(
     #[cfg(feature = "metrics")] metrics: &Metrics,
     charge: ReadCharge,
     pace: Option<&dyn ReadPacer>,
+    fd: &LookupFd,
 ) -> crate::Result<Block> {
-    #[cfg(feature = "metrics")]
-    use core::sync::atomic::Ordering::Relaxed;
-
     log::trace!("load {block_type:?} block {handle:?}");
 
     // Invariant: manifest Blocks have their own reader path and
@@ -269,28 +362,14 @@ pub(crate) fn load_block_paced(
         return Ok(block);
     }
 
-    // An untraced read leaves the descriptor cache as it found it, like the
-    // block cache above.
-    let (fd, cache_event) = if charge.touches_cache() {
-        file_accessor.get_or_open_table(&table_id, path)?
-    } else {
-        (file_accessor.peek_or_open_table(&table_id, path)?, None)
-    };
-
-    // Only track descriptor-table cache metrics; pinned FDs (None) are not cache events.
-    #[cfg(feature = "metrics")]
-    if let Some(hit) = cache_event
-        && charge.is_counted()
-    {
-        if hit {
-            metrics.table_file_opened_cached.fetch_add(1, Relaxed);
-        } else {
-            metrics.table_file_opened_uncached.fetch_add(1, Relaxed);
-        }
-    }
-
-    #[cfg(not(feature = "metrics"))]
-    let _ = cache_event;
+    let fd = fd.resolve(
+        file_accessor,
+        &table_id,
+        path,
+        charge,
+        #[cfg(feature = "metrics")]
+        metrics,
+    )?;
 
     let transform = build_block_transform(
         compression,
@@ -304,7 +383,7 @@ pub(crate) fn load_block_paced(
     // filesystem, while a handle refused before reading asked nothing.
     let mut produced = 0;
     let read = Block::from_file_issuing_paced(
-        fd.as_ref(),
+        fd,
         *handle,
         crate::table::block::BlockIdentity {
             table_id: table_id.table_id(),
