@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use super::filter::RibbonFilterRepr;
 use super::params::{Mode, Params};
 
+#[cfg(test)]
+mod tests;
+
 /// Resolves a struct field or enum variant identifier, by name or by index,
 /// to its name in `names`. An unknown field resolves to `None` (skipped); an
 /// unknown variant is an error.
@@ -210,15 +213,13 @@ impl<'de> Deserialize<'de> for Mode {
                     variant: true,
                 })?;
                 variant.unit_variant()?;
-                match name {
-                    Some("Standard") => Ok(Mode::Standard),
-                    Some("Homogeneous") => Ok(Mode::Homogeneous),
-                    // `Identifier` already refuses a variant outside the list.
-                    other => Err(de::Error::unknown_variant(
-                        other.unwrap_or_default(),
-                        MODE_VARIANTS,
-                    )),
-                }
+                // A variant identifier resolves to one of `MODE_VARIANTS` or
+                // fails, so anything but `Homogeneous` is `Standard`.
+                Ok(if name == Some("Homogeneous") {
+                    Mode::Homogeneous
+                } else {
+                    Mode::Standard
+                })
             }
         }
 

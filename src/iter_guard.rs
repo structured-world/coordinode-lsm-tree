@@ -2,6 +2,10 @@ use crate::{
     KvPair, UserKey, UserValue, blob_tree::Guard as BlobGuard, tree::Guard as StandardGuard,
 };
 
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod tests;
+
 /// Guard to access key-value pairs
 pub trait IterGuard {
     /// Accesses the key-value pair if the predicate returns `true`.
