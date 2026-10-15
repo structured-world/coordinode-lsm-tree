@@ -233,11 +233,11 @@ fn relocating_compaction_separates_inline_value_above_lowered_threshold() -> lsm
     Ok(())
 }
 
-/// Rounds that each overwrite one key and compact, so every compaction
-/// relocates the file the round before left stale, while the filter rewrites
-/// the same values in every one of them: with values in one lifetime group the
-/// rewrites leave no more blob files behind than the same rounds without the
-/// filter.
+/// Rounds that each overwrite one key beside a key of their own and compact:
+/// each round's file is left half stale rather than dead, so the compactions
+/// keep relocating, while the filter rewrites the same values in every one of
+/// them. With values in one lifetime group the rewrites leave no more blob
+/// files behind than the same rounds without the filter.
 #[test]
 fn filter_heavy_churn_with_relocation_keeps_blob_file_count() -> lsm_tree::Result<()> {
     let churn = |filter: bool| -> lsm_tree::Result<usize> {
@@ -248,10 +248,19 @@ fn filter_heavy_churn_with_relocation_keeps_blob_file_count() -> lsm_tree::Resul
         filter_on.store(filter, Ordering::Relaxed);
         let mut seqno = 2;
         for round in 2..8 {
+            let own = format!("round-{round}").into_bytes();
+            tree.insert(&own, written(&own, round), seqno);
             tree.insert(KEYS[0], written(KEYS[0], round), seqno);
             seqno += 1;
             tree.flush_active_memtable(0)?;
             tree.major_compact(64_000_000, seqno)?;
+        }
+        for round in 2..8 {
+            let own = format!("round-{round}").into_bytes();
+            assert_eq!(
+                tree.get(&own, SeqNo::MAX)?.as_deref(),
+                Some(written(&own, round).as_slice())
+            );
         }
         assert_eq!(
             tree.get(KEYS[0], SeqNo::MAX)?.as_deref(),
