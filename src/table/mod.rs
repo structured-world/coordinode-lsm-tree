@@ -56,6 +56,10 @@ pub(crate) mod zone_map;
 )]
 mod tests;
 
+#[cfg(all(test, feature = "std", feature = "metrics"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod lookup_fd_tests;
+
 pub use block::{Block, BlockOffset};
 pub use data_block::DataBlock;
 pub use id::{GlobalTableId, TableId};
