@@ -12,7 +12,7 @@ use crate::{
     compaction::{
         Choice,
         filter::{Context, FilterBlobOutput, StreamFilterAdapter, TransformCounters},
-        flavour::{RelocatingCompaction, StandardCompaction},
+        flavour::{FreshValues, RelocatingCompaction, StandardCompaction},
         state::CompactionState,
         stream::CompactionStream,
     },
@@ -2826,6 +2826,9 @@ fn run_subcompaction(
     let gc_balance = merge_iter.gc_balance();
 
     let mut filter_blob_writer = None;
+    // A relocating pass separates the filter's new values into its own blob
+    // output, beside the frames it relocates (see `FilterBlobOutput`).
+    let relocating = relocation.is_some() && opts.config.kv_separation_opts.is_some();
     // Filter-only transform counter (see `TransformCounters::filter`): read
     // after `produce` to decide the install's retention effect.
     let filter_marker = Arc::new(portable_atomic::AtomicU64::new(0));
@@ -2835,7 +2838,7 @@ fn run_subcompaction(
         version,
         FilterBlobOutput {
             folder: blobs_folder,
-            writer: &mut filter_blob_writer,
+            writer: (!relocating).then_some(&mut filter_blob_writer),
             runtime: rc,
         },
         &filter_ctx,
@@ -2921,8 +2924,7 @@ fn run_subcompaction(
             // mislabelling that rule exists to prevent. The set is what pins the
             // dictionary that recorded codec names, since this writer
             // compresses nothing of its own.
-            #[cfg(zstd_any)]
-            let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
+            let writer = with_fresh_encoding(writer, opts, rc);
 
             let inner = StandardCompaction::new(table_writer, tables_for_deletion);
             Box::new(
@@ -2936,7 +2938,11 @@ fn run_subcompaction(
                     opts.config.comparator.clone(),
                     opts.tree_id,
                 )
-                .with_drain_below(drain_below),
+                .with_drain_below(drain_below)
+                .with_fresh_values(FreshValues {
+                    options: blob_opts.clone(),
+                    compression: rc.blob_compression,
+                }),
             )
         }
         _ => Box::new(StandardCompaction::new(table_writer, tables_for_deletion)),
@@ -3237,6 +3243,41 @@ fn pick_blob_files_for_merge(
         files,
         for_locality,
     })
+}
+
+/// `writer`, a relocation's blob output, set up to also encode the new values
+/// the pass separates (see [`FreshValues`]): the tree's dictionary set pins
+/// the dictionary each output file records, and the dictionary of the
+/// snapshot's blob policy, with its two-pass setting, encodes the new values.
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "the zstd build reads the dictionaries"
+    )
+)]
+fn with_fresh_encoding(
+    writer: BlobFileWriter,
+    opts: &Options,
+    rc: &crate::runtime_config::RuntimeConfig,
+) -> BlobFileWriter {
+    #[cfg(zstd_any)]
+    {
+        let dicts = opts.config.current_zstd_dictionaries();
+        // Without the policy's dictionary only a new value's write fails, as
+        // the filter's own writer did on its first value: a pass that
+        // separates nothing new does not need it.
+        let dictionary = dicts.for_compression(rc.blob_compression).ok().flatten();
+        writer
+            .use_zstd_dictionary(dictionary)
+            .use_zstd_two_pass_seed(rc.zstd_two_pass_seed)
+            .use_zstd_dictionaries(dicts)
+    }
+    #[cfg(not(zstd_any))]
+    {
+        let _ = (opts, rc);
+        writer
+    }
 }
 
 /// Opens a relocation scan of `bf` at `from`, or at the frontier the file
@@ -4075,10 +4116,11 @@ fn merge_tables(
     // run that collected history from one that collected none.
     let gc_balance = merge_iter.gc_balance();
 
-    // This is used by the compaction filter if it wants to write new blobs
-    // TODO: the filter should really pipe new blobs into the compaction stream directly,
-    // TODO: but that will probably require to change the protocol between filter <-> compaction stream a bit
+    // Where the compaction filter writes the new values it separates, when
+    // this pass has no blob output of its own; a relocating pass separates
+    // them into its output, beside the frames it relocates.
     let mut filter_blob_writer = None;
+    let relocating = opts.config.kv_separation_opts.is_some() && !blob_files_to_rewrite.is_empty();
     // Filter-only transform counter (see `TransformCounters::filter`): read
     // after `produce` to decide the install's retention effect.
     let filter_marker = Arc::new(portable_atomic::AtomicU64::new(0));
@@ -4088,7 +4130,7 @@ fn merge_tables(
         &current_super_version.version,
         FilterBlobOutput {
             folder: &blobs_folder,
-            writer: &mut filter_blob_writer,
+            writer: (!relocating).then_some(&mut filter_blob_writer),
             runtime: &rc,
         },
         &filter_ctx,
@@ -4168,21 +4210,26 @@ fn merge_tables(
                 // `RelocatingCompaction`: the policy is only the opening value,
                 // each output file records the codec of the source its frames
                 // came from, and the set pins the dictionary that names.
-                #[cfg(zstd_any)]
-                let writer = writer.use_zstd_dictionaries(opts.config.current_zstd_dictionaries());
+                let writer = with_fresh_encoding(writer, opts, &rc);
 
                 let inner = StandardCompaction::new(table_writer, tables);
 
-                Box::new(RelocatingCompaction::new(
-                    inner,
-                    scanner.peekable(),
-                    writer,
-                    blob_files_to_rewrite,
-                    opts.rate_limiter.clone(),
-                    opts.stop_signal.clone(),
-                    opts.config.comparator.clone(),
-                    opts.tree_id,
-                ))
+                Box::new(
+                    RelocatingCompaction::new(
+                        inner,
+                        scanner.peekable(),
+                        writer,
+                        blob_files_to_rewrite,
+                        opts.rate_limiter.clone(),
+                        opts.stop_signal.clone(),
+                        opts.config.comparator.clone(),
+                        opts.tree_id,
+                    )
+                    .with_fresh_values(FreshValues {
+                        options: blob_opts.clone(),
+                        compression: rc.blob_compression,
+                    }),
+                )
             }
         }
         None => Box::new(StandardCompaction::new(table_writer, tables)),

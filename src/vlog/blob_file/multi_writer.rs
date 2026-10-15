@@ -580,6 +580,52 @@ impl MultiWriter {
         Ok(handle)
     }
 
+    /// Writes `value`, a value new to the value log, encoded under
+    /// `compression` into a file of lifetime `class` that records that codec:
+    /// the file a relocation copies frames of the same codec into, so a pass
+    /// that both relocates and separates new values cuts one set of files.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the encoding (a dictionary codec without the dictionary this
+    /// writer holds) and the write.
+    pub(crate) fn write_fresh(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        compression: CompressionType,
+        class: u8,
+    ) -> crate::Result<ValueHandle> {
+        super::writer::check_size_cap(value.len())?;
+        let encoded = super::writer::encode_value(
+            compression,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            #[cfg(zstd_any)]
+            self.zstd_two_pass_seed,
+            value,
+        )?;
+        self.select_output(compression, class)?;
+
+        let writer = &mut self.active_writer;
+        let offset = writer.offset();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the size cap above bounds the value far below u32::MAX"
+        )]
+        let on_disk_size = writer.write_encoded(key, seqno, &encoded, value.len() as u32)?;
+        let handle = ValueHandle {
+            blob_file_id: writer.blob_file_id(),
+            offset,
+            on_disk_size,
+        };
+        if writer.offset() >= self.target_size {
+            self.rotate()?;
+        }
+        Ok(handle)
+    }
+
     pub(crate) fn finish(mut self) -> crate::Result<Vec<BlobFile>> {
         let mut writers = core::iter::once((self.passthrough_compression, self.active_writer))
             .chain(

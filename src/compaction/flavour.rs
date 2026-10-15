@@ -1162,6 +1162,19 @@ pub struct RelocatingCompaction {
     /// The bytes of the records read by handle for cell rows so far, outside
     /// the paced scan of the rewritten files.
     frames_read: u64,
+    /// How a value at or above the separation threshold that reaches this
+    /// pass inline is separated into `blob_writer`: a value the compaction
+    /// filter or the merge operator put in place, which the stream leaves
+    /// inline for this pass to write beside the relocated frames. `None`
+    /// writes every inline value inline.
+    fresh: Option<FreshValues>,
+}
+
+/// What a relocating pass separates new values under: the tree's separation
+/// options and the blob codec of the compaction's runtime snapshot.
+pub struct FreshValues {
+    pub options: crate::KvSeparationOptions,
+    pub compression: crate::CompressionType,
 }
 
 impl RelocatingCompaction {
@@ -1204,7 +1217,53 @@ impl RelocatingCompaction {
             cell_copies_key: None,
             relocated_bytes: 0,
             frames_read: 0,
+            fresh: None,
         }
+    }
+
+    /// Separates values at or above `fresh`'s threshold that reach this pass
+    /// inline into the pass's own blob output (see the `fresh` field).
+    #[must_use]
+    pub fn with_fresh_values(mut self, fresh: FreshValues) -> Self {
+        self.fresh = Some(fresh);
+        self
+    }
+
+    /// Writes `item`, an inline value at or above the separation threshold,
+    /// into this pass's blob output as a value new to it, encoded under
+    /// `compression` in a file of lifetime `class`, and its pointer into the
+    /// table.
+    fn write_fresh(
+        &mut self,
+        compression: crate::CompressionType,
+        class: u8,
+        item: InternalValue,
+    ) -> crate::Result<()> {
+        let vhandle = self.blob_writer.write_fresh(
+            &item.key.user_key,
+            item.key.seqno,
+            &item.value,
+            compression,
+            class,
+        )?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a value is at most u32::MAX bytes long"
+        )]
+        let indirection = BlobIndirection {
+            vhandle,
+            size: item.value.len() as u32,
+        };
+        self.inner
+            .table_writer
+            .write(InternalValue::from_components(
+                item.key.user_key,
+                indirection.encode_into_vec(),
+                item.key.seqno,
+                crate::ValueType::Indirection,
+            ))?;
+        self.inner.table_writer.register_blob(indirection);
+        Ok(())
     }
 
     /// Writes the cell row `item`, every reference into a file being rewritten
@@ -1544,6 +1603,19 @@ impl CompactionFlavour for RelocatingCompaction {
             };
 
             self.inner.table_writer.register_blob(indirection);
+        } else if let Some(fresh) = &self.fresh
+            && item.key.value_type == crate::ValueType::Value
+            && item.value.len() >= fresh.options.separation_threshold as usize
+        {
+            // A value new to the value log: the filter's or the merge
+            // operator's, or one written inline before the threshold came
+            // down to it. It goes beside the frames this pass relocates.
+            let class = fresh
+                .options
+                .lifetime_classifier()
+                .class_of(&item.key.user_key, false);
+            let compression = fresh.compression;
+            self.write_fresh(compression, class, item)?;
         } else {
             self.inner.table_writer.write(item)?;
         }
