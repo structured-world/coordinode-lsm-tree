@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792093882434,
+  "lastUpdate": 1792096117027,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -42908,6 +42908,90 @@ window.BENCHMARK_DATA = {
             "value": 334422.3462616999,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.2us | P99.9: 82.1us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df2ce429689915721c23fd6f1be541b4dd5c346a",
+          "message": "build: build no proc-macro, drop enum_dispatch and serde derive (#915)\n\n## Summary\n- The crate builds no proc-macro: `cargo tree -e normal` lists no `syn`,\n`quote` or `proc-macro2` for default features or `--all-features`.\n- Dispatch on `AnyTree` and `IterGuardImpl` stays static, and their\npublic API is unchanged.\n\n## Changes\n- `enum_dispatch` removed. `impl AbstractTree for AnyTree` and `impl\nIterGuard for IterGuardImpl` are written out with a local `macro_rules!`\nthat matches on the variant and calls each method by its trait path;\nevery method is forwarded, defaulted ones included, so the overrides in\n`Tree`, `BlobTree` and the guards still run.\n- The `From` and `TryInto` conversions the derive generated for both\nenums are written out, with the same error strings.\n- `serde` no longer enables `derive` (it reached `syn` under\n`ribbon-serde`): `Mode`, `Params` and `RibbonFilterRepr` get\nhand-written `Serialize` / `Deserialize` with the derive's shape (named\nfields, the sequence form, unknown fields skipped, the same errors).\n- Intra-doc links in `abstract_tree.rs` name `crate::Tree` /\n`crate::BlobTree` explicitly.\n\nWith `--target all`, `cargo tree` still prints the `cfg(any())` edges\n`serde_core -> serde_derive` and `zerocopy -> zerocopy-derive`; that cfg\nis never true, so neither is built.\n\n## Testing\n- Tests pin the ribbon repr's serialised shape; they passed against the\nderive before it was replaced. A test covers the `AnyTree` conversions.\n- fmt, clippy (default and all features), the full nextest suite, doc\ntests, rustdoc, the no-std check, sst-dump and benches pass on Linux.\n\nUpstream request for the same change: fjall-rs/lsm-tree#323.\n\nCloses #832\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Ribbon filter snapshots can be serialized and deserialized using named\nfields or declaration-order sequences. Unknown fields are ignored, while\nmalformed or incomplete data is rejected.\n* The result type for flushing data to tables is now publicly\naccessible.\n* **Compatibility**\n* Conversions between standard and blob tree types continue to succeed\nfor matching variants and return errors for mismatches.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-15T20:15:54Z",
+          "tree_id": "343c2a9315ac3dea23327de42209e369a5446795",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/df2ce429689915721c23fd6f1be541b4dd5c346a"
+        },
+        "date": 1792096115956,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 136296.56717594797,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 16.6us | P99.9: 21.4us\nthreads: 1 | elapsed: 3.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2551816.353534558,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 744609.1230254363,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 3.3us | P99.9: 22.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 516995.10913579346,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.8us | P99.9: 29.1us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2401525.045252537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 266961.60192904103,
+            "unit": "ops/sec",
+            "extra": "P50: 3.2us | P99: 8.3us | P99.9: 22.1us\nthreads: 1 | elapsed: 0.75s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 140974.58834362894,
+            "unit": "ops/sec",
+            "extra": "P50: 6.3us | P99: 12.6us | P99.9: 26.7us\nthreads: 1 | elapsed: 1.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 754816.2237995081,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 737226.5401908337,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 3.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 361928.49479706347,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.9us | P99.9: 87.1us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
