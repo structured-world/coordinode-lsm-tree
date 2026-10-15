@@ -1,12 +1,15 @@
 // A compaction that relocates blob files writes the values its filter
 // rewrites into the same blob output as the values it relocates: the filter
-// adds no blob files of its own, and every value reads back.
+// adds no blob files of its own, and every value reads back. With values
+// grouped by lifetime, a new value and a relocated one belong to different
+// groups, so they share the output's files of their own group.
 
 use lsm_tree::{
     AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
     compaction::filter::{
         CompactionFilter, Context as CompactionFilterContext, Factory, ItemAccessor, Verdict,
     },
+    config::LifetimeGroups,
     get_tmp_folder,
 };
 use std::sync::{
@@ -59,7 +62,11 @@ fn rewritten(key: &[u8]) -> Vec<u8> {
     value.repeat(4_096)
 }
 
-fn open(path: &std::path::Path, filter_on: &Arc<AtomicBool>) -> lsm_tree::Result<AnyTree> {
+fn open(
+    path: &std::path::Path,
+    filter_on: &Arc<AtomicBool>,
+    groups: LifetimeGroups,
+) -> lsm_tree::Result<AnyTree> {
     Config::new(
         path,
         SequenceNumberCounter::default(),
@@ -68,7 +75,8 @@ fn open(path: &std::path::Path, filter_on: &Arc<AtomicBool>) -> lsm_tree::Result
     .with_kv_separation(Some(
         KvSeparationOptions::default()
             .age_cutoff(1.0)
-            .staleness_threshold(0.1),
+            .staleness_threshold(0.1)
+            .lifetime_groups(groups),
     ))
     .blob_compression(lsm_tree::CompressionType::None)
     .with_compaction_filter_factory(Some(Arc::new(RewriteFactory(Arc::clone(filter_on)))))
@@ -95,12 +103,15 @@ fn stale_first_file(tree: &AnyTree) -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// The blob files after a relocating compaction, with the filter on or off
-/// during it.
-fn relocate(filter: bool) -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
+/// The tree after a relocating compaction, with the filter on or off during
+/// it, its blob values grouped into `groups` lifetime groups.
+fn relocate(
+    filter: bool,
+    groups: LifetimeGroups,
+) -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
     let folder = get_tmp_folder();
     let filter_on = Arc::new(AtomicBool::new(false));
-    let tree = open(folder.path(), &filter_on)?;
+    let tree = open(folder.path(), &filter_on, groups)?;
     stale_first_file(&tree)?;
 
     filter_on.store(filter, Ordering::Relaxed);
@@ -112,35 +123,55 @@ fn relocate(filter: bool) -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
     Ok((tree, folder))
 }
 
-#[test]
-fn relocating_compaction_with_filter_rewrites_writes_one_set_of_blob_files() -> lsm_tree::Result<()>
-{
-    let (plain, _plain_dir) = relocate(false)?;
-    let (filtered, _filtered_dir) = relocate(true)?;
-
+/// Every value of `tree` reads back as [`relocate`] left it with the filter on.
+fn assert_filtered_values(tree: &AnyTree) -> lsm_tree::Result<()> {
     assert_eq!(
-        filtered.blob_file_count(),
-        plain.blob_file_count(),
-        "the filter's rewrites added blob files of their own"
-    );
-
-    assert_eq!(
-        filtered.get(KEYS[0], SeqNo::MAX)?.as_deref(),
+        tree.get(KEYS[0], SeqNo::MAX)?.as_deref(),
         Some(written(KEYS[0], 1).as_slice())
     );
     assert_eq!(
-        filtered.get(KEYS[1], SeqNo::MAX)?.as_deref(),
+        tree.get(KEYS[1], SeqNo::MAX)?.as_deref(),
         Some(written(KEYS[1], 0).as_slice())
     );
     for key in &KEYS[2..] {
         assert_eq!(
-            filtered.get(key, SeqNo::MAX)?.as_deref(),
+            tree.get(key, SeqNo::MAX)?.as_deref(),
             Some(rewritten(key).as_slice()),
             "{}",
             String::from_utf8_lossy(key)
         );
     }
     Ok(())
+}
+
+#[test]
+fn relocating_compaction_with_filter_rewrites_writes_one_set_of_blob_files() -> lsm_tree::Result<()>
+{
+    let (plain, _plain_dir) = relocate(false, LifetimeGroups::ONE)?;
+    let (filtered, _filtered_dir) = relocate(true, LifetimeGroups::ONE)?;
+
+    assert_eq!(
+        filtered.blob_file_count(),
+        plain.blob_file_count(),
+        "the filter's rewrites added blob files of their own"
+    );
+    assert_filtered_values(&filtered)
+}
+
+/// Grouped by lifetime, the filter's new values take the output's file of the
+/// group a new value belongs to, one file beside the relocated values'.
+#[test]
+fn relocating_compaction_with_lifetime_groups_puts_filter_rewrites_in_new_value_group()
+-> lsm_tree::Result<()> {
+    let (plain, _plain_dir) = relocate(false, LifetimeGroups::MAX)?;
+    let (filtered, _filtered_dir) = relocate(true, LifetimeGroups::MAX)?;
+
+    assert_eq!(
+        filtered.blob_file_count(),
+        plain.blob_file_count() + 1,
+        "the filter's rewrites did not take exactly the new-value group's file"
+    );
+    assert_filtered_values(&filtered)
 }
 
 /// A value written inline before the separation threshold came down to its
@@ -204,14 +235,15 @@ fn relocating_compaction_separates_inline_value_above_lowered_threshold() -> lsm
 
 /// Rounds that each overwrite one key and compact, so every compaction
 /// relocates the file the round before left stale, while the filter rewrites
-/// the same values in every one of them: the rewrites leave no more blob files
-/// behind than the same rounds without the filter.
+/// the same values in every one of them: with values in one lifetime group the
+/// rewrites leave no more blob files behind than the same rounds without the
+/// filter.
 #[test]
 fn filter_heavy_churn_with_relocation_keeps_blob_file_count() -> lsm_tree::Result<()> {
     let churn = |filter: bool| -> lsm_tree::Result<usize> {
         let folder = get_tmp_folder();
         let filter_on = Arc::new(AtomicBool::new(false));
-        let tree = open(folder.path(), &filter_on)?;
+        let tree = open(folder.path(), &filter_on, LifetimeGroups::ONE)?;
         stale_first_file(&tree)?;
         filter_on.store(filter, Ordering::Relaxed);
         let mut seqno = 2;
