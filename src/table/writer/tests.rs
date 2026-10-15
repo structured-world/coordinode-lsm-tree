@@ -509,7 +509,13 @@ fn group_tags_past_the_largest_are_refused() -> crate::Result<()> {
     let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_columnar(true);
     writer.last_encoded_tag = Some(u64::MAX);
     assert!(matches!(
-        writer.next_group_tag(b"k"),
+        writer.next_group_tag(
+            &crate::table::columnar::ColumnBatch {
+                row_count: 0,
+                columns: alloc::vec![],
+            },
+            b"k"
+        ),
         Err(crate::Error::InvalidHeader(_))
     ));
     Ok(())
@@ -527,13 +533,13 @@ fn group_tags_differ_for_different_content_at_one_id_and_age() -> crate::Result<
 
     let dir = tempfile::tempdir()?;
     let cmp = default_comparator();
-    let first_tag = |name: &str, key: &[u8]| -> crate::Result<Option<u64>> {
+    let first_tag = |name: &str, key: &[u8], value: &[u8]| -> crate::Result<Option<u64>> {
         let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
             .use_columnar(true)
             .use_created_at(1_000);
         let batch = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
             key.to_vec(),
-            b"v".to_vec(),
+            value.to_vec(),
             1,
             ValueType::Value,
         )])?;
@@ -541,11 +547,16 @@ fn group_tags_differ_for_different_content_at_one_id_and_age() -> crate::Result<
         Ok(writer.last_encoded_tag)
     };
 
-    let a = first_tag("a", b"apple")?;
-    let b = first_tag("b", b"banana")?;
-    let a_again = first_tag("a2", b"apple")?;
+    let a = first_tag("a", b"apple", b"v")?;
+    let b = first_tag("b", b"banana", b"v")?;
+    let a_other_value = first_tag("a3", b"apple", b"w")?;
+    let a_again = first_tag("a2", b"apple", b"v")?;
     assert!(a.is_some(), "the group was encoded");
-    assert_ne!(a, b, "different first groups started at one tag");
+    assert_ne!(a, b, "different first keys started at one tag");
+    assert_ne!(
+        a, a_other_value,
+        "one key with different values started at one tag"
+    );
     assert_eq!(a, a_again, "the same first group started at another tag");
     Ok(())
 }
