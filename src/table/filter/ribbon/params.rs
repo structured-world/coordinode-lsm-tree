@@ -2,14 +2,10 @@ use core::fmt;
 
 use super::error::ParamError;
 
-// `ribbon-serde` is wired in Cargo.toml as `["dep:serde"]` — turning it
-// on enables the cfg_attr-gated Serialize/Deserialize derives below and
-// on `RibbonFilterRepr` in filter.rs. The crate does not consume the
-// serde repr internally; the gate is preserved for callers that want
-// an in-memory snapshot of a built filter. (bitvec was previously a
-// dep here; it was dropped for 32-bit cross-arch compatibility and the
-// Repr now serialises a plain `Vec<u64>`.)
-#[cfg_attr(feature = "ribbon-serde", derive(serde::Serialize, serde::Deserialize))]
+// `ribbon-serde` gives `Mode`, `Params` and `RibbonFilterRepr`
+// Serialize/Deserialize (in `repr_serde`) for callers that want an
+// in-memory snapshot of a built filter; the crate itself does not consume
+// that repr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Standard,
@@ -25,7 +21,6 @@ impl fmt::Display for Mode {
     }
 }
 
-#[cfg_attr(feature = "ribbon-serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
     pub m: usize,

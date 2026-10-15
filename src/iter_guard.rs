@@ -1,10 +1,8 @@
 use crate::{
     KvPair, UserKey, UserValue, blob_tree::Guard as BlobGuard, tree::Guard as StandardGuard,
 };
-use enum_dispatch::enum_dispatch;
 
 /// Guard to access key-value pairs
-#[enum_dispatch]
 pub trait IterGuard {
     /// Accesses the key-value pair if the predicate returns `true`.
     ///
@@ -54,13 +52,90 @@ pub trait IterGuard {
 }
 
 /// Generic iterator value
-#[enum_dispatch(IterGuard)]
 pub enum IterGuardImpl {
     /// Iterator value of a standard LSM-tree
     Standard(StandardGuard),
 
     /// Iterator value of a key-value separated tree
     Blob(BlobGuard),
+}
+
+impl From<StandardGuard> for IterGuardImpl {
+    fn from(guard: StandardGuard) -> Self {
+        Self::Standard(guard)
+    }
+}
+
+impl From<BlobGuard> for IterGuardImpl {
+    fn from(guard: BlobGuard) -> Self {
+        Self::Blob(guard)
+    }
+}
+
+impl TryInto<StandardGuard> for IterGuardImpl {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<StandardGuard, Self::Error> {
+        match self {
+            Self::Standard(guard) => Ok(guard),
+            Self::Blob(_) => Err("Tried to convert variant Blob to Standard"),
+        }
+    }
+}
+
+impl TryInto<BlobGuard> for IterGuardImpl {
+    type Error = &'static str;
+
+    fn try_into(self) -> Result<BlobGuard, Self::Error> {
+        match self {
+            Self::Blob(guard) => Ok(guard),
+            Self::Standard(_) => Err("Tried to convert variant Standard to Blob"),
+        }
+    }
+}
+
+/// Calls the [`IterGuard`] method on the guard inside either variant. The
+/// trait path keeps a same-named inherent method of a guard from being picked
+/// instead.
+macro_rules! forward {
+    ($self:ident.$method:ident($($arg:expr),*)) => {
+        match $self {
+            IterGuardImpl::Standard(guard) => IterGuard::$method(guard, $($arg),*),
+            IterGuardImpl::Blob(guard) => IterGuard::$method(guard, $($arg),*),
+        }
+    };
+}
+
+// Every method is forwarded, the defaulted `value` included, so a guard's
+// override is the one that runs.
+impl IterGuard for IterGuardImpl {
+    #[inline]
+    fn into_inner_if(
+        self,
+        pred: impl Fn(&UserKey) -> bool,
+    ) -> crate::Result<(UserKey, Option<UserValue>)> {
+        forward!(self.into_inner_if(pred))
+    }
+
+    #[inline]
+    fn into_inner(self) -> crate::Result<KvPair> {
+        forward!(self.into_inner())
+    }
+
+    #[inline]
+    fn key(self) -> crate::Result<UserKey> {
+        forward!(self.key())
+    }
+
+    #[inline]
+    fn size(self) -> crate::Result<u32> {
+        forward!(self.size())
+    }
+
+    #[inline]
+    fn value(self) -> crate::Result<UserValue> {
+        forward!(self.value())
+    }
 }
 
 /// A range iterator that can reposition (seek) in place, without reopening its

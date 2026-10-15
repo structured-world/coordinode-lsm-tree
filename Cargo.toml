@@ -159,7 +159,6 @@ bytes = { version = "1.11.1", optional = true }
 # latest-`SuperVersion` mirror on the point-read fast path — gate their use
 # behind `#[cfg(feature = "std")]` so the no-std-check job never sees it.
 arc-swap = { version = "1.9", optional = true }
-enum_dispatch = "0.3.13"
 log = "0.4.32"
 # `spin` provides a no_std-compatible Mutex. Used by
 # `deletion_pause` so that module's only std footprint comes from the
@@ -227,8 +226,9 @@ portable-atomic = { version = "1", default-features = false, features = ["fallba
 libm = { version = "0.2", default-features = false }
 self_cell = "1.2.0"
 # Optional — only pulled in by the vendored Ribbon filter under the
-# `ribbon-serde` feature flag (off by default).
-serde = { version = "1", optional = true, features = ["derive"] }
+# `ribbon-serde` feature flag (off by default). No `derive`: the impls are
+# written out, so the crate builds no proc-macro (`syn`, `quote`).
+serde = { version = "1", optional = true }
 # sfa is vendored under src/sfa/ (upstream does not accept PRs; pinning
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.

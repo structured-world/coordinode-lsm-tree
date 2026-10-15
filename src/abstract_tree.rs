@@ -4,8 +4,7 @@
 
 use crate::tree::inner::{FlushGuard, VersionsWriteGuard};
 use crate::{
-    AnyTree, BlobTree, Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, Tree,
-    UserKey, UserValue,
+    Config, Guard, InternalValue, KvPair, Memtable, SeqNo, TableId, UserKey, UserValue,
     iter_guard::{IterGuardImpl, SeekableGuardIter},
     table::Table,
     version::Version,
@@ -18,7 +17,7 @@ use core::ops::RangeBounds;
 
 pub type RangeItem = crate::Result<KvPair>;
 
-type FlushToTablesResult = (
+pub type FlushToTablesResult = (
     Vec<Table>,
     Option<Vec<BlobFile>>,
     crate::runtime_config::WritePin,
@@ -35,7 +34,7 @@ pub struct CheckpointInfo {
     /// Number of SST files captured.
     pub sst_files: usize,
     /// Number of blob (value-log) files captured. Always `0` for a
-    /// standard [`Tree`].
+    /// standard [`Tree`](crate::Tree).
     pub blob_files: usize,
     /// Sum of the logical file sizes of every file the checkpoint captured:
     /// the SSTs, the blob files, and the `.restrict-bound` sidecar that belongs
@@ -111,7 +110,6 @@ pub enum ChecksumRefreshOutcome {
 }
 
 /// Generic Tree API
-#[enum_dispatch::enum_dispatch]
 pub trait AbstractTree: sealed::Sealed {
     /// Debug method for tracing the MVCC history of a key.
     #[doc(hidden)]
@@ -458,7 +456,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// The checkpoint is a fully functional tree that can be opened
     /// independently via [`Config::open`](crate::Config::open). For the
     /// common single-filesystem case all SST files (and blob files, for
-    /// [`BlobTree`]) are hard-linked rather than copied, so the operation
+    /// [`BlobTree`](crate::BlobTree)) are hard-linked rather than copied, so the operation
     /// is O(1) per file and consumes zero additional disk space until the
     /// original files are compacted away — at which point the inode is
     /// kept alive by the checkpoint link.
@@ -1025,7 +1023,7 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "metrics")]
     fn cache_stats(&self) -> crate::CacheStats;
 
-    /// Acquires the flush lock which is required to call [`Tree::flush`].
+    /// Acquires the flush lock which is required to call [`Tree::flush`](crate::Tree::flush).
     fn get_flush_lock(&self) -> FlushGuard<'_>;
 
     /// Synchronously flushes a memtable to a table.
@@ -1377,7 +1375,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// This operation scans the entire tree: O(n) complexity!
     ///
     /// Never, under any circumstances, use .`len()` == 0 to check
-    /// if the tree is empty, use [`Tree::is_empty`] instead.
+    /// if the tree is empty, use [`Tree::is_empty`](crate::Tree::is_empty) instead.
     ///
     /// # Examples
     ///
@@ -1570,7 +1568,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// may return [`PinnableSlice::Pinned`](crate::PinnableSlice::Pinned) holding a reference to that block's
     /// decompressed buffer (avoiding a data copy). Memtable and blob-resolved
     /// values use [`PinnableSlice::Owned`](crate::PinnableSlice::Owned). The default implementation always
-    /// returns `Owned`; only [`Tree`] overrides with the pinned path.
+    /// returns `Owned`; only [`Tree`](crate::Tree) overrides with the pinned path.
     ///
     /// The existing [`AbstractTree::get`] method is unaffected.
     ///
@@ -1672,7 +1670,8 @@ pub trait AbstractTree: sealed::Sealed {
     /// default trait implementation, however, is a convenience wrapper that
     /// simply calls [`AbstractTree::get`] for each key and therefore does not
     /// guarantee a single-snapshot or single-lock acquisition. Optimized
-    /// implementations (such as [`Tree`] and [`BlobTree`]) provide the
+    /// implementations (such as [`Tree`](crate::Tree) and
+    /// [`BlobTree`](crate::BlobTree)) provide the
     /// single-snapshot/one-lock behavior.
     ///
     /// # Examples

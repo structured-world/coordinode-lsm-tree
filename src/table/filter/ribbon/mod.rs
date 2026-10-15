@@ -93,6 +93,8 @@ pub mod error;
 pub mod filter;
 pub mod hashing;
 pub mod params;
+#[cfg(feature = "ribbon-serde")]
+mod repr_serde;
 
 pub use builder::RibbonBuilder;
 pub use error::{BuildError, ConstructionFailure, FilterReprError, ParamError};
