@@ -1700,6 +1700,8 @@ fn try_salvage_table(
             // Forward the caller's live-progress handle so the block walk
             // ticks per inspected / recovered block while it runs.
             progress: config.recovery_progress.clone(),
+            // The copy is stamped on the tree's clock, which FIFO judges it on.
+            clock: config.clock.clone(),
         },
     )?;
     if report.salvaged_path.is_none() {
@@ -3324,7 +3326,7 @@ fn recover_blob_files(
             let temp = blobs_folder.join(format!("{new_id}.salvage-tmp"));
             remove_temp(config, &temp)?;
             let salvage = (|| -> crate::Result<Option<(crate::vlog::BlobFile, crate::salvage::BlobSalvageReport)>> {
-                let report = crate::salvage::salvage_blob_file(
+                let report = crate::salvage::salvage_blob_file_on(
                     &blob_path,
                     temp.clone(),
                     &config.fs,
@@ -3341,6 +3343,8 @@ fn recover_blob_files(
                     // earlier dictionary resolves to that one.
                     #[cfg(zstd_any)]
                     dict.as_ref(),
+                    // Stamped on the tree's clock, as the blob files it writes are.
+                    config.clock.as_ref(),
                 )?;
                 let Some(salvaged_path) = report.salvaged_path.clone() else {
                     return Ok(None);

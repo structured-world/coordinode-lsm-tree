@@ -14452,6 +14452,60 @@ fn a_salvaged_blob_takes_a_fresh_id_and_the_original_is_removed() -> crate::Resu
     Ok(())
 }
 
+/// A blob file repair salvages is stamped on the tree's clock, as every blob
+/// file the tree writes is, so a repaired tree on a fixed clock writes the
+/// same bytes as any other.
+#[test]
+fn a_salvaged_blob_is_stamped_on_the_configured_clock() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Clock, Config, KvSeparationOptions, SequenceNumberCounter};
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    struct Fixed;
+    impl Clock for Fixed {
+        fn unix_time(&self) -> Duration {
+            Duration::from_secs(2_000)
+        }
+    }
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db_clock")?;
+    blob_tree_without_manifest(&memfs, &root)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(memfs.clone())
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .with_clock(Arc::new(Fixed))
+    .repair()?;
+    assert_eq!(report.blob_files_salvaged.len(), 1, "{report:?}");
+
+    let fs: Arc<dyn Fs> = memfs;
+    let salvaged = crate::vlog::recover_blob_file(
+        &blobs.join("1"),
+        1,
+        crate::Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &crate::compression::ZstdDictionaries::new(),
+    )?;
+    assert_eq!(
+        salvaged.0.meta.created_at,
+        Duration::from_secs(2_000).as_nanos(),
+        "the salvaged blob file was not stamped on the configured clock",
+    );
+    Ok(())
+}
+
 /// A ZERO ingest offset is a valid allocated offset, not a sentinel for
 /// absence: the first bulk ingestion on a fresh counter allocates
 /// `global_seqno == 0` (`next()` returns the pre-increment value). When blob

@@ -3,6 +3,9 @@
 // given the same fixed clock and the same writes produce the same files, byte
 // for byte, wherever they live.
 
+mod common;
+
+use common::{corrupt_data_region, nuke_manifest, sorted_sst_paths};
 use lsm_tree::{
     AbstractTree, AnyTree, Clock, Config, KvSeparationOptions, SequenceNumberCounter,
     compaction::Fifo,
@@ -138,6 +141,34 @@ fn trees_with_the_same_fixed_clock_write_identical_blob_files() {
     }
     assert_same_files(first.path(), second.path(), TABLES_FOLDER);
     assert_same_files(first.path(), second.path(), BLOBS_FOLDER);
+}
+
+/// A table repair salvages is stamped on the tree's clock, as every table the
+/// tree writes is: stamped on the process clock it would sit in FIFO's future
+/// under a lagging configured clock and never expire.
+#[test]
+fn repair_salvage_stamps_the_configured_clock() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    {
+        let tree = config(folder.path(), ManualClock::at(1_000)).open()?;
+        for i in 0..500u64 {
+            tree.insert(format!("k{i:05}"), format!("v-{i}"), i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let ssts = sorted_sst_paths(folder.path());
+    let victim = ssts.first().expect("a table to corrupt");
+    corrupt_data_region(victim)?;
+    nuke_manifest(folder.path())?;
+
+    let report = config(folder.path(), ManualClock::at(2_000)).repair_with_salvage(true)?;
+    assert_eq!(report.salvaged, 1, "{:?}", report.unreadable_files);
+    assert_eq!(
+        lsm_tree::inspect::read_table_properties(victim)?.created_at_nanos,
+        Duration::from_secs(2_000).as_nanos(),
+        "the salvaged table was not stamped on the configured clock",
+    );
+    Ok(())
 }
 
 #[test]

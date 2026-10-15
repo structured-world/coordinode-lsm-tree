@@ -868,14 +868,16 @@ pub struct Writer {
     #[cfg(feature = "columnar")]
     group_tags: crate::HashSet<u64>,
 
-    /// Tag of the first row group encoded here: a hash of the table's id and
-    /// age, in the lower half of `u64` so the increments after it never run
-    /// out, and never zero. Starting every table at its own point is what
-    /// makes a page's stamp name its table as well as its group: a page's
-    /// values are apart from their keys, so a page taken for another table's
-    /// would serve that table's value under this table's key. Nothing outside
-    /// the tree enters it, so a tree on a fixed clock writes the same tags
-    /// wherever its folder is. `None` until the first group derives it.
+    /// Tag of the first row group encoded here: a hash of the table's id, its
+    /// age and the last key of that group, in the lower half of `u64` so the
+    /// increments after it never run out, and never zero. Starting every table
+    /// at its own point is what makes a page's stamp name its table as well as
+    /// its group: a page's values are apart from their keys, so a page taken
+    /// for another table's would serve that table's value under this table's
+    /// key. The key keeps tables of one id and one age apart, as two trees on
+    /// one fixed clock write, and nothing outside the table enters it, so the
+    /// same writes give the same tags wherever the folder is. `None` until the
+    /// first group derives it.
     #[cfg(feature = "columnar")]
     group_tag_base: Option<u64>,
 
@@ -3182,7 +3184,7 @@ impl Writer {
         // copied page's stamp names.
         let group_tag = match carry {
             Some(carry) => carry.tag,
-            None => self.next_group_tag()?,
+            None => self.next_group_tag(&last_key)?,
         };
         let page_transform = self.data_transform(self.data_block_compression)?;
         let directory_transform = self.data_transform(crate::CompressionType::None)?;
@@ -4319,29 +4321,33 @@ impl Writer {
     }
 
     /// The tag the first group encoded here starts from (see
-    /// [`Self::group_tag_base`]).
+    /// [`Self::group_tag_base`]), seeded with the first group's `last_key`: two
+    /// tables of one id and one age start apart unless their first groups end
+    /// on the same key.
     #[cfg(feature = "columnar")]
-    fn group_tag_base(&mut self) -> u64 {
+    fn group_tag_base(&mut self, last_key: &[u8]) -> u64 {
         *self.group_tag_base.get_or_insert_with(|| {
             let age = self
                 .created_at
                 .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos());
-            let mut seed = [0u8; 24];
-            seed[..8].copy_from_slice(&self.table_id.to_le_bytes());
-            seed[8..].copy_from_slice(&age.to_le_bytes());
+            let mut seed = Vec::with_capacity(24 + last_key.len());
+            seed.extend_from_slice(&self.table_id.to_le_bytes());
+            seed.extend_from_slice(&age.to_le_bytes());
+            seed.extend_from_slice(last_key);
             // Never zero: the index names a group by a non-zero tag.
             (crate::hash::hash64(&seed) >> 1).max(1)
         })
     }
 
-    /// The tag for the next row group encoded here: the first tag past the
-    /// last one encoded, or the base before any, that no group of the table
-    /// took. Never zero, since the base is not and the increments are checked.
+    /// The tag for the next row group encoded here, the one ending on
+    /// `last_key`: the first tag past the last one encoded, or the base before
+    /// any, that no group of the table took. Never zero, since the base is not
+    /// and the increments are checked.
     #[cfg(feature = "columnar")]
-    fn next_group_tag(&mut self) -> crate::Result<u64> {
+    fn next_group_tag(&mut self, last_key: &[u8]) -> crate::Result<u64> {
         let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
         let mut tag = match self.last_encoded_tag {
-            None => self.group_tag_base(),
+            None => self.group_tag_base(last_key),
             Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
         };
         while self.group_tags.contains(&tag) {
