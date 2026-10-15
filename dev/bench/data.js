@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792096120737,
+  "lastUpdate": 1792096124414,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -44824,6 +44824,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.621619642,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "df2ce429689915721c23fd6f1be541b4dd5c346a",
+          "message": "build: build no proc-macro, drop enum_dispatch and serde derive (#915)\n\n## Summary\n- The crate builds no proc-macro: `cargo tree -e normal` lists no `syn`,\n`quote` or `proc-macro2` for default features or `--all-features`.\n- Dispatch on `AnyTree` and `IterGuardImpl` stays static, and their\npublic API is unchanged.\n\n## Changes\n- `enum_dispatch` removed. `impl AbstractTree for AnyTree` and `impl\nIterGuard for IterGuardImpl` are written out with a local `macro_rules!`\nthat matches on the variant and calls each method by its trait path;\nevery method is forwarded, defaulted ones included, so the overrides in\n`Tree`, `BlobTree` and the guards still run.\n- The `From` and `TryInto` conversions the derive generated for both\nenums are written out, with the same error strings.\n- `serde` no longer enables `derive` (it reached `syn` under\n`ribbon-serde`): `Mode`, `Params` and `RibbonFilterRepr` get\nhand-written `Serialize` / `Deserialize` with the derive's shape (named\nfields, the sequence form, unknown fields skipped, the same errors).\n- Intra-doc links in `abstract_tree.rs` name `crate::Tree` /\n`crate::BlobTree` explicitly.\n\nWith `--target all`, `cargo tree` still prints the `cfg(any())` edges\n`serde_core -> serde_derive` and `zerocopy -> zerocopy-derive`; that cfg\nis never true, so neither is built.\n\n## Testing\n- Tests pin the ribbon repr's serialised shape; they passed against the\nderive before it was replaced. A test covers the `AnyTree` conversions.\n- fmt, clippy (default and all features), the full nextest suite, doc\ntests, rustdoc, the no-std check, sst-dump and benches pass on Linux.\n\nUpstream request for the same change: fjall-rs/lsm-tree#323.\n\nCloses #832\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Ribbon filter snapshots can be serialized and deserialized using named\nfields or declaration-order sequences. Unknown fields are ignored, while\nmalformed or incomplete data is rejected.\n* The result type for flushing data to tables is now publicly\naccessible.\n* **Compatibility**\n* Conversions between standard and blob tree types continue to succeed\nfor matching variants and return errors for mismatches.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-15T20:15:54Z",
+          "tree_id": "343c2a9315ac3dea23327de42209e369a5446795",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/df2ce429689915721c23fd6f1be541b4dd5c346a"
+        },
+        "date": 1792096123207,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 496.123,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.857738ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 105.598,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.614196ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 441.507,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 97.790101ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3684.943,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9415.958,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.095,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.966271,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.626762219,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.199,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 78.839807,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.605926332,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
