@@ -176,6 +176,49 @@ impl LookupFd {
         if let Some(fd) = self.0.get() {
             return Ok(fd.as_ref());
         }
+        let fd = Self::open(
+            file_accessor,
+            table_id,
+            path,
+            charge,
+            #[cfg(feature = "metrics")]
+            metrics,
+        )?;
+        Ok(self.0.get_or_init(|| fd).as_ref())
+    }
+
+    /// The table's file, owned: the one this read resolved, or else taken now,
+    /// for a caller that keeps reading through it after the read.
+    pub(crate) fn into_file(
+        self,
+        file_accessor: &FileAccessor,
+        table_id: &GlobalTableId,
+        path: &Path,
+        charge: ReadCharge,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::io::Result<alloc::sync::Arc<dyn crate::fs::FsFile>> {
+        match self.0.into_inner() {
+            Some(fd) => Ok(fd),
+            None => Self::open(
+                file_accessor,
+                table_id,
+                path,
+                charge,
+                #[cfg(feature = "metrics")]
+                metrics,
+            ),
+        }
+    }
+
+    /// Takes the table's file from the descriptor cache, or opens it, counting
+    /// the access.
+    fn open(
+        file_accessor: &FileAccessor,
+        table_id: &GlobalTableId,
+        path: &Path,
+        charge: ReadCharge,
+        #[cfg(feature = "metrics")] metrics: &Metrics,
+    ) -> crate::io::Result<alloc::sync::Arc<dyn crate::fs::FsFile>> {
         let (fd, cache_event) = if charge.touches_cache() {
             file_accessor.get_or_open_table(table_id, path)?
         } else {
@@ -198,7 +241,7 @@ impl LookupFd {
         #[cfg(not(feature = "metrics"))]
         let _ = cache_event;
 
-        Ok(self.0.get_or_init(|| fd).as_ref())
+        Ok(fd)
     }
 }
 

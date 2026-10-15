@@ -76,7 +76,7 @@ fn wrong_input_type_names_what_was_expected() {
 }
 
 #[test]
-fn mode_round_trips_both_variants() {
+fn mode_both_variants_round_trip() {
     for mode in [Mode::Standard, Mode::Homogeneous] {
         let json = serde_json::to_string(&mode).expect("serialize");
         assert_eq!(serde_json::from_str::<Mode>(&json).ok(), Some(mode));
@@ -84,7 +84,7 @@ fn mode_round_trips_both_variants() {
 }
 
 #[test]
-fn params_rejects_a_duplicate_field() {
+fn params_duplicate_field_rejected() {
     let err = serde_json::from_str::<Params>(
         r#"{"m":3,"m":3,"w":16,"r":8,"mode":"Standard","seed":0,"retry_limit":8,"grow_limit":2}"#,
     )

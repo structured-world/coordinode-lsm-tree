@@ -114,6 +114,38 @@ fn cold_point_reads_take_the_descriptor_once_per_lookup() -> crate::Result<()> {
     Ok(())
 }
 
+/// The chunked multi-get planner checks the filters, walks the index and hands
+/// back the file the planned blocks are then read through: one lookup, one
+/// descriptor access.
+#[test]
+fn cold_block_task_plan_takes_the_descriptor_once() -> crate::Result<()> {
+    let keys: Vec<(&[u8], u64)> = [b"key000002".as_slice(), b"key000500", b"key000998"]
+        .into_iter()
+        .map(|k| (k, hash64(k)))
+        .collect();
+    for (name, shape) in shapes() {
+        let dir = tempdir()?;
+        let table = cold_table(dir.path(), shape)?;
+
+        let before = descriptor_accesses(&table);
+        let filters = table.metrics.filter_block_load_io.load(Relaxed);
+        let indexes = table.metrics.index_block_load_io.load(Relaxed);
+        let plan = table.plan_block_tasks(
+            &keys,
+            SeqNo::MAX,
+            &mut crate::table::probe_stats::PlanCounts::default(),
+        )?;
+        assert!(plan.is_some(), "{name}: the keys are planned");
+        assert!(
+            table.metrics.filter_block_load_io.load(Relaxed) > filters
+                && table.metrics.index_block_load_io.load(Relaxed) > indexes,
+            "{name}: the plan did not read its filter and index blocks from the file"
+        );
+        assert_eq!(descriptor_accesses(&table) - before, 1, "{name}");
+    }
+    Ok(())
+}
+
 /// A lookup the filter rules out reads only the filter, and a key absent from
 /// a block the filter let through still reads index and data: either way the
 /// descriptor is taken once.

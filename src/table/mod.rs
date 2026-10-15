@@ -7745,7 +7745,8 @@ impl Table {
     /// `None`.
     ///
     /// The filter answers are added to `tally` when one is given, for the
-    /// caller to count once it answers from this plan.
+    /// caller to count once it answers from this plan. Filter blocks are read
+    /// through `fd`, the caller's lookup.
     #[expect(
         clippy::indexing_slicing,
         reason = "passing[0] is valid after the emptiness check"
@@ -7755,6 +7756,7 @@ impl Table {
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
         tally: &mut crate::table::probe_stats::PlanCounts,
+        fd: &LookupFd,
     ) -> crate::Result<Option<(Vec<usize>, block_index::BlockIndexIterImpl, SeqNo)>> {
         if sorted_keys.is_empty() {
             return Ok(None);
@@ -7767,8 +7769,6 @@ impl Table {
             return Ok(None);
         }
         let mut passing: Vec<usize> = Vec::with_capacity(sorted_keys.len());
-        // The filter blocks the keys are checked against share the file.
-        let fd = LookupFd::default();
         for (i, (key, hash)) in sorted_keys.iter().enumerate() {
             // Below a tight-space restriction, as for a point read.
             if self.is_below_restriction(key) {
@@ -7776,7 +7776,7 @@ impl Table {
             }
             // Counted with the plan, not here: a level handed to the serial
             // resolve is probed and counted there.
-            let bloom = self.judge_bloom(key, *hash, &fd)?;
+            let bloom = self.judge_bloom(key, *hash, fd)?;
             Self::tally_bloom(tally, &bloom);
             if !bloom.should_skip() {
                 passing.push(i);
@@ -7853,25 +7853,21 @@ impl Table {
     ///
     /// Propagates a failure to open the file.
     pub(crate) fn open_file(&self) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
-        let (file, cache_event) = self
-            .file_accessor
-            .get_or_open_table(&self.global_id(), &self.path)?;
-        // Counted as the load path counts the file it opens; a pinned
-        // descriptor is no cache event.
-        #[cfg(feature = "metrics")]
-        if let Some(hit) = cache_event {
-            use core::sync::atomic::Ordering::Relaxed;
-            if hit {
-                self.metrics.table_file_opened_cached.fetch_add(1, Relaxed);
-            } else {
-                self.metrics
-                    .table_file_opened_uncached
-                    .fetch_add(1, Relaxed);
-            }
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = cache_event;
-        Ok(file)
+        self.lookup_file(LookupFd::default())
+    }
+
+    /// The file `fd` resolved for a lookup, or this table's file taken now,
+    /// owned for a caller that reads the lookup's blocks itself. Counted as the
+    /// load path counts the file it opens.
+    fn lookup_file(&self, fd: LookupFd) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
+        Ok(fd.into_file(
+            &self.file_accessor,
+            &self.global_id(),
+            &self.path,
+            ReadCharge::Foreground,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )?)
     }
 
     /// Whether this table's data blocks need the special load path rather than a
@@ -7924,8 +7920,11 @@ impl Table {
         seqno: SeqNo,
         tally: &mut crate::table::probe_stats::PlanCounts,
     ) -> crate::Result<Option<BlockTaskPlan>> {
+        // The filter and index blocks the plan reads, and the file the planned
+        // blocks are read through after it, share one descriptor access.
+        let fd = LookupFd::default();
         let Some((passing, mut block_iter, table_seqno)) =
-            self.plan_block_walk_setup(sorted_keys, seqno, tally)?
+            self.plan_block_walk_setup(sorted_keys, seqno, tally, &fd)?
         else {
             return Ok(None);
         };
@@ -7937,7 +7936,7 @@ impl Table {
             // PROPAGATED, not treated as end-of-index. Swallowing it would skip
             // the rest of this table and let a lower level answer a key the
             // failed table actually covers (same `?` contract as `batch_get`).
-            let Some(handle_result) = block_iter.next() else {
+            let Some(handle_result) = block_iter.next_with(&fd) else {
                 break;
             };
             let block_handle = handle_result?;
@@ -7986,9 +7985,8 @@ impl Table {
             return Ok(None);
         }
 
-        // Counted as every descriptor lookup is; the blocks are read through
-        // this file, with no second lookup.
-        let file = self.open_file()?;
+        // The blocks are read through this file, with no second lookup.
+        let file = self.lookup_file(fd)?;
         Ok(Some((file, table_seqno, self.is_chunk_special(), blocks)))
     }
 
