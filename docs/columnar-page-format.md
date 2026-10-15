@@ -434,15 +434,11 @@ group is lost, every later group's ordinal in the copy shifts, and each copied
 page would fail verification under its new one. A carried tag survives the
 copy. What the binding needs is uniqueness within a table, and the writer
 keeps every tag the table's groups were written under: a group it encodes
-takes the first free tag past the last one it encoded, and a copied group is
-accepted only when its own tag is free. A salvage copying one table in key
-order always finds its tags free, because the source's tags are unique and a
-re-encoded group takes a tag no higher than the source tag it replaces; a
-compaction copying the groups of several tables finds them free unless two of
-its inputs drew the same tags, by chance, and then writes the rows of the one
-that clashes. The groups a compaction encodes take tags from the output's own
-base, never from the sequence of a group it copied, so they do not take the
-tags of that source's later groups.
+takes its own tag, or the first free tag above it when another group already
+took that one, and a copied group is accepted only when its own tag is free.
+A salvage or a compaction copying groups finds their tags free unless a group
+it encoded, or a group of another input, drew the same tag by chance, and then
+writes the rows of the one that clashes rather than copying it.
 
 Moving a page between slots of one group is refused by
 `(column_id, part, row_page)`, which the stamp repeats. The row page is what
@@ -472,12 +468,17 @@ by the type its block header names, before its stamp is consulted. Moving a page
 tables** is refused too, encrypted or not. A row-major block moved into
 another table brings its own keys, so a read of it is a miss; a page does not,
 so the key page of one table beside the value page of another would serve the
-other table's value under this table's key. Every table therefore starts its
-tags at its own base, a hash of its path, id and creation time in the lower
-half of `u64`: tables' tags collide only by chance, and the stamp names the
-table as well as the group. The base is carried, not derived, so a group
-copied verbatim into another table keeps the tags its pages were stamped
-with. Under encryption the block layer's AAD binds the table id on top.
+other table's value under this table's key. Every group's tag is therefore a
+hash of its table's id, the table's creation time and the group's own
+content (each column's id, type, validity and bytes, and the group's last
+key), in the lower half of `u64`: two groups' tags collide only by chance
+unless they hold the same rows in tables of one id and one creation time, and
+the stamp names the table as well as the group. Nothing outside the table
+enters the hash, so a tree whose clock is fixed writes the same tags for the
+same rows wherever its folder is, and two such trees part wherever their
+content does. The tag is carried, not derived on read, so a group copied
+verbatim into another table keeps the tags its pages were stamped with. Under
+encryption the block layer's AAD binds the table id on top.
 
 ## Framing overhead
 

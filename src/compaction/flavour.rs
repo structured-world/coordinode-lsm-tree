@@ -493,6 +493,7 @@ pub(super) fn prepare_table_writer(
         // replaces the writer entirely (handled above, lines 85-90).
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
         .use_encryption(opts.config.encryption.clone())
+        .use_clock(opts.config.clock.clone())
         // Read the ECC scheme from the same live snapshot as the other
         // runtime-config-driven settings (e.g. `seqno_in_index` below) so a
         // compaction started after a scheme change stamps its output SSTs

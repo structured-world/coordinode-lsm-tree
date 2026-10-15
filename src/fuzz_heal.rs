@@ -412,6 +412,7 @@ fn salvage_and_check_minimality(
         blob_rewrite: None,
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     let report = crate::salvage::salvage_with_context(
         source,

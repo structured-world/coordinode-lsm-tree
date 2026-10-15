@@ -500,18 +500,115 @@ fn writer_rejects_partitioned_filter_switch_after_write() {
     let _writer = writer.use_partitioned_filter();
 }
 
-/// A table whose last group took the largest tag has none left for the next:
-/// encoding one more group fails rather than wrapping to a tag already used.
+/// A group whose tag a group of the table already took is encoded under
+/// another one: tags stay unique within the table.
 #[cfg(feature = "columnar")]
 #[test]
-fn group_tags_past_the_largest_are_refused() -> crate::Result<()> {
+fn a_group_tag_already_taken_is_skipped() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?.use_columnar(true);
-    writer.last_encoded_tag = Some(u64::MAX);
-    assert!(matches!(
-        writer.next_group_tag(),
-        Err(crate::Error::InvalidHeader(_))
-    ));
+    let mut writer = Writer::new(dir.path().join("1"), 1, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_created_at(1_000);
+    let batch = crate::table::columnar::ColumnBatch {
+        row_count: 0,
+        columns: alloc::vec![],
+    };
+    let tag = writer.next_group_tag(&batch, b"k");
+    writer.group_tags.insert(tag);
+    let next = writer.next_group_tag(&batch, b"k");
+    assert_ne!(next, 0, "a group is never tagged zero");
+    assert!(
+        !writer.group_tags.contains(&next),
+        "a taken tag was handed out"
+    );
+    Ok(())
+}
+
+/// The tags of two tables of one id and one age, the groups written given as
+/// `(key, value)` rows, one group each, sorted.
+#[cfg(feature = "columnar")]
+fn tags_of(
+    dir: &std::path::Path,
+    name: &str,
+    groups: &[(&[u8], &[u8])],
+) -> crate::Result<Vec<u64>> {
+    use crate::comparator::default_comparator;
+    use crate::table::columnar::entries_to_column_batch;
+
+    let mut writer = Writer::new(dir.join(name), 1, 0, Arc::new(StdFs))?
+        .use_columnar(true)
+        .use_created_at(1_000);
+    for (seqno, (key, value)) in (1..).zip(groups) {
+        let batch = entries_to_column_batch(&alloc::vec![InternalValue::from_components(
+            key.to_vec(),
+            value.to_vec(),
+            seqno,
+            ValueType::Value,
+        )])?;
+        writer.write_columnar_block_verbatim(&batch, &default_comparator())?;
+    }
+    let mut tags: Vec<u64> = writer.group_tags.iter().copied().collect();
+    tags.sort_unstable();
+    Ok(tags)
+}
+
+/// Two tables of one id and one age, as two trees on one fixed clock write,
+/// tag every group apart when its rows differ, so a page carried to the other
+/// table is refused by its stamp, and alike when the rows are the same, so
+/// the same writes give the same bytes. A later group counts as much as the
+/// first: the same first group followed by different ones must not repeat
+/// the later tags.
+#[cfg(feature = "columnar")]
+#[test]
+fn group_tags_differ_for_different_content_at_one_id_and_age() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let dir = dir.path();
+    let a = tags_of(dir, "a", &[(b"apple", b"v"), (b"cherry", b"x")])?;
+    let a_again = tags_of(dir, "a2", &[(b"apple", b"v"), (b"cherry", b"x")])?;
+    let other_key = tags_of(dir, "b", &[(b"banana", b"v"), (b"cherry", b"x")])?;
+    let other_value = tags_of(dir, "c", &[(b"apple", b"w"), (b"cherry", b"x")])?;
+    let other_later = tags_of(dir, "d", &[(b"apple", b"v"), (b"cherry", b"y")])?;
+
+    assert_eq!(a.len(), 2, "both groups were encoded");
+    assert_eq!(a, a_again, "the same groups took other tags");
+    for (other, what) in [
+        (&other_key, "a different first key"),
+        (&other_value, "a different first value"),
+        (&other_later, "a different later group"),
+    ] {
+        let shared = a.iter().filter(|tag| other.contains(tag)).count();
+        assert!(shared < 2, "{what} left every tag shared: {a:?} {other:?}");
+    }
+    Ok(())
+}
+
+/// Two groups whose columns hold the same bytes under different types are
+/// different groups, and take different tags.
+#[cfg(feature = "columnar")]
+#[test]
+fn group_tags_differ_for_columns_of_another_type() -> crate::Result<()> {
+    use crate::table::columnar::{Column, ColumnBatch, Number, TypeTag};
+
+    let dir = tempfile::tempdir()?;
+    let batch = |type_tag| ColumnBatch {
+        row_count: 1,
+        columns: alloc::vec![Column {
+            column_id: 0,
+            type_tag,
+            validity: None,
+            data: crate::Slice::from(7u64.to_le_bytes().to_vec()),
+        }],
+    };
+    let tag_of = |name: &str, type_tag| -> crate::Result<u64> {
+        let mut writer = Writer::new(dir.path().join(name), 1, 0, Arc::new(StdFs))?
+            .use_columnar(true)
+            .use_created_at(1_000);
+        Ok(writer.next_group_tag(&batch(type_tag), b"k"))
+    };
+
+    let fixed = tag_of("fixed", TypeTag::Fixed(8))?;
+    let number = tag_of("number", TypeTag::Number(Number::U64_LE))?;
+    assert_ne!(fixed, number, "one tag for columns of different types");
     Ok(())
 }
 

@@ -34,7 +34,6 @@ use crate::{
             index::FullIndexWriter,
         },
     },
-    time::unix_timestamp,
     vlog::BlobFileId,
 };
 use alloc::sync::Arc;
@@ -846,33 +845,27 @@ pub struct Writer {
     /// every table the engine writes itself.
     created_at: Option<u128>,
 
+    /// The tree's clock, read for the age when nothing above sets it; `None`
+    /// reads the process clock.
+    clock: Option<Arc<dyn crate::Clock>>,
+
     /// The key range to record instead of the rows' own, set by a caller that
     /// ordered it under the tree's comparator; `None` for every table the
     /// engine writes itself.
     key_range_cover: Option<(UserKey, UserKey)>,
 
-    /// Tag of the last row group encoded here under a tag of its own, `None`
-    /// before the first. Encoded tags advance from it rather than from a
-    /// copied group's, which follows its source's sequence: stepping past a
-    /// copy would take the tags of that source's next groups and refuse them.
-    #[cfg(feature = "columnar")]
-    last_encoded_tag: Option<u64>,
-
     /// Every tag a row group of this table was written under. Tags are unique
     /// within the table, which is what makes a page's stamp name exactly one
-    /// group: a group encoded here takes the first free tag past the last
-    /// one, and a group copied in keeps its own when it is free.
+    /// group: a group encoded here takes the first free tag from its own
+    /// ([`Self::next_group_tag`]), and a group copied in keeps its own when it
+    /// is free.
     #[cfg(feature = "columnar")]
     group_tags: crate::HashSet<u64>,
 
-    /// Tag of the first row group encoded here: a hash of the table's path,
-    /// id and creation time, in the lower half of `u64` so the increments
-    /// after it never run out, and never zero. Starting every table at its own point is what
-    /// makes a page's stamp name its table as well as its group: a page's
-    /// values are apart from their keys, so a page taken for another table's
-    /// would serve that table's value under this table's key.
+    /// The age the group tags of this table are derived under, read once at
+    /// the first group encoded here.
     #[cfg(feature = "columnar")]
-    group_tag_base: u64,
+    group_tag_age: Option<u128>,
 
     /// Pre-trained zstd dictionary for dictionary compression
     #[cfg(zstd_any)]
@@ -1164,15 +1157,6 @@ impl Writer {
             return Err(e.into());
         }
 
-        #[cfg(feature = "columnar")]
-        let group_tag_base = {
-            let mut seed = alloc::format!("{}", path.display()).into_bytes();
-            seed.extend_from_slice(&table_id.to_le_bytes());
-            seed.extend_from_slice(&crate::time::unix_timestamp().as_nanos().to_le_bytes());
-            // Never zero: the index names a group by a non-zero tag.
-            (crate::hash::hash64(&seed) >> 1).max(1)
-        };
-
         Ok(Self {
             fs,
             initial_level,
@@ -1235,11 +1219,9 @@ impl Writer {
             next_refresh_hashes: 0,
 
             #[cfg(feature = "columnar")]
-            last_encoded_tag: None,
-            #[cfg(feature = "columnar")]
             group_tags: crate::HashSet::default(),
             #[cfg(feature = "columnar")]
-            group_tag_base,
+            group_tag_age: None,
 
             block_buffer: Vec::new(),
             file_writer: writer,
@@ -1285,6 +1267,7 @@ impl Writer {
             lineage_transformed: false,
             lineage_last: false,
             created_at: None,
+            clock: None,
             key_range_cover: None,
 
             #[cfg(zstd_any)]
@@ -2556,6 +2539,19 @@ impl Writer {
         self
     }
 
+    /// Reads the time on `clock`, the tree's own, instead of the process clock.
+    #[must_use]
+    pub(crate) fn use_clock(mut self, clock: Option<Arc<dyn crate::Clock>>) -> Self {
+        self.assert_not_started("use_clock");
+        self.clock = clock;
+        self
+    }
+
+    /// The age this table records when nothing set it: now, on its clock.
+    fn now_nanos(&self) -> u128 {
+        crate::time::now_on(self.clock.as_ref()).as_nanos()
+    }
+
     /// Wires the resolved per-level retrieval-ribbon locator policy entry.
     ///
     /// `Enabled` makes the writer accumulate a per-key `(block_id, slot)`
@@ -3168,14 +3164,14 @@ impl Writer {
         // out where the pages are. Both are encrypted and ECC-protected exactly
         // like data.
         check_group_column_count(batch)?;
-        let page_transform = self.data_transform(self.data_block_compression)?;
-        let directory_transform = self.data_transform(crate::CompressionType::None)?;
         // A group copying another's pages keeps that group's tag, which every
         // copied page's stamp names.
         let group_tag = match carry {
             Some(carry) => carry.tag,
-            None => self.next_group_tag()?,
+            None => self.next_group_tag(batch, &last_key),
         };
+        let page_transform = self.data_transform(self.data_block_compression)?;
+        let directory_transform = self.data_transform(crate::CompressionType::None)?;
 
         // The group's rows are cut into row pages shared by every column, and
         // each column gets one page per row page, all of one column's pages
@@ -3403,9 +3399,6 @@ impl Writer {
                     "columnar: row group length overflows u32",
                 ))?;
             uncompressed += u64::from(header.uncompressed_length);
-        }
-        if carry.is_none() {
-            self.last_encoded_tag = Some(group_tag);
         }
         self.group_tags.insert(group_tag);
 
@@ -4281,47 +4274,63 @@ impl Writer {
     /// keeps the tag its pages were stamped with, so no group of the table may
     /// have taken it already; a group encoded here takes a free one instead.
     ///
-    /// A salvage copying one source table in key order always finds its tags
-    /// free: the source's tags are unique, a first group it re-encodes takes
-    /// the source tag it replaces ([`Self::start_group_tags_at`]), and a later
-    /// one the first free tag above the last re-encoded, which is at most the
-    /// source tag it replaces. A compaction copying the groups of several
-    /// tables finds them free unless two of its inputs drew the same tags, by
-    /// chance: the groups it encodes take tags from the output's own base,
-    /// not from the sequence of a group it copied.
+    /// A salvage or a compaction copying groups finds their tags free unless
+    /// another group of the output drew the same tag, by chance: every tag is
+    /// a hash of its own group's content ([`Self::next_group_tag`]), so a group
+    /// re-encoded here and a group copied in collide only when their hashes do,
+    /// and the one that clashes is then encoded rather than copied.
     #[cfg(feature = "columnar")]
     #[must_use]
     pub(crate) fn accepts_group_tag(&self, group_tag: u64) -> bool {
         group_tag != 0 && !self.group_tags.contains(&group_tag)
     }
 
-    /// Starts the tags of the groups encoded here at `tag`, when none has been
-    /// encoded yet; once one has, the order the encoded tags set stands. A
-    /// salvage calls it with each source group's tag before emitting the
-    /// group, so a group it must re-encode first takes the tag it replaces,
-    /// and the source's later groups, whose tags are above it, can still be
-    /// copied verbatim.
+    /// The tag for the row group `batch`, ending on `last_key`, encoded here: a
+    /// hash of the table's id, its age and the group's content, in the lower
+    /// half of `u64` and never zero, or the first tag above it no group of the
+    /// table took.
+    ///
+    /// Deriving every tag from its own group is what makes a page's stamp name
+    /// its table as well as its group: a page's values are apart from their
+    /// keys, so a page taken for another table's would serve that table's
+    /// value under this table's key, and two tables' tags meet only by chance
+    /// unless their groups hold the same rows. Nothing outside the table enters
+    /// the hash, so the same writes give the same tags wherever the folder is,
+    /// and tables of one id and one age, as two trees on one fixed clock write,
+    /// part wherever their content does.
     #[cfg(feature = "columnar")]
-    pub(crate) fn start_group_tags_at(&mut self, tag: u64) {
-        if self.last_encoded_tag.is_none() && tag != 0 {
-            self.group_tag_base = tag;
+    fn next_group_tag(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+        last_key: &[u8],
+    ) -> u64 {
+        let age = *self.group_tag_age.get_or_insert_with(|| {
+            self.created_at
+                .unwrap_or_else(|| crate::time::now_on(self.clock.as_ref()).as_nanos())
+        });
+        let mut seed = xxhash_rust::xxh3::Xxh3::default();
+        seed.update(&self.table_id.to_le_bytes());
+        seed.update(&age.to_le_bytes());
+        seed.update(&batch.row_count.to_le_bytes());
+        for column in &batch.columns {
+            let (type_tag, width) = column.type_tag.to_wire();
+            seed.update(&column.column_id.to_le_bytes());
+            seed.update(&[type_tag, width, u8::from(column.validity.is_some())]);
+            if let Some(validity) = &column.validity {
+                seed.update(validity);
+            }
+            seed.update(&(column.data.len() as u64).to_le_bytes());
+            seed.update(&column.data);
         }
-    }
-
-    /// The tag for the next row group encoded here: the first tag past the
-    /// last one encoded, or the base before any, that no group of the table
-    /// took. Never zero, since the base is not and the increments are checked.
-    #[cfg(feature = "columnar")]
-    fn next_group_tag(&self) -> crate::Result<u64> {
-        let exhausted = || crate::Error::InvalidHeader("columnar: row group tags exhausted");
-        let mut tag = match self.last_encoded_tag {
-            None => self.group_tag_base,
-            Some(last) => last.checked_add(1).ok_or_else(exhausted)?,
-        };
+        seed.update(last_key);
+        // Never zero: the index names a group by a non-zero tag.
+        let mut tag = (seed.digest() >> 1).max(1);
+        // The probe starts below 2^63 and steps once per tag a group of this
+        // table took, far fewer than 2^63, so it cannot overflow.
         while self.group_tags.contains(&tag) {
-            tag = tag.checked_add(1).ok_or_else(exhausted)?;
+            tag += 1;
         }
-        Ok(tag)
+        tag
     }
 
     /// `raw`, the blocks of one extent copied from `source`, with each block's
@@ -5077,7 +5086,7 @@ impl Writer {
         let created_at_nanos = self
             .created_at
             .or_else(|| ages.and_then(|ages| ages.age_of(first_key, last_key)))
-            .unwrap_or_else(|| unix_timestamp().as_nanos());
+            .unwrap_or_else(|| self.now_nanos());
         let mut meta_params = self.meta_section_params(
             first_key,
             last_key,

@@ -1599,6 +1599,7 @@ fn salvage_propagates_an_environmental_failure_from_the_mirror_probe() -> crate:
             blob_rewrite: None,
             owner_promotions: None,
             progress: None,
+            clock: None,
         };
         match super::meta_mirrors_diverge(&source, &fs, &options) {
             Ok(_) => {}
@@ -7760,6 +7761,7 @@ fn salvage_recovers_an_encrypted_sst_with_the_provider() -> crate::Result<()> {
         blob_rewrite: None,
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -7846,6 +7848,7 @@ fn a_salvaged_copy_under_a_new_id_reads_every_value() -> crate::Result<()> {
                 blob_rewrite: None,
                 owner_promotions: None,
                 progress: None,
+                clock: None,
             };
             let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
             assert!(
@@ -7935,6 +7938,7 @@ fn salvage_recovers_a_dictionary_sst_with_the_dictionary() -> crate::Result<()> 
         blob_rewrite: None,
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -8086,6 +8090,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         blob_rewrite: None,
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     let recovered_wrong = salvage_sst_with_options(&source, dest.clone(), &fs, &wrong)
         .map_or(0, |r| r.entries_salvaged);
@@ -8110,6 +8115,7 @@ fn salvage_recovers_an_encrypted_sst_with_a_nonzero_table_id() -> crate::Result<
         blob_rewrite: None,
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     let report = salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
     assert_eq!(
@@ -10587,9 +10593,11 @@ fn salvage_keeps_row_group_tags_unique_when_copies_and_reencodes_mix() -> crate:
                 .map(|g| g.group.directory.group_tag())
         })
         .collect::<crate::Result<_>>()?;
-    assert!(
-        tags.is_sorted_by(|a, b| a < b),
-        "row group tags must strictly increase in the copy, got {tags:?}",
+    let distinct: crate::HashSet<u64> = tags.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        tags.len(),
+        "row group tags must stay unique in the copy, got {tags:?}",
     );
     // Row 4 is the suppressed boundary key; every row after it survives.
     for i in 5..16u32 {
@@ -10817,6 +10825,7 @@ fn salvage_remaps_the_references_of_a_columnar_cells_table() -> crate::Result<()
         blob_rewrite: Some(Arc::new(rewrite)),
         owner_promotions: None,
         progress: None,
+        clock: None,
     };
     salvage_sst_with_options(&source, dest.clone(), &fs, &options)?;
 
