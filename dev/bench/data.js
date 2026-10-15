@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792093878627,
+  "lastUpdate": 1792093882434,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -43806,6 +43806,96 @@ window.BENCHMARK_DATA = {
             "value": 10515.145,
             "unit": "us",
             "extra": "keys: 10000 | scans: 40\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "da4cec15983aefdf67bc4e3ea6ca35349af7ed65",
+          "message": "feat(config): per-tree clock for reproducible tables and blob files (#914)\n\n## Summary\n\n- A tree can name the wall clock it reads: `Config::with_clock(Arc<dyn\nClock>)`. Without one it reads the process clock, as before.\n- Two trees on the same fixed clock, given the same writes in the same\norder and no encryption, write byte-identical tables, columnar tables\nand blob files, wherever their folders are.\n\nReplaces #913, closed when its branch was squashed into this single\ncommit.\n\n## Changes\n\n- Table and blob file writers take the tree's clock (`use_clock`) and\nstamp `created_at` on it; flush, compaction, ingest, compaction-filter\nblob writes, blob relocation and repair salvage\n(`SalvageOptions::clock`, and the blob salvage repair runs) hand it\nover. A salvaged copy still takes a fresh age: the source's own age is\nnot trusted.\n- FIFO measures TTL on the tree's clock.\n- Every columnar row group tag is a hash of the table id, its age and\nthe group's own content (column ids, types, validity, bytes and last\nkey), or the first free tag above it. It used to start a sequence at a\nhash of the absolute path, so tables of two trees still differed on a\nfixed clock; now two tables' tags meet only by chance unless their\ngroups hold the same rows, as `docs/columnar-page-format.md` promises.\nThis costs one xxh3 pass over the data written, about 1.6% of a columnar\nflush.\n- A blob file's in-memory metadata records the age its file records,\ninstead of reading the clock a second time.\n- `docs/columnar-page-format.md` describes the tags as they are; `Clock`\ndocs name the per-tree clock; a doc link that broke without the\n`columnar` feature is fixed.\n\n## Testing\n\n`tests/per_tree_clock.rs` covers byte-identical tables, columnar tables\nand blob files across two trees, FIFO expiring tables by the configured\nclock, and repair salvage stamping the configured clock; unit tests\ncover a salvaged blob file's age and group tags across different content\nand column types. Formatting, clippy in every CI configuration, the full\nnextest suite with all and default features, doc tests, docs and the\nno-std check pass.\n\nCloses #830\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an optional configurable clock for table and blob file\ntimestamps, salvage operations, and FIFO compaction TTL.\n* Columnar row-group tags are now based on table identity, creation\ntime, and group content; copied groups retain their tags, with conflicts\nresolved to keep tags unique.\n* **Bug Fixes**\n* FIFO compaction and file creation now consistently use the configured\nclock when one is provided.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-15T18:25:03Z",
+          "tree_id": "dd95fb74d235dee892fe0514d737459cc1fe6277",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/da4cec15983aefdf67bc4e3ea6ca35349af7ed65"
+        },
+        "date": 1792093881320,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 508.715,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 80.74947ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 160.236,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 51.271813ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 459.306,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.920645ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5195.55,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 10907.985999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.911,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.638591,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.642603102,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.879,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 82.378751,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.621619642,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
         ]
       }
