@@ -19,7 +19,6 @@ const RIBBON_FILTER_FORMAT_VERSION: u8 = 1;
 /// stores full `u64` words anyway; the `BitVec` wrapper was upstream
 /// flavour, not a load-bearing component.
 #[cfg(feature = "ribbon-serde")]
-#[derive(serde::Serialize, serde::Deserialize)]
 pub struct RibbonFilterRepr {
     pub version: u8,
     pub params: Params,

@@ -1,9 +1,9 @@
 use lsm_tree::{
+    // In scope for the trait methods called on `AnyTree`.
     AbstractTree,
     Config,
     KvSeparationOptions,
     SequenceNumberCounter,
-    // AbstractTree must be in scope for enum_dispatch method resolution on AnyTree
     get_tmp_folder,
     verify,
 };
