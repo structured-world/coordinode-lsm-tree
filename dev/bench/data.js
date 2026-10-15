@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791491330128,
+  "lastUpdate": 1792093874177,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -41978,6 +41978,90 @@ window.BENCHMARK_DATA = {
             "value": 235499.13931894055,
             "unit": "ops/sec",
             "extra": "P50: 2.8us | P99: 20.6us | P99.9: 225.3us\nthreads: 1 | elapsed: 0.85s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "da4cec15983aefdf67bc4e3ea6ca35349af7ed65",
+          "message": "feat(config): per-tree clock for reproducible tables and blob files (#914)\n\n## Summary\n\n- A tree can name the wall clock it reads: `Config::with_clock(Arc<dyn\nClock>)`. Without one it reads the process clock, as before.\n- Two trees on the same fixed clock, given the same writes in the same\norder and no encryption, write byte-identical tables, columnar tables\nand blob files, wherever their folders are.\n\nReplaces #913, closed when its branch was squashed into this single\ncommit.\n\n## Changes\n\n- Table and blob file writers take the tree's clock (`use_clock`) and\nstamp `created_at` on it; flush, compaction, ingest, compaction-filter\nblob writes, blob relocation and repair salvage\n(`SalvageOptions::clock`, and the blob salvage repair runs) hand it\nover. A salvaged copy still takes a fresh age: the source's own age is\nnot trusted.\n- FIFO measures TTL on the tree's clock.\n- Every columnar row group tag is a hash of the table id, its age and\nthe group's own content (column ids, types, validity, bytes and last\nkey), or the first free tag above it. It used to start a sequence at a\nhash of the absolute path, so tables of two trees still differed on a\nfixed clock; now two tables' tags meet only by chance unless their\ngroups hold the same rows, as `docs/columnar-page-format.md` promises.\nThis costs one xxh3 pass over the data written, about 1.6% of a columnar\nflush.\n- A blob file's in-memory metadata records the age its file records,\ninstead of reading the clock a second time.\n- `docs/columnar-page-format.md` describes the tags as they are; `Clock`\ndocs name the per-tree clock; a doc link that broke without the\n`columnar` feature is fixed.\n\n## Testing\n\n`tests/per_tree_clock.rs` covers byte-identical tables, columnar tables\nand blob files across two trees, FIFO expiring tables by the configured\nclock, and repair salvage stamping the configured clock; unit tests\ncover a salvaged blob file's age and group tags across different content\nand column types. Formatting, clippy in every CI configuration, the full\nnextest suite with all and default features, doc tests, docs and the\nno-std check pass.\n\nCloses #830\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added an optional configurable clock for table and blob file\ntimestamps, salvage operations, and FIFO compaction TTL.\n* Columnar row-group tags are now based on table identity, creation\ntime, and group content; copied groups retain their tags, with conflicts\nresolved to keep tags unique.\n* **Bug Fixes**\n* FIFO compaction and file creation now consistently use the configured\nclock when one is provided.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-15T18:25:03Z",
+          "tree_id": "dd95fb74d235dee892fe0514d737459cc1fe6277",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/da4cec15983aefdf67bc4e3ea6ca35349af7ed65"
+        },
+        "date": 1792093872363,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 69695.18920074716,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.8us | P99.9: 53.7us\nthreads: 1 | elapsed: 7.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2079153.4768202195,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 17.7us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 633061.277675987,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.1us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 456263.9217956885,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 6.8us | P99.9: 20.8us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2287505.9387943246,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 238095.8897410125,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 9.2us | P99.9: 17.6us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 136228.4075939052,
+            "unit": "ops/sec",
+            "extra": "P50: 6.6us | P99: 15.5us | P99.9: 21.6us\nthreads: 1 | elapsed: 1.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 625992.7913111525,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.3us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 702193.0693817907,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 2.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 334422.3462616999,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.2us | P99.9: 82.1us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
           }
         ]
       }
