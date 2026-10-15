@@ -69,8 +69,15 @@ pub struct TableSettings {
     /// format's layout through [`TableImport::append_rows`].
     pub columnar: bool,
     /// Whether a columnar table stores each value split into the caller's
-    /// fields, one column each, as an ingested batch does. Its batches then
-    /// come through [`TableImport::append_column_batch`].
+    /// fields, one column each, as an ingested batch does.
+    #[cfg_attr(
+        feature = "columnar",
+        doc = "Its batches then come through [`TableImport::append_column_batch`]."
+    )]
+    #[cfg_attr(
+        not(feature = "columnar"),
+        doc = "Its batches then come through `TableImport::append_column_batch`, built with the `columnar` feature."
+    )]
     pub split_fields: bool,
     /// The membership filter, carried over as solved; `None` writes none.
     pub filter: Option<FilterImage>,

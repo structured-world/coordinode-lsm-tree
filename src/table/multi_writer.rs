@@ -126,6 +126,9 @@ pub struct MultiWriter {
 
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
+    /// The tree's clock, handed to every successor [`Writer`].
+    clock: Option<Arc<dyn crate::Clock>>,
+
     /// Resolved Page ECC scheme — preserved here so the rotation path
     /// can stamp the same scheme on every successor [`Writer`].
     ecc: Option<crate::table::block::EccParams>,
@@ -375,6 +378,7 @@ impl MultiWriter {
             prefix_extractor: None,
 
             encryption: None,
+            clock: None,
 
             ecc: None,
             sync_mode: SyncMode::Normal,
@@ -991,6 +995,15 @@ impl MultiWriter {
         self
     }
 
+    /// Reads the time on the tree's `clock` in every table written (see
+    /// [`Writer::use_clock`]).
+    #[must_use]
+    pub(crate) fn use_clock(mut self, clock: Option<Arc<dyn crate::Clock>>) -> Self {
+        self.clock.clone_from(&clock);
+        self.writer = self.writer.use_clock(clock);
+        self
+    }
+
     /// Wires the tree's `Config::page_ecc` flag through to the
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer stamps the same setting on its blocks.
@@ -1277,6 +1290,7 @@ impl MultiWriter {
 
         new_writer = new_writer.use_prefix_extractor(self.prefix_extractor.clone());
         new_writer = new_writer.use_encryption(self.encryption.clone());
+        new_writer = new_writer.use_clock(self.clock.clone());
         new_writer = new_writer.use_ecc(self.ecc);
         new_writer = new_writer
             .use_sync_mode(self.sync_mode)

@@ -130,6 +130,11 @@ pub struct SalvageOptions {
     /// polls [`RecoveryProgress::snapshot`](crate::RecoveryProgress::snapshot)
     /// from another thread.
     pub progress: Option<Arc<crate::RecoveryProgress>>,
+    /// The clock the recovered copy is stamped on, or `None` (the default) for
+    /// the process clock. [`crate::repair`] passes the tree's
+    /// [`Config::with_clock`](crate::Config::with_clock), so FIFO judges the
+    /// copy on the clock it judges every other table on.
+    pub clock: Option<Arc<dyn crate::Clock>>,
 }
 
 /// How a referencing SST's blob handles into ONE blob file must be rewritten
@@ -1175,7 +1180,9 @@ fn salvage_attempt(
     // names it only then: without one, the copy's filter indexes the keys
     // alone and a prefix scan reads the copy rather than trust it.
     .use_prefix_extractor(options.prefix_extractor.clone())
-    .use_encryption(options.encryption.clone());
+    .use_encryption(options.encryption.clone())
+    // Stamped fresh, on the tree's clock: the source's own age is not trusted.
+    .use_clock(options.clock.clone());
     // The writer MIRRORS the source's compression descriptor, so it must be
     // handed the dictionary that descriptor NAMES. The set answers first; the
     // caller's single slot answers only when it holds that same id, which is
@@ -2523,7 +2530,6 @@ fn salvage_blocks(
                                 // cannot take without repeating a tag is re-encoded
                                 // under a fresh one rather than dropped.
                                 let group_tag = sb.group.directory.group_tag();
-                                writer.start_group_tags_at(group_tag);
                                 let verbatim_source = if table.has_delete_bitmap_section()
                                     || rebuilt_by_suppression
                                     || !writer.accepts_group_tag(group_tag)
@@ -3174,6 +3180,9 @@ pub(crate) fn blob_key_regresses(
 /// dictionary was supplied, or when writing `dest` fails. Per-record
 /// corruption is not an error: such records are dropped and listed in the
 /// returned [`BlobSalvageReport`].
+///
+/// The recovered file is stamped on the process clock; [`crate::repair`]
+/// stamps it on the tree's.
 pub fn salvage_blob_file(
     source: &std::path::Path,
     dest: std::path::PathBuf,
@@ -3182,6 +3191,38 @@ pub fn salvage_blob_file(
     comparator: &crate::comparator::SharedComparator,
     live_data_start: u64,
     #[cfg(zstd_any)] zstd_dictionary: Option<&alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+) -> crate::Result<BlobSalvageReport> {
+    salvage_blob_file_on(
+        source,
+        dest,
+        fs,
+        blob_file_id,
+        comparator,
+        live_data_start,
+        #[cfg(zstd_any)]
+        zstd_dictionary,
+        None,
+    )
+}
+
+/// [`salvage_blob_file`], stamping the recovered file on `clock`, a tree's
+/// own, instead of the process clock.
+#[cfg_attr(
+    zstd_any,
+    expect(
+        clippy::too_many_arguments,
+        reason = "salvage_blob_file's inputs plus the clock"
+    )
+)]
+pub(crate) fn salvage_blob_file_on(
+    source: &std::path::Path,
+    dest: std::path::PathBuf,
+    fs: &alloc::sync::Arc<dyn crate::fs::Fs>,
+    blob_file_id: crate::vlog::BlobFileId,
+    comparator: &crate::comparator::SharedComparator,
+    live_data_start: u64,
+    #[cfg(zstd_any)] zstd_dictionary: Option<&alloc::sync::Arc<crate::compression::ZstdDictionary>>,
+    clock: Option<&alloc::sync::Arc<dyn crate::Clock>>,
 ) -> crate::Result<BlobSalvageReport> {
     use crate::vlog::blob_file::{scanner::Scanner, writer::Writer as BlobWriter};
     use alloc::format;
@@ -3268,7 +3309,8 @@ pub fn salvage_blob_file(
     let sync_mode = crate::fs::SyncMode::Full;
     let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?
         .use_sync_mode(sync_mode)
-        .use_compression(compression);
+        .use_compression(compression)
+        .use_clock(clock.cloned());
     // No device hint: salvage does not know the tree's groups, and the hint
     // only steers where the device places the bytes.
     writer.set_lifetime_class(lifetime_class, None);
