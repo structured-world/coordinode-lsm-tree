@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792096124414,
+  "lastUpdate": 1792103930270,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -43838,6 +43838,90 @@ window.BENCHMARK_DATA = {
             "value": 361928.49479706347,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.9us | P99.9: 87.1us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "50bc74dfcd2ee627a04da0e7b8896c650ed96423",
+          "message": "perf(table): resolve the file descriptor once per table lookup (#916)\n\n## Summary\n- A point lookup that reads several blocks of one table from the file\ntakes the table's descriptor from the descriptor cache once, not once\nper block: a cold read of filter, index and data makes one\ndescriptor-table access instead of three.\n\n## Changes\n- `LookupFd` (lookup-scoped, `core::cell::OnceCell`) resolves the\ndescriptor at the first block the lookup reads from the file and hands\nit to the rest; an untraced read still peeks without promoting, and the\n`table_file_opened_*` counters count the one access.\n- `get`, `get_value`, `get_with_block` and `batch_get` share it across\nthe filter check, the index walk (`next_with` on the volatile and\ntwo-level block index readers) and the data or row-group loads.\n- The chunked multi-get planner (`plan_block_tasks`) shares it across\nits filter checks and index walk, and hands back the file that slot\nresolved for the planned blocks, so a plan takes the descriptor once as\nwell.\n- A row-group read takes its file through the same slot, so a columnar\npoint read's key-page and row-page steps open the file once.\n- Reads of a single block on their own (scans, compaction, maintenance)\nkeep resolving per read.\n- Tests covering the hand-written `AnyTree` / `IterGuardImpl` dispatch\nand the ribbon serde paths from #915, which merged without them.\n\n## Testing\n- Tests count descriptor accesses for every lookup entry point and for\nthe block-task planner on monolithic, partitioned and columnar tables\nwith nothing cached.\n- fmt, clippy (default and all features), the full nextest suite, doc\ntests, rustdoc, the no-std check, sst-dump, db_bench and benches pass on\nLinux.\n- `db_bench readrandom`, five interleaved rounds, head vs main: cold (1M\nkeys, 1 MB cache, partitioned metadata) 162.6k vs 162.5k ops/s; fully\ncached (200k keys, 256 MB) 527k vs 520k ops/s.\n\nUpstream note on the same pattern: fjall-rs/lsm-tree#196.\n\nCloses #833",
+          "timestamp": "2026-10-16T01:26:11+03:00",
+          "tree_id": "8b0dc8030cc35741ea5d8a11a7c85d14001c7378",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/50bc74dfcd2ee627a04da0e7b8896c650ed96423"
+        },
+        "date": 1792103929117,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 134369.05316161088,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.7us | P99.9: 28.5us\nthreads: 1 | elapsed: 3.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2615935.4126592986,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 771324.684351378,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.3us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 520006.17143324256,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.6us | P99.9: 22.2us\nthreads: 1 | elapsed: 0.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2340067.036134391,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.7us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 259438.73970004692,
+            "unit": "ops/sec",
+            "extra": "P50: 3.3us | P99: 8.5us | P99.9: 18.2us\nthreads: 1 | elapsed: 0.77s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 142827.74605045075,
+            "unit": "ops/sec",
+            "extra": "P50: 6.2us | P99: 12.8us | P99.9: 32.8us\nthreads: 1 | elapsed: 1.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 745245.3458720167,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 748168.3090949932,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 364365.65872686385,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 11.9us | P99.9: 80.4us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
