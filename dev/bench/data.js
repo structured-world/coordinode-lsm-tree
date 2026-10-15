@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792103934049,
+  "lastUpdate": 1792103937664,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -45844,6 +45844,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.605926332,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "50bc74dfcd2ee627a04da0e7b8896c650ed96423",
+          "message": "perf(table): resolve the file descriptor once per table lookup (#916)\n\n## Summary\n- A point lookup that reads several blocks of one table from the file\ntakes the table's descriptor from the descriptor cache once, not once\nper block: a cold read of filter, index and data makes one\ndescriptor-table access instead of three.\n\n## Changes\n- `LookupFd` (lookup-scoped, `core::cell::OnceCell`) resolves the\ndescriptor at the first block the lookup reads from the file and hands\nit to the rest; an untraced read still peeks without promoting, and the\n`table_file_opened_*` counters count the one access.\n- `get`, `get_value`, `get_with_block` and `batch_get` share it across\nthe filter check, the index walk (`next_with` on the volatile and\ntwo-level block index readers) and the data or row-group loads.\n- The chunked multi-get planner (`plan_block_tasks`) shares it across\nits filter checks and index walk, and hands back the file that slot\nresolved for the planned blocks, so a plan takes the descriptor once as\nwell.\n- A row-group read takes its file through the same slot, so a columnar\npoint read's key-page and row-page steps open the file once.\n- Reads of a single block on their own (scans, compaction, maintenance)\nkeep resolving per read.\n- Tests covering the hand-written `AnyTree` / `IterGuardImpl` dispatch\nand the ribbon serde paths from #915, which merged without them.\n\n## Testing\n- Tests count descriptor accesses for every lookup entry point and for\nthe block-task planner on monolithic, partitioned and columnar tables\nwith nothing cached.\n- fmt, clippy (default and all features), the full nextest suite, doc\ntests, rustdoc, the no-std check, sst-dump, db_bench and benches pass on\nLinux.\n- `db_bench readrandom`, five interleaved rounds, head vs main: cold (1M\nkeys, 1 MB cache, partitioned metadata) 162.6k vs 162.5k ops/s; fully\ncached (200k keys, 256 MB) 527k vs 520k ops/s.\n\nUpstream note on the same pattern: fjall-rs/lsm-tree#196.\n\nCloses #833",
+          "timestamp": "2026-10-16T01:26:11+03:00",
+          "tree_id": "8b0dc8030cc35741ea5d8a11a7c85d14001c7378",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/50bc74dfcd2ee627a04da0e7b8896c650ed96423"
+        },
+        "date": 1792103936488,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 496.292,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.552286ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 128.212,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 53.455313ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 424.329,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.335299ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3730.858,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9342.767,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.743,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.769663,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.610879146,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.007,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 79.429631,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.599282044,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
