@@ -1,5 +1,7 @@
-# Hardening policy: every `uses:` ref is pinned to a full commit
-# SHA with an inline `# vX.Y.Z` comment; every `actions/checkout`
+# Hardening policy: a third-party `uses:` ref is pinned to a full
+# commit SHA with an inline `# vX.Y.Z` comment, and a GitHub-owned
+# one (`actions/*`, `github/*`, `dependabot/*`) tracks its major tag,
+# as `.github/zizmor.yml` declares; every `actions/checkout`
 # step sets `persist-credentials: false` unless a later step in
 # the same job legitimately runs `git push`. Disabled/reference
 # workflows live in `.github/disabled/`, not here, so audit

@@ -1,0 +1,55 @@
+name: CodeQL
+
+# A workflow rather than the default setup: a head Dependabot pushed runs with a
+# read-only token, and code scanning accepts results from such a run only on a
+# `pull_request` event. The default setup skips those heads, so the required
+# `Analyze (actions)` check never reported on a Dependabot pull request; this
+# workflow runs on `pull_request` and reports it there too.
+#
+# The run on a Dependabot update's squash merge keeps a writable token: the
+# auto-merge workflow arms the merge with the release App's token, so that push
+# is the App's, not Dependabot's, and the read-only restriction does not apply.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "17 4 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    # The ruleset requires this check by name. A pull request that edits this
+    # file runs its own version, as one editing the CI workflow does for
+    # `ci-passed`; a change to either is in the diff a maintainer merges.
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
