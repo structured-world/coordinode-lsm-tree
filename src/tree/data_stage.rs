@@ -38,7 +38,7 @@ pub(super) struct ChunkRead<'k, K> {
     hits: Vec<(usize, usize, InternalValue)>,
     /// The loads this chunk leads, by task index: published as each block is
     /// decoded, given up if the chunk ends before that.
-    leads: Vec<(usize, crate::cache::BlockLead)>,
+    leads: Vec<(usize, crate::cache::BlockLead<'k>)>,
     /// The lowest task whose block failed to decode, and why: held rather than
     /// returned, so reads still in flight are not abandoned, and the lowest
     /// wins as a decode in task order would.
@@ -62,7 +62,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
     /// of its table can have (refused before its buffer is allocated). A chunk
     /// that fails has asked for nothing.
     pub(super) fn start<'s>(
-        chunk: &[BlockTask<'_>],
+        chunk: &[BlockTask<'k>],
         cached: &[TaskBlock],
         keys: &'k [K],
         carried: &mut Option<ChunkFile>,

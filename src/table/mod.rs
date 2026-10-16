@@ -8095,7 +8095,7 @@ impl Table {
         handle: &BlockHandle,
         block_type: BlockType,
         lead: bool,
-    ) -> crate::cache::BlockClaim {
+    ) -> crate::cache::BlockClaim<'_> {
         let claim = self.cache.claim_batched_block(
             self.global_id(),
             handle.offset(),

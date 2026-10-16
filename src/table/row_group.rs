@@ -902,7 +902,7 @@ impl GroupRead<'_> {
         directory: &PageDirectory,
         directory_len: u32,
         pages: &mut [PageSlot],
-    ) -> Vec<(usize, crate::cache::BlockLead)> {
+    ) -> Vec<(usize, crate::cache::BlockLead<'_>)> {
         let mut leads = Vec::new();
         if !self.charge.touches_cache() {
             return leads;

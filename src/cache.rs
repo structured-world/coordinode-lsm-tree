@@ -183,15 +183,16 @@ pub struct Cache {
     /// The cold loads in flight, keyed like the entries they will fill, so
     /// readers that miss the same block or blob at once share one read and
     /// one decode. Only a miss consults it.
-    loads: alloc::sync::Arc<Loads>,
+    loads: Loads,
 }
 
 /// The registry of cold loads in flight.
 type Loads =
     crate::inflight::InflightLoads<CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>;
 
-/// The lead of one cold load.
-type LoadLead = crate::inflight::Lead<CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>;
+/// The lead of one cold load, borrowing the cache's registry.
+type LoadLead<'a> =
+    crate::inflight::Lead<'a, CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>;
 
 /// What a cold load reads, beyond its position: a waiter takes a load's
 /// result only when it asked for the same thing, so a request with another
@@ -217,10 +218,10 @@ pub enum LoadIdentity {
 
 /// How a read that needs a block's partial prefix grown proceeds.
 #[cfg(feature = "zstd")]
-pub enum GrowthClaim {
+pub enum GrowthClaim<'a> {
     /// No growth of the block runs: grow it, holding the lead until the
     /// grown prefix is cached.
-    Lead(GrowthLead),
+    Lead(GrowthLead<'a>),
     /// Another read grew the block while this one waited: look at the cached
     /// prefix again before growing anything.
     Waited,
@@ -231,15 +232,15 @@ pub enum GrowthClaim {
 /// The lead of a partial prefix's growth. Dropping it, after the grown prefix
 /// is cached or on any failure, lets the reads waiting on it look again.
 #[cfg(feature = "zstd")]
-pub struct GrowthLead(
-    #[expect(dead_code, reason = "held for its drop, which releases the waiters")] LoadLead,
+pub struct GrowthLead<'a>(
+    #[expect(dead_code, reason = "held for its drop, which releases the waiters")] LoadLead<'a>,
 );
 
 /// How a block miss proceeds: lead the load, take a concurrent one's block,
 /// or load alone.
-pub enum BlockClaim {
+pub enum BlockClaim<'a> {
     /// No load of the block is in flight: read it, then [`BlockLead::publish`].
-    Lead(BlockLead),
+    Lead(BlockLead<'a>),
     /// A load of the block finished while this request waited for it.
     Shared(Block),
     /// Read the block without coordination: the registry is full, an
@@ -251,9 +252,9 @@ pub enum BlockClaim {
 /// The lead of a block load. Dropping it unpublished (an error or an unwind)
 /// releases its waiters to read on their own. A batched read's lead also
 /// keeps its thread from waiting on other loads while it lives.
-pub struct BlockLead(LoadLead, Option<crate::inflight::BatchToken>);
+pub struct BlockLead<'a>(LoadLead<'a>, Option<crate::inflight::BatchToken>);
 
-impl BlockLead {
+impl BlockLead<'_> {
     /// Hands the loaded block to the waiters, if any; insert it into the
     /// cache first, so a miss after this sees it there.
     pub(crate) fn publish(self, block: &Block) {
@@ -265,9 +266,9 @@ impl BlockLead {
 /// How a miss of a row group's decoded directory proceeds, as [`BlockClaim`]
 /// for a block.
 #[cfg(feature = "columnar")]
-pub enum DirectoryClaim {
+pub enum DirectoryClaim<'a> {
     /// Read the directory, then [`DirectoryLead::publish`] it.
-    Lead(DirectoryLead),
+    Lead(DirectoryLead<'a>),
     /// A concurrent read of the group's directory finished: the directory
     /// and its block's on-disk length.
     Shared(
@@ -280,10 +281,10 @@ pub enum DirectoryClaim {
 
 /// The lead of a directory load, as [`BlockLead`] for a block.
 #[cfg(feature = "columnar")]
-pub struct DirectoryLead(LoadLead);
+pub struct DirectoryLead<'a>(LoadLead<'a>);
 
 #[cfg(feature = "columnar")]
-impl DirectoryLead {
+impl DirectoryLead<'_> {
     /// Hands the decoded directory and its block's on-disk length to the
     /// waiters; cache it first, so a miss after this sees it there.
     pub(crate) fn publish(
@@ -297,9 +298,9 @@ impl DirectoryLead {
 }
 
 /// How a blob miss proceeds, as [`BlockClaim`] for a block.
-pub enum BlobClaim {
+pub enum BlobClaim<'a> {
     /// Read the value, then [`BlobLead::publish`].
-    Lead(BlobLead),
+    Lead(BlobLead<'a>),
     /// A concurrent read of the same record, for the same key, finished.
     Shared(UserValue),
     /// Read the value without coordination.
@@ -307,9 +308,9 @@ pub enum BlobClaim {
 }
 
 /// The lead of a blob load, as [`BlockLead`] for a block.
-pub struct BlobLead(LoadLead);
+pub struct BlobLead<'a>(LoadLead<'a>);
 
-impl BlobLead {
+impl BlobLead<'_> {
     /// Hands the value read for `user_key` to the waiters, caching it first
     /// when `fill` says so. Returns the bytes copied to own the key, which the
     /// cache entry and the waiters share: none when the value is neither
@@ -371,11 +372,11 @@ impl Cache {
             ),
             row_cache_enabled: true,
             metadata_priority: true,
-            loads: alloc::sync::Arc::new(crate::inflight::InflightLoads::new(
+            loads: crate::inflight::InflightLoads::new(
                 LOAD_SHARDS,
                 LOADS_PER_SHARD,
                 rustc_hash::FxBuildHasher,
-            )),
+            ),
         }
     }
 
@@ -394,7 +395,7 @@ impl Cache {
         id: GlobalTableId,
         offset: BlockOffset,
         identity: LoadIdentity,
-    ) -> BlockClaim {
+    ) -> BlockClaim<'_> {
         let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         match self.loads.claim(key, identity) {
             crate::inflight::Claim::Lead(lead) => BlockClaim::Lead(BlockLead(lead, None)),
@@ -428,7 +429,7 @@ impl Cache {
         offset: BlockOffset,
         identity: LoadIdentity,
         lead: bool,
-    ) -> BlockClaim {
+    ) -> BlockClaim<'_> {
         let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         if !(lead && crate::inflight::batches_may_lead()) {
             return match self.loads.take_ready(&key, &identity) {
@@ -458,7 +459,7 @@ impl Cache {
         id: GlobalTableId,
         offset: BlockOffset,
         identity: LoadIdentity,
-    ) -> DirectoryClaim {
+    ) -> DirectoryClaim<'_> {
         let key: CacheKey = (TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into();
         match self.loads.claim(key, identity) {
             crate::inflight::Claim::Lead(lead) => DirectoryClaim::Lead(DirectoryLead(lead)),
@@ -498,7 +499,7 @@ impl Cache {
         vlog_id: crate::TreeId,
         vhandle: &crate::vlog::ValueHandle,
         user_key: &[u8],
-    ) -> BlobClaim {
+    ) -> BlobClaim<'_> {
         let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
         let identity = LoadIdentity::Blob {
             on_disk_size: vhandle.on_disk_size,
@@ -734,7 +735,7 @@ impl Cache {
         &self,
         id: GlobalTableId,
         offset: BlockOffset,
-    ) -> GrowthClaim {
+    ) -> GrowthClaim<'_> {
         let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         match self.loads.claim(key, LoadIdentity::PartialGrowth) {
             crate::inflight::Claim::Lead(lead) => GrowthClaim::Lead(GrowthLead(lead)),

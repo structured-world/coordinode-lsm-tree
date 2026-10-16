@@ -277,14 +277,14 @@ pub struct InflightLoads<K, V, I, S> {
 }
 
 /// What a cache miss does about its load.
-pub enum Claim<K, V, I, S>
+pub enum Claim<'a, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
 {
     /// No load of this object is in flight: this request does it and must
     /// [`Lead::publish`] the result (dropping the lead abandons it).
-    Lead(Lead<K, V, I, S>),
+    Lead(Lead<'a, K, V, I, S>),
     /// A compatible load is in flight: [`Join::wait`] for it.
     Join(Join<V, I>),
     /// Load alone: an incompatible load of the key is in flight, or the
@@ -296,14 +296,15 @@ where
 /// [`Self::publish`], or as abandoned when dropped without it, which covers
 /// every error return and an unwind.
 ///
-/// Holds the registry rather than borrowing it, so a load handed to another
-/// stage (a batched read completing later) carries its lead along.
-pub struct Lead<K, V, I, S>
+/// Borrows the registry rather than sharing ownership of it: every reader on
+/// every core leads loads, and a reference count on the registry would be one
+/// cache line they all write.
+pub struct Lead<'a, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
 {
-    loads: Arc<InflightLoads<K, V, I, S>>,
+    loads: &'a InflightLoads<K, V, I, S>,
     key: K,
     /// Present until the lead finishes, publishing or dropped.
     ticket: Option<Arc<Ticket<V, I>>>,
@@ -328,7 +329,7 @@ impl<V: Clone, I> Join<V, I> {
     }
 }
 
-impl<K, V, I, S> Lead<K, V, I, S>
+impl<K, V, I, S> Lead<'_, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     V: Clone,
@@ -359,7 +360,7 @@ where
     }
 }
 
-impl<K, V, I, S> Drop for Lead<K, V, I, S>
+impl<K, V, I, S> Drop for Lead<'_, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
@@ -371,7 +372,7 @@ where
     }
 }
 
-impl<K, V, I, S> Lead<K, V, I, S>
+impl<K, V, I, S> Lead<'_, K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
@@ -420,7 +421,7 @@ where
     /// just missed the cache; a leader checks it once more before loading,
     /// since a load that closed between that miss and this claim has already
     /// put its result there.
-    pub fn claim(self: &Arc<Self>, key: K, identity: I) -> Claim<K, V, I, S> {
+    pub fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
         let mut shard = self.shard(&key).lock();
         if let Some(ticket) = shard.loads.get(&key) {
             return if ticket.identity == identity {
@@ -449,7 +450,7 @@ where
         shard.loads.insert(key.clone(), Arc::clone(&ticket));
         drop(shard);
         Claim::Lead(Lead {
-            loads: Arc::clone(self),
+            loads: self,
             key,
             ticket: Some(ticket),
         })

@@ -61,7 +61,7 @@ pub struct StagedRead<'t> {
     held: Vec<(u64, Block)>,
     /// The loads of needed blocks this read leads, by offset: published as
     /// each block is supplied, given up when the read ends before that.
-    leads: Vec<(u64, crate::cache::BlockLead)>,
+    leads: Vec<(u64, crate::cache::BlockLead<'t>)>,
     /// Whether this read may lead the loads of the blocks it needs: only when
     /// its driver completes the reads itself.
     lead_loads: bool,
