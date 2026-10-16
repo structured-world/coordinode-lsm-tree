@@ -350,8 +350,11 @@ const LOAD_SHARDS: usize = BLOCK_CACHE_SHARDS;
 const LOADS_PER_SHARD: usize = 64;
 /// How long cold loads must take before concurrent misses of one object wait
 /// for a single load instead of each loading it (see
-/// [`Cache::with_load_coalescing_after`]).
-const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(8);
+/// [`Cache::with_load_coalescing_after`]). Loads served from the page cache
+/// take a few microseconds for a block and tens for a whole column row group,
+/// and waiting on another reader there loses to loading alone; this sits
+/// above them and below a read that reaches a device or the network.
+const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(64);
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
 /// on many-core hosts while the lock array stays small; reads take a shared lock
