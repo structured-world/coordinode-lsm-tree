@@ -54,7 +54,7 @@ const ATTEST_LEN: usize = 1 + 8 + 16 + 16;
 
 /// The attestation sits next to the SST with a `.heal-attest` suffix APPENDED
 /// (not a replaced extension), so it never collides with the SST's own name.
-fn attest_path(table_path: &Path) -> PathBuf {
+pub fn attest_path(table_path: &Path) -> PathBuf {
     let mut name = table_path.as_os_str().to_os_string();
     name.push(".heal-attest");
     PathBuf::from(name)

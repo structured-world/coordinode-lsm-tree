@@ -155,13 +155,13 @@ pub struct TreeInner {
     /// `acquire_directory_lock`). Dropping it on tree close releases the OS
     /// advisory lock so another process can open the directory. `None` when the
     /// lock is disabled via
-    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock). The
-    /// field is never read directly (the `_` prefix marks it as a lifetime
-    /// guard); its sole job is to keep the lock held.
+    /// [`Config::with_directory_lock`](crate::Config::with_directory_lock). Its
+    /// sole job is to keep the lock held. Shared: a pin holds it too, so the
+    /// folder stays locked while a pin lists its files, after the tree drops.
     // std-only: cross-process file locking needs real OS files; a no_std build
     // is single-context and has nothing to guard against.
     #[cfg(feature = "std")]
-    pub(crate) _directory_lock: Option<Box<dyn crate::fs::FsFile>>,
+    pub(crate) directory_lock: Option<Arc<dyn crate::fs::FsFile>>,
 
     /// Tree-wide gate that defers SST / blob-file deletions while a
     /// [`Tree::create_checkpoint`](crate::AbstractTree::create_checkpoint) is in
@@ -389,7 +389,7 @@ impl TreeInner {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
-            _directory_lock: directory_lock,
+            directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: DeletionPause::new_shared(),
             #[cfg(feature = "std")]

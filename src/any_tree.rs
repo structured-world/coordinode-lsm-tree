@@ -235,6 +235,12 @@ impl AbstractTree for AnyTree {
         forward!(self.create_checkpoint(target_path))
     }
 
+    #[cfg(feature = "std")]
+    #[inline]
+    fn pin(&self) -> crate::PinnedVersion {
+        forward!(self.pin())
+    }
+
     #[inline]
     fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()> {
         forward!(self.flush_active_memtable(gc_watermark))

@@ -539,6 +539,11 @@ impl AbstractTree for Tree {
         )
     }
 
+    #[cfg(feature = "std")]
+    fn pin(&self) -> crate::PinnedVersion {
+        crate::PinnedVersion::take(self)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         let super_version = self.version_history.read().latest_version();
 
@@ -1398,36 +1403,8 @@ impl AbstractTree for Tree {
             .clone()
     }
 
-    #[expect(clippy::significant_drop_tightening)]
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
-        let mut version_history_lock = self.version_history.write();
-        let super_version = version_history_lock.latest_version();
-
-        if super_version.active_memtable.is_empty() {
-            return None;
-        }
-
-        let yanked_memtable = super_version.active_memtable;
-
-        let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(
-            self.memtable_id_counter.next(),
-            self.config.comparator.clone(),
-        ));
-        copy.sealed_memtables =
-            Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
-
-        // Rotate does not modify the memtable so it cannot break snapshots
-        copy.seqno = super_version.seqno;
-
-        version_history_lock.replace_latest_version(copy);
-
-        log::trace!(
-            "rotate: added memtable id={} to sealed memtables",
-            yanked_memtable.id,
-        );
-
-        Some(yanked_memtable)
+        self.rotate_memtable_locked(&mut self.version_history.write())
     }
 
     fn table_count(&self) -> usize {
@@ -2312,6 +2289,16 @@ impl Tree {
             // simply be run again, so waiting for the next pass costs nothing
             // and leaves no queued action to fire against a re-registered file.
             if self.deletion_pause.is_active() {
+                continue;
+            }
+            // A pin lists the dictionary for its copy: skipped the same way,
+            // and the next pass after the pin drops removes it. Pins register
+            // under the version lock held here, so none can slip in between.
+            #[cfg(feature = "std")]
+            if self
+                .deletion_pause
+                .is_pinned(&crate::dicts::path_of(&folder, id))
+            {
                 continue;
             }
             crate::dicts::remove(&*self.config.fs, &folder, id, self.config.sync_mode)?;
@@ -4500,7 +4487,14 @@ impl Tree {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
-    pub(crate) fn open(config: Config) -> crate::Result<Self> {
+    ///
+    /// `lock` says how the open comes by the directory lock: a caller that
+    /// wrote the tree's files under it passes it in, so no other opener gets
+    /// in between.
+    pub(crate) fn open(
+        config: Config,
+        #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
+    ) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
         // Resolve the per-tree compaction compression pool once, at open: if the
@@ -4553,10 +4547,38 @@ impl Tree {
         // (idempotent; `create_new` re-creates the `tables/` subtree). The lock
         // is threaded into the constructor so it lives for the tree's lifetime.
         #[cfg(feature = "std")]
-        let directory_lock = {
-            config.fs.create_dir_all(&config.path)?;
-            crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?
+        let restoring = matches!(lock, crate::config::DirectoryLock::Held(_));
+        #[cfg(feature = "std")]
+        let directory_lock = match lock {
+            crate::config::DirectoryLock::Held(held) => held,
+            crate::config::DirectoryLock::Acquire => {
+                config.fs.create_dir_all(&config.path)?;
+                crate::config::acquire_directory_lock(
+                    &*config.fs,
+                    &config.path,
+                    config.directory_lock,
+                )?
+            }
         };
+
+        // A restore that published the manifest but never made the restored
+        // memtable contents durable left a tree that lacks them: serving it
+        // would answer from a partial snapshot. Only the restore that finishes
+        // the job opens it.
+        #[cfg(feature = "std")]
+        if !restoring
+            && config
+                .fs
+                .exists(&config.path.join(crate::file::RESTORE_MARKER_FILE))?
+        {
+            return Err(crate::Error::from(crate::io::Error::new(
+                crate::io::ErrorKind::InvalidData,
+                format!(
+                    "{} holds an interrupted restore; run restore_pinned again to finish it",
+                    config.path.display(),
+                ),
+            )));
+        }
 
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
@@ -5145,6 +5167,41 @@ impl Tree {
         ))
     }
 
+    /// Seals the active memtable under the held version lock, returning it,
+    /// or `None` when it is empty.
+    pub(crate) fn rotate_memtable_locked(
+        &self,
+        history: &mut crate::version::SuperVersions,
+    ) -> Option<Arc<Memtable>> {
+        let super_version = history.latest_version_ref();
+
+        if super_version.active_memtable.is_empty() {
+            return None;
+        }
+
+        let yanked_memtable = Arc::clone(&super_version.active_memtable);
+
+        let mut copy = super_version.clone();
+        copy.active_memtable = Arc::new(Memtable::new(
+            self.memtable_id_counter.next(),
+            self.config.comparator.clone(),
+        ));
+        copy.sealed_memtables =
+            Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
+
+        // Rotate does not modify the memtable so it cannot break snapshots
+        copy.seqno = super_version.seqno;
+
+        history.replace_latest_version(copy);
+
+        log::trace!(
+            "rotate: added memtable id={} to sealed memtables",
+            yanked_memtable.id,
+        );
+
+        Some(yanked_memtable)
+    }
+
     /// Adds an item to the active memtable.
     ///
     /// Returns the added item's size and new size of the memtable.
@@ -5295,7 +5352,7 @@ impl Tree {
         mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
         // manifest probe; held for the tree's lifetime via
-        // `TreeInner::_directory_lock`.
+        // `TreeInner::directory_lock`.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> crate::Result<Self> {
         use crate::stop_signal::StopSignal;
@@ -5465,7 +5522,7 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
-            _directory_lock: directory_lock,
+            directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
             #[cfg(feature = "std")]

@@ -327,13 +327,30 @@ impl Drop for Inner {
         if self.is_deleted.load(core::sync::atomic::Ordering::Acquire) {
             log::trace!("Cleanup deleted table {global_id:?} at {:?}", self.path);
 
+            // A pin may list the file through another view of it (the one
+            // before a tight-space restriction): it stays, with its sidecars,
+            // until that pin drops. The pin's consumer reads the heal
+            // attestation beside the table.
+            #[cfg(feature = "std")]
+            let pinned = self.deletion_pause.get().is_some_and(|pause| {
+                pause.defer_removal_if_pinned(
+                    &self.fs,
+                    &self.path,
+                    crate::deletion_pause::PinnedKind::Table,
+                )
+            });
+            #[cfg(not(feature = "std"))]
+            let pinned = false;
+
             // Reclaim any pending `.heal-attest` sidecar: a retired table can
             // never be reconciled, so its attestation is dead weight. Done here
             // (before the deferred / background unlink paths return) so every
             // deletion route reclaims it. Best-effort: a missing sidecar (the
             // common case) is a no-op, and the recovery scan sweeps any straggler.
             #[cfg(feature = "std")]
-            crate::scrub::heal_attest::remove(&*self.fs, &self.path);
+            if !pinned {
+                crate::scrub::heal_attest::remove(&*self.fs, &self.path);
+            }
 
             // Reclaim any `.restrict-bound` sidecar the same way: a retired table's
             // tight-space restriction bound is dead weight, and left behind it would
@@ -343,7 +360,9 @@ impl Drop for Inner {
             // already linked its OWN copy of the sidecar, so removing this original is
             // safe even on the deferred-deletion (checkpoint-active) branch below.
             #[cfg(feature = "std")]
-            crate::restrict_bound::remove(&*self.fs, &self.path, crate::fs::SyncMode::Normal);
+            if !pinned {
+                crate::restrict_bound::remove(&*self.fs, &self.path, crate::fs::SyncMode::Normal);
+            }
 
             // Move the accessor and block index out so all file handles
             // (including clones held by the block index) are closed before
@@ -361,6 +380,10 @@ impl Drop for Inner {
             // Drop the accessor and block index (releases all Arc<dyn FsFile>).
             drop(file_accessor);
             drop(block_index);
+
+            if pinned {
+                return;
+            }
 
             // If a checkpoint is active, defer the physical deletion so the
             // file remains hard-linkable until the checkpoint releases its
@@ -497,6 +520,20 @@ impl Drop for Inner {
                 );
                 return;
             }
+
+            // A pinned file keeps its bytes until its last pin drops, which
+            // retries the retained reclaim; a pin being taken waits for this
+            // punch to finish.
+            #[cfg(feature = "std")]
+            let _unpinned = if let Some(pause) = self.deletion_pause.get() {
+                let Some(guard) = pause.begin_mutation(&self.path) else {
+                    pause.retain_reclaim(Arc::clone(&self.fs), (*self.path).clone(), reclaimable);
+                    return;
+                };
+                Some(guard)
+            } else {
+                None
+            };
 
             // Reclaim only what this tree exclusively owns. A completed
             // checkpoint hard-links SST files, and its captured manifest still
