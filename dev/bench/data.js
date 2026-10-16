@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792140911418,
+  "lastUpdate": 1792140915332,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -47884,6 +47884,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.599096759,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "89f12d2294f7c8f5cd9b32ed79f2c3d5a024f010",
+          "message": "feat(tree): pin a version for a point-in-time copy without file I/O (#918)\n\n## Summary\n\n- `AbstractTree::pin` takes a point-in-time view of a tree with no file\nI/O: it seals the active memtable and holds the tables, blob files and\ndictionaries in place, so a consumer (a Raft snapshot sent to a lagging\nfollower) can stream them at its own pace instead of paying a clone and\nan fsync per file.\n- `Config::restore_pinned` rebuilds the tree on the receiving side from\nthe streamed files, the pin's layout and its memtable contents. It takes\nthe directory lock before any write and holds it into the open, refuses\na folder that already holds a tree, keeps a `restoring` marker in the\nfolder until the restored memtable contents are durable (an ordinary\nopen refuses such a folder, a new restore finishes it), and raises the\nconfig's sequence counters so later writes land above the restored data.\n\n## Changes\n\n- `PinnedVersion`: the pinned files (`tables`, `blob_files`,\n`dictionaries`, each with id, level, path, size, open, and a table's\nheal attestation), `layout` (the version descriptor and the pin's seqno,\nserialized in memory, sealed with the tree's provider),\n`memtable_entries` and `memtable_range_tombstones` below the pin's\n`seqno`.\n- The deletion gate keeps a registry of pinned files. Until the last pin\nlisting a file drops, its removal after supersession (with a table's\nsidecars), a tight-space prefix punch and an in-place heal wait; a heal\npatrol scans a pinned table read-only. Taking a pin waits for a heal or\npunch already under way, so the captured bytes are stable, and runs no\ndeferred work itself.\n- A pin holds the source tree's directory lock, so the folder stays\nlocked while the pin lives, even after the tree drops; a removal\nreleased by a pin while a checkpoint is open goes to the checkpoint's\nqueue.\n- Dictionary collection skips a pinned dictionary.\n- The version lock is held only to seal, capture and register\ndictionaries; tables and blob files are registered after it is released.\n\n## Testing\n\nfmt, clippy (default and all features), the full nextest suite in both\nfeature sets, doc tests, the doc build, the no-std check, sst-dump and\ndb_bench pass on Linux.\n\nCloses #837\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added point-in-time snapshots of tree versions, including their files,\nentries, and range tombstones.\n* Added support for restoring a tree from a snapshot, including regular\nand blob trees.\n* Pinned files remain available and unchanged until all snapshots\nreferencing them are released.\n\n* **Bug Fixes**\n* Interrupted restores are protected from ordinary opens, and\nrestoration can be retried.\n* File cleanup and in-place healing now wait when affected files are\npinned.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T08:42:12Z",
+          "tree_id": "7376192a5512bb533ed387120731ad2b28e82cbc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/89f12d2294f7c8f5cd9b32ed79f2c3d5a024f010"
+        },
+        "date": 1792140914140,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 531.723,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 77.797384ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 123.869,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.624889ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 459.524,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 101.573679ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3600.886,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9303.146,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.303,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 87.425023,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.623911586,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.567,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 77.987839,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.611532341,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
