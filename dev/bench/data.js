@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792110650038,
+  "lastUpdate": 1792140907394,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -45698,6 +45698,90 @@ window.BENCHMARK_DATA = {
             "value": 361975.9437846292,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 12.0us | P99.9: 80.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "89f12d2294f7c8f5cd9b32ed79f2c3d5a024f010",
+          "message": "feat(tree): pin a version for a point-in-time copy without file I/O (#918)\n\n## Summary\n\n- `AbstractTree::pin` takes a point-in-time view of a tree with no file\nI/O: it seals the active memtable and holds the tables, blob files and\ndictionaries in place, so a consumer (a Raft snapshot sent to a lagging\nfollower) can stream them at its own pace instead of paying a clone and\nan fsync per file.\n- `Config::restore_pinned` rebuilds the tree on the receiving side from\nthe streamed files, the pin's layout and its memtable contents. It takes\nthe directory lock before any write and holds it into the open, refuses\na folder that already holds a tree, keeps a `restoring` marker in the\nfolder until the restored memtable contents are durable (an ordinary\nopen refuses such a folder, a new restore finishes it), and raises the\nconfig's sequence counters so later writes land above the restored data.\n\n## Changes\n\n- `PinnedVersion`: the pinned files (`tables`, `blob_files`,\n`dictionaries`, each with id, level, path, size, open, and a table's\nheal attestation), `layout` (the version descriptor and the pin's seqno,\nserialized in memory, sealed with the tree's provider),\n`memtable_entries` and `memtable_range_tombstones` below the pin's\n`seqno`.\n- The deletion gate keeps a registry of pinned files. Until the last pin\nlisting a file drops, its removal after supersession (with a table's\nsidecars), a tight-space prefix punch and an in-place heal wait; a heal\npatrol scans a pinned table read-only. Taking a pin waits for a heal or\npunch already under way, so the captured bytes are stable, and runs no\ndeferred work itself.\n- A pin holds the source tree's directory lock, so the folder stays\nlocked while the pin lives, even after the tree drops; a removal\nreleased by a pin while a checkpoint is open goes to the checkpoint's\nqueue.\n- Dictionary collection skips a pinned dictionary.\n- The version lock is held only to seal, capture and register\ndictionaries; tables and blob files are registered after it is released.\n\n## Testing\n\nfmt, clippy (default and all features), the full nextest suite in both\nfeature sets, doc tests, the doc build, the no-std check, sst-dump and\ndb_bench pass on Linux.\n\nCloses #837\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added point-in-time snapshots of tree versions, including their files,\nentries, and range tombstones.\n* Added support for restoring a tree from a snapshot, including regular\nand blob trees.\n* Pinned files remain available and unchanged until all snapshots\nreferencing them are released.\n\n* **Bug Fixes**\n* Interrupted restores are protected from ordinary opens, and\nrestoration can be retried.\n* File cleanup and in-place healing now wait when affected files are\npinned.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T08:42:12Z",
+          "tree_id": "7376192a5512bb533ed387120731ad2b28e82cbc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/89f12d2294f7c8f5cd9b32ed79f2c3d5a024f010"
+        },
+        "date": 1792140906087,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 128547.7839215851,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 19.2us | P99.9: 37.8us\nthreads: 1 | elapsed: 4.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2556021.4074972146,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 744187.5030423315,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 488017.3286559507,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.6us | P99.9: 23.2us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2288764.8561438047,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 7.4us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 263305.2088043548,
+            "unit": "ops/sec",
+            "extra": "P50: 3.2us | P99: 8.5us | P99.9: 21.5us\nthreads: 1 | elapsed: 0.76s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 137668.53391386446,
+            "unit": "ops/sec",
+            "extra": "P50: 6.5us | P99: 14.1us | P99.9: 33.3us\nthreads: 1 | elapsed: 1.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 747043.5025021064,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.4us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 729656.7094331355,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 329438.3350315687,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.3us | P99.9: 85.6us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
