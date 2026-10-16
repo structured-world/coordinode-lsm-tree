@@ -1310,6 +1310,16 @@ impl Config {
 )]
 pub(crate) const DIRECTORY_LOCK_FILE: &str = "LOCK";
 
+/// How an open comes by the directory lock.
+#[cfg(feature = "std")]
+pub(crate) enum DirectoryLock {
+    /// The open takes it.
+    Acquire,
+    /// The caller already holds it (`None` when the config disables the lock),
+    /// having written the tree's files under it.
+    Held(Option<Box<dyn crate::fs::FsFile>>),
+}
+
 /// Acquires the cross-process exclusive directory lock when `enabled`.
 ///
 /// Opens (creating if absent) a `LOCK` file under `dir` and takes a
@@ -1411,6 +1421,17 @@ impl Config {
     /// the compression policy references a `dict_id` that doesn't match the
     /// configured dictionary.
     pub fn open(self) -> crate::Result<AnyTree> {
+        self.open_with(
+            #[cfg(feature = "std")]
+            DirectoryLock::Acquire,
+        )
+    }
+
+    /// [`Self::open`], coming by the directory lock as `lock` says.
+    pub(crate) fn open_with(
+        self,
+        #[cfg(feature = "std")] lock: DirectoryLock,
+    ) -> crate::Result<AnyTree> {
         // The dictionary registry is loaded and the compression policy validated
         // inside `Tree::open`, under the directory lock — NOT here. Both read the
         // tree's `dicts/` folder, and the load SWEEPS unpublished temps; doing
@@ -1435,9 +1456,17 @@ impl Config {
         }
 
         Ok(if self.kv_separation_opts.is_some() {
-            AnyTree::Blob(BlobTree::open(self)?)
+            AnyTree::Blob(BlobTree::open(
+                self,
+                #[cfg(feature = "std")]
+                lock,
+            )?)
         } else {
-            AnyTree::Standard(Tree::open(self)?)
+            AnyTree::Standard(Tree::open(
+                self,
+                #[cfg(feature = "std")]
+                lock,
+            )?)
         })
     }
 
@@ -1455,19 +1484,25 @@ impl Config {
     /// [`memtable_entries`](crate::PinnedVersion::memtable_entries) and
     /// [`memtable_range_tombstones`](crate::PinnedVersion::memtable_range_tombstones).
     ///
-    /// The files are synced and the layout published as the tree's manifest,
-    /// then the memtable contents are written with their sequence numbers and
-    /// flushed. The returned tree reads as the source did at the pin, for every
-    /// key and every snapshot the source served then. The config must match the
+    /// The directory lock is taken first and held into the open, so no other
+    /// opener sees the folder half restored. The files are synced and the
+    /// layout published as the tree's manifest, then the memtable contents are
+    /// written with their sequence numbers and flushed. The returned tree reads
+    /// as the source did at the pin, for every key and every snapshot the
+    /// source served then. The config's sequence number counters are raised to
+    /// the pin's seqno (and the seqno counter past every restored version), so
+    /// later writes land above the restored data. The config must match the
     /// source's where it shapes the files: the tree type, comparator,
     /// encryption provider and dictionaries.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidHeader`](crate::Error::InvalidHeader) for a layout too
-    /// short to hold its version id; otherwise the failures of the syncs, the
-    /// manifest write, [`Self::open`] and the flush. A `v{id}` already in the
-    /// folder is refused rather than overwritten.
+    /// short to hold its header; [`Error::Locked`](crate::Error::Locked) when
+    /// another instance holds the folder; an `AlreadyExists` I/O error, before
+    /// anything is written, when the folder already holds a tree (a `current`
+    /// pointer or a manifest file); otherwise the failures of the syncs, the
+    /// manifest write, [`Self::open`] and the flush.
     #[cfg(feature = "std")]
     pub fn restore_pinned(
         self,

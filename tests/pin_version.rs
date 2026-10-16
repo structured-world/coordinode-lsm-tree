@@ -293,6 +293,83 @@ fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
     restore_matches_the_source(true)
 }
 
+/// A restore never publishes over a tree already in the target folder, closed
+/// or open: it refuses before writing anything, and that tree stays as it was.
+#[test]
+fn restore_refuses_a_folder_holding_a_tree() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    let layout = pin.layout()?;
+
+    {
+        let existing = open(dst.path(), false, &SequenceNumberCounter::default())?;
+        existing.insert("own", "kept", 0);
+        existing.flush_active_memtable(0)?;
+    }
+    let restore = || {
+        Config::new(
+            dst.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(&layout, [], [])
+    };
+    assert!(restore().is_err(), "a closed tree is refused");
+    let existing = open(dst.path(), false, &SequenceNumberCounter::default())?;
+    assert_eq!(
+        existing.get("own", SeqNo::MAX)?.as_deref(),
+        Some(&b"kept"[..])
+    );
+
+    let current = std::fs::read(dst.path().join("current"))?;
+    assert!(restore().is_err(), "an open tree is refused");
+    assert_eq!(
+        std::fs::read(dst.path().join("current"))?,
+        current,
+        "the open tree's pointer is untouched"
+    );
+    Ok(())
+}
+
+/// A write made on the restored tree with its own counters lands above every
+/// restored version, and reads back.
+#[test]
+fn restored_tree_writes_above_the_restored_data() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+
+    let seqno = SequenceNumberCounter::default();
+    let restored_visible = SequenceNumberCounter::default();
+    let restored = Config::new(dst.path(), seqno.clone(), restored_visible.clone())
+        .restore_pinned(
+            &pin.layout()?,
+            pin.memtable_entries(),
+            pin.memtable_range_tombstones(),
+        )?;
+    assert!(
+        restored_visible.get() >= pin.seqno(),
+        "the restored writes are published"
+    );
+
+    let at = seqno.next();
+    restored.insert("k01", "after", at);
+    restored_visible.fetch_max(at + 1);
+    assert_eq!(
+        restored.get("k01", SeqNo::MAX)?.as_deref(),
+        Some(&b"after"[..])
+    );
+    Ok(())
+}
+
 /// Pins release independently: a file stays while any pin listing it lives.
 #[test]
 fn concurrent_pins_release_independently() -> lsm_tree::Result<()> {

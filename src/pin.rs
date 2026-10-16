@@ -280,7 +280,10 @@ impl PinnedVersion {
             .encode_into(&mut writer, &self.comparator_name)?;
         writer.finish()?;
 
+        // The pin's seqno rides along: the restored tree's counters start at
+        // it, so a later write there lands above what the pin served.
         let mut layout = self.version.id().to_le_bytes().to_vec();
+        layout.extend_from_slice(&self.seqno.to_le_bytes());
         fs.open(path, &FsOpenOptions::new().read(true))?
             .read_to_end(&mut layout)?;
         Ok(layout)
@@ -346,19 +349,46 @@ pub fn restore(
     use crate::file::{BLOBS_FOLDER, DICTS_FOLDER, TABLES_FOLDER, fsync_directory};
     use std::io::Write;
 
-    let (id, manifest) = layout
+    let (id, rest) = layout
+        .split_first_chunk::<8>()
+        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
+    let (pin_seqno, manifest) = rest
         .split_first_chunk::<8>()
         .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
     let version_id = u64::from_le_bytes(*id);
+    let pin_seqno = u64::from_le_bytes(*pin_seqno);
 
     let fs = Arc::clone(&config.fs);
     let root = config.path.clone();
     let sync_mode = config.sync_mode;
     let runtime = Arc::new(config.initial_runtime_config.clone());
 
+    // Exclusive from the first write to the open: no other opener may see the
+    // folder before the memtable contents are in.
+    fs.create_dir_all(&root)?;
+    let lock = crate::config::acquire_directory_lock(&*fs, &root, config.directory_lock)?;
+    // Never publish over a tree that is already there: its open would sweep
+    // that tree's manifest and tables as orphans of the restored layout.
+    for entry in fs.read_dir(&root)? {
+        let name = &entry.file_name;
+        let manifest_file = name == crate::file::CURRENT_VERSION_FILE
+            || name.starts_with("edits-")
+            || name
+                .strip_prefix('v')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()));
+        if manifest_file {
+            return Err(crate::Error::from(crate::io::Error::new(
+                crate::io::ErrorKind::AlreadyExists,
+                format!(
+                    "restore_pinned: {} already holds a tree ({name})",
+                    root.display()
+                ),
+            )));
+        }
+    }
+
     // The streamed files first: the pointer published below must never name a
     // file a power loss can still take back.
-    fs.create_dir_all(&root)?;
     for folder in [TABLES_FOLDER, BLOBS_FOLDER, DICTS_FOLDER] {
         let folder = root.join(folder);
         if !fs.exists(&folder)? {
@@ -394,7 +424,9 @@ pub fn restore(
     )?;
     fsync_directory(&root, &*fs, sync_mode)?;
 
-    let tree = config.open()?;
+    let seqno = Arc::clone(&config.seqno);
+    let visible_seqno = Arc::clone(&config.visible_seqno);
+    let tree = config.open_with(crate::config::DirectoryLock::Held(lock))?;
 
     // A restricted table keeps its bound beside it, as on the source, so a
     // manifest repair of the restored tree recovers the restriction.
@@ -433,5 +465,14 @@ pub fn restore(
     drop(memtable);
     // Collect nothing: the restored tree serves every snapshot the source did.
     tree.flush_active_memtable(0)?;
+
+    // A write on the restored tree must land above every restored version, and
+    // reads see what the pin served. The tables may hold a write at or above
+    // the pin's seqno (flushed before its seqno was published).
+    let next = tree
+        .get_highest_seqno()
+        .map_or(pin_seqno, |highest| pin_seqno.max(highest + 1));
+    seqno.fetch_max(next);
+    visible_seqno.fetch_max(pin_seqno);
     Ok(tree)
 }

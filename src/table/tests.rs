@@ -1792,6 +1792,64 @@ fn punch_on_drop_waits_for_the_pin_listing_the_file() -> crate::Result<()> {
     Ok(())
 }
 
+/// A pinned table keeps its heal attestation: when a view of the file is
+/// deleted under the pin, the sidecar stays beside the table, where the pin's
+/// consumer reads it, until the pin drops.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn deleting_a_pinned_table_keeps_its_heal_attestation() -> crate::Result<()> {
+    use crate::fs::Fs;
+    use std::io::Write;
+
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?;
+    writer.write(crate::InternalValue::from_components(
+        b"k",
+        b"v",
+        1,
+        crate::ValueType::Value,
+    ))?;
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let attestation = crate::scrub::heal_attest::attest_path(&path);
+    fs.open(
+        &attestation,
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"attestation")?;
+
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(Arc::clone(&pause));
+    pause.pin_files(core::iter::once(path.as_path()));
+    table.mark_as_deleted();
+    drop(table);
+
+    assert!(fs.exists(&path)?, "the pinned table stays");
+    assert!(fs.exists(&attestation)?, "its attestation stays with it");
+
+    pause.unpin_files(core::iter::once(path.as_path()));
+    assert!(!fs.exists(&path)?, "the release removed the table");
+    assert!(!fs.exists(&attestation)?, "and its attestation");
+    Ok(())
+}
+
 /// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
 /// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
 /// pause and the heal lock. Without them a restricted view skips the checkpoint

@@ -348,10 +348,19 @@ impl BlobTree {
             .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))
     }
 
-    pub(crate) fn open(config: Config) -> crate::Result<Self> {
+    /// Opens the tree, coming by the directory lock as `lock` says; see
+    /// [`Tree::open`](crate::Tree::open).
+    pub(crate) fn open(
+        config: Config,
+        #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
+    ) -> crate::Result<Self> {
         use crate::file::{BLOBS_FOLDER, fsync_directory};
 
-        let index = crate::Tree::open(config)?;
+        let index = crate::Tree::open(
+            config,
+            #[cfg(feature = "std")]
+            lock,
+        )?;
 
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
         (*index.config.fs).create_dir_all(&blobs_folder)?;

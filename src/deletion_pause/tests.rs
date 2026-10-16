@@ -384,6 +384,26 @@ fn a_failed_punch_retains_the_extent_and_the_untried_remainder() {
     assert!(!pause.has_pending_reclaims(), "nothing left to retry");
 }
 
+/// A removal deferred while a pin is being taken is not run by the pin, which
+/// performs no file I/O: the next pin release runs it.
+#[test]
+fn a_removal_deferred_while_pinning_waits_for_the_next_release() {
+    let fs = MemFs::new();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/file.sst").to_path_buf();
+    write_file(&fs, &path, b"x");
+    let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
+
+    let pause = DeletionPause::new_shared();
+    let pinning = pause.begin_pin();
+    assert!(pause.defer_removal_if_pinned(&dyn_fs, &path, PinnedKind::BlobFile));
+    drop(pinning);
+    assert!(fs.exists(&path).unwrap(), "taking the pin removed nothing");
+
+    pause.unpin_files(core::iter::empty());
+    assert!(!fs.exists(&path).unwrap(), "the next release removed it");
+}
+
 #[test]
 fn nested_pauses_only_release_on_last_drop() {
     let fs = MemFs::new();

@@ -105,7 +105,27 @@ struct PinState {
     files: crate::HashMap<PathBuf, u32>,
     /// Removals of pinned files whose last view dropped, run when the last
     /// pin listing the file drops.
-    removals: Vec<(Arc<dyn Fs>, PathBuf)>,
+    removals: Vec<DeferredRemoval>,
+}
+
+/// A removal [`DeletionPause::defer_removal_if_pinned`] took over.
+#[cfg(feature = "std")]
+struct DeferredRemoval {
+    fs: Arc<dyn Fs>,
+    path: PathBuf,
+    kind: PinnedKind,
+}
+
+/// What kind of file a pinned removal is for: a table takes its sidecars
+/// (heal attestation, restriction bound) with it, and keeps them until then,
+/// since a pin's consumer reads the attestation beside the table.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy)]
+pub enum PinnedKind {
+    /// A table, with its sidecars.
+    Table,
+    /// A blob file, which has none.
+    BlobFile,
 }
 
 #[cfg_attr(
@@ -476,12 +496,17 @@ impl DeletionPause {
         &self,
         fs: &Arc<dyn Fs>,
         path: &crate::path::Path,
+        kind: PinnedKind,
     ) -> bool {
         let mut state = self.pins.lock();
         if state.pending == 0 && !state.files.contains_key(path) {
             return false;
         }
-        state.removals.push((Arc::clone(fs), path.to_path_buf()));
+        state.removals.push(DeferredRemoval {
+            fs: Arc::clone(fs),
+            path: path.to_path_buf(),
+            kind,
+        });
         true
     }
 
@@ -496,15 +521,23 @@ impl DeletionPause {
             let removals = core::mem::take(&mut state.removals);
             let (due, kept): (Vec<_>, Vec<_>) = removals
                 .into_iter()
-                .partition(|(_, path)| !state.files.contains_key(path.as_path()));
+                .partition(|removal| !state.files.contains_key(removal.path.as_path()));
             state.removals = kept;
             due
         };
-        for (fs, path) in due {
-            if let Err(e) = fs.remove_file(&path) {
+        for removal in due {
+            if matches!(removal.kind, PinnedKind::Table) {
+                crate::scrub::heal_attest::remove(&*removal.fs, &removal.path);
+                crate::restrict_bound::remove(
+                    &*removal.fs,
+                    &removal.path,
+                    crate::fs::SyncMode::Normal,
+                );
+            }
+            if let Err(e) = removal.fs.remove_file(&removal.path) {
                 log::warn!(
                     "Failed to remove {} after its last pin dropped: {e:?}",
-                    path.display(),
+                    removal.path.display(),
                 );
             }
         }
@@ -579,11 +612,10 @@ pub struct PinGuard<'a> {
 #[cfg(feature = "std")]
 impl Drop for PinGuard<'_> {
     fn drop(&mut self) {
+        // A removal deferred while the pin was taken, and a reclaim retained
+        // meanwhile, wait for the next release (this pin's drop at the
+        // latest): running them here would give the pin file I/O of its own.
         self.pause.pins.lock().pending -= 1;
-        // A removal deferred while the pin was taken goes now unless the pin
-        // listed the file. A reclaim retained meanwhile waits for the next
-        // retry: running it here would give the pin file I/O of its own.
-        self.pause.remove_due();
     }
 }
 

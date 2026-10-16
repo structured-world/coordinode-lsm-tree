@@ -4487,7 +4487,14 @@ impl Tree {
     /// # Errors
     ///
     /// Returns error, if an IO error occurred.
-    pub(crate) fn open(config: Config) -> crate::Result<Self> {
+    ///
+    /// `lock` says how the open comes by the directory lock: a caller that
+    /// wrote the tree's files under it passes it in, so no other opener gets
+    /// in between.
+    pub(crate) fn open(
+        config: Config,
+        #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
+    ) -> crate::Result<Self> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
         // Resolve the per-tree compaction compression pool once, at open: if the
@@ -4540,9 +4547,16 @@ impl Tree {
         // (idempotent; `create_new` re-creates the `tables/` subtree). The lock
         // is threaded into the constructor so it lives for the tree's lifetime.
         #[cfg(feature = "std")]
-        let directory_lock = {
-            config.fs.create_dir_all(&config.path)?;
-            crate::config::acquire_directory_lock(&*config.fs, &config.path, config.directory_lock)?
+        let directory_lock = match lock {
+            crate::config::DirectoryLock::Held(held) => held,
+            crate::config::DirectoryLock::Acquire => {
+                config.fs.create_dir_all(&config.path)?;
+                crate::config::acquire_directory_lock(
+                    &*config.fs,
+                    &config.path,
+                    config.directory_lock,
+                )?
+            }
         };
 
         // Check for old version

@@ -189,7 +189,11 @@ impl Drop for Inner {
             // before a tight-space relocation): it stays until that pin drops.
             #[cfg(feature = "std")]
             if let Some(pause) = self.deletion_pause.get()
-                && pause.defer_removal_if_pinned(&self.fs, &self.path)
+                && pause.defer_removal_if_pinned(
+                    &self.fs,
+                    &self.path,
+                    crate::deletion_pause::PinnedKind::BlobFile,
+                )
             {
                 return;
             }
