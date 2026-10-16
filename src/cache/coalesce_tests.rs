@@ -216,6 +216,131 @@ fn held_cold_load_does_not_block_another_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table of one large zstd data block that bounded ranges decode only in
+/// part, with its file and the block's offset.
+#[cfg(feature = "zstd")]
+fn partial_table(
+    folder: &std::path::Path,
+    fs: FaultFs<StdFs>,
+) -> crate::Result<(crate::table::Table, String, crate::table::BlockOffset)> {
+    use crate::config::{BlockSizePolicy, CompressionPolicy};
+    let crate::AnyTree::Standard(tree) = config(folder)
+        .with_fs(fs)
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 << 20)))
+        .data_block_compression_policy(CompressionPolicy::all(crate::CompressionType::zstd(19)?))
+        .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
+        .open()?
+    else {
+        unreachable!("standard tree configured");
+    };
+    for i in 0u64..20_000 {
+        tree.insert(
+            format!("key-{i:08}"),
+            format!("value-{i:08}-padding-padding"),
+            0,
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let binding = tree.version_history.read().latest_version();
+    let Some(table) = binding.version.iter_tables().next().cloned() else {
+        unreachable!("flush produced one table");
+    };
+    let offset = table
+        .untraced_index_walk()
+        .next()
+        .expect("the table has a data block")?
+        .offset();
+    let path = table.path.to_string_lossy().into_owned();
+    Ok((table, path, offset))
+}
+
+/// The keys of `table` below `upper`, read through the partial tier on the
+/// calling thread.
+#[cfg(feature = "zstd")]
+fn keys_below(table: &crate::table::Table, upper: u64) -> crate::Result<Vec<crate::UserKey>> {
+    crate::table::iter::force_partial_decode_on_this_thread();
+    let upper = crate::UserKey::from(format!("key-{upper:08}"));
+    table
+        .range_iter(crate::UserKey::from("key-")..upper)
+        .map(|kv| kv.map(|kv| kv.key.user_key))
+        .collect()
+}
+
+/// The keys `keys_below` must return.
+#[cfg(feature = "zstd")]
+fn expected_below(upper: u64) -> Vec<crate::UserKey> {
+    (0..upper)
+        .map(|i| crate::UserKey::from(format!("key-{i:08}")))
+        .collect()
+}
+
+/// Two bounded ranges that need the same cold block's prefix grown do it one
+/// after the other, in either completion order: with the wider read first the
+/// narrower one is served from its prefix without reading the block, with the
+/// narrower first the wider one resumes from it; every read returns exactly
+/// its rows, and the cached prefix never shrinks.
+#[cfg(feature = "zstd")]
+#[test]
+fn concurrent_partial_growth_is_serialized_in_either_order() -> crate::Result<()> {
+    const NARROW: u64 = 30;
+    const WIDE: u64 = 3_000;
+    for (first, second, reads_expected) in [(WIDE, NARROW, 1), (NARROW, WIDE, 2)] {
+        let folder = tempfile::tempdir()?;
+        let fs = FaultFs::new(StdFs);
+        let injector = fs.injector();
+        let (table, path, offset) = partial_table(folder.path(), fs)?;
+        let cache = Arc::clone(&table.cache);
+
+        // Holds the first read of the block until the second range waits on
+        // its growth.
+        let entered = Arc::new(Barrier::new(2));
+        let reads = Arc::new(AtomicUsize::new(0));
+        {
+            let (entered, reads, cache) =
+                (Arc::clone(&entered), Arc::clone(&reads), Arc::clone(&cache));
+            injector.hook_read_at(
+                path,
+                *offset,
+                Arc::new(move || {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        entered.wait();
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while cache.load_waiters() < 1 && Instant::now() < deadline {
+                            std::thread::yield_now();
+                        }
+                    }
+                }),
+            );
+        }
+        let leader = {
+            let table = table.clone();
+            std::thread::spawn(move || keys_below(&table, first))
+        };
+        entered.wait();
+        let follower = {
+            let table = table.clone();
+            std::thread::spawn(move || keys_below(&table, second))
+        };
+        assert_eq!(follower.join().expect("reader")?, expected_below(second));
+        assert_eq!(leader.join().expect("reader")?, expected_below(first));
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            reads_expected,
+            "{first} then {second}: the block is read once per growth"
+        );
+        let Some(entry) = cache.peek_partial_block(table.global_id(), offset) else {
+            panic!("the bounded reads left a partial prefix");
+        };
+        assert!(
+            &*entry.covered_upper >= format!("key-{:08}", WIDE - 1).as_bytes(),
+            "{first} then {second}: the prefix covers the wider read"
+        );
+        assert_eq!(cache.loads_in_flight(), 0);
+    }
+    Ok(())
+}
+
 /// Reads that miss the same cold separated value at once read its record once
 /// and every one gets the value.
 #[test]

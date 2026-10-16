@@ -154,3 +154,70 @@ fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() 
         "a handle declaring a different size must not be served the cached value",
     );
 }
+
+/// A partial-tier entry whose prefix decoded `decoded` inner blocks and served
+/// `hits` reads.
+#[cfg(feature = "zstd")]
+fn partial_entry(decoded: u32, hits: u32) -> super::PartialBlockEntry {
+    super::PartialBlockEntry {
+        resume: crate::table::lazy_block::PartialResume {
+            window_prime: crate::Slice::from(vec![0_u8; decoded as usize * 16]),
+            decoded_blocks: decoded,
+            state: None,
+            compressed_cursor: 0,
+        },
+        covered_upper: crate::UserKey::from(format!("upper-{decoded}")),
+        total_blocks: 8,
+        hits,
+    }
+}
+
+/// Recording a partial prefix never shrinks the cached one, whichever of two
+/// concurrent reads records last: a read that grew the prefix less, or served
+/// from an older copy of it and bumps its hit count, keeps the longer prefix
+/// and the higher hit count instead of overwriting them.
+#[cfg(feature = "zstd")]
+#[test]
+fn partial_prefix_never_shrinks_whichever_read_records_last() {
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let offset = crate::table::BlockOffset(0);
+    let resident = |cache: &Cache| {
+        let Some(entry) = cache.peek_partial_block(id, offset) else {
+            panic!("a partial entry is cached");
+        };
+        (entry.resume.decoded_blocks, entry.hits, entry.covered_upper)
+    };
+
+    // The longer growth records first, then the shorter one.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(id, offset, partial_entry(2, 0));
+    assert_eq!(resident(&cache), (5, 1, crate::UserKey::from("upper-5")));
+
+    // The shorter growth records first, then the longer one.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(2, 0));
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    assert_eq!(resident(&cache), (5, 1, crate::UserKey::from("upper-5")));
+
+    // A hit bump made on a copy taken before the prefix grew keeps the grown
+    // prefix and carries the bump.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    let older = partial_entry(2, 2);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(
+        id,
+        offset,
+        super::PartialBlockEntry {
+            hits: older.hits + 1,
+            ..older
+        },
+    );
+    assert_eq!(resident(&cache), (5, 3, crate::UserKey::from("upper-5")));
+
+    // An equally long prefix takes the newer hit count.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(id, offset, partial_entry(5, 2));
+    assert_eq!(resident(&cache), (5, 2, crate::UserKey::from("upper-5")));
+}

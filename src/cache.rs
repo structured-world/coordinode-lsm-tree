@@ -202,7 +202,32 @@ pub enum LoadIdentity {
     /// A separated value: its record's on-disk size. The user key is checked
     /// against the value the load returns, as a cache hit checks it.
     Blob { on_disk_size: u32 },
+    /// Growth of a block's partially decoded prefix. Waiters take no value:
+    /// once the growth ends they look at the cached prefix again.
+    #[cfg(feature = "zstd")]
+    PartialGrowth,
 }
+
+/// How a read that needs a block's partial prefix grown proceeds.
+#[cfg(feature = "zstd")]
+pub enum GrowthClaim<'a> {
+    /// No growth of the block runs: grow it, holding the lead until the
+    /// grown prefix is cached.
+    Lead(GrowthLead<'a>),
+    /// Another read grew the block while this one waited: look at the cached
+    /// prefix again before growing anything.
+    Waited,
+    /// Grow without coordination: the registry is full.
+    Alone,
+}
+
+/// The lead of a partial prefix's growth. Dropping it, after the grown prefix
+/// is cached or on any failure, lets the reads waiting on it look again.
+#[cfg(feature = "zstd")]
+pub struct GrowthLead<'a>(
+    #[expect(dead_code, reason = "held for its drop, which releases the waiters")]
+    crate::inflight::Lead<'a, CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>,
+);
 
 /// How a block miss proceeds: lead the load, take a concurrent one's block,
 /// or load alone.
@@ -546,9 +571,12 @@ impl Cache {
         }
     }
 
-    /// Inserts or replaces the partial-tier entry for `offset` (high-water
-    /// growth: a wider covering prefix with more decoded inner blocks replaces a
-    /// narrower one).
+    /// Records the partial-tier entry for `offset`, never letting its decoded
+    /// prefix shrink: when the resident entry already decoded more inner
+    /// blocks (a concurrent read grew it further), that one stays, with the
+    /// higher of the two hit counts. A read that served from an older copy of
+    /// the entry, or grew it less, can therefore not undo another read's
+    /// growth.
     #[cfg(feature = "zstd")]
     #[doc(hidden)]
     pub fn insert_partial_block(
@@ -557,10 +585,45 @@ impl Cache {
         offset: BlockOffset,
         entry: PartialBlockEntry,
     ) {
-        self.data.insert(
+        self.data.insert_merged(
             (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
-            Item::PartialBlock(entry),
+            |resident| match resident {
+                Some(Item::PartialBlock(resident))
+                    if resident.resume.decoded_blocks > entry.resume.decoded_blocks =>
+                {
+                    Some(Item::PartialBlock(PartialBlockEntry {
+                        hits: resident.hits.max(entry.hits),
+                        ..resident.clone()
+                    }))
+                }
+                Some(Item::PartialBlock(resident)) => Some(Item::PartialBlock(PartialBlockEntry {
+                    hits: resident.hits.max(entry.hits),
+                    ..entry
+                })),
+                _ => Some(Item::PartialBlock(entry)),
+            },
         );
+    }
+
+    /// Claims the growth of the partially decoded prefix of the block at
+    /// `offset`, so two reads that both need it longer decode the new inner
+    /// blocks once: the second waits for the first, then finds the longer
+    /// prefix cached.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn claim_partial_growth(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+    ) -> GrowthClaim<'_> {
+        let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, LoadIdentity::PartialGrowth) {
+            crate::inflight::Claim::Lead(lead) => GrowthClaim::Lead(GrowthLead(lead)),
+            crate::inflight::Claim::Join(join) => {
+                let _ = join.wait();
+                GrowthClaim::Waited
+            }
+            crate::inflight::Claim::Alone => GrowthClaim::Alone,
+        }
     }
 
     /// Drops the partial-tier entry for `offset` (used on promotion to a full
