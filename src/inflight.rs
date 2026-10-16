@@ -16,13 +16,20 @@
 //! waiters then load on their own and meet the real outcome themselves, so an
 //! error is never cached and never handed to a reader that did not cause it.
 //!
-//! Waiting blocks the thread: on a condition variable under `std`, by spinning
-//! under `no_std`. No lock of this registry or of the cache is held while a
-//! load runs or while a waiter waits.
+//! Waiting blocks the thread. A load served from the page cache settles in
+//! microseconds, less than parking and waking a thread costs, so a waiter
+//! first spins and yields for about that long; only a slower load parks it,
+//! on a condition variable under `std` (`no_std` keeps spinning). No lock of
+//! this registry or of the cache is held while a load runs or while a waiter
+//! waits.
+//!
+//! A ticket nobody else holds once its load closes is kept for the next load
+//! of its shard, so an uncontended miss allocates nothing here.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hash::{BuildHasher, Hash};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "std")]
 type Mutex<T> = parking_lot::Mutex<T>;
@@ -40,10 +47,22 @@ enum State<V> {
     Abandoned,
 }
 
+/// Rounds of exponentially longer spinning a waiter does before yielding:
+/// 1023 spin hints in all, a few microseconds.
+const SPIN_ROUNDS: u32 = 10;
+/// Times a waiter yields its core, once spinning is over, before parking.
+#[cfg(feature = "std")]
+const YIELD_ROUNDS: u32 = 8;
+/// Tickets one shard keeps for reuse.
+const SPARE_TICKETS: usize = 4;
+
 /// One load in flight: what it loads (its identity) and how it ended.
 struct Ticket<V, I> {
     identity: I,
     state: Mutex<State<V>>,
+    /// Set once `state` is no longer pending, so a spinning waiter polls it
+    /// without taking the lock.
+    is_settled: AtomicBool,
     #[cfg(feature = "std")]
     settled: parking_lot::Condvar,
 }
@@ -53,40 +72,72 @@ impl<V, I> Ticket<V, I> {
         Self {
             identity,
             state: Mutex::new(State::Pending),
+            is_settled: AtomicBool::new(false),
             #[cfg(feature = "std")]
             settled: parking_lot::Condvar::new(),
         }
     }
 
     fn settle(&self, state: State<V>) {
+        // The flag is set after the state, so a waiter that sees it set
+        // finds the state settled.
         *self.state.lock() = state;
+        self.is_settled.store(true, Ordering::Release);
         #[cfg(feature = "std")]
         self.settled.notify_all();
+    }
+
+    /// Readies a ticket nobody else holds for another load.
+    fn reset(&mut self, identity: I) {
+        self.identity = identity;
+        *self.state.get_mut() = State::Pending;
+        *self.is_settled.get_mut() = false;
     }
 }
 
 impl<V: Clone, I> Ticket<V, I> {
     /// Waits for the leader, returning its value, or `None` when it gave up.
     fn wait(&self) -> Option<V> {
-        #[cfg(feature = "std")]
-        {
-            let mut state = self.state.lock();
-            loop {
-                match &*state {
-                    State::Pending => self.settled.wait(&mut state),
-                    State::Ready(value) => return Some(value.clone()),
-                    State::Abandoned => return None,
+        let mut round = 0;
+        while !self.is_settled.load(Ordering::Acquire) {
+            // `round` stops counting at its last stage, so it stays below
+            // `SPIN_ROUNDS + YIELD_ROUNDS`.
+            if round < SPIN_ROUNDS {
+                for _ in 0..1_u32 << round {
+                    core::hint::spin_loop();
                 }
+                round += 1;
+            } else {
+                #[cfg(feature = "std")]
+                {
+                    if round >= SPIN_ROUNDS + YIELD_ROUNDS {
+                        break;
+                    }
+                    std::thread::yield_now();
+                    round += 1;
+                }
+                // no-std: nothing to park on; keep spinning.
+                #[cfg(not(feature = "std"))]
+                core::hint::spin_loop();
             }
         }
-        #[cfg(not(feature = "std"))]
+        self.settled_value()
+    }
+
+    /// The leader's outcome, parking until it settles under `std`.
+    fn settled_value(&self) -> Option<V> {
+        let mut state = self.state.lock();
         loop {
-            match &*self.state.lock() {
-                State::Pending => {}
+            match &*state {
+                #[cfg(feature = "std")]
+                State::Pending => self.settled.wait(&mut state),
+                // no-std: only reached once `is_settled` was seen set, which
+                // is stored after the state, so the state is not pending.
+                #[cfg(not(feature = "std"))]
+                State::Pending => return None,
                 State::Ready(value) => return Some(value.clone()),
                 State::Abandoned => return None,
             }
-            core::hint::spin_loop();
         }
     }
 }
@@ -160,8 +211,15 @@ impl Drop for BatchToken {
 #[repr(align(64))]
 struct Padded<T>(T);
 
-/// One shard: the tickets of its keys' loads in flight.
-type Shard<K, V, I, S> = Mutex<hashbrown::HashMap<K, Arc<Ticket<V, I>>, S>>;
+/// What one shard holds: the tickets of its keys' loads in flight, and
+/// settled tickets nobody holds any more, kept for reuse.
+struct ShardState<K, V, I, S> {
+    loads: hashbrown::HashMap<K, Arc<Ticket<V, I>>, S>,
+    spare: Vec<Arc<Ticket<V, I>>>,
+}
+
+/// One shard of the registry.
+type Shard<K, V, I, S> = Mutex<ShardState<K, V, I, S>>;
 
 /// The loads in flight, sharded by key hash and bounded per shard.
 pub struct InflightLoads<K, V, I, S> {
@@ -203,7 +261,8 @@ where
 {
     loads: Arc<InflightLoads<K, V, I, S>>,
     key: K,
-    ticket: Arc<Ticket<V, I>>,
+    /// Always present until the drop hands it back to the registry.
+    ticket: Option<Arc<Ticket<V, I>>>,
     published: bool,
 }
 
@@ -240,7 +299,9 @@ where
     /// cache), or a value no later request needs: once closed, a new miss of
     /// the key leads a load of its own.
     pub fn publish(mut self, value: V) {
-        self.ticket.settle(State::Ready(value));
+        if let Some(ticket) = &self.ticket {
+            ticket.settle(State::Ready(value));
+        }
         self.published = true;
     }
 
@@ -249,7 +310,9 @@ where
     /// answer and before the load closes finds no value and loads on its own,
     /// so `false` lets a leader skip building a value nobody would take.
     pub fn has_waiters(&self) -> bool {
-        Arc::strong_count(&self.ticket) > 2
+        self.ticket
+            .as_ref()
+            .is_some_and(|ticket| Arc::strong_count(ticket) > 2)
     }
 }
 
@@ -259,12 +322,15 @@ where
     S: BuildHasher,
 {
     fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
         // Not published: the load failed or unwound. Waiters load on their
         // own, so none is left waiting and no error is remembered.
         if !self.published {
-            self.ticket.settle(State::Abandoned);
+            ticket.settle(State::Abandoned);
         }
-        self.loads.close(&self.key, &self.ticket);
+        self.loads.close(&self.key, ticket);
     }
 }
 
@@ -281,9 +347,10 @@ where
         let count = shards.next_power_of_two().clamp(1, 256);
         let mut list = Vec::with_capacity(count);
         for _ in 0..count {
-            list.push(Padded(Mutex::new(hashbrown::HashMap::with_hasher(
-                hasher.clone(),
-            ))));
+            list.push(Padded(Mutex::new(ShardState {
+                loads: hashbrown::HashMap::with_hasher(hasher.clone()),
+                spare: Vec::with_capacity(SPARE_TICKETS),
+            })));
         }
         Self {
             shards: list,
@@ -299,23 +366,34 @@ where
     /// put its result there.
     pub fn claim(self: &Arc<Self>, key: K, identity: I) -> Claim<K, V, I, S> {
         let mut shard = self.shard(&key).lock();
-        if let Some(ticket) = shard.get(&key) {
+        if let Some(ticket) = shard.loads.get(&key) {
             return if ticket.identity == identity {
                 Claim::Join(Join(Arc::clone(ticket)))
             } else {
                 Claim::Alone
             };
         }
-        if shard.len() >= self.per_shard_limit {
+        if shard.loads.len() >= self.per_shard_limit {
             return Claim::Alone;
         }
-        let ticket = Arc::new(Ticket::new(identity));
-        shard.insert(key.clone(), Arc::clone(&ticket));
+        // A spare ticket is held by nothing but the shard, so it is reset in
+        // place rather than allocated anew.
+        let ticket = match shard.spare.pop() {
+            Some(mut spare) => match Arc::get_mut(&mut spare) {
+                Some(unshared) => {
+                    unshared.reset(identity);
+                    spare
+                }
+                None => Arc::new(Ticket::new(identity)),
+            },
+            None => Arc::new(Ticket::new(identity)),
+        };
+        shard.loads.insert(key.clone(), Arc::clone(&ticket));
         drop(shard);
         Claim::Lead(Lead {
             loads: Arc::clone(self),
             key,
-            ticket,
+            ticket: Some(ticket),
             published: false,
         })
     }
@@ -324,7 +402,7 @@ where
     /// published and not yet closed, without claiming anything: for a reader
     /// that may neither wait nor lead.
     pub fn take_ready(&self, key: &K, identity: &I) -> Option<V> {
-        let ticket = Arc::clone(self.shard(key).lock().get(key)?);
+        let ticket = Arc::clone(self.shard(key).lock().loads.get(key)?);
         if ticket.identity != *identity {
             return None;
         }
@@ -337,7 +415,10 @@ where
     /// How many loads are in flight, for tests.
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|shard| shard.0.lock().len()).sum()
+        self.shards
+            .iter()
+            .map(|shard| shard.0.lock().loads.len())
+            .sum()
     }
 
     /// How many requests wait on loads in flight, for tests.
@@ -351,6 +432,7 @@ where
                 shard
                     .0
                     .lock()
+                    .loads
                     .values()
                     .map(|ticket| Arc::strong_count(ticket) - 2)
                     .collect::<Vec<_>>()
@@ -379,15 +461,29 @@ where
     }
 
     /// Removes `ticket` from the registry, unless another load of the key has
-    /// taken its place.
-    fn close(&self, key: &K, ticket: &Arc<Ticket<V, I>>) {
+    /// taken its place, and keeps it for reuse once nothing else holds it.
+    fn close(&self, key: &K, mut ticket: Arc<Ticket<V, I>>) {
         let mut shard = self.shard(key).lock();
         if shard
+            .loads
             .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, ticket))
+            .is_some_and(|current| Arc::ptr_eq(current, &ticket))
         {
-            shard.remove(key);
+            shard.loads.remove(key);
         }
+        // Out of the registry, the ticket gains no new holder: a waiter that
+        // still holds it keeps it shared, and it is dropped instead. A kept
+        // ticket lets go of its value, which the cache owns and charges, and
+        // the value is dropped after the lock.
+        let mut value = State::Pending;
+        if shard.spare.len() < SPARE_TICKETS
+            && let Some(unshared) = Arc::get_mut(&mut ticket)
+        {
+            core::mem::swap(&mut value, unshared.state.get_mut());
+            shard.spare.push(ticket);
+        }
+        drop(shard);
+        drop(value);
     }
 }
 
