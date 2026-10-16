@@ -223,10 +223,13 @@ pub(crate) struct TransformCounters {
 
 /// Where a filter's separated replacement values go: a blob file in `folder`,
 /// opened on the first one into `writer`, under the compaction's `runtime`
-/// snapshot like everything else the compaction writes.
+/// snapshot like everything else the compaction writes. Without a `writer`
+/// the replacement stays inline, for a compaction whose own blob output
+/// separates it where the row is written: a relocating one, whose relocated
+/// frames and new values then share target-sized files in key order.
 pub(crate) struct FilterBlobOutput<'a> {
     pub folder: &'a Path,
-    pub writer: &'a mut Option<BlobFileWriter>,
+    pub writer: Option<&'a mut Option<BlobFileWriter>>,
     pub runtime: &'a crate::runtime_config::RuntimeConfig,
 }
 
@@ -237,7 +240,8 @@ pub(crate) struct StreamFilterAdapter<'a, 'b: 'a> {
     filter: Option<&'a mut (dyn CompactionFilter + 'b)>,
     shared: AccessorShared<'a>,
     blob_opts: Option<&'a KvSeparationOptions>,
-    blob_writer: &'a mut Option<BlobFileWriter>,
+    /// `None` when the compaction's output separates the values itself.
+    blob_writer: Option<&'a mut Option<BlobFileWriter>>,
     runtime: &'a crate::runtime_config::RuntimeConfig,
     ctx: &'a Context,
     counters: TransformCounters,
@@ -281,6 +285,11 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
         let Some(blob_opts) = self.blob_opts else {
             return Ok((ValueType::Value, new_value));
         };
+        // Separated where the row is written, and paced there by the merge
+        // loop, which sees the whole value inline.
+        let Some(blob_writer) = self.blob_writer.as_deref_mut() else {
+            return Ok((ValueType::Value, new_value));
+        };
 
         #[expect(clippy::cast_possible_truncation, reason = "values are u32 length max")]
         let value_size = new_value.len() as u32;
@@ -302,7 +311,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
             return Err(super::worker::cancelled_compaction());
         }
 
-        let writer = if let Some(writer) = self.blob_writer {
+        let writer = if let Some(writer) = blob_writer {
             writer
         } else {
             // Instantiate writer as necessary, under the compaction's snapshot:
@@ -338,7 +347,7 @@ impl<'a, 'b: 'a> StreamFilterAdapter<'a, 'b> {
                     .use_zstd_dictionaries(dicts)
             };
 
-            self.blob_writer.insert(writer)
+            blob_writer.insert(writer)
         };
 
         // A value the filter writes is new: it has outlived nothing yet.

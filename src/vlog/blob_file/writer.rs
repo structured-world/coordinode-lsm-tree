@@ -34,7 +34,7 @@ use std::io::Write;
 pub(super) const MAX_DECOMPRESSION_SIZE: usize = 256 * 1024 * 1024;
 
 /// Returns `Err(DecompressedSizeTooLarge)` if `len > MAX_DECOMPRESSION_SIZE`.
-fn check_size_cap(len: usize) -> crate::Result<()> {
+pub(super) fn check_size_cap(len: usize) -> crate::Result<()> {
     if len > MAX_DECOMPRESSION_SIZE {
         return Err(crate::Error::DecompressedSizeTooLarge {
             declared: len as u64,
@@ -42,6 +42,72 @@ fn check_size_cap(len: usize) -> crate::Result<()> {
         });
     }
     Ok(())
+}
+
+/// `value` as a blob frame stores it under `compression`: compressed with
+/// `dictionary` for a dictionary codec, as it is for none. The output is
+/// checked against the size cap, which applies to blob data whatever its
+/// encoding.
+#[cfg_attr(
+    not(any(feature = "lz4", zstd_any)),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "without a codec built in, a value is stored as it is and cannot fail"
+    )
+)]
+#[cfg_attr(
+    not(zstd_any),
+    expect(
+        clippy::elidable_lifetime_names,
+        reason = "named to stay valid in the zstd build, where the dictionary is a second reference"
+    )
+)]
+pub(super) fn encode_value<'v>(
+    compression: CompressionType,
+    #[cfg(zstd_any)] dictionary: Option<&crate::compression::ZstdDictionary>,
+    #[cfg(zstd_any)] two_pass_seed: bool,
+    value: &'v [u8],
+) -> crate::Result<alloc::borrow::Cow<'v, [u8]>> {
+    Ok(match compression {
+        CompressionType::None => alloc::borrow::Cow::Borrowed(value),
+
+        #[cfg(feature = "lz4")]
+        CompressionType::Lz4 => {
+            let compressed = lz4_flex::block::compress(value);
+            check_size_cap(compressed.len())?;
+            alloc::borrow::Cow::Owned(compressed)
+        }
+
+        #[cfg(zstd_any)]
+        CompressionType::Zstd(level) => {
+            let compressed =
+                crate::compression::ZstdBackend::compress(value, level, two_pass_seed)?;
+            check_size_cap(compressed.len())?;
+            alloc::borrow::Cow::Owned(compressed)
+        }
+
+        #[cfg(zstd_any)]
+        CompressionType::ZstdDict { level, dict_id } => {
+            let dict = dictionary.ok_or(crate::Error::ZstdDictMismatch {
+                expected: dict_id,
+                got: None,
+            })?;
+            if dict.id() != dict_id {
+                return Err(crate::Error::ZstdDictMismatch {
+                    expected: dict_id,
+                    got: Some(dict.id()),
+                });
+            }
+            let compressed = crate::compression::ZstdBackend::compress_with_dict(
+                value,
+                level,
+                dict,
+                two_pass_seed,
+            )?;
+            check_size_cap(compressed.len())?;
+            alloc::borrow::Cow::Owned(compressed)
+        }
+    })
 }
 
 // Note: these constants are `pub` for crate-internal use but the parent
@@ -387,58 +453,45 @@ impl Writer {
         check_size_cap(uncompressed_len as usize)?;
         check_size_cap(value.len())?;
 
-        #[cfg(zstd_any)]
-        let two_pass_seed = self.zstd_two_pass_seed;
-
         // Perform compression before mutating writer state, so an error
-        // leaves the writer consistent. Post-compression output is also
-        // checked against the cap (reuses DecompressedSizeTooLarge since
-        // the cap applies uniformly to all blob data regardless of
-        // compression state).
-        let value = match &self.compression {
-            CompressionType::None => alloc::borrow::Cow::Borrowed(value),
-
-            #[cfg(feature = "lz4")]
-            CompressionType::Lz4 => {
-                let compressed = lz4_flex::block::compress(value);
-                check_size_cap(compressed.len())?;
-                alloc::borrow::Cow::Owned(compressed)
-            }
-
+        // leaves the writer consistent.
+        let value = encode_value(
+            self.compression,
             #[cfg(zstd_any)]
-            CompressionType::Zstd(level) => {
-                let compressed =
-                    crate::compression::ZstdBackend::compress(value, *level, two_pass_seed)?;
-                check_size_cap(compressed.len())?;
-                alloc::borrow::Cow::Owned(compressed)
-            }
-
+            self.zstd_dictionary.as_deref(),
             #[cfg(zstd_any)]
-            CompressionType::ZstdDict { level, dict_id } => {
-                let dict =
-                    self.zstd_dictionary
-                        .as_deref()
-                        .ok_or(crate::Error::ZstdDictMismatch {
-                            expected: *dict_id,
-                            got: None,
-                        })?;
-                if dict.id() != *dict_id {
-                    return Err(crate::Error::ZstdDictMismatch {
-                        expected: *dict_id,
-                        got: Some(dict.id()),
-                    });
-                }
-                let compressed = crate::compression::ZstdBackend::compress_with_dict(
-                    value,
-                    *level,
-                    dict,
-                    two_pass_seed,
-                )?;
-                check_size_cap(compressed.len())?;
-                alloc::borrow::Cow::Owned(compressed)
-            }
-        };
+            self.zstd_two_pass_seed,
+            value,
+        )?;
+        self.append(key, seqno, &value, uncompressed_len)
+    }
 
+    /// Writes `encoded`, a value already encoded under the codec this file
+    /// records, without encoding it again. `uncompressed_len` is its decoded
+    /// length.
+    pub(crate) fn write_encoded(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        encoded: &[u8],
+        uncompressed_len: u32,
+    ) -> crate::Result<u32> {
+        assert!(!key.is_empty());
+        assert!(u16::try_from(key.len()).is_ok());
+
+        check_size_cap(uncompressed_len as usize)?;
+        check_size_cap(encoded.len())?;
+        self.append(key, seqno, encoded, uncompressed_len)
+    }
+
+    /// Appends the frame of `value`, already in its on-disk form.
+    fn append(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+        uncompressed_len: u32,
+    ) -> crate::Result<u32> {
         // Ensure the compressed value length fits in u32 before we write it
         // to disk as a 32-bit length. This prevents truncation if compression
         // expands the payload (possible for incompressible data near u32 boundary).
@@ -479,7 +532,7 @@ impl Writer {
         let checksum = {
             let mut hasher = xxhash_rust::xxh3::Xxh3::default();
             hasher.update(key);
-            hasher.update(&value);
+            hasher.update(value);
             hasher.update(&header_crc.to_le_bytes());
             hasher.digest128()
         };
@@ -506,7 +559,7 @@ impl Writer {
         self.writer.write_u32::<LittleEndian>(header_crc)?;
 
         self.writer.write_all(key)?;
-        self.writer.write_all(&value)?;
+        self.writer.write_all(value)?;
 
         // Update offset
         self.offset += BLOB_HEADER_LEN as u64;
