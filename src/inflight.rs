@@ -28,6 +28,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::hash::{BuildHasher, Hash};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -36,16 +37,6 @@ type Mutex<T> = parking_lot::Mutex<T>;
 // no-std: a spin mutex; the waiter below spins on it instead of parking.
 #[cfg(not(feature = "std"))]
 type Mutex<T> = spin::Mutex<T>;
-
-/// Where a ticket's load stands.
-enum State<V> {
-    /// The leader is loading.
-    Pending,
-    /// The leader loaded `V`; every waiter takes a clone.
-    Ready(V),
-    /// The leader failed or unwound: waiters load on their own.
-    Abandoned,
-}
 
 /// Rounds of exponentially longer spinning a waiter does before yielding:
 /// 1023 spin hints in all, a few microseconds.
@@ -57,41 +48,92 @@ const YIELD_ROUNDS: u32 = 8;
 const SPARE_TICKETS: usize = 4;
 
 /// One load in flight: what it loads (its identity) and how it ended.
+///
+/// Its lead settles it once: it writes `value` (`None` for a load that failed
+/// or unwound, whose waiters then load on their own) and only then sets
+/// `is_settled`. A reader looks at `value` only after seeing `is_settled`
+/// set, and `value` is written again only through `&mut`, once nothing else
+/// holds the ticket, so the waiters of a load read its value at once, without
+/// taking turns on a lock.
 struct Ticket<V, I> {
     identity: I,
-    state: Mutex<State<V>>,
-    /// Set once `state` is no longer pending, so a spinning waiter polls it
-    /// without taking the lock.
+    value: UnsafeCell<Option<V>>,
     is_settled: AtomicBool,
+    /// Waiters that spun out and park; the lead wakes them only if any did.
+    #[cfg(feature = "std")]
+    parked: core::sync::atomic::AtomicU32,
+    #[cfg(feature = "std")]
+    park_lock: parking_lot::Mutex<()>,
     #[cfg(feature = "std")]
     settled: parking_lot::Condvar,
 }
+
+// SAFETY: `value` is written once, before `is_settled` is set with release
+// ordering, and read only after `is_settled` is seen set with acquire
+// ordering; every other write takes `&mut self`. Sharing a ticket shares `&V`
+// between threads (`V: Sync`) and hands them clones of it (`V: Send`).
+unsafe impl<V: Send + Sync, I: Sync> Sync for Ticket<V, I> {}
 
 impl<V, I> Ticket<V, I> {
     fn new(identity: I) -> Self {
         Self {
             identity,
-            state: Mutex::new(State::Pending),
+            value: UnsafeCell::new(None),
             is_settled: AtomicBool::new(false),
+            #[cfg(feature = "std")]
+            parked: core::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "std")]
+            park_lock: parking_lot::Mutex::new(()),
             #[cfg(feature = "std")]
             settled: parking_lot::Condvar::new(),
         }
     }
 
-    fn settle(&self, state: State<V>) {
-        // The flag is set after the state, so a waiter that sees it set
-        // finds the state settled.
-        *self.state.lock() = state;
-        self.is_settled.store(true, Ordering::Release);
+    /// Settles the load with `value`, `None` when it failed.
+    ///
+    /// # Safety
+    ///
+    /// Called at most once while the ticket is shared: by its lead, which
+    /// settles it exactly once.
+    unsafe fn settle(&self, value: Option<V>) {
+        // SAFETY: the lead is the one writer, and no reader looks at the
+        // value before `is_settled` is set below.
+        unsafe {
+            *self.value.get() = value;
+        }
+        self.is_settled.store(true, Ordering::SeqCst);
+        // A waiter counts itself parked before it checks `is_settled` and
+        // sleeps, all under `park_lock`; both sides are sequentially
+        // consistent, so either it sees the ticket settled and never sleeps,
+        // or this sees it counted and wakes it under the same lock.
         #[cfg(feature = "std")]
-        self.settled.notify_all();
+        if self.parked.load(Ordering::SeqCst) > 0 {
+            drop(self.park_lock.lock());
+            self.settled.notify_all();
+        }
     }
 
-    /// Readies a ticket nobody else holds for another load.
-    fn reset(&mut self, identity: I) {
+    /// The settled outcome, or `None` while the load runs.
+    fn outcome(&self) -> Option<&Option<V>> {
+        if self.is_settled.load(Ordering::Acquire) {
+            // SAFETY: `is_settled` is set after the value was written, and the
+            // value is not written again while the ticket is shared.
+            Some(unsafe { &*self.value.get() })
+        } else {
+            None
+        }
+    }
+
+    /// Readies a ticket nobody else holds for another load, returning the
+    /// value of its last one for the caller to drop.
+    fn reset(&mut self, identity: I) -> Option<V> {
         self.identity = identity;
-        *self.state.get_mut() = State::Pending;
         *self.is_settled.get_mut() = false;
+        #[cfg(feature = "std")]
+        {
+            *self.parked.get_mut() = 0;
+        }
+        self.value.get_mut().take()
     }
 }
 
@@ -99,8 +141,11 @@ impl<V: Clone, I> Ticket<V, I> {
     /// Waits for the leader, returning its value, or `None` when it gave up.
     fn wait(&self) -> Option<V> {
         let mut round = 0;
-        while !self.is_settled.load(Ordering::Acquire) {
-            // `round` stops counting at its last stage, so it stays below
+        loop {
+            if let Some(outcome) = self.outcome() {
+                return outcome.clone();
+            }
+            // `round` stops counting at its last stage, so it stays at most
             // `SPIN_ROUNDS + YIELD_ROUNDS`.
             if round < SPIN_ROUNDS {
                 for _ in 0..1_u32 << round {
@@ -111,7 +156,7 @@ impl<V: Clone, I> Ticket<V, I> {
                 #[cfg(feature = "std")]
                 {
                     if round >= SPIN_ROUNDS + YIELD_ROUNDS {
-                        break;
+                        return self.park();
                     }
                     std::thread::yield_now();
                     round += 1;
@@ -121,24 +166,23 @@ impl<V: Clone, I> Ticket<V, I> {
                 core::hint::spin_loop();
             }
         }
-        self.settled_value()
     }
 
-    /// The leader's outcome, parking until it settles under `std`.
-    fn settled_value(&self) -> Option<V> {
-        let mut state = self.state.lock();
-        loop {
-            match &*state {
-                #[cfg(feature = "std")]
-                State::Pending => self.settled.wait(&mut state),
-                // no-std: only reached once `is_settled` was seen set, which
-                // is stored after the state, so the state is not pending.
-                #[cfg(not(feature = "std"))]
-                State::Pending => return None,
-                State::Ready(value) => return Some(value.clone()),
-                State::Abandoned => return None,
-            }
+    /// Sleeps until the lead settles the load.
+    #[cfg(feature = "std")]
+    fn park(&self) -> Option<V> {
+        let mut guard = self.park_lock.lock();
+        self.parked.fetch_add(1, Ordering::SeqCst);
+        while !self.is_settled.load(Ordering::SeqCst) {
+            self.settled.wait(&mut guard);
         }
+        drop(guard);
+        self.outcome().and_then(Option::clone)
+    }
+
+    /// The leader's value if it has published one, without waiting.
+    fn try_take(&self) -> Option<V> {
+        self.outcome().and_then(Option::clone)
     }
 }
 
@@ -281,10 +325,7 @@ impl<V: Clone, I> Join<V, I> {
     /// not block (one holding leads of its own others may wait on), which
     /// then loads on its own instead.
     pub fn try_take(&self) -> Option<V> {
-        match &*self.0.state.lock() {
-            State::Ready(value) => Some(value.clone()),
-            State::Pending | State::Abandoned => None,
-        }
+        self.0.try_take()
     }
 }
 
@@ -300,7 +341,9 @@ where
     /// the key leads a load of its own.
     pub fn publish(mut self, value: V) {
         if let Some(ticket) = &self.ticket {
-            ticket.settle(State::Ready(value));
+            // SAFETY: the lead settles once: here, marking itself published so
+            // its drop does not settle again.
+            unsafe { ticket.settle(Some(value)) };
         }
         self.published = true;
     }
@@ -328,7 +371,8 @@ where
         // Not published: the load failed or unwound. Waiters load on their
         // own, so none is left waiting and no error is remembered.
         if !self.published {
-            ticket.settle(State::Abandoned);
+            // SAFETY: not published, so this is the lead's one settling.
+            unsafe { ticket.settle(None) };
         }
         self.loads.close(&self.key, ticket);
     }
@@ -376,12 +420,14 @@ where
         if shard.loads.len() >= self.per_shard_limit {
             return Claim::Alone;
         }
-        // A spare ticket is held by nothing but the shard, so it is reset in
-        // place rather than allocated anew.
+        // A spare ticket is held by nothing but the shard (and holds no value:
+        // the close that kept it took it), so it is reset in place rather
+        // than allocated anew.
         let ticket = match shard.spare.pop() {
             Some(mut spare) => match Arc::get_mut(&mut spare) {
                 Some(unshared) => {
-                    unshared.reset(identity);
+                    let previous = unshared.reset(identity);
+                    debug_assert!(previous.is_none(), "a spare ticket holds no value");
                     spare
                 }
                 None => Arc::new(Ticket::new(identity)),
@@ -406,10 +452,7 @@ where
         if ticket.identity != *identity {
             return None;
         }
-        match &*ticket.state.lock() {
-            State::Ready(value) => Some(value.clone()),
-            State::Pending | State::Abandoned => None,
-        }
+        ticket.try_take()
     }
 
     /// How many loads are in flight, for tests.
@@ -475,11 +518,11 @@ where
         // still holds it keeps it shared, and it is dropped instead. A kept
         // ticket lets go of its value, which the cache owns and charges, and
         // the value is dropped after the lock.
-        let mut value = State::Pending;
+        let mut value = None;
         if shard.spare.len() < SPARE_TICKETS
             && let Some(unshared) = Arc::get_mut(&mut ticket)
         {
-            core::mem::swap(&mut value, unshared.state.get_mut());
+            value = unshared.value.get_mut().take();
             shard.spare.push(ticket);
         }
         drop(shard);
