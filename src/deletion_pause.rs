@@ -468,20 +468,46 @@ impl DeletionPause {
         self.pins.lock().files.contains_key(path)
     }
 
-    /// Takes over the removal of `path` when a live pin lists it, returning
-    /// `true`; the removal runs when the last pin listing the file drops.
-    /// Never blocks, so a `Drop` impl may call it.
+    /// Takes over the removal of `path` when a live pin lists it or a pin is
+    /// being taken, returning `true`: the removal runs once no pin lists the
+    /// file and none is being taken. Never blocks, so a `Drop` impl may call
+    /// it.
     pub(crate) fn defer_removal_if_pinned(
         &self,
         fs: &Arc<dyn Fs>,
         path: &crate::path::Path,
     ) -> bool {
         let mut state = self.pins.lock();
-        if !state.files.contains_key(path) {
+        if state.pending == 0 && !state.files.contains_key(path) {
             return false;
         }
         state.removals.push((Arc::clone(fs), path.to_path_buf()));
         true
+    }
+
+    /// Runs the deferred removals that are due: none while a pin is being
+    /// taken, otherwise those of the files no pin lists.
+    fn remove_due(&self) {
+        let due = {
+            let mut state = self.pins.lock();
+            if state.pending > 0 || state.removals.is_empty() {
+                return;
+            }
+            let removals = core::mem::take(&mut state.removals);
+            let (due, kept): (Vec<_>, Vec<_>) = removals
+                .into_iter()
+                .partition(|(_, path)| !state.files.contains_key(path.as_path()));
+            state.removals = kept;
+            due
+        };
+        for (fs, path) in due {
+            if let Err(e) = fs.remove_file(&path) {
+                log::warn!(
+                    "Failed to remove {} after its last pin dropped: {e:?}",
+                    path.display(),
+                );
+            }
+        }
     }
 
     /// Stops new in-place mutations and waits for the ones under way, so the
@@ -500,43 +526,29 @@ impl DeletionPause {
     }
 
     /// Registers the files of a pin.
-    pub(crate) fn pin_files(&self, paths: &[PathBuf]) {
+    pub(crate) fn pin_files<'p>(&self, paths: impl Iterator<Item = &'p crate::path::Path>) {
         let mut state = self.pins.lock();
         for path in paths {
             // Bounded by the number of live pins.
-            *state.files.entry(path.clone()).or_insert(0) += 1;
+            *state.files.entry(path.to_path_buf()).or_insert(0) += 1;
         }
     }
 
     /// Releases the files of a pin: runs the removals deferred for the files
     /// no other pin lists, then the reclaims that waited for them.
-    pub(crate) fn unpin_files(&self, paths: &[PathBuf]) {
-        let removals = {
+    pub(crate) fn unpin_files<'p>(&self, paths: impl Iterator<Item = &'p crate::path::Path>) {
+        {
             let mut state = self.pins.lock();
-            let mut released = Vec::new();
             for path in paths {
-                if let Some(count) = state.files.get_mut(path.as_path()) {
+                if let Some(count) = state.files.get_mut(path) {
                     *count -= 1;
                     if *count == 0 {
-                        state.files.remove(path.as_path());
-                        released.push(path);
+                        state.files.remove(path);
                     }
                 }
             }
-            let (due, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut state.removals)
-                .into_iter()
-                .partition(|(_, path)| released.contains(&path));
-            state.removals = kept;
-            due
-        };
-        for (fs, path) in removals {
-            if let Err(e) = fs.remove_file(&path) {
-                log::warn!(
-                    "Failed to remove {} after its last pin dropped: {e:?}",
-                    path.display(),
-                );
-            }
         }
+        self.remove_due();
         self.retry_pending_reclaims();
     }
 }
@@ -568,6 +580,10 @@ pub struct PinGuard<'a> {
 impl Drop for PinGuard<'_> {
     fn drop(&mut self) {
         self.pause.pins.lock().pending -= 1;
+        // A removal deferred while the pin was taken goes now unless the pin
+        // listed the file. A reclaim retained meanwhile waits for the next
+        // retry: running it here would give the pin file I/O of its own.
+        self.pause.remove_due();
     }
 }
 

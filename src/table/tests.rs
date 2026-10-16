@@ -1769,7 +1769,7 @@ fn punch_on_drop_waits_for_the_pin_listing_the_file() -> crate::Result<()> {
 
     let pause = crate::deletion_pause::DeletionPause::new_shared();
     table.install_deletion_pause(Arc::clone(&pause));
-    pause.pin_files(core::slice::from_ref(&path));
+    pause.pin_files(core::iter::once(path.as_path()));
     let punch = table.punch_offset_for(b"k0128")?;
     assert!(punch > 0, "the fixture has a punchable prefix");
     table.mark_punch_on_drop(punch);
@@ -1781,7 +1781,7 @@ fn punch_on_drop_waits_for_the_pin_listing_the_file() -> crate::Result<()> {
         "the reclaim waits for the pin"
     );
 
-    pause.unpin_files(core::slice::from_ref(&path));
+    pause.unpin_files(core::iter::once(path.as_path()));
     assert!(!pause.has_pending_reclaims(), "the pin's release ran it");
     assert!(
         read(&fs)?

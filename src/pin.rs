@@ -141,7 +141,6 @@ pub struct PinnedVersion {
     version: Version,
     sealed: Arc<SealedMemtables>,
     seqno: SeqNo,
-    files: Vec<PathBuf>,
     tables: Vec<PinnedFile>,
     blob_files: Vec<PinnedFile>,
     dictionaries: Vec<PinnedFile>,
@@ -159,14 +158,37 @@ impl PinnedVersion {
         // the version is captured and its files registered.
         let pinning = pause.begin_pin();
 
-        let mut history = tree.version_history.write();
-        // Every write below this seqno has reached the active memtable: the
-        // insert runs under this lock's read side.
-        let seqno = tree.config.visible_seqno.get();
-        tree.rotate_memtable_locked(&mut history);
-        let super_version = history.latest_version();
-        let version = super_version.version.clone();
-        let sealed = Arc::clone(&super_version.sealed_memtables);
+        // The version lock is held only to seal, capture and register the
+        // dictionaries: writers wait on it, and the listings below can be long.
+        let (seqno, version, sealed, dictionaries) = {
+            let mut history = tree.version_history.write();
+            // Every write below this seqno has reached the active memtable:
+            // the insert runs under this lock's read side.
+            let seqno = tree.config.visible_seqno.get();
+            tree.rotate_memtable_locked(&mut history);
+            let super_version = history.latest_version_ref();
+            let version = super_version.version.clone();
+            let sealed = Arc::clone(&super_version.sealed_memtables);
+
+            let folder = tree.config.path.join(crate::file::DICTS_FOLDER);
+            let dictionaries: Vec<PinnedFile> = version
+                .dicts()
+                .iter()
+                .map(|&id| PinnedFile {
+                    id: u64::from(id),
+                    level: None,
+                    path: folder.join(id.to_string()),
+                    fs: Arc::clone(&tree.config.fs),
+                })
+                .collect();
+            // Under the version lock: the dictionary collection, which runs
+            // under it too, sees the pin or has finished. A table or blob file
+            // needs no such window: the captured version holds it, and no
+            // mutation starts before `pinning` drops.
+            pause.pin_files(dictionaries.iter().map(PinnedFile::path));
+            drop(history);
+            (seqno, version, sealed, dictionaries)
+        };
 
         let tables: Vec<PinnedFile> = version
             .iter_levels()
@@ -192,35 +214,13 @@ impl PinnedVersion {
                 fs: Arc::clone(&blob_file.0.fs),
             })
             .collect();
-        let folder = tree.config.path.join(crate::file::DICTS_FOLDER);
-        let dictionaries: Vec<PinnedFile> = version
-            .dicts()
-            .iter()
-            .map(|&id| PinnedFile {
-                id: u64::from(id),
-                level: None,
-                path: folder.join(id.to_string()),
-                fs: Arc::clone(&tree.config.fs),
-            })
-            .collect();
-
-        let files: Vec<PathBuf> = tables
-            .iter()
-            .chain(&blob_files)
-            .chain(&dictionaries)
-            .map(|file| file.path.clone())
-            .collect();
-        // Under the version lock: the dictionary collection, which runs under
-        // it too, sees the pin or has finished.
-        pause.pin_files(&files);
-        drop(history);
+        pause.pin_files(tables.iter().chain(&blob_files).map(PinnedFile::path));
         drop(pinning);
 
         Self {
             version,
             sealed,
             seqno,
-            files,
             tables,
             blob_files,
             dictionaries,
@@ -323,7 +323,13 @@ impl Drop for PinnedVersion {
     fn drop(&mut self) {
         // Before the version's handles drop, so the files whose last view goes
         // with them are removed the ordinary way.
-        self.pause.unpin_files(&self.files);
+        self.pause.unpin_files(
+            self.tables
+                .iter()
+                .chain(&self.blob_files)
+                .chain(&self.dictionaries)
+                .map(PinnedFile::path),
+        );
     }
 }
 
