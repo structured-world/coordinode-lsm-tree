@@ -536,7 +536,7 @@ fn copy_metadata_file_optional(
 /// section read does not invalidate the digest (the TOC-bound
 /// section checksum was stamped at writer-time, not derived from
 /// on-disk bytes).
-fn write_current_for_version(
+pub fn write_current_for_version(
     target_fs: &dyn Fs,
     target_root: &Path,
     version_id: u64,

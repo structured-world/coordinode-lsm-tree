@@ -1723,6 +1723,75 @@ fn punch_on_drop_retains_the_reclaim_while_a_checkpoint_link_survives() -> crate
     Ok(())
 }
 
+/// A tight-space reclaim of a file a pin lists waits for the pin: the dropping
+/// view retains the reclaim and leaves the bytes, and the pin's release
+/// punches the consumed prefix.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_waits_for_the_pin_listing_the_file() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::MemFs::new());
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(256);
+    for i in 0..256u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"v",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let read = |fs: &Arc<dyn Fs>| -> crate::Result<Vec<u8>> {
+        let file = fs.open(&path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        Ok(crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec())
+    };
+    let before = read(&fs)?;
+
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    table.install_deletion_pause(Arc::clone(&pause));
+    pause.pin_files(core::slice::from_ref(&path));
+    let punch = table.punch_offset_for(b"k0128")?;
+    assert!(punch > 0, "the fixture has a punchable prefix");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+
+    assert_eq!(read(&fs)?, before, "a pinned file keeps its bytes");
+    assert!(
+        pause.has_pending_reclaims(),
+        "the reclaim waits for the pin"
+    );
+
+    pause.unpin_files(core::slice::from_ref(&path));
+    assert!(!pause.has_pending_reclaims(), "the pin's release ran it");
+    assert!(
+        read(&fs)?
+            .get(..64)
+            .is_some_and(|head| head.iter().all(|&b| b == 0)),
+        "the reclaim punched the consumed prefix once the pin dropped",
+    );
+    Ok(())
+}
+
 /// `reopen_restricted` creates a DISTINCT `Inner` for the same table, so it must
 /// PROPAGATE the tree-installed shared gates onto it: the checkpoint deletion
 /// pause and the heal lock. Without them a restricted view skips the checkpoint

@@ -432,7 +432,7 @@ fn scan_and_reconcile(
     // gates it too: without `page_ecc` an ECC table falls back to the
     // read-only scrub (nothing can have healed), so reconciling would burn
     // a digest read only to fail closed on the walk's parity warning.
-    let heals =
+    let mut heals =
         cfg!(feature = "page_ecc") && options.heal_in_place && table.metadata.ecc_params.is_some();
     // Serializes same-table heals for the WHOLE scan-to-reconcile span (not
     // just the scan): with two overlapping heal patrols, A could compute a
@@ -458,6 +458,17 @@ fn scan_and_reconcile(
                 .map(|p| p.enter_mutation_window())
         })
         .flatten();
+    // A pinned table keeps its bytes until its last pin drops: it is scanned
+    // without writing (reads correct the faults meanwhile), and the first heal
+    // patrol after the pin heals it. A pin being taken waits for this heal.
+    let _unpinned = match table.deletion_pause.get().filter(|_| heals) {
+        Some(pause) => {
+            let guard = pause.begin_mutation(&table.path);
+            heals = guard.is_some();
+            guard
+        }
+        None => None,
+    };
     // The CURRENT view of this table, resolved under the heal lock: a
     // concurrent patrol may have refreshed the manifest — or a tight-space
     // compaction may have installed a RESTRICTED same-id view — after this
@@ -487,7 +498,7 @@ fn scan_and_reconcile(
         .as_ref()
         .map_or_else(|| table.checksum(), crate::table::Table::checksum);
     let (mut partial, heal_attributable) =
-        scan_one(scan_table, options, tree.sync_mode(), manifest_checksum);
+        scan_one(scan_table, heals, tree.sync_mode(), manifest_checksum);
     if heals
         && wants_checksum_refresh(&partial)
         && let Some(finding) = refresh_healed_checksum(tree, scan_table, heal_attributable)
@@ -1040,20 +1051,19 @@ fn refresh_healed_checksum(
 /// which never writes.
 fn scan_one(
     table: &crate::table::Table,
-    options: &PatrolScrubOptions,
+    heal: bool,
     sync_mode: crate::fs::SyncMode,
     manifest_checksum: crate::Checksum,
 ) -> (PatrolScrubReport, bool) {
-    // In-place heal only applies to SSTs written with Page-ECC parity — there is
-    // nothing to reconstruct without it. A table with no ECC still needs its
-    // integrity checked, so it takes the normal scrub path (which verifies each
-    // block's checksum and reports uncorrectable ones) rather than the heal path,
-    // whose per-block reconstruction is a no-op there.
+    // `heal` holds only for a Page-ECC table (there is nothing to reconstruct
+    // without parity) that no pin lists. Every other table still needs its
+    // integrity checked, so it takes the normal scrub path, which verifies each
+    // block's checksum and reports uncorrectable ones without writing.
     #[cfg(feature = "page_ecc")]
-    if options.heal_in_place && table.metadata.ecc_params.is_some() {
+    if heal {
         return table.heal_data_blocks_in_place(sync_mode, manifest_checksum);
     }
-    let _ = (options, sync_mode, manifest_checksum);
+    let _ = (heal, sync_mode, manifest_checksum);
     (table.scrub_data_blocks(), false)
 }
 

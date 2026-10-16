@@ -539,6 +539,11 @@ impl AbstractTree for Tree {
         )
     }
 
+    #[cfg(feature = "std")]
+    fn pin(&self) -> crate::PinnedVersion {
+        crate::PinnedVersion::take(self)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         let super_version = self.version_history.read().latest_version();
 
@@ -1398,36 +1403,8 @@ impl AbstractTree for Tree {
             .clone()
     }
 
-    #[expect(clippy::significant_drop_tightening)]
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
-        let mut version_history_lock = self.version_history.write();
-        let super_version = version_history_lock.latest_version();
-
-        if super_version.active_memtable.is_empty() {
-            return None;
-        }
-
-        let yanked_memtable = super_version.active_memtable;
-
-        let mut copy = version_history_lock.latest_version();
-        copy.active_memtable = Arc::new(Memtable::new(
-            self.memtable_id_counter.next(),
-            self.config.comparator.clone(),
-        ));
-        copy.sealed_memtables =
-            Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
-
-        // Rotate does not modify the memtable so it cannot break snapshots
-        copy.seqno = super_version.seqno;
-
-        version_history_lock.replace_latest_version(copy);
-
-        log::trace!(
-            "rotate: added memtable id={} to sealed memtables",
-            yanked_memtable.id,
-        );
-
-        Some(yanked_memtable)
+        self.rotate_memtable_locked(&mut self.version_history.write())
     }
 
     fn table_count(&self) -> usize {
@@ -2312,6 +2289,16 @@ impl Tree {
             // simply be run again, so waiting for the next pass costs nothing
             // and leaves no queued action to fire against a re-registered file.
             if self.deletion_pause.is_active() {
+                continue;
+            }
+            // A pin lists the dictionary for its copy: skipped the same way,
+            // and the next pass after the pin drops removes it. Pins register
+            // under the version lock held here, so none can slip in between.
+            #[cfg(feature = "std")]
+            if self
+                .deletion_pause
+                .is_pinned(&crate::dicts::path_of(&folder, id))
+            {
                 continue;
             }
             crate::dicts::remove(&*self.config.fs, &folder, id, self.config.sync_mode)?;
@@ -5143,6 +5130,41 @@ impl Tree {
             None,
             None,
         ))
+    }
+
+    /// Seals the active memtable under the held version lock, returning it,
+    /// or `None` when it is empty.
+    pub(crate) fn rotate_memtable_locked(
+        &self,
+        history: &mut crate::version::SuperVersions,
+    ) -> Option<Arc<Memtable>> {
+        let super_version = history.latest_version_ref();
+
+        if super_version.active_memtable.is_empty() {
+            return None;
+        }
+
+        let yanked_memtable = Arc::clone(&super_version.active_memtable);
+
+        let mut copy = super_version.clone();
+        copy.active_memtable = Arc::new(Memtable::new(
+            self.memtable_id_counter.next(),
+            self.config.comparator.clone(),
+        ));
+        copy.sealed_memtables =
+            Arc::new(super_version.sealed_memtables.add(yanked_memtable.clone()));
+
+        // Rotate does not modify the memtable so it cannot break snapshots
+        copy.seqno = super_version.seqno;
+
+        history.replace_latest_version(copy);
+
+        log::trace!(
+            "rotate: added memtable id={} to sealed memtables",
+            yanked_memtable.id,
+        );
+
+        Some(yanked_memtable)
     }
 
     /// Adds an item to the active memtable.

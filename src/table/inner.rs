@@ -383,6 +383,15 @@ impl Drop for Inner {
                 return;
             }
 
+            // A pin may list the file through another view of it (the one
+            // before a tight-space restriction): it stays until that pin drops.
+            #[cfg(feature = "std")]
+            if let Some(pause) = self.deletion_pause.get()
+                && pause.defer_removal_if_pinned(&self.fs, &self.path)
+            {
+                return;
+            }
+
             // Off-foreground reclaim: return the SST's blocks to the filesystem
             // synchronously (so a footprint scan reflects the reclaim at once)
             // and hand the directory-entry unlink to the background deleter.
@@ -497,6 +506,20 @@ impl Drop for Inner {
                 );
                 return;
             }
+
+            // A pinned file keeps its bytes until its last pin drops, which
+            // retries the retained reclaim; a pin being taken waits for this
+            // punch to finish.
+            #[cfg(feature = "std")]
+            let _unpinned = if let Some(pause) = self.deletion_pause.get() {
+                let Some(guard) = pause.begin_mutation(&self.path) else {
+                    pause.retain_reclaim(Arc::clone(&self.fs), (*self.path).clone(), reclaimable);
+                    return;
+                };
+                Some(guard)
+            } else {
+                None
+            };
 
             // Reclaim only what this tree exclusively owns. A completed
             // checkpoint hard-links SST files, and its captured manifest still

@@ -225,6 +225,13 @@ pub mod backpressure;
 #[cfg(feature = "std")]
 pub(crate) mod checkpoint;
 
+// std-only like checkpoints: the restore writes the received tree through the
+// filesystem, and the pin's registry waits on a condition variable.
+#[cfg(feature = "std")]
+mod pin;
+#[cfg(feature = "std")]
+pub use pin::{PinnedEntry, PinnedFile, PinnedRangeTombstone, PinnedVersion};
+
 #[doc(hidden)]
 pub mod blob_tree;
 

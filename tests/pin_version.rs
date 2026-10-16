@@ -1,0 +1,353 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026-present, Dmitry Prudnikov
+//
+// End-to-end tests for `AbstractTree::pin`: a point-in-time view that holds the
+// tree's files in place without file I/O, and `Config::restore_pinned`, which
+// rebuilds the tree from it elsewhere.
+
+use lsm_tree::{
+    AbstractTree, AnyTree, Config, Guard, KvSeparationOptions, PinnedVersion, SeqNo,
+    SequenceNumberCounter,
+    fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, StdFs},
+    io::ErrorKind,
+};
+use std::{path::Path, sync::Arc};
+use test_log::test;
+
+/// A tree at `path`, a blob tree when `blob`, whose visible seqno `visible`
+/// drives.
+fn open(path: &Path, blob: bool, visible: &SequenceNumberCounter) -> lsm_tree::Result<AnyTree> {
+    let config = Config::new(path, SequenceNumberCounter::default(), visible.clone());
+    if blob {
+        config
+            .with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(64),
+            ))
+            .open()
+    } else {
+        config.open()
+    }
+}
+
+/// A value of `len` bytes that names `key` and `seqno`.
+fn value(key: &str, seqno: SeqNo, len: usize) -> Vec<u8> {
+    format!("{key}@{seqno}:").into_bytes().repeat(len / 8 + 1)
+}
+
+/// Writes a history into `tree`: tables with overwrites, tombstones and a range
+/// tombstone, and a memtable holding more of each. Returns the next seqno.
+fn write_history(tree: &AnyTree, visible: &SequenceNumberCounter) -> lsm_tree::Result<SeqNo> {
+    let mut seqno = 0;
+    let step = |seqno: &mut SeqNo| {
+        *seqno += 1;
+        visible.set(*seqno);
+        *seqno - 1
+    };
+    for i in 0..40 {
+        let key = format!("k{i:02}");
+        let s = step(&mut seqno);
+        tree.insert(key.as_str(), value(&key, s, 8 + i * 10), s);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in (0..40).step_by(3) {
+        let key = format!("k{i:02}");
+        let s = step(&mut seqno);
+        tree.insert(key.as_str(), value(&key, s, 200), s);
+    }
+    let s = step(&mut seqno);
+    tree.remove("k05", s);
+    let s = step(&mut seqno);
+    let _ = tree.remove_range("k30", "k33", s);
+    tree.flush_active_memtable(0)?;
+    // Left in the memtable: the pin seals it.
+    for i in (1..40).step_by(4) {
+        let key = format!("k{i:02}");
+        let s = step(&mut seqno);
+        tree.insert(key.as_str(), value(&key, s, 120), s);
+    }
+    let s = step(&mut seqno);
+    tree.remove("k08", s);
+    let s = step(&mut seqno);
+    let _ = tree.remove_range("k20", "k22", s);
+    Ok(seqno)
+}
+
+/// Every key and value `tree` reads at snapshot `seqno`.
+fn read_at(tree: &AnyTree, seqno: SeqNo) -> lsm_tree::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    tree.iter(seqno, None)
+        .map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.to_vec(), value.to_vec()))
+        })
+        .collect()
+}
+
+/// Copies the pin's files into the tree folders under `root`, as a consumer
+/// streaming them would.
+fn ship(pin: &PinnedVersion, root: &Path) -> lsm_tree::Result<()> {
+    for (folder, files) in [
+        ("tables", pin.tables()),
+        ("blobs", pin.blob_files()),
+        ("dicts", pin.dictionaries()),
+    ] {
+        std::fs::create_dir_all(root.join(folder))?;
+        for file in files {
+            std::fs::copy(file.path(), root.join(folder).join(file.id().to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The bytes of every file `pin` lists.
+fn contents(pin: &PinnedVersion) -> lsm_tree::Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+    pin.tables()
+        .iter()
+        .chain(pin.blob_files())
+        .map(|file| Ok((file.path().to_path_buf(), std::fs::read(file.path())?)))
+        .collect()
+}
+
+/// Waits for `path` to be removed; a removal may be handed to a background
+/// deleter.
+fn gone(path: &Path) -> bool {
+    for _ in 0..500 {
+        if !path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// Whether `tree`'s current version still lists `path`.
+fn current(tree: &AnyTree, path: &Path) -> bool {
+    let version = tree.current_version();
+    version.iter_tables().any(|table| &**table.path == path)
+        || version.blob_files.iter().any(|blob| blob.path() == path)
+}
+
+#[test]
+fn pin_performs_no_file_io() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let injector = Arc::new(FaultInjector::new());
+    let visible = SequenceNumberCounter::default();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        visible.clone(),
+    )
+    .with_fs(FaultFs::with_injector(StdFs, Arc::clone(&injector)))
+    .open()?;
+    write_history(&tree, &visible)?;
+
+    for op in [
+        FaultOp::Open,
+        FaultOp::CreateDir,
+        FaultOp::CreateDirAll,
+        FaultOp::RemoveFile,
+        FaultOp::Rename,
+        FaultOp::SyncDirectory,
+        FaultOp::Write,
+        FaultOp::Flush,
+        FaultOp::SyncAll,
+        FaultOp::SyncData,
+        FaultOp::SetLen,
+        FaultOp::HardLink,
+        FaultOp::Reflink,
+        FaultOp::PunchHole,
+    ] {
+        injector.arm(FaultRule::new(op, Fault::Error(ErrorKind::Other)));
+    }
+    let opens = injector.open_count();
+
+    let pin = tree.pin();
+    assert_eq!(injector.open_count(), opens, "the pin opened no file");
+    assert_eq!(pin.tables().len(), 2);
+    assert!(
+        pin.memtable_entries().count() > 0,
+        "the memtable was sealed"
+    );
+    assert!(!pin.layout()?.is_empty(), "the layout is built in memory");
+
+    injector.clear();
+    Ok(())
+}
+
+/// Every file a pin lists keeps its bytes while a flush and a major compaction
+/// supersede it, and goes once the pin drops.
+fn superseded_files_stay_until_the_pin_drops(blob: bool) -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(dir.path(), blob, &visible)?;
+    let mut seqno = write_history(&tree, &visible)?;
+
+    let pin = tree.pin();
+    let pinned = contents(&pin)?;
+
+    for i in 0..40 {
+        let key = format!("k{i:02}");
+        tree.insert(key.as_str(), value(&key, seqno, 300), seqno);
+        seqno += 1;
+    }
+    visible.set(seqno);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, seqno)?;
+
+    let superseded: Vec<&Path> = pinned
+        .iter()
+        .map(|(path, _)| path.as_path())
+        .filter(|path| !current(&tree, path))
+        .collect();
+    assert!(
+        !superseded.is_empty(),
+        "the compaction superseded pinned files"
+    );
+    for (path, bytes) in &pinned {
+        assert_eq!(
+            &std::fs::read(path)?,
+            bytes,
+            "{} changed under the pin",
+            path.display()
+        );
+    }
+
+    drop(pin);
+    for path in superseded {
+        assert!(gone(path), "{} outlived the pin", path.display());
+    }
+    Ok(())
+}
+
+#[test]
+fn pinned_tables_stay_until_the_pin_drops() -> lsm_tree::Result<()> {
+    superseded_files_stay_until_the_pin_drops(false)
+}
+
+#[test]
+fn pinned_blob_files_stay_until_the_pin_drops() -> lsm_tree::Result<()> {
+    superseded_files_stay_until_the_pin_drops(true)
+}
+
+/// A tree restored from a pin reads as the source did at the pin, for every
+/// key and every snapshot up to the pin's seqno.
+fn restore_matches_the_source(blob: bool) -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), blob, &visible)?;
+    let mut seqno = write_history(&tree, &visible)?;
+
+    let pin = tree.pin();
+    assert_eq!(pin.seqno(), seqno);
+    let expected: Vec<_> = (0..=pin.seqno())
+        .map(|at| read_at(&tree, at))
+        .collect::<lsm_tree::Result<_>>()?;
+
+    // The source moves on; the pin does not.
+    for i in 0..10 {
+        let key = format!("k{i:02}");
+        tree.insert(key.as_str(), value(&key, seqno, 90), seqno);
+        seqno += 1;
+    }
+    visible.set(seqno);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    ship(&pin, dst.path())?;
+    let restored_visible = SequenceNumberCounter::new(pin.seqno());
+    let config = Config::new(
+        dst.path(),
+        SequenceNumberCounter::new(pin.seqno()),
+        restored_visible.clone(),
+    );
+    let config = if blob {
+        config.with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(64),
+        ))
+    } else {
+        config
+    };
+    let layout = pin.layout()?;
+    let restored = config.restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    )?;
+    drop(pin);
+
+    for (at, expected) in expected.iter().enumerate() {
+        let at = SeqNo::try_from(at).unwrap_or(SeqNo::MAX);
+        assert_eq!(&read_at(&restored, at)?, expected, "snapshot {at}");
+        assert_eq!(&read_at(&tree, at)?, expected, "source snapshot {at}");
+    }
+    Ok(())
+}
+
+#[test]
+fn restored_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
+    restore_matches_the_source(false)
+}
+
+#[test]
+fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
+    restore_matches_the_source(true)
+}
+
+/// Pins release independently: a file stays while any pin listing it lives.
+#[test]
+fn concurrent_pins_release_independently() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(dir.path(), false, &visible)?;
+    let mut seqno = write_history(&tree, &visible)?;
+
+    let mut rewrite = |tree: &AnyTree| -> lsm_tree::Result<()> {
+        for i in 0..40 {
+            let key = format!("k{i:02}");
+            tree.insert(key.as_str(), value(&key, seqno, 50), seqno);
+            seqno += 1;
+        }
+        visible.set(seqno);
+        tree.flush_active_memtable(0)?;
+        tree.major_compact(u64::MAX, seqno)?;
+        Ok(())
+    };
+
+    let first = tree.pin();
+    rewrite(&tree)?;
+    let second = tree.pin();
+    rewrite(&tree)?;
+
+    let first_only: Vec<_> = first
+        .tables()
+        .iter()
+        .map(|file| file.path().to_path_buf())
+        .collect();
+    let second_only: Vec<_> = second
+        .tables()
+        .iter()
+        .map(|file| file.path().to_path_buf())
+        .collect();
+    assert!(first_only.iter().all(|path| !second_only.contains(path)));
+    assert!(
+        first_only
+            .iter()
+            .chain(&second_only)
+            .all(|path| path.exists())
+    );
+
+    drop(first);
+    for path in &first_only {
+        assert!(gone(path), "{} outlived its only pin", path.display());
+    }
+    assert!(
+        second_only.iter().all(|path| path.exists()),
+        "the second pin still holds its files"
+    );
+
+    drop(second);
+    for path in &second_only {
+        assert!(gone(path), "{} outlived its only pin", path.display());
+    }
+    Ok(())
+}

@@ -185,6 +185,15 @@ impl Drop for Inner {
                 return;
             }
 
+            // A pin may list the file through another view of it (the one
+            // before a tight-space relocation): it stays until that pin drops.
+            #[cfg(feature = "std")]
+            if let Some(pause) = self.deletion_pause.get()
+                && pause.defer_removal_if_pinned(&self.fs, &self.path)
+            {
+                return;
+            }
+
             // Off-foreground reclaim: free the blocks synchronously (accurate
             // footprint scan) and hand the unlink to the background deleter.
             // Falls through to a synchronous remove_file when none installed.
@@ -294,43 +303,60 @@ impl Drop for Inner {
                         // `retry_pending_reclaims` — mirroring the table-prefix
                         // punch. A bare retention, never a blocking re-probe:
                         // this is a Drop impl (see `retain_reclaim`).
-                        if !deferred {
-                            let exclusively_owned = match self.fs.hard_link_count(&self.path) {
-                                Ok(n) => n <= 1,
-                                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
-                                    // The file is gone: its space is already back.
-                                    return;
-                                }
-                                Err(e) => {
-                                    log::debug!(
-                                        "Retaining tight-space punch of blob file {:?} at {} for a retry: link-count probe failed: {e:?}",
-                                        self.id,
-                                        self.path.display(),
-                                    );
-                                    false
-                                }
-                            };
-                            let punch_failed = exclusively_owned
-                                && match self.fs.punch_hole(&self.path, data_start, len) {
-                                    Ok(()) => false,
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}; retaining it for a retry: {e:?}",
-                                            self.id,
-                                            self.path.display(),
-                                        );
-                                        true
-                                    }
-                                };
-                            if (!exclusively_owned || punch_failed)
-                                && let Some(pause) = self.deletion_pause.get()
-                            {
+                        if deferred {
+                            return;
+                        }
+                        // A pinned file keeps its bytes until its last pin
+                        // drops, which retries the retained reclaim; a pin
+                        // being taken waits for this punch to finish.
+                        let _unpinned = if let Some(pause) = self.deletion_pause.get() {
+                            let Some(guard) = pause.begin_mutation(&self.path) else {
                                 pause.retain_reclaim(
                                     Arc::clone(&self.fs),
                                     self.path.clone(),
                                     alloc::vec![(data_start, len)],
                                 );
+                                return;
+                            };
+                            Some(guard)
+                        } else {
+                            None
+                        };
+                        let exclusively_owned = match self.fs.hard_link_count(&self.path) {
+                            Ok(n) => n <= 1,
+                            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {
+                                // The file is gone: its space is already back.
+                                return;
                             }
+                            Err(e) => {
+                                log::debug!(
+                                    "Retaining tight-space punch of blob file {:?} at {} for a retry: link-count probe failed: {e:?}",
+                                    self.id,
+                                    self.path.display(),
+                                );
+                                false
+                            }
+                        };
+                        let punch_failed = exclusively_owned
+                            && match self.fs.punch_hole(&self.path, data_start, len) {
+                                Ok(()) => false,
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to punch tight-space data [{data_start}, {off}) of blob file {:?} at {}; retaining it for a retry: {e:?}",
+                                        self.id,
+                                        self.path.display(),
+                                    );
+                                    true
+                                }
+                            };
+                        if (!exclusively_owned || punch_failed)
+                            && let Some(pause) = self.deletion_pause.get()
+                        {
+                            pause.retain_reclaim(
+                                Arc::clone(&self.fs),
+                                self.path.clone(),
+                                alloc::vec![(data_start, len)],
+                            );
                         }
                     }
                 }

@@ -78,6 +78,34 @@ pub struct DeletionPause {
     /// blocking operations, so spinning would burn a core.
     #[cfg(feature = "std")]
     link_gate: parking_lot::RwLock<()>,
+
+    /// The files live pins list, and the in-place mutations that keep a pin
+    /// from being taken: a pinned file's bytes must not change until its last
+    /// pin drops. `parking_lot`: a pin waits on `pins_settled` for in-flight
+    /// mutations to finish, which spinning would turn into a busy core.
+    #[cfg(feature = "std")]
+    pins: parking_lot::Mutex<PinState>,
+
+    /// Signalled when the last in-flight mutation finishes.
+    #[cfg(feature = "std")]
+    pins_settled: parking_lot::Condvar,
+}
+
+/// See [`DeletionPause::pins`].
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct PinState {
+    /// Pins being taken: while non-zero no in-place mutation starts, so the
+    /// version a pin captures is not changed under it before its files are
+    /// registered.
+    pending: u32,
+    /// In-place mutations under way (a heal, a prefix punch).
+    in_flight: u32,
+    /// How many live pins list each file.
+    files: crate::HashMap<PathBuf, u32>,
+    /// Removals of pinned files whose last view dropped, run when the last
+    /// pin listing the file drops.
+    removals: Vec<(Arc<dyn Fs>, PathBuf)>,
 }
 
 #[cfg_attr(
@@ -327,6 +355,13 @@ impl DeletionPause {
         };
         #[cfg(feature = "std")]
         let _mutation = self.enter_mutation_window();
+        // A pinned file keeps its bytes until its last pin drops, which retries
+        // this reclaim.
+        #[cfg(feature = "std")]
+        let Some(_unpinned) = self.begin_mutation(&item.path) else {
+            pending.lock().push(item);
+            return;
+        };
         match item.fs.hard_link_count(&item.path) {
             Ok(n) if n <= 1 => {
                 let mut unreclaimed: Option<Vec<(u64, u64)>> = None;
@@ -405,6 +440,134 @@ impl DeletionPause {
     #[cfg(test)]
     pub(crate) fn has_pending_reclaims(&self) -> bool {
         !self.pending_reclaims.lock().is_empty()
+    }
+}
+
+#[cfg(feature = "std")]
+impl DeletionPause {
+    /// Starts an in-place mutation of `path` (a heal write-back, a prefix
+    /// punch), or `None` when a live pin lists the file or a pin is being
+    /// taken: the caller then leaves the file as it is and keeps its intent
+    /// for a later attempt. Never blocks, so a `Drop` impl may call it.
+    pub(crate) fn begin_mutation(&self, path: &crate::path::Path) -> Option<MutationGuard<'_>> {
+        let mut state = self.pins.lock();
+        if state.pending > 0 || state.files.contains_key(path) {
+            return None;
+        }
+        // Bounded by the number of threads mutating at once.
+        state.in_flight += 1;
+        drop(state);
+        Some(MutationGuard { pause: self })
+    }
+
+    /// Whether a live pin lists `path`. Only dictionary collection asks: the
+    /// other paths need the answer together with a mutation slot or a
+    /// deferred removal.
+    #[cfg(zstd_any)]
+    pub(crate) fn is_pinned(&self, path: &crate::path::Path) -> bool {
+        self.pins.lock().files.contains_key(path)
+    }
+
+    /// Takes over the removal of `path` when a live pin lists it, returning
+    /// `true`; the removal runs when the last pin listing the file drops.
+    /// Never blocks, so a `Drop` impl may call it.
+    pub(crate) fn defer_removal_if_pinned(
+        &self,
+        fs: &Arc<dyn Fs>,
+        path: &crate::path::Path,
+    ) -> bool {
+        let mut state = self.pins.lock();
+        if !state.files.contains_key(path) {
+            return false;
+        }
+        state.removals.push((Arc::clone(fs), path.to_path_buf()));
+        true
+    }
+
+    /// Stops new in-place mutations and waits for the ones under way, so the
+    /// version a pin captures next is not changed under it. The returned
+    /// guard lets mutations start again once the pin's files are registered.
+    ///
+    /// Holds no lock while waiting: a heal under way takes the version lock
+    /// to record its new digest, and must be able to.
+    pub(crate) fn begin_pin(&self) -> PinGuard<'_> {
+        let mut state = self.pins.lock();
+        state.pending += 1;
+        while state.in_flight > 0 {
+            self.pins_settled.wait(&mut state);
+        }
+        PinGuard { pause: self }
+    }
+
+    /// Registers the files of a pin.
+    pub(crate) fn pin_files(&self, paths: &[PathBuf]) {
+        let mut state = self.pins.lock();
+        for path in paths {
+            // Bounded by the number of live pins.
+            *state.files.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// Releases the files of a pin: runs the removals deferred for the files
+    /// no other pin lists, then the reclaims that waited for them.
+    pub(crate) fn unpin_files(&self, paths: &[PathBuf]) {
+        let removals = {
+            let mut state = self.pins.lock();
+            let mut released = Vec::new();
+            for path in paths {
+                if let Some(count) = state.files.get_mut(path.as_path()) {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.files.remove(path.as_path());
+                        released.push(path);
+                    }
+                }
+            }
+            let (due, kept): (Vec<_>, Vec<_>) = core::mem::take(&mut state.removals)
+                .into_iter()
+                .partition(|(_, path)| released.contains(&path));
+            state.removals = kept;
+            due
+        };
+        for (fs, path) in removals {
+            if let Err(e) = fs.remove_file(&path) {
+                log::warn!(
+                    "Failed to remove {} after its last pin dropped: {e:?}",
+                    path.display(),
+                );
+            }
+        }
+        self.retry_pending_reclaims();
+    }
+}
+
+/// An in-place mutation under way; see [`DeletionPause::begin_mutation`].
+#[cfg(feature = "std")]
+pub struct MutationGuard<'a> {
+    pause: &'a DeletionPause,
+}
+
+#[cfg(feature = "std")]
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.pause.pins.lock();
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            self.pause.pins_settled.notify_all();
+        }
+    }
+}
+
+/// A pin being taken; see [`DeletionPause::begin_pin`].
+#[cfg(feature = "std")]
+pub struct PinGuard<'a> {
+    pause: &'a DeletionPause,
+}
+
+#[cfg(feature = "std")]
+impl Drop for PinGuard<'_> {
+    fn drop(&mut self) {
+        self.pause.pins.lock().pending -= 1;
     }
 }
 

@@ -1317,6 +1317,11 @@ impl AbstractTree for BlobTree {
         )
     }
 
+    #[cfg(feature = "std")]
+    fn pin(&self) -> crate::PinnedVersion {
+        crate::PinnedVersion::take(&self.index)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         self.index.print_trace(key)
     }

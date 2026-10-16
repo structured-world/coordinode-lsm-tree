@@ -1441,6 +1441,43 @@ impl Config {
         })
     }
 
+    /// Builds a tree at [`Self::path`] from a [`PinnedVersion`](crate::PinnedVersion)
+    /// taken elsewhere, and opens it.
+    ///
+    /// Before the call, the pin's files lie in the tree's folders under their
+    /// ids: each of [`tables`](crate::PinnedVersion::tables) as `tables/{id}`
+    /// (with its [`heal_attestation`](crate::PinnedFile::heal_attestation),
+    /// when it has one, as `tables/{id}.heal-attest`), each of
+    /// [`blob_files`](crate::PinnedVersion::blob_files) as `blobs/{id}`, each of
+    /// [`dictionaries`](crate::PinnedVersion::dictionaries) as `dicts/{id}`.
+    /// `layout` is the pin's [`layout`](crate::PinnedVersion::layout), and
+    /// `entries` and `range_tombstones` are its
+    /// [`memtable_entries`](crate::PinnedVersion::memtable_entries) and
+    /// [`memtable_range_tombstones`](crate::PinnedVersion::memtable_range_tombstones).
+    ///
+    /// The files are synced and the layout published as the tree's manifest,
+    /// then the memtable contents are written with their sequence numbers and
+    /// flushed. The returned tree reads as the source did at the pin, for every
+    /// key and every snapshot the source served then. The config must match the
+    /// source's where it shapes the files: the tree type, comparator,
+    /// encryption provider and dictionaries.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidHeader`](crate::Error::InvalidHeader) for a layout too
+    /// short to hold its version id; otherwise the failures of the syncs, the
+    /// manifest write, [`Self::open`] and the flush. A `v{id}` already in the
+    /// folder is refused rather than overwritten.
+    #[cfg(feature = "std")]
+    pub fn restore_pinned(
+        self,
+        layout: &[u8],
+        entries: impl IntoIterator<Item = crate::PinnedEntry>,
+        range_tombstones: impl IntoIterator<Item = crate::PinnedRangeTombstone>,
+    ) -> crate::Result<AnyTree> {
+        crate::pin::restore(self, layout, entries, range_tombstones)
+    }
+
     /// A snapshot of the dictionaries the tree can currently decompress
     /// against.
     ///

@@ -517,6 +517,45 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "std")]
     fn create_checkpoint(&self, target_path: &crate::path::Path) -> crate::Result<CheckpointInfo>;
 
+    /// Pins the tree's current state for a point-in-time copy that costs no
+    /// file I/O: seals the active memtable and returns a
+    /// [`PinnedVersion`](crate::PinnedVersion) holding the sealed memtables,
+    /// tables, blob files and dictionaries as they are now.
+    ///
+    /// Nothing is copied, linked, synced or written. The pinned files stay on
+    /// disk with unchanged bytes while flushes and compactions supersede them,
+    /// until the last pin listing them drops; a consumer streams them byte for
+    /// byte and rebuilds the tree elsewhere with
+    /// [`Config::restore_pinned`](crate::Config::restore_pinned). A restart
+    /// drops every pin.
+    ///
+    /// Waits for an in-place heal or a tight-space hole punch already under
+    /// way to finish; new ones on a pinned file wait for the pin.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .open()?;
+    /// tree.insert("a", "1", 0);
+    /// tree.flush_active_memtable(0)?;
+    /// tree.insert("b", "2", 1);
+    ///
+    /// let pin = tree.pin();
+    /// assert_eq!(pin.tables().len(), 1);
+    /// assert_eq!(pin.memtable_entries().count(), 1);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    fn pin(&self) -> crate::PinnedVersion;
+
     /// Seals the active memtable and flushes it, with every memtable sealed
     /// before it, to tables: the durability barrier for a caller that keeps
     /// its own journal of the writes.

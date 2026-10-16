@@ -40,7 +40,7 @@ use std::io::{Read, Write};
 
 /// The file `id` is stored under.
 #[must_use]
-fn path_of(folder: &Path, id: DictId) -> PathBuf {
+pub fn path_of(folder: &Path, id: DictId) -> PathBuf {
     folder.join(id.to_string())
 }
 

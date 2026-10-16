@@ -429,6 +429,47 @@ fn patrol_scrub_heals_in_place_restoring_the_block_byte_for_byte() -> crate::Res
     Ok(())
 }
 
+/// A pinned table keeps its bytes: a heal patrol while the pin lives scans it
+/// without writing (the scan still corrects the fault it reads), and the first
+/// heal patrol after the pin drops heals it.
+#[test]
+fn heal_in_place_waits_for_the_pin_listing_the_table() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (sst_path, block) = write_ecc_sst(dir.path());
+
+    let original = std::fs::read(&sst_path)?;
+    let corrupt_pos = block.offset().0 as usize + Header::MIN_LEN + 3;
+    let mut rotted = original.clone();
+    let slot = rotted
+        .get_mut(corrupt_pos)
+        .expect("corrupt_pos in range for the SST bytes");
+    *slot ^= 0x80;
+    std::fs::write(&sst_path, &rotted)?;
+
+    let tree = open_ecc_tree(dir.path());
+    let opts = PatrolScrubOptions::default().heal_in_place(true);
+    let pin = tree.pin();
+    let report = patrol_scrub(&tree, &opts);
+    assert_eq!(report.blocks_healed_in_place, 0, "{report:?}");
+    assert_eq!(report.corrections_applied, 1, "{report:?}");
+    assert_eq!(
+        std::fs::read(&sst_path)?,
+        rotted,
+        "a heal under a pin leaves the pinned bytes as they are",
+    );
+
+    drop(pin);
+    let report = patrol_scrub(&tree, &opts);
+    assert_eq!(report.blocks_healed_in_place, 1, "{report:?}");
+    assert!(report.is_ok(), "{report:?}");
+    assert_eq!(
+        std::fs::read(&sst_path)?,
+        original,
+        "healed once the pin dropped"
+    );
+    Ok(())
+}
+
 #[test]
 fn patrol_scrub_heal_in_place_leaves_an_uncorrectable_block_for_salvage() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
