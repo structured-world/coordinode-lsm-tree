@@ -612,6 +612,24 @@ fn each_block_stores_seqnos_in_the_shorter_form() -> crate::Result<()> {
     Ok(())
 }
 
+/// The length the coding choice counts is the length the writer emits, at
+/// every 7-bit boundary and at both ends of the range.
+#[test]
+fn varint_len_matches_the_written_length() {
+    use varint_rs::VarintWriter;
+
+    let mut values = vec![0, u64::MAX];
+    for shift in 1..64 {
+        let edge = 1u64 << shift;
+        values.extend([edge - 1, edge, edge + 1]);
+    }
+    for value in values {
+        let mut written = Vec::new();
+        written.write_u64_varint(value).expect("write to a Vec");
+        assert_eq!(super::varint_len(value) as usize, written.len(), "{value}");
+    }
+}
+
 /// The choice compares encoded lengths over every interval of the block and
 /// keeps full seqnos on a tie: deltas of the same length as the seqnos
 /// compress worse than them.

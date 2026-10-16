@@ -288,8 +288,10 @@ impl SeqnoCoding {
 /// LEB128 length of `value`.
 #[inline]
 fn varint_len(value: u64) -> u32 {
-    // 1 byte per started 7 bits; zero still takes one byte.
-    (64 - (value | 1).leading_zeros()).div_ceil(7)
+    // 1 byte per started 7 bits, zero still one byte: ceil(bits / 7) for
+    // bits in 1..=64 equals (9 * bits + 64) / 64, a multiply and a shift.
+    let bits = 64 - (value | 1).leading_zeros();
+    (9 * bits + 64) >> 6
 }
 
 /// Whether a block stores its non-head seqnos relative to their restart
