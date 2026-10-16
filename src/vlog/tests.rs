@@ -193,6 +193,82 @@ fn blob_punch_on_drop_retains_the_reclaim_when_the_link_probe_cannot_answer() ->
     Ok(())
 }
 
+/// A blob file a pin lists keeps its bytes: a tight-space reclaim waits for the
+/// pin, and a removal of a deleted view waits for it too.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_pinned_blob_file_waits_for_its_pin() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+
+    let memfs = MemFs::new();
+    let root = std::path::absolute("/blobs")?;
+    memfs.create_dir_all(&root)?;
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let write = |path: &std::path::Path| -> crate::Result<()> {
+        let mut w = super::blob_file::writer::Writer::new(path, 0, 0, &*fs)?;
+        w.write(b"a", 1, &[b'x'; 64])?;
+        w.write(b"b", 2, &[b'y'; 64])?;
+        w.finish()?;
+        Ok(())
+    };
+    let recover = |path: &std::path::Path, id| {
+        recover_blob_file(
+            path,
+            id,
+            Checksum::from_raw(0),
+            0,
+            &fs,
+            #[cfg(zstd_any)]
+            &no_dicts(),
+        )
+    };
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+
+    // The reclaim of a superseded view waits.
+    let punched = root.join("0");
+    write(&punched)?;
+    let first_frame_end = super::BlobFileScanner::new(&punched, &memfs, 0)?
+        .next()
+        .expect("first frame")?
+        .frame_end;
+    let bytes = |path: &std::path::Path| -> crate::Result<Vec<u8>> {
+        let file = memfs.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len = crate::fs::FsFile::metadata(&*file)?.len;
+        Ok(crate::file::read_exact(&*file, 0, usize::try_from(len).unwrap_or(0))?.to_vec())
+    };
+    let original = bytes(&punched)?;
+    let blob = recover(&punched, 0)?;
+    blob.install_deletion_pause(Arc::clone(&pause));
+    pause.pin_files(core::iter::once(punched.as_path()));
+    blob.mark_punch_on_drop(first_frame_end);
+    drop(blob);
+    assert_eq!(
+        bytes(&punched)?,
+        original,
+        "a pinned blob file keeps its bytes"
+    );
+    assert!(
+        pause.has_pending_reclaims(),
+        "the reclaim waits for the pin"
+    );
+
+    // The removal of a deleted view waits.
+    let removed = root.join("1");
+    write(&removed)?;
+    let blob = recover(&removed, 1)?;
+    blob.install_deletion_pause(Arc::clone(&pause));
+    pause.pin_files(core::iter::once(removed.as_path()));
+    blob.mark_as_deleted();
+    drop(blob);
+    assert!(memfs.exists(&removed)?, "a pinned blob file stays");
+
+    pause.unpin_files([punched.as_path(), removed.as_path()].into_iter());
+    assert!(!pause.has_pending_reclaims(), "the release ran the reclaim");
+    assert!(memfs.punched_bytes() > 0, "and punched the consumed prefix");
+    assert!(!memfs.exists(&removed)?, "and removed the deleted file");
+    Ok(())
+}
+
 /// Two directory entries of the SAME id — `0` beside a noncanonical `00`, what
 /// a repair leaves when its post-commit removal of the displaced copy fails —
 /// both match the manifest id and both used to be recovered. The version this

@@ -90,6 +90,10 @@ fn ship(pin: &PinnedVersion, root: &Path) -> lsm_tree::Result<()> {
         ("blobs", pin.blob_files()),
         ("dicts", pin.dictionaries()),
     ] {
+        // A folder the pin has no files for is left out, as a consumer would.
+        if files.is_empty() {
+            continue;
+        }
         std::fs::create_dir_all(root.join(folder))?;
         for file in files {
             std::fs::copy(file.path(), root.join(folder).join(file.id().to_string()))?;
@@ -367,6 +371,102 @@ fn restored_tree_writes_above_the_restored_data() -> lsm_tree::Result<()> {
         restored.get("k01", SeqNo::MAX)?.as_deref(),
         Some(&b"after"[..])
     );
+    Ok(())
+}
+
+/// A pinned file describes itself: a table has a level, a blob file none, the
+/// size and the bytes read through the pin are the file's, and a table's heal
+/// attestation is reported when one lies beside it.
+#[test]
+fn pinned_files_describe_themselves() -> lsm_tree::Result<()> {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(dir.path(), true, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    assert!(!pin.tables().is_empty() && !pin.blob_files().is_empty());
+
+    for file in pin.tables().iter().chain(pin.blob_files()) {
+        let on_disk = std::fs::read(file.path())?;
+        assert_eq!(file.file_size()?, on_disk.len() as u64);
+        let mut read = Vec::new();
+        file.open()?.read_to_end(&mut read)?;
+        assert_eq!(read, on_disk, "{file:?}");
+        assert_eq!(file.heal_attestation()?, None);
+    }
+    assert!(pin.tables().iter().all(|file| file.level().is_some()));
+    assert!(pin.blob_files().iter().all(|file| file.level().is_none()));
+
+    let table = pin.tables().first().expect("a table");
+    let mut attestation = table.path().as_os_str().to_owned();
+    attestation.push(".heal-attest");
+    std::fs::write(&attestation, b"attestation")?;
+    assert_eq!(
+        table.heal_attestation()?.as_deref(),
+        Some(Path::new(&attestation))
+    );
+    let blob_file = pin.blob_files().first().expect("a blob file");
+    let mut beside = blob_file.path().as_os_str().to_owned();
+    beside.push(".heal-attest");
+    std::fs::write(&beside, b"not a table's")?;
+    assert_eq!(blob_file.heal_attestation()?, None, "only a table has one");
+    assert!(format!("{table:?}").contains("PinnedFile"));
+    Ok(())
+}
+
+/// A pin lists the compression dictionaries its tables were written against,
+/// and a tree restored with them reads every key.
+#[cfg(feature = "zstd")]
+#[test]
+fn pin_lists_dictionaries_and_restores_with_them() -> lsm_tree::Result<()> {
+    use lsm_tree::{CompressionType, ZstdDictionary, config::CompressionPolicy};
+
+    let samples: Vec<u8> = (0..500u32)
+        .flat_map(|i| format!("key-{i:05}value-{i:05}-padding").into_bytes())
+        .collect();
+    let dictionary = Arc::new(ZstdDictionary::new(&samples));
+    let configure = |path: &Path, visible: &SequenceNumberCounter| -> lsm_tree::Result<Config> {
+        Ok(
+            Config::new(path, SequenceNumberCounter::default(), visible.clone())
+                .data_block_compression_policy(CompressionPolicy::all(CompressionType::zstd_dict(
+                    3,
+                    dictionary.id(),
+                )?))
+                .zstd_dictionary(Some(Arc::clone(&dictionary))),
+        )
+    };
+
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = configure(src.path(), &visible)?.open()?;
+    for i in 0..100u32 {
+        tree.insert(
+            format!("key-{i:05}"),
+            format!("value-{i:05}-padding"),
+            u64::from(i),
+        );
+    }
+    visible.set(100);
+    tree.flush_active_memtable(0)?;
+
+    let pin = tree.pin();
+    assert_eq!(pin.dictionaries().len(), 1);
+    assert_eq!(pin.dictionaries()[0].id(), u64::from(dictionary.id()));
+    ship(&pin, dst.path())?;
+    let restored = configure(dst.path(), &SequenceNumberCounter::default())?.restore_pinned(
+        &pin.layout()?,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    )?;
+    for i in 0..100u32 {
+        assert_eq!(
+            restored.get(format!("key-{i:05}"), SeqNo::MAX)?.as_deref(),
+            Some(format!("value-{i:05}-padding").as_bytes())
+        );
+    }
     Ok(())
 }
 

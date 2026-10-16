@@ -404,6 +404,91 @@ fn a_removal_deferred_while_pinning_waits_for_the_next_release() {
     assert!(!fs.exists(&path).unwrap(), "the next release removed it");
 }
 
+/// A retained reclaim of a pinned file stays retained through a retry and is
+/// punched once the pin releases the file.
+#[test]
+fn a_pinned_reclaim_stays_retained_through_a_retry() {
+    let fs = MemFs::new();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/file.sst").to_path_buf();
+    write_file(&fs, &path, &[7u8; 4096]);
+    let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
+
+    let pause = DeletionPause::new_shared();
+    pause.pin_files(core::iter::once(path.as_path()));
+    pause.retain_reclaim(Arc::clone(&dyn_fs), path.clone(), vec![(0, 1024)]);
+    pause.retry_pending_reclaims();
+    assert!(
+        pause.has_pending_reclaims(),
+        "the pin keeps the reclaim waiting"
+    );
+    assert_eq!(
+        fs.punched_bytes(),
+        0,
+        "no byte of the pinned file was punched"
+    );
+
+    pause.unpin_files(core::iter::once(path.as_path()));
+    assert!(!pause.has_pending_reclaims(), "the release ran it");
+    assert_eq!(fs.punched_bytes(), 1024);
+}
+
+/// Taking a pin waits for an in-place mutation already under way, and no
+/// mutation starts while the pin is being taken.
+#[test]
+fn a_pin_waits_for_a_mutation_under_way() {
+    let pause = DeletionPause::new_shared();
+    let path = Path::new("/d/file.sst");
+    let mutation = pause.begin_mutation(path).unwrap();
+
+    let (taken, pinned) = std::sync::mpsc::channel();
+    let pinner = {
+        let pause = Arc::clone(&pause);
+        std::thread::spawn(move || {
+            let pinning = pause.begin_pin();
+            taken.send(()).unwrap();
+            assert!(
+                pause.begin_mutation(Path::new("/d/other.sst")).is_none(),
+                "no mutation starts while a pin is being taken"
+            );
+            drop(pinning);
+        })
+    };
+    assert!(
+        pinned
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "the pin waits for the mutation"
+    );
+    drop(mutation);
+    pinned
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    pinner.join().unwrap();
+    assert!(
+        pause.begin_mutation(path).is_some(),
+        "mutations start again"
+    );
+}
+
+/// A file two pins list stays pinned until both release it.
+#[test]
+fn a_file_pinned_twice_stays_pinned_until_both_release() {
+    let pause = DeletionPause::new_shared();
+    let path = Path::new("/d/file.sst");
+    pause.pin_files(core::iter::once(path));
+    pause.pin_files(core::iter::once(path));
+
+    pause.unpin_files(core::iter::once(path));
+    assert!(
+        pause.begin_mutation(path).is_none(),
+        "the other pin holds it"
+    );
+
+    pause.unpin_files(core::iter::once(path));
+    assert!(pause.begin_mutation(path).is_some(), "both released it");
+}
+
 #[test]
 fn nested_pauses_only_release_on_last_drop() {
     let fs = MemFs::new();
