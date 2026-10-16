@@ -538,15 +538,14 @@ pub trait AbstractTree: sealed::Sealed {
     /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
     ///
     /// let folder = tempfile::tempdir()?;
-    /// let tree = Config::new(
-    ///     &folder,
-    ///     SequenceNumberCounter::default(),
-    ///     SequenceNumberCounter::default(),
-    /// )
-    /// .open()?;
-    /// tree.insert("a", "1", 0);
+    /// let seqno = SequenceNumberCounter::default();
+    /// let visible = SequenceNumberCounter::default();
+    /// let tree = Config::new(&folder, seqno.clone(), visible.clone()).open()?;
+    /// tree.insert("a", "1", seqno.next());
     /// tree.flush_active_memtable(0)?;
-    /// tree.insert("b", "2", 1);
+    /// tree.insert("b", "2", seqno.next());
+    /// // The writes are published: the pin holds every write below this.
+    /// visible.set(seqno.get());
     ///
     /// let pin = tree.pin();
     /// assert_eq!(pin.tables().len(), 1);
