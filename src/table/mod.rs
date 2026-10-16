@@ -8017,7 +8017,7 @@ impl Table {
                 .insert_block(self.global_id(), handle.offset(), block.clone());
         }
         if let Some(lead) = lead {
-            lead.publish(block.clone());
+            lead.publish(&block);
         }
         self.data_block_of(block)
     }

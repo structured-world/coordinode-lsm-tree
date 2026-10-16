@@ -305,9 +305,8 @@ where
 {
     loads: Arc<InflightLoads<K, V, I, S>>,
     key: K,
-    /// Always present until the drop hands it back to the registry.
+    /// Present until the lead finishes, publishing or dropped.
     ticket: Option<Arc<Ticket<V, I>>>,
-    published: bool,
 }
 
 /// A waiter's hold on a load another request leads.
@@ -339,13 +338,14 @@ where
     /// value already made visible where a later request looks first (the
     /// cache), or a value no later request needs: once closed, a new miss of
     /// the key leads a load of its own.
-    pub fn publish(mut self, value: V) {
-        if let Some(ticket) = &self.ticket {
-            // SAFETY: the lead settles once: here, marking itself published so
-            // its drop does not settle again.
-            unsafe { ticket.settle(Some(value)) };
-        }
-        self.published = true;
+    pub fn publish(self, value: V) {
+        self.publish_with(|| value);
+    }
+
+    /// As [`Self::publish`], building the value only when a request waits
+    /// for it.
+    pub fn publish_with(mut self, value: impl FnOnce() -> V) {
+        self.finish(Some(value));
     }
 
     /// Whether any request is waiting for this load now. Only the registry
@@ -365,16 +365,28 @@ where
     S: BuildHasher,
 {
     fn drop(&mut self) {
+        // Not published: the load failed or unwound. Waiters load on their
+        // own, so none is left waiting and no error is remembered.
+        self.finish(None::<fn() -> V>);
+    }
+}
+
+impl<K, V, I, S> Lead<K, V, I, S>
+where
+    K: Eq + Hash + Clone,
+    S: BuildHasher,
+{
+    /// Closes the load and settles it with the value `value` builds (`None`
+    /// when it failed) for the requests waiting on it; a no-op once done.
+    fn finish(&mut self, value: Option<impl FnOnce() -> V>) {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        // Not published: the load failed or unwound. Waiters load on their
-        // own, so none is left waiting and no error is remembered.
-        if !self.published {
-            // SAFETY: not published, so this is the lead's one settling.
-            unsafe { ticket.settle(None) };
+        if let Some(ticket) = self.loads.close(&self.key, ticket) {
+            // SAFETY: the ticket was taken out of the lead above, so this is
+            // its one settling.
+            unsafe { ticket.settle(value.map(|build| build())) };
         }
-        self.loads.close(&self.key, ticket);
     }
 }
 
@@ -440,7 +452,6 @@ where
             loads: Arc::clone(self),
             key,
             ticket: Some(ticket),
-            published: false,
         })
     }
 
@@ -504,8 +515,10 @@ where
     }
 
     /// Removes `ticket` from the registry, unless another load of the key has
-    /// taken its place, and keeps it for reuse once nothing else holds it.
-    fn close(&self, key: &K, mut ticket: Arc<Ticket<V, I>>) {
+    /// taken its place. Returns it when requests wait on it, for the lead to
+    /// settle; otherwise nobody can ever see its outcome, so it is not
+    /// settled at all, and is kept for reuse.
+    fn close(&self, key: &K, mut ticket: Arc<Ticket<V, I>>) -> Option<Arc<Ticket<V, I>>> {
         let mut shard = self.shard(key).lock();
         if shard
             .loads
@@ -514,19 +527,15 @@ where
         {
             shard.loads.remove(key);
         }
-        // Out of the registry, the ticket gains no new holder: a waiter that
-        // still holds it keeps it shared, and it is dropped instead. A kept
-        // ticket lets go of its value, which the cache owns and charges, and
-        // the value is dropped after the lock.
-        let mut value = None;
-        if shard.spare.len() < SPARE_TICKETS
-            && let Some(unshared) = Arc::get_mut(&mut ticket)
-        {
-            value = unshared.value.get_mut().take();
+        // Out of the registry, the ticket gains no new holder, so a ticket
+        // only the lead holds now has no waiter and never will.
+        if Arc::get_mut(&mut ticket).is_none() {
+            return Some(ticket);
+        }
+        if shard.spare.len() < SPARE_TICKETS {
             shard.spare.push(ticket);
         }
-        drop(shard);
-        drop(value);
+        None
     }
 }
 

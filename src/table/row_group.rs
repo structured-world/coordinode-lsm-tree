@@ -428,7 +428,7 @@ impl GroupRead<'_> {
                     self.cache
                         .get_directory(self.table_id, self.group.offset(), true)
                 {
-                    lead.publish(Arc::clone(&directory), directory_len);
+                    lead.publish(&directory, directory_len);
                     return self.load_from_directory(directory, directory_len, want, true);
                 }
                 self.read_selective(want, Some(lead))
@@ -739,7 +739,7 @@ impl GroupRead<'_> {
             );
         }
         if let Some(lead) = lead {
-            lead.publish(Arc::clone(&directory), directory_len);
+            lead.publish(&directory, directory_len);
         }
         Ok(RowGroupBlocks {
             directory,
@@ -1003,7 +1003,7 @@ impl GroupRead<'_> {
             // Leads are in slot order, and runs are admitted in slot order.
             while leads.next_if(|(led, _)| *led < position).is_some() {}
             if let Some((_, lead)) = leads.next_if(|(led, _)| *led == position) {
-                lead.publish(page.clone());
+                lead.publish(&page);
             }
             slot.block = Some(page);
         }

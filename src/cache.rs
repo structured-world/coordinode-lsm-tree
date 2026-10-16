@@ -254,11 +254,11 @@ pub enum BlockClaim {
 pub struct BlockLead(LoadLead, Option<crate::inflight::BatchToken>);
 
 impl BlockLead {
-    /// Hands the loaded block to the waiters; insert it into the cache first,
-    /// so a miss after this sees it there.
-    pub(crate) fn publish(self, block: Block) {
+    /// Hands the loaded block to the waiters, if any; insert it into the
+    /// cache first, so a miss after this sees it there.
+    pub(crate) fn publish(self, block: &Block) {
         let Self(lead, _batch) = self;
-        lead.publish(Item::Block(block));
+        lead.publish_with(|| Item::Block(block.clone()));
     }
 }
 
@@ -288,10 +288,11 @@ impl DirectoryLead {
     /// waiters; cache it first, so a miss after this sees it there.
     pub(crate) fn publish(
         self,
-        directory: alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        directory: &alloc::sync::Arc<crate::table::column_page::PageDirectory>,
         len: u32,
     ) {
-        self.0.publish(Item::Directory(directory, len));
+        self.0
+            .publish_with(|| Item::Directory(alloc::sync::Arc::clone(directory), len));
     }
 }
 

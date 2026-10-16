@@ -209,7 +209,7 @@ fn a_thread_leading_a_batched_load_never_waits() {
     while cache.load_waiters() < 1 {
         std::thread::yield_now();
     }
-    held.publish(crate::table::Block {
+    held.publish(&crate::table::Block {
         header: crate::table::block::Header::test_dummy(crate::table::block::BlockType::Data),
         data: crate::Slice::from(&b"block"[..]),
     });

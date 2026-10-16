@@ -395,7 +395,7 @@ pub(crate) fn load_block_paced(
                     if charge.is_counted() {
                         record_block_load_cached(metrics, block_type);
                     }
-                    lead.publish(block.clone());
+                    lead.publish(&block);
                     return Ok(block);
                 }
                 Some(lead)
@@ -479,7 +479,7 @@ pub(crate) fn load_block_paced(
         cache.insert_block(table_id, handle.offset(), block.clone());
     }
     if let Some(lead) = lead {
-        lead.publish(block.clone());
+        lead.publish(&block);
     }
     Ok(block)
 }

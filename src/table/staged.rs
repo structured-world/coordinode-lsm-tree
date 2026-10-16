@@ -172,7 +172,7 @@ impl<'t> StagedRead<'t> {
             .cache
             .insert_block(self.table.global_id(), handle.offset(), block.clone());
         if let Some(at) = self.leads.iter().position(|(at, _)| *at == offset) {
-            self.leads.swap_remove(at).1.publish(block.clone());
+            self.leads.swap_remove(at).1.publish(&block);
         }
         self.need.retain(|h| h.offset() != handle.offset());
         self.held.push((offset, block));

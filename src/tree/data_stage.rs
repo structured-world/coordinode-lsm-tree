@@ -80,7 +80,9 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         // A block another read has published since the chunk was planned is
         // taken as held; the rest are claimed, so a point read missing one of
         // them meanwhile waits for this chunk instead of reading it again.
-        let mut shared = alloc::vec![false; chunk.len()];
+        // Which tasks took a shared block, sized only once one does: a chunk
+        // whose blocks were all cached allocates nothing here.
+        let mut shared: Vec<bool> = Vec::new();
         let lead = out.leads_loads();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
             match block {
@@ -97,6 +99,9 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                         crate::cache::BlockClaim::Shared(block) => {
                             let block = task.table.data_block_of(block)?;
                             Tree::read_task_keys(task, index, &block, keys, &mut read.hits)?;
+                            if shared.is_empty() {
+                                shared.resize(chunk.len(), false);
+                            }
                             if let Some(flag) = shared.get_mut(index) {
                                 *flag = true;
                             }
