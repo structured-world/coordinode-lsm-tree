@@ -62,6 +62,44 @@ fn row_cache_when_given_block_subslices_stores_detached_copies() {
     assert_eq!(&*got.key.user_key, &[7_u8; 32][..]);
 }
 
+/// A cache whose loads were never measured slow lets concurrent misses of one
+/// block each load it, taking nothing in the registry; one set to share every
+/// load coordinates them.
+#[test]
+fn misses_share_loads_only_once_loads_are_measured_slow() {
+    use super::{BlockClaim, LoadIdentity};
+
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let offset = crate::table::BlockOffset(0);
+    let identity = LoadIdentity::Block {
+        block_type: crate::table::block::BlockType::Data,
+        size: 100,
+        compression: crate::CompressionType::None,
+        encrypted: false,
+    };
+
+    let quick = Cache::with_capacity_bytes(1024 * 1024);
+    assert!(quick.load_coalescing_after() > core::time::Duration::ZERO);
+    assert!(matches!(
+        quick.claim_block(id, offset, identity),
+        BlockClaim::Alone
+    ));
+    assert!(matches!(
+        quick.claim_block(id, offset, identity),
+        BlockClaim::Alone
+    ));
+    assert_eq!(quick.loads_in_flight(), 0, "the registry is not touched");
+
+    let sharing = Cache::with_capacity_bytes(1024 * 1024)
+        .with_load_coalescing_after(core::time::Duration::ZERO);
+    let BlockClaim::Lead(lead) = sharing.claim_block(id, offset, identity) else {
+        panic!("a sharing cache coordinates the load");
+    };
+    assert_eq!(sharing.loads_in_flight(), 1);
+    drop(lead);
+    assert_eq!(sharing.loads_in_flight(), 0);
+}
+
 #[test]
 fn metadata_priority_defaults_on_and_toggles() {
     // On by default.
@@ -164,7 +202,10 @@ fn a_thread_leading_a_batched_load_never_waits() {
     use super::{BlockClaim, LoadIdentity};
     use std::sync::Arc;
 
-    let cache = Arc::new(Cache::with_capacity_bytes(1024 * 1024));
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
     let id = crate::table::GlobalTableId::from((0, 1));
     let identity = LoadIdentity::Block {
         block_type: crate::table::block::BlockType::Data,
@@ -225,7 +266,10 @@ fn a_blob_read_for_another_key_at_the_same_position_is_not_shared() {
     use super::BlobClaim;
     use std::sync::Arc;
 
-    let cache = Arc::new(Cache::with_capacity_bytes(1024 * 1024));
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
     let vhandle = crate::vlog::ValueHandle {
         blob_file_id: 3,
         offset: 0,

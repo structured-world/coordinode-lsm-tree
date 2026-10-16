@@ -668,6 +668,7 @@ impl GroupRead<'_> {
         want: &PageWant<'_>,
         lead: Option<crate::cache::DirectoryLead>,
     ) -> crate::Result<RowGroupBlocks> {
+        let timer = crate::cache::Cache::time_load();
         let fd = self.open()?;
         let group_len = self.group.size() as usize;
         let io_buffer = self.budget.io_buffer() as usize;
@@ -727,6 +728,8 @@ impl GroupRead<'_> {
             self.count_cached(false, found);
         }
         let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages)?;
+        self.cache
+            .record_directory_load(self.table_id, self.group.offset(), timer);
         // Cached only now that the blocks it named carried the stamps it
         // implies: another group's directory read in this one's place fails
         // the read without staying behind to refuse every healthy page later.

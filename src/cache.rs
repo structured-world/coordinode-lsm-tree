@@ -348,6 +348,10 @@ const LOAD_SHARDS: usize = BLOCK_CACHE_SHARDS;
 /// most `LOAD_SHARDS * LOADS_PER_SHARD` tickets; a miss past that loads on
 /// its own.
 const LOADS_PER_SHARD: usize = 64;
+/// How long cold loads must take before concurrent misses of one object wait
+/// for a single load instead of each loading it (see
+/// [`Cache::with_load_coalescing_after`]).
+const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(8);
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
 /// on many-core hosts while the lock array stays small; reads take a shared lock
@@ -375,6 +379,7 @@ impl Cache {
             loads: crate::inflight::InflightLoads::new(
                 LOAD_SHARDS,
                 LOADS_PER_SHARD,
+                DEFAULT_LOAD_COALESCING_AFTER,
                 rustc_hash::FxBuildHasher,
             ),
         }
@@ -554,6 +559,90 @@ impl Cache {
     #[must_use]
     pub fn metadata_priority(&self) -> bool {
         self.metadata_priority
+    }
+
+    /// Sets how long cold loads must take before readers that miss the same
+    /// block, blob or column directory at once share one read and decode
+    /// instead of each doing it, returning the cache for builder-style
+    /// configuration.
+    ///
+    /// The cache times a sample of its cold loads. While they finish quicker
+    /// than `after` (blocks served from the page cache, with cores to spare),
+    /// a reader loads on its own: waiting for another reader's load would
+    /// cost it more than its own. Once loads take longer (slow or remote
+    /// storage, or cores saturated), concurrent misses of one object wait for
+    /// a single load. `Duration::ZERO` shares every load; `Duration::MAX`
+    /// none. Without the `std` feature loads are not timed, so only
+    /// `Duration::ZERO` shares there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use lsm_tree::Cache;
+    ///
+    /// let cache = Cache::with_capacity_bytes(64 << 20)
+    ///     .with_load_coalescing_after(Duration::from_micros(50));
+    /// assert_eq!(cache.load_coalescing_after(), Duration::from_micros(50));
+    /// ```
+    #[must_use]
+    pub fn with_load_coalescing_after(mut self, after: core::time::Duration) -> Self {
+        self.loads.set_coalesce_after(after);
+        self
+    }
+
+    /// How long cold loads must take before concurrent misses share them
+    /// (see [`Cache::with_load_coalescing_after`]).
+    #[must_use]
+    pub fn load_coalescing_after(&self) -> core::time::Duration {
+        self.loads.coalesce_after()
+    }
+
+    /// Starts timing a cold load about to run on the calling thread, for the
+    /// estimate that decides whether misses share loads.
+    pub(crate) fn time_load() -> crate::inflight::LoadTimer {
+        crate::inflight::LoadTimer::start()
+    }
+
+    /// Records the cold load of the block at `offset` that `timer` timed.
+    pub(crate) fn record_block_load(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
+            timer,
+        );
+    }
+
+    /// Records the cold read of the separated value `vhandle` names that
+    /// `timer` timed.
+    pub(crate) fn record_blob_load(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
+            timer,
+        );
+    }
+
+    /// Records the cold read of the row group at `offset` that `timer` timed.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn record_directory_load(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into(),
+            timer,
+        );
     }
 
     /// Returns the amount of cached bytes.

@@ -185,6 +185,7 @@ impl<'a> Accessor<'a> {
             crate::cache::BlobClaim::Alone => None,
         };
 
+        let timer = crate::cache::Cache::time_load();
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
 
         let (file, _) = blob_file
@@ -205,6 +206,7 @@ impl<'a> Accessor<'a> {
         let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
         self.count_decoded(decoded);
         let value = parsed?;
+        cache.record_blob_load(tree_id, vhandle, timer);
         match lead {
             Some(lead) => {
                 let detached = lead.publish(

@@ -30,7 +30,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::hash::{BuildHasher, Hash};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(feature = "std")]
 type Mutex<T> = parking_lot::Mutex<T>;
@@ -262,10 +262,63 @@ struct ShardState<K, V, I, S> {
     spare: Vec<Arc<Ticket<V, I>>>,
 }
 
-/// One shard of the registry.
-type Shard<K, V, I, S> = Mutex<ShardState<K, V, I, S>>;
+/// One shard of the registry: its loads, and how long the physical loads of
+/// its keys take.
+struct Shard<K, V, I, S> {
+    state: Mutex<ShardState<K, V, I, S>>,
+    /// Smoothed duration of the shard's sampled physical loads, in
+    /// nanoseconds; zero until one is sampled.
+    load_nanos: AtomicU32,
+}
+
+/// One in this many physical loads of a thread is timed.
+#[cfg(feature = "std")]
+const LOAD_SAMPLE_EVERY: u32 = 16;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Physical loads the calling thread has started, counting modulo
+    /// [`LOAD_SAMPLE_EVERY`] to pick the ones it times.
+    static LOADS_STARTED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// The timing of one physical load, when it is one of the sampled ones.
+#[derive(Clone, Copy)]
+pub struct LoadTimer {
+    // no-std: no clock to read; loads are not timed and the estimates stay
+    // at zero.
+    #[cfg(feature = "std")]
+    started: Option<std::time::Instant>,
+}
+
+impl LoadTimer {
+    /// Starts timing a physical load about to run on the calling thread, if
+    /// it is one of the sampled ones.
+    #[must_use]
+    pub fn start() -> Self {
+        #[cfg(feature = "std")]
+        {
+            let sampled = LOADS_STARTED.with(|count| {
+                // A counter modulo the sampling period: it is meant to wrap.
+                let next = count.get().wrapping_add(1) % LOAD_SAMPLE_EVERY;
+                count.set(next);
+                next == 0
+            });
+            Self {
+                started: sampled.then(std::time::Instant::now),
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        Self {}
+    }
+}
 
 /// The loads in flight, sharded by key hash and bounded per shard.
+///
+/// A miss coordinates through the registry only while the physical loads of
+/// its shard take at least the coalescing threshold: a load quicker than
+/// that costs less than waiting for another reader's, and the miss then
+/// loads alone without taking any lock here.
 pub struct InflightLoads<K, V, I, S> {
     shards: Vec<Padded<Shard<K, V, I, S>>>,
     shard_mask: u64,
@@ -274,6 +327,10 @@ pub struct InflightLoads<K, V, I, S> {
     /// alone, so a burst of distinct cold keys cannot grow the registry
     /// without bound.
     per_shard_limit: usize,
+    /// The load duration, in nanoseconds, from which misses coordinate;
+    /// zero coordinates every miss, and one past any estimate (an estimate
+    /// is at most `u32::MAX`) none.
+    coalesce_after_nanos: u64,
 }
 
 /// What a cache miss does about its load.
@@ -399,30 +456,47 @@ where
     S: BuildHasher + Clone,
 {
     /// A registry of `shards` shards (rounded up to a power of two, at most
-    /// 256) coordinating up to `per_shard_limit` loads each.
-    pub fn new(shards: usize, per_shard_limit: usize, hasher: S) -> Self {
+    /// 256) coordinating up to `per_shard_limit` loads each, once their
+    /// physical loads take `coalesce_after` (see [`Self::set_coalesce_after`]).
+    pub fn new(
+        shards: usize,
+        per_shard_limit: usize,
+        coalesce_after: core::time::Duration,
+        hasher: S,
+    ) -> Self {
         let count = shards.next_power_of_two().clamp(1, 256);
         let mut list = Vec::with_capacity(count);
         for _ in 0..count {
-            list.push(Padded(Mutex::new(ShardState {
-                loads: hashbrown::HashMap::with_hasher(hasher.clone()),
-                spare: Vec::with_capacity(SPARE_TICKETS),
-            })));
+            list.push(Padded(Shard {
+                state: Mutex::new(ShardState {
+                    loads: hashbrown::HashMap::with_hasher(hasher.clone()),
+                    spare: Vec::with_capacity(SPARE_TICKETS),
+                }),
+                load_nanos: AtomicU32::new(0),
+            }));
         }
-        Self {
+        let mut loads = Self {
             shards: list,
             shard_mask: count as u64 - 1,
             hasher,
             per_shard_limit,
-        }
+            coalesce_after_nanos: 0,
+        };
+        loads.set_coalesce_after(coalesce_after);
+        loads
     }
 
     /// Claims the load of `key` for a request of `identity`. The caller has
     /// just missed the cache; a leader checks it once more before loading,
     /// since a load that closed between that miss and this claim has already
-    /// put its result there.
+    /// put its result there. While the key's shard loads quicker than the
+    /// coalescing threshold, the request loads alone without a lock taken.
     pub fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
-        let mut shard = self.shard(&key).lock();
+        let shard = self.shard(&key);
+        if !self.coalesces(shard) {
+            return Claim::Alone;
+        }
+        let mut shard = shard.state.lock();
         if let Some(ticket) = shard.loads.get(&key) {
             return if ticket.identity == identity {
                 Claim::Join(Join(Arc::clone(ticket)))
@@ -460,7 +534,11 @@ where
     /// published and not yet closed, without claiming anything: for a reader
     /// that may neither wait nor lead.
     pub fn take_ready(&self, key: &K, identity: &I) -> Option<V> {
-        let ticket = Arc::clone(self.shard(key).lock().loads.get(key)?);
+        let shard = self.shard(key);
+        if !self.coalesces(shard) {
+            return None;
+        }
+        let ticket = Arc::clone(shard.state.lock().loads.get(key)?);
         if ticket.identity != *identity {
             return None;
         }
@@ -472,7 +550,7 @@ where
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.0.lock().loads.len())
+            .map(|shard| shard.0.state.lock().loads.len())
             .sum()
     }
 
@@ -486,6 +564,7 @@ where
             .flat_map(|shard| {
                 shard
                     .0
+                    .state
                     .lock()
                     .loads
                     .values()
@@ -501,6 +580,55 @@ where
     K: Eq + Hash + Clone,
     S: BuildHasher,
 {
+    /// Sets the duration a physical load must take for misses to coordinate:
+    /// zero coordinates every miss; one longer than any load is ever measured
+    /// to take, none. Without a clock (`no_std`) loads are never measured, so
+    /// only zero coordinates there.
+    pub fn set_coalesce_after(&mut self, coalesce_after: core::time::Duration) {
+        // Past `u64::MAX` nanoseconds (five centuries) is as good as never.
+        self.coalesce_after_nanos = u64::try_from(coalesce_after.as_nanos()).unwrap_or(u64::MAX);
+    }
+
+    /// The duration a physical load must take for misses to coordinate.
+    pub fn coalesce_after(&self) -> core::time::Duration {
+        core::time::Duration::from_nanos(self.coalesce_after_nanos)
+    }
+
+    /// Whether misses of `shard` coordinate: its loads take at least the
+    /// threshold.
+    fn coalesces(&self, shard: &Shard<K, V, I, S>) -> bool {
+        u64::from(shard.load_nanos.load(Ordering::Relaxed)) >= self.coalesce_after_nanos
+    }
+
+    /// Folds the physical load of `key` that `timer` timed, if it is a
+    /// sampled one, into its shard's estimate.
+    pub fn record_load(&self, key: &K, timer: LoadTimer) {
+        #[cfg(feature = "std")]
+        if let Some(started) = timer.started {
+            // A load past `u32::MAX` nanoseconds (four seconds) is simply slow.
+            let sample = u32::try_from(started.elapsed().as_nanos()).unwrap_or(u32::MAX);
+            self.fold_sample(key, sample);
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = (key, timer);
+    }
+
+    /// Moves the estimate of `key`'s shard an eighth of the way to `sample`.
+    /// Read and written apart: it is a statistic, and two samples folded at
+    /// once lose one of them rather than anything that needs to be exact.
+    fn fold_sample(&self, key: &K, sample: u32) {
+        let estimate = &self.shard(key).load_nanos;
+        let old = estimate.load(Ordering::Relaxed);
+        // Seven eighths of one `u32` and an eighth of another stay within one.
+        estimate.store(old - old / 8 + sample / 8, Ordering::Relaxed);
+    }
+
+    /// The load-time estimate of `key`'s shard, in nanoseconds, for tests.
+    #[cfg(test)]
+    fn estimate(&self, key: &K) -> u32 {
+        self.shard(key).load_nanos.load(Ordering::Relaxed)
+    }
+
     fn shard(&self, key: &K) -> &Shard<K, V, I, S> {
         let hash = self.hasher.hash_one(key);
         #[expect(
@@ -520,7 +648,7 @@ where
     /// settle; otherwise nobody can ever see its outcome, so it is not
     /// settled at all, and is kept for reuse.
     fn close(&self, key: &K, mut ticket: Arc<Ticket<V, I>>) -> Option<Arc<Ticket<V, I>>> {
-        let mut shard = self.shard(key).lock();
+        let mut shard = self.shard(key).state.lock();
         if shard
             .loads
             .get(key)

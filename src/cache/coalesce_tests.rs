@@ -21,6 +21,16 @@ fn write_keys(config: Config, count: u8) -> crate::Result<()> {
     tree.flush_active_memtable(0)
 }
 
+/// A cache of `bytes` without a row cache whose misses share every cold load,
+/// however quick: these tests exercise the sharing itself.
+fn sharing_cache(bytes: u64) -> Arc<Cache> {
+    Arc::new(
+        Cache::with_capacity_bytes(bytes)
+            .with_row_cache(false)
+            .with_load_coalescing_after(Duration::ZERO),
+    )
+}
+
 fn config(folder: &std::path::Path) -> Config {
     Config::new(
         folder,
@@ -114,7 +124,7 @@ fn simultaneous_cold_point_reads_of_one_block_read_it_once() -> crate::Result<()
     write_keys(config(folder.path()), 64)?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
     let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
@@ -143,7 +153,7 @@ fn a_block_the_cache_refuses_still_reaches_its_waiters() -> crate::Result<()> {
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
     // 64 bytes over 64 shards: no block fits a shard, so none is kept.
-    let cache = Arc::new(Cache::with_capacity_bytes(64).with_row_cache(false));
+    let cache = sharing_cache(64);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
     let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
@@ -167,7 +177,7 @@ fn failed_cold_load_releases_waiters_and_is_not_remembered() -> crate::Result<()
     write_keys(config(folder.path()), 64)?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
     let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
@@ -208,7 +218,7 @@ fn held_cold_load_does_not_block_another_block() -> crate::Result<()> {
     )?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
 
@@ -260,7 +270,7 @@ fn simultaneous_cold_reads_of_one_row_group_read_its_directory_once() -> crate::
     }
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
     let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
@@ -282,7 +292,7 @@ fn point_read_waits_for_a_block_a_multi_get_reads() -> crate::Result<()> {
     write_keys(config(folder.path()), 64)?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, false)?;
     let (path, offset) = first_data_block(&tree);
 
@@ -331,7 +341,7 @@ fn point_read_waits_for_a_block_a_multi_get_reads() -> crate::Result<()> {
 fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     write_keys(config(folder.path()), 64)?;
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), FaultFs::new(StdFs), &cache, false)?;
     let crate::resumable::Step::Pending(mut read) = tree.start_multi_get(
         (0..64u8).map(|key| crate::UserKey::from(&[key][..])),
@@ -387,7 +397,9 @@ fn partial_table(
     use crate::config::{BlockSizePolicy, CompressionPolicy};
     let crate::AnyTree::Standard(tree) = config(folder)
         .with_fs(fs)
-        .use_cache(Arc::new(Cache::with_capacity_bytes(64 << 20)))
+        .use_cache(Arc::new(
+            Cache::with_capacity_bytes(64 << 20).with_load_coalescing_after(Duration::ZERO),
+        ))
         .data_block_compression_policy(CompressionPolicy::all(crate::CompressionType::zstd(19)?))
         .data_block_size_policy(BlockSizePolicy::all(512 * 1024))
         .open()?
@@ -516,7 +528,7 @@ fn simultaneous_cold_reads_of_one_blob_read_it_once() -> crate::Result<()> {
     )?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
-    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let cache = sharing_cache(64 << 20);
     let tree = reopen_cold(folder.path(), fs, &cache, true)?;
     // Warm the index side, which resolves no value, so the readers meet only
     // at the blob read.

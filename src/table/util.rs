@@ -406,6 +406,9 @@ pub(crate) fn load_block_paced(
         None
     };
 
+    // Timed from here, where it no longer waits on anything but the read and
+    // decode, for the estimate that decides whether misses share loads.
+    let timer = crate::cache::Cache::time_load();
     let fd = fd.resolve(
         file_accessor,
         &table_id,
@@ -475,6 +478,7 @@ pub(crate) fn load_block_paced(
         ecc_status,
         recovery,
     )?;
+    cache.record_block_load(table_id, handle.offset(), timer);
     if charge.touches_cache() {
         cache.insert_block(table_id, handle.offset(), block.clone());
     }
