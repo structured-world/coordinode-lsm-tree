@@ -163,6 +163,28 @@ impl<'a> Accessor<'a> {
             return Ok(None);
         };
 
+        let lead = match cache.claim_blob(tree_id, vhandle, key) {
+            crate::cache::BlobClaim::Shared(value) => {
+                #[cfg(feature = "metrics")]
+                if let Some(metrics) = self.metrics {
+                    metrics
+                        .blob_load_shared
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(Some(value));
+            }
+            crate::cache::BlobClaim::Lead(lead) => {
+                // A read that finished between the miss above and this claim
+                // left its value in the cache, when the fill policy let it.
+                if let Some(value) = cache.get_blob(tree_id, vhandle, key) {
+                    lead.publish(cache, tree_id, vhandle, key, value.clone(), false);
+                    return Ok(Some(value));
+                }
+                Some(lead)
+            }
+            crate::cache::BlobClaim::Alone => None,
+        };
+
         let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
 
         let (file, _) = blob_file
@@ -183,9 +205,23 @@ impl<'a> Accessor<'a> {
         let parsed = reader.parse_record(key, vhandle, &record, &mut decoded);
         self.count_decoded(decoded);
         let value = parsed?;
-        if self.fill.fills() {
-            let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
-            self.count_gather(detached);
+        match lead {
+            Some(lead) => {
+                let detached = lead.publish(
+                    cache,
+                    tree_id,
+                    vhandle,
+                    key,
+                    value.clone(),
+                    self.fill.fills(),
+                );
+                self.count_gather(detached);
+            }
+            None if self.fill.fills() => {
+                let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
+                self.count_gather(detached);
+            }
+            None => {}
         }
 
         Ok(Some(value))

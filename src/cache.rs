@@ -180,7 +180,110 @@ pub struct Cache {
     /// re-decode on the next index descent. Disable to put every block on equal
     /// footing (the pre-priority behaviour), e.g. for A/B measurement.
     metadata_priority: bool,
+    /// The cold loads in flight, keyed like the entries they will fill, so
+    /// readers that miss the same block or blob at once share one read and
+    /// one decode. Only a miss consults it.
+    loads: crate::inflight::InflightLoads<CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>,
 }
+
+/// What a cold load reads, beyond its position: a waiter takes a load's
+/// result only when it asked for the same thing, so a request with another
+/// extent, role or codec never receives bytes interpreted for a different one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoadIdentity {
+    /// A table block: its role, on-disk length, codec (dictionary included)
+    /// and whether it is encrypted.
+    Block {
+        block_type: BlockType,
+        size: u32,
+        compression: crate::CompressionType,
+        encrypted: bool,
+    },
+    /// A separated value: its record's on-disk size. The user key is checked
+    /// against the value the load returns, as a cache hit checks it.
+    Blob { on_disk_size: u32 },
+}
+
+/// How a block miss proceeds: lead the load, take a concurrent one's block,
+/// or load alone.
+pub enum BlockClaim<'a> {
+    /// No load of the block is in flight: read it, then [`BlockLead::publish`].
+    Lead(BlockLead<'a>),
+    /// A load of the block finished while this request waited for it.
+    Shared(Block),
+    /// Read the block without coordination: the registry is full, an
+    /// incompatible load of the position is in flight, or the load this
+    /// request waited for failed.
+    Alone,
+}
+
+/// The lead of a block load. Dropping it unpublished (an error or an unwind)
+/// releases its waiters to read on their own.
+pub struct BlockLead<'a>(
+    crate::inflight::Lead<'a, CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>,
+);
+
+impl BlockLead<'_> {
+    /// Hands the loaded block to the waiters; insert it into the cache first,
+    /// so a miss after this sees it there.
+    pub(crate) fn publish(self, block: Block) {
+        self.0.publish(Item::Block(block));
+    }
+}
+
+/// How a blob miss proceeds, as [`BlockClaim`] for a block.
+pub enum BlobClaim<'a> {
+    /// Read the value, then [`BlobLead::publish`].
+    Lead(BlobLead<'a>),
+    /// A concurrent read of the same record, for the same key, finished.
+    Shared(UserValue),
+    /// Read the value without coordination.
+    Alone,
+}
+
+/// The lead of a blob load, as [`BlockLead`] for a block.
+pub struct BlobLead<'a>(
+    crate::inflight::Lead<'a, CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>,
+);
+
+impl BlobLead<'_> {
+    /// Hands the value read for `user_key` to the waiters, caching it first
+    /// when `fill` says so. Returns the bytes copied to own the key, which the
+    /// cache entry and the waiters share: none when the value is neither
+    /// cached nor awaited.
+    pub(crate) fn publish(
+        self,
+        cache: &Cache,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
+        value: UserValue,
+        fill: bool,
+    ) -> usize {
+        if !fill && !self.0.has_waiters() {
+            // Dropped unpublished: nothing to share, and the key is not
+            // copied for nobody.
+            return 0;
+        }
+        let item = Item::Blob(user_key.into(), vhandle.on_disk_size, value);
+        if fill {
+            cache.data.insert(
+                (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
+                item.clone(),
+            );
+        }
+        self.0.publish(item);
+        user_key.len()
+    }
+}
+
+/// Shards of the load registry: as many as the cache, so two loads that
+/// would contend on one cache shard are the ones that share a registry shard.
+const LOAD_SHARDS: usize = BLOCK_CACHE_SHARDS;
+/// Loads one registry shard coordinates at once, so the registry holds at
+/// most `LOAD_SHARDS * LOADS_PER_SHARD` tickets; a miss past that loads on
+/// its own.
+const LOADS_PER_SHARD: usize = 64;
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
 /// on many-core hosts while the lock array stays small; reads take a shared lock
@@ -205,6 +308,74 @@ impl Cache {
             ),
             row_cache_enabled: true,
             metadata_priority: true,
+            loads: crate::inflight::InflightLoads::new(
+                LOAD_SHARDS,
+                LOADS_PER_SHARD,
+                rustc_hash::FxBuildHasher,
+            ),
+        }
+    }
+
+    /// Claims the cold load of the block at `offset` after a cache miss.
+    ///
+    /// Blocks while a compatible load of the block runs on another thread,
+    /// returning its block. A [`BlockClaim::Lead`] holder checks the cache
+    /// once more before reading: a load that finished between its miss and
+    /// this claim left the block there.
+    pub(crate) fn claim_block(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+    ) -> BlockClaim<'_> {
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => BlockClaim::Lead(BlockLead(lead)),
+            crate::inflight::Claim::Join(join) => match join.wait() {
+                Some(Item::Block(block)) => BlockClaim::Shared(block),
+                _ => BlockClaim::Alone,
+            },
+            crate::inflight::Claim::Alone => BlockClaim::Alone,
+        }
+    }
+
+    /// How many requests wait on cold loads in flight, for tests.
+    #[cfg(test)]
+    pub(crate) fn load_waiters(&self) -> usize {
+        self.loads.waiters()
+    }
+
+    /// How many cold loads are in flight, for tests.
+    #[cfg(test)]
+    pub(crate) fn loads_in_flight(&self) -> usize {
+        self.loads.len()
+    }
+
+    /// Claims the cold read of the separated value `vhandle` names for
+    /// `user_key`, as [`Self::claim_block`] does for a block. A shared value
+    /// is returned only when the read it came from was for the same key and
+    /// size: the position alone names a record, not whose it is.
+    pub(crate) fn claim_blob(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
+    ) -> BlobClaim<'_> {
+        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
+        let identity = LoadIdentity::Blob {
+            on_disk_size: vhandle.on_disk_size,
+        };
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => BlobClaim::Lead(BlobLead(lead)),
+            crate::inflight::Claim::Join(join) => match join.wait() {
+                Some(Item::Blob(read_key, size, value))
+                    if &*read_key == user_key && size == vhandle.on_disk_size =>
+                {
+                    BlobClaim::Shared(value)
+                }
+                _ => BlobClaim::Alone,
+            },
+            crate::inflight::Claim::Alone => BlobClaim::Alone,
         }
     }
 
@@ -578,3 +749,7 @@ impl Cache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod coalesce_tests;

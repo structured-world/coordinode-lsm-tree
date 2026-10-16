@@ -299,7 +299,16 @@ pub struct FaultInjector {
     /// Whether a removal of a file with an open handle fails, as on a backend
     /// that refuses to unlink an open file.
     refuse_open_removal: core::sync::atomic::AtomicBool,
+    /// Called on a positional read at the paired offset of a file whose path
+    /// contains the paired text, before the read is served, so a test can
+    /// hold a read in flight while other readers run.
+    #[cfg(test)]
+    read_hooks: spin::Mutex<Vec<(String, u64, ReadHook)>>,
 }
+
+/// What a test runs inside a positional read at one offset.
+#[cfg(test)]
+pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
 
 impl FaultInjector {
     /// Creates an injector with no rules (every operation passes untouched).
@@ -357,6 +366,30 @@ impl FaultInjector {
     /// earlier rule already claimed.
     pub fn arm(&self, rule: FaultRule) {
         self.rules.lock().push(rule);
+    }
+
+    /// Runs `hook` inside every positional read at `offset` of a file whose
+    /// path contains `path`, before the read is served.
+    #[cfg(test)]
+    pub(crate) fn hook_read_at(&self, path: impl Into<String>, offset: u64, hook: ReadHook) {
+        self.read_hooks.lock().push((path.into(), offset, hook));
+    }
+
+    /// Runs the hooks armed for a read at `offset` of `path`, outside the
+    /// hook list's lock so a hook may block.
+    #[cfg(test)]
+    fn run_read_hooks(&self, path: &Path, offset: u64) {
+        let path = path.to_string_lossy();
+        let hooks: Vec<ReadHook> = self
+            .read_hooks
+            .lock()
+            .iter()
+            .filter(|(within, at, _)| *at == offset && path.contains(within.as_str()))
+            .map(|(_, _, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
+            hook();
+        }
     }
 
     /// Records one positional read. Called on every `read_at`, matched or not.
@@ -846,6 +879,8 @@ impl FsFile for FaultFile {
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.injector.count_read();
+        #[cfg(test)]
+        self.injector.run_read_hooks(&self.path, offset);
         if let Some(Fault::Error(kind)) = self.injector.check_read_at(Some(&self.path), offset) {
             return Err(fault_error(kind, FaultOp::ReadAt));
         }

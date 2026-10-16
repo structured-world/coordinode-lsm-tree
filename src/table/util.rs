@@ -362,6 +362,50 @@ pub(crate) fn load_block_paced(
         return Ok(block);
     }
 
+    // A read that leaves the cache as it found it loads alone: it must not
+    // take a block a foreground read decoded, and its own read verifies
+    // the disk afresh.
+    let lead = if charge.touches_cache() {
+        match cache.claim_block(
+            table_id,
+            handle.offset(),
+            crate::cache::LoadIdentity::Block {
+                block_type,
+                size: handle.size(),
+                compression,
+                encrypted: encryption.is_some(),
+            },
+        ) {
+            crate::cache::BlockClaim::Shared(block) => {
+                #[cfg(feature = "metrics")]
+                if charge.is_counted() {
+                    metrics
+                        .block_load_shared
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(block);
+            }
+            crate::cache::BlockClaim::Lead(lead) => {
+                // A load that finished between the miss above and this claim
+                // left its block in the cache.
+                if let Some(block) = cache.get_block(table_id, handle.offset())
+                    && block.header.block_type == block_type
+                {
+                    #[cfg(feature = "metrics")]
+                    if charge.is_counted() {
+                        record_block_load_cached(metrics, block_type);
+                    }
+                    lead.publish(block.clone());
+                    return Ok(block);
+                }
+                Some(lead)
+            }
+            crate::cache::BlockClaim::Alone => None,
+        }
+    } else {
+        None
+    };
+
     let fd = fd.resolve(
         file_accessor,
         &table_id,
@@ -433,6 +477,9 @@ pub(crate) fn load_block_paced(
     )?;
     if charge.touches_cache() {
         cache.insert_block(table_id, handle.offset(), block.clone());
+    }
+    if let Some(lead) = lead {
+        lead.publish(block.clone());
     }
     Ok(block)
 }

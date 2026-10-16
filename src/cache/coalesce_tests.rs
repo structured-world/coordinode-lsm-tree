@@ -1,0 +1,265 @@
+use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+use crate::{AbstractTree, AnyTree, Cache, Config, SeqNo, SequenceNumberCounter};
+use alloc::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+const READERS: u8 = 8;
+
+/// The value written under `key` by [`write_keys`].
+fn value(key: u8) -> [u8; 32] {
+    [key; 32]
+}
+
+/// Writes keys `0..count` and flushes them into one table.
+fn write_keys(config: Config, count: u8) -> crate::Result<()> {
+    let tree = config.open()?;
+    for key in 0..count {
+        tree.insert([key], value(key), u64::from(key));
+    }
+    tree.flush_active_memtable(0)
+}
+
+fn config(folder: &std::path::Path) -> Config {
+    Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+}
+
+/// The tree in `folder` reopened over `fs` with `cache`, so nothing it holds
+/// is cached.
+fn reopen_cold(
+    folder: &std::path::Path,
+    fs: FaultFs<StdFs>,
+    cache: &Arc<Cache>,
+    separated: bool,
+) -> crate::Result<AnyTree> {
+    let config = config(folder).with_fs(fs).use_cache(Arc::clone(cache));
+    if separated {
+        config
+            .with_kv_separation(Some(
+                crate::KvSeparationOptions::default().separation_threshold(1),
+            ))
+            .open()
+    } else {
+        config.open()
+    }
+}
+
+/// The path and file offset of the table's first data block.
+fn first_data_block(tree: &AnyTree) -> (String, u64) {
+    use crate::table::block_index::BlockIndex as _;
+    let version = tree.current_version();
+    let Some(table) = version.iter_tables().next() else {
+        panic!("the flush wrote a table");
+    };
+    let Some(handle) = table.block_index.iter().find_map(Result::ok) else {
+        panic!("a non-empty table has a data block");
+    };
+    (table.path.to_string_lossy().into_owned(), *handle.offset())
+}
+
+/// A hook that holds the first read it sees until `waiters` requests wait on
+/// cold loads (or ten seconds pass), and counts every read it sees.
+fn hold_until_joined(
+    cache: &Arc<Cache>,
+    waiters: usize,
+) -> (Arc<AtomicUsize>, crate::fs::ReadHook) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let hook: crate::fs::ReadHook = {
+        let (reads, cache) = (Arc::clone(&reads), Arc::clone(cache));
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while cache.load_waiters() < waiters && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+            }
+        })
+    };
+    (reads, hook)
+}
+
+/// Reads keys `0..READERS` from `tree`, one thread each, all released at once.
+#[expect(
+    clippy::needless_collect,
+    reason = "every reader is spawned before any is joined, or the barrier never opens"
+)]
+fn read_at_once(tree: &AnyTree) -> Vec<crate::Result<Option<crate::UserValue>>> {
+    let barrier = Arc::new(Barrier::new(usize::from(READERS)));
+    let readers: Vec<_> = (0..READERS)
+        .map(|key| {
+            let (tree, barrier) = (tree.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                tree.get([key], SeqNo::MAX)
+            })
+        })
+        .collect();
+    readers
+        .into_iter()
+        .map(|reader| reader.join().expect("reader"))
+        .collect()
+}
+
+/// Point reads that miss the same cold block at once read and decode it once:
+/// one reader loads it, the others wait and take its block, every one gets the
+/// right value, and no load stays registered.
+#[test]
+fn simultaneous_cold_point_reads_of_one_block_read_it_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    injector.hook_read_at(path, offset, hook);
+
+    for (key, got) in (0..READERS).zip(read_at_once(&tree)) {
+        assert_eq!(got?.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the block");
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        tree.metrics().block_load_shared_count(),
+        usize::from(READERS) - 1
+    );
+    Ok(())
+}
+
+/// A load that fails releases its waiters to read on their own, so each meets
+/// the failure itself, and the next read after the fault clears succeeds: no
+/// error is remembered and no waiter is stranded.
+#[test]
+fn failed_cold_load_releases_waiters_and_is_not_remembered() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    injector.hook_read_at(path.clone(), offset, hook);
+    injector.arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(path)
+            .at_offset(offset),
+    );
+
+    for got in read_at_once(&tree) {
+        assert!(got.is_err(), "every reader meets the read failure");
+    }
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        usize::from(READERS),
+        "a failed load is not shared: each waiter read for itself"
+    );
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+
+    injector.clear();
+    assert_eq!(
+        tree.get([0], SeqNo::MAX)?.as_deref(),
+        Some(&value(0)[..]),
+        "the failure was not remembered"
+    );
+    Ok(())
+}
+
+/// Loads of different blocks do not wait on each other: while one block's
+/// read is held, a read of another block completes.
+#[test]
+fn held_cold_load_does_not_block_another_block() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(
+        config(folder.path()).data_block_size_policy(crate::config::BlockSizePolicy::all(256)),
+        64,
+    )?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+
+    let held = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    {
+        let (held, release) = (Arc::clone(&held), Arc::clone(&release));
+        injector.hook_read_at(
+            path,
+            offset,
+            Arc::new(move || {
+                held.wait();
+                release.wait();
+            }),
+        );
+    }
+    let first = {
+        let tree = tree.clone();
+        std::thread::spawn(move || tree.get([0], SeqNo::MAX))
+    };
+    held.wait();
+    // The last key lives in another block, whose load runs while the first
+    // block's read is held.
+    assert_eq!(tree.get([63], SeqNo::MAX)?.as_deref(), Some(&value(63)[..]));
+    release.wait();
+    assert_eq!(
+        first.join().expect("reader")?.as_deref(),
+        Some(&value(0)[..])
+    );
+    Ok(())
+}
+
+/// Reads that miss the same cold separated value at once read its record once
+/// and every one gets the value.
+#[test]
+fn simultaneous_cold_reads_of_one_blob_read_it_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    // One key, so its record is the blob file's first, at offset 0.
+    write_keys(
+        config(folder.path()).with_kv_separation(Some(
+            crate::KvSeparationOptions::default().separation_threshold(1),
+        )),
+        1,
+    )?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, true)?;
+    // Warm the index side, which resolves no value, so the readers meet only
+    // at the blob read.
+    assert!(tree.contains_key([0], SeqNo::MAX)?);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    injector.hook_read_at("blobs", 0, hook);
+
+    let barrier = Arc::new(Barrier::new(usize::from(READERS)));
+    let readers: Vec<_> = (0..READERS)
+        .map(|_| {
+            let (tree, barrier) = (tree.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                tree.get([0], SeqNo::MAX)
+            })
+        })
+        .collect();
+    for reader in readers {
+        assert_eq!(
+            reader.join().expect("reader")?.as_deref(),
+            Some(&value(0)[..])
+        );
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the record");
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    #[cfg(feature = "metrics")]
+    assert_eq!(
+        tree.metrics().blob_load_shared_count(),
+        usize::from(READERS) - 1
+    );
+    Ok(())
+}
