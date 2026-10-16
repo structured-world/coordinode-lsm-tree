@@ -256,6 +256,36 @@ fn estimate_moves_an_eighth_toward_each_sample() {
     assert!(estimate() > u32::MAX / 8 * 7, "converges toward the sample");
 }
 
+/// A timed wait of a batched read counts as its length shared among the
+/// reads it handed back, in every shard: a batch of slow reads switches
+/// sharing on for keys of any shard, and a wait that handed back nothing
+/// tells nothing.
+#[test]
+fn a_batched_wait_feeds_every_shard_its_share_per_read() {
+    std::thread::spawn(|| {
+        let loads: Loads =
+            InflightLoads::new(8, 8, Duration::from_micros(100), rustc_hash::FxBuildHasher);
+        let timed = std::iter::repeat_with(LoadTimer::start)
+            .find(|timer| timer.started.is_some())
+            .expect("one in the sampling period is timed");
+        loads.record_batch_wait(timed, 0);
+        assert!((0..64u64).all(|key| loads.estimate(&key) == 0));
+
+        std::thread::sleep(Duration::from_millis(20));
+        // Twenty milliseconds over four reads: five each, far past 100 µs.
+        loads.record_batch_wait(timed, 4);
+        for key in 0..64u64 {
+            let estimate = loads.estimate(&key);
+            assert!(
+                (5_000_000 / 8..250_000_000 / 8).contains(&estimate),
+                "key {key}: {estimate}"
+            );
+        }
+    })
+    .join()
+    .expect("sampling thread");
+}
+
 /// One load in `LOAD_SAMPLE_EVERY` of a thread is timed, and a timed one
 /// feeds the estimate when recorded.
 #[test]

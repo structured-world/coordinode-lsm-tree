@@ -620,6 +620,12 @@ impl Cache {
         );
     }
 
+    /// Records a wait of a batched read that `timer` timed, which handed back
+    /// `reads` block reads.
+    pub(crate) fn record_batch_wait(&self, timer: crate::inflight::LoadTimer, reads: usize) {
+        self.loads.record_batch_wait(timer, reads);
+    }
+
     /// Records the cold read of the separated value `vhandle` names that
     /// `timer` timed.
     pub(crate) fn record_blob_load(

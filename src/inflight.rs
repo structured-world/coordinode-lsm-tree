@@ -631,6 +631,29 @@ where
         let _ = (key, timer);
     }
 
+    /// Folds a wait of a batched read that `timer` timed, if it is a sampled
+    /// one, into the estimate of every shard, as what each of its `reads`
+    /// took: the wait's length shared among the reads it handed back. A
+    /// batch's reads carry no key between them a sample could be told apart
+    /// by, and how long storage takes is not a property of any one key.
+    pub fn record_batch_wait(&self, timer: LoadTimer, reads: usize) {
+        #[cfg(feature = "std")]
+        if let Some(started) = timer.started
+            && reads > 0
+        {
+            let per_read = started.elapsed().as_nanos() / reads as u128;
+            // A read past `u32::MAX` nanoseconds (four seconds) is simply slow.
+            let sample = u32::try_from(per_read).unwrap_or(u32::MAX);
+            for shard in &self.shards {
+                let estimate = &shard.0.load_nanos;
+                let old = estimate.load(Ordering::Relaxed);
+                estimate.store(old - old / 8 + sample / 8, Ordering::Relaxed);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = (timer, reads);
+    }
+
     /// Moves the estimate of `key`'s shard an eighth of the way to `sample`.
     /// Read and written apart: it is a statistic, and two samples folded at
     /// once lose one of them rather than anything that needs to be exact.

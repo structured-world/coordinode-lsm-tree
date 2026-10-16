@@ -387,6 +387,59 @@ fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
     Ok(())
 }
 
+/// Multi-gets reading through the `io_uring` ring's own queue lead the loads
+/// of their blocks and publish them from the ring's completions, while point
+/// reads of the same keys run at once and wait on those loads: every read
+/// answers right, none is left waiting, and no load stays registered.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[test]
+fn point_reads_wait_on_multi_gets_reading_through_io_uring() -> crate::Result<()> {
+    if !crate::fs::is_io_uring_available() {
+        return Ok(());
+    }
+    let folder = tempfile::tempdir()?;
+    write_keys(
+        config(folder.path()).data_block_size_policy(crate::config::BlockSizePolicy::all(256)),
+        200,
+    )?;
+    for _ in 0..4 {
+        let cache = sharing_cache(64 << 20);
+        let tree = config(folder.path())
+            .with_fs(crate::fs::IoUringFs::new()?)
+            .use_cache(Arc::clone(&cache))
+            .open()?;
+        let barrier = Arc::new(Barrier::new(usize::from(READERS)));
+        let readers: Vec<_> = (0..READERS)
+            .map(|reader| {
+                let (tree, barrier) = (tree.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || -> crate::Result<()> {
+                    barrier.wait();
+                    if reader % 2 == 0 {
+                        let values = tree.multi_get((0..200u8).map(|key| [key]), SeqNo::MAX)?;
+                        for (key, got) in (0..200u8).zip(values) {
+                            assert_eq!(got.as_deref(), Some(&value(key)[..]), "key {key}");
+                        }
+                    } else {
+                        for key in 0..200u8 {
+                            assert_eq!(
+                                tree.get([key], SeqNo::MAX)?.as_deref(),
+                                Some(&value(key)[..]),
+                                "key {key}"
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().expect("reader")?;
+        }
+        assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    }
+    Ok(())
+}
+
 /// A table of one large zstd data block that bounded ranges decode only in
 /// part, with its file and the block's offset.
 #[cfg(feature = "zstd")]
