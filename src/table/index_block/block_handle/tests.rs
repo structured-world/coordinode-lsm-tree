@@ -86,7 +86,7 @@ fn parse_truncated_rejects_suffix_len_beyond_remaining_bytes() {
         offset,
         12,
         16,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -105,7 +105,7 @@ fn parse_truncated_rejects_prefix_span_crossing_entry_boundary() {
         offset,
         13,
         16,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -124,7 +124,7 @@ fn parse_truncated_rejects_prefix_span_crossing_restart_key_boundary() {
         offset,
         8,
         14,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -141,7 +141,7 @@ fn parse_truncated_rejects_base_key_offset_past_entry_start() {
         offset,
         17,
         16,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -162,7 +162,7 @@ fn parse_truncated_rejects_invalid_marker() {
         offset,
         12,
         16,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -183,7 +183,7 @@ fn parse_truncated_rejects_suffix_span_overlapping_trailer_region() {
         offset,
         12,
         16,
-        0,
+        None,
         entries_end,
     );
     assert!(parsed.is_none());
