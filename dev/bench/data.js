@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792169675494,
+  "lastUpdate": 1792169679153,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -48904,6 +48904,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.611532341,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "43e0b507200b3b4651cf76a16aa7a1ac991c4fca",
+          "message": "perf(table): delta-encode sequence numbers inside a restart interval (#919)\n\n## Summary\n- Data blocks store the sequence numbers of non-head entries as zigzag\ndeltas from their restart head, where that is shorter than storing them\nin full\n- Each block picks its coding from the encoded lengths and records the\nchoice in one bit on its first entry's value-type byte, so blocks of\nscattered seqnos (random keys) keep the full form and stay\nbyte-identical to before\n\n## Changes\n- `InternalValue` encodes with a per-block `SeqnoCoding` state;\n`DataBlock::encode_into` chooses deltas only when their total varint\nlength is strictly below the full seqnos'\n- The decoder reads the coding bit once per block (also from a partially\ndecoded prefix) and hands each truncated entry its head's seqno only\nwhen the block stores deltas\n- A flagged byte on any later head or on a truncated entry is rejected\nas an unknown value type\n- The v5-to-v6 converter re-encodes each source block's rows instead of\ncopying the 5.x payload, keeping one 6.0 block per source block\n- structured-zstd 0.2.1\n\n## Measurements\nTable bytes, main → branch (flush + full compaction): 2M × 16 B\nsequential keys lz4 −7.7%, zstd −14.7%, uncompressed −6.6%; 2M × 100 B\nzstd −0.9%; 300K × 1000 B zstd −0.06%; random keys byte-identical on\nevery codec. Linux, 15 interleaved rounds, medians: compaction on\nsequential zstd −3.0%, random uncompressed −0.8%, random zstd +0.5%\n(within noise); write of sequential zstd −4.1%.\n\n## Testing\nfmt, nextest (all features and default), clippy in both feature sets,\ndoc tests, rustdoc, the no-std check, sst-dump, db_bench and the\nv5-to-v6 converter's lint and tests pass on Linux.\n\nCloses #844\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Data blocks now use compact sequence-number delta encoding when it\ntakes less space than full sequence numbers. Reading remains supported\nacross both encoding formats.\n* **Improvements**\n* Table imports and non-columnar table conversions now re-encode rows\nwhen writing data blocks, preserving source-block boundaries during\nimport. Data-block sizing is fixed for table imports.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T19:41:17+03:00",
+          "tree_id": "ecfc249f5c5df15903b7d12e16b4b7d68bffc5bc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/43e0b507200b3b4651cf76a16aa7a1ac991c4fca"
+        },
+        "date": 1792169677922,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 504.517,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 77.825683ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 141.59,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 51.180782ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 443.565,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.796056ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3649.204,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9295.361,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.295,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.376447,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.611030323,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.279,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 78.249983,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.608174025,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
