@@ -59,13 +59,10 @@ struct Ticket<V, I> {
     identity: I,
     value: UnsafeCell<Option<V>>,
     is_settled: AtomicBool,
-    /// Waiters that spun out and park; the lead wakes them only if any did.
+    /// Waiters that spun out and park on the ticket's address; the lead
+    /// wakes them, all at once, only if any did.
     #[cfg(feature = "std")]
     parked: core::sync::atomic::AtomicU32,
-    #[cfg(feature = "std")]
-    park_lock: parking_lot::Mutex<()>,
-    #[cfg(feature = "std")]
-    settled: parking_lot::Condvar,
 }
 
 // SAFETY: `value` is written once, before `is_settled` is set with release
@@ -82,11 +79,14 @@ impl<V, I> Ticket<V, I> {
             is_settled: AtomicBool::new(false),
             #[cfg(feature = "std")]
             parked: core::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "std")]
-            park_lock: parking_lot::Mutex::new(()),
-            #[cfg(feature = "std")]
-            settled: parking_lot::Condvar::new(),
         }
+    }
+
+    /// The address the ticket's waiters park on: stable while it is shared,
+    /// since it lives behind the `Arc` they all hold.
+    #[cfg(feature = "std")]
+    fn park_key(&self) -> usize {
+        core::ptr::from_ref(self).addr()
     }
 
     /// Settles the load with `value`, `None` when it failed.
@@ -102,14 +102,21 @@ impl<V, I> Ticket<V, I> {
             *self.value.get() = value;
         }
         self.is_settled.store(true, Ordering::SeqCst);
-        // A waiter counts itself parked before it checks `is_settled` and
-        // sleeps, all under `park_lock`; both sides are sequentially
-        // consistent, so either it sees the ticket settled and never sleeps,
-        // or this sees it counted and wakes it under the same lock.
+        // A waiter counts itself parked, then checks `is_settled` under the
+        // parking lot's queue lock before it sleeps; both sides are
+        // sequentially consistent, so either it sees the ticket settled and
+        // never sleeps, or this sees it counted and wakes it, the queue lock
+        // ordering the wake after its check.
         #[cfg(feature = "std")]
         if self.parked.load(Ordering::SeqCst) > 0 {
-            drop(self.park_lock.lock());
-            self.settled.notify_all();
+            // SAFETY: the key is this ticket's address, which only its own
+            // waiters park on.
+            unsafe {
+                parking_lot_core::unpark_all(
+                    self.park_key(),
+                    parking_lot_core::DEFAULT_UNPARK_TOKEN,
+                );
+            }
         }
     }
 
@@ -171,12 +178,23 @@ impl<V: Clone, I> Ticket<V, I> {
     /// Sleeps until the lead settles the load.
     #[cfg(feature = "std")]
     fn park(&self) -> Option<V> {
-        let mut guard = self.park_lock.lock();
         self.parked.fetch_add(1, Ordering::SeqCst);
         while !self.is_settled.load(Ordering::SeqCst) {
-            self.settled.wait(&mut guard);
+            // SAFETY: the key is this ticket's address, which only its own
+            // waiters park on, and the callbacks neither panic nor call into
+            // the parking lot. A wake that finds the ticket still pending
+            // (a spurious one) parks again.
+            unsafe {
+                parking_lot_core::park(
+                    self.park_key(),
+                    || !self.is_settled.load(Ordering::SeqCst),
+                    || {},
+                    |_, _| {},
+                    parking_lot_core::DEFAULT_PARK_TOKEN,
+                    None,
+                );
+            }
         }
-        drop(guard);
         self.outcome().and_then(Option::clone)
     }
 

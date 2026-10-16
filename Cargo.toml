@@ -68,6 +68,7 @@ default = ["std", "parallel"]
 std = [
     "dep:arc-swap",
     "dep:parking_lot",
+    "dep:parking_lot_core",
     "dep:tempfile",
     "rustc-hash/std",
     "varint-rs/std",
@@ -170,6 +171,10 @@ spin = { version = "0.12", default-features = false, features = ["mutex", "spin_
 # userspace fast-path, concurrent readers); `spin::RwLock` is the no_std lock.
 hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }
 parking_lot = { version = "0.12", optional = true }
+# The parking primitive under `parking_lot`: a cold load's waiters park on
+# the address of the load and its lead wakes them all at once, rather than
+# one after another through a condition variable's mutex.
+parking_lot_core = { version = "0.9", optional = true }
 # LZ4 block codec for hot-path blocks. `default-features = false` drops the
 # `std` and `frame` defaults (we use only the block API and stay no_std-capable
 # via `alloc`), but the malformed-input safety flags are NOT dropped: verify and
