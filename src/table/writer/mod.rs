@@ -4034,6 +4034,9 @@ impl Writer {
     /// Counts each new key of `entries`, in order, against the partition of a
     /// prebuilt filter that covers it, and refuses a key none of them covers,
     /// before anything is written. Without a prebuilt filter it does nothing.
+    /// A column batch is written whole, not entry by entry, so only it needs
+    /// the count up front.
+    #[cfg(feature = "columnar")]
     pub(crate) fn count_prebuilt_keys(
         &mut self,
         entries: &[InternalValue],
@@ -4051,94 +4054,6 @@ impl Writer {
             }
         }
         Ok(())
-    }
-
-    /// Appends a row data block from its compressed payload, as another store
-    /// wrote it and its reader verified it, framed under this writer: this
-    /// table's encryption, place binding and parity, no decompression and no
-    /// recompression. The payload must be compressed with this writer's data
-    /// codec (and dictionary), and carry a per-KV checksum footer exactly when
-    /// this writer emits one for the table. `entries` are the block's rows, used
-    /// for the index, filter, locator, zone and seqno accounting a freshly
-    /// encoded block gets; they are not re-serialized.
-    ///
-    /// Returns the block's last user key, or `None` for an empty entry set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the entries are out of internal-key order
-    /// ([`Self::validate_direct_block_order`]), the payload disagrees with its
-    /// uncompressed length, or the write fails.
-    #[cfg(feature = "std")]
-    pub(crate) fn append_compressed_data_block(
-        &mut self,
-        payload: &[u8],
-        uncompressed_length: u32,
-        entries: &[InternalValue],
-        comparator: &crate::SharedComparator,
-    ) -> crate::Result<Option<crate::UserKey>> {
-        self.validate_direct_block_order(entries, comparator)?;
-        self.count_prebuilt_keys(entries, comparator)?;
-        let Some(inputs) = self.account_direct_block(entries)? else {
-            return Ok(None);
-        };
-        let kv_flags = if self
-            .kv_checksum
-            .is_some_and(|(policy, _)| policy.applies(self.initial_level, self.table_id))
-        {
-            crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER
-        } else {
-            0
-        };
-        let transform = {
-            let t = crate::table::block::BlockTransform::from_parts(
-                self.data_block_compression,
-                self.encryption.as_deref(),
-                #[cfg(zstd_any)]
-                self.zstd_dictionary.as_deref(),
-            )?;
-            if let Some(ecc) = self.ecc {
-                t.with_ecc(ecc)
-            } else {
-                t
-            }
-        };
-        let prepared = Block::prepare_compressed(
-            payload,
-            uncompressed_length,
-            super::block::BlockIdentity {
-                table_id: self.table_id,
-                block_type: super::block::BlockType::Data,
-                dict_id: self.data_block_compression.dict_id(),
-                window_log: 0,
-            },
-            &transform,
-            kv_flags,
-        )?;
-        // The inner-block layout a compression here would have recorded, read
-        // from the frame: a range read partial-decodes the carried block as it
-        // would one this writer compressed.
-        #[cfg(zstd_any)]
-        let layout = match self.data_block_compression {
-            CompressionType::Zstd(_) => crate::compression::inner_block_layout_of(payload)?,
-            _ => Vec::new(),
-        };
-        #[cfg(not(zstd_any))]
-        let layout = Vec::new();
-        let at = next_block_at(self.table_id, &self.file_writer);
-        let header = prepared.write_to(&mut self.file_writer, at)?;
-        self.register_written_block(
-            header,
-            layout,
-            inputs.last_key.clone(),
-            inputs.last_seqno,
-            inputs.seqno_bounds,
-            inputs.item_count,
-            inputs.zone_block_min,
-            None,
-        )?;
-        self.locator_block_done();
-        Ok(Some(inputs.last_key))
     }
 
     /// Appends a columnar row group by copying its raw on-disk bytes

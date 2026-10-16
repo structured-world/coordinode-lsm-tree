@@ -1001,65 +1001,6 @@ impl Block {
         Self::seal(header, data, compressed, layout, &identity, transform)
     }
 
-    /// Runs the stages after compression (encrypt → checksum → ecc) over a
-    /// payload that is already compressed as `transform` compresses, and
-    /// returns a [`PreparedBlock`] framed like any other: a block carried from
-    /// another store keeps its compressed bytes and gets this store's
-    /// encryption, place binding and parity. `uncompressed_length` is the
-    /// payload's length once decompressed; `extra_flags` as in
-    /// [`Self::write_into_with_flags`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::InvalidHeader`] for an uncompressed payload
-    /// whose length is not `uncompressed_length`, and the encryption and size
-    /// errors [`Self::write_into`] returns.
-    pub(crate) fn prepare_compressed<'a>(
-        payload: &'a [u8],
-        uncompressed_length: u32,
-        identity: BlockIdentity,
-        transform: &BlockTransform<'_>,
-        extra_flags: u8,
-    ) -> crate::Result<PreparedBlock<'a>> {
-        use crate::table::block::header::block_flags;
-
-        debug_assert_eq!(
-            extra_flags & !block_flags::KNOWN,
-            0,
-            "extra_flags must contain only defined block_flags bits",
-        );
-        if uncompressed_length > MAX_DECOMPRESSION_SIZE {
-            return Err(crate::Error::DecompressedSizeTooLarge {
-                declared: u64::from(uncompressed_length),
-                limit: u64::from(MAX_DECOMPRESSION_SIZE),
-            });
-        }
-        let compressed = transform.compression() != CompressionType::None;
-        if !compressed && payload.len() != uncompressed_length as usize {
-            return Err(crate::Error::InvalidHeader(
-                "uncompressed block payload is not its uncompressed length",
-            ));
-        }
-        let mut flags = extra_flags;
-        if compressed {
-            flags |= block_flags::COMPRESSED;
-        }
-        if transform.encryption().is_some() {
-            flags |= block_flags::ENCRYPTED;
-        }
-        let header = Header {
-            block_type: identity.block_type,
-            block_flags: flags,
-            stored_checksum: Checksum::from_raw(0), // bound by the write
-            data_length: 0,                         // set by the seal
-            uncompressed_length,
-        };
-        // No layout here: the payload was not compressed by this call. The
-        // writer that carries it reads its inner-block layout back from the
-        // frame and registers that with the block.
-        Self::seal(header, payload, None, Vec::new(), &identity, transform)
-    }
-
     /// The stages after compression: encrypt `owned` (or `data` when nothing
     /// owns a transformed copy), then checksum, then the parity trailer.
     fn seal<'a>(

@@ -72,8 +72,7 @@ fn imported_table_records_the_properties_it_was_given() -> crate::Result<()> {
         settings,
     )?;
     let rows = rows(20);
-    let payload = crate::table::DataBlock::encode_into_vec(&rows, 16, 0.0)?;
-    table.append_block(&payload, u32::try_from(payload.len()).unwrap(), &rows)?;
+    table.append_block(rows.clone())?;
     let checksum = table.finish()?;
 
     let mut levels = vec![Vec::new(); 7];

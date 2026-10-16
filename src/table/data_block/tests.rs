@@ -17,7 +17,7 @@ fn make_truncated_data_entry(shared_prefix_len: usize) -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "payload", 0, Value);
     let mut bytes = Vec::new();
     value
-        .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+        .encode_truncated_into(&mut bytes, &mut 0, shared_prefix_len)
         .expect("encoding test InternalValue into truncated form must succeed");
     bytes
 }
@@ -26,7 +26,7 @@ fn make_full_data_entry() -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "payload", 0, Value);
     let mut bytes = Vec::new();
     value
-        .encode_full_into(&mut bytes, &mut ())
+        .encode_full_into(&mut bytes, &mut 0)
         .expect("encoding full test InternalValue must succeed");
     bytes
 }
@@ -35,7 +35,7 @@ fn make_full_tombstone_entry() -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
     let mut bytes = Vec::new();
     value
-        .encode_full_into(&mut bytes, &mut ())
+        .encode_full_into(&mut bytes, &mut 0)
         .expect("encoding full tombstone InternalValue must succeed");
     bytes
 }
@@ -44,7 +44,7 @@ fn make_truncated_tombstone_entry(shared_prefix_len: usize) -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
     let mut bytes = Vec::new();
     value
-        .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+        .encode_truncated_into(&mut bytes, &mut 0, shared_prefix_len)
         .expect("encoding tombstone InternalValue into truncated form must succeed");
     bytes
 }
@@ -212,6 +212,7 @@ fn parse_truncated_rejects_prefix_span_crossing_restart_key_boundary() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -233,6 +234,7 @@ fn parse_truncated_returns_none_for_unknown_value_type_byte() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -254,6 +256,7 @@ fn parse_truncated_rejects_key_span_crossing_block_boundary() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -275,6 +278,7 @@ fn parse_truncated_rejects_value_span_crossing_block_boundary() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -297,6 +301,7 @@ fn parse_truncated_rejects_key_span_overlapping_trailer_region() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -319,6 +324,7 @@ fn parse_truncated_rejects_value_span_overlapping_trailer_region() {
         offset,
         8,
         14,
+        0,
         entries_end,
     );
     assert!(parsed.is_none());
@@ -370,6 +376,139 @@ fn kv_checked_block_round_trips_through_reader() -> crate::Result<()> {
         assert_eq!(got.key.seqno, want.key.seqno);
         assert_eq!(got.key.value_type, want.key.value_type);
         assert_eq!(got.value, want.value);
+    }
+    Ok(())
+}
+
+/// The stored seqno delta is the zigzag of the wrapping difference: a step
+/// either way costs one small varint, and every pair round-trips, the ends of
+/// the u64 range next to each other included.
+#[test]
+fn seqno_delta_round_trips_both_ways_and_across_the_range_ends() {
+    use super::{seqno_delta, seqno_from_delta};
+
+    assert_eq!(seqno_delta(10, 10), 0);
+    assert_eq!(seqno_delta(9, 10), 1, "one older version");
+    assert_eq!(seqno_delta(11, 10), 2, "one later write");
+    let edges = [
+        0,
+        1,
+        2,
+        63,
+        64,
+        1 << 32,
+        u64::MAX >> 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for head in edges {
+        for seqno in edges {
+            assert_eq!(
+                seqno_from_delta(seqno_delta(seqno, head), head),
+                seqno,
+                "{seqno} under {head}"
+            );
+        }
+    }
+}
+
+/// Items whose seqnos rise, fall and jump across the whole range inside one
+/// restart interval: older versions of a key below its head (negative
+/// deltas), later keys above it (positive), and a key whose versions sit at
+/// both ends of the range (deltas that wrap).
+fn mixed_seqno_items() -> Vec<InternalValue> {
+    let rows: [(&str, SeqNo); 13] = [
+        ("a", 100),
+        ("a", 99),
+        ("a", 7),
+        ("b", 1_000_000),
+        ("b", 0),
+        ("c", SeqNo::MAX >> 1),
+        ("c", 3),
+        ("d", 5),
+        ("e", 1 << 40),
+        ("e", 1 << 39),
+        ("e", 2),
+        ("f", 0),
+        ("g", 64),
+    ];
+    rows.into_iter()
+        .map(|(key, seqno)| {
+            if seqno % 3 == 0 {
+                InternalValue::from_components(key, "", seqno, Tombstone)
+            } else {
+                InternalValue::from_components(key, format!("{key}@{seqno}"), seqno, Value)
+            }
+        })
+        .collect()
+}
+
+/// A block over those items reads every entry back with its seqno, forward
+/// and backward, at every restart interval: each item decodes against the
+/// head of its own interval.
+#[test]
+fn seqnos_relative_to_the_restart_head_read_back_both_directions() -> crate::Result<()> {
+    let items = mixed_seqno_items();
+    for restart_interval in 1..=16 {
+        let block = DataBlock::new(Block {
+            data: DataBlock::encode_into_vec(&items, restart_interval, 1.33)?.into(),
+            header: Header::test_dummy(BlockType::Data),
+        });
+        let forward: Vec<InternalValue> = block
+            .iter(default_comparator())
+            .map(|item| item.materialize(block.as_slice()))
+            .collect();
+        assert_eq!(forward, items, "forward, interval {restart_interval}");
+        let backward: Vec<InternalValue> = block
+            .iter(default_comparator())
+            .rev()
+            .map(|item| item.materialize(block.as_slice()))
+            .collect();
+        let mut reversed = items.clone();
+        reversed.reverse();
+        assert_eq!(backward, reversed, "backward, interval {restart_interval}");
+    }
+    Ok(())
+}
+
+/// A point read at any snapshot finds the version the snapshot sees, also
+/// when that version is stored below its interval's head, and finds nothing
+/// when the snapshot sees none.
+#[test]
+fn point_reads_see_the_right_version_under_seqno_deltas() -> crate::Result<()> {
+    let items = mixed_seqno_items();
+    let snapshots = [
+        0,
+        1,
+        3,
+        4,
+        7,
+        8,
+        99,
+        100,
+        101,
+        1_000_000,
+        1_000_001,
+        1 << 40,
+    ];
+    for restart_interval in [1, 2, 3, 4, 16] {
+        let block = DataBlock::new(Block {
+            data: DataBlock::encode_into_vec(&items, restart_interval, 1.33)?.into(),
+            header: Header::test_dummy(BlockType::Data),
+        });
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            for snapshot in snapshots.into_iter().chain([SeqNo::MAX]) {
+                let expected = items
+                    .iter()
+                    .find(|item| &*item.key.user_key == key.as_bytes() && item.key.seqno < snapshot)
+                    .cloned();
+                assert_eq!(
+                    block.point_read(key.as_bytes(), snapshot, &default_comparator())?,
+                    expected,
+                    "{key} at {snapshot}, interval {restart_interval}"
+                );
+            }
+        }
     }
     Ok(())
 }

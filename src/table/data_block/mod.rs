@@ -149,6 +149,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         offset: usize,
         base_key_offset: usize,
         base_key_end: usize,
+        base_seqno: SeqNo,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
         // Slice-based decode (see `parse_full` / `read_leb128`).
@@ -162,8 +163,9 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         }
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let (seqno, np) = read_leb128!(buf, pos);
+        let (delta, np) = read_leb128!(buf, pos);
         pos = np;
+        let seqno = seqno_from_delta(delta, base_seqno);
 
         let (shared_raw, np) = read_leb128!(buf, pos);
         pos = np;
@@ -239,11 +241,48 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
     }
 }
 
-impl Encodable<()> for InternalValue {
+/// A non-head entry's seqno as stored: the zigzag-encoded wrapping difference
+/// from its restart head's, small in either direction (a later key written
+/// later, an older version of the head's key).
+#[inline]
+fn seqno_delta(seqno: SeqNo, head_seqno: SeqNo) -> u64 {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "the wrapping difference is reinterpreted as signed on purpose"
+    )]
+    let delta = seqno.wrapping_sub(head_seqno) as i64;
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "zigzag maps the signed delta onto u64 bit for bit"
+    )]
+    let zigzag = ((delta << 1) ^ (delta >> 63)) as u64;
+    zigzag
+}
+
+/// The inverse of [`seqno_delta`]: the seqno a stored delta names under its
+/// restart head's. Every u64 decodes to some seqno, so a corrupt delta reads
+/// as a wrong seqno, which the block checksum is there to catch.
+#[inline]
+fn seqno_from_delta(zigzag: u64, head_seqno: SeqNo) -> SeqNo {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "zigzag decode reinterprets the low bit as the sign"
+    )]
+    let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the signed delta is applied as a wrapping difference"
+    )]
+    head_seqno.wrapping_add(delta as u64)
+}
+
+/// The encoder's state is the current restart head's seqno: every entry after
+/// the head stores its seqno as a delta from it.
+impl Encodable<SeqNo> for InternalValue {
     fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
-        _state: &mut (),
+        head_seqno: &mut SeqNo,
     ) -> crate::Result<()> {
         // We encode restart markers as:
         // [value type] [seqno] [user key len] [user key] [value len] [value]
@@ -251,6 +290,7 @@ impl Encodable<()> for InternalValue {
 
         writer.write_u8(u8::from(self.key.value_type))?; // 1
         writer.write_u64_varint(self.key.seqno)?; // 2
+        *head_seqno = self.key.seqno;
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
         writer.write_u16_varint(self.key.user_key.len() as u16)?; // 3
@@ -269,15 +309,15 @@ impl Encodable<()> for InternalValue {
     fn encode_truncated_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
-        _state: &mut (),
+        head_seqno: &mut SeqNo,
         shared_len: usize,
     ) -> crate::Result<()> {
         // We encode truncated values as:
-        // [value type] [seqno] [shared prefix len] [rest key len] [rest key] [value len] [value]
-        // 1            2       3                   4              5          6?          7?
+        // [value type] [seqno delta] [shared prefix len] [rest key len] [rest key] [value len] [value]
+        // 1            2             3                   4              5          6?          7?
 
         writer.write_u8(u8::from(self.key.value_type))?; // 1
-        writer.write_u64_varint(self.key.seqno)?; // 2
+        writer.write_u64_varint(seqno_delta(self.key.seqno, *head_seqno))?; // 2
 
         // TODO: maybe we can skip this varint altogether if prefix truncation = false
 
@@ -1136,7 +1176,7 @@ impl DataBlock {
             .key
             .user_key;
 
-        let mut serializer = Encoder::<'_, (), InternalValue>::new(
+        let mut serializer = Encoder::<'_, SeqNo, InternalValue>::new(
             writer,
             items.len(),
             restart_interval,
