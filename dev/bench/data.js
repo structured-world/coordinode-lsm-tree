@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792110646432,
+  "lastUpdate": 1792110650038,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -46864,6 +46864,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.599282044,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0779d9c84f1eac8ab72ceaec1d1a0501a988b486",
+          "message": "perf(compaction): write filter-rewritten blobs into the relocation output (#917)\n\n## Summary\n\n- A relocating compaction writes the values its compaction filter\nrewrites into its own blob output instead of a separate lazily opened\nwriter, so the filter adds no blob files of its own and its rewrites sit\nnext to the relocated values.\n- An inline value that reaches a relocating compaction above the\nseparation threshold in force is separated into the same output.\n\n## Changes\n\n- `RelocatingCompaction` takes the blob options and compression for\nfresh values and separates new values (filter rewrites, inline values\nabove the threshold) into its blob writer, in the lifetime class of a\nnew value; relocated byte accounting is unchanged.\n- The filter adapter returns a rewritten value inline when the\ncompaction relocates, so the merge loop writes it through the flavour;\nnon-relocating compactions keep the lazy filter writer.\n- `BlobFileWriter` splits value encoding from appending, and\n`MultiWriter::write_fresh` encodes once, picks the output for the codec\nand class, and rotates at the target size.\n\nWith values grouped by lifetime (the default), a rewritten value belongs\nto the new-value group and takes that group's file; the saving in file\ncount shows with one lifetime group.\n\n## Testing\n\nfmt, clippy (default and all features), the full nextest suite, doc\ntests, doc build, the no-std check, sst-dump and the bench build pass on\nLinux.\n\nCloses #834\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Compaction now applies configured value-separation thresholds to newly\nwritten and rewritten values, while preserving smaller values inline.\nThis helps keep blob storage organized as values move through\ncompaction.\n* Compaction can reuse suitable blob files for rewritten values, helping\nlimit additional file creation, including when lifetime groups are\nconfigured.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T00:18:03Z",
+          "tree_id": "f814871c5fa42a1bcb8a2a4d7cfe56046a3a5d3b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0779d9c84f1eac8ab72ceaec1d1a0501a988b486"
+        },
+        "date": 1792110648909,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 504.018,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21152431 B | decoded: 20703136 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 76.818999ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 117.125,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.060657ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 441.862,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.856751ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3786.3010000000004,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9483.829,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.103,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 87.162879,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.612576262,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.191,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 77.004799,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.599096759,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
