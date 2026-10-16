@@ -133,6 +133,31 @@ fn simultaneous_cold_point_reads_of_one_block_read_it_once() -> crate::Result<()
     Ok(())
 }
 
+/// A block the cache will not keep (heavier than a cache shard, as one the
+/// cache evicts at once) still reaches the readers waiting on its load: they
+/// hold the decoded block itself, not a cache entry, so the block is read once.
+#[test]
+fn a_block_the_cache_refuses_still_reaches_its_waiters() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    // 64 bytes over 64 shards: no block fits a shard, so none is kept.
+    let cache = Arc::new(Cache::with_capacity_bytes(64).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    injector.hook_read_at(path, offset, hook);
+
+    for (key, got) in (0..READERS).zip(read_at_once(&tree)) {
+        assert_eq!(got?.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the block");
+    assert_eq!(cache.size(), 0, "the cache kept nothing");
+    assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
 /// A load that fails releases its waiters to read on their own, so each meets
 /// the failure itself, and the next read after the fault clears succeeds: no
 /// error is remembered and no waiter is stranded.

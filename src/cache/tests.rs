@@ -216,6 +216,53 @@ fn a_thread_leading_a_batched_load_never_waits() {
     assert!(waiter.join().expect("waiter"), "took the published block");
 }
 
+/// A read waiting on another read of the same blob position takes the value
+/// only when it was read for the same key: a corrupt index entry can name a
+/// position that holds another key's record, and such a read must meet the
+/// real outcome on its own rather than receive the other key's value.
+#[test]
+fn a_blob_read_for_another_key_at_the_same_position_is_not_shared() {
+    use super::BlobClaim;
+    use std::sync::Arc;
+
+    let cache = Arc::new(Cache::with_capacity_bytes(1024 * 1024));
+    let vhandle = crate::vlog::ValueHandle {
+        blob_file_id: 3,
+        offset: 0,
+        on_disk_size: 5,
+    };
+    let BlobClaim::Lead(lead) = cache.claim_blob(0, &vhandle, b"owner") else {
+        panic!("the first read leads");
+    };
+    let other_key = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || matches!(cache.claim_blob(0, &vhandle, b"intruder"), BlobClaim::Alone)
+    });
+    let same_key = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || match cache.claim_blob(0, &vhandle, b"owner") {
+            BlobClaim::Shared(value) => &*value == b"value",
+            _ => false,
+        }
+    });
+    while cache.load_waiters() < 2 {
+        std::thread::yield_now();
+    }
+    let _ = lead.publish(
+        &cache,
+        0,
+        &vhandle,
+        b"owner",
+        crate::UserValue::from(&b"value"[..]),
+        false,
+    );
+    assert!(other_key.join().expect("reader"), "another key reads alone");
+    assert!(
+        same_key.join().expect("reader"),
+        "the same key takes the value"
+    );
+}
+
 /// A partial-tier entry whose prefix decoded `decoded` inner blocks and served
 /// `hits` reads.
 #[cfg(feature = "zstd")]
