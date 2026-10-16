@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792103937664,
+  "lastUpdate": 1792110642545,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -44768,6 +44768,90 @@ window.BENCHMARK_DATA = {
             "value": 364365.65872686385,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 11.9us | P99.9: 80.4us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0779d9c84f1eac8ab72ceaec1d1a0501a988b486",
+          "message": "perf(compaction): write filter-rewritten blobs into the relocation output (#917)\n\n## Summary\n\n- A relocating compaction writes the values its compaction filter\nrewrites into its own blob output instead of a separate lazily opened\nwriter, so the filter adds no blob files of its own and its rewrites sit\nnext to the relocated values.\n- An inline value that reaches a relocating compaction above the\nseparation threshold in force is separated into the same output.\n\n## Changes\n\n- `RelocatingCompaction` takes the blob options and compression for\nfresh values and separates new values (filter rewrites, inline values\nabove the threshold) into its blob writer, in the lifetime class of a\nnew value; relocated byte accounting is unchanged.\n- The filter adapter returns a rewritten value inline when the\ncompaction relocates, so the merge loop writes it through the flavour;\nnon-relocating compactions keep the lazy filter writer.\n- `BlobFileWriter` splits value encoding from appending, and\n`MultiWriter::write_fresh` encodes once, picks the output for the codec\nand class, and rotates at the target size.\n\nWith values grouped by lifetime (the default), a rewritten value belongs\nto the new-value group and takes that group's file; the saving in file\ncount shows with one lifetime group.\n\n## Testing\n\nfmt, clippy (default and all features), the full nextest suite, doc\ntests, doc build, the no-std check, sst-dump and the bench build pass on\nLinux.\n\nCloses #834\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Compaction now applies configured value-separation thresholds to newly\nwritten and rewritten values, while preserving smaller values inline.\nThis helps keep blob storage organized as values move through\ncompaction.\n* Compaction can reuse suitable blob files for rewritten values, helping\nlimit additional file creation, including when lifetime groups are\nconfigured.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T00:18:03Z",
+          "tree_id": "f814871c5fa42a1bcb8a2a4d7cfe56046a3a5d3b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0779d9c84f1eac8ab72ceaec1d1a0501a988b486"
+        },
+        "date": 1792110641364,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 133930.89908777928,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.0us | P99.9: 28.1us\nthreads: 1 | elapsed: 4.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2619406.7708993233,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 736984.9860939593,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 500926.1924928716,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 26.9us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2270814.6532808347,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 256313.78811559523,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.3us | P99.9: 16.4us\nthreads: 1 | elapsed: 0.78s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 139875.81084171677,
+            "unit": "ops/sec",
+            "extra": "P50: 6.4us | P99: 13.0us | P99.9: 27.3us\nthreads: 1 | elapsed: 1.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 756266.0851887992,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.4us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 753806.2949466661,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 361975.9437846292,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 12.0us | P99.9: 80.2us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
           }
         ]
       }
