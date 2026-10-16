@@ -262,6 +262,39 @@ impl BlockLead {
     }
 }
 
+/// How a miss of a row group's decoded directory proceeds, as [`BlockClaim`]
+/// for a block.
+#[cfg(feature = "columnar")]
+pub enum DirectoryClaim {
+    /// Read the directory, then [`DirectoryLead::publish`] it.
+    Lead(DirectoryLead),
+    /// A concurrent read of the group's directory finished: the directory
+    /// and its block's on-disk length.
+    Shared(
+        alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        u32,
+    ),
+    /// Read the directory without coordination.
+    Alone,
+}
+
+/// The lead of a directory load, as [`BlockLead`] for a block.
+#[cfg(feature = "columnar")]
+pub struct DirectoryLead(LoadLead);
+
+#[cfg(feature = "columnar")]
+impl DirectoryLead {
+    /// Hands the decoded directory and its block's on-disk length to the
+    /// waiters; cache it first, so a miss after this sees it there.
+    pub(crate) fn publish(
+        self,
+        directory: alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        len: u32,
+    ) {
+        self.0.publish(Item::Directory(directory, len));
+    }
+}
+
 /// How a blob miss proceeds, as [`BlockClaim`] for a block.
 pub enum BlobClaim {
     /// Read the value, then [`BlobLead::publish`].
@@ -411,6 +444,35 @@ impl Cache {
                 _ => BlockClaim::Alone,
             },
             crate::inflight::Claim::Alone => BlockClaim::Alone,
+        }
+    }
+
+    /// Claims the cold read of the decoded directory of the row group at
+    /// `offset`, as [`Self::claim_block`] does for a block. `identity` names
+    /// the group's extent, so a read of another extent at the same offset
+    /// never takes this directory.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn claim_directory(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+    ) -> DirectoryClaim {
+        let key: CacheKey = (TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => DirectoryClaim::Lead(DirectoryLead(lead)),
+            crate::inflight::Claim::Join(join) => {
+                let shared = if crate::inflight::may_wait() {
+                    join.wait()
+                } else {
+                    join.try_take()
+                };
+                match shared {
+                    Some(Item::Directory(directory, len)) => DirectoryClaim::Shared(directory, len),
+                    _ => DirectoryClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Alone => DirectoryClaim::Alone,
         }
     }
 

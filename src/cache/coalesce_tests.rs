@@ -216,6 +216,39 @@ fn held_cold_load_does_not_block_another_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// Point reads that miss the same cold columnar row group at once read its
+/// directory once: one reader reads it with the pages it needs, the others
+/// take the directory from it and find those pages cached.
+#[cfg(feature = "columnar")]
+#[test]
+fn simultaneous_cold_reads_of_one_row_group_read_its_directory_once() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    {
+        let crate::AnyTree::Standard(tree) = config(folder.path()).open()? else {
+            unreachable!("standard tree configured");
+        };
+        tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+        for key in 0..64u8 {
+            tree.insert([key], value(key), u64::from(key));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+    let (reads, hook) = hold_until_joined(&cache, usize::from(READERS) - 1);
+    injector.hook_read_at(path, offset, hook);
+
+    for (key, got) in (0..READERS).zip(read_at_once(&tree)) {
+        assert_eq!(got?.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the directory");
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    Ok(())
+}
+
 /// A point read that misses a block a blocking multi-get is reading waits for
 /// the multi-get's read instead of reading it again, and both answer right.
 #[test]
