@@ -491,6 +491,8 @@ impl Decodable<IndexBlockParsedItem> for KeyedBlockHandle {
         offset: usize,
         base_key_offset: usize,
         base_key_end: usize,
+        // An index entry stores its seqno whole.
+        _base_seqno: Option<SeqNo>,
         entries_end: usize,
     ) -> Option<IndexBlockParsedItem> {
         let marker = reader.read_u8().ok()?;

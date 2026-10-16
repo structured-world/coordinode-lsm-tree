@@ -149,12 +149,22 @@ pub trait Decodable<ParsedItem> {
         entries_end: usize,
     ) -> Option<ParsedItem>;
 
-    /// Parses a (possibly) prefix truncated item from a reader.
+    /// Whether a block whose entry region starts with `entries` stores the
+    /// seqnos of its non-head items relative to their restart head's.
+    fn seqno_deltas(entries: &[u8]) -> bool {
+        let _ = entries;
+        false
+    }
+
+    /// Parses a (possibly) prefix truncated item from a reader. `base_seqno`
+    /// is its restart head's seqno when the block stores seqno deltas
+    /// (see [`Self::seqno_deltas`]), `None` when it stores them in full.
     fn parse_truncated(
         reader: &mut Cursor<&[u8]>,
         offset: usize,
         base_key_offset: usize,
         base_key_end: usize,
+        base_seqno: Option<SeqNo>,
         entries_end: usize,
     ) -> Option<ParsedItem>;
 }
@@ -165,6 +175,9 @@ struct LoScanner {
     remaining_in_interval: usize,
     base_key_offset: Option<usize>,
     base_key_end: Option<usize>,
+    /// The current restart head's seqno. Read only while `base_key_offset` is
+    /// set.
+    base_seqno: SeqNo,
 }
 
 #[derive(Debug)]
@@ -174,6 +187,8 @@ struct HiScanner {
     stack: Vec<usize>, // TODO: SmallVec?
     base_key_offset: Option<usize>,
     base_key_end: Option<usize>,
+    /// See [`LoScanner::base_seqno`].
+    base_seqno: SeqNo,
 }
 
 /// Generic block decoder for RocksDB-style blocks
@@ -188,6 +203,8 @@ pub struct Decoder<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> {
 
     // Cached metadata
     restart_interval: u8,
+    /// See [`Decodable::seqno_deltas`].
+    seqno_deltas: bool,
     binary_index_step_size: u8,
     binary_index_offset: u32,
     binary_index_len: u32,
@@ -321,6 +338,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 remaining_in_interval: 0,
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
 
             hi_scanner: HiScanner {
@@ -329,9 +347,11 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 stack: Vec::new(),
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
 
             restart_interval: meta.restart_interval,
+            seqno_deltas: Item::seqno_deltas(&block.data),
             binary_index_step_size: meta.binary_index_step_size,
             binary_index_offset: meta.binary_index_offset,
             binary_index_len: meta.binary_index_len,
@@ -382,6 +402,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 remaining_in_interval: 0,
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
 
             hi_scanner: HiScanner {
@@ -390,9 +411,11 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 stack: Vec::new(),
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
 
             restart_interval,
+            seqno_deltas: Item::seqno_deltas(&block.data),
 
             binary_index_step_size,
             binary_index_offset,
@@ -465,6 +488,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 remaining_in_interval: 0,
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
             // No backward cursor: base_key_offset stays None so `next` never
             // treats the (zeroed) hi_scanner.offset as an upper bound.
@@ -474,8 +498,11 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 stack: Vec::new(),
                 base_key_offset: None,
                 base_key_end: None,
+                base_seqno: 0,
             },
             restart_interval,
+            // The coding flag sits in the first entry, which a prefix holds.
+            seqno_deltas: Item::seqno_deltas(&block.data),
             // No trailer/index: keep these zeroed. Forward `next` reads neither.
             binary_index_step_size: 2,
             binary_index_offset: 0,
@@ -913,8 +940,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     fn parse_current_item(
         reader: &mut Cursor<&[u8]>,
         offset: usize,
-        base_key_offset: Option<usize>,
-        base_key_end: Option<usize>,
+        (base_key_offset, base_key_end, base_seqno): (Option<usize>, Option<usize>, Option<SeqNo>),
         is_restart: bool,
         entries_end: usize,
     ) -> Option<Parsed> {
@@ -927,9 +953,37 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 offset,
                 base_key_offset.expect("should parse truncated item"),
                 base_key_end.expect("should parse truncated item"),
+                base_seqno,
                 entries_end,
             )
         }
+    }
+
+    /// The seqno a truncated item under a head of seqno `head` is stored
+    /// relative to, if the block stores deltas.
+    #[inline]
+    fn seqno_base(&self, head: SeqNo) -> Option<SeqNo> {
+        self.seqno_deltas.then_some(head)
+    }
+
+    /// The forward cursor's restart head: key span and seqno base.
+    #[inline]
+    fn lo_base(&self) -> (Option<usize>, Option<usize>, Option<SeqNo>) {
+        (
+            self.lo_scanner.base_key_offset,
+            self.lo_scanner.base_key_end,
+            self.seqno_base(self.lo_scanner.base_seqno),
+        )
+    }
+
+    /// The backward cursor's restart head: key span and seqno base.
+    #[inline]
+    fn hi_base(&self) -> (Option<usize>, Option<usize>, Option<SeqNo>) {
+        (
+            self.hi_scanner.base_key_offset,
+            self.hi_scanner.base_key_end,
+            self.seqno_base(self.hi_scanner.base_seqno),
+        )
     }
 
     fn compute_entries_end(&self) -> Option<usize> {
@@ -983,6 +1037,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                     self.hi_scanner.offset += reader.position() as usize;
                     self.hi_scanner.base_key_offset = Some(item.key_offset());
                     self.hi_scanner.base_key_end = Some(item.key_end_offset());
+                    self.hi_scanner.base_seqno = item.seqno();
                 });
 
             if parsed_restart.is_some() {
@@ -1010,6 +1065,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 offset,
                 self.hi_scanner.base_key_offset.expect("should exist"),
                 self.hi_scanner.base_key_end.expect("should exist"),
+                self.seqno_base(self.hi_scanner.base_seqno),
                 entries_end,
             )
             .inspect(|_| {
@@ -1042,14 +1098,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         let mut reader = Self::reader_at(self.entries(), offset)?;
 
-        Self::parse_current_item(
-            &mut reader,
-            offset,
-            self.hi_scanner.base_key_offset,
-            self.hi_scanner.base_key_end,
-            is_restart,
-            entries_end,
-        )
+        Self::parse_current_item(&mut reader, offset, self.hi_base(), is_restart, entries_end)
     }
 
     pub fn advance_while(&mut self, pred: impl Fn(&Parsed, &[u8]) -> bool) {
@@ -1076,8 +1125,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             let Some(item) = Self::parse_current_item(
                 &mut reader,
                 self.lo_scanner.offset,
-                self.lo_scanner.base_key_offset,
-                self.lo_scanner.base_key_end,
+                self.lo_base(),
                 is_restart,
                 entries_end,
             ) else {
@@ -1109,6 +1157,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             if is_restart {
                 self.lo_scanner.base_key_offset = Some(item.key_offset());
                 self.lo_scanner.base_key_end = Some(item.key_end_offset());
+                self.lo_scanner.base_seqno = item.seqno();
                 self.lo_scanner.remaining_in_interval = usize::from(self.restart_interval) - 1;
             } else {
                 self.lo_scanner.remaining_in_interval -= 1;
@@ -1140,8 +1189,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             let Some(item) = Self::parse_current_item(
                 &mut reader,
                 offset,
-                self.hi_scanner.base_key_offset,
-                self.hi_scanner.base_key_end,
+                self.hi_base(),
                 is_restart,
                 entries_end,
             ) else {
@@ -1179,15 +1227,8 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             clippy::cast_possible_truncation,
             reason = "blocks do not even come close to 4 GiB in size"
         )]
-        if Self::parse_current_item(
-            &mut reader,
-            offset,
-            self.hi_scanner.base_key_offset,
-            self.hi_scanner.base_key_end,
-            is_restart,
-            entries_end,
-        )
-        .is_some()
+        if Self::parse_current_item(&mut reader, offset, self.hi_base(), is_restart, entries_end)
+            .is_some()
         {
             self.hi_scanner.offset = offset + reader.position() as usize;
         }
@@ -1212,14 +1253,8 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         let mut reader = Self::reader_at(self.entries(), offset)?;
 
-        let item = Self::parse_current_item(
-            &mut reader,
-            offset,
-            self.hi_scanner.base_key_offset,
-            self.hi_scanner.base_key_end,
-            is_restart,
-            entries_end,
-        )?;
+        let item =
+            Self::parse_current_item(&mut reader, offset, self.hi_base(), is_restart, entries_end)?;
 
         Some(cmp(&item, self.entries()))
     }
@@ -1277,8 +1312,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Iterator for Decoder<'_,
         let item = Self::parse_current_item(
             &mut reader,
             self.lo_scanner.offset,
-            self.lo_scanner.base_key_offset,
-            self.lo_scanner.base_key_end,
+            self.lo_base(),
             is_restart,
             entries_end,
         )
@@ -1288,6 +1322,7 @@ impl<Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Iterator for Decoder<'_,
             if is_restart {
                 self.lo_scanner.base_key_offset = Some(item.key_offset());
                 self.lo_scanner.base_key_end = Some(item.key_end_offset());
+                self.lo_scanner.base_seqno = item.seqno();
             }
         });
 

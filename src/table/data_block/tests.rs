@@ -1,4 +1,4 @@
-use super::DataBlockParsedItem;
+use super::{DataBlockParsedItem, SeqnoCoding};
 use crate::comparator::default_comparator;
 use crate::io::ReadBytesExt;
 use crate::{
@@ -6,7 +6,7 @@ use crate::{
     ValueType::{Tombstone, Value},
     table::{
         Block, DataBlock,
-        block::{BlockType, Decodable, Encodable, Header, ParsedItem},
+        block::{BlockType, Decodable, Encodable, Encoder, Header, ParsedItem},
     },
 };
 use std::io::{Cursor, Seek};
@@ -17,7 +17,7 @@ fn make_truncated_data_entry(shared_prefix_len: usize) -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "payload", 0, Value);
     let mut bytes = Vec::new();
     value
-        .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+        .encode_truncated_into(&mut bytes, &mut SeqnoCoding::default(), shared_prefix_len)
         .expect("encoding test InternalValue into truncated form must succeed");
     bytes
 }
@@ -26,7 +26,7 @@ fn make_full_data_entry() -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "payload", 0, Value);
     let mut bytes = Vec::new();
     value
-        .encode_full_into(&mut bytes, &mut ())
+        .encode_full_into(&mut bytes, &mut SeqnoCoding::default())
         .expect("encoding full test InternalValue must succeed");
     bytes
 }
@@ -35,7 +35,7 @@ fn make_full_tombstone_entry() -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
     let mut bytes = Vec::new();
     value
-        .encode_full_into(&mut bytes, &mut ())
+        .encode_full_into(&mut bytes, &mut SeqnoCoding::default())
         .expect("encoding full tombstone InternalValue must succeed");
     bytes
 }
@@ -44,7 +44,7 @@ fn make_truncated_tombstone_entry(shared_prefix_len: usize) -> Vec<u8> {
     let value = InternalValue::from_components("abcdef", "", 0, Tombstone);
     let mut bytes = Vec::new();
     value
-        .encode_truncated_into(&mut bytes, &mut (), shared_prefix_len)
+        .encode_truncated_into(&mut bytes, &mut SeqnoCoding::default(), shared_prefix_len)
         .expect("encoding tombstone InternalValue into truncated form must succeed");
     bytes
 }
@@ -212,6 +212,7 @@ fn parse_truncated_rejects_prefix_span_crossing_restart_key_boundary() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -233,6 +234,7 @@ fn parse_truncated_returns_none_for_unknown_value_type_byte() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -254,6 +256,7 @@ fn parse_truncated_rejects_key_span_crossing_block_boundary() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -275,6 +278,7 @@ fn parse_truncated_rejects_value_span_crossing_block_boundary() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -297,6 +301,7 @@ fn parse_truncated_rejects_key_span_overlapping_trailer_region() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -319,6 +324,7 @@ fn parse_truncated_rejects_value_span_overlapping_trailer_region() {
         offset,
         8,
         14,
+        Some(0),
         entries_end,
     );
     assert!(parsed.is_none());
@@ -372,6 +378,328 @@ fn kv_checked_block_round_trips_through_reader() -> crate::Result<()> {
         assert_eq!(got.value, want.value);
     }
     Ok(())
+}
+
+/// The stored seqno delta is the zigzag of the wrapping difference: a step
+/// either way costs one small varint, and every pair round-trips, the ends of
+/// the u64 range next to each other included.
+#[test]
+fn seqno_delta_round_trips_both_ways_and_across_the_range_ends() {
+    use super::{seqno_delta, seqno_from_delta};
+
+    assert_eq!(seqno_delta(10, 10), 0);
+    assert_eq!(seqno_delta(9, 10), 1, "one older version");
+    assert_eq!(seqno_delta(11, 10), 2, "one later write");
+    let edges = [
+        0,
+        1,
+        2,
+        63,
+        64,
+        1 << 32,
+        u64::MAX >> 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for head in edges {
+        for seqno in edges {
+            assert_eq!(
+                seqno_from_delta(seqno_delta(seqno, head), head),
+                seqno,
+                "{seqno} under {head}"
+            );
+        }
+    }
+}
+
+/// Items whose seqnos rise, fall and jump across the whole range inside one
+/// restart interval: older versions of a key below its head (negative
+/// deltas), later keys above it (positive), and a key whose versions sit at
+/// both ends of the range (deltas that wrap).
+fn mixed_seqno_items() -> Vec<InternalValue> {
+    let rows: [(&str, SeqNo); 13] = [
+        ("a", 100),
+        ("a", 99),
+        ("a", 7),
+        ("b", 1_000_000),
+        ("b", 0),
+        ("c", SeqNo::MAX >> 1),
+        ("c", 3),
+        ("d", 5),
+        ("e", 1 << 40),
+        ("e", 1 << 39),
+        ("e", 2),
+        ("f", 0),
+        ("g", 64),
+    ];
+    rows.into_iter()
+        .map(|(key, seqno)| {
+            if seqno % 3 == 0 {
+                InternalValue::from_components(key, "", seqno, Tombstone)
+            } else {
+                InternalValue::from_components(key, format!("{key}@{seqno}"), seqno, Value)
+            }
+        })
+        .collect()
+}
+
+/// A block over `items` with its seqno coding chosen by the caller rather
+/// than by length, so both codings run on the same items.
+fn block_with_coding(
+    items: &[InternalValue],
+    restart_interval: u8,
+    deltas: bool,
+) -> crate::Result<DataBlock> {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::<'_, SeqnoCoding, InternalValue>::new(
+        &mut bytes,
+        items.len(),
+        restart_interval,
+        1.33,
+        &items.first().expect("non-empty").key.user_key,
+    );
+    encoder.state = SeqnoCoding::new(deltas);
+    for item in items {
+        encoder.write(item)?;
+    }
+    encoder.finish()?;
+    Ok(DataBlock::new(Block {
+        data: bytes.into(),
+        header: Header::test_dummy(BlockType::Data),
+    }))
+}
+
+/// A block over those items reads every entry back with its seqno, forward
+/// and backward, at every restart interval and in both seqno codings: each
+/// delta decodes against the head of its own interval.
+#[test]
+fn seqnos_relative_to_the_restart_head_read_back_both_directions() -> crate::Result<()> {
+    let items = mixed_seqno_items();
+    for (restart_interval, deltas) in (1..=16).flat_map(|ri| [(ri, false), (ri, true)]) {
+        let block = block_with_coding(&items, restart_interval, deltas)?;
+        let forward: Vec<InternalValue> = block
+            .iter(default_comparator())
+            .map(|item| item.materialize(block.as_slice()))
+            .collect();
+        assert_eq!(
+            forward, items,
+            "forward, interval {restart_interval}, deltas {deltas}"
+        );
+        let backward: Vec<InternalValue> = block
+            .iter(default_comparator())
+            .rev()
+            .map(|item| item.materialize(block.as_slice()))
+            .collect();
+        let mut reversed = items.clone();
+        reversed.reverse();
+        assert_eq!(
+            backward, reversed,
+            "backward, interval {restart_interval}, deltas {deltas}"
+        );
+    }
+    Ok(())
+}
+
+/// A point read at any snapshot finds the version the snapshot sees, also
+/// when that version is stored below its interval's head, and finds nothing
+/// when the snapshot sees none.
+#[test]
+fn point_reads_see_the_right_version_under_seqno_deltas() -> crate::Result<()> {
+    let items = mixed_seqno_items();
+    let snapshots = [
+        0,
+        1,
+        3,
+        4,
+        7,
+        8,
+        99,
+        100,
+        101,
+        1_000_000,
+        1_000_001,
+        1 << 40,
+    ];
+    for (restart_interval, deltas) in [1, 2, 3, 4, 16]
+        .into_iter()
+        .flat_map(|ri| [(ri, false), (ri, true)])
+    {
+        let block = block_with_coding(&items, restart_interval, deltas)?;
+        for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            for snapshot in snapshots.into_iter().chain([SeqNo::MAX]) {
+                let expected = items
+                    .iter()
+                    .find(|item| &*item.key.user_key == key.as_bytes() && item.key.seqno < snapshot)
+                    .cloned();
+                assert_eq!(
+                    block.point_read(key.as_bytes(), snapshot, &default_comparator())?,
+                    expected,
+                    "{key} at {snapshot}, interval {restart_interval}, deltas {deltas}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Items whose keys ascend, one per seqno.
+fn items_at(seqnos: &[SeqNo]) -> Vec<InternalValue> {
+    seqnos
+        .iter()
+        .enumerate()
+        .map(|(idx, &seqno)| {
+            InternalValue::from_components(format!("k{idx:02}"), format!("v{idx}"), seqno, Value)
+        })
+        .collect()
+}
+
+/// Reads `block` forward, backward and by point reads, against `items`.
+fn assert_block_reads_back(block: &DataBlock, items: &[InternalValue]) -> crate::Result<()> {
+    let forward: Vec<InternalValue> = block
+        .iter(default_comparator())
+        .map(|item| item.materialize(block.as_slice()))
+        .collect();
+    assert_eq!(forward, items);
+    let backward: Vec<InternalValue> = block
+        .iter(default_comparator())
+        .rev()
+        .map(|item| item.materialize(block.as_slice()))
+        .collect();
+    let mut reversed = items.to_vec();
+    reversed.reverse();
+    assert_eq!(backward, reversed);
+    for item in items {
+        assert_eq!(
+            block.point_read(&item.key.user_key, SeqNo::MAX, &default_comparator())?,
+            Some(item.clone()),
+        );
+    }
+    Ok(())
+}
+
+/// A block stores its seqnos in whichever form is shorter, and says which on
+/// its first entry: a run of writes relative to the restart heads, keys
+/// written at scattered times in full. Both read back in either direction and
+/// under point reads.
+#[test]
+fn each_block_stores_seqnos_in_the_shorter_form() -> crate::Result<()> {
+    use super::SEQNO_DELTAS;
+
+    // Close to each other: deltas take a byte, full seqnos six.
+    let run = items_at(&[
+        (1 << 40) + 3,
+        (1 << 40) + 4,
+        (1 << 40) + 1,
+        (1 << 40) + 9,
+        (1 << 40) + 20,
+        (1 << 40) + 22,
+    ]);
+    // Far from their heads: full seqnos take a byte, deltas six.
+    let scattered = items_at(&[1 << 40, 3, 1, 2, 1 << 41, 5]);
+
+    for (items, deltas) in [(run, true), (scattered, false)] {
+        let bytes = DataBlock::encode_into_vec(&items, 3, 1.33)?;
+        assert_eq!(
+            bytes.first().copied().map(|byte| byte & SEQNO_DELTAS != 0),
+            Some(deltas),
+        );
+        let block = DataBlock::new(Block {
+            data: bytes.into(),
+            header: Header::test_dummy(BlockType::Data),
+        });
+        assert_block_reads_back(&block, &items)?;
+    }
+    Ok(())
+}
+
+/// The length the coding choice counts is the length the writer emits, at
+/// every 7-bit boundary and at both ends of the range.
+#[test]
+fn varint_len_matches_the_written_length() {
+    use varint_rs::VarintWriter;
+
+    let mut values = vec![0, u64::MAX];
+    for shift in 1..64 {
+        let edge = 1u64 << shift;
+        values.extend([edge - 1, edge, edge + 1]);
+    }
+    for value in values {
+        let mut written = Vec::new();
+        written.write_u64_varint(value).expect("write to a Vec");
+        assert_eq!(super::varint_len(value) as usize, written.len(), "{value}");
+    }
+}
+
+/// The choice compares encoded lengths over every interval of the block and
+/// keeps full seqnos on a tie: deltas of the same length as the seqnos
+/// compress worse than them.
+#[test]
+fn block_coding_keeps_full_seqnos_unless_deltas_are_shorter() {
+    use super::block_uses_deltas;
+
+    // A single entry has nothing to store either way.
+    assert!(!block_uses_deltas(&items_at(&[5]), 16));
+    // A run of writes: one byte per delta against three per seqno.
+    assert!(block_uses_deltas(
+        &items_at(&[1_000_000, 1_000_001, 1_000_002, 1_000_003]),
+        2
+    ));
+    // Both one byte: the tie keeps full seqnos.
+    assert!(!block_uses_deltas(&items_at(&[10, 11, 12]), 16));
+    // Seqnos spread over the range: a delta carries a sign bit on top of the
+    // seqno's width, a byte more here.
+    assert!(!block_uses_deltas(
+        &items_at(&[1 << 20, (1 << 21) - 1, 1]),
+        16
+    ));
+    // Each restart head starts afresh: a run per interval stays a run even
+    // when the intervals sit far apart.
+    assert!(block_uses_deltas(
+        &items_at(&[1 << 40, (1 << 40) + 1, 7 << 50, (7 << 50) + 1]),
+        2
+    ));
+}
+
+/// The seqno-coding bit belongs to the block's first entry only: there it
+/// parses as the value type it rides on, and on any later head or on a
+/// truncated entry it is rejected like any other unknown type byte.
+#[test]
+fn seqno_coding_bit_is_read_on_the_first_entry_and_refused_elsewhere() {
+    use super::SEQNO_DELTAS;
+
+    let mut head = make_full_data_entry();
+    *head.get_mut(0).expect("type byte") |= SEQNO_DELTAS;
+    assert!(<InternalValue as Decodable<DataBlockParsedItem>>::seqno_deltas(&head));
+    let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_full(
+        &mut Cursor::new(head.as_slice()),
+        0,
+        head.len(),
+    )
+    .expect("a flagged first entry parses");
+    assert_eq!(parsed.value_type, Value);
+
+    let later = 16;
+    assert!(
+        <InternalValue as Decodable<DataBlockParsedItem>>::parse_full(
+            &mut Cursor::new(head.as_slice()),
+            later,
+            later + head.len(),
+        )
+        .is_none()
+    );
+
+    let mut entry = make_truncated_data_entry(2);
+    *entry.get_mut(0).expect("type byte") |= SEQNO_DELTAS;
+    let offset = 16;
+    let parsed = <InternalValue as Decodable<DataBlockParsedItem>>::parse_truncated(
+        &mut Cursor::new(entry.as_slice()),
+        offset,
+        8,
+        14,
+        Some(0),
+        offset + entry.len(),
+    );
+    assert!(parsed.is_none());
 }
 
 #[test]

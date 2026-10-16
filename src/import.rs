@@ -20,7 +20,7 @@ use crate::{Checksum, CompressionType, InternalValue, SeqNo, TableId, TreeType, 
 use alloc::sync::Arc;
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(clippy::indexing_slicing, reason = "test code")]
 mod tests;
 
 /// How a table being imported is encoded: what its blocks were compressed
@@ -30,8 +30,8 @@ mod tests;
     reason = "each flag is an independent property of the table, not a state"
 )]
 pub struct TableSettings {
-    /// The codec the source compressed the data blocks with; the imported
-    /// payloads are written as they are, so this must match them.
+    /// The codec the data blocks are compressed with: the source's, which
+    /// its dictionary and recorded properties name.
     pub data_compression: CompressionType,
     /// The codec the index blocks are compressed with.
     pub index_compression: CompressionType,
@@ -293,6 +293,11 @@ impl TableImport {
         settings: TableSettings,
     ) -> crate::Result<Self> {
         let writer = Writer::new(path, table_id, level, fs)?
+            // A row table's blocks end where its source's did
+            // ([`Self::append_block`] cuts each), so a carried locator, which
+            // names blocks by ordinal, still points at the right ones; the
+            // size never cuts one first.
+            .use_data_block_size(crate::config::MAX_BLOCK_SIZE)
             .use_data_block_compression(settings.data_compression)
             .use_index_block_compression(settings.index_compression)
             .use_data_block_restart_interval(settings.data_restart_interval)
@@ -516,35 +521,30 @@ impl TableImport {
         Ok(())
     }
 
-    /// Appends a data block from its compressed payload and its rows, in key
-    /// order after every block appended before it.
+    /// Appends one data block of a row table: its source block's rows, in key
+    /// order after every block appended before it, encoded in this format and
+    /// ending where the source block did.
     ///
     /// # Errors
     ///
     /// Returns an error if the rows are out of order, a row references a blob
-    /// in a value that does not decode, the payload disagrees with its
-    /// uncompressed length, or the write fails.
-    pub fn append_block(
-        &mut self,
-        payload: &[u8],
-        uncompressed_length: u32,
-        rows: &[InternalValue],
-    ) -> crate::Result<()> {
+    /// in a value that does not decode, or the write fails.
+    pub fn append_block(&mut self, rows: Vec<InternalValue>) -> crate::Result<()> {
         if self.columnar {
             return Err(crate::Error::InvalidHeader(
                 "a columnar table takes its rows, not its source's blocks",
             ));
         }
-        let refs = self.served_refs(rows)?;
-        self.writer.append_compressed_data_block(
-            payload,
-            uncompressed_length,
-            rows,
-            &self.comparator,
-        )?;
+        self.writer
+            .validate_direct_block_order(&rows, &self.comparator)?;
+        let refs = self.served_refs(&rows)?;
         if let (Some(lo), Some(hi)) = (rows.first(), rows.last()) {
             self.widen_key_range(&lo.key.user_key, &hi.key.user_key);
         }
+        for row in rows {
+            self.writer.write_counted(row, &self.comparator)?;
+        }
+        self.writer.spill_block()?;
         crate::blob_tree::links::fold_blob_links(
             &mut self.blob_links,
             &mut self.owned_cells,

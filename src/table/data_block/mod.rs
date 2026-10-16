@@ -81,6 +81,13 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             return None;
         }
 
+        // The block's seqno-coding bit rides on its first entry only (see
+        // `seqno_deltas`); on any other head it is an unknown type byte.
+        let value_type = if offset == 0 {
+            value_type & !SEQNO_DELTAS
+        } else {
+            value_type
+        };
         let value_type = ValueType::try_from(value_type).ok()?;
 
         let (seqno, np) = read_leb128!(buf, pos);
@@ -149,6 +156,7 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         offset: usize,
         base_key_offset: usize,
         base_key_end: usize,
+        base_seqno: Option<SeqNo>,
         entries_end: usize,
     ) -> Option<DataBlockParsedItem> {
         // Slice-based decode (see `parse_full` / `read_leb128`).
@@ -160,10 +168,16 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
         if value_type == TRAILER_START_MARKER {
             return None;
         }
+        // Only the block's first entry carries the seqno-coding bit, so a
+        // flagged byte here fails the conversion like any other unknown type.
         let value_type = ValueType::try_from(value_type).ok()?;
 
-        let (seqno, np) = read_leb128!(buf, pos);
+        let (stored, np) = read_leb128!(buf, pos);
         pos = np;
+        let seqno = match base_seqno {
+            Some(head) => seqno_from_delta(stored, head),
+            None => stored,
+        };
 
         let (shared_raw, np) = read_leb128!(buf, pos);
         pos = np;
@@ -237,20 +251,125 @@ impl Decodable<DataBlockParsedItem> for InternalValue {
             }
         })
     }
+
+    fn seqno_deltas(entries: &[u8]) -> bool {
+        entries
+            .first()
+            .is_some_and(|&byte| byte & SEQNO_DELTAS != 0)
+    }
 }
 
-impl Encodable<()> for InternalValue {
+/// Set on the value-type byte of a block's first entry when the block's
+/// non-head entries store their seqnos relative to their restart head's
+/// rather than in full. Value types are 0..=5 and the trailer marker is 255,
+/// so the bit never collides. It is set once per block rather than on every
+/// head, where it would cost the compressor a literal per interval.
+const SEQNO_DELTAS: u8 = 0x80;
+
+/// The encoder's state: the current restart head's seqno, whether the block
+/// stores seqno deltas, and whether the bit saying so is still to be written.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SeqnoCoding {
+    head: SeqNo,
+    deltas: bool,
+    mark: bool,
+}
+
+impl SeqnoCoding {
+    fn new(deltas: bool) -> Self {
+        Self {
+            head: 0,
+            deltas,
+            mark: deltas,
+        }
+    }
+}
+
+/// LEB128 length of `value`.
+#[inline]
+fn varint_len(value: u64) -> u32 {
+    // 1 byte per started 7 bits, zero still one byte: ceil(bits / 7) for
+    // bits in 1..=64 equals (9 * bits + 64) / 64, a multiply and a shift.
+    let bits = 64 - (value | 1).leading_zeros();
+    (9 * bits + 64) >> 6
+}
+
+/// Whether a block stores its non-head seqnos relative to their restart
+/// head's: only when that takes fewer bytes than storing them in full.
+/// Sequential writes give small deltas; seqnos scattered over a wide range
+/// (random keys) give deltas as wide as the seqnos plus a sign bit, and even
+/// at equal length such deltas compress worse than the seqnos, so those
+/// blocks stay full.
+fn block_uses_deltas(items: &[InternalValue], restart_interval: u8) -> bool {
+    let (mut full, mut delta) = (0u64, 0u64);
+    for interval in items.chunks(usize::from(restart_interval)) {
+        let Some((head, rest)) = interval.split_first() else {
+            continue;
+        };
+        for item in rest {
+            full += u64::from(varint_len(item.key.seqno));
+            delta += u64::from(varint_len(seqno_delta(item.key.seqno, head.key.seqno)));
+        }
+    }
+    delta < full
+}
+
+/// A non-head entry's seqno as stored: the zigzag-encoded wrapping difference
+/// from its restart head's, small in either direction (a later key written
+/// later, an older version of the head's key).
+#[inline]
+fn seqno_delta(seqno: SeqNo, head_seqno: SeqNo) -> u64 {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "the wrapping difference is reinterpreted as signed on purpose"
+    )]
+    let delta = seqno.wrapping_sub(head_seqno) as i64;
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "zigzag maps the signed delta onto u64 bit for bit"
+    )]
+    let zigzag = ((delta << 1) ^ (delta >> 63)) as u64;
+    zigzag
+}
+
+/// The inverse of [`seqno_delta`]: the seqno a stored delta names under its
+/// restart head's. Every u64 decodes to some seqno, so a corrupt delta reads
+/// as a wrong seqno, which the block checksum is there to catch.
+#[inline]
+fn seqno_from_delta(zigzag: u64, head_seqno: SeqNo) -> SeqNo {
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "zigzag decode reinterprets the low bit as the sign"
+    )]
+    let delta = ((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64);
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the signed delta is applied as a wrapping difference"
+    )]
+    head_seqno.wrapping_add(delta as u64)
+}
+
+/// The encoder's state is the block's seqno coding: the entries after a
+/// restart head store their seqno either as a delta from the head's or in
+/// full, as the [`SEQNO_DELTAS`] bit on the block's first entry says.
+impl Encodable<SeqnoCoding> for InternalValue {
     fn encode_full_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
-        _state: &mut (),
+        coding: &mut SeqnoCoding,
     ) -> crate::Result<()> {
         // We encode restart markers as:
-        // [value type] [seqno] [user key len] [user key] [value len] [value]
-        // 1            2       3              4          5?           6?
+        // [value type (| seqno coding on the first)] [seqno] [user key len] [user key] [value len] [value]
+        // 1                                          2       3              4          5?           6?
 
-        writer.write_u8(u8::from(self.key.value_type))?; // 1
+        let flag = if core::mem::take(&mut coding.mark) {
+            SEQNO_DELTAS
+        } else {
+            0
+        };
+        writer.write_u8(u8::from(self.key.value_type) | flag)?; // 1
         writer.write_u64_varint(self.key.seqno)?; // 2
+        coding.head = self.key.seqno;
 
         #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
         writer.write_u16_varint(self.key.user_key.len() as u16)?; // 3
@@ -269,15 +388,20 @@ impl Encodable<()> for InternalValue {
     fn encode_truncated_into<W: crate::io::Write>(
         &self,
         writer: &mut W,
-        _state: &mut (),
+        coding: &mut SeqnoCoding,
         shared_len: usize,
     ) -> crate::Result<()> {
         // We encode truncated values as:
-        // [value type] [seqno] [shared prefix len] [rest key len] [rest key] [value len] [value]
-        // 1            2       3                   4              5          6?          7?
+        // [value type] [seqno or delta] [shared prefix len] [rest key len] [rest key] [value len] [value]
+        // 1            2                3                   4              5          6?          7?
 
         writer.write_u8(u8::from(self.key.value_type))?; // 1
-        writer.write_u64_varint(self.key.seqno)?; // 2
+        let seqno = if coding.deltas {
+            seqno_delta(self.key.seqno, coding.head)
+        } else {
+            self.key.seqno
+        };
+        writer.write_u64_varint(seqno)?; // 2
 
         // TODO: maybe we can skip this varint altogether if prefix truncation = false
 
@@ -1136,13 +1260,15 @@ impl DataBlock {
             .key
             .user_key;
 
-        let mut serializer = Encoder::<'_, (), InternalValue>::new(
+        let mut serializer = Encoder::<'_, SeqnoCoding, InternalValue>::new(
             writer,
             items.len(),
             restart_interval,
             hash_index_ratio,
             first_key,
         );
+
+        serializer.state = SeqnoCoding::new(block_uses_deltas(items, restart_interval));
 
         for item in items {
             serializer.write(item)?;

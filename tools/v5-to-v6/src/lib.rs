@@ -869,17 +869,15 @@ fn convert_table(
             }
             continue;
         }
-        let frame = export.frame(
-            block.offset,
-            block.size,
-            lsm5::table::block::BlockType::Data,
-        )?;
+        // The 6.0 data block stores a non-head entry's seqno relative to its
+        // restart head, unlike the 5.x one: the rows are encoded again, one
+        // block for each of the source's.
         let rows: Vec<lsm6::InternalValue> = export
             .rows(block)?
             .into_iter()
             .map(internal_value)
             .collect::<Result<_, _>>()?;
-        table.append_block(&frame.payload, frame.uncompressed_length, &rows)?;
+        table.append_block(rows)?;
     }
     for rt in export.range_tombstones() {
         table.range_tombstone(
