@@ -240,6 +240,12 @@ impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
         self.jobs.push(job);
     }
 
+    /// The blocking driver completes every read itself, on the calling
+    /// thread, and runs its jobs there too.
+    fn leads_loads(&self) -> bool {
+        crate::inflight::batches_may_lead()
+    }
+
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn read(&mut self, read: read_job::BlockRequest<'a>) {
         let slot = if let Some(slot) = self
@@ -4209,19 +4215,21 @@ impl Tree {
     }
 
     /// Decodes the block of task `index` from `bytes`, keeping it in the cache
-    /// when it fits in `keep_room`, and point-reads its keys, adding each hit
-    /// to `hits` as `(task index, key index, entry)`.
+    /// when it fits in `keep_room` and handing it to the reads waiting on
+    /// `lead`, and point-reads its keys, adding each hit to `hits` as
+    /// `(task index, key index, entry)`.
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
         index: usize,
         bytes: &[u8],
         keep_room: &mut u64,
+        lead: Option<crate::cache::BlockLead>,
         keys: &[K],
         hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
         let block = task
             .table
-            .decode_data_block_keeping(bytes, &task.handle, keep_room)?;
+            .decode_data_block_keeping(bytes, &task.handle, keep_room, lead)?;
         Self::read_task_keys(task, index, &block, keys, hits)
     }
 

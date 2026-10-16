@@ -59,6 +59,12 @@ pub struct StagedRead<'t> {
     need: Vec<BlockHandle>,
     /// The blocks held, by their offset in the table file.
     held: Vec<(u64, Block)>,
+    /// The loads of needed blocks this read leads, by offset: published as
+    /// each block is supplied, given up when the read ends before that.
+    leads: Vec<(u64, crate::cache::BlockLead)>,
+    /// Whether this read may lead the loads of the blocks it needs: only when
+    /// its driver completes the reads itself.
+    lead_loads: bool,
     /// What the filters answered, counted once the plan is.
     tally: PlanCounts,
     /// Once planned: each data block and the positions of the keys in it.
@@ -67,11 +73,13 @@ pub struct StagedRead<'t> {
 
 impl<'t> StagedRead<'t> {
     /// Opens the staged read of `table` for `sorted_keys` (each with its hash,
-    /// sorted by the table's comparator) at the snapshot `seqno`.
+    /// sorted by the table's comparator) at the snapshot `seqno`. `lead_loads`
+    /// says whether it may lead the cold loads of the blocks it needs.
     pub(crate) fn start(
         table: &'t Table,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
+        lead_loads: bool,
     ) -> StagedStart<'t> {
         if table.metadata.ecc_params.is_some() {
             return StagedStart::Serial;
@@ -104,6 +112,8 @@ impl<'t> StagedRead<'t> {
             passing,
             need: Vec::new(),
             held: Vec::new(),
+            leads: Vec::new(),
+            lead_loads,
             tally: PlanCounts::default(),
             blocks: Vec::new(),
         };
@@ -161,6 +171,9 @@ impl<'t> StagedRead<'t> {
         self.table
             .cache
             .insert_block(self.table.global_id(), handle.offset(), block.clone());
+        if let Some(at) = self.leads.iter().position(|(at, _)| *at == offset) {
+            self.leads.swap_remove(at).1.publish(block.clone());
+        }
         self.need.retain(|h| h.offset() != handle.offset());
         self.held.push((offset, block));
         Ok(())
@@ -225,9 +238,22 @@ impl<'t> StagedRead<'t> {
         {
             return;
         }
-        match self.table.cached_block(&handle, block_type) {
-            Some(block) => self.held.push((offset, block)),
-            None => self.need.push(handle),
+        if let Some(block) = self.table.cached_block(&handle, block_type) {
+            self.held.push((offset, block));
+            return;
+        }
+        // Claimed, so a point read missing the block while this read fetches
+        // it waits for it rather than reading it again.
+        match self
+            .table
+            .claim_batched_block(&handle, block_type, self.lead_loads)
+        {
+            crate::cache::BlockClaim::Shared(block) => self.held.push((offset, block)),
+            crate::cache::BlockClaim::Lead(lead) => {
+                self.leads.push((offset, lead));
+                self.need.push(handle);
+            }
+            crate::cache::BlockClaim::Alone => self.need.push(handle),
         }
     }
 

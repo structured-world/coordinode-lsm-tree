@@ -216,6 +216,109 @@ fn held_cold_load_does_not_block_another_block() -> crate::Result<()> {
     Ok(())
 }
 
+/// A point read that misses a block a blocking multi-get is reading waits for
+/// the multi-get's read instead of reading it again, and both answer right.
+#[test]
+fn point_read_waits_for_a_block_a_multi_get_reads() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), fs, &cache, false)?;
+    let (path, offset) = first_data_block(&tree);
+
+    let entered = Arc::new(Barrier::new(2));
+    let reads = Arc::new(AtomicUsize::new(0));
+    {
+        let (entered, reads, cache) =
+            (Arc::clone(&entered), Arc::clone(&reads), Arc::clone(&cache));
+        injector.hook_read_at(
+            path,
+            offset,
+            Arc::new(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.wait();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while cache.load_waiters() < 1 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+            }),
+        );
+    }
+    let batch = {
+        let tree = tree.clone();
+        std::thread::spawn(move || tree.multi_get((0..64u8).map(|key| [key]), SeqNo::MAX))
+    };
+    entered.wait();
+    let point = std::thread::spawn(move || tree.get([0], SeqNo::MAX));
+    assert_eq!(
+        point.join().expect("reader")?.as_deref(),
+        Some(&value(0)[..])
+    );
+    let values = batch.join().expect("reader")?;
+    for (key, got) in (0..64u8).zip(values) {
+        assert_eq!(got.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one read of the block");
+    assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
+/// A multi-get its caller drives leads no load: the caller can hold it
+/// suspended as long as it likes, so a point read missing one of its blocks
+/// meanwhile reads the block itself rather than waiting on it.
+#[test]
+fn a_suspended_resumable_multi_get_holds_no_load() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), FaultFs::new(StdFs), &cache, false)?;
+    let crate::resumable::Step::Pending(mut read) = tree.start_multi_get(
+        (0..64u8).map(|key| crate::UserKey::from(&[key][..])),
+        SeqNo::MAX,
+    )?
+    else {
+        panic!("a cold multi-get suspends on its reads");
+    };
+    // Suspended with work handed out and not done.
+    let jobs = read.take_jobs();
+    let reads = read.take_reads();
+    assert_eq!(cache.loads_in_flight(), 0, "a suspended read leads no load");
+    assert_eq!(tree.get([0], SeqNo::MAX)?.as_deref(), Some(&value(0)[..]));
+
+    for job in jobs {
+        let outcome = job.run();
+        read.complete_job(outcome);
+    }
+    for mut block in reads {
+        let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+        read.complete_read(block.tag, result, block.buf);
+    }
+    let mut step = read.resume();
+    let values = loop {
+        match step {
+            crate::resumable::Step::Done(values) => break values?,
+            crate::resumable::Step::Pending(mut read) => {
+                for job in read.take_jobs() {
+                    let outcome = job.run();
+                    read.complete_job(outcome);
+                }
+                for mut block in read.take_reads() {
+                    let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+                    read.complete_read(block.tag, result, block.buf);
+                }
+                step = read.resume();
+            }
+        }
+    };
+    for (key, got) in (0..64u8).zip(values) {
+        assert_eq!(got.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    Ok(())
+}
+
 /// A table of one large zstd data block that bounded ranges decode only in
 /// part, with its file and the block's offset.
 #[cfg(feature = "zstd")]

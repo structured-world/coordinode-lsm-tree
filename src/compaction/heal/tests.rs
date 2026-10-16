@@ -278,7 +278,7 @@ fn a_staged_read_leaves_ecc_tables_to_the_serial_path() -> crate::Result<()> {
     ];
     assert!(
         matches!(
-            crate::table::staged::StagedRead::start(table, &sorted_keys, MAX_SEQNO),
+            crate::table::staged::StagedRead::start(table, &sorted_keys, MAX_SEQNO, true),
             crate::table::staged::StagedStart::Serial
         ),
         "a staged read must leave an ECC table to the serial path so a \

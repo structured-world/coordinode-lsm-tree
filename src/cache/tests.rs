@@ -155,6 +155,67 @@ fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() 
     );
 }
 
+/// A thread that leads a batched read's load waits on no other load: with
+/// another thread leading a block it needs, it is told to read the block
+/// alone at once instead of blocking. Two batched reads each waiting on a
+/// block the other leads would otherwise never finish.
+#[test]
+fn a_thread_leading_a_batched_load_never_waits() {
+    use super::{BlockClaim, LoadIdentity};
+    use std::sync::Arc;
+
+    let cache = Arc::new(Cache::with_capacity_bytes(1024 * 1024));
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let identity = LoadIdentity::Block {
+        block_type: crate::table::block::BlockType::Data,
+        size: 100,
+        compression: crate::CompressionType::None,
+        encrypted: false,
+    };
+    // Another reader leads the load of block 0 and keeps it in flight.
+    let BlockClaim::Lead(held) = cache.claim_block(id, crate::table::BlockOffset(0), identity)
+    else {
+        panic!("the first claim leads");
+    };
+
+    let waited = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            let BlockClaim::Lead(batched) =
+                cache.claim_batched_block(id, crate::table::BlockOffset(1), identity, true)
+            else {
+                panic!("the batched read leads block 1");
+            };
+            let claim = cache.claim_block(id, crate::table::BlockOffset(0), identity);
+            drop(batched);
+            matches!(claim, BlockClaim::Alone)
+        }
+    })
+    .join()
+    .expect("the batched reader returns instead of waiting");
+    assert!(waited, "told to read the block alone");
+
+    // Without a batched lead the same claim waits, and takes the block once
+    // it is published.
+    let waiter = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            matches!(
+                cache.claim_block(id, crate::table::BlockOffset(0), identity),
+                BlockClaim::Shared(_)
+            )
+        }
+    });
+    while cache.load_waiters() < 1 {
+        std::thread::yield_now();
+    }
+    held.publish(crate::table::Block {
+        header: crate::table::block::Header::test_dummy(crate::table::block::BlockType::Data),
+        data: crate::Slice::from(&b"block"[..]),
+    });
+    assert!(waiter.join().expect("waiter"), "took the published block");
+}
+
 /// A partial-tier entry whose prefix decoded `decoded` inner blocks and served
 /// `hits` reads.
 #[cfg(feature = "zstd")]

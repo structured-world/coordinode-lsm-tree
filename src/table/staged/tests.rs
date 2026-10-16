@@ -39,7 +39,7 @@ fn a_read_holds_its_blocks_at_their_decoded_size() {
     );
     let keys = batch();
     let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
-    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX) else {
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX, true) else {
         panic!("an unpinned table is staged");
     };
     let file = std::fs::read(&*table.path).expect("table file");
@@ -131,7 +131,7 @@ fn table_with(
 /// block it asks for from the table file, and returns the plan and what it
 /// asked for.
 fn drive(table: &Table, keys: &[(&[u8], u64)]) -> Option<Driven> {
-    let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX) else {
+    let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX, true) else {
         return None;
     };
     let file = std::fs::read(&*table.path).expect("table file");
@@ -589,7 +589,7 @@ fn a_snapshot_below_the_global_seqno_reads_nothing() {
         },
     );
     assert!(matches!(
-        StagedRead::start(&table, &keys, 50),
+        StagedRead::start(&table, &keys, 50, true),
         StagedStart::Nothing
     ));
 }
@@ -603,11 +603,11 @@ fn a_staged_read_starts_only_where_it_can_answer() {
     let dir = tempdir().expect("dir");
     let table = table(dir.path(), |w| w, false, false, 1_000_000);
     assert!(matches!(
-        StagedRead::start(&table, &keys, 1),
+        StagedRead::start(&table, &keys, 1, true),
         StagedStart::Nothing
     ));
     assert!(matches!(
-        StagedRead::start(&table, &[], SeqNo::MAX),
+        StagedRead::start(&table, &[], SeqNo::MAX, true),
         StagedStart::Nothing
     ));
 }

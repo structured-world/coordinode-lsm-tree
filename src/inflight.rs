@@ -91,6 +91,71 @@ impl<V: Clone, I> Ticket<V, I> {
     }
 }
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Loads the calling thread leads for a batched read. Such a read
+    /// publishes them only once its driver handles their completions, and the
+    /// driver runs other loads on the same thread meanwhile: were one of those
+    /// to wait on a load another driver leads while that driver waits on one
+    /// of ours, neither would ever publish. So a thread holding a batched lead
+    /// never waits.
+    static BATCH_LEADS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Whether the calling thread may wait on another request's load: it holds
+/// no lead of a batched read.
+#[must_use]
+pub fn may_wait() -> bool {
+    #[cfg(feature = "std")]
+    {
+        BATCH_LEADS.with(core::cell::Cell::get) == 0
+    }
+    // no-std: no thread-local state; batched reads take no leads there.
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Whether a batched read may lead loads on the calling thread: only where
+/// the thread's held leads are counted, so its other loads stop waiting.
+#[must_use]
+pub const fn batches_may_lead() -> bool {
+    cfg!(feature = "std")
+}
+
+/// Counts one batched lead on the calling thread for as long as it lives.
+///
+/// Created only by a read the blocking driver runs, which takes the lead,
+/// publishes or drops it and runs its other loads all on the one thread it
+/// drives on; a read a caller resumes on other threads takes no lead.
+pub struct BatchToken(());
+
+impl BatchToken {
+    /// Counts a batched lead on the calling thread.
+    #[must_use]
+    pub fn new() -> Self {
+        #[cfg(feature = "std")]
+        BATCH_LEADS.with(|count| count.set(count.get() + 1));
+        Self(())
+    }
+}
+
+impl Default for BatchToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BatchToken {
+    fn drop(&mut self) {
+        // Every token counted one on this thread (it cannot leave it), so the
+        // count is at least one here.
+        #[cfg(feature = "std")]
+        BATCH_LEADS.with(|count| count.set(count.get() - 1));
+    }
+}
+
 /// 64-byte-aligned so neighbouring shard locks do not share a cache line.
 #[repr(align(64))]
 struct Padded<T>(T);
@@ -110,14 +175,14 @@ pub struct InflightLoads<K, V, I, S> {
 }
 
 /// What a cache miss does about its load.
-pub enum Claim<'a, K, V, I, S>
+pub enum Claim<K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
 {
     /// No load of this object is in flight: this request does it and must
     /// [`Lead::publish`] the result (dropping the lead abandons it).
-    Lead(Lead<'a, K, V, I, S>),
+    Lead(Lead<K, V, I, S>),
     /// A compatible load is in flight: [`Join::wait`] for it.
     Join(Join<V, I>),
     /// Load alone: an incompatible load of the key is in flight, or the
@@ -128,12 +193,15 @@ where
 /// The leader's hold on a load. Settles the ticket exactly once: by
 /// [`Self::publish`], or as abandoned when dropped without it, which covers
 /// every error return and an unwind.
-pub struct Lead<'a, K, V, I, S>
+///
+/// Holds the registry rather than borrowing it, so a load handed to another
+/// stage (a batched read completing later) carries its lead along.
+pub struct Lead<K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
 {
-    loads: &'a InflightLoads<K, V, I, S>,
+    loads: Arc<InflightLoads<K, V, I, S>>,
     key: K,
     ticket: Arc<Ticket<V, I>>,
     published: bool,
@@ -148,9 +216,20 @@ impl<V: Clone, I> Join<V, I> {
     pub fn wait(self) -> Option<V> {
         self.0.wait()
     }
+
+    /// The leader's value if it has published one, without waiting: `None`
+    /// while it is still loading or after it failed. For a reader that must
+    /// not block (one holding leads of its own others may wait on), which
+    /// then loads on its own instead.
+    pub fn try_take(&self) -> Option<V> {
+        match &*self.0.state.lock() {
+            State::Ready(value) => Some(value.clone()),
+            State::Pending | State::Abandoned => None,
+        }
+    }
 }
 
-impl<K, V, I, S> Lead<'_, K, V, I, S>
+impl<K, V, I, S> Lead<K, V, I, S>
 where
     K: Eq + Hash + Clone,
     V: Clone,
@@ -174,7 +253,7 @@ where
     }
 }
 
-impl<K, V, I, S> Drop for Lead<'_, K, V, I, S>
+impl<K, V, I, S> Drop for Lead<K, V, I, S>
 where
     K: Eq + Hash + Clone,
     S: BuildHasher,
@@ -218,7 +297,7 @@ where
     /// just missed the cache; a leader checks it once more before loading,
     /// since a load that closed between that miss and this claim has already
     /// put its result there.
-    pub fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
+    pub fn claim(self: &Arc<Self>, key: K, identity: I) -> Claim<K, V, I, S> {
         let mut shard = self.shard(&key).lock();
         if let Some(ticket) = shard.get(&key) {
             return if ticket.identity == identity {
@@ -234,11 +313,25 @@ where
         shard.insert(key.clone(), Arc::clone(&ticket));
         drop(shard);
         Claim::Lead(Lead {
-            loads: self,
+            loads: Arc::clone(self),
             key,
             ticket,
             published: false,
         })
+    }
+
+    /// The value of a load of `key` for `identity` that has already been
+    /// published and not yet closed, without claiming anything: for a reader
+    /// that may neither wait nor lead.
+    pub fn take_ready(&self, key: &K, identity: &I) -> Option<V> {
+        let ticket = Arc::clone(self.shard(key).lock().get(key)?);
+        if ticket.identity != *identity {
+            return None;
+        }
+        match &*ticket.state.lock() {
+            State::Ready(value) => Some(value.clone()),
+            State::Pending | State::Abandoned => None,
+        }
     }
 
     /// How many loads are in flight, for tests.

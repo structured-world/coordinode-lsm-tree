@@ -8006,6 +8006,7 @@ impl Table {
         bytes: &[u8],
         handle: &BlockHandle,
         room: &mut u64,
+        lead: Option<crate::cache::BlockLead>,
     ) -> crate::Result<DataBlock> {
         let block = self.decode_block_from_bytes(bytes, *handle.offset(), BlockType::Data)?;
         // Weighed as the cache weighs it: decoded, not as it was read.
@@ -8015,8 +8016,15 @@ impl Table {
             self.cache
                 .insert_block(self.global_id(), handle.offset(), block.clone());
         }
-        let has_kv_footer = self.metadata.kv_checksum_algo.is_some();
-        DataBlock::from_loaded(block, has_kv_footer)
+        if let Some(lead) = lead {
+            lead.publish(block.clone());
+        }
+        self.data_block_of(block)
+    }
+
+    /// `block`, a data block of this table, as the point reads take it.
+    pub(crate) fn data_block_of(&self, block: Block) -> crate::Result<DataBlock> {
+        DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())
     }
 
     /// Refuses the block at `handle` when its size is one no block of this
@@ -8064,6 +8072,50 @@ impl Table {
     /// # Errors
     ///
     /// Propagates a corruption or decode error.
+    /// The codec a block a batched read decodes is written with. Filter blocks
+    /// are written uncompressed and without the dictionary, index blocks with
+    /// the index codec, data blocks with the data codec and its dictionary:
+    /// the same choice each block's load makes.
+    fn batched_codec(&self, block_type: BlockType) -> CompressionType {
+        match block_type {
+            BlockType::Filter => CompressionType::None,
+            BlockType::Index => self.metadata.index_block_compression,
+            _ => self.metadata.data_block_compression,
+        }
+    }
+
+    /// Claims the load of the block at `handle`, of `block_type`, for a
+    /// batched read about to read it with others: when `lead` lets it, the
+    /// read leads it, so a point read missing the same block meanwhile waits
+    /// for it rather than reading it again; a block another read already
+    /// published is taken. Never waits, since a batched read holds the leads
+    /// of its other blocks.
+    pub(crate) fn claim_batched_block(
+        &self,
+        handle: &BlockHandle,
+        block_type: BlockType,
+        lead: bool,
+    ) -> crate::cache::BlockClaim {
+        let claim = self.cache.claim_batched_block(
+            self.global_id(),
+            handle.offset(),
+            crate::cache::LoadIdentity::Block {
+                block_type,
+                size: handle.size(),
+                compression: self.batched_codec(block_type),
+                encrypted: self.encryption.is_some(),
+            },
+            lead,
+        );
+        #[cfg(feature = "metrics")]
+        if matches!(claim, crate::cache::BlockClaim::Shared(_)) {
+            self.metrics
+                .block_load_shared
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        claim
+    }
+
     pub(crate) fn decode_block_from_bytes(
         &self,
         bytes: &[u8],
@@ -8078,14 +8130,7 @@ impl Table {
             self.metadata.ecc_params.is_none(),
             "a Page-ECC table's blocks are read through the load path, which heals"
         );
-        // Filter blocks are written uncompressed and without the dictionary,
-        // index blocks with the index codec, data blocks with the data codec
-        // and its dictionary: the same choice each block's load makes.
-        let compression = match block_type {
-            BlockType::Filter => CompressionType::None,
-            BlockType::Index => self.metadata.index_block_compression,
-            _ => self.metadata.data_block_compression,
-        };
+        let compression = self.batched_codec(block_type);
         let transform = crate::table::util::build_block_transform(
             compression,
             self.encryption.as_deref(),

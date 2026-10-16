@@ -4,8 +4,12 @@ use std::sync::{Arc, Barrier};
 
 type Loads = InflightLoads<u64, Arc<Vec<u8>>, u32, rustc_hash::FxBuildHasher>;
 
-fn loads(per_shard_limit: usize) -> Loads {
-    InflightLoads::new(4, per_shard_limit, rustc_hash::FxBuildHasher)
+fn loads(per_shard_limit: usize) -> Arc<Loads> {
+    Arc::new(InflightLoads::new(
+        4,
+        per_shard_limit,
+        rustc_hash::FxBuildHasher,
+    ))
 }
 
 /// Readers that miss the same key at once do the load once: one leads, the
@@ -13,7 +17,7 @@ fn loads(per_shard_limit: usize) -> Loads {
 #[test]
 fn simultaneous_claims_of_one_key_load_it_once() {
     const READERS: usize = 16;
-    let loads = Arc::new(loads(8));
+    let loads = loads(8);
     let barrier = Arc::new(Barrier::new(READERS));
     let loaded = Arc::new(AtomicUsize::new(0));
     // Holds the leader inside its load until every reader has claimed, so the
@@ -75,7 +79,7 @@ fn abandoned_load_releases_waiters_empty_handed() {
 /// another thread is woken with nothing instead of waiting forever.
 #[test]
 fn unwinding_leader_wakes_its_waiters() {
-    let loads = Arc::new(loads(8));
+    let loads = loads(8);
     let Claim::Lead(lead) = loads.claim(3, 1) else {
         panic!("the first claim leads");
     };
@@ -126,13 +130,39 @@ fn distinct_keys_lead_independently() {
 #[test]
 fn full_registry_degrades_to_loading_alone() {
     // One shard, so every key lands in it.
-    let loads: Loads = InflightLoads::new(1, 1, rustc_hash::FxBuildHasher);
+    let loads: Arc<Loads> = Arc::new(InflightLoads::new(1, 1, rustc_hash::FxBuildHasher));
     let Claim::Lead(lead) = loads.claim(20, 1) else {
         panic!("leads");
     };
     assert!(matches!(loads.claim(21, 1), Claim::Alone));
     lead.publish(Arc::new(vec![]));
     assert!(matches!(loads.claim(21, 1), Claim::Lead(_)));
+}
+
+/// A reader that must not wait sees a load's value only once it is published:
+/// nothing while it is pending, the value after publish, and nothing after the
+/// leader gave up.
+#[test]
+fn try_take_never_waits() {
+    let loads = loads(8);
+    let Claim::Lead(lead) = loads.claim(40, 1) else {
+        panic!("leads");
+    };
+    let Claim::Join(pending) = loads.claim(40, 1) else {
+        panic!("joins");
+    };
+    assert_eq!(pending.try_take(), None, "still loading");
+    lead.publish(Arc::new(vec![4]));
+    assert_eq!(pending.try_take(), Some(Arc::new(vec![4])));
+
+    let Claim::Lead(lead) = loads.claim(41, 1) else {
+        panic!("leads");
+    };
+    let Claim::Join(failed) = loads.claim(41, 1) else {
+        panic!("joins");
+    };
+    drop(lead);
+    assert_eq!(failed.try_take(), None, "a failed load hands nothing out");
 }
 
 /// Nothing is remembered once a load closes, success or failure: the next

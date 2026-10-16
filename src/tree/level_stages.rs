@@ -164,11 +164,12 @@ impl<'a> LevelStages<'a> {
                     self.deferred = true;
                     continue;
                 }
-                entry.read = match StagedRead::start(entry.table, keys, self.seqno) {
-                    StagedStart::Nothing => LevelRead::Nothing,
-                    StagedStart::Serial => LevelRead::Serial,
-                    StagedStart::Staged(read) => LevelRead::Staged(read),
-                };
+                entry.read =
+                    match StagedRead::start(entry.table, keys, self.seqno, out.leads_loads()) {
+                        StagedStart::Nothing => LevelRead::Nothing,
+                        StagedStart::Serial => LevelRead::Serial,
+                        StagedStart::Staged(read) => LevelRead::Staged(read),
+                    };
             }
             // Whether the table's next stage is to be read through the file it
             // holds.

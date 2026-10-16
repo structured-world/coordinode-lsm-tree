@@ -167,6 +167,7 @@ where
     }
 
     /// The resident value for `key`, by reference.
+    #[cfg(feature = "zstd")]
     fn find(&self, hash: u64, key: &K) -> Option<&V> {
         self.map
             .find(hash, |(k, _)| k == key)
@@ -538,6 +539,7 @@ where
     /// slip between the two. `merge` returning `None` leaves the entry as it
     /// is; a derived value heavier than a shard is refused, as by
     /// [`Self::insert_with_priority`].
+    #[cfg(feature = "zstd")]
     pub fn insert_merged(&self, key: K, merge: impl FnOnce(Option<&V>) -> Option<V>) {
         let (h, shard) = self.locate(&key);
         let mut core = shard.write();
