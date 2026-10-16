@@ -534,6 +534,11 @@ impl DeletionPause {
                     crate::fs::SyncMode::Normal,
                 );
             }
+            // An open checkpoint may still link the file (through a view of it
+            // it captured): it takes over the removal, as for any other view.
+            if self.is_active() && self.try_enqueue(Arc::clone(&removal.fs), removal.path.clone()) {
+                continue;
+            }
             if let Err(e) = removal.fs.remove_file(&removal.path) {
                 log::warn!(
                     "Failed to remove {} after its last pin dropped: {e:?}",

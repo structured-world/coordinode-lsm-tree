@@ -31,6 +31,13 @@ pub const BLOBS_FOLDER: &str = "blobs";
 pub const DICTS_FOLDER: &str = "dicts";
 pub const CURRENT_VERSION_FILE: &str = "current";
 
+/// Marks a tree folder whose restore has not finished.
+///
+/// It lies there from before a restore publishes the manifest until the
+/// restored memtable contents are durable: an ordinary open refuses the folder
+/// while it is there, and a new restore of the folder finishes the job.
+pub const RESTORE_MARKER_FILE: &str = "restoring";
+
 /// Suffix of a table replacement a manifest repair has not published yet.
 ///
 /// A repair builds the replacement under this name until the manifest that

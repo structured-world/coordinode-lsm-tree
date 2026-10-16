@@ -269,6 +269,46 @@ fn a_pinned_blob_file_waits_for_its_pin() -> crate::Result<()> {
     Ok(())
 }
 
+/// A deleted view of a pinned blob file retired while a checkpoint is open
+/// stays after the checkpoint closes, until the pin drops.
+#[test]
+fn a_pinned_blob_file_outlives_an_open_checkpoint() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+
+    let memfs = MemFs::new();
+    let root = std::path::absolute("/blobs")?;
+    memfs.create_dir_all(&root)?;
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let path = root.join("0");
+    {
+        let mut w = super::blob_file::writer::Writer::new(&path, 0, 0, &*fs)?;
+        w.write(b"a", 1, &[b'x'; 64])?;
+        w.finish()?;
+    }
+    let blob = recover_blob_file(
+        &path,
+        0,
+        Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    )?;
+    let pause = crate::deletion_pause::DeletionPause::new_shared();
+    blob.install_deletion_pause(Arc::clone(&pause));
+    pause.pin_files(core::iter::once(path.as_path()));
+
+    let checkpoint = pause.acquire();
+    blob.mark_as_deleted();
+    drop(blob);
+    drop(checkpoint);
+    assert!(memfs.exists(&path)?, "the pin still holds the file");
+
+    pause.unpin_files(core::iter::once(path.as_path()));
+    assert!(!memfs.exists(&path)?, "the pin's release removed it");
+    Ok(())
+}
+
 /// Two directory entries of the SAME id — `0` beside a noncanonical `00`, what
 /// a repair leaves when its post-commit removal of the displaced copy fails —
 /// both match the manifest id and both used to be recovered. The version this

@@ -1485,7 +1485,10 @@ impl Config {
     /// [`memtable_range_tombstones`](crate::PinnedVersion::memtable_range_tombstones).
     ///
     /// The directory lock is taken first and held into the open, so no other
-    /// opener sees the folder half restored. The files are synced and the
+    /// opener sees the folder half restored. Until the restored memtable
+    /// contents are durable a `restoring` marker lies in the folder: an
+    /// ordinary [`Self::open`] refuses it, and calling this again with the
+    /// same pin finishes an interrupted restore. The files are synced and the
     /// layout published as the tree's manifest, then the memtable contents are
     /// written with their sequence numbers and flushed. The returned tree reads
     /// as the source did at the pin, for every key and every snapshot the
@@ -1501,7 +1504,8 @@ impl Config {
     /// short to hold its header; [`Error::Locked`](crate::Error::Locked) when
     /// another instance holds the folder; an `AlreadyExists` I/O error, before
     /// anything is written, when the folder already holds a tree (a `current`
-    /// pointer or a manifest file); otherwise the failures of the syncs, the
+    /// pointer or a manifest file) that no interrupted restore left; otherwise
+    /// the failures of the syncs, the
     /// manifest write, [`Self::open`] and the flush.
     #[cfg(feature = "std")]
     pub fn restore_pinned(

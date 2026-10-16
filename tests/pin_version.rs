@@ -374,6 +374,82 @@ fn restored_tree_writes_above_the_restored_data() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A pin keeps the source folder locked: the tree it came from may be dropped,
+/// but no other opener gets the folder (and a registry of its own that knows
+/// nothing of the pin) until the pin drops.
+#[test]
+fn a_pin_keeps_the_source_folder_locked() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(dir.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    drop(tree);
+
+    assert!(
+        matches!(
+            open(dir.path(), false, &SequenceNumberCounter::default()),
+            Err(lsm_tree::Error::Locked(_))
+        ),
+        "the pin holds the folder"
+    );
+    drop(pin);
+    open(dir.path(), false, &SequenceNumberCounter::default())?;
+    Ok(())
+}
+
+/// A restore interrupted after it published the manifest but before the pinned
+/// memtable contents were flushed leaves a folder an ordinary open refuses,
+/// and a second restore finishes it.
+#[test]
+fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    let expected = read_at(&tree, pin.seqno())?;
+    assert!(pin.memtable_entries().count() > 0);
+    ship(&pin, dst.path())?;
+    let layout = pin.layout()?;
+
+    let injector = Arc::new(FaultInjector::new());
+    // The edit log is first touched once the manifest is published: failing it
+    // stops the restore between the publication and the memtable flush.
+    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("edits-"));
+    let interrupted = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(FaultFs::with_injector(StdFs, Arc::clone(&injector)))
+    .restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    );
+    assert!(interrupted.is_err(), "the fault stopped the restore");
+    drop(interrupted);
+
+    assert!(
+        open(dst.path(), false, &SequenceNumberCounter::default()).is_err(),
+        "an ordinary open does not serve the partial tree"
+    );
+    let restored = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    )?;
+    assert_eq!(read_at(&restored, pin.seqno())?, expected);
+    Ok(())
+}
+
 /// A pinned file describes itself: a table has a level, a blob file none, the
 /// size and the bytes read through the pin are the file's, and a table's heal
 /// attestation is reported when one lies beside it.

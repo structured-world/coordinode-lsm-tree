@@ -145,6 +145,10 @@ pub struct PinnedVersion {
     blob_files: Vec<PinnedFile>,
     dictionaries: Vec<PinnedFile>,
     pause: Arc<DeletionPause>,
+    /// The source tree's directory lock: while the pin lives, no other opener
+    /// gets the folder (with a registry of its own that knows nothing of the
+    /// pin), even after the tree drops.
+    _directory_lock: Option<Arc<dyn FsFile>>,
     comparator_name: Arc<str>,
     runtime: Arc<RuntimeConfig>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
@@ -225,6 +229,7 @@ impl PinnedVersion {
             blob_files,
             dictionaries,
             pause,
+            _directory_lock: tree.directory_lock.clone(),
             comparator_name: tree.config.comparator.name().into(),
             runtime: tree.runtime_config.load_full(),
             encryption: tree.config.encryption.clone(),
@@ -367,8 +372,12 @@ pub fn restore(
     // folder before the memtable contents are in.
     fs.create_dir_all(&root)?;
     let lock = crate::config::acquire_directory_lock(&*fs, &root, config.directory_lock)?;
-    // Never publish over a tree that is already there: its open would sweep
+    let marker = root.join(crate::file::RESTORE_MARKER_FILE);
+    // A folder an interrupted restore left is this restore's to finish: its
+    // manifest goes, and the open below sweeps what that restore's flush
+    // wrote. Any other tree is never published over: its open would sweep
     // that tree's manifest and tables as orphans of the restored layout.
+    let resuming = fs.exists(&marker)?;
     for entry in fs.read_dir(&root)? {
         let name = &entry.file_name;
         let manifest_file = name == crate::file::CURRENT_VERSION_FILE
@@ -376,7 +385,10 @@ pub fn restore(
             || name
                 .strip_prefix('v')
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()));
-        if manifest_file {
+        if !manifest_file {
+            continue;
+        }
+        if !resuming {
             return Err(crate::Error::from(crate::io::Error::new(
                 crate::io::ErrorKind::AlreadyExists,
                 format!(
@@ -385,6 +397,7 @@ pub fn restore(
                 ),
             )));
         }
+        fs.remove_file(&entry.path)?;
     }
 
     // The streamed files first: the pointer published below must never name a
@@ -404,6 +417,15 @@ pub fn restore(
             FsFile::sync_all_with(&*file, sync_mode)?;
         }
         fsync_directory(&folder, &*fs, sync_mode)?;
+    }
+
+    // Durable before the manifest is: a crash from here until the restored
+    // memtable contents are flushed leaves a folder an ordinary open refuses.
+    if !resuming {
+        let file = fs.open(&marker, &FsOpenOptions::new().write(true).create_new(true))?;
+        FsFile::sync_all_with(&*file, sync_mode)?;
+        drop(file);
+        fsync_directory(&root, &*fs, sync_mode)?;
     }
 
     let mut file = fs.open(
@@ -474,5 +496,9 @@ pub fn restore(
         .map_or(pin_seqno, |highest| pin_seqno.max(highest + 1));
     seqno.fetch_max(next);
     visible_seqno.fetch_max(pin_seqno);
+
+    // The flush made the restored contents durable: the tree is whole now.
+    fs.remove_file(&marker)?;
+    fsync_directory(&root, &*fs, sync_mode)?;
     Ok(tree)
 }

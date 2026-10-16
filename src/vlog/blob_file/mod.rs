@@ -162,6 +162,22 @@ impl Drop for Inner {
                 .inspect(|d| d.remove_for_blob_file(&global_id));
             drop(file_accessor);
 
+            // A pin may list the file through another view of it (the one
+            // before a tight-space relocation): it stays until that pin drops.
+            // Checked before the checkpoint below, whose release would
+            // otherwise remove the file while the pin still lists it; the
+            // pin's release hands the removal to a checkpoint open then.
+            #[cfg(feature = "std")]
+            if let Some(pause) = self.deletion_pause.get()
+                && pause.defer_removal_if_pinned(
+                    &self.fs,
+                    &self.path,
+                    crate::deletion_pause::PinnedKind::BlobFile,
+                )
+            {
+                return;
+            }
+
             // If a checkpoint is active, defer the physical deletion so the
             // file remains hard-linkable until the checkpoint releases its
             // pause. Short-circuit on the common no-checkpoint path: skip
@@ -182,19 +198,6 @@ impl Drop for Inner {
                     self.id,
                     self.path.display(),
                 );
-                return;
-            }
-
-            // A pin may list the file through another view of it (the one
-            // before a tight-space relocation): it stays until that pin drops.
-            #[cfg(feature = "std")]
-            if let Some(pause) = self.deletion_pause.get()
-                && pause.defer_removal_if_pinned(
-                    &self.fs,
-                    &self.path,
-                    crate::deletion_pause::PinnedKind::BlobFile,
-                )
-            {
                 return;
             }
 

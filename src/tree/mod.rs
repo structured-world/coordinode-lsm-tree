@@ -4547,6 +4547,8 @@ impl Tree {
         // (idempotent; `create_new` re-creates the `tables/` subtree). The lock
         // is threaded into the constructor so it lives for the tree's lifetime.
         #[cfg(feature = "std")]
+        let restoring = matches!(lock, crate::config::DirectoryLock::Held(_));
+        #[cfg(feature = "std")]
         let directory_lock = match lock {
             crate::config::DirectoryLock::Held(held) => held,
             crate::config::DirectoryLock::Acquire => {
@@ -4558,6 +4560,25 @@ impl Tree {
                 )?
             }
         };
+
+        // A restore that published the manifest but never made the restored
+        // memtable contents durable left a tree that lacks them: serving it
+        // would answer from a partial snapshot. Only the restore that finishes
+        // the job opens it.
+        #[cfg(feature = "std")]
+        if !restoring
+            && config
+                .fs
+                .exists(&config.path.join(crate::file::RESTORE_MARKER_FILE))?
+        {
+            return Err(crate::Error::from(crate::io::Error::new(
+                crate::io::ErrorKind::InvalidData,
+                format!(
+                    "{} holds an interrupted restore; run restore_pinned again to finish it",
+                    config.path.display(),
+                ),
+            )));
+        }
 
         // Check for old version
         if config.fs.exists(&config.path.join("version"))? {
@@ -5331,7 +5352,7 @@ impl Tree {
         mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
         // manifest probe; held for the tree's lifetime via
-        // `TreeInner::_directory_lock`.
+        // `TreeInner::directory_lock`.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> crate::Result<Self> {
         use crate::stop_signal::StopSignal;
@@ -5501,7 +5522,7 @@ impl Tree {
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
             #[cfg(feature = "std")]
-            _directory_lock: directory_lock,
+            directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
             deletion_pause: Arc::clone(&deletion_pause),
             #[cfg(feature = "std")]

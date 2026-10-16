@@ -471,6 +471,33 @@ fn a_pin_waits_for_a_mutation_under_way() {
     );
 }
 
+/// A pinned removal released while a checkpoint holds the pause goes to the
+/// checkpoint's queue: the checkpoint may still link the file.
+#[test]
+fn a_released_pin_removal_waits_for_an_open_checkpoint() {
+    let fs = MemFs::new();
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    let path = Path::new("/d/file.blob").to_path_buf();
+    write_file(&fs, &path, b"x");
+    let dyn_fs: Arc<dyn Fs> = Arc::new(fs.clone());
+
+    let pause = DeletionPause::new_shared();
+    pause.pin_files(core::iter::once(path.as_path()));
+    assert!(pause.defer_removal_if_pinned(&dyn_fs, &path, PinnedKind::BlobFile));
+
+    let checkpoint = pause.acquire();
+    pause.unpin_files(core::iter::once(path.as_path()));
+    assert!(
+        fs.exists(&path).unwrap(),
+        "the open checkpoint may still link it"
+    );
+    drop(checkpoint);
+    assert!(
+        !fs.exists(&path).unwrap(),
+        "the checkpoint's release removed it"
+    );
+}
+
 /// A file two pins list stays pinned until both release it.
 #[test]
 fn a_file_pinned_twice_stays_pinned_until_both_release() {
