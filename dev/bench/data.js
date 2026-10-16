@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792140915332,
+  "lastUpdate": 1792169671443,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -46628,6 +46628,90 @@ window.BENCHMARK_DATA = {
             "value": 329438.3350315687,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.3us | P99.9: 85.6us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "43e0b507200b3b4651cf76a16aa7a1ac991c4fca",
+          "message": "perf(table): delta-encode sequence numbers inside a restart interval (#919)\n\n## Summary\n- Data blocks store the sequence numbers of non-head entries as zigzag\ndeltas from their restart head, where that is shorter than storing them\nin full\n- Each block picks its coding from the encoded lengths and records the\nchoice in one bit on its first entry's value-type byte, so blocks of\nscattered seqnos (random keys) keep the full form and stay\nbyte-identical to before\n\n## Changes\n- `InternalValue` encodes with a per-block `SeqnoCoding` state;\n`DataBlock::encode_into` chooses deltas only when their total varint\nlength is strictly below the full seqnos'\n- The decoder reads the coding bit once per block (also from a partially\ndecoded prefix) and hands each truncated entry its head's seqno only\nwhen the block stores deltas\n- A flagged byte on any later head or on a truncated entry is rejected\nas an unknown value type\n- The v5-to-v6 converter re-encodes each source block's rows instead of\ncopying the 5.x payload, keeping one 6.0 block per source block\n- structured-zstd 0.2.1\n\n## Measurements\nTable bytes, main → branch (flush + full compaction): 2M × 16 B\nsequential keys lz4 −7.7%, zstd −14.7%, uncompressed −6.6%; 2M × 100 B\nzstd −0.9%; 300K × 1000 B zstd −0.06%; random keys byte-identical on\nevery codec. Linux, 15 interleaved rounds, medians: compaction on\nsequential zstd −3.0%, random uncompressed −0.8%, random zstd +0.5%\n(within noise); write of sequential zstd −4.1%.\n\n## Testing\nfmt, nextest (all features and default), clippy in both feature sets,\ndoc tests, rustdoc, the no-std check, sst-dump, db_bench and the\nv5-to-v6 converter's lint and tests pass on Linux.\n\nCloses #844\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Data blocks now use compact sequence-number delta encoding when it\ntakes less space than full sequence numbers. Reading remains supported\nacross both encoding formats.\n* **Improvements**\n* Table imports and non-columnar table conversions now re-encode rows\nwhen writing data blocks, preserving source-block boundaries during\nimport. Data-block sizing is fixed for table imports.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-16T19:41:17+03:00",
+          "tree_id": "ecfc249f5c5df15903b7d12e16b4b7d68bffc5bc",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/43e0b507200b3b4651cf76a16aa7a1ac991c4fca"
+        },
+        "date": 1792169670327,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 132059.00564246232,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 17.3us | P99.9: 28.8us\nthreads: 1 | elapsed: 4.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2514590.1233815076,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 694433.9459534698,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 502131.97201204766,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.7us | P99.9: 23.3us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2318881.203820278,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.7us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 251816.6896429041,
+            "unit": "ops/sec",
+            "extra": "P50: 3.4us | P99: 8.7us | P99.9: 20.0us\nthreads: 1 | elapsed: 0.79s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 139044.7182357924,
+            "unit": "ops/sec",
+            "extra": "P50: 6.4us | P99: 12.3us | P99.9: 25.9us\nthreads: 1 | elapsed: 1.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 731344.6414816924,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.4us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 736089.050522267,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 354323.0555624117,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.6us | P99.9: 82.9us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
