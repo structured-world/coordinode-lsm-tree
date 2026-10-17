@@ -573,14 +573,27 @@ fn concurrent_partial_growth_is_serialized_in_either_order() -> crate::Result<()
 #[cfg(feature = "zstd")]
 #[test]
 fn a_read_waiting_on_a_growth_that_promotes_shares_the_full_load() -> crate::Result<()> {
-    // Wide enough to decode most of the block, which promotes it.
-    const WIDE: u64 = 19_500;
     const NARROW: u64 = 30;
     let folder = tempfile::tempdir()?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
     let (table, path, offset) = partial_table(folder.path(), fs)?;
     let cache = Arc::clone(&table.cache);
+    // Inside the first block yet past most of it, so decoding up to it
+    // promotes the block: a range reaching past the block is not decoded in
+    // part at all.
+    let wide: u64 = {
+        let handle = table
+            .untraced_index_walk()
+            .next()
+            .expect("the table has a data block")?;
+        let last = std::str::from_utf8(&handle.end_key()[..])
+            .ok()
+            .and_then(|key| key.strip_prefix("key-"))
+            .and_then(|number| number.parse::<u64>().ok())
+            .expect("the fixture's keys are numbered");
+        last * 97 / 100
+    };
 
     // The first read (the wide range's frame) is held until the narrow range
     // waits on its growth; the second (its full load after promoting) until a
@@ -607,14 +620,14 @@ fn a_read_waiting_on_a_growth_that_promotes_shares_the_full_load() -> crate::Res
             }),
         );
     }
-    let wide = {
+    let wide_read = {
         let table = table.clone();
-        std::thread::spawn(move || keys_below(&table, WIDE))
+        std::thread::spawn(move || keys_below(&table, wide))
     };
     entered.wait();
     let narrow = std::thread::spawn(move || keys_below(&table, NARROW));
     assert_eq!(narrow.join().expect("reader")?, expected_below(NARROW));
-    assert_eq!(wide.join().expect("reader")?, expected_below(WIDE));
+    assert_eq!(wide_read.join().expect("reader")?, expected_below(wide));
     assert_eq!(
         reads.load(Ordering::SeqCst),
         2,

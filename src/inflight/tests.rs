@@ -284,7 +284,16 @@ fn a_batch_token_dropped_off_its_thread_is_refused() {
     let token = std::thread::spawn(super::BatchToken::new)
         .join()
         .expect("the token is taken");
-    let dropped = std::thread::spawn(move || drop(token)).join();
+    // The other thread holds a lead of its own, so a drop there would not
+    // underflow its count: only the check of the token's thread refuses it.
+    // Its own token is forgotten rather than dropped after, which would
+    // underflow the count the foreign drop lowered.
+    let dropped = std::thread::spawn(move || {
+        let own = super::BatchToken::new();
+        drop(token);
+        core::mem::forget(own);
+    })
+    .join();
     assert!(dropped.is_err(), "dropping it on another thread panics");
 }
 
