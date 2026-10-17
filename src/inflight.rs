@@ -246,16 +246,10 @@ pub const fn batches_may_lead() -> bool {
 /// resumable read crosses threads; debug builds check it is dropped on the
 /// thread whose count it holds.
 pub struct BatchToken {
-    /// The counter of the creating thread, by address, to tell its thread.
+    /// The thread whose count the token holds. Its id, never its counter's
+    /// address: a thread that has exited can leave that address to the next.
     #[cfg(all(feature = "std", debug_assertions))]
-    counter: usize,
-}
-
-/// The address of the calling thread's batched-lead counter: unique to the
-/// thread while it lives.
-#[cfg(all(feature = "std", debug_assertions))]
-fn counter_of_this_thread() -> usize {
-    BATCH_LEADS.with(|count| core::ptr::from_ref(count).addr())
+    thread: std::thread::ThreadId,
 }
 
 impl BatchToken {
@@ -266,7 +260,7 @@ impl BatchToken {
         BATCH_LEADS.with(|count| count.set(count.get() + 1));
         Self {
             #[cfg(all(feature = "std", debug_assertions))]
-            counter: counter_of_this_thread(),
+            thread: std::thread::current().id(),
         }
     }
 }
@@ -284,8 +278,8 @@ impl Drop for BatchToken {
         // on one thread), so the count is at least one here.
         #[cfg(all(feature = "std", debug_assertions))]
         debug_assert_eq!(
-            self.counter,
-            counter_of_this_thread(),
+            self.thread,
+            std::thread::current().id(),
             "a batched lead was dropped off the thread that took it"
         );
         #[cfg(feature = "std")]
