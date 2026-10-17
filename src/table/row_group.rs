@@ -710,9 +710,12 @@ impl GroupRead<'_> {
         };
         let directory = self.admit_directory(&prefix, directory_len)?;
         // The directory's load is its own request; the pages it names are
-        // timed as they are fetched, in their own shards.
-        self.cache
-            .record_directory_load(self.table_id, self.group.offset(), timer);
+        // timed as they are fetched, in their own shards. A read that must
+        // leave no trace feeds no estimate.
+        if self.charge.touches_cache() {
+            self.cache
+                .record_directory_load(self.table_id, self.group.offset(), timer);
+        }
         let directory = if want
             .zone_column()
             .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
@@ -914,21 +917,24 @@ impl GroupRead<'_> {
                 )?;
             }
             // The pages read from disk here, read and decoded, timed into
-            // the shards their own loads coordinate in.
-            let pages_from = *self.group.offset()
-                + u64::from(directory_len)
-                + u64::from(directory.pages_start());
-            self.cache.record_block_loads(
-                self.table_id,
-                batch
-                    .iter()
-                    .zip(spans)
-                    .filter(|&(_, &(start, _))| start >= front.len())
-                    .flat_map(|(run, _)| run.clone())
-                    .filter_map(|slot| pages.get(slot).and_then(|s| entries.get(s.index)))
-                    .map(|entry| BlockOffset(pages_from + u64::from(entry.offset))),
-                timer,
-            );
+            // the shards their own loads coordinate in, unless this read must
+            // leave no trace.
+            if self.charge.touches_cache() {
+                let pages_from = *self.group.offset()
+                    + u64::from(directory_len)
+                    + u64::from(directory.pages_start());
+                self.cache.record_block_loads(
+                    self.table_id,
+                    batch
+                        .iter()
+                        .zip(spans)
+                        .filter(|&(_, &(start, _))| start >= front.len())
+                        .flat_map(|(run, _)| run.clone())
+                        .filter_map(|slot| pages.get(slot).and_then(|s| entries.get(s.index)))
+                        .map(|entry| BlockOffset(pages_from + u64::from(entry.offset))),
+                    timer,
+                );
+            }
         }
         Ok(pages)
     }

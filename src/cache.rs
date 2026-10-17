@@ -532,7 +532,7 @@ impl Cache {
     }
 
     /// The load-time estimates of every registry shard summed, for tests.
-    #[cfg(all(test, feature = "columnar"))]
+    #[cfg(test)]
     pub(crate) fn load_estimates_total(&self) -> u64 {
         self.loads.estimates_total()
     }

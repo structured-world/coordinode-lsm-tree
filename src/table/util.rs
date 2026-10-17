@@ -383,6 +383,12 @@ pub(crate) fn load_block_paced(
                         .block_load_shared
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
+                // The read that led may not have cached the block (a
+                // multi-get past the room it keeps for its blocks): this read
+                // caches it, as it would have reading the block itself.
+                if !cache.has_block(table_id, handle.offset()) {
+                    cache.insert_block(table_id, handle.offset(), block.clone());
+                }
                 return Ok(block);
             }
             crate::cache::BlockClaim::Lead(lead) => {
@@ -478,8 +484,10 @@ pub(crate) fn load_block_paced(
         ecc_status,
         recovery,
     )?;
-    cache.record_block_load(table_id, handle.offset(), timer);
+    // A read that must leave no trace feeds no estimate either: its loads
+    // would otherwise switch on the waiting of the reads after it.
     if charge.touches_cache() {
+        cache.record_block_load(table_id, handle.offset(), timer);
         cache.insert_block(table_id, handle.offset(), block.clone());
     }
     if let Some(lead) = lead {

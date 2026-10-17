@@ -8016,6 +8016,8 @@ impl Table {
             self.cache
                 .insert_block(self.global_id(), handle.offset(), block.clone());
         }
+        // Published whether cached or not: a point read waiting on it caches
+        // the block itself when this read had no room left for it.
         if let Some(lead) = lead {
             lead.publish(&block);
         }

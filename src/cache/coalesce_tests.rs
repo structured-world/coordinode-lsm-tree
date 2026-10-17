@@ -357,6 +357,61 @@ fn a_multi_get_leads_and_publishes_its_filter_and_index_loads() -> crate::Result
     Ok(())
 }
 
+/// A point read waiting on a block a multi-get decodes past the room it
+/// keeps for its blocks takes the block and caches it, as it would have
+/// reading the block itself: a later read of the block finds it cached.
+#[test]
+fn a_waiting_point_read_caches_a_block_a_multi_get_had_no_room_for() -> crate::Result<()> {
+    use crate::table::block::BlockType;
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let cache = sharing_cache(64 << 20);
+    let tree = reopen_cold(folder.path(), FaultFs::new(StdFs), &cache, false)?;
+    let table = {
+        let version = tree.current_version();
+        let Some(table) = version.iter_tables().next().cloned() else {
+            panic!("the flush wrote a table");
+        };
+        table
+    };
+    let keyed = {
+        use crate::table::block_index::BlockIndex as _;
+        table
+            .block_index
+            .iter()
+            .find_map(Result::ok)
+            .expect("a non-empty table has a data block")
+    };
+    let handle = crate::table::BlockHandle::new(keyed.offset(), keyed.size());
+    let bytes = {
+        let file = std::fs::read(&*table.path)?;
+        let start = usize::try_from(*handle.offset()).expect("offset fits");
+        file.get(start..start + handle.size() as usize)
+            .expect("the block lies in the table file")
+            .to_vec()
+    };
+    let Some(lead) = table.claim_batched_block(&handle, BlockType::Data, true) else {
+        panic!("the multi-get leads the block's load");
+    };
+    let point = std::thread::spawn(move || tree.get([0], SeqNo::MAX));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cache.load_waiters() < 1 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(cache.load_waiters(), 1, "the point read waits on the load");
+    // No room left: the multi-get does not cache the block itself.
+    table.decode_data_block_keeping(&bytes, &handle, &mut 0, Some(lead))?;
+    assert_eq!(
+        point.join().expect("reader")?.as_deref(),
+        Some(&value(0)[..])
+    );
+    assert!(
+        cache.has_block(table.global_id(), handle.offset()),
+        "the waiting point read cached the block"
+    );
+    Ok(())
+}
+
 /// A multi-get its caller drives leads no load: the caller can hold it
 /// suspended as long as it likes, so a point read missing one of its blocks
 /// meanwhile reads the block itself rather than waiting on it.

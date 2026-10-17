@@ -229,6 +229,29 @@ impl<'t> StagedRead<'t> {
         (self.table_seqno, self.blocks, self.tally)
     }
 
+    /// Claims the loads of the blocks this stage needs, once the stage is
+    /// handed out to be read, so a point read missing one of them meanwhile
+    /// waits for this read rather than reading it again. A block already led
+    /// here is not claimed again.
+    pub(crate) fn claim_loads(&mut self) {
+        let (block_type, _) = self.need();
+        for at in 0..self.need.len() {
+            let Some(&handle) = self.need.get(at) else {
+                continue;
+            };
+            let offset = *handle.offset();
+            if self.leads.iter().any(|(led, _)| *led == offset) {
+                continue;
+            }
+            if let Some(lead) = self
+                .table
+                .claim_batched_block(&handle, block_type, self.lead_loads)
+            {
+                self.leads.push((offset, lead));
+            }
+        }
+    }
+
     /// Records that the stage needs the block at `handle`, unless it is held
     /// or asked for already, or the cache has it, in which case it is held.
     fn want(&mut self, handle: BlockHandle, block_type: BlockType) {
@@ -242,14 +265,9 @@ impl<'t> StagedRead<'t> {
             self.held.push((offset, block));
             return;
         }
-        // Claimed, so a point read missing the block while this read fetches
-        // it waits for it rather than reading it again.
-        if let Some(lead) = self
-            .table
-            .claim_batched_block(&handle, block_type, self.lead_loads)
-        {
-            self.leads.push((offset, lead));
-        }
+        // Claimed only once the stage is handed out (`claim_loads`): a stage
+        // the level defers would otherwise hold a load no read has started,
+        // and a point read missing the block would wait on it.
         self.need.push(handle);
     }
 

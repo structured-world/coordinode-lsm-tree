@@ -76,6 +76,76 @@ fn a_read_holds_its_blocks_at_their_decoded_size() {
     );
 }
 
+/// A staged read claims the loads of its stage's blocks only once the stage
+/// is handed out: a stage the level defers under its budget holds no load a
+/// point read missing the same block would wait on.
+#[test]
+fn a_staged_read_claims_its_loads_only_when_its_stage_is_handed_out() {
+    let dir = tempdir().expect("tempdir");
+    let table = table_with(
+        dir.path(),
+        |w| w,
+        false,
+        false,
+        1_000_000,
+        |params| {
+            params.cache = Arc::new(
+                Cache::with_capacity_bytes(1_000_000)
+                    .with_load_coalescing_after(core::time::Duration::ZERO),
+            );
+        },
+    );
+    let keys = batch();
+    let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX, true) else {
+        panic!("an unpinned table is staged");
+    };
+    let needed = read.need().1.len();
+    assert!(needed > 0, "the cold filter is needed");
+    assert_eq!(
+        table.cache.loads_in_flight(),
+        0,
+        "a stage not handed out leads no load"
+    );
+    read.claim_loads();
+    assert_eq!(table.cache.loads_in_flight(), needed);
+    read.claim_loads();
+    assert_eq!(table.cache.loads_in_flight(), needed, "claimed once");
+}
+
+/// A read that must leave no trace feeds no load-time estimate, while a read
+/// of the same blocks that may touch the cache does: an untraced scan's slow
+/// loads would otherwise switch on waiting for the reads after it.
+#[test]
+fn an_untraced_load_feeds_no_estimate() {
+    let dir = tempdir().expect("tempdir");
+    let table = table(dir.path(), |w| w, false, false, 1_000_000);
+    let walk = |untraced: bool| {
+        let table = table.clone();
+        std::thread::spawn(move || {
+            crate::inflight::override_load_sampling_on_this_thread(Some(true));
+            if untraced {
+                table.untraced_index_walk().count()
+            } else {
+                table.maintenance_index_walk().count()
+            }
+        })
+        .join()
+        .expect("walker")
+    };
+    assert!(walk(true) > 0, "the index has entries");
+    assert_eq!(
+        table.cache.load_estimates_total(),
+        0,
+        "untraced loads are not timed"
+    );
+    walk(false);
+    assert!(
+        table.cache.load_estimates_total() > 0,
+        "a read that touches the cache is timed"
+    );
+}
+
 /// Writes 500 keys `key000000..key000998` (even numbers only, so every odd
 /// number is a miss inside the key range) into one table shaped by `shape`,
 /// and opens it with a cache of `cache_bytes`, pinning as asked.

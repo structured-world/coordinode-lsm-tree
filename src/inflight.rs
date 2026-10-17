@@ -335,7 +335,7 @@ std::thread_local! {
 
 /// Makes the calling thread time every load (`Some(true)`), none
 /// (`Some(false)`), or sample them again (`None`), for tests.
-#[cfg(all(test, feature = "std", any(feature = "zstd", feature = "columnar")))]
+#[cfg(all(test, feature = "std"))]
 pub fn override_load_sampling_on_this_thread(sample: Option<bool>) {
     SAMPLING_OVERRIDE.with(|cell| cell.set(sample));
 }
@@ -756,7 +756,7 @@ where
     }
 
     /// The load-time estimates of every shard summed, for tests.
-    #[cfg(all(test, feature = "columnar"))]
+    #[cfg(test)]
     pub fn estimates_total(&self) -> u64 {
         self.shards
             .iter()

@@ -225,6 +225,9 @@ impl<'a> LevelStages<'a> {
                 // flight while it is opened, so the tables after it see the
                 // level as they would with its reads out; its reads are asked
                 // for the moment the file is back.
+                // Admitted: the stage's loads are claimed now, not when its
+                // blocks were found, so a deferred stage leads none.
+                read.claim_loads();
                 if entry.file.is_none() {
                     out.job(Job::Open {
                         tag: at,
