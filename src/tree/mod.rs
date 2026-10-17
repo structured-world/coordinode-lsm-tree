@@ -233,6 +233,10 @@ struct DriveSink<'a> {
     #[cfg(feature = "std")]
     wake: Arc<LevelWake>,
     jobs: Vec<read_job::Job>,
+    /// The cache of the first table a block was read for, which the waits
+    /// on the queues are timed into for the estimate that decides whether
+    /// misses share loads.
+    cache: Option<&'a crate::cache::Cache>,
 }
 
 impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
@@ -240,8 +244,17 @@ impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
         self.jobs.push(job);
     }
 
+    /// The blocking driver completes every read itself, on the calling
+    /// thread, and runs its jobs there too.
+    fn leads_loads(&self) -> bool {
+        crate::inflight::batches_may_lead()
+    }
+
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn read(&mut self, read: read_job::BlockRequest<'a>) {
+        if self.cache.is_none() {
+            self.cache = Some(&read.table.cache);
+        }
         let slot = if let Some(slot) = self
             .queues
             .iter()
@@ -4030,6 +4043,7 @@ impl Tree {
                 thread: std::thread::current(),
             }),
             jobs: Vec::new(),
+            cache: None,
         };
         // The jobs being run; those their results ask for collect in the
         // sink meanwhile.
@@ -4053,6 +4067,7 @@ impl Tree {
 
             // A block is handed to its read the moment it is back.
             let mut on_done = |done: crate::fs::ReadDone| level.read_done(done);
+            let cache = sink.cache;
             let queues = &mut sink.queues;
             #[cfg(feature = "std")]
             let wake = &sink.wake;
@@ -4085,11 +4100,11 @@ impl Tree {
             };
             let second = reading.next();
             if second.is_none() || must_wait(first) {
-                first.queue.wait(1, &mut on_done);
+                Self::timed_wait(first.queue.as_mut(), cache, &mut on_done);
                 continue;
             }
             if let Some(q) = second.into_iter().chain(reading).find(|q| must_wait(q)) {
-                q.queue.wait(1, &mut on_done);
+                Self::timed_wait(q.queue.as_mut(), cache, &mut on_done);
                 continue;
             }
             // Every queue still reading wakes the level, which only a queue
@@ -4104,6 +4119,27 @@ impl Tree {
                 wake.sleeping
                     .store(false, core::sync::atomic::Ordering::SeqCst);
             }
+        }
+    }
+
+    /// Waits on `queue` for at least one read, handing each to `on_done`,
+    /// and folds a sample of such waits into `cache`'s load-time estimate as
+    /// the wait's length shared among the reads it handed back: what each
+    /// read cost the storage, whether the queue reads them one after another
+    /// or overlaps them in flight.
+    fn timed_wait(
+        queue: &mut dyn crate::fs::ReadQueue,
+        cache: Option<&crate::cache::Cache>,
+        on_done: &mut dyn FnMut(crate::fs::ReadDone),
+    ) {
+        let timer = crate::cache::Cache::time_load();
+        let mut reads = 0usize;
+        queue.wait(1, &mut |done| {
+            reads += 1;
+            on_done(done);
+        });
+        if let Some(cache) = cache {
+            cache.record_batch_wait(timer, reads);
         }
     }
 
@@ -4209,19 +4245,21 @@ impl Tree {
     }
 
     /// Decodes the block of task `index` from `bytes`, keeping it in the cache
-    /// when it fits in `keep_room`, and point-reads its keys, adding each hit
-    /// to `hits` as `(task index, key index, entry)`.
+    /// when it fits in `keep_room` and handing it to the reads waiting on
+    /// `lead`, and point-reads its keys, adding each hit to `hits` as
+    /// `(task index, key index, entry)`.
     fn resolve_block_task<K: AsRef<[u8]>>(
         task: &BlockTask<'_>,
         index: usize,
         bytes: &[u8],
         keep_room: &mut u64,
+        lead: Option<crate::cache::BlockLead>,
         keys: &[K],
         hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
         let block = task
             .table
-            .decode_data_block_keeping(bytes, &task.handle, keep_room)?;
+            .decode_data_block_keeping(bytes, &task.handle, keep_room, lead)?;
         Self::read_task_keys(task, index, &block, keys, hits)
     }
 

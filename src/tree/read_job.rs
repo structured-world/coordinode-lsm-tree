@@ -237,6 +237,14 @@ pub(super) trait ReadSink<'a> {
 
     /// Takes a block read the read asks for.
     fn read(&mut self, read: BlockRequest<'a>);
+
+    /// Whether the read may lead the cold loads of the blocks it asks for,
+    /// so a point read missing one meanwhile waits for it. Only a driver that
+    /// completes the reads it is handed on its own, on one thread, may: a read
+    /// a caller resumes at will could hold a lead for as long as it likes.
+    fn leads_loads(&self) -> bool {
+        false
+    }
 }
 
 /// What a read asks for, kept until its driver takes it: jobs, then reads.

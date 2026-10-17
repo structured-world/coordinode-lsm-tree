@@ -164,11 +164,12 @@ impl<'a> LevelStages<'a> {
                     self.deferred = true;
                     continue;
                 }
-                entry.read = match StagedRead::start(entry.table, keys, self.seqno) {
-                    StagedStart::Nothing => LevelRead::Nothing,
-                    StagedStart::Serial => LevelRead::Serial,
-                    StagedStart::Staged(read) => LevelRead::Staged(read),
-                };
+                entry.read =
+                    match StagedRead::start(entry.table, keys, self.seqno, out.leads_loads()) {
+                        StagedStart::Nothing => LevelRead::Nothing,
+                        StagedStart::Serial => LevelRead::Serial,
+                        StagedStart::Staged(read) => LevelRead::Staged(read),
+                    };
             }
             // Whether the table's next stage is to be read through the file it
             // holds.
@@ -224,6 +225,16 @@ impl<'a> LevelStages<'a> {
                 // flight while it is opened, so the tables after it see the
                 // level as they would with its reads out; its reads are asked
                 // for the moment the file is back.
+                // Admitted: the blocks other reads cached while the stage
+                // waited are held, and the loads of the rest are claimed now,
+                // not when they were found, so a deferred stage leads none.
+                read.take_cached();
+                let (_, need) = read.need();
+                if need.is_empty() {
+                    continue;
+                }
+                let asked_bytes: u64 = need.iter().map(|handle| u64::from(handle.size())).sum();
+                read.claim_loads();
                 if entry.file.is_none() {
                     out.job(Job::Open {
                         tag: at,
