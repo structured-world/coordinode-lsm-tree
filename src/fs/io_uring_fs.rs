@@ -454,6 +454,32 @@ impl Fs for IoUringFs {
         // not the I/O submission path.
         super::StdFs.volume_id(path)
     }
+
+    // The file system's capabilities, and the operations they gate, are the
+    // mount's and go through the same syscalls as on `StdFs`; the ring has no
+    // opcode for any of them. `sync_directory_with`, `sync_device` and the
+    // files' `sync_*_with` keep the trait defaults: on Linux every `SyncMode`
+    // is the same `fsync` / `fdatasync`, which these handles issue on the ring.
+
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        super::StdFs.capabilities(path)
+    }
+
+    fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
+        super::StdFs.try_disable_cow(path)
+    }
+
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        super::StdFs.punch_hole(path, offset, len)
+    }
+
+    fn reflink_file(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
+        super::StdFs.reflink_file(src, dst)
+    }
+
+    fn hard_link_count(&self, path: &Path) -> crate::io::Result<u64> {
+        super::StdFs.hard_link_count(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +596,11 @@ impl FsFile for IoUringFile {
 
     fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
         FsFile::set_write_lifetime(&self.file, lifetime)
+    }
+
+    fn hint(&self, hint: super::FileHint) -> crate::io::Result<()> {
+        // `posix_fadvise` on the descriptor the ring reads through.
+        FsFile::hint(&self.file, hint)
     }
 
     fn lock_exclusive(&self) -> crate::io::Result<()> {

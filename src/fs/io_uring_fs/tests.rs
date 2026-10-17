@@ -2415,3 +2415,247 @@ fn dropping_a_read_queue_with_reads_in_flight_leaves_the_backend_usable() -> io:
     assert_eq!(buf.to_vec(), expected_bytes(1, 64, 64));
     Ok(())
 }
+
+/// Writes `len` bytes of `byte` to a new file at `path` through `fs`.
+fn write_file(fs: &IoUringFs, path: &Path, byte: u8, len: usize) -> io::Result<()> {
+    let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+    file.write_all(&vec![byte; len])?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// A directory reports the same capabilities through `IoUringFs` as through
+/// `StdFs`: both reach the same kernel files, and every path that adapts to
+/// the file system (tight-space reclaim, prefix punches, reflinked
+/// checkpoints) asks the capabilities first.
+#[test]
+fn capabilities_match_the_std_backend() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    assert_eq!(
+        fs.capabilities(dir.path()),
+        crate::fs::StdFs.capabilities(dir.path())
+    );
+    Ok(())
+}
+
+/// A hole punched through `IoUringFs` frees the range: it reads back as
+/// zeros, the file keeps its length, and the range holds a hole.
+#[test]
+fn a_hole_punched_through_io_uring_lands() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    if !crate::fs::StdFs.capabilities(dir.path()).punch_hole {
+        eprintln!("skipping: the temporary directory's file system cannot punch holes");
+        return Ok(());
+    }
+    let path = dir.path().join("punched");
+    write_file(&fs, &path, 0xAB, 1 << 20)?;
+    fs.punch_hole(&path, 0, 512 * 1024)?;
+
+    assert_eq!(fs.extent_contains_hole(&path, 0, 512 * 1024)?, Some(true));
+    assert_eq!(fs.metadata(&path)?.len, 1 << 20, "the length is kept");
+    let file = fs.open(&path, &FsOpenOptions::new().read(true))?;
+    let mut head = [0xFFu8; 64];
+    assert_eq!(file.read_at(&mut head, 0)?, 64);
+    assert_eq!(head, [0u8; 64], "the punched range reads as zeros");
+    let mut tail = [0u8; 64];
+    assert_eq!(file.read_at(&mut tail, 512 * 1024)?, 64);
+    assert_eq!(tail, [0xABu8; 64], "the rest is untouched");
+    Ok(())
+}
+
+/// The link count of a path reads through `IoUringFs`, so a reclaim can tell
+/// a file a checkpoint shares from one it may truncate.
+#[test]
+fn the_link_count_of_a_path_reads_through_io_uring() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (path, link) = (dir.path().join("table"), dir.path().join("link"));
+    write_file(&fs, &path, 1, 4_096)?;
+    assert_eq!(Fs::hard_link_count(&fs, &path)?, 1);
+    fs.hard_link(&path, &link)?;
+    assert_eq!(Fs::hard_link_count(&fs, &path)?, 2);
+    Ok(())
+}
+
+/// A file of `blocks` 64-byte blocks, byte `i` holding `i % 251`, opened for
+/// reading through `fault` over the ring.
+fn faulted_file(
+    fs: &IoUringFs,
+    fault: &crate::fs::FaultFs<IoUringFs>,
+    path: &Path,
+    blocks: usize,
+) -> io::Result<Arc<dyn FsFile>> {
+    let bytes: Vec<u8> = (0..blocks * 64)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    let mut file = fs.open(path, &FsOpenOptions::new().write(true).create(true))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(Arc::from(
+        fault.open(path, &FsOpenOptions::new().read(true))?,
+    ))
+}
+
+/// The bytes of block `block` of a [`faulted_file`].
+fn faulted_block(block: usize) -> Vec<u8> {
+    (block * 64..(block + 1) * 64)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect()
+}
+
+/// Reads through a `FaultFs` over the ring go to the ring's queue together,
+/// not one blocking read each, and a read rule still fires on the read it
+/// names, the others unharmed.
+#[test]
+fn a_fault_rule_fires_on_reads_through_the_wrapped_ring_queue() -> io::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let fault = FaultFs::new(fs.clone());
+    let dir = tempfile::tempdir()?;
+    let file = faulted_file(&fs, &fault, &dir.path().join("queued"), 8)?;
+    fault.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("queued")
+            .at_offset(3 * 64)
+            .once(),
+    );
+
+    let channels = fs
+        .inner
+        .counts
+        .channels
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let mut done: Vec<(usize, Vec<u8>, Option<crate::io::ErrorKind>)> = Vec::new();
+    {
+        let mut queue = fault.read_queue();
+        for tag in 0..8 {
+            queue.submit(QueuedRead {
+                tag,
+                file: Arc::clone(&file),
+                offset: (tag * 64) as u64,
+                buf: vec![0; 64],
+            });
+        }
+        queue.wait(8, &mut |read| {
+            done.push((read.tag, read.buf, read.result.err().map(|e| e.kind())));
+        });
+    }
+    assert_eq!(
+        fs.inner
+            .counts
+            .channels
+            .load(core::sync::atomic::Ordering::Relaxed)
+            - channels,
+        0,
+        "no read took a blocking channel of its own"
+    );
+    done.sort_by_key(|(tag, ..)| *tag);
+    assert_eq!(done.len(), 8);
+    for (tag, buf, error) in done {
+        if tag == 3 {
+            assert_eq!(error, Some(crate::io::ErrorKind::Other), "the rule fired");
+        } else {
+            assert_eq!(error, None, "read {tag}");
+            assert_eq!(buf, faulted_block(tag), "read {tag}");
+        }
+    }
+    assert_eq!(fault.injector().read_count(), 8, "every read was seen");
+    Ok(())
+}
+
+/// A batched read through a `FaultFs` over the ring is one batch of the
+/// ring, and a read rule on one of its blocks fails the batch with that
+/// block's error after the blocks before it were read.
+#[test]
+fn a_fault_rule_fires_on_a_batched_read_through_the_wrapped_ring() -> io::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let fault = FaultFs::new(fs.clone());
+    let dir = tempfile::tempdir()?;
+    let file = faulted_file(&fs, &fault, &dir.path().join("batched"), 8)?;
+    /// A read of each 64-byte block of `file` into its buffer.
+    fn block_reads<'a>(
+        file: &'a dyn FsFile,
+        buffers: &'a mut [[u8; 64]],
+    ) -> Vec<crate::fs::BlockRead<'a>> {
+        buffers
+            .iter_mut()
+            .enumerate()
+            .map(|(i, buf)| crate::fs::BlockRead {
+                file,
+                offset: (i * 64) as u64,
+                buf: crate::fs::BlockBuf::new(buf),
+            })
+            .collect()
+    }
+    let mut buffers = vec![[0u8; 64]; 8];
+
+    let channels = fs
+        .inner
+        .counts
+        .channels
+        .load(core::sync::atomic::Ordering::Relaxed);
+    fault.read_blocks_batched(&mut block_reads(file.as_ref(), &mut buffers))?;
+    assert_eq!(
+        fs.inner
+            .counts
+            .channels
+            .load(core::sync::atomic::Ordering::Relaxed)
+            - channels,
+        1,
+        "one batch of the ring"
+    );
+    for (i, buf) in buffers.iter().enumerate() {
+        assert_eq!(buf.to_vec(), faulted_block(i), "block {i}");
+    }
+
+    fault.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("batched")
+            .at_offset(5 * 64)
+            .once(),
+    );
+    let mut fresh = vec![[0u8; 64]; 8];
+    let mut batch = block_reads(file.as_ref(), &mut fresh);
+    let error = fault
+        .read_blocks_batched(&mut batch)
+        .expect_err("the rule fails the batch");
+    assert_eq!(error.kind(), crate::io::ErrorKind::Other);
+    assert!(
+        batch.iter().take(5).all(|req| req.buf.is_full()),
+        "the blocks before the failing one were read"
+    );
+    Ok(())
+}
+
+/// A file cloned through `IoUringFs` holds the source's bytes in an inode of
+/// its own, not a second name of the source.
+#[test]
+fn a_file_cloned_through_io_uring_is_independent() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let dir = tempfile::tempdir()?;
+    let (source, clone) = (dir.path().join("source"), dir.path().join("clone"));
+    write_file(&fs, &source, 7, 64 * 1024)?;
+    fs.reflink_file(&source, &clone)?;
+
+    let clone_file = fs.open(&clone, &FsOpenOptions::new().read(true).write(true))?;
+    let mut bytes = vec![0u8; 64 * 1024];
+    assert_eq!(clone_file.read_at(&mut bytes, 0)?, bytes.len());
+    assert!(bytes.iter().all(|&b| b == 7), "the clone holds the source");
+    assert_eq!(Fs::hard_link_count(&fs, &clone)?, 1, "an inode of its own");
+    Ok(())
+}
