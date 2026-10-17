@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792169679153,
+  "lastUpdate": 1792279731252,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -47558,6 +47558,90 @@ window.BENCHMARK_DATA = {
             "value": 354323.0555624117,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.6us | P99.9: 82.9us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc64719d71ab2511b273466bc7004c6c1887c272",
+          "message": "perf(cache): coalesce concurrent cold reads and decode (#923)\n\n## Summary\n\n- Readers that miss the cache for the same block, separated value,\ncolumn row group directory or column page at once share one read and one\ndecode instead of each doing it, once cold loads are measured slow\nenough for waiting to pay.\n- Growth of a partially decoded zstd prefix is serialized per block and\nnever shrinks a longer cached prefix; a bounded range takes a full load\nof the block already in flight instead of reading the frame again.\n- Cache hits are untouched: no registry lookup, no allocation.\n\nReplaces #922 (same change, history squashed).\n\n## Changes\n\n- `inflight`: a bounded, sharded registry of loads in flight. The first\nmiss of an object leads its load; a concurrent miss with the same\nidentity (role, on-disk length, codec, encryption; for a blob also its\nkey and size) waits for it. A lead that fails or unwinds releases its\nwaiters to load on their own, so an error is never shared or remembered.\nWaiters spin briefly, then park on the ticket's address and are woken\ntogether; tickets are reused, so an uncontended miss allocates nothing.\n- Sharing is adaptive. The cache times about one cold load in sixteen\nper thread, picked at random so no periodic workload falls in step with\nit (point loads, blob reads, partial-prefix growths, column directory\nand page reads, and the blocking multi-get driver's waits on its read\nqueues, shared among the reads each wait returned), into a smoothed\nper-shard estimate. A miss coordinates only while that estimate is at\nleast `Cache::with_load_coalescing_after` (default 64 µs, above\npage-cache loads, below a read that reaches a device or the network);\notherwise it loads alone after one atomic read. `Duration::ZERO` shares\nevery load, `Duration::MAX` none. Without `std` there is no clock, so\nonly `ZERO` shares. Reads that must leave no trace (verification,\npatrol, reclaim) and reads paced by a rate budget, which may wait on it\nmid-read, lead no load and feed no estimate.\n- Wired into the SST block loader, the blob accessor, partial-prefix\ngrowth, column row group directory and page reads (a read handed a\ndirectory by a coordinated load coordinates its pages too; a lead takes\na page cached since its lookup instead of reading it, and a page whose\nbytes the read already holds is not claimed), and the multi-get: batched\nleads never wait on another load, a read the caller resumes leads none,\na staged read claims the loads of a stage only when the level hands it\nout and holds what other reads cached meanwhile, and a point read that\ntakes a block from a multi-get caches it when the multi-get had no room\nto.\n- `insert_partial_block` keeps the longer of two concurrently recorded\nprefixes.\n- Metrics `block_load_shared_count` and `blob_load_shared_count`.\n- structured-zstd updated to 0.2.2.\n\n## Testing\n\nfmt, clippy (all features and default), the full nextest suite in both\nconfigurations, doc tests, docs, the no-std check, `tools/sst-dump`, the\nbench tests and the 5.x converter pass on Linux. New tests drive\nsimultaneous cold reads through a held read and show one backing read\nper block, blob and column group, failure release, independent blocks,\nprefix growth in both completion orders, a bounded range sharing a full\nload, multi-get and staged leads, load timing per kind, and multi-gets\nreading through the `io_uring` ring's own queue against point reads of\nthe same keys.\n\nMeasured on the concurrent cold/hot read stand against `main` (bench\nprofile, medians of five or more interleaved rounds). On a device\nserving one 20 µs read at a time, eight threads reading the same keys:\npoint reads 53k to 87k ops/s, P99 2.7 ms to 0.46 ms; blob reads 10.6k to\nabout 50k; column scans 6.2k to 17.9k, P99 5.1 ms to 2.1 ms; columnar\npoint reads of 1 MiB row groups 9.6k to 21.9k, P99 4.0 ms to 0.9 ms.\nDifferent keys on that device, and every page-cache and cache-hit\nworkload, stay at `main`'s throughput within noise.\n\nCloses #874",
+          "timestamp": "2026-10-18T02:06:14+03:00",
+          "tree_id": "4534fdeeb9109f3e9a11002fad650ee77a61ece1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bc64719d71ab2511b273466bc7004c6c1887c272"
+        },
+        "date": 1792279729797,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 75007.83294352311,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.8us | P99.9: 30.0us\nthreads: 1 | elapsed: 7.14s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2199710.095807053,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 640690.633750032,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.1us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 459894.7506488718,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.8us | P99.9: 20.9us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2362623.5133796963,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.8us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 247151.4946833271,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 8.5us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 128076.06849600612,
+            "unit": "ops/sec",
+            "extra": "P50: 6.3us | P99: 26.0us | P99.9: 39.4us\nthreads: 1 | elapsed: 1.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 670732.2183414066,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.0us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 728949.860652669,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 309998.6778246392,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.1us | P99.9: 95.7us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
