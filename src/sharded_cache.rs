@@ -166,6 +166,14 @@ where
         Some(slot.value.clone())
     }
 
+    /// The resident value for `key`, by reference.
+    #[cfg(feature = "zstd")]
+    fn find(&self, hash: u64, key: &K) -> Option<&V> {
+        self.map
+            .find(hash, |(k, _)| k == key)
+            .map(|(_, slot)| &slot.value)
+    }
+
     /// Read without promotion: returns the value (cloned) without touching the
     /// frequency counter. Used by readers that inspect an entry without
     /// counting it as a hit: the partial-decode tier and monitoring reports.
@@ -524,6 +532,25 @@ where
         }
         let (h, shard) = self.locate(&key);
         shard.write().insert(h, key, value, weight, priority);
+    }
+
+    /// Inserts the value `merge` derives from what `key` holds now, read and
+    /// replaced under one write lock, so a concurrent writer of the key cannot
+    /// slip between the two. `merge` returning `None` leaves the entry as it
+    /// is; a derived value heavier than a shard is refused, as by
+    /// [`Self::insert_with_priority`].
+    #[cfg(feature = "zstd")]
+    pub fn insert_merged(&self, key: K, merge: impl FnOnce(Option<&V>) -> Option<V>) {
+        let (h, shard) = self.locate(&key);
+        let mut core = shard.write();
+        let Some(value) = merge(core.find(h, &key)) else {
+            return;
+        };
+        let weight = self.weighter.weight(&key, &value);
+        if weight > self.per_shard_capacity {
+            return;
+        }
+        core.insert(h, key, value, weight, Priority::Normal);
     }
 
     /// Removes `key` if present.

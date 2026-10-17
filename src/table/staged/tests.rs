@@ -39,7 +39,7 @@ fn a_read_holds_its_blocks_at_their_decoded_size() {
     );
     let keys = batch();
     let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
-    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX) else {
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX, true) else {
         panic!("an unpinned table is staged");
     };
     let file = std::fs::read(&*table.path).expect("table file");
@@ -73,6 +73,125 @@ fn a_read_holds_its_blocks_at_their_decoded_size() {
     assert!(
         decoded > read_as,
         "the compressed index ({read_as} bytes read) is held decoded ({decoded} bytes)"
+    );
+}
+
+/// A staged read claims the loads of its stage's blocks only once the stage
+/// is handed out: a stage the level defers under its budget holds no load a
+/// point read missing the same block would wait on.
+#[test]
+fn a_staged_read_claims_its_loads_only_when_its_stage_is_handed_out() {
+    let dir = tempdir().expect("tempdir");
+    let table = table_with(
+        dir.path(),
+        |w| w,
+        false,
+        false,
+        1_000_000,
+        |params| {
+            params.cache = Arc::new(
+                Cache::with_capacity_bytes(1_000_000)
+                    .with_load_coalescing_after(core::time::Duration::ZERO),
+            );
+        },
+    );
+    let keys = batch();
+    let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX, true) else {
+        panic!("an unpinned table is staged");
+    };
+    let needed = read.need().1.len();
+    assert!(needed > 0, "the cold filter is needed");
+    assert_eq!(
+        table.cache.loads_in_flight(),
+        0,
+        "a stage not handed out leads no load"
+    );
+    read.claim_loads();
+    assert_eq!(table.cache.loads_in_flight(), needed);
+    read.claim_loads();
+    assert_eq!(table.cache.loads_in_flight(), needed, "claimed once");
+}
+
+/// A block another read caches while a stage waits is held when the stage is
+/// handed out instead of read again, and a load the stage already led for it
+/// is closed, so nothing waits on a read that is never issued.
+#[test]
+fn a_stage_takes_blocks_cached_while_it_waited() {
+    let dir = tempdir().expect("tempdir");
+    let table = table_with(
+        dir.path(),
+        |w| w,
+        false,
+        false,
+        1_000_000,
+        |params| {
+            params.cache = Arc::new(
+                Cache::with_capacity_bytes(1_000_000)
+                    .with_load_coalescing_after(core::time::Duration::ZERO),
+            );
+        },
+    );
+    let keys = batch();
+    let keys: Vec<(&[u8], u64)> = keys.iter().map(|(k, h)| (k.as_slice(), *h)).collect();
+    let StagedStart::Staged(mut read) = StagedRead::start(&table, &keys, SeqNo::MAX, true) else {
+        panic!("an unpinned table is staged");
+    };
+    read.claim_loads();
+    let (block_type, need) = read.need();
+    let need: Vec<BlockHandle> = need.to_vec();
+    assert!(!need.is_empty(), "the cold filter is needed");
+    // Another read caches every needed block meanwhile.
+    let file = std::fs::read(&*table.path).expect("table file");
+    for handle in &need {
+        let start = usize::try_from(*handle.offset()).expect("offset fits");
+        let bytes = file
+            .get(start..)
+            .and_then(|rest| rest.get(..handle.size() as usize))
+            .expect("the block lies in the table file");
+        let block = table
+            .decode_block_from_bytes(bytes, *handle.offset(), block_type)
+            .expect("decode");
+        table
+            .cache
+            .insert_block(table.global_id(), handle.offset(), block);
+    }
+    read.take_cached();
+    assert!(read.need().1.is_empty(), "nothing is left to read");
+    assert!(read.held_bytes() > 0, "the cached blocks are held");
+    assert_eq!(table.cache.loads_in_flight(), 0, "the led loads are closed");
+}
+
+/// A read that must leave no trace feeds no load-time estimate, while a read
+/// of the same blocks that may touch the cache does: an untraced scan's slow
+/// loads would otherwise switch on waiting for the reads after it.
+#[test]
+fn an_untraced_load_feeds_no_estimate() {
+    let dir = tempdir().expect("tempdir");
+    let table = table(dir.path(), |w| w, false, false, 1_000_000);
+    let walk = |untraced: bool| {
+        let table = table.clone();
+        std::thread::spawn(move || {
+            crate::inflight::override_load_sampling_on_this_thread(Some(true));
+            if untraced {
+                table.untraced_index_walk().count()
+            } else {
+                table.maintenance_index_walk().count()
+            }
+        })
+        .join()
+        .expect("walker")
+    };
+    assert!(walk(true) > 0, "the index has entries");
+    assert_eq!(
+        table.cache.load_estimates_total(),
+        0,
+        "untraced loads are not timed"
+    );
+    walk(false);
+    assert!(
+        table.cache.load_estimates_total() > 0,
+        "a read that touches the cache is timed"
     );
 }
 
@@ -131,7 +250,7 @@ fn table_with(
 /// block it asks for from the table file, and returns the plan and what it
 /// asked for.
 fn drive(table: &Table, keys: &[(&[u8], u64)]) -> Option<Driven> {
-    let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX) else {
+    let StagedStart::Staged(mut read) = StagedRead::start(table, keys, SeqNo::MAX, true) else {
         return None;
     };
     let file = std::fs::read(&*table.path).expect("table file");
@@ -589,7 +708,7 @@ fn a_snapshot_below_the_global_seqno_reads_nothing() {
         },
     );
     assert!(matches!(
-        StagedRead::start(&table, &keys, 50),
+        StagedRead::start(&table, &keys, 50, true),
         StagedStart::Nothing
     ));
 }
@@ -603,11 +722,11 @@ fn a_staged_read_starts_only_where_it_can_answer() {
     let dir = tempdir().expect("dir");
     let table = table(dir.path(), |w| w, false, false, 1_000_000);
     assert!(matches!(
-        StagedRead::start(&table, &keys, 1),
+        StagedRead::start(&table, &keys, 1, true),
         StagedStart::Nothing
     ));
     assert!(matches!(
-        StagedRead::start(&table, &[], SeqNo::MAX),
+        StagedRead::start(&table, &[], SeqNo::MAX, true),
         StagedStart::Nothing
     ));
 }

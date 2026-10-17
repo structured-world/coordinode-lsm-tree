@@ -34,6 +34,15 @@ pub struct Metrics {
     /// Number of blocks that were read from block cache
     pub(crate) data_block_load_cached: AtomicUsize,
 
+    /// Block misses served by another read's concurrent load of the same
+    /// block, waited for instead of read again: neither a cache hit nor a
+    /// read of the file.
+    pub(crate) block_load_shared: AtomicUsize,
+
+    /// Separated-value misses served by another read's concurrent load of
+    /// the same record, on the same terms as `block_load_shared`.
+    pub(crate) blob_load_shared: AtomicUsize,
+
     /// Number of range tombstone blocks that were actually read from disk
     pub(crate) range_tombstone_block_load_io: AtomicUsize,
 
@@ -378,6 +387,19 @@ impl Metrics {
     /// across interleaved files need a request per file per stretch.
     pub fn blob_read_count(&self) -> usize {
         self.blob_read_io.load(Relaxed)
+    }
+
+    /// Block misses that waited for another read's load of the same block
+    /// and took its result, so the block was read and decoded once for both.
+    /// Counted apart from cache hits and from file reads.
+    pub fn block_load_shared_count(&self) -> usize {
+        self.block_load_shared.load(Relaxed)
+    }
+
+    /// Separated-value misses served by another read's concurrent load of the
+    /// same record, on the same terms as [`Self::block_load_shared_count`].
+    pub fn blob_load_shared_count(&self) -> usize {
+        self.blob_load_shared.load(Relaxed)
     }
 
     /// The share of [`Self::blob_bytes_read`] read ahead: the coalesced spans

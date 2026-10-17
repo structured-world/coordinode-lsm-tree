@@ -36,6 +36,9 @@ pub(super) struct ChunkRead<'k, K> {
     files: Vec<(TableId, Option<Arc<dyn FsFile>>)>,
     /// `(task index, key index, entry)` for every key found so far.
     hits: Vec<(usize, usize, InternalValue)>,
+    /// The loads this chunk leads, by task index: published as each block is
+    /// decoded, given up if the chunk ends before that.
+    leads: Vec<(usize, crate::cache::BlockLead<'k>)>,
     /// The lowest task whose block failed to decode, and why: held rather than
     /// returned, so reads still in flight are not abandoned, and the lowest
     /// wins as a decode in task order would.
@@ -59,7 +62,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
     /// of its table can have (refused before its buffer is allocated). A chunk
     /// that fails has asked for nothing.
     pub(super) fn start<'s>(
-        chunk: &[BlockTask<'_>],
+        chunk: &[BlockTask<'k>],
         cached: &[TaskBlock],
         keys: &'k [K],
         carried: &mut Option<ChunkFile>,
@@ -70,15 +73,28 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             fills: Vec::new(),
             files: Vec::new(),
             hits: Vec::new(),
+            leads: Vec::new(),
             decode_failure: None,
         };
         // Whatever can fail comes first, so a failed chunk hands out no job.
+        // The blocks to read are claimed, so a point read missing one of them
+        // meanwhile waits for this chunk instead of reading it again.
+        let lead = out.leads_loads();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
             match block {
                 TaskBlock::Held(block) => {
                     Tree::read_task_keys(task, index, block, keys, &mut read.hits)?;
                 }
-                TaskBlock::Read => task.table.check_block_size(&task.handle)?,
+                TaskBlock::Read => {
+                    task.table.check_block_size(&task.handle)?;
+                    if let Some(lead) = task.table.claim_batched_block(
+                        &task.handle,
+                        crate::table::block::BlockType::Data,
+                        lead,
+                    ) {
+                        read.leads.push((index, lead));
+                    }
+                }
                 TaskBlock::Load => {}
             }
         }
@@ -218,12 +234,23 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         let Some(task) = chunk.get(index) else {
             return;
         };
-        if let Err(e) =
-            Tree::resolve_block_task(task, index, bytes, keep_room, self.keys, &mut self.hits)
-            && self
-                .decode_failure
-                .as_ref()
-                .is_none_or(|(held, _)| index < *held)
+        let lead = self
+            .leads
+            .iter()
+            .position(|(at, _)| *at == index)
+            .map(|at| self.leads.swap_remove(at).1);
+        if let Err(e) = Tree::resolve_block_task(
+            task,
+            index,
+            bytes,
+            keep_room,
+            lead,
+            self.keys,
+            &mut self.hits,
+        ) && self
+            .decode_failure
+            .as_ref()
+            .is_none_or(|(held, _)| index < *held)
         {
             self.decode_failure = Some((index, e));
         }
