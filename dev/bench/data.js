@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792279736224,
+  "lastUpdate": 1792279740092,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -49924,6 +49924,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.608174025,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc64719d71ab2511b273466bc7004c6c1887c272",
+          "message": "perf(cache): coalesce concurrent cold reads and decode (#923)\n\n## Summary\n\n- Readers that miss the cache for the same block, separated value,\ncolumn row group directory or column page at once share one read and one\ndecode instead of each doing it, once cold loads are measured slow\nenough for waiting to pay.\n- Growth of a partially decoded zstd prefix is serialized per block and\nnever shrinks a longer cached prefix; a bounded range takes a full load\nof the block already in flight instead of reading the frame again.\n- Cache hits are untouched: no registry lookup, no allocation.\n\nReplaces #922 (same change, history squashed).\n\n## Changes\n\n- `inflight`: a bounded, sharded registry of loads in flight. The first\nmiss of an object leads its load; a concurrent miss with the same\nidentity (role, on-disk length, codec, encryption; for a blob also its\nkey and size) waits for it. A lead that fails or unwinds releases its\nwaiters to load on their own, so an error is never shared or remembered.\nWaiters spin briefly, then park on the ticket's address and are woken\ntogether; tickets are reused, so an uncontended miss allocates nothing.\n- Sharing is adaptive. The cache times about one cold load in sixteen\nper thread, picked at random so no periodic workload falls in step with\nit (point loads, blob reads, partial-prefix growths, column directory\nand page reads, and the blocking multi-get driver's waits on its read\nqueues, shared among the reads each wait returned), into a smoothed\nper-shard estimate. A miss coordinates only while that estimate is at\nleast `Cache::with_load_coalescing_after` (default 64 µs, above\npage-cache loads, below a read that reaches a device or the network);\notherwise it loads alone after one atomic read. `Duration::ZERO` shares\nevery load, `Duration::MAX` none. Without `std` there is no clock, so\nonly `ZERO` shares. Reads that must leave no trace (verification,\npatrol, reclaim) and reads paced by a rate budget, which may wait on it\nmid-read, lead no load and feed no estimate.\n- Wired into the SST block loader, the blob accessor, partial-prefix\ngrowth, column row group directory and page reads (a read handed a\ndirectory by a coordinated load coordinates its pages too; a lead takes\na page cached since its lookup instead of reading it, and a page whose\nbytes the read already holds is not claimed), and the multi-get: batched\nleads never wait on another load, a read the caller resumes leads none,\na staged read claims the loads of a stage only when the level hands it\nout and holds what other reads cached meanwhile, and a point read that\ntakes a block from a multi-get caches it when the multi-get had no room\nto.\n- `insert_partial_block` keeps the longer of two concurrently recorded\nprefixes.\n- Metrics `block_load_shared_count` and `blob_load_shared_count`.\n- structured-zstd updated to 0.2.2.\n\n## Testing\n\nfmt, clippy (all features and default), the full nextest suite in both\nconfigurations, doc tests, docs, the no-std check, `tools/sst-dump`, the\nbench tests and the 5.x converter pass on Linux. New tests drive\nsimultaneous cold reads through a held read and show one backing read\nper block, blob and column group, failure release, independent blocks,\nprefix growth in both completion orders, a bounded range sharing a full\nload, multi-get and staged leads, load timing per kind, and multi-gets\nreading through the `io_uring` ring's own queue against point reads of\nthe same keys.\n\nMeasured on the concurrent cold/hot read stand against `main` (bench\nprofile, medians of five or more interleaved rounds). On a device\nserving one 20 µs read at a time, eight threads reading the same keys:\npoint reads 53k to 87k ops/s, P99 2.7 ms to 0.46 ms; blob reads 10.6k to\nabout 50k; column scans 6.2k to 17.9k, P99 5.1 ms to 2.1 ms; columnar\npoint reads of 1 MiB row groups 9.6k to 21.9k, P99 4.0 ms to 0.9 ms.\nDifferent keys on that device, and every page-cache and cache-hit\nworkload, stay at `main`'s throughput within noise.\n\nCloses #874",
+          "timestamp": "2026-10-18T02:06:14+03:00",
+          "tree_id": "4534fdeeb9109f3e9a11002fad650ee77a61ece1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/bc64719d71ab2511b273466bc7004c6c1887c272"
+        },
+        "date": 1792279738930,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 527.948,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.849521ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 137.455,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.809124ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 455.613,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.705223ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5174.184,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 10680.107,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.559,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 87.490559,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.63127355,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.023,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 79.626239,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.629215097,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
