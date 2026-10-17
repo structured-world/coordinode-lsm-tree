@@ -915,7 +915,9 @@ impl GroupRead<'_> {
             }
             // The pages read from disk here, read and decoded, timed into
             // the shards their own loads coordinate in.
-            let group_at = *self.group.offset();
+            let pages_from = *self.group.offset()
+                + u64::from(directory_len)
+                + u64::from(directory.pages_start());
             self.cache.record_block_loads(
                 self.table_id,
                 batch
@@ -924,7 +926,7 @@ impl GroupRead<'_> {
                     .filter(|&(_, &(start, _))| start >= front.len())
                     .flat_map(|(run, _)| run.clone())
                     .filter_map(|slot| pages.get(slot).and_then(|s| entries.get(s.index)))
-                    .map(|entry| BlockOffset(group_at + page_at(entry) as u64)),
+                    .map(|entry| BlockOffset(pages_from + u64::from(entry.offset))),
                 timer,
             );
         }
@@ -957,9 +959,10 @@ impl GroupRead<'_> {
             let Some(entry) = entries.get(slot.index).filter(|_| slot.block.is_none()) else {
                 continue;
             };
+            let offset = BlockOffset(pages_at + u64::from(entry.offset));
             let claim = self.cache.claim_page(
                 self.table_id,
-                BlockOffset(pages_at + u64::from(entry.offset)),
+                offset,
                 crate::cache::LoadIdentity::Block {
                     block_type: BlockType::ColumnPage,
                     size: entry.length,
@@ -978,7 +981,20 @@ impl GroupRead<'_> {
                     }
                     slot.block = Some(page);
                 }
-                crate::cache::BlockClaim::Lead(lead) => leads.push((at, lead)),
+                // A load that finished between the cache lookup before these
+                // claims and this one left the page cached: hand that to the
+                // reads waiting on this lead rather than reading it again. A
+                // cached block of another type is left to the read, which
+                // refuses it.
+                crate::cache::BlockClaim::Lead(lead) => {
+                    match self.cache.get_block(self.table_id, offset) {
+                        Some(page) if page.header.block_type == BlockType::ColumnPage => {
+                            lead.publish(&page);
+                            slot.block = Some(page);
+                        }
+                        _ => leads.push((at, lead)),
+                    }
+                }
                 crate::cache::BlockClaim::Alone => {}
             }
         }
