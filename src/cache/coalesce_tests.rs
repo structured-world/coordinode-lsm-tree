@@ -567,6 +567,136 @@ fn concurrent_partial_growth_is_serialized_in_either_order() -> crate::Result<()
     Ok(())
 }
 
+/// A read waiting on a prefix growth that ends by promoting the block to a
+/// full load does not grow a prefix of its own: it takes the full block from
+/// the promoting read's load instead of reading the frame again.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_read_waiting_on_a_growth_that_promotes_shares_the_full_load() -> crate::Result<()> {
+    // Wide enough to decode most of the block, which promotes it.
+    const WIDE: u64 = 19_500;
+    const NARROW: u64 = 30;
+    let folder = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let (table, path, offset) = partial_table(folder.path(), fs)?;
+    let cache = Arc::clone(&table.cache);
+
+    // The first read (the wide range's frame) is held until the narrow range
+    // waits on its growth; the second (its full load after promoting) until a
+    // read waits on that load, or ten seconds pass.
+    let entered = Arc::new(Barrier::new(2));
+    let reads = Arc::new(AtomicUsize::new(0));
+    {
+        let (entered, reads, cache) =
+            (Arc::clone(&entered), Arc::clone(&reads), Arc::clone(&cache));
+        injector.hook_read_at(
+            path,
+            *offset,
+            Arc::new(move || {
+                let n = reads.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    entered.wait();
+                }
+                if n <= 1 {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while cache.load_waiters() < 1 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+            }),
+        );
+    }
+    let wide = {
+        let table = table.clone();
+        std::thread::spawn(move || keys_below(&table, WIDE))
+    };
+    entered.wait();
+    let narrow = std::thread::spawn(move || keys_below(&table, NARROW));
+    assert_eq!(narrow.join().expect("reader")?, expected_below(NARROW));
+    assert_eq!(wide.join().expect("reader")?, expected_below(WIDE));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        2,
+        "the wide read's frame and its full load, and nothing for the narrow one"
+    );
+    assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
+/// A read that caches the values it reads, waiting on a read of the same
+/// value that does not, caches the shared value itself: whether the value
+/// lands in the cache follows the policy of the read that asked, not of the
+/// one that happened to lead.
+#[cfg(feature = "metrics")]
+#[test]
+fn a_caching_read_caches_a_value_it_took_from_a_read_that_does_not() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    write_keys(
+        config(folder.path()).with_kv_separation(Some(
+            crate::KvSeparationOptions::default().separation_threshold(1),
+        )),
+        1,
+    )?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let cache = sharing_cache(64 << 20);
+    let tree = reopen_cold(folder.path(), fs, &cache, true)?;
+    let crate::AnyTree::Blob(blob) = &tree else {
+        unreachable!("a separated tree opens as a blob tree");
+    };
+    assert!(tree.contains_key([0], SeqNo::MAX)?);
+
+    // The first read of the record (by a read that does not cache) is held
+    // until the caching read waits on it.
+    let entered = Arc::new(Barrier::new(2));
+    {
+        let (entered, cache) = (Arc::clone(&entered), Arc::clone(&cache));
+        let first = Arc::new(AtomicUsize::new(0));
+        injector.hook_read_at(
+            "blobs",
+            0,
+            Arc::new(move || {
+                if first.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.wait();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while cache.load_waiters() < 1 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+            }),
+        );
+    }
+    let leader = {
+        let tree = tree.clone();
+        std::thread::spawn(move || tree.get([0], SeqNo::MAX))
+    };
+    entered.wait();
+    blob.index
+        .update_runtime_config(|cfg| cfg.blob_cache_fill = crate::config::BlobCacheFill::Always)?;
+    let caching = {
+        let tree = tree.clone();
+        std::thread::spawn(move || tree.get([0], SeqNo::MAX))
+    };
+    assert_eq!(
+        caching.join().expect("reader")?.as_deref(),
+        Some(&value(0)[..])
+    );
+    assert_eq!(
+        leader.join().expect("reader")?.as_deref(),
+        Some(&value(0)[..])
+    );
+
+    let reads = tree.metrics().blob_read_count();
+    assert_eq!(tree.get([0], SeqNo::MAX)?.as_deref(), Some(&value(0)[..]));
+    assert_eq!(
+        tree.metrics().blob_read_count(),
+        reads,
+        "the caching read cached the value it shared"
+    );
+    Ok(())
+}
+
 /// Reads that miss the same cold separated value at once read its record once
 /// and every one gets the value.
 #[test]

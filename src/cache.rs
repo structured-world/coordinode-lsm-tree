@@ -424,13 +424,15 @@ impl Cache {
 
     /// Claims the block at `offset` for a batched read about to read it along
     /// with others. Never waits, since the read goes on to lead more blocks:
-    /// a block another read already published is taken, and one still being
-    /// read is read again alone.
+    /// a block another read is still loading is read again alone.
     ///
     /// `lead` says whether the read may lead the load (see
     /// [`crate::inflight::batches_may_lead`]); a lead it takes counts on this
     /// thread until it is published or dropped, so the thread waits on
-    /// nothing meanwhile. Without it no load is claimed at all.
+    /// nothing meanwhile. Without it the read claims nothing and reads alone:
+    /// the registry holds only loads not yet published (a lead leaves it
+    /// before it settles), so there is no finished load to take there, and
+    /// a published one is in the cache the caller just missed.
     pub(crate) fn claim_batched_block(
         &self,
         id: GlobalTableId,
@@ -438,13 +440,10 @@ impl Cache {
         identity: LoadIdentity,
         lead: bool,
     ) -> BlockClaim<'_> {
-        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         if !(lead && crate::inflight::batches_may_lead()) {
-            return match self.loads.take_ready(&key, &identity) {
-                Some(Item::Block(block)) => BlockClaim::Shared(block),
-                _ => BlockClaim::Alone,
-            };
+            return BlockClaim::Alone;
         }
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
         match self.loads.claim(key, identity) {
             crate::inflight::Claim::Lead(lead) => {
                 BlockClaim::Lead(BlockLead(lead, Some(crate::inflight::BatchToken::new())))

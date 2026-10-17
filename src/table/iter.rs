@@ -742,6 +742,7 @@ impl Iter {
 
         // Looks at the cached prefix, and again after waiting on another
         // read's growth of it, which may have covered this query already.
+        let mut waited = false;
         let (carried_hits, carried_resume, _growth) = loop {
             // Already promoted to a full resident block → let the normal
             // cached load path serve it (no point re-synthesizing a partial
@@ -792,6 +793,12 @@ impl Iter {
                         }
                         (entry.hits, Some(entry.resume))
                     }
+                    // The growth this read waited on left no prefix: it
+                    // promoted the block and is loading it whole, or it
+                    // failed. Either way the full load path serves this read,
+                    // taking the block from that load rather than reading the
+                    // frame again for a prefix.
+                    None if waited => return Ok(None),
                     None => (0, None),
                 };
             match self.cache.claim_partial_growth(self.table_id, offset) {
@@ -815,7 +822,7 @@ impl Iter {
                     break (carried_hits, carried_resume, Some(lead));
                 }
                 crate::cache::GrowthClaim::Alone => break (carried_hits, carried_resume, None),
-                crate::cache::GrowthClaim::Waited => {}
+                crate::cache::GrowthClaim::Waited => waited = true,
             }
         };
 

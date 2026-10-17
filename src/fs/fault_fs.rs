@@ -426,6 +426,8 @@ impl FaultInjector {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
         self.writeback_log.lock().clear();
+        #[cfg(test)]
+        self.read_hooks.lock().clear();
         self.reads.store(0, core::sync::atomic::Ordering::Relaxed);
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }

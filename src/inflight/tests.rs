@@ -200,8 +200,7 @@ fn timed_loads() -> Loads {
 
 /// While loads are quicker than the threshold, a miss loads alone and leaves
 /// nothing in the registry: two concurrent misses of one key both load, as
-/// they would with no registry at all, and a non-waiting reader finds
-/// nothing to take.
+/// they would with no registry at all.
 #[test]
 fn quick_loads_do_not_coordinate() {
     let loads = timed_loads();
@@ -211,7 +210,6 @@ fn quick_loads_do_not_coordinate() {
     assert!(matches!(loads.claim(1, 1), Claim::Alone));
     assert!(matches!(loads.claim(1, 1), Claim::Alone));
     assert_eq!(loads.len(), 0, "no ticket is taken");
-    assert_eq!(loads.take_ready(&1, &1), None);
 }
 
 /// Loads that turn slow switch coordination on, and turning quick again
@@ -240,6 +238,27 @@ fn coordination_follows_the_measured_load_time() {
     );
 }
 
+/// A threshold of seconds is reachable: loads taking ten seconds switch on a
+/// five-second threshold, as the duration says, and `Duration::MAX` stays
+/// out of reach of any load.
+#[test]
+fn a_threshold_of_seconds_is_reached_by_loads_that_take_longer() {
+    let loads: Loads = InflightLoads::new(1, 8, Duration::from_secs(5), rustc_hash::FxBuildHasher);
+    for _ in 0..256 {
+        loads.fold_sample(&1, 10_000_000_000);
+    }
+    assert!(
+        matches!(loads.claim(1, 1), Claim::Lead(_)),
+        "ten-second loads pass a five-second threshold"
+    );
+
+    let never: Loads = InflightLoads::new(1, 8, Duration::MAX, rustc_hash::FxBuildHasher);
+    for _ in 0..256 {
+        never.fold_sample(&1, !0);
+    }
+    assert!(matches!(never.claim(1, 1), Claim::Alone), "MAX shares none");
+}
+
 /// The estimate moves an eighth of the way to each sample, and stays within
 /// range for the longest sample there is.
 #[test]
@@ -251,9 +270,22 @@ fn estimate_moves_an_eighth_toward_each_sample() {
     loads.fold_sample(&3, 800);
     assert_eq!(estimate(), 100 - 12 + 100);
     for _ in 0..512 {
-        loads.fold_sample(&3, u32::MAX);
+        loads.fold_sample(&3, u64::MAX);
     }
-    assert!(estimate() > u32::MAX / 8 * 7, "converges toward the sample");
+    assert!(estimate() > u64::MAX / 8 * 7, "converges toward the sample");
+}
+
+/// A batched lead counts on the thread that took it; dropped on another, it
+/// would leave that thread's count up and push the other's below zero, so a
+/// debug build refuses it at the drop.
+#[cfg(debug_assertions)]
+#[test]
+fn a_batch_token_dropped_off_its_thread_is_refused() {
+    let token = std::thread::spawn(super::BatchToken::new)
+        .join()
+        .expect("the token is taken");
+    let dropped = std::thread::spawn(move || drop(token)).join();
+    assert!(dropped.is_err(), "dropping it on another thread panics");
 }
 
 /// A timed wait of a batched read counts as its length shared among the

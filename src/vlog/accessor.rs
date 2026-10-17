@@ -171,6 +171,13 @@ impl<'a> Accessor<'a> {
                         .blob_load_shared
                         .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
+                // The read that led may not cache what it reads (its policy
+                // is its own, taken when it began): one whose policy does
+                // caches the shared value itself.
+                if self.fill.fills() && !cache.contains_blob(tree_id, vhandle) {
+                    let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
+                    self.count_gather(detached);
+                }
                 return Ok(Some(value));
             }
             crate::cache::BlobClaim::Lead(lead) => {

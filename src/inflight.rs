@@ -30,7 +30,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::hash::{BuildHasher, Hash};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "std")]
 type Mutex<T> = parking_lot::Mutex<T>;
@@ -241,8 +241,22 @@ pub const fn batches_may_lead() -> bool {
 ///
 /// Created only by a read the blocking driver runs, which takes the lead,
 /// publishes or drops it and runs its other loads all on the one thread it
-/// drives on; a read a caller resumes on other threads takes no lead.
-pub struct BatchToken(());
+/// drives on; a read a caller resumes on other threads takes no lead. The
+/// token is `Send` only because the read state that may hold one is, and a
+/// resumable read crosses threads; debug builds check it is dropped on the
+/// thread whose count it holds.
+pub struct BatchToken {
+    /// The counter of the creating thread, by address, to tell its thread.
+    #[cfg(all(feature = "std", debug_assertions))]
+    counter: usize,
+}
+
+/// The address of the calling thread's batched-lead counter: unique to the
+/// thread while it lives.
+#[cfg(all(feature = "std", debug_assertions))]
+fn counter_of_this_thread() -> usize {
+    BATCH_LEADS.with(|count| core::ptr::from_ref(count).addr())
+}
 
 impl BatchToken {
     /// Counts a batched lead on the calling thread.
@@ -250,7 +264,10 @@ impl BatchToken {
     pub fn new() -> Self {
         #[cfg(feature = "std")]
         BATCH_LEADS.with(|count| count.set(count.get() + 1));
-        Self(())
+        Self {
+            #[cfg(all(feature = "std", debug_assertions))]
+            counter: counter_of_this_thread(),
+        }
     }
 }
 
@@ -262,8 +279,15 @@ impl Default for BatchToken {
 
 impl Drop for BatchToken {
     fn drop(&mut self) {
-        // Every token counted one on this thread (it cannot leave it), so the
-        // count is at least one here.
+        // Every token counted one on the thread that creates it and is
+        // dropped there (only the blocking driver creates one, and it drives
+        // on one thread), so the count is at least one here.
+        #[cfg(all(feature = "std", debug_assertions))]
+        debug_assert_eq!(
+            self.counter,
+            counter_of_this_thread(),
+            "a batched lead was dropped off the thread that took it"
+        );
         #[cfg(feature = "std")]
         BATCH_LEADS.with(|count| count.set(count.get() - 1));
     }
@@ -286,8 +310,14 @@ struct Shard<K, V, I, S> {
     state: Mutex<ShardState<K, V, I, S>>,
     /// Smoothed duration of the shard's sampled physical loads, in
     /// nanoseconds; zero until one is sampled.
-    load_nanos: AtomicU32,
+    load_nanos: portable_atomic::AtomicU64,
 }
+
+/// The threshold that coordinates no miss: [`Duration::MAX`], and anything
+/// past `u64::MAX` nanoseconds (five centuries).
+///
+/// [`Duration::MAX`]: core::time::Duration::MAX
+const NEVER: u64 = u64::MAX;
 
 /// One in this many physical loads of a thread is timed.
 #[cfg(feature = "std")]
@@ -346,8 +376,7 @@ pub struct InflightLoads<K, V, I, S> {
     /// without bound.
     per_shard_limit: usize,
     /// The load duration, in nanoseconds, from which misses coordinate;
-    /// zero coordinates every miss, and one past any estimate (an estimate
-    /// is at most `u32::MAX`) none.
+    /// zero coordinates every miss, and [`NEVER`] none.
     coalesce_after_nanos: u64,
 }
 
@@ -398,7 +427,9 @@ impl<V: Clone, I> Join<V, I> {
     /// The leader's value if it has published one, without waiting: `None`
     /// while it is still loading or after it failed. For a reader that must
     /// not block (one holding leads of its own others may wait on), which
-    /// then loads on its own instead.
+    /// then loads on its own instead. A join is taken from the registry,
+    /// which a lead leaves before it settles, so the value is there only when
+    /// the lead published between that claim and this call.
     pub fn try_take(&self) -> Option<V> {
         self.0.try_take()
     }
@@ -490,7 +521,7 @@ where
                     loads: hashbrown::HashMap::with_hasher(hasher.clone()),
                     spare: Vec::with_capacity(SPARE_TICKETS),
                 }),
-                load_nanos: AtomicU32::new(0),
+                load_nanos: portable_atomic::AtomicU64::new(0),
             }));
         }
         let mut loads = Self {
@@ -548,21 +579,6 @@ where
         })
     }
 
-    /// The value of a load of `key` for `identity` that has already been
-    /// published and not yet closed, without claiming anything: for a reader
-    /// that may neither wait nor lead.
-    pub fn take_ready(&self, key: &K, identity: &I) -> Option<V> {
-        let shard = self.shard(key);
-        if !self.coalesces(shard) {
-            return None;
-        }
-        let ticket = Arc::clone(shard.state.lock().loads.get(key)?);
-        if ticket.identity != *identity {
-            return None;
-        }
-        ticket.try_take()
-    }
-
     /// How many loads are in flight, for tests.
     #[cfg(test)]
     pub fn len(&self) -> usize {
@@ -603,8 +619,7 @@ where
     /// to take, none. Without a clock (`no_std`) loads are never measured, so
     /// only zero coordinates there.
     pub fn set_coalesce_after(&mut self, coalesce_after: core::time::Duration) {
-        // Past `u64::MAX` nanoseconds (five centuries) is as good as never.
-        self.coalesce_after_nanos = u64::try_from(coalesce_after.as_nanos()).unwrap_or(u64::MAX);
+        self.coalesce_after_nanos = u64::try_from(coalesce_after.as_nanos()).unwrap_or(NEVER);
     }
 
     /// The duration a physical load must take for misses to coordinate.
@@ -615,7 +630,8 @@ where
     /// Whether misses of `shard` coordinate: its loads take at least the
     /// threshold.
     fn coalesces(&self, shard: &Shard<K, V, I, S>) -> bool {
-        u64::from(shard.load_nanos.load(Ordering::Relaxed)) >= self.coalesce_after_nanos
+        self.coalesce_after_nanos != NEVER
+            && shard.load_nanos.load(Ordering::Relaxed) >= self.coalesce_after_nanos
     }
 
     /// Folds the physical load of `key` that `timer` timed, if it is a
@@ -623,8 +639,9 @@ where
     pub fn record_load(&self, key: &K, timer: LoadTimer) {
         #[cfg(feature = "std")]
         if let Some(started) = timer.started {
-            // A load past `u32::MAX` nanoseconds (four seconds) is simply slow.
-            let sample = u32::try_from(started.elapsed().as_nanos()).unwrap_or(u32::MAX);
+            // A load past `u64::MAX` nanoseconds (five centuries) is simply
+            // slow.
+            let sample = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.fold_sample(key, sample);
         }
         #[cfg(not(feature = "std"))]
@@ -642,8 +659,9 @@ where
             && reads > 0
         {
             let per_read = started.elapsed().as_nanos() / reads as u128;
-            // A read past `u32::MAX` nanoseconds (four seconds) is simply slow.
-            let sample = u32::try_from(per_read).unwrap_or(u32::MAX);
+            // A read past `u64::MAX` nanoseconds (five centuries) is simply
+            // slow.
+            let sample = u64::try_from(per_read).unwrap_or(u64::MAX);
             for shard in &self.shards {
                 let estimate = &shard.0.load_nanos;
                 let old = estimate.load(Ordering::Relaxed);
@@ -657,16 +675,16 @@ where
     /// Moves the estimate of `key`'s shard an eighth of the way to `sample`.
     /// Read and written apart: it is a statistic, and two samples folded at
     /// once lose one of them rather than anything that needs to be exact.
-    fn fold_sample(&self, key: &K, sample: u32) {
+    fn fold_sample(&self, key: &K, sample: u64) {
         let estimate = &self.shard(key).load_nanos;
         let old = estimate.load(Ordering::Relaxed);
-        // Seven eighths of one `u32` and an eighth of another stay within one.
+        // Seven eighths of one `u64` and an eighth of another stay within one.
         estimate.store(old - old / 8 + sample / 8, Ordering::Relaxed);
     }
 
     /// The load-time estimate of `key`'s shard, in nanoseconds, for tests.
     #[cfg(test)]
-    fn estimate(&self, key: &K) -> u32 {
+    fn estimate(&self, key: &K) -> u64 {
         self.shard(key).load_nanos.load(Ordering::Relaxed)
     }
 
