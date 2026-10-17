@@ -59,6 +59,12 @@ pub struct StagedRead<'t> {
     need: Vec<BlockHandle>,
     /// The blocks held, by their offset in the table file.
     held: Vec<(u64, Block)>,
+    /// The loads of needed blocks this read leads, by offset: published as
+    /// each block is supplied, given up when the read ends before that.
+    leads: Vec<(u64, crate::cache::BlockLead<'t>)>,
+    /// Whether this read may lead the loads of the blocks it needs: only when
+    /// its driver completes the reads itself.
+    lead_loads: bool,
     /// What the filters answered, counted once the plan is.
     tally: PlanCounts,
     /// Once planned: each data block and the positions of the keys in it.
@@ -67,11 +73,13 @@ pub struct StagedRead<'t> {
 
 impl<'t> StagedRead<'t> {
     /// Opens the staged read of `table` for `sorted_keys` (each with its hash,
-    /// sorted by the table's comparator) at the snapshot `seqno`.
+    /// sorted by the table's comparator) at the snapshot `seqno`. `lead_loads`
+    /// says whether it may lead the cold loads of the blocks it needs.
     pub(crate) fn start(
         table: &'t Table,
         sorted_keys: &[(&[u8], u64)],
         seqno: SeqNo,
+        lead_loads: bool,
     ) -> StagedStart<'t> {
         if table.metadata.ecc_params.is_some() {
             return StagedStart::Serial;
@@ -104,6 +112,8 @@ impl<'t> StagedRead<'t> {
             passing,
             need: Vec::new(),
             held: Vec::new(),
+            leads: Vec::new(),
+            lead_loads,
             tally: PlanCounts::default(),
             blocks: Vec::new(),
         };
@@ -161,6 +171,9 @@ impl<'t> StagedRead<'t> {
         self.table
             .cache
             .insert_block(self.table.global_id(), handle.offset(), block.clone());
+        if let Some(at) = self.leads.iter().position(|(at, _)| *at == offset) {
+            self.leads.swap_remove(at).1.publish(&block);
+        }
         self.need.retain(|h| h.offset() != handle.offset());
         self.held.push((offset, block));
         Ok(())
@@ -216,6 +229,55 @@ impl<'t> StagedRead<'t> {
         (self.table_seqno, self.blocks, self.tally)
     }
 
+    /// Holds the needed blocks another read has cached since the stage found
+    /// them missing, so the stage reads only what is still cold. Done when the
+    /// stage is handed out: one deferred under the level's budget can wait
+    /// while other reads fill the cache.
+    pub(crate) fn take_cached(&mut self) {
+        let (block_type, _) = self.need();
+        let table = self.table;
+        let held = &mut self.held;
+        let leads = &mut self.leads;
+        self.need
+            .retain(|handle| match table.cached_block(handle, block_type) {
+                Some(block) => {
+                    let offset = *handle.offset();
+                    // A load this read already leads for it hands the cached
+                    // block to its waiters rather than leaving them on a read
+                    // that is never issued.
+                    if let Some(at) = leads.iter().position(|(led, _)| *led == offset) {
+                        leads.swap_remove(at).1.publish(&block);
+                    }
+                    held.push((offset, block));
+                    false
+                }
+                None => true,
+            });
+    }
+
+    /// Claims the loads of the blocks this stage needs, once the stage is
+    /// handed out to be read, so a point read missing one of them meanwhile
+    /// waits for this read rather than reading it again. A block already led
+    /// here is not claimed again.
+    pub(crate) fn claim_loads(&mut self) {
+        let (block_type, _) = self.need();
+        for at in 0..self.need.len() {
+            let Some(&handle) = self.need.get(at) else {
+                continue;
+            };
+            let offset = *handle.offset();
+            if self.leads.iter().any(|(led, _)| *led == offset) {
+                continue;
+            }
+            if let Some(lead) = self
+                .table
+                .claim_batched_block(&handle, block_type, self.lead_loads)
+            {
+                self.leads.push((offset, lead));
+            }
+        }
+    }
+
     /// Records that the stage needs the block at `handle`, unless it is held
     /// or asked for already, or the cache has it, in which case it is held.
     fn want(&mut self, handle: BlockHandle, block_type: BlockType) {
@@ -225,10 +287,14 @@ impl<'t> StagedRead<'t> {
         {
             return;
         }
-        match self.table.cached_block(&handle, block_type) {
-            Some(block) => self.held.push((offset, block)),
-            None => self.need.push(handle),
+        if let Some(block) = self.table.cached_block(&handle, block_type) {
+            self.held.push((offset, block));
+            return;
         }
+        // Claimed only once the stage is handed out (`claim_loads`): a stage
+        // the level defers would otherwise hold a load no read has started,
+        // and a point read missing the block would wait on it.
+        self.need.push(handle);
     }
 
     /// The held block at `offset`.

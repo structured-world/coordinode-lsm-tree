@@ -248,6 +248,10 @@ mod cache;
 /// (replaces `quick_cache`; works on `std` and `no_std + alloc`).
 mod sharded_cache;
 
+/// Coordination of concurrent cold loads of one cached object, so a miss
+/// shared by many readers reads and decodes it once.
+mod inflight;
+
 #[doc(hidden)]
 pub mod checksum;
 

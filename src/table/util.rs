@@ -362,6 +362,62 @@ pub(crate) fn load_block_paced(
         return Ok(block);
     }
 
+    // A read that leaves the cache as it found it loads alone: it must not
+    // take a block a foreground read decoded, and its own read verifies
+    // the disk afresh. So does a paced read: its pacer may hold it on a rate
+    // budget in the middle of the read, which a read waiting on it would
+    // wait out too, and which is no measure of how long a load takes.
+    let coordinated = charge.touches_cache() && pace.is_none();
+    let lead = if coordinated {
+        match cache.claim_block(
+            table_id,
+            handle.offset(),
+            crate::cache::LoadIdentity::Block {
+                block_type,
+                size: handle.size(),
+                compression,
+                encrypted: encryption.is_some(),
+            },
+        ) {
+            crate::cache::BlockClaim::Shared(block) => {
+                #[cfg(feature = "metrics")]
+                if charge.is_counted() {
+                    metrics
+                        .block_load_shared
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                // The read that led may not have cached the block (a
+                // multi-get past the room it keeps for its blocks): this read
+                // caches it, as it would have reading the block itself.
+                if !cache.has_block(table_id, handle.offset()) {
+                    cache.insert_block(table_id, handle.offset(), block.clone());
+                }
+                return Ok(block);
+            }
+            crate::cache::BlockClaim::Lead(lead) => {
+                // A load that finished between the miss above and this claim
+                // left its block in the cache.
+                if let Some(block) = cache.get_block(table_id, handle.offset())
+                    && block.header.block_type == block_type
+                {
+                    #[cfg(feature = "metrics")]
+                    if charge.is_counted() {
+                        record_block_load_cached(metrics, block_type);
+                    }
+                    lead.publish(&block);
+                    return Ok(block);
+                }
+                Some(lead)
+            }
+            crate::cache::BlockClaim::Alone => None,
+        }
+    } else {
+        None
+    };
+
+    // Timed from here, where it no longer waits on anything but the read and
+    // decode, for the estimate that decides whether misses share loads.
+    let timer = crate::cache::Cache::time_load();
     let fd = fd.resolve(
         file_accessor,
         &table_id,
@@ -431,8 +487,16 @@ pub(crate) fn load_block_paced(
         ecc_status,
         recovery,
     )?;
+    // A read that must leave no trace feeds no estimate either: its loads
+    // would otherwise switch on the waiting of the reads after it.
+    if coordinated {
+        cache.record_block_load(table_id, handle.offset(), timer);
+    }
     if charge.touches_cache() {
         cache.insert_block(table_id, handle.offset(), block.clone());
+    }
+    if let Some(lead) = lead {
+        lead.publish(&block);
     }
     Ok(block)
 }

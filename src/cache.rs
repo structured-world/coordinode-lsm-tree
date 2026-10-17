@@ -180,7 +180,181 @@ pub struct Cache {
     /// re-decode on the next index descent. Disable to put every block on equal
     /// footing (the pre-priority behaviour), e.g. for A/B measurement.
     metadata_priority: bool,
+    /// The cold loads in flight, keyed like the entries they will fill, so
+    /// readers that miss the same block or blob at once share one read and
+    /// one decode. Only a miss consults it.
+    loads: Loads,
 }
+
+/// The registry of cold loads in flight.
+type Loads =
+    crate::inflight::InflightLoads<CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>;
+
+/// The lead of one cold load, borrowing the cache's registry.
+type LoadLead<'a> =
+    crate::inflight::Lead<'a, CacheKey, Item, LoadIdentity, rustc_hash::FxBuildHasher>;
+
+/// What a cold load reads, beyond its position: a waiter takes a load's
+/// result only when it asked for the same thing, so a request with another
+/// extent, role or codec never receives bytes interpreted for a different one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoadIdentity {
+    /// A table block: its role, on-disk length, codec (dictionary included)
+    /// and whether it is encrypted.
+    Block {
+        block_type: BlockType,
+        size: u32,
+        compression: crate::CompressionType,
+        encrypted: bool,
+    },
+    /// A separated value: its record's on-disk size. The user key is checked
+    /// against the value the load returns, as a cache hit checks it.
+    Blob { on_disk_size: u32 },
+    /// Growth of a block's partially decoded prefix. Waiters take no value:
+    /// once the growth ends they look at the cached prefix again.
+    #[cfg(feature = "zstd")]
+    PartialGrowth,
+}
+
+/// How a read that needs a block's partial prefix grown proceeds.
+#[cfg(feature = "zstd")]
+pub enum GrowthClaim<'a> {
+    /// No growth of the block runs: grow it, holding the lead until the
+    /// grown prefix is cached.
+    Lead(GrowthLead<'a>),
+    /// Another read grew the block while this one waited: look at the cached
+    /// prefix again before growing anything.
+    Waited,
+    /// Grow without coordination: the registry is full.
+    Alone,
+}
+
+/// The lead of a partial prefix's growth. Dropping it, after the grown prefix
+/// is cached or on any failure, lets the reads waiting on it look again.
+#[cfg(feature = "zstd")]
+pub struct GrowthLead<'a>(
+    #[expect(dead_code, reason = "held for its drop, which releases the waiters")] LoadLead<'a>,
+);
+
+/// How a block miss proceeds: lead the load, take a concurrent one's block,
+/// or load alone.
+pub enum BlockClaim<'a> {
+    /// No load of the block is in flight: read it, then [`BlockLead::publish`].
+    Lead(BlockLead<'a>),
+    /// A load of the block finished while this request waited for it.
+    Shared(Block),
+    /// Read the block without coordination: the registry is full, an
+    /// incompatible load of the position is in flight, or the load this
+    /// request waited for failed.
+    Alone,
+}
+
+/// The lead of a block load. Dropping it unpublished (an error or an unwind)
+/// releases its waiters to read on their own. A batched read's lead also
+/// keeps its thread from waiting on other loads while it lives.
+pub struct BlockLead<'a>(LoadLead<'a>, Option<crate::inflight::BatchToken>);
+
+impl BlockLead<'_> {
+    /// Hands the loaded block to the waiters, if any; insert it into the
+    /// cache first, so a miss after this sees it there.
+    pub(crate) fn publish(self, block: &Block) {
+        let Self(lead, _batch) = self;
+        lead.publish_with(|| Item::Block(block.clone()));
+    }
+}
+
+/// How a miss of a row group's decoded directory proceeds, as [`BlockClaim`]
+/// for a block.
+#[cfg(feature = "columnar")]
+pub enum DirectoryClaim<'a> {
+    /// Read the directory, then [`DirectoryLead::publish`] it.
+    Lead(DirectoryLead<'a>),
+    /// A concurrent read of the group's directory finished: the directory
+    /// and its block's on-disk length.
+    Shared(
+        alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        u32,
+    ),
+    /// Read the directory without coordination.
+    Alone,
+}
+
+/// The lead of a directory load, as [`BlockLead`] for a block.
+#[cfg(feature = "columnar")]
+pub struct DirectoryLead<'a>(LoadLead<'a>);
+
+#[cfg(feature = "columnar")]
+impl DirectoryLead<'_> {
+    /// Hands the decoded directory and its block's on-disk length to the
+    /// waiters; cache it first, so a miss after this sees it there.
+    pub(crate) fn publish(
+        self,
+        directory: &alloc::sync::Arc<crate::table::column_page::PageDirectory>,
+        len: u32,
+    ) {
+        self.0
+            .publish_with(|| Item::Directory(alloc::sync::Arc::clone(directory), len));
+    }
+}
+
+/// How a blob miss proceeds, as [`BlockClaim`] for a block.
+pub enum BlobClaim<'a> {
+    /// Read the value, then [`BlobLead::publish`].
+    Lead(BlobLead<'a>),
+    /// A concurrent read of the same record, for the same key, finished.
+    Shared(UserValue),
+    /// Read the value without coordination.
+    Alone,
+}
+
+/// The lead of a blob load, as [`BlockLead`] for a block.
+pub struct BlobLead<'a>(LoadLead<'a>);
+
+impl BlobLead<'_> {
+    /// Hands the value read for `user_key` to the waiters, caching it first
+    /// when `fill` says so. Returns the bytes copied to own the key, which the
+    /// cache entry and the waiters share: none when the value is neither
+    /// cached nor awaited.
+    pub(crate) fn publish(
+        self,
+        cache: &Cache,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
+        value: UserValue,
+        fill: bool,
+    ) -> usize {
+        if !fill && !self.0.has_waiters() {
+            // Dropped unpublished: nothing to share, and the key is not
+            // copied for nobody.
+            return 0;
+        }
+        let item = Item::Blob(user_key.into(), vhandle.on_disk_size, value);
+        if fill {
+            cache.data.insert(
+                (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
+                item.clone(),
+            );
+        }
+        self.0.publish(item);
+        user_key.len()
+    }
+}
+
+/// Shards of the load registry: as many as the cache, so two loads that
+/// would contend on one cache shard are the ones that share a registry shard.
+const LOAD_SHARDS: usize = BLOCK_CACHE_SHARDS;
+/// Loads one registry shard coordinates at once, so the registry holds at
+/// most `LOAD_SHARDS * LOADS_PER_SHARD` tickets; a miss past that loads on
+/// its own.
+const LOADS_PER_SHARD: usize = 64;
+/// How long cold loads must take before concurrent misses of one object wait
+/// for a single load instead of each loading it (see
+/// [`Cache::with_load_coalescing_after`]). Loads served from the page cache
+/// take a few microseconds for a block and tens for a whole column row group,
+/// and waiting on another reader there loses to loading alone; this sits
+/// above them and below a read that reaches a device or the network.
+const DEFAULT_LOAD_COALESCING_AFTER: core::time::Duration = core::time::Duration::from_micros(64);
 
 /// Number of shards in the block cache. 64 keeps per-shard write contention low
 /// on many-core hosts while the lock array stays small; reads take a shared lock
@@ -205,6 +379,204 @@ impl Cache {
             ),
             row_cache_enabled: true,
             metadata_priority: true,
+            loads: crate::inflight::InflightLoads::new(
+                LOAD_SHARDS,
+                LOADS_PER_SHARD,
+                DEFAULT_LOAD_COALESCING_AFTER,
+                rustc_hash::FxBuildHasher,
+            ),
+        }
+    }
+
+    /// Claims the cold load of the block at `offset` after a cache miss.
+    ///
+    /// Blocks while a compatible load of the block runs on another thread,
+    /// returning its block. A [`BlockClaim::Lead`] holder checks the cache
+    /// once more before reading: a load that finished between its miss and
+    /// this claim left the block there.
+    ///
+    /// A thread that holds a batched read's lead never waits (see
+    /// [`crate::inflight::may_wait`]): it takes a block another read already
+    /// published and reads one still being read again on its own.
+    pub(crate) fn claim_block(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+    ) -> BlockClaim<'_> {
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => BlockClaim::Lead(BlockLead(lead, None)),
+            crate::inflight::Claim::Join(join) => {
+                let shared = if crate::inflight::may_wait() {
+                    join.wait()
+                } else {
+                    join.try_take()
+                };
+                match shared {
+                    Some(Item::Block(block)) => BlockClaim::Shared(block),
+                    _ => BlockClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Alone => BlockClaim::Alone,
+        }
+    }
+
+    /// Claims the lead of the load of the block at `offset` for a batched
+    /// read about to read it along with others; `None` when the read reads
+    /// it alone. Never waits, since the read goes on to lead more blocks: a
+    /// block another read is loading is read again alone. Nor does it take
+    /// one: the registry holds only loads not yet published (a lead leaves
+    /// it before it settles), and a published one is in the cache the caller
+    /// just missed.
+    ///
+    /// `lead` says whether the read may lead the load (see
+    /// [`crate::inflight::batches_may_lead`]); a lead it takes counts on this
+    /// thread until it is published or dropped, so the thread waits on
+    /// nothing meanwhile.
+    pub(crate) fn claim_batched_block(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+        lead: bool,
+    ) -> Option<BlockLead<'_>> {
+        if !(lead && crate::inflight::batches_may_lead()) {
+            return None;
+        }
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => {
+                Some(BlockLead(lead, Some(crate::inflight::BatchToken::new())))
+            }
+            crate::inflight::Claim::Join(_) | crate::inflight::Claim::Alone => None,
+        }
+    }
+
+    /// Claims the load of a row group's page at `offset` for a read about to
+    /// fetch it along with the group's other pages. Waits for a compatible
+    /// load another read runs only while this thread holds no lead of a
+    /// batched read, so until this read leads a page of its own: from then
+    /// on others may be waiting on it, and a page another read is loading is
+    /// read again alone. A lead taken here counts as a batched one.
+    ///
+    /// `with_directory` says the load of the group's directory is
+    /// coordinated, by this read or one it took the directory from: its pages
+    /// are then coordinated too, whatever their own loads measured, since a
+    /// page read along with the directory is never timed on its own.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn claim_page(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+        with_directory: bool,
+    ) -> BlockClaim<'_> {
+        if !crate::inflight::batches_may_lead() {
+            return BlockClaim::Alone;
+        }
+        let key: CacheKey = (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim_as(key, identity, with_directory) {
+            crate::inflight::Claim::Lead(lead) => {
+                BlockClaim::Lead(BlockLead(lead, Some(crate::inflight::BatchToken::new())))
+            }
+            crate::inflight::Claim::Join(join) if crate::inflight::may_wait() => {
+                match join.wait() {
+                    Some(Item::Block(block)) => BlockClaim::Shared(block),
+                    _ => BlockClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Join(_) | crate::inflight::Claim::Alone => BlockClaim::Alone,
+        }
+    }
+
+    /// Claims the cold read of the decoded directory of the row group at
+    /// `offset`, as [`Self::claim_block`] does for a block. `identity` names
+    /// the group's extent, so a read of another extent at the same offset
+    /// never takes this directory.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn claim_directory(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        identity: LoadIdentity,
+    ) -> DirectoryClaim<'_> {
+        let key: CacheKey = (TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => DirectoryClaim::Lead(DirectoryLead(lead)),
+            crate::inflight::Claim::Join(join) => {
+                let shared = if crate::inflight::may_wait() {
+                    join.wait()
+                } else {
+                    join.try_take()
+                };
+                match shared {
+                    Some(Item::Directory(directory, len)) => DirectoryClaim::Shared(directory, len),
+                    _ => DirectoryClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Alone => DirectoryClaim::Alone,
+        }
+    }
+
+    /// How many requests wait on cold loads in flight, for tests.
+    #[cfg(test)]
+    pub(crate) fn load_waiters(&self) -> usize {
+        self.loads.waiters()
+    }
+
+    /// How many cold loads are in flight, for tests.
+    #[cfg(test)]
+    pub(crate) fn loads_in_flight(&self) -> usize {
+        self.loads.len()
+    }
+
+    /// The load-time estimates of every registry shard summed, for tests.
+    #[cfg(test)]
+    pub(crate) fn load_estimates_total(&self) -> u64 {
+        self.loads.estimates_total()
+    }
+
+    /// The load-time estimate of the shard that the partial-prefix growth of
+    /// the block at `offset` coordinates in, for tests.
+    #[cfg(all(test, feature = "zstd"))]
+    pub(crate) fn partial_growth_estimate(&self, id: GlobalTableId, offset: BlockOffset) -> u64 {
+        self.loads
+            .estimate(&(TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into())
+    }
+
+    /// Claims the cold read of the separated value `vhandle` names for
+    /// `user_key`, as [`Self::claim_block`] does for a block. A shared value
+    /// is returned only when the read it came from was for the same key and
+    /// size: the position alone names a record, not whose it is.
+    pub(crate) fn claim_blob(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        user_key: &[u8],
+    ) -> BlobClaim<'_> {
+        let key: CacheKey = (TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into();
+        let identity = LoadIdentity::Blob {
+            on_disk_size: vhandle.on_disk_size,
+        };
+        match self.loads.claim(key, identity) {
+            crate::inflight::Claim::Lead(lead) => BlobClaim::Lead(BlobLead(lead)),
+            crate::inflight::Claim::Join(join) => {
+                let shared = if crate::inflight::may_wait() {
+                    join.wait()
+                } else {
+                    join.try_take()
+                };
+                match shared {
+                    Some(Item::Blob(read_key, size, value))
+                        if &*read_key == user_key && size == vhandle.on_disk_size =>
+                    {
+                        BlobClaim::Shared(value)
+                    }
+                    _ => BlobClaim::Alone,
+                }
+            }
+            crate::inflight::Claim::Alone => BlobClaim::Alone,
         }
     }
 
@@ -237,6 +609,134 @@ impl Cache {
     #[must_use]
     pub fn metadata_priority(&self) -> bool {
         self.metadata_priority
+    }
+
+    /// Sets how long cold loads must take before readers that miss the same
+    /// block, blob or column directory at once share one read and decode
+    /// instead of each doing it, returning the cache for builder-style
+    /// configuration.
+    ///
+    /// The cache times a sample of its cold loads. While they finish quicker
+    /// than `after` (blocks served from the page cache, with cores to spare),
+    /// a reader loads on its own: waiting for another reader's load would
+    /// cost it more than its own. Once loads take longer (slow or remote
+    /// storage, or cores saturated), concurrent misses of one object wait for
+    /// a single load. `Duration::ZERO` shares every load; `Duration::MAX`
+    /// none. Without the `std` feature loads are not timed, so only
+    /// `Duration::ZERO` shares there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use lsm_tree::Cache;
+    ///
+    /// let cache = Cache::with_capacity_bytes(64 << 20)
+    ///     .with_load_coalescing_after(Duration::from_micros(50));
+    /// assert_eq!(cache.load_coalescing_after(), Duration::from_micros(50));
+    /// ```
+    #[must_use]
+    pub fn with_load_coalescing_after(mut self, after: core::time::Duration) -> Self {
+        self.loads.set_coalesce_after(after);
+        self
+    }
+
+    /// How long cold loads must take before concurrent misses share them
+    /// (see [`Cache::with_load_coalescing_after`]).
+    #[must_use]
+    pub fn load_coalescing_after(&self) -> core::time::Duration {
+        self.loads.coalesce_after()
+    }
+
+    /// Starts timing a cold load about to run on the calling thread, for the
+    /// estimate that decides whether misses share loads.
+    pub(crate) fn time_load() -> crate::inflight::LoadTimer {
+        crate::inflight::LoadTimer::start()
+    }
+
+    /// Records the cold load of the block at `offset` that `timer` timed.
+    pub(crate) fn record_block_load(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
+            timer,
+        );
+    }
+
+    /// Records a read of the blocks at `offsets` that `timer` timed, issued
+    /// together: each takes an even share of it.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn record_block_loads(
+        &self,
+        id: GlobalTableId,
+        offsets: impl Iterator<Item = BlockOffset> + Clone,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_loads(
+            offsets.map(|offset| (TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into()),
+            timer,
+        );
+    }
+
+    /// Records the growth of the partially decoded prefix of the block at
+    /// `offset` that `timer` timed.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn record_partial_growth(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
+            timer,
+        );
+    }
+
+    /// Whether a full load of the block at `offset` is in flight, which a
+    /// read that would decode only a prefix of it can take instead.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn block_load_in_flight(&self, id: GlobalTableId, offset: BlockOffset) -> bool {
+        self.loads
+            .in_flight(&(TAG_BLOCK, id.tree_id(), id.table_id(), *offset).into())
+    }
+
+    /// Records a wait of a batched read that `timer` timed, which handed back
+    /// `reads` block reads.
+    pub(crate) fn record_batch_wait(&self, timer: crate::inflight::LoadTimer, reads: usize) {
+        self.loads.record_batch_wait(timer, reads);
+    }
+
+    /// Records the cold read of the separated value `vhandle` names that
+    /// `timer` timed.
+    pub(crate) fn record_blob_load(
+        &self,
+        vlog_id: crate::TreeId,
+        vhandle: &crate::vlog::ValueHandle,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_BLOB, vlog_id, vhandle.blob_file_id, vhandle.offset).into(),
+            timer,
+        );
+    }
+
+    /// Records the cold read of the row group at `offset` that `timer` timed.
+    #[cfg(feature = "columnar")]
+    pub(crate) fn record_directory_load(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+        timer: crate::inflight::LoadTimer,
+    ) {
+        self.loads.record_load(
+            &(TAG_DIRECTORY, id.tree_id(), id.table_id(), *offset).into(),
+            timer,
+        );
     }
 
     /// Returns the amount of cached bytes.
@@ -375,9 +875,12 @@ impl Cache {
         }
     }
 
-    /// Inserts or replaces the partial-tier entry for `offset` (high-water
-    /// growth: a wider covering prefix with more decoded inner blocks replaces a
-    /// narrower one).
+    /// Records the partial-tier entry for `offset`, never letting its decoded
+    /// prefix shrink: when the resident entry already decoded more inner
+    /// blocks (a concurrent read grew it further), that one stays, with the
+    /// higher of the two hit counts. A read that served from an older copy of
+    /// the entry, or grew it less, can therefore not undo another read's
+    /// growth.
     #[cfg(feature = "zstd")]
     #[doc(hidden)]
     pub fn insert_partial_block(
@@ -386,10 +889,45 @@ impl Cache {
         offset: BlockOffset,
         entry: PartialBlockEntry,
     ) {
-        self.data.insert(
+        self.data.insert_merged(
             (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into(),
-            Item::PartialBlock(entry),
+            |resident| match resident {
+                Some(Item::PartialBlock(resident))
+                    if resident.resume.decoded_blocks > entry.resume.decoded_blocks =>
+                {
+                    Some(Item::PartialBlock(PartialBlockEntry {
+                        hits: resident.hits.max(entry.hits),
+                        ..resident.clone()
+                    }))
+                }
+                Some(Item::PartialBlock(resident)) => Some(Item::PartialBlock(PartialBlockEntry {
+                    hits: resident.hits.max(entry.hits),
+                    ..entry
+                })),
+                _ => Some(Item::PartialBlock(entry)),
+            },
         );
+    }
+
+    /// Claims the growth of the partially decoded prefix of the block at
+    /// `offset`, so two reads that both need it longer decode the new inner
+    /// blocks once: the second waits for the first, then finds the longer
+    /// prefix cached.
+    #[cfg(feature = "zstd")]
+    pub(crate) fn claim_partial_growth(
+        &self,
+        id: GlobalTableId,
+        offset: BlockOffset,
+    ) -> GrowthClaim<'_> {
+        let key: CacheKey = (TAG_PARTIAL_BLOCK, id.tree_id(), id.table_id(), *offset).into();
+        match self.loads.claim(key, LoadIdentity::PartialGrowth) {
+            crate::inflight::Claim::Lead(lead) => GrowthClaim::Lead(GrowthLead(lead)),
+            crate::inflight::Claim::Join(join) if crate::inflight::may_wait() => {
+                let _ = join.wait();
+                GrowthClaim::Waited
+            }
+            crate::inflight::Claim::Join(_) | crate::inflight::Claim::Alone => GrowthClaim::Alone,
+        }
     }
 
     /// Drops the partial-tier entry for `offset` (used on promotion to a full
@@ -577,4 +1115,9 @@ impl Cache {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
+mod coalesce_tests;

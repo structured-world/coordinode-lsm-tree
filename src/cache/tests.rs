@@ -62,6 +62,44 @@ fn row_cache_when_given_block_subslices_stores_detached_copies() {
     assert_eq!(&*got.key.user_key, &[7_u8; 32][..]);
 }
 
+/// A cache whose loads were never measured slow lets concurrent misses of one
+/// block each load it, taking nothing in the registry; one set to share every
+/// load coordinates them.
+#[test]
+fn misses_share_loads_only_once_loads_are_measured_slow() {
+    use super::{BlockClaim, LoadIdentity};
+
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let offset = crate::table::BlockOffset(0);
+    let identity = LoadIdentity::Block {
+        block_type: crate::table::block::BlockType::Data,
+        size: 100,
+        compression: crate::CompressionType::None,
+        encrypted: false,
+    };
+
+    let quick = Cache::with_capacity_bytes(1024 * 1024);
+    assert!(quick.load_coalescing_after() > core::time::Duration::ZERO);
+    assert!(matches!(
+        quick.claim_block(id, offset, identity),
+        BlockClaim::Alone
+    ));
+    assert!(matches!(
+        quick.claim_block(id, offset, identity),
+        BlockClaim::Alone
+    ));
+    assert_eq!(quick.loads_in_flight(), 0, "the registry is not touched");
+
+    let sharing = Cache::with_capacity_bytes(1024 * 1024)
+        .with_load_coalescing_after(core::time::Duration::ZERO);
+    let BlockClaim::Lead(lead) = sharing.claim_block(id, offset, identity) else {
+        panic!("a sharing cache coordinates the load");
+    };
+    assert_eq!(sharing.loads_in_flight(), 1);
+    drop(lead);
+    assert_eq!(sharing.loads_in_flight(), 0);
+}
+
 #[test]
 fn metadata_priority_defaults_on_and_toggles() {
     // On by default.
@@ -153,4 +191,185 @@ fn a_blob_lookup_with_a_conflicting_size_misses_rather_than_serving_the_value() 
         cache.get_blob(0, &conflicting, b"key").is_none(),
         "a handle declaring a different size must not be served the cached value",
     );
+}
+
+/// A thread that leads a batched read's load waits on no other load: with
+/// another thread leading a block it needs, it is told to read the block
+/// alone at once instead of blocking. Two batched reads each waiting on a
+/// block the other leads would otherwise never finish.
+#[test]
+fn a_thread_leading_a_batched_load_never_waits() {
+    use super::{BlockClaim, LoadIdentity};
+    use std::sync::Arc;
+
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let identity = LoadIdentity::Block {
+        block_type: crate::table::block::BlockType::Data,
+        size: 100,
+        compression: crate::CompressionType::None,
+        encrypted: false,
+    };
+    // Another reader leads the load of block 0 and keeps it in flight.
+    let BlockClaim::Lead(held) = cache.claim_block(id, crate::table::BlockOffset(0), identity)
+    else {
+        panic!("the first claim leads");
+    };
+
+    let waited = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            let Some(batched) =
+                cache.claim_batched_block(id, crate::table::BlockOffset(1), identity, true)
+            else {
+                panic!("the batched read leads block 1");
+            };
+            let claim = cache.claim_block(id, crate::table::BlockOffset(0), identity);
+            drop(batched);
+            matches!(claim, BlockClaim::Alone)
+        }
+    })
+    .join()
+    .expect("the batched reader returns instead of waiting");
+    assert!(waited, "told to read the block alone");
+
+    // Without a batched lead the same claim waits, and takes the block once
+    // it is published.
+    let waiter = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || {
+            matches!(
+                cache.claim_block(id, crate::table::BlockOffset(0), identity),
+                BlockClaim::Shared(_)
+            )
+        }
+    });
+    while cache.load_waiters() < 1 {
+        std::thread::yield_now();
+    }
+    held.publish(&crate::table::Block {
+        header: crate::table::block::Header::test_dummy(crate::table::block::BlockType::Data),
+        data: crate::Slice::from(&b"block"[..]),
+    });
+    assert!(waiter.join().expect("waiter"), "took the published block");
+}
+
+/// A read waiting on another read of the same blob position takes the value
+/// only when it was read for the same key: a corrupt index entry can name a
+/// position that holds another key's record, and such a read must meet the
+/// real outcome on its own rather than receive the other key's value.
+#[test]
+fn a_blob_read_for_another_key_at_the_same_position_is_not_shared() {
+    use super::BlobClaim;
+    use std::sync::Arc;
+
+    let cache = Arc::new(
+        Cache::with_capacity_bytes(1024 * 1024)
+            .with_load_coalescing_after(core::time::Duration::ZERO),
+    );
+    let vhandle = crate::vlog::ValueHandle {
+        blob_file_id: 3,
+        offset: 0,
+        on_disk_size: 5,
+    };
+    let BlobClaim::Lead(lead) = cache.claim_blob(0, &vhandle, b"owner") else {
+        panic!("the first read leads");
+    };
+    let other_key = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || matches!(cache.claim_blob(0, &vhandle, b"intruder"), BlobClaim::Alone)
+    });
+    let same_key = std::thread::spawn({
+        let cache = Arc::clone(&cache);
+        move || match cache.claim_blob(0, &vhandle, b"owner") {
+            BlobClaim::Shared(value) => &*value == b"value",
+            _ => false,
+        }
+    });
+    while cache.load_waiters() < 2 {
+        std::thread::yield_now();
+    }
+    let _ = lead.publish(
+        &cache,
+        0,
+        &vhandle,
+        b"owner",
+        crate::UserValue::from(&b"value"[..]),
+        false,
+    );
+    assert!(other_key.join().expect("reader"), "another key reads alone");
+    assert!(
+        same_key.join().expect("reader"),
+        "the same key takes the value"
+    );
+}
+
+/// A partial-tier entry whose prefix decoded `decoded` inner blocks and served
+/// `hits` reads.
+#[cfg(feature = "zstd")]
+fn partial_entry(decoded: u32, hits: u32) -> super::PartialBlockEntry {
+    super::PartialBlockEntry {
+        resume: crate::table::lazy_block::PartialResume {
+            window_prime: crate::Slice::from(vec![0_u8; decoded as usize * 16]),
+            decoded_blocks: decoded,
+            state: None,
+            compressed_cursor: 0,
+        },
+        covered_upper: crate::UserKey::from(format!("upper-{decoded}")),
+        total_blocks: 8,
+        hits,
+    }
+}
+
+/// Recording a partial prefix never shrinks the cached one, whichever of two
+/// concurrent reads records last: a read that grew the prefix less, or served
+/// from an older copy of it and bumps its hit count, keeps the longer prefix
+/// and the higher hit count instead of overwriting them.
+#[cfg(feature = "zstd")]
+#[test]
+fn partial_prefix_never_shrinks_whichever_read_records_last() {
+    let id = crate::table::GlobalTableId::from((0, 1));
+    let offset = crate::table::BlockOffset(0);
+    let resident = |cache: &Cache| {
+        let Some(entry) = cache.peek_partial_block(id, offset) else {
+            panic!("a partial entry is cached");
+        };
+        (entry.resume.decoded_blocks, entry.hits, entry.covered_upper)
+    };
+
+    // The longer growth records first, then the shorter one.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(id, offset, partial_entry(2, 0));
+    assert_eq!(resident(&cache), (5, 1, crate::UserKey::from("upper-5")));
+
+    // The shorter growth records first, then the longer one.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(2, 0));
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    assert_eq!(resident(&cache), (5, 1, crate::UserKey::from("upper-5")));
+
+    // A hit bump made on a copy taken before the prefix grew keeps the grown
+    // prefix and carries the bump.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    let older = partial_entry(2, 2);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(
+        id,
+        offset,
+        super::PartialBlockEntry {
+            hits: older.hits + 1,
+            ..older
+        },
+    );
+    assert_eq!(resident(&cache), (5, 3, crate::UserKey::from("upper-5")));
+
+    // An equally long prefix takes the newer hit count.
+    let cache = Cache::with_capacity_bytes(1024 * 1024);
+    cache.insert_partial_block(id, offset, partial_entry(5, 1));
+    cache.insert_partial_block(id, offset, partial_entry(5, 2));
+    assert_eq!(resident(&cache), (5, 2, crate::UserKey::from("upper-5")));
 }

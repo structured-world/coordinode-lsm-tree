@@ -395,69 +395,121 @@ impl GroupRead<'_> {
             self.group.offset(),
             self.charge.touches_cache(),
         ) {
-            // Decoded and checked when it was cached; its length, extent and
-            // tag are checked again against this read's index entry, which is
-            // what names the group here.
-            check_directory_len(indexed_directory_len(self.group)?, directory_len)?;
-            check_group_extent(self.group, directory_len, &directory)?;
-            check_head_zones_len(self.group, &directory)?;
-            self.check_group_tag(&directory)?;
-            // A directory cached by a read that did not select by its head
-            // zone block's column lacks those zones: the first read that does
-            // reads the block and caches the directory with them.
-            let directory = if want
-                .zone_column()
-                .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
-            {
-                let directory = self.with_head_zones(&directory, directory_len, &Slice::empty())?;
-                if self.charge.touches_cache() {
-                    self.cache.insert_directory(
-                        self.table_id,
-                        self.group.offset(),
-                        Arc::clone(&directory),
-                        directory_len,
-                    );
+            return self.load_from_directory(directory, directory_len, want, true);
+        }
+        // A read that leaves the cache as it found it reads alone, as a block
+        // load does.
+        if !self.charge.touches_cache() {
+            return self.read_selective(want, None);
+        }
+        match self.cache.claim_directory(
+            self.table_id,
+            self.group.offset(),
+            crate::cache::LoadIdentity::Block {
+                block_type: BlockType::ColumnPageDirectory,
+                size: self.group.size(),
+                compression: CompressionType::None,
+                encrypted: self.encryption.is_some(),
+            },
+        ) {
+            crate::cache::DirectoryClaim::Shared(directory, directory_len) => {
+                #[cfg(feature = "metrics")]
+                if self.charge.is_counted() {
+                    self.metrics
+                        .block_load_shared
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
-                directory
-            } else {
-                directory
-            };
-            let zones = match want.zone_block_column(&directory) {
-                Some(column_id) => Some(self.zone_block(
-                    &directory,
-                    directory_len,
-                    column_id,
-                    &Slice::empty(),
-                    true,
-                )?),
-                None => None,
-            };
-            let wanted = want.resolve(&directory, zones.as_ref())?;
-            let mut pages = wanted.slots(&directory);
-            let found = self.fill_cached(&directory, directory_len, &mut pages)?;
-            self.count_cached(true, found);
-            if pages.iter().all(|slot| slot.block.is_some()) {
-                return Ok(RowGroupBlocks {
-                    directory,
-                    row_pages: wanted.row_pages,
-                    pages,
-                });
+                self.load_from_directory(directory, directory_len, want, false)
             }
-            let pages = self.fetch_missing(
-                self.open()?,
+            crate::cache::DirectoryClaim::Lead(lead) => {
+                // A read that finished between the miss above and this claim
+                // left the directory in the cache.
+                if let Some((directory, directory_len)) =
+                    self.cache
+                        .get_directory(self.table_id, self.group.offset(), true)
+                {
+                    lead.publish(&directory, directory_len);
+                    return self.load_from_directory(directory, directory_len, want, true);
+                }
+                self.read_selective(want, Some(lead))
+            }
+            crate::cache::DirectoryClaim::Alone => self.read_selective(want, None),
+        }
+    }
+
+    /// Loads the pages `want` selects in the group whose decoded `directory`
+    /// is in hand, from the cache or another read's load of it (`cached`
+    /// says which), reading only the pages not cached.
+    fn load_from_directory(
+        &self,
+        directory: Arc<PageDirectory>,
+        directory_len: u32,
+        want: &PageWant<'_>,
+        cached: bool,
+    ) -> crate::Result<RowGroupBlocks> {
+        // Decoded and checked when it was cached or loaded; its length,
+        // extent and tag are checked again against this read's index
+        // entry, which is what names the group here.
+        check_directory_len(indexed_directory_len(self.group)?, directory_len)?;
+        check_group_extent(self.group, directory_len, &directory)?;
+        check_head_zones_len(self.group, &directory)?;
+        self.check_group_tag(&directory)?;
+        // A directory cached by a read that did not select by its head
+        // zone block's column lacks those zones: the first read that does
+        // reads the block and caches the directory with them.
+        let directory = if want
+            .zone_column()
+            .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
+        {
+            let directory = self.with_head_zones(&directory, directory_len, &Slice::empty())?;
+            if self.charge.touches_cache() {
+                self.cache.insert_directory(
+                    self.table_id,
+                    self.group.offset(),
+                    Arc::clone(&directory),
+                    directory_len,
+                );
+            }
+            directory
+        } else {
+            directory
+        };
+        let zones = match want.zone_block_column(&directory) {
+            Some(column_id) => Some(self.zone_block(
                 &directory,
                 directory_len,
+                column_id,
                 &Slice::empty(),
-                pages,
-            )?;
+                true,
+            )?),
+            None => None,
+        };
+        let wanted = want.resolve(&directory, zones.as_ref())?;
+        let mut pages = wanted.slots(&directory);
+        let found = self.fill_cached(&directory, directory_len, &mut pages)?;
+        self.count_cached(cached, found);
+        if pages.iter().all(|slot| slot.block.is_some()) {
             return Ok(RowGroupBlocks {
                 directory,
                 row_pages: wanted.row_pages,
                 pages,
             });
         }
-
-        self.read_selective(want)
+        // A directory taken from another read's load: that load was
+        // coordinated, so the pages are too.
+        let pages = self.fetch_missing(
+            self.open()?,
+            &directory,
+            directory_len,
+            &Slice::empty(),
+            pages,
+            !cached,
+        )?;
+        Ok(RowGroupBlocks {
+            directory,
+            row_pages: wanted.row_pages,
+            pages,
+        })
     }
 
     /// Loads the pages `want` selects in the group `earlier` read, [`load`]
@@ -510,6 +562,7 @@ impl GroupRead<'_> {
                 directory_len,
                 &Slice::empty(),
                 pages,
+                false,
             )?
         };
         Ok(RowGroupBlocks {
@@ -614,7 +667,12 @@ impl GroupRead<'_> {
     /// pages are served from it; any other read takes exactly the directory,
     /// with the head zone block after it when it selects by the key column,
     /// whose zones a writer puts there.
-    fn read_selective(&self, want: &PageWant<'_>) -> crate::Result<RowGroupBlocks> {
+    fn read_selective(
+        &self,
+        want: &PageWant<'_>,
+        lead: Option<crate::cache::DirectoryLead>,
+    ) -> crate::Result<RowGroupBlocks> {
+        let timer = crate::cache::Cache::time_load();
         let fd = self.open()?;
         let group_len = self.group.size() as usize;
         let io_buffer = self.budget.io_buffer() as usize;
@@ -651,6 +709,13 @@ impl GroupRead<'_> {
             self.read(fd, 0, head_end, BlockType::ColumnPageDirectory)?
         };
         let directory = self.admit_directory(&prefix, directory_len)?;
+        // The directory's load is its own request; the pages it names are
+        // timed as they are fetched, in their own shards. A read that must
+        // leave no trace feeds no estimate.
+        if self.charge.touches_cache() {
+            self.cache
+                .record_directory_load(self.table_id, self.group.offset(), timer);
+        }
         let directory = if want
             .zone_column()
             .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
@@ -673,7 +738,21 @@ impl GroupRead<'_> {
             let found = self.fill_cached(&directory, directory_len, &mut pages)?;
             self.count_cached(false, found);
         }
-        let pages = self.fetch_missing(fd, &directory, directory_len, &prefix, pages)?;
+        // The reads waiting on the directory take it only once this read's
+        // pages are cached, so they find those pages there. Handing it on as
+        // soon as the pages are claimed spares a read of other pages the wait
+        // for these, but measured, it lost more than it saved: groups read in
+        // one request had their pages read again by the waiters (a same-key
+        // columnar scan on a single-queue device ran a third slower), and
+        // cache-hit scans lost a few percent.
+        let pages = self.fetch_missing(
+            fd,
+            &directory,
+            directory_len,
+            &prefix,
+            pages,
+            lead.is_some(),
+        )?;
         // Cached only now that the blocks it named carried the stamps it
         // implies: another group's directory read in this one's place fails
         // the read without staying behind to refuse every healthy page later.
@@ -684,6 +763,9 @@ impl GroupRead<'_> {
                 Arc::clone(&directory),
                 directory_len,
             );
+        }
+        if let Some(lead) = lead {
+            lead.publish(&directory, directory_len);
         }
         Ok(RowGroupBlocks {
             directory,
@@ -732,7 +814,8 @@ impl GroupRead<'_> {
     /// is a request of its own. Requests go out the budget's in-flight count
     /// at a time. `front` holds the group's first bytes when an earlier read
     /// brought them in, and a range it covers is served from it rather than
-    /// asked for again.
+    /// asked for again. `with_directory` says the load of the directory was
+    /// coordinated.
     fn fetch_missing(
         &self,
         fd: &dyn FsFile,
@@ -740,9 +823,12 @@ impl GroupRead<'_> {
         directory_len: u32,
         front: &Slice,
         mut pages: Vec<PageSlot>,
+        with_directory: bool,
     ) -> crate::Result<Vec<PageSlot>> {
         let entries = directory.entries();
         let io_buffer = self.budget.io_buffer() as usize;
+        let leads = self.claim_pages(directory, directory_len, front, &mut pages, with_directory);
+        let mut leads = leads.into_iter().peekable();
         // Runs of slots whose pages are missing and lie back to back in the
         // group: consecutive slots of consecutive directory entries.
         let requests = {
@@ -810,6 +896,7 @@ impl GroupRead<'_> {
                 .filter(|&&(start, _)| start >= front.len())
                 .map(|&(start, end)| (start, end - start))
                 .collect();
+            let timer = crate::cache::Cache::time_load();
             let mut read = self.read_many(fd, &beyond)?.into_iter();
             for (run, &(start, end)) in batch.iter().zip(spans) {
                 let span = if start >= front.len() {
@@ -826,10 +913,106 @@ impl GroupRead<'_> {
                     start,
                     &span,
                     &mut pages,
+                    &mut leads,
                 )?;
+            }
+            // The pages read from disk here, read and decoded, timed into
+            // the shards their own loads coordinate in, unless this read must
+            // leave no trace.
+            if self.charge.touches_cache() {
+                let pages_from = *self.group.offset()
+                    + u64::from(directory_len)
+                    + u64::from(directory.pages_start());
+                self.cache.record_block_loads(
+                    self.table_id,
+                    batch
+                        .iter()
+                        .zip(spans)
+                        .filter(|&(_, &(start, _))| start >= front.len())
+                        .flat_map(|(run, _)| run.clone())
+                        .filter_map(|slot| pages.get(slot).and_then(|s| entries.get(s.index)))
+                        .map(|entry| BlockOffset(pages_from + u64::from(entry.offset))),
+                    timer,
+                );
             }
         }
         Ok(pages)
+    }
+
+    /// Claims the load of every page `pages` lacks before any is read: one
+    /// no read is loading is led here, so a read missing it meanwhile waits
+    /// for this one, and one another read is loading fills its slot from
+    /// that load while this read leads none yet. Once it leads one, others
+    /// may wait on it, so it waits no more and reads such a page alone.
+    /// Returns the leads by slot, in slot order. A read that must leave no
+    /// trace in the cache claims nothing, and neither is a page claimed whose
+    /// bytes `front` already holds: its read is done, and waiting on another
+    /// read's load of it could only delay it. `with_directory` says the load
+    /// of the directory was coordinated (see [`crate::Cache::claim_page`]).
+    fn claim_pages(
+        &self,
+        directory: &PageDirectory,
+        directory_len: u32,
+        front: &Slice,
+        pages: &mut [PageSlot],
+        with_directory: bool,
+    ) -> Vec<(usize, crate::cache::BlockLead<'_>)> {
+        let mut leads = Vec::new();
+        if !self.charge.touches_cache() {
+            return leads;
+        }
+        // Within the group: the extent check proved the pages fill it, and
+        // its length is a `u32`.
+        let in_group = directory_len as usize + directory.pages_start() as usize;
+        let pages_at = *self.group.offset() + in_group as u64;
+        let entries = directory.entries();
+        for (at, slot) in pages.iter_mut().enumerate() {
+            let Some(entry) = entries.get(slot.index).filter(|entry| {
+                slot.block.is_none()
+                    && in_group + entry.offset as usize + entry.length as usize > front.len()
+            }) else {
+                continue;
+            };
+            let offset = BlockOffset(pages_at + u64::from(entry.offset));
+            let claim = self.cache.claim_page(
+                self.table_id,
+                offset,
+                crate::cache::LoadIdentity::Block {
+                    block_type: BlockType::ColumnPage,
+                    size: entry.length,
+                    compression: self.compression,
+                    encrypted: self.encryption.is_some(),
+                },
+                with_directory,
+            );
+            match claim {
+                crate::cache::BlockClaim::Shared(page) => {
+                    #[cfg(feature = "metrics")]
+                    if self.charge.is_counted() {
+                        self.metrics
+                            .block_load_shared
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    slot.block = Some(page);
+                }
+                // A load that finished between the cache lookup before these
+                // claims and this one left the page cached: hand that to the
+                // reads waiting on this lead rather than reading it again. A
+                // cached block of another type is left to the read, which
+                // refuses it.
+                crate::cache::BlockClaim::Lead(lead) => {
+                    match self.cache.get_block(self.table_id, offset) {
+                        Some(page) if page.header.block_type == BlockType::ColumnPage => {
+                            lead.publish(&page);
+                            slot.block = Some(page);
+                        }
+                        _ => leads.push((at, lead)),
+                    }
+                }
+                crate::cache::BlockClaim::Alone => {}
+            }
+        }
+        leads
     }
 
     /// Verifies, admits and caches the pages `run` names out of `span`, the
@@ -838,7 +1021,13 @@ impl GroupRead<'_> {
     /// A page is cached only once its stamp is the one `directory` implies
     /// for its slot: a page read in another page's place (a misdirected or
     /// transient read) fails the read without staying behind in the cache to
-    /// fail every later read of the group.
+    /// fail every later read of the group. A page this read leads the load
+    /// of (`leads`, by slot in slot order) is handed to the reads waiting on
+    /// it once cached.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the run, its bytes, the slots it fills and the leads it publishes"
+    )]
     fn admit_pages(
         &self,
         directory: &PageDirectory,
@@ -847,11 +1036,13 @@ impl GroupRead<'_> {
         start: usize,
         span: &Slice,
         pages: &mut [PageSlot],
+        leads: &mut core::iter::Peekable<alloc::vec::IntoIter<(usize, crate::cache::BlockLead)>>,
     ) -> crate::Result<()> {
         let entries = directory.entries();
         let pages_at = directory_len as usize + directory.pages_start() as usize;
         let page_at = |entry: &PageEntry| pages_at + entry.offset as usize;
-        for slot in pages.get_mut(run).into_iter().flatten() {
+        let first = run.start;
+        for (position, slot) in (first..).zip(pages.get_mut(run).into_iter().flatten()) {
             let Some(entry) = entries.get(slot.index) else {
                 continue;
             };
@@ -882,6 +1073,11 @@ impl GroupRead<'_> {
                 ));
             }
             self.cache_block(&handle, page.clone());
+            // Leads are in slot order, and runs are admitted in slot order.
+            while leads.next_if(|(led, _)| *led < position).is_some() {}
+            if let Some((_, lead)) = leads.next_if(|(led, _)| *led == position) {
+                lead.publish(&page);
+            }
             slot.block = Some(page);
         }
         Ok(())

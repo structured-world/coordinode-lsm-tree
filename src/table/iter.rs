@@ -726,11 +726,6 @@ impl Iter {
             return Ok(None);
         };
         let offset = BlockOffset(*handle.offset());
-        // Already promoted to a full resident block → let the normal cached load
-        // path serve it (no point re-synthesizing a partial alongside it).
-        if self.cache.has_block(self.table_id, offset) {
-            return Ok(None);
-        }
         // Cold-block gate: only engage on genuinely large blocks (the cold tier
         // runs multi-MB blocks) where decoding a fraction saves far more than the
         // per-call setup. The total decompressed size is the last cumulative end.
@@ -745,51 +740,103 @@ impl Iter {
         let total_blocks = ends.len() as u32;
         let ends = ends.to_vec();
 
-        // Existing partial entry: serve from it (bumping hits) when it already
-        // covers the query, else decide whether to grow it or promote. The fall-
-        // through carries the hit count + the resume payload to continue from.
-        let (carried_hits, carried_resume) =
-            match self.cache.peek_partial_block(self.table_id, offset) {
-                Some(entry) => {
-                    let covered = self.comparator.compare(&entry.covered_upper, upper)
-                        != std::cmp::Ordering::Less;
-                    if covered {
-                        let hits = entry.hits + 1;
-                        if hits >= PARTIAL_PROMOTE_HITS {
-                            // Hot enough: promote to a full resident block.
+        // Looks at the cached prefix, and again after waiting on another
+        // read's growth of it, which may have covered this query already.
+        let mut waited = false;
+        let (carried_hits, carried_resume, _growth) = loop {
+            // Already promoted to a full resident block → let the normal
+            // cached load path serve it (no point re-synthesizing a partial
+            // alongside it).
+            if self.cache.has_block(self.table_id, offset) {
+                return Ok(None);
+            }
+            // A full load of the block is in flight (a point read, an
+            // unbounded scan, a promotion): the full load path waits for it
+            // and takes the whole block, which covers any query, rather than
+            // reading the frame again for a prefix.
+            if self.cache.block_load_in_flight(self.table_id, offset) {
+                return Ok(None);
+            }
+            // Existing partial entry: serve from it (bumping hits) when it
+            // already covers the query, else decide whether to grow it or
+            // promote. The fall-through carries the hit count + the resume
+            // payload to continue from.
+            let (carried_hits, carried_resume) =
+                match self.cache.peek_partial_block(self.table_id, offset) {
+                    Some(entry) => {
+                        let covered = self.comparator.compare(&entry.covered_upper, upper)
+                            != std::cmp::Ordering::Less;
+                        if covered {
+                            let hits = entry.hits + 1;
+                            if hits >= PARTIAL_PROMOTE_HITS {
+                                // Hot enough: promote to a full resident block.
+                                self.cache.evict_partial_block(self.table_id, offset);
+                                return Ok(None);
+                            }
+                            // Synthesize the served block from the cached decompressed
+                            // prefix (only the touched fraction is held in memory).
+                            let block = crate::table::lazy_block::synthesize_data_block(
+                                &entry.resume.window_prime,
+                                self.data_block_restart_interval,
+                            )?;
+                            // The block is a gather of the cached prefix's entries.
+                            #[cfg(feature = "metrics")]
+                            if self.charge.is_counted() {
+                                self.metrics.record_gather(block.inner.data.len());
+                            }
+                            self.cache.insert_partial_block(
+                                self.table_id,
+                                offset,
+                                crate::cache::PartialBlockEntry { hits, ..entry },
+                            );
+                            return Ok(Some(block));
+                        }
+                        // Coverage miss → grow the extent by resuming from the snapshot.
+                        // If most of the block is already decoded, a full decode + block
+                        // cache beats holding a near-complete partial, so promote.
+                        if promote_by_fraction(entry.resume.decoded_blocks, total_blocks) {
                             self.cache.evict_partial_block(self.table_id, offset);
                             return Ok(None);
                         }
-                        // Synthesize the served block from the cached decompressed
-                        // prefix (only the touched fraction is held in memory).
-                        let block = crate::table::lazy_block::synthesize_data_block(
-                            &entry.resume.window_prime,
-                            self.data_block_restart_interval,
-                        )?;
-                        // The block is a gather of the cached prefix's entries.
-                        #[cfg(feature = "metrics")]
-                        if self.charge.is_counted() {
-                            self.metrics.record_gather(block.inner.data.len());
-                        }
-                        self.cache.insert_partial_block(
-                            self.table_id,
-                            offset,
-                            crate::cache::PartialBlockEntry { hits, ..entry },
-                        );
-                        return Ok(Some(block));
+                        (entry.hits, Some(entry.resume))
                     }
-                    // Coverage miss → grow the extent by resuming from the snapshot.
-                    // If most of the block is already decoded, a full decode + block
-                    // cache beats holding a near-complete partial, so promote.
-                    if promote_by_fraction(entry.resume.decoded_blocks, total_blocks) {
-                        self.cache.evict_partial_block(self.table_id, offset);
-                        return Ok(None);
+                    // The growth this read waited on left no prefix: it
+                    // promoted the block and is loading it whole, or it
+                    // failed. Either way the full load path serves this read,
+                    // taking the block from that load rather than reading the
+                    // frame again for a prefix.
+                    None if waited => return Ok(None),
+                    None => (0, None),
+                };
+            match self.cache.claim_partial_growth(self.table_id, offset) {
+                crate::cache::GrowthClaim::Lead(lead) => {
+                    // A growth that ended between the look above and this
+                    // claim left a longer prefix: look at it instead of
+                    // decoding from the older one.
+                    let decoded = |resume: Option<&crate::table::lazy_block::PartialResume>| {
+                        resume.map_or(0, |resume| resume.decoded_blocks)
+                    };
+                    let grown = self
+                        .cache
+                        .peek_partial_block(self.table_id, offset)
+                        .is_some_and(|entry| {
+                            decoded(Some(&entry.resume)) > decoded(carried_resume.as_ref())
+                        });
+                    if grown
+                        || self.cache.has_block(self.table_id, offset)
+                        || self.cache.block_load_in_flight(self.table_id, offset)
+                    {
+                        drop(lead);
+                        continue;
                     }
-                    (entry.hits, Some(entry.resume))
+                    break (carried_hits, carried_resume, Some(lead));
                 }
-                None => (0, None),
-            };
+                crate::cache::GrowthClaim::Alone => break (carried_hits, carried_resume, None),
+                crate::cache::GrowthClaim::Waited => waited = true,
+            }
+        };
 
+        let timer = crate::cache::Cache::time_load();
         let (fd, _cache_event) = self
             .file_accessor
             .get_or_open_table(&self.table_id, &self.path)?;
@@ -886,6 +933,10 @@ impl Iter {
             covered_upper,
             payload,
         } = built?;
+        // Timed into the shard its growths coordinate in, which no other
+        // load of the block feeds.
+        self.cache
+            .record_partial_growth(self.table_id, offset, timer);
         // Covering this query decoded most of the block → promote: drop the
         // partial and let the caller cache the whole block.
         if promote_by_fraction(payload.decoded_blocks, total_blocks) {
