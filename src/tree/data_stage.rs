@@ -77,12 +77,8 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             decode_failure: None,
         };
         // Whatever can fail comes first, so a failed chunk hands out no job.
-        // A block another read has published since the chunk was planned is
-        // taken as held; the rest are claimed, so a point read missing one of
-        // them meanwhile waits for this chunk instead of reading it again.
-        // Which tasks took a shared block, sized only once one does: a chunk
-        // whose blocks were all cached allocates nothing here.
-        let mut shared: Vec<bool> = Vec::new();
+        // The blocks to read are claimed, so a point read missing one of them
+        // meanwhile waits for this chunk instead of reading it again.
         let lead = out.leads_loads();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
             match block {
@@ -91,23 +87,12 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 }
                 TaskBlock::Read => {
                     task.table.check_block_size(&task.handle)?;
-                    match task.table.claim_batched_block(
+                    if let Some(lead) = task.table.claim_batched_block(
                         &task.handle,
                         crate::table::block::BlockType::Data,
                         lead,
                     ) {
-                        crate::cache::BlockClaim::Shared(block) => {
-                            let block = task.table.data_block_of(block)?;
-                            Tree::read_task_keys(task, index, &block, keys, &mut read.hits)?;
-                            if shared.is_empty() {
-                                shared.resize(chunk.len(), false);
-                            }
-                            if let Some(flag) = shared.get_mut(index) {
-                                *flag = true;
-                            }
-                        }
-                        crate::cache::BlockClaim::Lead(lead) => read.leads.push((index, lead)),
-                        crate::cache::BlockClaim::Alone => {}
+                        read.leads.push((index, lead));
                     }
                 }
                 TaskBlock::Load => {}
@@ -126,7 +111,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
         }
         let mut carry = carried.take();
         for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if !matches!(block, TaskBlock::Read) || shared.get(index) == Some(&true) {
+            if !matches!(block, TaskBlock::Read) {
                 continue;
             }
             // Its size is checked above.

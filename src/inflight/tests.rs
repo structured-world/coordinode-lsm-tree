@@ -327,21 +327,19 @@ fn a_batched_wait_feeds_every_shard_its_share_per_read() {
     .expect("sampling thread");
 }
 
-/// One load in `LOAD_SAMPLE_EVERY` of a thread is timed, and a timed one
-/// feeds the estimate when recorded.
+/// About one load in `LOAD_SAMPLE_EVERY` of a thread is timed, and a timed
+/// one feeds the estimate when recorded.
 #[test]
 fn one_load_in_the_sampling_period_is_timed() {
     std::thread::spawn(|| {
-        let timers: Vec<LoadTimer> = (0..LOAD_SAMPLE_EVERY * 4)
+        let timers: Vec<LoadTimer> = (0..LOAD_SAMPLE_EVERY * 256)
             .map(|_| LoadTimer::start())
             .collect();
-        assert_eq!(
-            timers
-                .iter()
-                .filter(|timer| timer.started.is_some())
-                .count(),
-            4
-        );
+        let timed = timers
+            .iter()
+            .filter(|timer| timer.started.is_some())
+            .count();
+        assert!((128..=384).contains(&timed), "{timed} of 4096 timed");
         let loads = timed_loads();
         let timed = timers
             .into_iter()
@@ -350,6 +348,35 @@ fn one_load_in_the_sampling_period_is_timed() {
         std::thread::sleep(Duration::from_millis(1));
         loads.record_load(&4, timed);
         assert!(loads.estimate(&4) > 0);
+    })
+    .join()
+    .expect("sampling thread");
+}
+
+/// The loads a thread times follow no period a workload can fall in step
+/// with: a thread alternating the loads of two registries times loads of
+/// both, where timing every sixteenth would time only the one on that slot.
+#[test]
+fn a_thread_alternating_registries_times_loads_of_each() {
+    std::thread::spawn(|| {
+        let (first, second) = (timed_loads(), timed_loads());
+        for _ in 0..LOAD_SAMPLE_EVERY * 16 {
+            for loads in [&first, &second] {
+                let timer = LoadTimer::start();
+                if timer.started.is_some() {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                loads.record_load(&5, timer);
+            }
+        }
+        assert!(
+            first.estimate(&5) > 0,
+            "the first registry's loads are timed"
+        );
+        assert!(
+            second.estimate(&5) > 0,
+            "the second registry's loads are timed"
+        );
     })
     .join()
     .expect("sampling thread");

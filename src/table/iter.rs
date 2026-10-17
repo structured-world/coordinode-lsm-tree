@@ -750,6 +750,13 @@ impl Iter {
             if self.cache.has_block(self.table_id, offset) {
                 return Ok(None);
             }
+            // A full load of the block is in flight (a point read, an
+            // unbounded scan, a promotion): the full load path waits for it
+            // and takes the whole block, which covers any query, rather than
+            // reading the frame again for a prefix.
+            if self.cache.block_load_in_flight(self.table_id, offset) {
+                return Ok(None);
+            }
             // Existing partial entry: serve from it (bumping hits) when it
             // already covers the query, else decide whether to grow it or
             // promote. The fall-through carries the hit count + the resume
@@ -815,7 +822,10 @@ impl Iter {
                         .is_some_and(|entry| {
                             decoded(Some(&entry.resume)) > decoded(carried_resume.as_ref())
                         });
-                    if grown || self.cache.has_block(self.table_id, offset) {
+                    if grown
+                        || self.cache.has_block(self.table_id, offset)
+                        || self.cache.block_load_in_flight(self.table_id, offset)
+                    {
                         drop(lead);
                         continue;
                     }
@@ -826,6 +836,7 @@ impl Iter {
             }
         };
 
+        let timer = crate::cache::Cache::time_load();
         let (fd, _cache_event) = self
             .file_accessor
             .get_or_open_table(&self.table_id, &self.path)?;
@@ -922,6 +933,10 @@ impl Iter {
             covered_upper,
             payload,
         } = built?;
+        // Timed into the shard its growths coordinate in, which no other
+        // load of the block feeds.
+        self.cache
+            .record_partial_growth(self.table_id, offset, timer);
         // Covering this query decoded most of the block → promote: drop the
         // partial and let the caller cache the whole block.
         if promote_by_fraction(payload.decoded_blocks, total_blocks) {

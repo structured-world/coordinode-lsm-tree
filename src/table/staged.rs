@@ -244,17 +244,13 @@ impl<'t> StagedRead<'t> {
         }
         // Claimed, so a point read missing the block while this read fetches
         // it waits for it rather than reading it again.
-        match self
+        if let Some(lead) = self
             .table
             .claim_batched_block(&handle, block_type, self.lead_loads)
         {
-            crate::cache::BlockClaim::Shared(block) => self.held.push((offset, block)),
-            crate::cache::BlockClaim::Lead(lead) => {
-                self.leads.push((offset, lead));
-                self.need.push(handle);
-            }
-            crate::cache::BlockClaim::Alone => self.need.push(handle),
+            self.leads.push((offset, lead));
         }
+        self.need.push(handle);
     }
 
     /// The held block at `offset`.

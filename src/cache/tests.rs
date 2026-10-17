@@ -222,7 +222,7 @@ fn a_thread_leading_a_batched_load_never_waits() {
     let waited = std::thread::spawn({
         let cache = Arc::clone(&cache);
         move || {
-            let BlockClaim::Lead(batched) =
+            let Some(batched) =
                 cache.claim_batched_block(id, crate::table::BlockOffset(1), identity, true)
             else {
                 panic!("the batched read leads block 1");

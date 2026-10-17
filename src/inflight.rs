@@ -313,15 +313,31 @@ struct Shard<K, V, I, S> {
 /// [`Duration::MAX`]: core::time::Duration::MAX
 const NEVER: u64 = u64::MAX;
 
-/// One in this many physical loads of a thread is timed.
+/// One in this many physical loads of a thread is timed, on average.
 #[cfg(feature = "std")]
 const LOAD_SAMPLE_EVERY: u32 = 16;
 
 #[cfg(feature = "std")]
 std::thread_local! {
-    /// Physical loads the calling thread has started, counting modulo
-    /// [`LOAD_SAMPLE_EVERY`] to pick the ones it times.
-    static LOADS_STARTED: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// The calling thread's sampling generator (xorshift32, never zero). The
+    /// loads it times follow no period, so a thread that serves several
+    /// caches or keys in a fixed rotation still times loads of each, where
+    /// timing every n-th load would time only the one on that slot.
+    static LOAD_SAMPLER: core::cell::Cell<u32> = const { core::cell::Cell::new(0x9E37_79B9) };
+}
+
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    /// Whether the calling thread times every load (`Some(true)`), none
+    /// (`Some(false)`), or samples them (`None`), for tests.
+    static SAMPLING_OVERRIDE: core::cell::Cell<Option<bool>> = const { core::cell::Cell::new(None) };
+}
+
+/// Makes the calling thread time every load (`Some(true)`), none
+/// (`Some(false)`), or sample them again (`None`), for tests.
+#[cfg(all(test, feature = "std", any(feature = "zstd", feature = "columnar")))]
+pub fn override_load_sampling_on_this_thread(sample: Option<bool>) {
+    SAMPLING_OVERRIDE.with(|cell| cell.set(sample));
 }
 
 /// The timing of one physical load, when it is one of the sampled ones.
@@ -340,11 +356,19 @@ impl LoadTimer {
     pub fn start() -> Self {
         #[cfg(feature = "std")]
         {
-            let sampled = LOADS_STARTED.with(|count| {
-                // A counter modulo the sampling period: it is meant to wrap.
-                let next = count.get().wrapping_add(1) % LOAD_SAMPLE_EVERY;
-                count.set(next);
-                next == 0
+            #[cfg(test)]
+            if let Some(sampled) = SAMPLING_OVERRIDE.with(core::cell::Cell::get) {
+                return Self {
+                    started: sampled.then(std::time::Instant::now),
+                };
+            }
+            let sampled = LOAD_SAMPLER.with(|state| {
+                let mut x = state.get();
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                state.set(x);
+                x < u32::MAX / LOAD_SAMPLE_EVERY
             });
             Self {
                 started: sampled.then(std::time::Instant::now),
@@ -535,8 +559,22 @@ where
     /// put its result there. While the key's shard loads quicker than the
     /// coalescing threshold, the request loads alone without a lock taken.
     pub fn claim(&self, key: K, identity: I) -> Claim<'_, K, V, I, S> {
+        self.claim_as(key, identity, false)
+    }
+
+    /// As [`Self::claim`], coordinating whatever the key's shard has
+    /// measured when `coordinated` says so: for an object loaded as part of
+    /// one whose load is coordinated already, such as a page of a row group
+    /// whose directory load is, whose own loads may never have been timed.
+    /// A threshold no load reaches still coordinates nothing.
+    pub fn claim_as(&self, key: K, identity: I, coordinated: bool) -> Claim<'_, K, V, I, S> {
         let shard = self.shard(&key);
-        if !self.coalesces(shard) {
+        let coalesces = if coordinated {
+            self.coalesce_after_nanos != NEVER
+        } else {
+            self.coalesces(shard)
+        };
+        if !coalesces {
             return Claim::Alone;
         }
         let mut shard = shard.state.lock();
@@ -666,9 +704,44 @@ where
         let _ = (timer, reads);
     }
 
+    /// Folds a read of the objects `keys` names that `timer` timed, if it is
+    /// a sampled one, into the estimate of each one's shard, as what each
+    /// took: the read's length shared among them, since they were asked for
+    /// together.
+    #[cfg(feature = "columnar")]
+    pub fn record_loads(&self, keys: impl Iterator<Item = K> + Clone, timer: LoadTimer) {
+        #[cfg(feature = "std")]
+        if let Some(started) = timer.started {
+            // Counted only for a sampled read, so the others pay nothing.
+            let count = keys.clone().count();
+            if count == 0 {
+                return;
+            }
+            let per_load = started.elapsed().as_nanos() / count as u128;
+            // A load past `u64::MAX` nanoseconds (five centuries) is simply
+            // slow.
+            let sample = u64::try_from(per_load).unwrap_or(u64::MAX);
+            for key in keys {
+                self.fold_sample(&key, sample);
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = (keys, timer);
+    }
+
+    /// Whether a load of `key` is in flight now, coordinated here. A load
+    /// of a shard that does not coordinate is never registered.
+    #[cfg(feature = "zstd")]
+    pub fn in_flight(&self, key: &K) -> bool {
+        let shard = self.shard(key);
+        self.coalesces(shard) && shard.state.lock().loads.contains_key(key)
+    }
+
     /// Moves the estimate of `key`'s shard an eighth of the way to `sample`.
     /// Read and written apart: it is a statistic, and two samples folded at
     /// once lose one of them rather than anything that needs to be exact.
+    // no-std: nothing is timed without a clock, so nothing is folded.
+    #[cfg(any(test, feature = "std"))]
     fn fold_sample(&self, key: &K, sample: u64) {
         let estimate = &self.shard(key).load_nanos;
         let old = estimate.load(Ordering::Relaxed);
@@ -678,8 +751,17 @@ where
 
     /// The load-time estimate of `key`'s shard, in nanoseconds, for tests.
     #[cfg(test)]
-    fn estimate(&self, key: &K) -> u64 {
+    pub fn estimate(&self, key: &K) -> u64 {
         self.shard(key).load_nanos.load(Ordering::Relaxed)
+    }
+
+    /// The load-time estimates of every shard summed, for tests.
+    #[cfg(all(test, feature = "columnar"))]
+    pub fn estimates_total(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|shard| shard.0.load_nanos.load(Ordering::Relaxed))
+            .sum()
     }
 
     fn shard(&self, key: &K) -> &Shard<K, V, I, S> {

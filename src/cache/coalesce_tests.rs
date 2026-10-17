@@ -334,6 +334,29 @@ fn point_read_waits_for_a_block_a_multi_get_reads() -> crate::Result<()> {
     Ok(())
 }
 
+/// A blocking multi-get over a table whose filter and index blocks are not
+/// pinned leads the loads of those blocks as well, and publishes each one as
+/// it is supplied: every value is right and no load stays registered.
+#[test]
+fn a_multi_get_leads_and_publishes_its_filter_and_index_loads() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let cache = sharing_cache(64 << 20);
+    let tree = config(folder.path())
+        .with_fs(FaultFs::new(StdFs))
+        .use_cache(Arc::clone(&cache))
+        .filter_block_pinning_policy(PinningPolicy::all(false))
+        .index_block_pinning_policy(PinningPolicy::all(false))
+        .open()?;
+    let values = tree.multi_get((0..64u8).map(|key| [key]), SeqNo::MAX)?;
+    for (key, got) in (0..64u8).zip(values) {
+        assert_eq!(got.as_deref(), Some(&value(key)[..]), "key {key}");
+    }
+    assert_eq!(cache.loads_in_flight(), 0, "no load stays registered");
+    Ok(())
+}
+
 /// A multi-get its caller drives leads no load: the caller can hold it
 /// suspended as long as it likes, so a point read missing one of its blocks
 /// meanwhile reads the block itself rather than waiting on it.
@@ -634,6 +657,135 @@ fn a_read_waiting_on_a_growth_that_promotes_shares_the_full_load() -> crate::Res
         "the wide read's frame and its full load, and nothing for the narrow one"
     );
     assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
+/// The growth of a block's partial prefix is timed into the shard its
+/// growths coordinate in, so bounded scans alone switch their coordination
+/// on once their loads are slow.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_partial_prefix_growth_is_timed_in_its_own_shard() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let (table, _, offset) = partial_table(folder.path(), FaultFs::new(StdFs))?;
+    let (cache, id) = (Arc::clone(&table.cache), table.global_id());
+    let keys = std::thread::spawn(move || {
+        crate::inflight::override_load_sampling_on_this_thread(Some(true));
+        keys_below(&table, 30)
+    })
+    .join()
+    .expect("reader")?;
+    assert_eq!(keys, expected_below(30));
+    assert!(
+        cache.partial_growth_estimate(id, offset) > 0,
+        "the growth's load was timed"
+    );
+    Ok(())
+}
+
+/// A bounded range missing a cold block that another read is loading whole
+/// takes that load's block, which covers any query, rather than reading the
+/// frame again for a prefix of it.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_bounded_range_takes_a_full_load_in_flight_rather_than_a_prefix() -> crate::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let (table, path, offset) = partial_table(folder.path(), fs)?;
+    let cache = Arc::clone(&table.cache);
+
+    // The full load's read is held until the bounded range waits on it.
+    let entered = Arc::new(Barrier::new(2));
+    let reads = Arc::new(AtomicUsize::new(0));
+    {
+        let (entered, reads, cache) =
+            (Arc::clone(&entered), Arc::clone(&reads), Arc::clone(&cache));
+        injector.hook_read_at(
+            path,
+            *offset,
+            Arc::new(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.wait();
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while cache.load_waiters() < 1 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+            }),
+        );
+    }
+    // An unbounded scan loads its first block whole.
+    let full = {
+        let table = table.clone();
+        std::thread::spawn(move || {
+            table
+                .range_iter::<core::ops::RangeFull>(..)
+                .next()
+                .transpose()
+                .map(|kv| kv.map(|kv| kv.key.user_key))
+        })
+    };
+    entered.wait();
+    let bounded = std::thread::spawn(move || keys_below(&table, 30));
+    assert_eq!(bounded.join().expect("reader")?, expected_below(30));
+    assert_eq!(
+        full.join().expect("reader")?,
+        expected_below(1).into_iter().next()
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "one read of the block, the full load's"
+    );
+    assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
+/// The pages a read fetches under a cached directory are timed into the
+/// shards their own loads coordinate in, so reads of a group whose directory
+/// is warm switch their coordination on once its page loads are slow.
+#[cfg(feature = "columnar")]
+#[test]
+fn page_loads_under_a_cached_directory_are_timed() -> crate::Result<()> {
+    use crate::config::BlockSizePolicy;
+    let key = |i: u16| i.to_be_bytes();
+    let folder = tempfile::tempdir()?;
+    {
+        let crate::AnyTree::Standard(tree) = config(folder.path())
+            .filter_policy(crate::config::FilterPolicy::disabled())
+            .columnar_row_group_size_policy(BlockSizePolicy::all(128 * 1_024))
+            .columnar_page_size_policy(BlockSizePolicy::all(4 * 1_024))
+            .open()?
+        else {
+            unreachable!("standard tree configured");
+        };
+        tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+        for i in 0..200u16 {
+            tree.insert(key(i), [b'v'; 4_096], u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let cache = Arc::new(Cache::with_capacity_bytes(64 << 20).with_row_cache(false));
+    let tree = reopen_cold(folder.path(), FaultFs::new(StdFs), &cache, false)?;
+    let read = |i: u16, timed: bool| {
+        let tree = tree.clone();
+        std::thread::spawn(move || {
+            crate::inflight::override_load_sampling_on_this_thread(Some(timed));
+            tree.get(key(i), SeqNo::MAX)
+        })
+        .join()
+        .expect("reader")
+    };
+    // Untimed: the directory, the index and the key page are cached.
+    assert_eq!(read(7, false)?.as_deref(), Some(&[b'v'; 4_096][..]));
+    assert_eq!(cache.load_estimates_total(), 0);
+    // A row of the same group on another row page: only that page loads.
+    assert_eq!(read(20, true)?.as_deref(), Some(&[b'v'; 4_096][..]));
+    assert!(
+        cache.load_estimates_total() > 0,
+        "the page's load was timed"
+    );
     Ok(())
 }
 

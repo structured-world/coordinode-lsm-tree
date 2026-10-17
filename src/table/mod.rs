@@ -8084,19 +8084,18 @@ impl Table {
         }
     }
 
-    /// Claims the load of the block at `handle`, of `block_type`, for a
-    /// batched read about to read it with others: when `lead` lets it, the
-    /// read leads it, so a point read missing the same block meanwhile waits
-    /// for it rather than reading it again; a block another read already
-    /// published is taken. Never waits, since a batched read holds the leads
-    /// of its other blocks.
+    /// Claims the lead of the load of the block at `handle`, of `block_type`,
+    /// for a batched read about to read it with others, when `lead` lets it:
+    /// a point read missing the same block meanwhile then waits for it rather
+    /// than reading it again. `None` when the read reads it alone. Never
+    /// waits, since a batched read holds the leads of its other blocks.
     pub(crate) fn claim_batched_block(
         &self,
         handle: &BlockHandle,
         block_type: BlockType,
         lead: bool,
-    ) -> crate::cache::BlockClaim<'_> {
-        let claim = self.cache.claim_batched_block(
+    ) -> Option<crate::cache::BlockLead<'_>> {
+        self.cache.claim_batched_block(
             self.global_id(),
             handle.offset(),
             crate::cache::LoadIdentity::Block {
@@ -8106,14 +8105,7 @@ impl Table {
                 encrypted: self.encryption.is_some(),
             },
             lead,
-        );
-        #[cfg(feature = "metrics")]
-        if matches!(claim, crate::cache::BlockClaim::Shared(_)) {
-            self.metrics
-                .block_load_shared
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
-        claim
+        )
     }
 
     pub(crate) fn decode_block_from_bytes(

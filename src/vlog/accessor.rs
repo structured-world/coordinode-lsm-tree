@@ -173,7 +173,10 @@ impl<'a> Accessor<'a> {
                 }
                 // The read that led may not cache what it reads (its policy
                 // is its own, taken when it began): one whose policy does
-                // caches the shared value itself.
+                // caches the shared value itself. The position alone is
+                // checked: every value cached there passed the record check
+                // of its key and size against the record's header, so an
+                // entry at this position is for this same key and size.
                 if self.fill.fills() && !cache.contains_blob(tree_id, vhandle) {
                     let detached = cache.insert_blob(tree_id, vhandle, key, value.clone());
                     self.count_gather(detached);
