@@ -827,7 +827,7 @@ impl GroupRead<'_> {
     ) -> crate::Result<Vec<PageSlot>> {
         let entries = directory.entries();
         let io_buffer = self.budget.io_buffer() as usize;
-        let leads = self.claim_pages(directory, directory_len, &mut pages, with_directory);
+        let leads = self.claim_pages(directory, directory_len, front, &mut pages, with_directory);
         let mut leads = leads.into_iter().peekable();
         // Runs of slots whose pages are missing and lie back to back in the
         // group: consecutive slots of consecutive directory entries.
@@ -945,12 +945,15 @@ impl GroupRead<'_> {
     /// that load while this read leads none yet. Once it leads one, others
     /// may wait on it, so it waits no more and reads such a page alone.
     /// Returns the leads by slot, in slot order. A read that must leave no
-    /// trace in the cache claims nothing. `with_directory` says the load of
-    /// the directory was coordinated (see [`crate::Cache::claim_page`]).
+    /// trace in the cache claims nothing, and neither is a page claimed whose
+    /// bytes `front` already holds: its read is done, and waiting on another
+    /// read's load of it could only delay it. `with_directory` says the load
+    /// of the directory was coordinated (see [`crate::Cache::claim_page`]).
     fn claim_pages(
         &self,
         directory: &PageDirectory,
         directory_len: u32,
+        front: &Slice,
         pages: &mut [PageSlot],
         with_directory: bool,
     ) -> Vec<(usize, crate::cache::BlockLead<'_>)> {
@@ -958,11 +961,16 @@ impl GroupRead<'_> {
         if !self.charge.touches_cache() {
             return leads;
         }
-        let pages_at =
-            *self.group.offset() + u64::from(directory_len) + u64::from(directory.pages_start());
+        // Within the group: the extent check proved the pages fill it, and
+        // its length is a `u32`.
+        let in_group = directory_len as usize + directory.pages_start() as usize;
+        let pages_at = *self.group.offset() + in_group as u64;
         let entries = directory.entries();
         for (at, slot) in pages.iter_mut().enumerate() {
-            let Some(entry) = entries.get(slot.index).filter(|_| slot.block.is_none()) else {
+            let Some(entry) = entries.get(slot.index).filter(|entry| {
+                slot.block.is_none()
+                    && in_group + entry.offset as usize + entry.length as usize > front.len()
+            }) else {
                 continue;
             };
             let offset = BlockOffset(pages_at + u64::from(entry.offset));

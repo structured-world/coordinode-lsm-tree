@@ -8066,14 +8066,6 @@ impl Table {
         Some(block)
     }
 
-    /// Decodes the on-disk `bytes` of this table's block of `block_type` read
-    /// at `offset`, with the codec that block type is written with, exactly as
-    /// the load path decodes it; a block of another type is refused. Not for
-    /// Page-ECC tables, whose recovery needs the re-reading load path.
-    ///
-    /// # Errors
-    ///
-    /// Propagates a corruption or decode error.
     /// The codec a block a batched read decodes is written with. Filter blocks
     /// are written uncompressed and without the dictionary, index blocks with
     /// the index codec, data blocks with the data codec and its dictionary:
@@ -8110,6 +8102,14 @@ impl Table {
         )
     }
 
+    /// Decodes the on-disk `bytes` of this table's block of `block_type` read
+    /// at `offset`, with the codec that block type is written with, exactly as
+    /// the load path decodes it; a block of another type is refused. Not for
+    /// Page-ECC tables, whose recovery needs the re-reading load path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a corruption or decode error.
     pub(crate) fn decode_block_from_bytes(
         &self,
         bytes: &[u8],

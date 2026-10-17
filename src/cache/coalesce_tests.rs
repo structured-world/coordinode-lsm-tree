@@ -844,6 +844,84 @@ fn page_loads_under_a_cached_directory_are_timed() -> crate::Result<()> {
     Ok(())
 }
 
+/// A maintenance read paced by a rate budget may wait on it in the middle of
+/// its read: it leads no load a foreground miss of the same block would wait
+/// behind, and the wait feeds no load-time estimate.
+#[cfg(feature = "std")]
+#[test]
+fn a_paced_maintenance_load_holds_up_no_foreground_miss() -> crate::Result<()> {
+    use crate::table::util::ReadPacer;
+    use std::sync::atomic::AtomicBool;
+
+    /// Stands for a rate budget: holds the read until it is released.
+    struct Budget {
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+    impl ReadPacer for Budget {
+        fn active(&self) -> bool {
+            true
+        }
+        fn pace(&self, _offset: u64, _len: u64) {
+            self.entered.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.released.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    write_keys(config(folder.path()), 64)?;
+    let cache = sharing_cache(64 << 20);
+    let tree = reopen_cold(folder.path(), FaultFs::new(StdFs), &cache, false)?;
+    let version = tree.current_version();
+    let Some(table) = version.iter_tables().next() else {
+        panic!("the flush wrote a table");
+    };
+    let handle = {
+        use crate::table::block_index::BlockIndex as _;
+        let Some(keyed) = table.block_index.iter().find_map(Result::ok) else {
+            panic!("a non-empty table has a data block");
+        };
+        *keyed.as_ref()
+    };
+    let budget = Budget {
+        entered: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    };
+    let (held_up, foreground, paced) = std::thread::scope(|scope| {
+        let paced = scope.spawn(|| {
+            crate::inflight::override_load_sampling_on_this_thread(Some(true));
+            table.load_data_block_for_maintenance(&handle, &budget)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !budget.entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let foreground = scope.spawn(|| {
+            crate::inflight::override_load_sampling_on_this_thread(Some(false));
+            tree.get([0], SeqNo::MAX)
+        });
+        while !foreground.is_finished() && cache.load_waiters() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let held_up = cache.load_waiters() > 0;
+        budget.released.store(true, Ordering::SeqCst);
+        (
+            held_up,
+            foreground.join().expect("foreground"),
+            paced.join().expect("maintenance"),
+        )
+    });
+    assert!(!held_up, "the foreground miss waited on the paced read");
+    assert_eq!(foreground?.as_deref(), Some(&value(0)[..]));
+    assert!(paced?.is_some(), "the paced read loads the block");
+    assert_eq!(cache.load_estimates_total(), 0, "the paced wait was timed");
+    assert_eq!(cache.loads_in_flight(), 0);
+    Ok(())
+}
+
 /// A read that caches the values it reads, waiting on a read of the same
 /// value that does not, caches the shared value itself: whether the value
 /// lands in the cache follows the policy of the read that asked, not of the

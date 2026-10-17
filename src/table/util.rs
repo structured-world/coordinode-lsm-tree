@@ -364,8 +364,11 @@ pub(crate) fn load_block_paced(
 
     // A read that leaves the cache as it found it loads alone: it must not
     // take a block a foreground read decoded, and its own read verifies
-    // the disk afresh.
-    let lead = if charge.touches_cache() {
+    // the disk afresh. So does a paced read: its pacer may hold it on a rate
+    // budget in the middle of the read, which a read waiting on it would
+    // wait out too, and which is no measure of how long a load takes.
+    let coordinated = charge.touches_cache() && pace.is_none();
+    let lead = if coordinated {
         match cache.claim_block(
             table_id,
             handle.offset(),
@@ -486,8 +489,10 @@ pub(crate) fn load_block_paced(
     )?;
     // A read that must leave no trace feeds no estimate either: its loads
     // would otherwise switch on the waiting of the reads after it.
-    if charge.touches_cache() {
+    if coordinated {
         cache.record_block_load(table_id, handle.offset(), timer);
+    }
+    if charge.touches_cache() {
         cache.insert_block(table_id, handle.offset(), block.clone());
     }
     if let Some(lead) = lead {
