@@ -654,9 +654,16 @@ where
         self.coalesce_after_nanos = u64::try_from(coalesce_after.as_nanos()).unwrap_or(NEVER);
     }
 
-    /// The duration a physical load must take for misses to coordinate.
+    /// The duration a physical load must take for misses to coordinate;
+    /// [`Duration::MAX`] when none does.
+    ///
+    /// [`Duration::MAX`]: core::time::Duration::MAX
     pub fn coalesce_after(&self) -> core::time::Duration {
-        core::time::Duration::from_nanos(self.coalesce_after_nanos)
+        if self.coalesce_after_nanos == NEVER {
+            core::time::Duration::MAX
+        } else {
+            core::time::Duration::from_nanos(self.coalesce_after_nanos)
+        }
     }
 
     /// Whether misses of `shard` coordinate: its loads take at least the

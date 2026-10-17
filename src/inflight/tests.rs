@@ -259,6 +259,19 @@ fn a_threshold_of_seconds_is_reached_by_loads_that_take_longer() {
     assert!(matches!(never.claim(1, 1), Claim::Alone), "MAX shares none");
 }
 
+/// A threshold that coordinates nothing reads back as `Duration::MAX`, the
+/// value that sets it, as does one past what nanoseconds in a `u64` hold;
+/// a finite one reads back as set.
+#[test]
+fn a_threshold_reads_back_as_set() {
+    let mut loads: Loads = InflightLoads::new(1, 8, Duration::MAX, rustc_hash::FxBuildHasher);
+    assert_eq!(loads.coalesce_after(), Duration::MAX);
+    loads.set_coalesce_after(Duration::from_secs(u64::MAX));
+    assert_eq!(loads.coalesce_after(), Duration::MAX);
+    loads.set_coalesce_after(Duration::from_micros(64));
+    assert_eq!(loads.coalesce_after(), Duration::from_micros(64));
+}
+
 /// The estimate moves an eighth of the way to each sample, and stays within
 /// range for the longest sample there is.
 #[test]
