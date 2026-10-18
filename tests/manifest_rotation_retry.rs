@@ -66,3 +66,49 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
     }
     Ok(())
 }
+
+/// An install whose directory sync fails is withdrawn: the operation that
+/// asked for it reports the failure and removes what it wrote for it (a
+/// compaction its outputs), so the snapshot it named must not stay in place
+/// for a reopen to take over the files that are gone.
+#[test]
+fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .manifest_log_rotate_bytes(0)
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in ["k0", "k1"].into_iter().enumerate() {
+            tree.insert(k, "v", seqno as u64);
+            tree.flush_active_memtable(0)?;
+        }
+        // The compaction syncs its output's folder, then fails the directory
+        // sync of the install that names the output.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .once(),
+        );
+        assert!(
+            tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+            "the armed directory sync must fail the compaction's install"
+        );
+    }
+
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
