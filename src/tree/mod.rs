@@ -5537,6 +5537,7 @@ impl Tree {
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
+            false,
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
@@ -5690,7 +5691,19 @@ impl Tree {
         // the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> crate::Result<Self> {
-        use crate::file::fsync_directory;
+        use crate::file::{BLOBS_FOLDER, fsync_directory};
+        use crate::fs::SyncMode;
+        use crate::path::PathBuf;
+
+        /// Adds `folder` on `fs` to `folders` unless it is there already.
+        fn once(folders: &mut Vec<(PathBuf, Arc<dyn Fs>)>, folder: &Path, fs: &Arc<dyn Fs>) {
+            if !folders
+                .iter()
+                .any(|(at, on)| at == folder && Arc::ptr_eq(on, fs))
+            {
+                folders.push((folder.to_path_buf(), Arc::clone(fs)));
+            }
+        }
 
         let path = config.path.clone();
         log::trace!("Creating LSM-tree at {}", path.display());
@@ -5699,29 +5712,52 @@ impl Tree {
 
         (*config.fs).create_dir_all(&path)?;
 
-        // Create tables directories for all configured paths (primary + routes).
-        // create_dir_all may create both <route> and <route>/tables.
-        // Fsync the tables dir, its parent (route dir), AND the route's parent
-        // to make all newly-created directory entries durable on POSIX.
-        for (table_folder_path, folder_fs) in config.all_tables_folders() {
-            folder_fs.create_dir_all(&table_folder_path)?;
-            fsync_directory(&table_folder_path, &*folder_fs, sync_mode)?;
-            if let Some(parent) = table_folder_path.parent() {
-                fsync_directory(parent, &*folder_fs, sync_mode)?;
-                if let Some(grandparent) = parent.parent() {
-                    fsync_directory(grandparent, &*folder_fs, sync_mode)?;
+        // Every folder the tree writes into is made before its first snapshot,
+        // so the directory sync that makes the snapshot's name durable makes
+        // every name made in the tree folder durable too. A new folder holds
+        // no entry yet and needs no sync of its own. What lies outside the tree
+        // folder is synced once each after the snapshot: a routed tables
+        // folder's name in its route, the route's name in the folder above it,
+        // and the tree folder's own name in its parent.
+        let mut outside: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
+        for (tables_folder, folder_fs) in config.all_tables_folders() {
+            folder_fs.create_dir_all(&tables_folder)?;
+            if !tables_folder.starts_with(&path)
+                && let Some(route) = tables_folder.parent()
+            {
+                once(&mut outside, route, &folder_fs);
+                if let Some(above) = route.parent() {
+                    once(&mut outside, above, &folder_fs);
                 }
             }
         }
-
-        // IMPORTANT: fsync primary folder on Unix
-        fsync_directory(&path, &*config.fs, sync_mode)?;
+        if config.kv_separation_opts.is_some() {
+            (*config.fs).create_dir_all(&path.join(BLOBS_FOLDER))?;
+        }
+        if let Some(parent) = path.parent() {
+            once(&mut outside, parent, &config.fs);
+        }
+        let tree_fs = Arc::clone(&config.fs);
 
         let inner = TreeInner::create_new(
             config,
             #[cfg(feature = "std")]
             directory_lock,
         )?;
+        for (folder, folder_fs) in &outside {
+            // A barrier orders syncs on its own device only: the last sync of
+            // the creation on another device than the tree's is a full one.
+            let mode = if sync_mode == SyncMode::Barrier
+                && !matches!(
+                    (folder_fs.volume_id(folder), tree_fs.volume_id(&path)),
+                    (Some(a), Some(b)) if a == b
+                ) {
+                SyncMode::Full
+            } else {
+                sync_mode
+            };
+            fsync_directory(folder, &**folder_fs, mode)?;
+        }
         Ok(Self(Arc::new(inner)))
     }
 

@@ -787,7 +787,7 @@ pub fn recover(
     // verify fails the open in every mode. A clean end-of-log is always
     // accepted. Each applied edit advances `recovery.curr_version_id` past the
     // snapshot's id.
-    let log_path = folder.join(format!("edits-{curr_version_id}"));
+    let log_path = super::edit_log::log_path(folder, curr_version_id);
     let edits = super::edit_log::replay_log(fs, &log_path, mode)?;
     if !edits.is_empty() {
         log::info!(

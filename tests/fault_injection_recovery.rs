@@ -189,8 +189,9 @@ fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> 
     Ok(())
 }
 
-/// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
-/// table, `sync_data` on the manifest edit log) of a flush workload, fail that one barrier,
+/// Exhaustive crash-point sweep: for every durability barrier (`sync_data` on a
+/// table and on the manifest edit log, `sync_all` wherever one is still issued)
+/// of a flush workload, fail that one barrier,
 /// simulate a power loss, reopen, and assert recovery yields a *consistent
 /// prefix* of the inserted keys.
 ///
