@@ -49,9 +49,10 @@
 //! One `CrashFs` is one device. A sync under [`SyncMode::Barrier`], of a file
 //! or a directory, keeps writes in order without making them durable: it is
 //! queued, and [`Fs::sync_device`], or any other sync on the device, makes
-//! every queued one durable. [`CrashFs::crash`] loses them all;
-//! [`CrashFs::crash_keeping`] keeps a prefix of them in the order they were
-//! issued, the most a power loss can leave.
+//! every queued one durable. A removal or a rename issued behind a queued
+//! sync is queued with it, as one step. [`CrashFs::crash`] loses them all;
+//! [`CrashFs::crash_keeping`] keeps a prefix of the steps in the order they
+//! were issued, the most a power loss can leave.
 //!
 //! This is a test/dev surface: it is gated behind the `std` feature and is not
 //! part of the production storage path.
@@ -126,7 +127,7 @@ enum Ordered {
 }
 
 impl CrashState {
-    /// Makes durable the first `count` ordered syncs, in the order they were
+    /// Makes durable the first `count` ordered steps, in the order they were
     /// issued, and drops the rest.
     fn settle(&mut self, count: usize) {
         let ordered = core::mem::take(&mut self.ordered);
@@ -217,7 +218,7 @@ impl CrashState {
         }
     }
 
-    /// Makes durable every ordered sync: a device flush, or a full sync that
+    /// Makes durable every ordered step: a device flush, or a full sync that
     /// flushes the device cache with it.
     fn settle_all(&mut self) {
         self.settle(self.ordered.len());
@@ -397,16 +398,18 @@ impl CrashFs {
         self.crash_keeping(0);
     }
 
-    /// How many syncs [`SyncMode::Barrier`] issued that no device flush has
-    /// made durable yet: a power loss keeps some prefix of them, which
+    /// How many ordered steps no device flush has made durable yet: each sync
+    /// [`SyncMode::Barrier`] issued, and each removal or rename issued behind
+    /// one, which the barrier orders like a sync. A power loss keeps some
+    /// prefix of them, each step whole, which
     /// [`crash_keeping`](Self::crash_keeping) picks.
     #[must_use]
-    pub fn ordered_syncs(&self) -> usize {
+    pub fn ordered_steps(&self) -> usize {
         self.state.lock().ordered.len()
     }
 
     /// Simulates a power loss that keeps the first `kept` of the
-    /// [ordered syncs](Self::ordered_syncs), in the order they were issued,
+    /// [ordered steps](Self::ordered_steps), in the order they were issued,
     /// and loses the rest, then rolls back as [`crash`](Self::crash) does.
     ///
     /// # Panics

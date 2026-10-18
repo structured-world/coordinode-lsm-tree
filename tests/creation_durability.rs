@@ -137,6 +137,24 @@ fn an_open_without_a_pointer_refuses_a_snapshot_a_creation_never_names() {
     }
 }
 
+/// A tables folder that cannot be listed fails an open without a pointer:
+/// whether it holds a tree's state is not known.
+#[test]
+fn an_open_fails_over_a_tables_folder_it_cannot_list() {
+    use lsm_tree::fs::{Fs, FsOpenOptions};
+    let mem = MemFs::new();
+    let fs = CrashFs::new(mem.clone());
+    let db = std::path::absolute(DB).expect("absolute path");
+    mem.create_dir_all(&db).expect("tree folder");
+    mem.open(
+        &db.join("tables"),
+        &FsOpenOptions::new().write(true).create(true),
+    )
+    .expect("a file where the tables folder goes");
+
+    assert!(config(&fs, false).open().is_err());
+}
+
 /// A level route inside the primary tables folder is a folder there, not a
 /// table: an open without a pointer creates the tree over the route's empty
 /// folder, made in advance or by a creation cut short.

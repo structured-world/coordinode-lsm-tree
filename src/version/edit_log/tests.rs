@@ -90,6 +90,32 @@ fn a_log_whose_emptying_failed_to_sync_is_synced_on_the_retry() -> crate::Result
     Ok(())
 }
 
+/// A probe of the log's name that fails for another reason than its absence
+/// fails the creation: whether a log is there to empty is not known.
+#[test]
+fn a_failed_probe_of_the_log_fails_its_creation() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::Metadata,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("edits-0"),
+    );
+    let Err(crate::Error::Io(e)) = create_log(&fs, Path::new("/db"), 0, SyncMode::Full) else {
+        panic!("the probe's failure is the creation's");
+    };
+    assert_eq!(e.kind(), crate::io::ErrorKind::PermissionDenied);
+    fs.injector().clear();
+    assert!(
+        !fs.exists(&log_path(Path::new("/db"), 0))?,
+        "no log is made"
+    );
+    Ok(())
+}
+
 /// A first append whose directory sync fails writes no edit: a record left
 /// in the log would be made durable by the next append's sync, though the
 /// operation it records was reported failed.

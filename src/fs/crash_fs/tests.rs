@@ -1579,7 +1579,7 @@ fn a_barrier_sync_is_lost_without_a_device_flush() {
     write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
 
     assert_eq!(
-        fs.ordered_syncs(),
+        fs.ordered_steps(),
         2,
         "the file sync and the directory sync"
     );
@@ -1595,7 +1595,7 @@ fn a_device_flush_makes_the_barrier_syncs_durable() {
     write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Barrier);
     fs.sync_device(Path::new("/d")).unwrap();
 
-    assert_eq!(fs.ordered_syncs(), 0);
+    assert_eq!(fs.ordered_steps(), 0);
     fs.crash();
     assert_eq!(read(&fs, "/d/a"), b"A");
 }
@@ -1660,7 +1660,7 @@ fn a_removal_behind_a_lost_barrier_sync_is_lost_with_it() {
         write_synced(&fs, "/d", "/d/old", b"O", SyncMode::Full);
         write_synced(&fs, "/d", "/d/new", b"N", SyncMode::Barrier);
         fs.remove_file(Path::new("/d/old")).unwrap();
-        assert_eq!(fs.ordered_syncs(), 3, "two syncs and the removal");
+        assert_eq!(fs.ordered_steps(), 3, "two syncs and the removal");
         fs.crash_keeping(kept);
         fs.exists(Path::new("/d/old")).unwrap()
     };
@@ -1680,7 +1680,7 @@ fn a_removal_of_a_file_only_the_queue_holds_is_ordered_behind_its_syncs() {
         fs.create_dir_all(Path::new("/d")).unwrap();
         write_synced(&fs, "/d", "/d/f", b"F", SyncMode::Barrier);
         fs.remove_file(Path::new("/d/f")).unwrap();
-        assert_eq!(fs.ordered_syncs(), 3, "two syncs and the removal");
+        assert_eq!(fs.ordered_steps(), 3, "two syncs and the removal");
         fs.crash_keeping(kept);
         fs.exists(Path::new("/d/f"))
             .unwrap()
@@ -1770,7 +1770,7 @@ fn a_rename_behind_a_barrier_is_kept_or_lost_whole() {
             .unwrap();
         fs
     };
-    let count = build().ordered_syncs();
+    let count = build().ordered_steps();
     for kept in 0..=count {
         let fs = build();
         fs.crash_keeping(kept);
@@ -1784,6 +1784,94 @@ fn a_rename_behind_a_barrier_is_kept_or_lost_whole() {
     }
 }
 
+/// Writes `content` to the new file `path` without syncing anything.
+fn write_unsynced(fs: &CrashFs, path: &str, content: &[u8]) {
+    let mut file = fs
+        .open(
+            Path::new(path),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    file.write_all(content).unwrap();
+}
+
+/// A kept rename of a file whose bytes were never synced replaces the
+/// destination with a file that has no durable bytes: neither name is left.
+#[test]
+fn a_kept_rename_of_a_never_synced_file_leaves_neither_name() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    write_unsynced(&fs, "/d/b", b"B");
+    fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
+
+    fs.crash_keeping(fs.ordered_steps());
+    assert!(!fs.exists(Path::new("/d/a")).unwrap());
+    assert!(!fs.exists(Path::new("/d/b")).unwrap());
+}
+
+/// A lost rename onto a name whose entry was never synced leaves that name
+/// as the kept steps left it, without an entry, and the source as it was.
+#[test]
+fn a_lost_rename_onto_an_unsynced_name_drops_that_name() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    write_unsynced(&fs, "/d/a", b"A");
+    let kept = fs.ordered_steps();
+    fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
+
+    fs.crash_keeping(kept);
+    assert!(!fs.exists(Path::new("/d/a")).unwrap());
+    assert_eq!(read(&fs, "/d/b"), b"B");
+}
+
+/// Hard links keep their removals and renames immediate behind a queued
+/// removal, and the name left alone in a link group renames in the queue:
+/// once every step is kept, the file is under the last name.
+#[test]
+fn linked_names_beside_a_queued_removal_end_under_the_last_name() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/c", b"C", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/c")).unwrap();
+    fs.hard_link(Path::new("/d/a"), Path::new("/d/l")).unwrap();
+    fs.rename(Path::new("/d/a"), Path::new("/d/m")).unwrap();
+    fs.remove_file(Path::new("/d/l")).unwrap();
+    fs.rename(Path::new("/d/m"), Path::new("/d/n")).unwrap();
+    fs.sync_directory_with(Path::new("/d"), SyncMode::Barrier)
+        .unwrap();
+
+    fs.crash_keeping(fs.ordered_steps());
+    assert_eq!(read(&fs, "/d/n"), b"A");
+    for gone in ["/d/a", "/d/c", "/d/l", "/d/m"] {
+        assert!(!fs.exists(Path::new(gone)).unwrap(), "{gone}");
+    }
+}
+
+/// A folder removed whole takes its queued removals and renames with it: a
+/// crash brings none of its names back.
+#[test]
+fn a_removed_folder_drops_its_queued_steps() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d/sub")).unwrap();
+    write_synced(&fs, "/d/sub", "/d/sub/p", b"P", SyncMode::Full);
+    write_synced(&fs, "/d/sub", "/d/sub/q", b"Q", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/sub/p")).unwrap();
+    fs.rename(Path::new("/d/sub/q"), Path::new("/d/sub/r"))
+        .unwrap();
+    fs.remove_dir_all(Path::new("/d/sub")).unwrap();
+
+    fs.crash_keeping(0);
+    assert!(!fs.exists(Path::new("/d/sub")).unwrap());
+    assert_eq!(read(&fs, "/d/x"), b"X");
+}
+
 /// A kept rename keeps its destination when the step after it that takes
 /// the name again (a removal, or a rename away) is lost: the name holds the
 /// renamed file, as the kept prefix left it.
@@ -1795,13 +1883,13 @@ fn a_kept_rename_survives_a_lost_step_that_takes_its_name() {
         write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Full);
         write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
         fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
-        let kept = fs.ordered_syncs();
+        let kept = fs.ordered_steps();
         if rename_away {
             fs.rename(Path::new("/d/a"), Path::new("/d/c")).unwrap();
         } else {
             fs.remove_file(Path::new("/d/a")).unwrap();
         }
-        assert!(fs.ordered_syncs() > kept, "the later step is queued");
+        assert!(fs.ordered_steps() > kept, "the later step is queued");
 
         fs.crash_keeping(kept);
         assert_eq!(read(&fs, "/d/a"), b"B", "rename away: {rename_away}");

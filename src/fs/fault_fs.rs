@@ -296,6 +296,9 @@ pub struct FaultInjector {
     /// mode a component synced its files at (e.g. a salvage writer honouring
     /// `Config::sync_mode`), which the pass-through delegation cannot show.
     sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
+    /// Observed `(path, mode)` pairs from every `sync_directory_with`, in call
+    /// order: which of a directory's syncs flush the device is a cost.
+    directory_sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
     /// Every sync of any kind, with its path, in call order: how many syncs
     /// an operation costs is part of what it does.
     syncs: spin::Mutex<Vec<(PathBuf, SyncKind)>>,
@@ -444,6 +447,7 @@ impl FaultInjector {
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
+        self.directory_sync_log.lock().clear();
         self.syncs.lock().clear();
         self.writeback_log.lock().clear();
         #[cfg(test)]
@@ -476,6 +480,18 @@ impl FaultInjector {
     #[must_use]
     pub fn sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
         self.sync_log
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.to_string_lossy().contains(substr))
+            .map(|(_, m)| *m)
+            .collect()
+    }
+
+    /// The [`SyncMode`]s of the directory syncs of folders whose path contains
+    /// `substr`, in call order.
+    #[must_use]
+    pub fn directory_sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
+        self.directory_sync_log
             .lock()
             .iter()
             .filter(|(p, _)| p.to_string_lossy().contains(substr))
@@ -688,6 +704,10 @@ impl<F: Fs> Fs for FaultFs<F> {
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
         self.injector.note_sync(path, SyncKind::Directory);
+        self.injector
+            .directory_sync_log
+            .lock()
+            .push((path.to_path_buf(), mode));
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncDirectory, Some(path)) {
             return Err(fault_error(kind, FaultOp::SyncDirectory));
         }

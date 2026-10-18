@@ -369,6 +369,10 @@ fn a_retried_creation_syncs_the_folders_a_failed_one_left() {
         config().open().is_err(),
         "self-check: the creation fails on a folder sync"
     );
+    assert!(
+        !fs.exists(&root.join("a")).expect("probe"),
+        "the failed creation removes the folders it made"
+    );
     let _ = fs.injector().take_syncs();
 
     let _tree = config().open().expect("the retry");
@@ -386,6 +390,84 @@ fn a_retried_creation_syncs_the_folders_a_failed_one_left() {
             holder.display()
         );
     }
+}
+
+/// A creation in a tree folder that exists already gives no folder above it
+/// a new entry, so it syncs none of them: one it may not read (a folder
+/// others may only pass through) would fail the creation.
+#[test]
+fn a_creation_in_a_folder_that_exists_syncs_nothing_above_it() {
+    use lsm_tree::fs::Fs;
+    let base = std::path::absolute("/census/made/tree").expect("absolute path");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    fs.create_dir_all(&base)
+        .expect("the tree folder, made beforehand");
+    let _tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .open()
+    .expect("open");
+
+    let above: Vec<PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .filter(|(path, kind)| *kind == SyncKind::Directory && !path.starts_with(&base))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(above.is_empty(), "synced above the tree: {above:?}");
+}
+
+/// Under barrier syncs a deep route on another device than the tree's
+/// flushes that device once, with the last of its folder syncs; the ones
+/// before it are ordered ahead of it on the same device.
+#[test]
+fn a_new_route_on_another_device_flushes_it_once() {
+    use lsm_tree::fs::{Fs, SyncMode};
+    let base = std::path::absolute("/census/flush/tree").expect("absolute path");
+    let route = std::path::absolute("/elsewhere/a/b/c/hot").expect("absolute path");
+    let tree_fs = Arc::new(FaultFs::new(MemFs::new()));
+    let route_fs = Arc::new(FaultFs::new(MemFs::new()));
+    tree_fs
+        .create_dir_all(base.parent().expect("a parent"))
+        .expect("the tree's parent");
+    route_fs
+        .create_dir_all(std::path::Path::new("/elsewhere"))
+        .expect("the route's root");
+    let _tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(tree_fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: route,
+        fs: route_fs.clone(),
+    }])
+    .open()
+    .expect("open");
+
+    let modes = route_fs.injector().directory_sync_modes_for("elsewhere");
+    assert_eq!(
+        modes.len(),
+        4,
+        "every new folder's holder is synced: {modes:?}"
+    );
+    assert_eq!(
+        modes.iter().filter(|mode| **mode == SyncMode::Full).count(),
+        1,
+        "one flush of the route's device: {modes:?}"
+    );
+    assert_eq!(
+        modes.last(),
+        Some(&SyncMode::Full),
+        "the last one: {modes:?}"
+    );
 }
 
 /// An open of a KV-separated tree that makes its missing `blobs/` folder

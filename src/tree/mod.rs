@@ -5726,63 +5726,96 @@ impl Tree {
         // durable too. A route on another backend holds its own names, even
         // one whose path lies inside the tree folder.
         let mut holders: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
+        // The first folder each chain made, on its backend: what a failed
+        // creation removes, so a retry makes the chain anew and syncs it,
+        // rather than finding folders whose names were never made durable.
+        let mut made: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
         // The open made the tree folder already, to lock it, and every folder
-        // above it that did not exist: their names are new all the same. A
-        // folder that existed before may be one a creation left when it
-        // failed on a sync, made but not known durable, so every folder
-        // above it is synced: nothing tells how far up that creation went.
-        let tree_holders = if made_by_open.is_empty() && (*config.fs).exists(&path)? {
-            ancestors(&path)
-        } else {
-            made_by_open
-                .iter()
-                .cloned()
-                .chain(new_entry_holders(&*config.fs, &path)?)
-                .collect()
-        };
+        // above it that did not exist: their names are new all the same.
+        let tree_holders: Vec<PathBuf> = made_by_open
+            .iter()
+            .cloned()
+            .chain(new_entry_holders(&*config.fs, &path)?)
+            .collect();
+        if let Some(top) = first_made(&path, &tree_holders) {
+            made.push((top, Arc::clone(&config.fs)));
+        }
         for holder in tree_holders {
             once(&mut holders, &holder, &config.fs);
         }
-        (*config.fs).create_dir_all(&path)?;
-        for (tables_folder, folder_fs) in config.all_tables_folders() {
-            let covered = Arc::ptr_eq(&folder_fs, &config.fs);
-            let folder_holders = if folder_fs.exists(&tables_folder)? {
-                ancestors(&tables_folder)
-            } else {
-                new_entry_holders(&*folder_fs, &tables_folder)?
-            };
-            for holder in folder_holders {
-                if !(covered && holder == path) {
-                    once(&mut holders, &holder, &folder_fs);
-                }
-            }
-            folder_fs.create_dir_all(&tables_folder)?;
-        }
-        if config.kv_separation_opts.is_some() {
-            (*config.fs).create_dir_all(&path.join(BLOBS_FOLDER))?;
-        }
-        let tree_fs = Arc::clone(&config.fs);
-        for (folder, folder_fs) in &holders {
-            // A barrier orders syncs on its own device only: the last sync of
-            // the creation on another device than the tree's is a full one.
-            let mode = if sync_mode == SyncMode::Barrier
-                && !matches!(
-                    (folder_fs.volume_id(folder), tree_fs.volume_id(&path)),
-                    (Some(a), Some(b)) if a == b
-                ) {
-                SyncMode::Full
-            } else {
-                sync_mode
-            };
-            fsync_directory(folder, &**folder_fs, mode)?;
-        }
 
-        let inner = TreeInner::create_new(
-            config,
-            #[cfg(feature = "std")]
-            directory_lock,
-        )?;
-        Ok(Self(Arc::new(inner)))
+        let built = (|| -> crate::Result<()> {
+            (*config.fs).create_dir_all(&path)?;
+            for (tables_folder, folder_fs) in config.all_tables_folders() {
+                let covered = Arc::ptr_eq(&folder_fs, &config.fs);
+                let folder_holders = new_entry_holders(&*folder_fs, &tables_folder)?;
+                if let Some(top) = first_made(&tables_folder, &folder_holders) {
+                    once(&mut made, &top, &folder_fs);
+                }
+                for holder in folder_holders {
+                    if !(covered && holder == path) {
+                        once(&mut holders, &holder, &folder_fs);
+                    }
+                }
+                folder_fs.create_dir_all(&tables_folder)?;
+            }
+            if config.kv_separation_opts.is_some() {
+                let blobs = path.join(BLOBS_FOLDER);
+                if !(*config.fs).exists(&blobs)? {
+                    once(&mut made, &blobs, &config.fs);
+                }
+                (*config.fs).create_dir_all(&blobs)?;
+            }
+            // A barrier orders syncs on its own device only: the last sync of
+            // the creation on each other device than the tree's is a full one,
+            // and the ones before it there are ordered ahead of it.
+            let tree_volume = config.fs.volume_id(&path);
+            let volumes: Vec<Option<u64>> = holders
+                .iter()
+                .map(|(folder, folder_fs)| folder_fs.volume_id(folder))
+                .collect();
+            for (at, (folder, folder_fs)) in holders.iter().enumerate() {
+                let volume = volumes.get(at).copied().flatten();
+                let foreign = volume.is_none() || volume != tree_volume;
+                let last_there =
+                    volume.is_none() || !volumes.iter().skip(at + 1).any(|later| *later == volume);
+                let mode = if sync_mode == SyncMode::Barrier && foreign && last_there {
+                    SyncMode::Full
+                } else {
+                    sync_mode
+                };
+                fsync_directory(folder, &**folder_fs, mode)?;
+            }
+            Ok(())
+        })();
+
+        let created = built.and_then(|()| {
+            TreeInner::create_new(
+                config,
+                #[cfg(feature = "std")]
+                directory_lock,
+            )
+        });
+        match created {
+            Ok(inner) => Ok(Self(Arc::new(inner))),
+            Err(e) => {
+                // The lock went with the failed creation; nothing holds what
+                // it made now. Nested chains go with the outer one.
+                for (folder, folder_fs) in &made {
+                    match folder_fs.remove_dir_all(folder) {
+                        Ok(()) => {}
+                        Err(gone) if gone.kind() == crate::io::ErrorKind::NotFound => {}
+                        Err(left) => log::warn!(
+                            "Tree::create_new: could not remove {} after a failed creation \
+                             ({left}); a retry finds it without the sync that makes its \
+                             name durable",
+                            folder.display()
+                        ),
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Recovers the level manifest, loading all tables from disk.
@@ -6640,19 +6673,19 @@ impl Tree {
     }
 }
 
-/// Every folder above `folder`, nearest first.
-fn ancestors(folder: &Path) -> Vec<crate::path::PathBuf> {
-    let mut holders = Vec::new();
+/// The first folder made on the way to `folder`, given the folders that
+/// gained an entry making it ([`new_entry_holders`], nearest first): the one
+/// directly under the farthest of them. `None` when nothing was made.
+fn first_made(folder: &Path, holders: &[crate::path::PathBuf]) -> Option<crate::path::PathBuf> {
+    let farthest = holders.last()?;
     let mut made = folder;
-    // A relative path ends in an empty parent, which names no folder.
-    while let Some(holder) = made
-        .parent()
-        .filter(|holder| !holder.to_string_lossy().is_empty())
-    {
-        holders.push(holder.to_path_buf());
+    while let Some(holder) = made.parent() {
+        if holder == farthest.as_path() {
+            return Some(made.to_path_buf());
+        }
         made = holder;
     }
-    holders
+    None
 }
 
 /// The folders that gain a new entry when `folder` is made on `fs`: each one

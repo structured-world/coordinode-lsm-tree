@@ -491,13 +491,13 @@ fn a_tight_space_blob_defrag_on_another_volume_syncs_its_edits_in_full() -> lsm_
     Ok(())
 }
 
-/// Every prefix of the ordered syncs on one device is a tree that reopens
+/// Every prefix of the ordered steps on one device is a tree that reopens
 /// with a prefix of the flushes, and a device flush keeps them all.
 #[test]
 fn a_power_loss_keeps_an_ordered_prefix_of_barrier_flushes() -> lsm_tree::Result<()> {
     let probe = CrashFs::new(MemFs::new());
     drop(flushes(&probe, None)?);
-    let ordered = probe.ordered_syncs();
+    let ordered = probe.ordered_steps();
     assert!(ordered > 0, "the flushes are ordered, not yet durable");
 
     for kept in 0..=ordered {
@@ -558,7 +558,7 @@ fn every_prefix(
 ) -> lsm_tree::Result<()> {
     let probe = CrashFs::new(MemFs::new());
     workload(&probe)?;
-    let ordered = probe.ordered_syncs();
+    let ordered = probe.ordered_steps();
     for kept in 0..=ordered {
         let fs = CrashFs::new(MemFs::new());
         workload(&fs)?;
@@ -617,7 +617,7 @@ fn a_power_loss_during_creation_leaves_a_folder_that_opens() -> lsm_tree::Result
     Ok(())
 }
 
-/// A power loss during a compaction, at any prefix of its ordered syncs,
+/// A power loss during a compaction, at any prefix of its ordered steps,
 /// reopens with every key the flushes before it made durable.
 #[test]
 fn a_power_loss_during_a_compaction_keeps_the_flushed_keys() -> lsm_tree::Result<()> {
@@ -690,7 +690,7 @@ fn a_power_loss_keeps_an_ordered_prefix_of_blob_and_routed_flushes() -> lsm_tree
 fn a_flush_across_two_devices_never_names_a_lost_table() -> lsm_tree::Result<()> {
     let (probe_main, probe_hot) = (CrashFs::new(MemFs::new()), CrashFs::new(MemFs::new()));
     drop(flushes(&probe_main, Some(&probe_hot))?);
-    let (ordered_main, ordered_hot) = (probe_main.ordered_syncs(), probe_hot.ordered_syncs());
+    let (ordered_main, ordered_hot) = (probe_main.ordered_steps(), probe_hot.ordered_steps());
 
     for kept_main in 0..=ordered_main {
         for kept_hot in 0..=ordered_hot {
