@@ -85,15 +85,24 @@ fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
 /// A tree that lived holds its history in its edit log even when no table is
 /// left (a dropped range, the retention floor it raised): a lost snapshot
 /// over that log is refused, never taken for a fresh folder and created over.
+/// The tree has rotated, so no log of the creation's generation is left to
+/// stand in the way of a new one.
 #[test]
 fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     use lsm_tree::fs::Fs;
     let mem = MemFs::new();
     let fs = CrashFs::new(mem.clone());
     {
-        let tree = config(&fs, false).open().expect("create");
-        tree.insert("key", "value", 0);
-        tree.flush_active_memtable(0).expect("flush");
+        // The first install appends, the second rotates, the third appends
+        // to the rotated generation's log.
+        let tree = config(&fs, false)
+            .manifest_log_rotate_bytes(1)
+            .open()
+            .expect("create");
+        for i in 0..2u64 {
+            tree.insert(format!("key{i}"), "value", i);
+            tree.flush_active_memtable(0).expect("flush");
+        }
         tree.drop_range::<&[u8], _>(..).expect("drop");
     }
     // The tree's path as the tree spells it: absolute (on Windows, with a
@@ -103,11 +112,21 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
         mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
         "self-check: no table is left"
     );
-    assert!(
-        mem.metadata(&db.join("edits-0")).expect("log").len > 0,
-        "self-check: the log holds the edits"
+    let mut logs_with_edits = 0;
+    for entry in mem.read_dir(db).expect("tree folder") {
+        if entry.file_name.starts_with('v') {
+            mem.remove_file(&entry.path).expect("lose the snapshot");
+        } else if entry.file_name.starts_with("edits-")
+            && entry.file_name != "edits-0"
+            && mem.metadata(&entry.path).expect("log").len > 0
+        {
+            logs_with_edits += 1;
+        }
+    }
+    assert_eq!(
+        logs_with_edits, 1,
+        "self-check: a rotated generation's log holds the drop"
     );
-    mem.remove_file(&db.join("v0")).expect("lose the snapshot");
 
     assert!(
         config(&fs, false).open().is_err(),
