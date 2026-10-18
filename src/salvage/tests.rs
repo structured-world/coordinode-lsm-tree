@@ -8530,10 +8530,12 @@ fn publish_fails_when_the_temp_name_cannot_be_dropped() -> crate::Result<()> {
 
     let result = salvage_sst(&source, dest.clone(), &fs);
     assert!(
-        result.as_ref().is_err_and(
-            |e| matches!(e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
-        ),
-        "a stuck temp name must fail the salvage, not be shrugged off: {result:?}",
+        result.as_ref().is_err_and(|e| matches!(
+            e,
+            crate::Error::SalvageOutput(e)
+                if matches!(&**e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
+        )),
+        "a stuck temp name must fail the salvage as a destination failure: {result:?}",
     );
     // The freshly linked destination must be unwound with the error: left
     // installed, a retry after the filesystem is fixed would bounce off
@@ -8626,9 +8628,11 @@ fn publish_refuses_to_replace_a_concurrently_created_destination_without_hard_li
 
     let result = salvage_sst(&source, dest.clone(), &fs);
     assert!(
-        result.as_ref().is_err_and(
-            |e| matches!(e, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::AlreadyExists)
-        ),
+        result.as_ref().is_err_and(|e| matches!(
+            e,
+            crate::Error::SalvageOutput(e)
+                if matches!(&**e, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::AlreadyExists)
+        )),
         "the publish must refuse the taken destination, not replace it: {result:?}",
     );
     assert_eq!(

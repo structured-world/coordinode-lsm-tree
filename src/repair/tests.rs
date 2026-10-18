@@ -16375,7 +16375,11 @@ fn repair_propagates_a_full_destination_during_salvage() -> crate::Result<()> {
     .with_fs(fault)
     .repair_with_salvage(true);
     assert!(
-        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::StorageFull),
+        matches!(
+            result,
+            Err(crate::Error::SalvageOutput(ref e))
+                if matches!(**e, crate::Error::Io(ref e) if e.kind() == ErrorKind::StorageFull)
+        ),
         "a full destination must abort the repair, never grade the source: {:?}",
         result.map(|r| (r.recovered, r.unreadable)),
     );
