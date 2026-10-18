@@ -5730,7 +5730,7 @@ impl Tree {
             }
             if tables_folder.starts_with(&path) {
                 let mut folder = tables_folder.parent();
-                while let Some(holder) = folder.filter(|holder| *holder != path) {
+                while let Some(holder) = folder.filter(|holder| *holder != path.as_path()) {
                     once(&mut outside, holder, &folder_fs);
                     folder = holder.parent();
                 }
@@ -6627,20 +6627,25 @@ impl Tree {
 }
 
 /// Returns `true` if the directory contains version-related artifacts
-/// (a `tables/` subdir, a `blobs/` subdir, or any `vN` manifest file).
+/// (a file in `tables/` or `blobs/`, or any `vN` manifest file).
 ///
 /// Used by [`Tree::open`] to distinguish a genuinely fresh directory
 /// (safe to `create_new`) from a half-written checkpoint or other
-/// interrupted sealing (must error rather than silently overwrite).
+/// interrupted sealing (must error rather than silently overwrite). Empty
+/// folders hold nothing to lose: a creation a power loss cut short leaves
+/// them, and creating the tree over them again is what finishes it.
 ///
 /// A missing parent directory is treated as "no state" — `create_new`
 /// is what creates the directory in the first place, so callers may
 /// invoke `Tree::open` against a path that does not exist yet.
 fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
-    if fs.exists(&folder.join(crate::file::TABLES_FOLDER))?
-        || fs.exists(&folder.join(crate::file::BLOBS_FOLDER))?
-    {
-        return Ok(true);
+    for data in [crate::file::TABLES_FOLDER, crate::file::BLOBS_FOLDER] {
+        match fs.read_dir(&folder.join(data)) {
+            Ok(entries) if !entries.is_empty() => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,

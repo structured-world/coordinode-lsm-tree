@@ -39,8 +39,9 @@
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
 //! even when its content was synced. The directory synced is matched by what
 //! the backend reports as the same directory, so any spelling of it covers
-//! its entries. Removed entries are not brought back, and directories
-//! themselves are not rolled back. Opens, operations that make or remove
+//! its entries. Removed entries are not brought back, except a durable file
+//! removed behind a [`SyncMode::Barrier`] sync a power loss loses (see
+//! below), and directories themselves are not rolled back. Opens, operations that make or remove
 //! entries, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
@@ -106,6 +107,10 @@ enum Ordered {
     Image(PathBuf, Vec<u8>),
     /// The entries a directory sync covered.
     Entries(Vec<PathBuf>),
+    /// A removal of a file that was durable, issued after an ordered sync: a
+    /// barrier keeps it behind that sync, so a power loss that loses the sync
+    /// loses the removal too and leaves the file with its durable image.
+    Removed(PathBuf, Vec<u8>),
 }
 
 impl CrashState {
@@ -113,7 +118,8 @@ impl CrashState {
     /// issued, and drops the rest.
     fn settle(&mut self, count: usize) {
         let ordered = core::mem::take(&mut self.ordered);
-        for sync in ordered.into_iter().take(count) {
+        let mut ordered = ordered.into_iter();
+        for sync in ordered.by_ref().take(count) {
             match sync {
                 Ordered::Image(path, bytes) => self.set_durable(&path, bytes),
                 Ordered::Entries(entries) => {
@@ -121,6 +127,17 @@ impl CrashState {
                         self.pending_entries.remove(entry);
                     }
                 }
+                Ordered::Removed(..) => {}
+            }
+        }
+        // A removal behind a lost sync is lost with it: the file stays, as it
+        // was durable, unless its name was made durable again since.
+        for sync in ordered {
+            if let Ordered::Removed(path, bytes) = sync
+                && !self.durable.contains_key(&path)
+            {
+                self.touched.insert(path.clone());
+                self.durable.insert(path, bytes);
             }
         }
     }
@@ -141,6 +158,7 @@ impl CrashState {
                 entries.retain(|entry| entry != path);
                 true
             }
+            Ordered::Removed(..) => true,
         });
     }
 
@@ -705,7 +723,16 @@ impl Fs for CrashFs {
         let _namespace = self.namespace.lock();
         self.inner.remove_file(path)?;
         let name = self.name_after(path);
-        self.state.lock().forget_name(&name);
+        let mut state = self.state.lock();
+        // Behind an ordered sync, the removal of a durable file is ordered
+        // too: a power loss that keeps only a prefix of the syncs may lose it.
+        let ordered_removal = (!state.ordered.is_empty() && state.names_of(&name).len() == 1)
+            .then(|| state.durable.get(&name).cloned())
+            .flatten();
+        state.forget_name(&name);
+        if let Some(bytes) = ordered_removal {
+            state.ordered.push(Ordered::Removed(name, bytes));
+        }
         Ok(())
     }
 
@@ -733,7 +760,7 @@ impl Fs for CrashFs {
         state.touched.retain(|k| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
         state.ordered.retain_mut(|sync| match sync {
-            Ordered::Image(name, _) => !name.starts_with(path),
+            Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
             Ordered::Entries(entries) => {
                 entries.retain(|entry| !entry.starts_with(path));
                 true
@@ -800,7 +827,7 @@ impl Fs for CrashFs {
         for sync in &mut state.ordered {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
-                Ordered::Image(..) => {}
+                Ordered::Image(..) | Ordered::Removed(..) => {}
                 Ordered::Entries(entries) => entries.retain(|entry| entry != from),
             }
         }

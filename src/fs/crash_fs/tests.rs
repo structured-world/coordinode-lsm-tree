@@ -1648,3 +1648,23 @@ fn a_barrier_sync_follows_a_rename_and_goes_with_a_removal() {
     assert!(!fs.exists(Path::new("/d/tmp")).unwrap());
     assert!(!fs.exists(Path::new("/d/gone")).unwrap());
 }
+
+/// A barrier orders the removal of a durable file behind the syncs before it:
+/// a power loss that loses one of them loses the removal too, and one that
+/// keeps them all keeps the removal.
+#[test]
+fn a_removal_behind_a_lost_barrier_sync_is_lost_with_it() {
+    let removed_after = |kept: usize| {
+        let fs = CrashFs::new(MemFs::new());
+        fs.create_dir_all(Path::new("/d")).unwrap();
+        write_synced(&fs, "/d", "/d/old", b"O", SyncMode::Full);
+        write_synced(&fs, "/d", "/d/new", b"N", SyncMode::Barrier);
+        fs.remove_file(Path::new("/d/old")).unwrap();
+        assert_eq!(fs.ordered_syncs(), 3, "two syncs and the removal");
+        fs.crash_keeping(kept);
+        fs.exists(Path::new("/d/old")).unwrap()
+    };
+    assert!(removed_after(0), "nothing kept: the old file stays");
+    assert!(removed_after(2), "the syncs kept, the removal lost");
+    assert!(!removed_after(3), "everything kept: the removal too");
+}
