@@ -416,14 +416,16 @@ impl FaultInjector {
     /// Screens `reqs` in order as [`Self::screen_by_fd`] does, up to the first
     /// a rule fails: how many come before it, and its error.
     fn screen_batch(&self, reqs: &[BlockRead<'_>]) -> (usize, Option<io::Error>) {
+        // A request partly filled reads from `filled` bytes in. One whose
+        // offset overflows is the inner backend's to refuse, and it refuses the
+        // whole batch before reading any of it, wherever that request stands:
+        // none of the batch is read, so no rule may count any of it.
+        let resume = |req: &BlockRead<'_>| req.offset.checked_add(req.buf.filled() as u64);
+        if reqs.iter().any(|req| resume(req).is_none()) {
+            return (reqs.len(), None);
+        }
         for (at, req) in reqs.iter().enumerate() {
-            // A request partly filled reads from `filled` bytes in. One whose
-            // offset overflows is the inner backend's to refuse, and it refuses
-            // the whole batch before reading any of it: the requests after it
-            // are never read, so no rule may count them.
-            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                return (reqs.len(), None);
-            };
+            let offset = resume(req).unwrap_or(req.offset);
             if let Some(error) = self.screen_by_fd(req.file, offset) {
                 return (at, Some(error));
             }

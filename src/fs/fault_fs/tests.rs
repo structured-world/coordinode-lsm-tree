@@ -818,47 +818,66 @@ fn a_queued_read_the_rules_fail_is_handed_back_by_the_next_wait() -> io::Result<
 /// read that never happens, and a retry still meets it.
 #[test]
 fn a_batch_failed_by_an_overflow_spends_no_rule_on_the_requests_after_it() -> io::Result<()> {
-    let fs = FaultFs::new(DescriptorFs::new(true));
-    let files = two_readable(&fs)?;
-    fs.injector().arm(
-        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path("f1")
-            .once(),
-    );
-    let before = fs.injector().read_count();
+    // The overflowing request first, then last: either way the batch is
+    // refused whole, before any of it is read.
+    for overflow_first in [true, false] {
+        let fs = FaultFs::new(DescriptorFs::new(true));
+        let files = two_readable(&fs)?;
+        fs.injector().arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("f1")
+                .once(),
+        );
+        let before = fs.injector().read_count();
 
-    let mut bufs = [[0u8; 16]; 2];
-    let [b0, b1] = &mut bufs;
-    let mut overflowing = crate::fs::BlockBuf::new(b0);
-    overflowing.append(&[0]);
-    let mut reqs = [
-        BlockRead {
+        let mut bufs = [[0u8; 16]; 2];
+        let [b0, b1] = &mut bufs;
+        let mut overflowing = crate::fs::BlockBuf::new(b0);
+        overflowing.append(&[0]);
+        let overflowing = BlockRead {
             file: files[0].as_ref(),
             offset: u64::MAX,
             buf: overflowing,
-        },
-        BlockRead {
+        };
+        let valid = BlockRead {
             file: files[1].as_ref(),
             offset: 0,
             buf: crate::fs::BlockBuf::new(b1),
-        },
-    ];
-    let err = fs
-        .read_blocks_batched(&mut reqs)
-        .expect_err("the backend refuses an overflowing offset");
-    assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    assert_eq!(fs.injector().read_count(), before, "nothing was read");
+        };
+        let mut reqs = if overflow_first {
+            [overflowing, valid]
+        } else {
+            [valid, overflowing]
+        };
+        let err = fs
+            .read_blocks_batched(&mut reqs)
+            .expect_err("the backend refuses an overflowing offset");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "overflow first: {overflow_first}"
+        );
+        assert_eq!(
+            fs.injector().read_count(),
+            before,
+            "nothing was screened (overflow first: {overflow_first})"
+        );
 
-    let mut buf = [0u8; 16];
-    let mut retry = [BlockRead {
-        file: files[1].as_ref(),
-        offset: 0,
-        buf: crate::fs::BlockBuf::new(&mut buf),
-    }];
-    let err = fs
-        .read_blocks_batched(&mut retry)
-        .expect_err("the rule still fails the read of f1");
-    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        let mut buf = [0u8; 16];
+        let mut retry = [BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(&mut buf),
+        }];
+        let err = fs
+            .read_blocks_batched(&mut retry)
+            .expect_err("the rule still fails the read of f1");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::PermissionDenied,
+            "overflow first: {overflow_first}"
+        );
+    }
     Ok(())
 }
 
