@@ -444,6 +444,7 @@ impl FaultInjector {
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
+        self.syncs.lock().clear();
         self.writeback_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();

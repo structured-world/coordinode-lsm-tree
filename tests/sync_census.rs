@@ -240,3 +240,23 @@ fn creating_a_routed_tree_syncs_the_route_once() {
         "the first flush"
     );
 }
+
+/// A route inside the tree folder holds a new entry of its own, its tables
+/// folder: the tree folder's sync makes only the route's name durable, so
+/// creating the tree syncs the route too.
+#[test]
+fn creating_a_tree_with_a_route_inside_it_syncs_the_route() {
+    let base = PathBuf::from("/census/nested/tree");
+    let route = base.join("hot");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census {
+        base: base.clone(),
+        route: Some(route.clone()),
+        injector: fs.injector(),
+    };
+
+    let _tree = open(&base, &fs, false, Some(&route));
+    let mut expected = creation();
+    expected.push((Synced::RouteDir, SyncKind::Directory));
+    assert_eq!(census.take(), sorted(expected), "creating");
+}

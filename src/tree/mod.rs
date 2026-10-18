@@ -5715,16 +5715,26 @@ impl Tree {
         // Every folder the tree writes into is made before its first snapshot,
         // so the directory sync that makes the snapshot's name durable makes
         // every name made in the tree folder durable too. A new folder holds
-        // no entry yet and needs no sync of its own. What lies outside the tree
-        // folder is synced once each after the snapshot: a routed tables
-        // folder's name in its route, the route's name in the folder above it,
-        // and the tree folder's own name in its parent.
+        // no entry yet and needs no sync of its own. Every other folder that
+        // holds a new name is synced once each after the snapshot: a routed
+        // tables folder's name in its route, the route's name in the folder
+        // above it (each folder between a route and the tree folder, for a
+        // route inside the tree folder), and the tree folder's own name in its
+        // parent.
+        let primary_tables = path.join(crate::file::TABLES_FOLDER);
         let mut outside: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
         for (tables_folder, folder_fs) in config.all_tables_folders() {
             folder_fs.create_dir_all(&tables_folder)?;
-            if !tables_folder.starts_with(&path)
-                && let Some(route) = tables_folder.parent()
-            {
+            if tables_folder == primary_tables {
+                continue;
+            }
+            if tables_folder.starts_with(&path) {
+                let mut folder = tables_folder.parent();
+                while let Some(holder) = folder.filter(|holder| *holder != path) {
+                    once(&mut outside, holder, &folder_fs);
+                    folder = holder.parent();
+                }
+            } else if let Some(route) = tables_folder.parent() {
                 once(&mut outside, route, &folder_fs);
                 if let Some(above) = route.parent() {
                     once(&mut outside, above, &folder_fs);
