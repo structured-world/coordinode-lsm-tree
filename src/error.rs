@@ -577,6 +577,16 @@ pub enum Error {
     /// A caller-side error, refused before anything is written. The payload
     /// names which of these it is.
     CellRow(&'static str),
+
+    /// A salvage could not write, finish or make durable its OUTPUT: the
+    /// failure lies with the destination, not with the bytes of the file
+    /// being salvaged.
+    ///
+    /// A recovery that met it stops rather than grade the SOURCE unreadable:
+    /// that would leave intact data out of the rebuilt manifest, and the
+    /// cleanup after the commit would remove it. Fix the destination
+    /// (its space, its device) and retry.
+    SalvageOutput(alloc::boxed::Box<Self>),
 }
 
 impl core::fmt::Display for Error {
@@ -637,6 +647,7 @@ impl core::error::Error for Error {
             // the post-commit step's own failure through the standard chain.
             #[cfg(feature = "std")]
             Self::RepairedButUnopened { cause, .. } => Some(&**cause),
+            Self::SalvageOutput(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -707,6 +718,9 @@ impl Error {
             #[cfg(zstd_any)]
             Self::ZstdDictMismatch { .. } => true,
             Self::UnsupportedFormat { .. } => true,
+            // The destination failed, whatever its kind: the source's bytes
+            // are not implicated.
+            Self::SalvageOutput(_) => true,
             _ => false,
         }
     }
