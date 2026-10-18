@@ -448,6 +448,9 @@ fn a_reflink_rule_matches_the_destination_path() {
 struct DescriptorFs {
     mem: MemFs,
     by_descriptor: bool,
+    /// Its queue issues the reads submitted at any wait, a wait for none
+    /// included, as the ring's does.
+    eager_queue: bool,
     paths: spin::Mutex<Vec<(i32, PathBuf)>>,
 }
 
@@ -456,7 +459,16 @@ impl DescriptorFs {
         Self {
             mem: MemFs::new(),
             by_descriptor,
+            eager_queue: false,
             paths: spin::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reads by descriptor, through a queue that issues at a wait for none.
+    fn eager() -> Self {
+        Self {
+            eager_queue: true,
+            ..Self::new(true)
         }
     }
 
@@ -488,6 +500,49 @@ impl DescriptorFs {
             Ok(())
         } else {
             Err(io::Error::new(ErrorKind::UnexpectedEof, "short read"))
+        }
+    }
+}
+
+/// The queue of a [`DescriptorFs`]: it reads what was submitted at a wait for
+/// some, as the default queue does, or at any wait when the backend is eager,
+/// as the ring's does.
+struct DescriptorQueue<'a> {
+    fs: &'a DescriptorFs,
+    submitted: Vec<QueuedRead>,
+}
+
+impl ReadQueue for DescriptorQueue<'_> {
+    fn submit(&mut self, read: QueuedRead) {
+        self.submitted.push(read);
+    }
+
+    fn outstanding(&self) -> usize {
+        self.submitted.len()
+    }
+
+    fn issues_at_wait_for_none(&self) -> bool {
+        self.fs.eager_queue
+    }
+
+    fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        if min == 0 && !self.fs.eager_queue {
+            return;
+        }
+        for mut read in core::mem::take(&mut self.submitted) {
+            let result = {
+                let mut req = BlockRead {
+                    file: read.file.as_ref(),
+                    offset: read.offset,
+                    buf: crate::fs::BlockBuf::new(&mut read.buf[..]),
+                };
+                self.fs.read_one(&mut req)
+            };
+            on_done(ReadDone {
+                tag: read.tag,
+                buf: read.buf,
+                result,
+            });
         }
     }
 }
@@ -560,6 +615,13 @@ impl Fs for DescriptorFs {
 
     fn reads_by_descriptor(&self) -> bool {
         self.by_descriptor
+    }
+
+    fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        Box::new(DescriptorQueue {
+            fs: self,
+            submitted: Vec::new(),
+        })
     }
 
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
@@ -970,6 +1032,90 @@ fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
             .map(|read| read.result.as_ref().map_err(io::Error::kind)),
         Some(Err::<&(), _>(ErrorKind::PermissionDenied)),
     );
+    Ok(())
+}
+
+/// A wait for none issues the submitted reads of a queue that issues them at
+/// such a wait, as the ring's does, so a caller polling several queues has
+/// them all in flight: each read is screened as it is issued.
+#[test]
+fn a_wait_for_none_issues_the_reads_of_a_queue_that_issues_them() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::eager());
+    let files: Vec<Arc<dyn FsFile>> = two_readable(&fs)?.into_iter().map(Arc::from).collect();
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+
+    let mut queue = fs.read_queue();
+    for (tag, file) in files.iter().enumerate() {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(file),
+            offset: 0,
+            buf: vec![0; 16],
+        });
+    }
+    let mut done = Vec::new();
+    queue.wait(0, &mut |read| done.push(read));
+    done.sort_by_key(|read| read.tag);
+    assert_eq!(done.len(), 2, "both reads were issued");
+    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(
+        done[1].result.as_ref().map_err(io::Error::kind),
+        Err::<&(), _>(ErrorKind::PermissionDenied),
+    );
+    assert_eq!(queue.outstanding(), 0);
+    Ok(())
+}
+
+/// A request with nothing to read is not read by the backend, so no rule
+/// is spent on it, in a batch or in a queue: the rule still fails the next
+/// real read.
+#[test]
+fn an_empty_request_spends_no_rule() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut empty: [u8; 0] = [];
+    let mut reqs = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut empty),
+    }];
+    fs.read_blocks_batched(&mut reqs)?;
+
+    let file: Arc<dyn FsFile> =
+        Arc::from(fs.open(Path::new("/d/f1"), &FsOpenOptions::new().read(true))?);
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 0,
+        file: Arc::clone(&file),
+        offset: 0,
+        buf: Vec::new(),
+    });
+    let mut done = Vec::new();
+    queue.wait(1, &mut |read| done.push(read));
+    assert!(done.first().is_some_and(|read| read.result.is_ok()));
+    assert_eq!(fs.injector().read_count(), before, "nothing was read");
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the rule still fails the first real read");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     Ok(())
 }
 

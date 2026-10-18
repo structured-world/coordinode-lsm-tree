@@ -1698,6 +1698,12 @@ impl ReadQueue for UringReadQueue<'_> {
         self.serial.len() + self.submitted.len()
     }
 
+    fn issues_at_wait_for_none(&self) -> bool {
+        // It sends what fits on the ring; a read that does not fit waits for
+        // the next wait.
+        true
+    }
+
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
         // A wait for none only looks at what is ready: it sends what fits
         // and keeps the rest rather than wait for room on the channel.

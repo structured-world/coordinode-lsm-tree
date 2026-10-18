@@ -404,11 +404,15 @@ impl FaultInjector {
         }
     }
 
-    /// Takes the request of `file` at `offset` through the read rules when it
-    /// has a descriptor, which an inner backend that reads by descriptor reads
-    /// it by, past `FaultFile::read_at`. A file without one reaches `read_at`,
-    /// which screens it there.
-    fn screen_by_fd(&self, file: &dyn FsFile, offset: u64) -> Option<io::Error> {
+    /// Takes the request of `len` bytes of `file` at `offset` through the read
+    /// rules when it has a descriptor, which an inner backend that reads by
+    /// descriptor reads it by, past `FaultFile::read_at`. A file without one
+    /// reaches `read_at`, which screens it there. A request with nothing to
+    /// read is finished without a read, and spends no rule.
+    fn screen_by_fd(&self, file: &dyn FsFile, offset: u64, len: usize) -> Option<io::Error> {
+        if len == 0 {
+            return None;
+        }
         let fd = file.backing_fd()?;
         self.screen_read(self.path_of(fd).as_deref(), offset)
     }
@@ -432,7 +436,8 @@ impl FaultInjector {
         }
         for (at, req) in reqs.iter().enumerate() {
             let offset = resume(req).unwrap_or(req.offset);
-            if let Some(error) = self.screen_by_fd(req.file, offset) {
+            let len = req.buf.capacity() - req.buf.filled();
+            if let Some(error) = self.screen_by_fd(req.file, offset, len) {
                 return (at, Some(error));
             }
         }
@@ -883,13 +888,13 @@ impl<F: Fs> Fs for FaultFs<F> {
 }
 
 /// The [`ReadQueue`] of a [`FaultFs`]: the inner backend's queue, each read
-/// screened by the read rules as a wait that is sure to issue it does: a
-/// read never issued spends no rule, and a rule armed before the issuing
-/// wait applies to it. A wait for none may leave a read held in the inner
-/// queue, so it neither screens nor hands over the reads submitted since;
-/// they count as held, and the next wait for some issues them. A read a rule
-/// fails never reaches the inner queue and is handed back failed by that
-/// wait.
+/// screened by the read rules as the wait that issues it hands it on: a read
+/// never issued spends no rule, and a rule armed before the issuing wait
+/// applies to it. A wait for none issues the reads submitted since only when
+/// the inner queue issues at such a wait; otherwise it neither screens nor
+/// hands them over, they count as held, and the next wait for some issues
+/// them. A read a rule fails never reaches the inner queue and is handed
+/// back failed by that wait.
 struct FaultReadQueue<'a> {
     inner: Box<dyn ReadQueue + 'a>,
     injector: &'a FaultInjector,
@@ -913,14 +918,22 @@ impl ReadQueue for FaultReadQueue<'_> {
         self.inner.held() + self.submitted.len() + self.failed.len()
     }
 
+    fn issues_at_wait_for_none(&self) -> bool {
+        self.inner.issues_at_wait_for_none()
+    }
+
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
-        if min == 0 {
+        if min == 0 && !self.inner.issues_at_wait_for_none() {
             // Only what the inner queue has issued already, and is ready.
             self.inner.wait(0, on_done);
             return;
         }
         for read in core::mem::take(&mut self.submitted) {
-            match self.injector.screen_by_fd(read.file.as_ref(), read.offset) {
+            let len = read.buf.len();
+            match self
+                .injector
+                .screen_by_fd(read.file.as_ref(), read.offset, len)
+            {
                 Some(error) => self.failed.push(ReadDone {
                     tag: read.tag,
                     buf: read.buf,

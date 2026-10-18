@@ -901,6 +901,17 @@ pub trait ReadQueue {
         self.outstanding()
     }
 
+    /// Whether a [`wait`](Self::wait) for none issues the reads submitted
+    /// since the last wait, rather than leave them for a wait for some. A
+    /// wrapper that takes each read through checks of its own as it is issued
+    /// passes the reads on at such a wait only when this is `true`.
+    ///
+    /// The default, `false`, matches a queue that reads only while it is
+    /// waited on for at least one read. `io_uring` answers `true`.
+    fn issues_at_wait_for_none(&self) -> bool {
+        false
+    }
+
     /// Issues every read not yet issued, then hands reads to `on_done` as they
     /// finish, each once, until at least `min` have been handed over in this
     /// call or none is left outstanding. A read that has finished by then is
