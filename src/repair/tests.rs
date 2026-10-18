@@ -17370,6 +17370,91 @@ fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A tree restored from a pin of a tree that still owes a repair's report
+/// holds that repair's data, so it owes the report too: the pin's layout
+/// carries it, and a repairing open of the restored tree hands it out.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_pinned_restore_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/restored")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let installed = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    let pin = tree.pin();
+    memfs.create_dir_all(&target.join("tables"))?;
+    for table in pin.tables() {
+        let mut bytes = Vec::new();
+        table.open()?.read_to_end(&mut bytes)?;
+        memfs
+            .open(
+                &target.join("tables").join(table.id().to_string()),
+                &FsOpenOptions::new().write(true).create_new(true),
+            )?
+            .write_all(&bytes)?;
+    }
+    let layout = pin.layout()?;
+    drop(config(&target).restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    )?);
+    drop(pin);
+    drop(tree);
+
+    let (restored, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the restored tree owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert_eq!(
+        restored.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref())
+    );
+    Ok(())
+}
+
 /// A copy of the report that is gone when the checkpoint opens it (a
 /// rotation carried the report to its next snapshot and removed the old
 /// copy) is looked for again: the checkpoint still carries the report.

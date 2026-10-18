@@ -585,21 +585,9 @@ pub fn copy_metadata(
     // the next repairing open) describes losses in the data just linked, so
     // the checkpoint owes it too: copied under the checkpoint's snapshot id
     // first, so the install's directory sync makes its name durable with
-    // the snapshot's. A copy gone by the time it is read was carried by a
-    // rotation to its next snapshot, written before the old one went, so
-    // the newest is looked for again; none left means none is owed.
-    while let Some(from) = crate::file::newest_repair_report(src_fs, src_root)? {
-        if crate::file::copy_repair_report(
-            src_fs,
-            src_root,
-            from,
-            target_fs,
-            target_root,
-            version.id(),
-            sync_mode,
-        )? {
-            break;
-        }
+    // the snapshot's.
+    if let Some(report) = crate::file::owed_repair_report(src_fs, src_root)? {
+        crate::file::write_repair_report(target_fs, target_root, version.id(), &report, sync_mode)?;
     }
     crate::version::persist_version(
         target_root,

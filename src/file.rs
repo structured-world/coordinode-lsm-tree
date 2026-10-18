@@ -104,73 +104,90 @@ pub fn carry_repair_report(
     to: u64,
     sync_mode: SyncMode,
 ) -> crate::Result<bool> {
-    copy_repair_report(fs, folder, from, fs, folder, to, sync_mode)
+    let Some(bytes) = read_repair_report(fs, folder, from)? else {
+        return Ok(false);
+    };
+    write_repair_report(fs, folder, to, &bytes, sync_mode)?;
+    Ok(true)
 }
 
-/// The snapshot id of the newest copy of a repair report in `folder`, if any.
-///
-/// While a tree is open, every copy it holds carries the one report its
-/// opening repair left (a rotation carries the same bytes to the next
-/// snapshot), so the newest stands for all of them.
-///
-/// # Errors
-///
-/// Propagates a failure to list the folder.
-pub fn newest_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<u64>> {
-    Ok(fs
-        .read_dir(folder)?
-        .into_iter()
-        .filter(|entry| !entry.is_dir)
-        .filter_map(|entry| match repair_report_name(&entry.file_name) {
-            Some((id, false)) => Some(id),
-            _ => None,
-        })
-        .max())
-}
-
-/// Copies the repair report kept for snapshot `from` in `src_folder` to the
-/// copy for snapshot `to` in `dst_folder`.
-///
-/// [`carry_repair_report`] does it within one folder; a checkpoint does it
-/// across, since it holds the repaired data and so owes the report its tree
-/// still owes.
-///
-/// # Errors
-///
-/// Propagates a failure to read the copy or to write the new one.
-pub fn copy_repair_report(
-    src_fs: &dyn Fs,
-    src_folder: &Path,
-    from: u64,
-    dst_fs: &dyn Fs,
-    dst_folder: &Path,
-    to: u64,
-    sync_mode: SyncMode,
-) -> crate::Result<bool> {
+/// The bytes of the copy of a repair report kept for snapshot `id` in
+/// `folder`, sealed as they lie; `None` when there is none.
+fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
     use crate::fs::FsOpenOptions;
-    let source = src_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{from}"));
-    let file = match src_fs.open(&source, &FsOpenOptions::new().read(true)) {
+    let source = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"));
+    let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
         Ok(file) => file,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let len = usize::try_from(file.metadata()?.len)
         .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
-    let bytes = read_exact(&*file, 0, len)?;
-    drop(file);
-    let fs = dst_fs;
-    let target = dst_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}"));
-    let temporary = dst_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}.tmp"));
+    Ok(Some(read_exact(&*file, 0, len)?.to_vec()))
+}
+
+/// The repair report the tree in `folder` still owes, sealed as its copies
+/// lie; `None` when it owes none.
+///
+/// While a tree is open, every copy it holds carries the one report its
+/// opening repair left, so the newest stands for all of them. A rotation
+/// carries it to its next snapshot and then removes the old copy, so a copy
+/// gone when read means a newer one is there: the newest is looked for
+/// again. A copy is retired only by the repairing open, never while the
+/// tree is open.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder or read a copy.
+pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Vec<u8>>> {
+    loop {
+        let newest = fs
+            .read_dir(folder)?
+            .into_iter()
+            .filter(|entry| !entry.is_dir)
+            .filter_map(|entry| match repair_report_name(&entry.file_name) {
+                Some((id, false)) => Some(id),
+                _ => None,
+            })
+            .max();
+        let Some(id) = newest else {
+            return Ok(None);
+        };
+        if let Some(bytes) = read_repair_report(fs, folder, id)? {
+            return Ok(Some(bytes));
+        }
+    }
+}
+
+/// Writes `bytes` as the copy of a repair report for snapshot `id` in
+/// `folder`.
+///
+/// Under a temporary name, synced and renamed, so the directory sync that
+/// installs the snapshot makes its name durable with the snapshot's.
+///
+/// # Errors
+///
+/// Propagates a failure to write, sync or rename the copy.
+pub fn write_repair_report(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: u64,
+    bytes: &[u8],
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
+    use crate::fs::FsOpenOptions;
+    let target = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"));
+    let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"));
     let mut copy = fs.open(
         &temporary,
         &FsOpenOptions::new().write(true).create(true).truncate(true),
     )?;
-    copy.write_all(&bytes)?;
+    copy.write_all(bytes)?;
     copy.flush()?;
     FsFile::sync_all_with(&*copy, sync_mode)?;
     drop(copy);
     fs.rename(&temporary, &target)?;
-    Ok(true)
+    Ok(())
 }
 
 /// Suffix of a manifest repair's in-progress blob salvage copy.
