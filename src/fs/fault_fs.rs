@@ -129,6 +129,8 @@ pub enum FaultOp {
     /// makes the probe answer `None`, as a backend that cannot tell the
     /// volume of that path does.
     VolumeId,
+    /// [`Fs::remove_dir_all`]: the removal of a directory and all it holds.
+    RemoveDirAll,
 }
 
 /// What a sync seen by a [`FaultFs`] made durable (see
@@ -656,6 +658,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDirAll, Some(path)) {
+            return Err(fault_error(kind, FaultOp::RemoveDirAll));
+        }
         self.inner.remove_dir_all(path)
     }
 
@@ -674,6 +679,10 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::Metadata));
         }
         self.inner.read_link(path)
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        self.inner.symlink(target, link)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {

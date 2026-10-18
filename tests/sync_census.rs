@@ -392,6 +392,59 @@ fn a_retried_creation_syncs_the_folders_a_failed_one_left() {
     }
 }
 
+/// A failed creation that cannot remove the folders it made syncs their
+/// holders instead: a retry finds them as folders that exist and syncs none
+/// of them, so their names must be durable before the failure returns.
+#[test]
+fn a_failed_creation_that_keeps_its_folders_syncs_them() {
+    use lsm_tree::fs::{Fault, FaultOp, FaultRule, Fs};
+    let root = std::path::absolute("/census/kept").expect("absolute path");
+    let base = root.join("a").join("b").join("tree");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    fs.create_dir_all(&root).expect("the folder that exists");
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path(root.to_string_lossy())
+        .once(),
+    );
+    fs.injector().arm(FaultRule::new(
+        FaultOp::RemoveDirAll,
+        Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+    ));
+    let _ = fs.injector().take_syncs();
+
+    assert!(
+        Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .open()
+        .is_err(),
+        "self-check: the creation fails on a folder sync"
+    );
+    assert!(
+        fs.exists(&root.join("a")).expect("probe"),
+        "self-check: the folders stay"
+    );
+    let synced: Vec<PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| *kind == SyncKind::Directory)
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        synced.iter().filter(|path| **path == root).count(),
+        2,
+        "the failed sync of the root and the one that makes it durable: {synced:?}"
+    );
+}
+
 /// A creation in a tree folder that exists already gives no folder above it
 /// a new entry, so it syncs none of them: one it may not read (a folder
 /// others may only pass through) would fail the creation.

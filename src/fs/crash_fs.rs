@@ -97,6 +97,10 @@ struct CrashState {
     link_group: HashMap<PathBuf, u64>,
     /// The id the next link group takes.
     next_link_group: u64,
+    /// The durable target of each symbolic link a queued removal or rename
+    /// took, captured before it went: a crash that loses that step puts the
+    /// link back, as it puts a file back from its durable image.
+    links: HashMap<PathBuf, PathBuf>,
     /// What [`SyncMode::Barrier`] synced, in order, and no device flush or
     /// full sync has made durable since: a crash keeps a prefix of it.
     ordered: Vec<Ordered>,
@@ -176,14 +180,20 @@ impl CrashState {
                 // image of a file made under its name later still lands.
                 Ordered::Removed(path, _) => {
                     self.durable.remove(&path);
+                    self.links.remove(&path);
                 }
                 Ordered::Renamed {
                     from, to, bytes, ..
                 } => {
                     self.durable.remove(&to);
                     self.durable.remove(&from);
+                    self.links.remove(&to);
+                    let link = self.links.remove(&from);
                     if let Some(bytes) = bytes {
                         self.set_durable(&to, bytes);
+                    } else if let Some(target) = link {
+                        // The link moved, under its new name.
+                        self.links.insert(to, target);
                     }
                 }
             }
@@ -269,6 +279,7 @@ impl CrashState {
     fn forget_name(&mut self, path: &Path) {
         self.forget_ordered(path);
         self.durable.remove(path);
+        self.links.remove(path);
         self.pending_entries.remove(path);
         let touched = self.touched.remove(path);
         if let Some(group) = self.link_group.remove(path)
@@ -423,6 +434,7 @@ impl CrashFs {
         let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
         for path in &lost {
             state.durable.remove(path);
+            state.links.remove(path);
             state.link_group.remove(path);
             state.touched.insert(path.clone());
         }
@@ -433,10 +445,15 @@ impl CrashFs {
             .touched
             .iter()
             .chain(state.durable.keys())
+            .chain(state.links.keys())
             .cloned()
             .collect();
 
         for path in paths {
+            if let Some(target) = state.links.get(&path) {
+                self.restore_link(&path, target);
+                continue;
+            }
             match state.durable.get(&path) {
                 Some(bytes) => self.restore_durable(&path, bytes),
                 None => {
@@ -452,14 +469,58 @@ impl CrashFs {
             }
         }
 
-        // Post-crash, only durable files exist and they are "clean".
+        // Post-crash, only durable files exist and they are "clean"; a link
+        // put back is the disk's own again, untouched by this run.
         state.touched = state.durable.keys().cloned().collect();
+        state.links.clear();
         let CrashState {
             durable,
             link_group,
             ..
         } = &mut *state;
         link_group.retain(|name, _| durable.contains_key(name));
+    }
+
+    /// Captures what the name `name` holds before a queued step may take it,
+    /// on its first touch this run: a file's bytes as its durable image, a
+    /// symbolic link's target as the link to put back.
+    fn capture_name(&self, name: &Path) -> io::Result<()> {
+        match self.inner.read_link(name) {
+            Ok(None) => self.capture_first_touch(name),
+            Ok(Some(target)) => {
+                let mut state = self.state.lock();
+                if !state.touched.contains(name) && !state.links.contains_key(name) {
+                    state.links.insert(name.to_path_buf(), target);
+                }
+                state.touched.insert(name.to_path_buf());
+                Ok(())
+            }
+            // A probe that fails says nothing to capture; the step itself
+            // reports what is wrong with the name.
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Puts back the symbolic link `path` to `target`, in place of whatever
+    /// the run left under the name.
+    fn restore_link(&self, path: &Path, target: &Path) {
+        if matches!(self.inner.read_link(path), Ok(Some(now)) if now == target) {
+            return;
+        }
+        match self.inner.remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "crash(): clearing {} for its link failed: {e}",
+                path.display()
+            ),
+        }
+        self.inner.symlink(target, path).unwrap_or_else(|e| {
+            panic!(
+                "crash(): putting back the link {} failed: {e}",
+                path.display()
+            )
+        });
     }
 
     /// Overwrites the inner file at `path` with its durable image `bytes`.
@@ -806,9 +867,7 @@ impl Fs for CrashFs {
         let queued = !self.state.lock().ordered.is_empty();
         if queued {
             let name = self.name_after(path);
-            if matches!(self.inner.read_link(&name), Ok(None)) {
-                self.capture_first_touch(&name)?;
-            }
+            self.capture_name(&name)?;
         }
         self.inner.remove_file(path)?;
         let name = self.name_after(path);
@@ -849,6 +908,7 @@ impl Fs for CrashFs {
         }
         state.durable.retain(|k, _| !k.starts_with(path));
         state.touched.retain(|k| !k.starts_with(path));
+        state.links.retain(|k, _| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
         state.ordered.retain_mut(|sync| match sync {
             Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
@@ -889,9 +949,7 @@ impl Fs for CrashFs {
         // A symlink names no bytes of its own.
         if from != to && !self.state.lock().ordered.is_empty() {
             for name in [self.name_after(from), self.name_after(to)] {
-                if matches!(self.inner.read_link(&name), Ok(None)) {
-                    self.capture_first_touch(&name)?;
-                }
+                self.capture_name(&name)?;
             }
         }
         self.inner.rename(from, to)?;
@@ -977,6 +1035,7 @@ impl Fs for CrashFs {
         }
         // The source's state moves with its file, under the new name.
         let from_durable = state.durable.remove(from);
+        let from_link = state.links.remove(from);
         let from_touched = state.touched.remove(from);
         let from_group = state.link_group.remove(from);
         state.pending_entries.remove(from);
@@ -999,6 +1058,9 @@ impl Fs for CrashFs {
         // The rename is as durable as the source was.
         if let Some(bytes) = from_durable {
             state.durable.insert(to.to_path_buf(), bytes);
+        }
+        if let Some(target) = from_link {
+            state.links.insert(to.to_path_buf(), target);
         }
         if from_touched {
             state.touched.insert(to.to_path_buf());

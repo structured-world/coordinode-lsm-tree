@@ -437,6 +437,30 @@ impl Fs for StdFs {
         }
     }
 
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        // A link to a directory is a distinct kind on Windows: the target,
+        // resolved against the link's folder, tells which to make.
+        #[cfg(windows)]
+        let made = {
+            let resolved = link
+                .parent()
+                .map_or_else(|| target.to_path_buf(), |folder| folder.join(target));
+            if resolved.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let made: std::io::Result<()> = {
+            let _ = (target, link);
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        };
+        made.map_err(io::Error::from)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // `std::fs::rename` satisfies the trait's replace contract on every
         // platform: on Windows it maps to `MoveFileExW` with

@@ -5801,16 +5801,33 @@ impl Tree {
             Err(e) => {
                 // The lock went with the failed creation; nothing holds what
                 // it made now. Nested chains go with the outer one.
+                let mut left = false;
                 for (folder, folder_fs) in &made {
                     match folder_fs.remove_dir_all(folder) {
                         Ok(()) => {}
                         Err(gone) if gone.kind() == crate::io::ErrorKind::NotFound => {}
-                        Err(left) => log::warn!(
-                            "Tree::create_new: could not remove {} after a failed creation \
-                             ({left}); a retry finds it without the sync that makes its \
-                             name durable",
-                            folder.display()
-                        ),
+                        Err(kept) => {
+                            log::warn!(
+                                "Tree::create_new: could not remove {} after a failed \
+                                 creation ({kept}); syncing the folders it made instead",
+                                folder.display()
+                            );
+                            left = true;
+                        }
+                    }
+                }
+                // A retry finds what is left as folders that exist and gives
+                // their holders no sync, so their names are made durable now,
+                // each with a device flush: this is the failure path.
+                if left {
+                    for (folder, folder_fs) in &holders {
+                        if let Err(sync) = fsync_directory(folder, &**folder_fs, SyncMode::Full) {
+                            log::warn!(
+                                "Tree::create_new: could not sync {} after a failed creation \
+                                 ({sync}); a power loss may take back the folder it made",
+                                folder.display()
+                            );
+                        }
                     }
                 }
                 Err(e)

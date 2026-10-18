@@ -1248,6 +1248,23 @@ pub trait Fs: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Makes `link` a symbolic link to `target`, stored as given: the inverse
+    /// of [`read_link`](Self::read_link), for a backend that reports links.
+    ///
+    /// The default refuses with [`io::ErrorKind::Unsupported`]: a backend
+    /// without symbolic links ([`MemFs`]) has none to make.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the link cannot be made.
+    fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+        let _ = (target, link);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this backend has no symbolic links",
+        ))
+    }
+
     /// Renames a file from `from` to `to`.
     ///
     /// If `to` already exists as a regular file, it is atomically replaced —

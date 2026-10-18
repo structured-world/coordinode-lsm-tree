@@ -386,6 +386,52 @@ fn renaming_over_a_hard_link_keeps_the_file_touched() {
     assert_eq!(read(&fs, link.to_str().unwrap()), b"other");
 }
 
+/// A symbolic link the run never touched, removed or renamed behind a
+/// barrier sync, is back as it was when a power loss loses that step, and
+/// moved when the power loss keeps it.
+#[cfg(unix)]
+#[test]
+fn a_symlink_behind_a_lost_step_is_put_back() {
+    for rename in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_owned();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        let moved = dir.path().join("moved");
+        std::fs::write(&target, b"T").unwrap();
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        let build = || {
+            let fs = CrashFs::new(crate::fs::StdFs);
+            write_synced(&fs, &root, &format!("{root}/x"), b"X", SyncMode::Barrier);
+            let kept = fs.ordered_steps();
+            if rename {
+                fs.rename(&link, &moved).unwrap();
+            } else {
+                fs.remove_file(&link).unwrap();
+            }
+            (fs, kept)
+        };
+
+        let (fs, kept) = build();
+        fs.crash_keeping(kept);
+        assert_eq!(
+            fs.read_link(&link).unwrap(),
+            Some(PathBuf::from("target")),
+            "rename: {rename}"
+        );
+        assert!(!moved.exists(), "rename: {rename}");
+
+        let (fs, _) = build();
+        fs.crash_keeping(fs.ordered_steps());
+        assert_eq!(fs.read_link(&link).unwrap(), None, "rename: {rename}");
+        assert_eq!(
+            fs.read_link(&moved).unwrap(),
+            rename.then(|| PathBuf::from("target")),
+            "rename: {rename}"
+        );
+    }
+}
+
 /// A hard link of a symlink is a second name of the symlink, not of the file
 /// it points to (Linux `linkat(2)` without `AT_SYMLINK_FOLLOW`): the two
 /// names hold no bytes of their own, so no durable image is kept under them.
