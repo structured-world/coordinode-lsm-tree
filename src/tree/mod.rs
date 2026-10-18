@@ -6756,8 +6756,11 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
-    // An edit in any log is a tree's history (a clear, the retention floor it
-    // raised) even when no table is left and its snapshot is lost.
+    // A tree's history (a clear, the retention floor it raised) outlives its
+    // tables, and a lost snapshot leaves its log behind: an edit in any log,
+    // or the log of any generation past the first, which only a rotation
+    // makes, is a tree that lived. A creation cut short leaves only the
+    // first generation's empty log.
     let entries = match config.fs.read_dir(&config.path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
@@ -6775,7 +6778,9 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
         if digits(name.strip_prefix('v')) {
             return Ok(true);
         }
-        if digits(name.strip_prefix("edits-")) && config.fs.metadata(&entry.path)?.len > 0 {
+        if digits(name.strip_prefix("edits-"))
+            && (name != "edits-0" || config.fs.metadata(&entry.path)?.len > 0)
+        {
             return Ok(true);
         }
     }

@@ -113,7 +113,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
         "self-check: no table is left"
     );
     let mut logs_with_edits = 0;
-    for entry in mem.read_dir(db).expect("tree folder") {
+    for entry in mem.read_dir(&db).expect("tree folder") {
         if entry.file_name.starts_with('v') {
             mem.remove_file(&entry.path).expect("lose the snapshot");
         } else if entry.file_name.starts_with("edits-")
@@ -134,12 +134,11 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     );
 }
 
-/// Only the exact name `v0` is what a creation cut short leaves: a snapshot
-/// spelled otherwise (`v00`, or an id past the counter's range) is not
-/// something a creation wrote, and an open without a pointer refuses it
-/// rather than create over it.
+/// A snapshot spelled otherwise than a tree writes it (`v00`, or an id past
+/// the counter's range) is not something a creation cut short leaves: an
+/// open refuses it rather than create a tree over it.
 #[test]
-fn an_open_without_a_pointer_refuses_a_snapshot_a_creation_never_names() {
+fn an_open_refuses_a_snapshot_a_creation_never_names() {
     use lsm_tree::fs::{Fs, FsOpenOptions};
     for name in ["v00", "v18446744073709551616"] {
         let mem = MemFs::new();
@@ -199,6 +198,49 @@ fn an_open_creates_over_an_empty_route_inside_the_tables_folder() {
         .open()
         .expect("an empty route is no tree state");
     assert_eq!(tree.table_count(), 0);
+}
+
+/// A tree that rotates on every install keeps its history in its snapshot and
+/// leaves its log empty: the log of a generation past the first is a tree
+/// that lived all the same, and a lost snapshot over it is refused.
+#[test]
+fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
+    use lsm_tree::fs::Fs;
+    let mem = MemFs::new();
+    let fs = CrashFs::new(mem.clone());
+    {
+        let tree = config(&fs, false)
+            .manifest_log_rotate_bytes(0)
+            .open()
+            .expect("create");
+        tree.insert("key", "value", 0);
+        tree.flush_active_memtable(0).expect("flush");
+        tree.drop_range::<&[u8], _>(..).expect("drop");
+    }
+    let db = std::path::absolute(DB).expect("absolute path");
+    assert!(
+        mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
+        "self-check: no table is left"
+    );
+    let mut rotated_logs = 0;
+    for entry in mem.read_dir(&db).expect("tree folder") {
+        if entry.file_name.starts_with('v') {
+            mem.remove_file(&entry.path).expect("lose the snapshot");
+        } else if entry.file_name.starts_with("edits-") && entry.file_name != "edits-0" {
+            assert_eq!(
+                mem.metadata(&entry.path).expect("log").len,
+                0,
+                "self-check: the rotated log is empty"
+            );
+            rotated_logs += 1;
+        }
+    }
+    assert_eq!(rotated_logs, 1, "self-check: one rotated generation's log");
+
+    assert!(
+        config(&fs, false).open().is_err(),
+        "a rotated generation's log is a tree's state"
+    );
 }
 
 /// Flushes past a manifest rotation survive a power loss: the rotated
