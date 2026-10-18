@@ -89,8 +89,10 @@ pub fn create_log(
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the open, write, or fsync fails, or an encoding
-/// error from [`VersionEdit::encode`].
+/// Returns an I/O error if the open or the directory sync fails, an encoding
+/// error from [`VersionEdit::encode`], and
+/// [`crate::Error::InstallOutcomeUnknown`] when the write of the record or
+/// its sync fails.
 pub fn append_edit(
     fs: &dyn Fs,
     path: &Path,
@@ -115,11 +117,15 @@ pub fn append_edit(
         // sync although the operation it records was reported failed.
         crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
     }
-    super::framing::write_frame(&mut file, scratch)?;
+    // From the first byte on, a failure leaves a record a power loss may keep
+    // whole: the edit's outcome is unknown.
+    let unknown = |e: crate::Error| crate::Error::InstallOutcomeUnknown(alloc::boxed::Box::new(e));
+    super::framing::write_frame(&mut file, scratch).map_err(unknown)?;
     // `sync_data` persists the file size with the data (its contract, POSIX
     // `fdatasync`), which is all replay reads; the log's name is covered by
     // the directory sync above.
-    file.sync_data_with(sync_mode).map_err(crate::Error::from)?;
+    file.sync_data_with(sync_mode)
+        .map_err(|e| unknown(crate::Error::from(e)))?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
     let appended = u64::try_from(super::framing::FRAME_HEADER_LEN + scratch.len())
         .map_err(|_| crate::Error::Unrecoverable)?;

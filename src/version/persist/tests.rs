@@ -54,3 +54,65 @@ fn an_install_replaces_a_failed_attempt_and_refuses_a_live_generation() -> crate
     );
     Ok(())
 }
+
+/// An install whose directory sync fails is withdrawn: a withdrawal made
+/// durable reports the plain failure, the previous generation installed; one
+/// that cannot be (its removal or its sync fails) reports the outcome
+/// unknown, since a power loss may still keep the rename.
+#[test]
+fn a_withdrawal_that_is_not_durable_leaves_the_outcome_unknown() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    let folder = Path::new("/tree");
+    let cases = [
+        // The install's sync fails, the withdrawal's succeeds.
+        (
+            vec![FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once()],
+            false,
+        ),
+        // Both syncs fail.
+        (
+            vec![FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).times(2)],
+            true,
+        ),
+        // The install's sync fails and the snapshot cannot be removed; the
+        // first removal is that of a leftover temporary.
+        (
+            vec![
+                FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once(),
+                FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+                    .on_path("/tree/v8")
+                    .skip(1)
+                    .once(),
+            ],
+            true,
+        ),
+    ];
+    for (rules, unknown) in cases {
+        let fs = FaultFs::new(MemFs::new());
+        fs.create_dir_all(folder)?;
+        for rule in rules {
+            fs.injector().arm(rule);
+        }
+        let result = persist_version(
+            folder,
+            &Version::new(8, crate::TreeType::Standard),
+            "default",
+            &fs,
+            Arc::default(),
+            None,
+            SyncMode::Normal,
+        );
+        assert!(
+            result.is_err(),
+            "the armed directory sync fails the install"
+        );
+        assert_eq!(
+            matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+            unknown,
+            "{result:?}"
+        );
+    }
+    Ok(())
+}

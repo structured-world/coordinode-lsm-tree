@@ -287,12 +287,14 @@ pub struct SuperVersions {
     /// vanish, and a log found at open may not have been synced before.
     log_entry_synced: bool,
 
-    /// Whether a rotation failed since the last that succeeded. A failed one
-    /// may still have installed its snapshot on disk (its rename made before
-    /// the failure can survive), and recovery would then replay that snapshot's
-    /// log, not the current one: an edit appended to the current log would be
-    /// lost. So the next persist rotates too, writing a snapshot of the whole
-    /// state that supersedes either outcome.
+    /// Whether an install failed since the last rotation that succeeded. A
+    /// failed rotation may still have installed its snapshot on disk (its
+    /// rename made before the failure can survive), and recovery would then
+    /// replay that snapshot's log, not the current one: an edit appended to
+    /// the current log would be lost. A failed append may have left its record
+    /// in the log, which the next append's sync would make durable. So the
+    /// next persist rotates, writing a snapshot of the whole state that
+    /// supersedes either outcome.
     rotation_pending: bool,
 
     /// Reusable payload-assembly buffer for edit appends — the scratch
@@ -615,10 +617,13 @@ impl SuperVersions {
                         .shrink_to(crate::version::framing::MAX_FRAME_PAYLOAD as usize);
                 }
                 Err(e) => {
-                    // A failed append may have written a partial record; the
-                    // on-disk size is unknown, so drop the cache and re-measure
-                    // on the next install.
+                    // A failed append may have written a record, whole or
+                    // partial: the on-disk size is unknown, so drop the cache
+                    // and re-measure on the next install. A later append
+                    // would land after that record and its sync would make
+                    // it durable, so the next install rotates instead.
                     self.log_bytes = None;
+                    self.rotation_pending = true;
                     return Err(e);
                 }
             }

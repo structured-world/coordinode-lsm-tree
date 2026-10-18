@@ -141,13 +141,15 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
 
             // A switch stopped with neither the source's pointer nor the
             // converted store's snapshot in the folder: a tree opened there is
-            // refused rather than started fresh over it.
+            // refused rather than started fresh over it. The guard is named
+            // like a snapshot but is the switch's own, there to refuse it.
             let installed = std::fs::read_dir(folder.path())?.any(|entry| {
                 entry.is_ok_and(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .strip_prefix('v')
-                        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name != GUARD
+                        && name.strip_prefix('v').is_some_and(|id| {
+                            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+                        })
                 })
             });
             if !installed

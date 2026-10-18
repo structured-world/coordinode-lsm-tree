@@ -36,9 +36,9 @@ pub const SNAPSHOT_TEMPORARY_SUFFIX: &str = ".tmp";
 ///
 /// Propagates an I/O or encoding error. When the directory sync after the
 /// rename fails, the snapshot's name is taken back first, so the previous
-/// generation stays the installed one; a power loss can still have made the
-/// rename durable and not the withdrawal, so the caller treats the outcome as
-/// unknown (see `SuperVersions::persist_change`).
+/// generation stays the installed one; when the withdrawal cannot be made
+/// durable, a power loss may still keep the rename, and the error is
+/// [`crate::Error::InstallOutcomeUnknown`].
 pub fn persist_version(
     folder: &Path,
     version: &Version,
@@ -96,32 +96,36 @@ pub fn persist_version(
     // The snapshot's name and its log's, and every entry made in the folder
     // before (a new tree's folders), durable together.
     if let Err(e) = fsync_directory(folder, fs, sync_mode) {
-        withdraw(folder, &path, fs, sync_mode);
-        return Err(e.into());
+        return Err(if withdraw(folder, &path, fs, sync_mode) {
+            e.into()
+        } else {
+            crate::Error::InstallOutcomeUnknown(alloc::boxed::Box::new(e.into()))
+        });
     }
     Ok(())
 }
 
 /// Takes back the name of a snapshot whose install failed at its directory
-/// sync, so the previous generation is the installed one again: the caller
-/// reports the failure and removes what it wrote for the install (a
-/// compaction's outputs), which the withdrawn snapshot would name. The removal
-/// is synced where it can be; whatever this cannot do leaves the outcome
-/// unknown, which the caller already assumes.
-fn withdraw(folder: &Path, snapshot: &Path, fs: &dyn Fs, sync_mode: SyncMode) {
+/// sync, so the previous generation is the installed one again, and returns
+/// whether that is durable. When it is not, a power loss may still keep the
+/// rename: the install's outcome is unknown, and what the snapshot names has
+/// to stay.
+fn withdraw(folder: &Path, snapshot: &Path, fs: &dyn Fs, sync_mode: SyncMode) -> bool {
     if let Err(e) = fs.remove_file(snapshot) {
         log::warn!(
             "persist: could not withdraw {} after a failed install: {e}",
             snapshot.display()
         );
-        return;
+        return false;
     }
     if let Err(e) = fsync_directory(folder, fs, sync_mode) {
         log::warn!(
             "persist: the withdrawal of {} is not durable: {e}",
             snapshot.display()
         );
+        return false;
     }
+    true
 }
 
 /// Removes `path`, left by a failed install of the same id, if it exists.

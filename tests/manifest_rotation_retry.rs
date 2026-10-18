@@ -89,8 +89,8 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
 
     {
         let tree = open(fs)?;
-        for (seqno, k) in ["k0", "k1"].into_iter().enumerate() {
-            tree.insert(k, "v", seqno as u64);
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
             tree.flush_active_memtable(0)?;
         }
         // The compaction syncs its output's folder, then fails the directory
@@ -104,6 +104,212 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
             tree.major_compact(64 * 1024 * 1024, 0).is_err(),
             "the armed directory sync must fail the compaction's install"
         );
+    }
+
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
+
+/// The files of the tree's tables folder.
+fn table_files(dir: &std::path::Path) -> std::io::Result<usize> {
+    Ok(std::fs::read_dir(dir.join("tables"))?.count())
+}
+
+/// A compaction whose install cannot be withdrawn leaves its outcome unknown:
+/// the snapshot naming its output may be the one a reopen finds, so the
+/// output stays and the reopen reads every key from it.
+#[test]
+fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let snapshot = dir.path().join("v").to_string_lossy().into_owned();
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .manifest_log_rotate_bytes(0)
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        // The install's directory sync fails, then the removal that would
+        // withdraw its snapshot; the first removal is that of a leftover
+        // temporary.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .once(),
+        );
+        injector.arm(
+            FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+                .on_path(snapshot)
+                .skip(1)
+                .once(),
+        );
+        assert!(
+            matches!(
+                tree.major_compact(64 * 1024 * 1024, 0),
+                Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+            ),
+            "the install can be neither made durable nor withdrawn"
+        );
+    }
+
+    // The snapshot stayed, naming the compaction's output.
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
+
+/// A withdrawal whose own directory sync fails is not durable either: the
+/// compaction's output stays on disk, for whichever generation a power loss
+/// leaves, and the reopen's orphan sweep takes it when it is not named.
+#[test]
+fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .manifest_log_rotate_bytes(0)
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        assert_eq!(table_files(dir.path())?, 2);
+        // The install's directory sync fails, and so does the withdrawal's.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
+                .times(2),
+        );
+        assert!(
+            tree.major_compact(64 * 1024 * 1024, 0).is_err(),
+            "the armed directory syncs must fail the compaction's install"
+        );
+        assert_eq!(
+            table_files(dir.path())?,
+            3,
+            "the inputs and the output stay"
+        );
+    }
+
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
+
+/// An edit appended to the log whose sync fails may still reach the disk,
+/// whole: the compaction that asked for it keeps its output, which a reopen
+/// replaying the edit reads, and the next install rotates rather than append
+/// after the edit and make it durable.
+#[test]
+fn a_compaction_whose_edit_sync_fails_keeps_its_output() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        // The edit is written to the log; its sync fails.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+                .on_path("edits-")
+                .once(),
+        );
+        assert!(
+            matches!(
+                tree.major_compact(64 * 1024 * 1024, 0),
+                Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+            ),
+            "the armed sync must fail the compaction's install"
+        );
+
+        // The retry installs, and so does a flush after it.
+        tree.major_compact(64 * 1024 * 1024, 0)?;
+        tree.insert("k2", "v", 2);
+        tree.flush_active_memtable(0)?;
+        for k in ["k0", "k1", "k2"] {
+            assert!(tree.get(k, 3)?.is_some(), "{k} must read after the retry");
+        }
+    }
+
+    // The log still holds the failed edit: a reopen over it reads every key.
+    let tree = open(FaultFs::new(StdFs))?;
+    for k in ["k0", "k1", "k2"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after reopening");
+    }
+    Ok(())
+}
+
+/// A reopen right after an edit whose sync failed replays it when it reached
+/// the log: the output it names is still there.
+#[test]
+fn a_reopen_after_a_failed_edit_sync_reads_the_output_it_names() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let open = |fs| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .open()
+    };
+
+    {
+        let tree = open(fs)?;
+        for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+            tree.insert(k, "v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        injector.arm(
+            FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+                .on_path("edits-")
+                .once(),
+        );
+        assert!(tree.major_compact(64 * 1024 * 1024, 0).is_err());
     }
 
     let tree = open(FaultFs::new(StdFs))?;

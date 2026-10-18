@@ -587,6 +587,16 @@ pub enum Error {
     /// cleanup after the commit would remove it. Fix the destination
     /// (its space, its device) and retry.
     SalvageOutput(alloc::boxed::Box<Self>),
+
+    /// A manifest install failed after its edit or snapshot was written, so
+    /// a power loss may still make it the installed one: what it names is
+    /// kept on disk, and the next install writes a full snapshot over it.
+    ///
+    /// The operation that asked for the install (a flush, a compaction)
+    /// reports it as failed and may be retried; the tree reopened after a
+    /// crash holds either the state before it or the state it installed,
+    /// whole. The payload is the failure itself.
+    InstallOutcomeUnknown(alloc::boxed::Box<Self>),
 }
 
 impl core::fmt::Display for Error {
@@ -647,7 +657,7 @@ impl core::error::Error for Error {
             // the post-commit step's own failure through the standard chain.
             #[cfg(feature = "std")]
             Self::RepairedButUnopened { cause, .. } => Some(&**cause),
-            Self::SalvageOutput(cause) => Some(&**cause),
+            Self::SalvageOutput(cause) | Self::InstallOutcomeUnknown(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -721,6 +731,7 @@ impl Error {
             // The destination failed, whatever its kind: the source's bytes
             // are not implicated.
             Self::SalvageOutput(_) => true,
+            Self::InstallOutcomeUnknown(cause) => cause.is_environmental(),
             _ => false,
         }
     }

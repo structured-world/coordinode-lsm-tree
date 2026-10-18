@@ -386,7 +386,6 @@ fn compute_table_checksum_matches_oneshot_xxh3() -> crate::Result<()> {
     Ok(())
 }
 
-#[test]
 /// A log is a generation's file too: a rebuilt snapshot under an id an
 /// orphaned log still carries would meet that log at its install.
 #[test]
@@ -13054,7 +13053,7 @@ fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
                 .strip_prefix('v')
                 .or_else(|| e.file_name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_manifest || e.file_name == "current" {
+            if is_manifest {
                 memfs.remove_file(&e.path)?;
             }
         }
@@ -13231,6 +13230,143 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
 fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let (memfs, root, blob_path) = a_blob_tree_with_a_damaged_tail()?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+
+    // The rebuilt snapshot's write (the only `v*` file left to write) dies
+    // with ENOSPC, strictly BEFORE its rename installs it.
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
+            .on_path(root.join("v").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "the manifest write fault must fail the repair: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none(),
+        "self-check: the fault fired before the install",
+    );
+
+    let leftover: Vec<String> = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        leftover,
+        vec![
+            blob_path
+                .file_name()
+                .expect("blob file name")
+                .to_string_lossy()
+                .to_string()
+        ],
+        "an uncommitted fresh-id replacement must be unwound, or every \
+         failed attempt stacks another copy",
+    );
+    Ok(())
+}
+
+/// An install whose withdrawal is not durable may come back after a power
+/// loss: the rebuilt snapshot's name is gone now, but it can still be the
+/// installed one, naming the fresh-id blob replacement, which therefore stays.
+#[test]
+fn a_repair_whose_install_cannot_be_withdrawn_keeps_its_blob_replacements() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let repair = |fs: FaultFs<MemFs>, root: &std::path::Path| {
+        Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .repair()
+    };
+
+    // A repair of the same tree without a fault tells which directory sync
+    // under the tree folder installs the rebuilt snapshot: the first after
+    // the snapshot's own data sync.
+    let (probe_fs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let under_root = |path: &std::path::Path| path.starts_with(&root);
+    let probe = FaultFs::new(MemFs::clone(&probe_fs));
+    let injector = probe.injector();
+    repair(probe, &root)?;
+    let syncs = injector.take_syncs();
+    let snapshot_synced = syncs
+        .iter()
+        .position(|(path, kind)| {
+            *kind != SyncKind::Directory
+                && path.parent() == Some(&*root)
+                && path.to_string_lossy().ends_with(".tmp")
+        })
+        .ok_or(crate::Error::Unrecoverable)?;
+    let skip = syncs
+        .iter()
+        .take(snapshot_synced)
+        .filter(|(path, kind)| *kind == SyncKind::Directory && under_root(path))
+        .count();
+
+    let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    // The install's directory sync fails, and so does the withdrawal's.
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(root.to_string_lossy())
+            .skip(skip as u64)
+            .times(2),
+    );
+    let result = repair(fault, &root);
+    assert!(
+        matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+        "the install can be neither made durable nor withdrawn: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert_eq!(
+        memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .count(),
+        2,
+        "the damaged original and its replacement both stay",
+    );
+    Ok(())
+}
+
+/// A KV-separated tree at `/db` on a fresh `MemFs` whose one blob file has a
+/// damaged last frame, with every manifest file removed: a repair salvages
+/// the blob into a fresh-id replacement and rebuilds the snapshot. Returns
+/// the filesystem, the tree's folder and the blob file's path.
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_blob_tree_with_a_damaged_tail() -> crate::Result<(
+    std::sync::Arc<crate::fs::MemFs>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+)> {
+    use crate::fs::{Fs, MemFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
@@ -13292,53 +13428,7 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
             memfs.remove_file(&e.path)?;
         }
     }
-
-    // The rebuilt snapshot's write (the only `v*` file left to write) dies
-    // with ENOSPC, strictly BEFORE its rename installs it.
-    let fault = FaultFs::new((*memfs).clone());
-    fault.injector().arm(
-        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
-            .on_path(root.join("v").to_string_lossy()),
-    );
-    let result = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_fs(fault)
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(16),
-    ))
-    .repair();
-    assert!(
-        result.is_err(),
-        "the manifest write fault must fail the repair: {:?}",
-        result.map(|r| r.recovered),
-    );
-    assert!(
-        crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none(),
-        "self-check: the fault fired before the install",
-    );
-
-    let leftover: Vec<String> = memfs
-        .read_dir(&blobs)?
-        .into_iter()
-        .filter(|e| !e.is_dir)
-        .map(|e| e.file_name)
-        .collect();
-    assert_eq!(
-        leftover,
-        vec![
-            blob_path
-                .file_name()
-                .expect("blob file name")
-                .to_string_lossy()
-                .to_string()
-        ],
-        "an uncommitted fresh-id replacement must be unwound, or every \
-         failed attempt stacks another copy",
-    );
-    Ok(())
+    Ok((memfs, root, blob_path))
 }
 
 #[test]

@@ -4183,7 +4183,10 @@ enum InstallProbe {
     Installed,
     /// The name is ABSENT (`NotFound`): the install did not happen. Absence
     /// is conclusive: the rebuilt id is above every manifest file on disk, so
-    /// only the persist's rename makes the name, and nothing removes it after.
+    /// only the persist's rename makes the name, and only the persist's
+    /// withdrawal removes it after, which the persist reports as
+    /// [`crate::Error::InstallOutcomeUnknown`] unless it made the removal
+    /// durable.
     NotInstalled,
     /// The name's existence cannot be told (a transient or permission failure
     /// of the probe): NO conclusion. The caller must fail SAFE: treating
@@ -6773,6 +6776,13 @@ fn publish_repaired_manifest(
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
         Ok(()) => published_blob_replacements.disarm(),
+        // The persist renamed the snapshot into place and could not make its
+        // withdrawal durable: a power loss may bring the name back, so its
+        // absence proves nothing.
+        Err(e @ crate::Error::InstallOutcomeUnknown(_)) => {
+            published_blob_replacements.disarm();
+            return Err(e);
+        }
         Err(e) => match probe_install(&*config.fs, &config.path, version_id) {
             InstallProbe::NotInstalled => return Err(e),
             InstallProbe::Installed => {

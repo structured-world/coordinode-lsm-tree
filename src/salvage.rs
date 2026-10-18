@@ -2609,7 +2609,7 @@ fn salvage_blocks(
                                             end_key.as_ref(),
                                         ));
                                     }
-                                    Err(e) => return Err(e),
+                                    Err(e) => return Err(output_failure(e)),
                                 }
                             }
                             // An ENVIRONMENTAL I/O read is retryable and propagates,
