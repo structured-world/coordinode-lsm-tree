@@ -1753,6 +1753,37 @@ fn a_rename_onto_a_name_removed_behind_a_lost_barrier_leaves_both_files() {
     assert_eq!(read(&fs, "/d/b"), b"B");
 }
 
+/// A rename behind a barrier sync is one step of the namespace: whatever
+/// prefix of the syncs a power loss keeps, both names are either as they were
+/// before it or as it left them, never half of each.
+#[test]
+fn a_rename_behind_a_barrier_is_kept_or_lost_whole() {
+    let build = || {
+        let fs = CrashFs::new(MemFs::new());
+        fs.create_dir_all(Path::new("/d")).unwrap();
+        write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Full);
+        write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Full);
+        write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+        fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
+        // The rename's own entry, made durable behind it.
+        fs.sync_directory_with(Path::new("/d"), SyncMode::Barrier)
+            .unwrap();
+        fs
+    };
+    let count = build().ordered_syncs();
+    for kept in 0..=count {
+        let fs = build();
+        fs.crash_keeping(kept);
+        let state = |path: &str| fs.exists(Path::new(path)).unwrap().then(|| read(&fs, path));
+        let (a, b) = (state("/d/a"), state("/d/b"));
+        assert!(
+            (a.as_deref(), b.as_deref()) == (Some(&b"A"[..]), Some(&b"B"[..]))
+                || (a.as_deref(), b.as_deref()) == (Some(&b"B"[..]), None),
+            "kept {kept} of {count}: a = {a:?}, b = {b:?}"
+        );
+    }
+}
+
 /// Two files the simulator never touched, one renamed over the other behind
 /// a barrier sync, are both back as they were when a power loss loses the
 /// rename.

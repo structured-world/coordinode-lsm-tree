@@ -338,6 +338,83 @@ fn creating_a_tree_under_missing_folders_syncs_each_of_them() {
     }
 }
 
+/// A creation that failed on a folder sync leaves its folders behind, made but
+/// not known durable; the retry finds them existing and syncs each of them
+/// all the same, up the chain, since it cannot tell they were made by a
+/// creation that never finished.
+#[test]
+fn a_retried_creation_syncs_the_folders_a_failed_one_left() {
+    use lsm_tree::fs::{Fault, FaultOp, FaultRule, Fs};
+    let root = std::path::absolute("/census/retry").expect("absolute path");
+    let base = root.join("a").join("b").join("tree");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    fs.create_dir_all(&root).expect("the folder that exists");
+    let config = || {
+        Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+    };
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path(root.to_string_lossy())
+        .once(),
+    );
+    assert!(
+        config().open().is_err(),
+        "self-check: the creation fails on a folder sync"
+    );
+    let _ = fs.injector().take_syncs();
+
+    let _tree = config().open().expect("the retry");
+    let synced: Vec<PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| *kind == SyncKind::Directory)
+        .map(|(path, _)| path)
+        .collect();
+    for holder in [root.clone(), root.join("a"), root.join("a").join("b")] {
+        assert!(
+            synced.contains(&holder),
+            "{} is synced by the retry: {synced:?}",
+            holder.display()
+        );
+    }
+}
+
+/// An open of a KV-separated tree that makes its missing `blobs/` folder
+/// makes that folder's name durable: an edit the open itself installs (a
+/// dictionary it registers) spends the first edit's folder sync, so no later
+/// flush would.
+#[test]
+fn an_open_that_makes_the_blob_folder_syncs_its_name() {
+    use lsm_tree::fs::Fs;
+    let base = PathBuf::from("/census/blobs-again/tree");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census::new(&base, None, fs.injector());
+    drop(open(&base, &fs, true, None));
+    let blobs = std::path::absolute(&base)
+        .expect("absolute path")
+        .join("blobs");
+    fs.remove_dir_all(&blobs)
+        .expect("lose the empty blob folder");
+    let _ = census.take();
+
+    let _tree = open(&base, &fs, true, None);
+    assert!(
+        census
+            .take()
+            .contains(&(Synced::TreeDir, SyncKind::Directory)),
+        "the tree folder is synced for the blob folder's name"
+    );
+}
+
 /// A route whose path lies inside the tree folder but on a backend of its
 /// own holds its names on that backend: creating the tree syncs, there, every
 /// folder that gained one, the tree folder included, since the snapshot's

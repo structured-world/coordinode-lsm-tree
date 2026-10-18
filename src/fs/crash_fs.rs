@@ -112,6 +112,17 @@ enum Ordered {
     /// and leaves the file as the syncs before it made it. The flag says the
     /// name's entry was not durable yet when it was removed.
     Removed(PathBuf, bool),
+    /// A rename issued behind an ordered sync, kept or lost whole: kept, the
+    /// destination's old file and the source's name are gone and the
+    /// destination holds `bytes`; lost, both names are as the syncs before it
+    /// left them. The flags say each name's entry was not durable yet.
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+        from_pending: bool,
+        to_pending: bool,
+        bytes: Option<Vec<u8>>,
+    },
 }
 
 impl CrashState {
@@ -133,18 +144,43 @@ impl CrashState {
                 Ordered::Removed(path, _) => {
                     self.durable.remove(&path);
                 }
+                Ordered::Renamed {
+                    from, to, bytes, ..
+                } => {
+                    self.durable.remove(&to);
+                    self.durable.remove(&from);
+                    if let Some(bytes) = bytes {
+                        self.set_durable(&to, bytes);
+                    }
+                }
             }
         }
         // A removal behind a lost sync is lost with it, and so is everything
         // made under that name after it: no sync that could make the new
         // entry durable comes before the lost one. The file stays as the kept
         // syncs left it; an entry made only after the removal is dropped,
-        // one that was pending before it stays pending.
+        // one that was pending before it stays pending. A lost rename leaves
+        // both of its names so.
         for sync in ordered {
-            if let Ordered::Removed(path, was_pending) = sync
-                && !was_pending
-            {
-                self.pending_entries.remove(&path);
+            match sync {
+                Ordered::Removed(path, false) => {
+                    self.pending_entries.remove(&path);
+                }
+                Ordered::Renamed {
+                    from,
+                    to,
+                    from_pending,
+                    to_pending,
+                    ..
+                } => {
+                    if !from_pending {
+                        self.pending_entries.remove(&from);
+                    }
+                    if !to_pending {
+                        self.pending_entries.remove(&to);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -165,7 +201,7 @@ impl CrashState {
                 entries.retain(|entry| entry != path);
                 true
             }
-            Ordered::Removed(..) => true,
+            Ordered::Removed(..) | Ordered::Renamed { .. } => true,
         });
     }
 
@@ -781,6 +817,7 @@ impl Fs for CrashFs {
         state.pending_entries.retain(|k| !k.starts_with(path));
         state.ordered.retain_mut(|sync| match sync {
             Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
+            Ordered::Renamed { from, to, .. } => !from.starts_with(path) && !to.starts_with(path),
             Ordered::Entries(entries) => {
                 entries.retain(|entry| !entry.starts_with(path));
                 true
@@ -841,55 +878,59 @@ impl Fs for CrashFs {
         let (from, to) = (self.name_after(from), self.name_after(to));
         let (from, to) = (from.as_path(), to.as_path());
         let mut state = self.state.lock();
-        // Behind an ordered sync, the rename is ordered too, as a removal is:
-        // a power loss that keeps only a prefix of the syncs may lose it, and
-        // with it everything after, leaving both names as the kept syncs made
-        // them. Queued in its place: the destination's old file goes, the
-        // source's name goes, and the destination takes the bytes the source
-        // had durable or queued by then. Names with hard links keep the
-        // immediate rename.
+        // Behind an ordered sync, the rename is ordered too, as a removal is,
+        // and as one step: a power loss that keeps only a prefix of the syncs
+        // either keeps it whole or loses it, and with it everything after,
+        // leaving both names as the kept syncs made them. Kept, the
+        // destination's old file and the source's name are gone and the
+        // destination holds the bytes the source had durable or queued by
+        // then. Names with hard links keep the immediate rename.
         if !state.ordered.is_empty()
             && state.names_of(from).len() == 1
             && state.names_of(to).len() <= 1
         {
-            // What a removal of the source's name still queued left under it
-            // belongs to the removed file; the file renamed has only the
-            // images queued after that removal.
-            let remade_after = state
+            // The last queued step that took the source's name from the file
+            // it held (a removal, a rename away or onto it): what the name
+            // had before belongs to that file. The file renamed now has only
+            // what that step and the ones after gave it.
+            let since = state.ordered.iter().rposition(|sync| match sync {
+                Ordered::Removed(name, _) => name.as_path() == from,
+                Ordered::Renamed {
+                    from: source,
+                    to: target,
+                    ..
+                } => source.as_path() == from || target.as_path() == from,
+                _ => false,
+            });
+            let queued = state
                 .ordered
                 .iter()
-                .rposition(
-                    |sync| matches!(sync, Ordered::Removed(name, _) if name.as_path() == from),
-                )
-                .map_or(0, |removal| removal + 1);
-            let queued =
-                state
-                    .ordered
-                    .iter()
-                    .skip(remade_after)
-                    .rev()
-                    .find_map(|sync| match sync {
-                        Ordered::Image(name, bytes) if name.as_path() == from => {
-                            Some(bytes.clone())
-                        }
-                        _ => None,
-                    });
+                .skip(since.unwrap_or(0))
+                .rev()
+                .find_map(|sync| match sync {
+                    Ordered::Image(name, bytes) if name.as_path() == from => Some(bytes.clone()),
+                    Ordered::Renamed {
+                        to: target,
+                        bytes: Some(bytes),
+                        ..
+                    } if target.as_path() == from => Some(bytes.clone()),
+                    _ => None,
+                });
             let bytes = queued.or_else(|| {
-                (remade_after == 0)
+                since
+                    .is_none()
                     .then(|| state.durable.get(from).cloned())
                     .flatten()
             });
             let to_pending = state.pending_entries.contains(to);
             let from_pending = state.pending_entries.contains(from);
-            state
-                .ordered
-                .push(Ordered::Removed(to.to_path_buf(), to_pending));
-            state
-                .ordered
-                .push(Ordered::Removed(from.to_path_buf(), from_pending));
-            if let Some(bytes) = bytes {
-                state.ordered.push(Ordered::Image(to.to_path_buf(), bytes));
-            }
+            state.ordered.push(Ordered::Renamed {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                from_pending,
+                to_pending,
+                bytes,
+            });
             state.touched.insert(from.to_path_buf());
             state.touched.insert(to.to_path_buf());
             // The destination's entry is new until its directory is synced.
@@ -916,7 +957,7 @@ impl Fs for CrashFs {
         for sync in &mut state.ordered {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
-                Ordered::Image(..) | Ordered::Removed(..) => {}
+                Ordered::Image(..) | Ordered::Removed(..) | Ordered::Renamed { .. } => {}
                 Ordered::Entries(entries) => entries.retain(|entry| entry != from),
             }
         }

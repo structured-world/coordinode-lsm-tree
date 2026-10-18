@@ -5727,18 +5727,31 @@ impl Tree {
         // one whose path lies inside the tree folder.
         let mut holders: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
         // The open made the tree folder already, to lock it, and every folder
-        // above it that did not exist: their names are new all the same.
-        for holder in made_by_open
-            .iter()
-            .cloned()
-            .chain(new_entry_holders(&*config.fs, &path)?)
-        {
+        // above it that did not exist: their names are new all the same. A
+        // folder that existed before may be one a creation left when it
+        // failed on a sync, made but not known durable, so every folder
+        // above it is synced: nothing tells how far up that creation went.
+        let tree_holders = if made_by_open.is_empty() && (*config.fs).exists(&path)? {
+            ancestors(&path)
+        } else {
+            made_by_open
+                .iter()
+                .cloned()
+                .chain(new_entry_holders(&*config.fs, &path)?)
+                .collect()
+        };
+        for holder in tree_holders {
             once(&mut holders, &holder, &config.fs);
         }
         (*config.fs).create_dir_all(&path)?;
         for (tables_folder, folder_fs) in config.all_tables_folders() {
             let covered = Arc::ptr_eq(&folder_fs, &config.fs);
-            for holder in new_entry_holders(&*folder_fs, &tables_folder)? {
+            let folder_holders = if folder_fs.exists(&tables_folder)? {
+                ancestors(&tables_folder)
+            } else {
+                new_entry_holders(&*folder_fs, &tables_folder)?
+            };
+            for holder in folder_holders {
                 if !(covered && holder == path) {
                     once(&mut holders, &holder, &folder_fs);
                 }
@@ -6625,6 +6638,21 @@ impl Tree {
 
         Ok(())
     }
+}
+
+/// Every folder above `folder`, nearest first.
+fn ancestors(folder: &Path) -> Vec<crate::path::PathBuf> {
+    let mut holders = Vec::new();
+    let mut made = folder;
+    // A relative path ends in an empty parent, which names no folder.
+    while let Some(holder) = made
+        .parent()
+        .filter(|holder| !holder.to_string_lossy().is_empty())
+    {
+        holders.push(holder.to_path_buf());
+        made = holder;
+    }
+    holders
 }
 
 /// The folders that gain a new entry when `folder` is made on `fs`: each one
