@@ -29,7 +29,6 @@ pub const BLOBS_FOLDER: &str = "blobs";
 /// and immutable once written; and rather than in each SST because every table
 /// compressed against one would then carry its own copy.
 pub const DICTS_FOLDER: &str = "dicts";
-pub const CURRENT_VERSION_FILE: &str = "current";
 
 /// Marks a tree folder whose restore has not finished.
 ///

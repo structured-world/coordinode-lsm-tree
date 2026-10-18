@@ -57,9 +57,9 @@ pub mod writer;
 /// MUST introduce a new `MANIFEST_LAYOUT_VERSION_V2` constant
 /// (and `_V3`, `_V4`, ... for each subsequent post-release break,
 /// incrementing the numeric suffix every time) — even if the change
-/// is otherwise additive. The CURRENT
-/// pointer's canonical digest binds this value, so a layout-only
-/// break is detected at recovery without requiring a
+/// is otherwise additive. The checksummed footer carries this
+/// value and the reader refuses any other, so a layout-only break
+/// is detected at recovery without requiring a
 /// [`crate::FormatVersion`] bump.
 pub const MANIFEST_LAYOUT_VERSION_V1: u8 = 1;
 

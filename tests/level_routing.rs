@@ -944,8 +944,8 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .filter(|n| {
                 n.strip_prefix('v')
+                    .or_else(|| n.strip_prefix("edits-"))
                     .is_some_and(|rest| rest.parse::<u64>().is_ok())
-                    || n == "current"
             })
             .collect();
         names.sort();

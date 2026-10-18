@@ -4575,7 +4575,7 @@ impl Tree {
         }
 
         // Acquire the cross-process directory lock BEFORE any manifest access
-        // (the `CURRENT` probe + `has_existing_version_state` check below, and
+        // (the installed-snapshot probe + `has_existing_version_state` check below, and
         // the recover / create paths). Acquiring it here makes `open()`
         // exclusive end-to-end: a concurrent opener fails fast with
         // `Error::Locked` instead of racing through the probe and observing a
@@ -4649,14 +4649,23 @@ impl Tree {
             return Err(crate::Error::InvalidVersion(1));
         }
 
-        // Recover when the tree holds an installed snapshot, verified here;
-        // create one otherwise.
-        let recovering = crate::version::recovery::installed_snapshot(
+        // Recover when the tree holds an installed snapshot, create one
+        // otherwise. The installed snapshot is opened here, which reads its
+        // footer under the configured provider.
+        let installed = crate::version::recovery::installed_snapshot(
             &config.path,
             &*config.fs,
-            config.encryption.clone(),
-        )?
-        .is_some();
+            config.encryption.as_ref(),
+        )?;
+        if let Some(id) = installed {
+            crate::version::recovery::open_snapshot(
+                &config.path,
+                id,
+                &*config.fs,
+                config.encryption.clone(),
+            )?;
+        }
+        let recovering = installed.is_some();
 
         // Load the tree's own dictionaries before anything opens a table: a
         // table resolves the dictionary id it recorded against this set, so an
@@ -5384,7 +5393,7 @@ impl Tree {
     /// Returns error, if an IO error occurred.
     #[expect(
         clippy::too_many_lines,
-        reason = "Tree::recover threads the whole open sequence (CURRENT validation, \
+        reason = "Tree::recover threads the whole open sequence (snapshot validation, \
                   Manifest decode, encryption + runtime plumbing, version recovery, \
                   TreeInner assembly) — splitting it would create helper functions whose \
                   only caller is this one site"
@@ -5415,7 +5424,7 @@ impl Tree {
         let snapshot_id = crate::version::recovery::installed_snapshot(
             &config.path,
             &*config.fs,
-            config.encryption.clone(),
+            config.encryption.as_ref(),
         )?
         .ok_or(crate::Error::ManifestFooterInvalid(
             "the tree holds no installed manifest snapshot",
@@ -5862,7 +5871,7 @@ impl Tree {
             config.encryption.clone(),
         )?;
 
-        // The on-disk snapshot CURRENT points at — the generation orphan cleanup
+        // The installed on-disk snapshot: the generation orphan cleanup
         // must preserve. Intermediate versions live only in the edit log, so the
         // latest version id (`version.id()`) has no `v{id}` file of its own.
         let snapshot_id = recovery.snapshot_id;
@@ -6548,7 +6557,7 @@ impl Tree {
 
         // NOTE: Cleanup old versions
         // But only after we definitely recovered the latest version.
-        // Preserve the snapshot CURRENT references (and its `edits-` log) — the
+        // Preserve the installed snapshot (and its `edits-` log): the
         // latest version id has no file of its own under the incremental
         // manifest, so cleaning by it would delete the live snapshot.
         Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs)?;
@@ -6651,8 +6660,7 @@ impl Tree {
     /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
     /// rotation can leak an old snapshot or its log; this sweeps them on open.
-    /// The live snapshot and log are the installed generation. A `current`
-    /// file, which no V6 code writes or reads, goes too.
+    /// The live snapshot and log are the installed generation.
     ///
     /// # Behavior change vs pre-Fs-trait code
     ///
@@ -6678,7 +6686,7 @@ impl Tree {
             let name = &dirent.file_name;
             let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
             let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            if is_orphan_snapshot || is_orphan_log || name == "current" {
+            if is_orphan_snapshot || is_orphan_log {
                 log::trace!("Cleanup orphaned manifest file {name}");
                 match fs.remove_file(&dirent.path) {
                     Ok(()) => {}

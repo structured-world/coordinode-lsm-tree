@@ -1,6 +1,6 @@
 use super::*;
 use crate::coding::Encode;
-use crate::fs::{FsOpenOptions, MemFs};
+use crate::fs::MemFs;
 use crate::io::{LittleEndian, WriteBytesExt};
 use crate::version::edit::{AddedBlobFile, ChangedLevel, TableDesc, VersionEdit};
 use std::io::Write;
@@ -482,7 +482,7 @@ fn apply_overwrites_gc_stats_when_present() {
 /// test corruption-recovery write the corrupted manifest first, then
 /// install it, so the per-Block / per-record check downstream is the one
 /// that surfaces the corruption.
-fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+fn install_fixture(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
     crate::version::edit_log::create_log(fs, folder, version_id)
 }
 
@@ -607,7 +607,7 @@ fn recover_tables(levels: u8, records: &[(u8, u32, u64)]) -> crate::Result<Recov
     let folder = Path::new("/tables");
     fs.create_dir_all(folder)?;
     write_tables(folder, 1, levels, records, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
     recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
 }
 
@@ -716,7 +716,7 @@ fn recover_rejects_corrupt_blob_file_count() -> crate::Result<()> {
     fs.create_dir_all(folder)?;
 
     write_corrupt_blob_count(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
         panic!("corrupt blob_file_count should fail");
@@ -786,7 +786,7 @@ fn recover_rejects_a_truncated_tables_section_in_every_mode() -> crate::Result<(
     fs.create_dir_all(folder)?;
 
     write_truncated_tables_tail(folder, 1, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -824,7 +824,7 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
     w.start("blob_gc_stats")?;
     w.write_u32::<LittleEndian>(0)?;
     w.finish()?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     let result = recover(
         folder,
@@ -864,7 +864,7 @@ fn recover_rejects_a_tables_section_cut_inside_a_frame_header() -> crate::Result
     fs.create_dir_all(folder)?;
 
     write_truncated_at_second_run(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -917,7 +917,7 @@ fn recover_rejects_a_truncated_blob_files_section_in_every_mode() -> crate::Resu
     fs.create_dir_all(folder)?;
 
     write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(e, crate::Error::InvalidHeader("blob_files section"))
@@ -950,7 +950,7 @@ fn recover_rejects_a_truncated_blob_gc_stats_section_in_every_mode() -> crate::R
     let folder = Path::new("/truncated/gc_stats");
     fs.create_dir_all(folder)?;
     write_truncated_blob_gc_stats(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -1043,7 +1043,7 @@ fn recover_rejects_a_corrupt_table_record_in_every_mode() -> crate::Result<()> {
     let folder = Path::new("/corrupt/table_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(
@@ -1114,7 +1114,7 @@ fn recover_rejects_a_corrupt_blob_file_record_in_every_mode() -> crate::Result<(
     let folder = Path::new("/corrupt/blob_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(
@@ -1138,7 +1138,7 @@ fn write_manifest_labelled(folder: &Path, fs: &dyn Fs, format_version: u8) -> cr
     write_empty_blob_files(&mut w)?;
     write_empty_blob_gc_stats(&mut w)?;
     w.finish()?;
-    write_current(folder, 1, fs)
+    install_fixture(folder, 1, fs)
 }
 
 /// Recovery reads the format version before any section: a manifest of

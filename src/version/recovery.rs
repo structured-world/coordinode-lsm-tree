@@ -140,7 +140,7 @@ fn place_table(
 /// encrypted manifest block requires.
 ///
 /// Read strictly, whatever the recovery mode: the section is one checksummed
-/// block bound to the `CURRENT` digest, so it arrives whole, and a record that
+/// block the snapshot's footer indexes, so it arrives whole, and a record that
 /// does not verify, decode or fall in place is a writer defect or a forgery.
 /// Opening past one would drop tables the manifest committed, and the open
 /// then deletes their files as orphans.
@@ -389,6 +389,20 @@ fn parse_dicts_section(mut bytes: &[u8]) -> crate::Result<Vec<crate::file::DictI
     Ok(ids)
 }
 
+/// Refuses a snapshot of another format than this engine's as
+/// [`crate::Error::InvalidVersion`].
+fn check_format(
+    archive: &mut crate::manifest_blocks::reader::ManifestArchiveReader,
+) -> crate::Result<()> {
+    let format = archive.read_section("format_version")?;
+    let format = format
+        .first()
+        .copied()
+        .ok_or(crate::Error::InvalidHeader("format_version"))?;
+    crate::FormatVersion::try_from(format).map_err(|()| crate::Error::InvalidVersion(format))?;
+    Ok(())
+}
+
 /// The version id `name` holds as a snapshot (`v{id}`), if it is one.
 #[must_use]
 pub fn snapshot_id_of(name: &str) -> Option<VersionId> {
@@ -409,7 +423,7 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
     digits.parse().ok()
 }
 
-/// The installed snapshot of the tree in `folder`, verified, or `None` when
+/// The id of the installed snapshot of the tree in `folder`, or `None` when
 /// the tree has none (a new tree, or one whose creation never completed).
 ///
 /// A snapshot is installed once its edit log exists: a rotation syncs the
@@ -419,22 +433,20 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
 /// log is a rotation that never completed and is passed over, and an older
 /// generation a rotation left behind is never chosen, being lower.
 ///
-/// The installed snapshot has to open (the footer, its head-mirror fallback
-/// and the TOC checksums, through
-/// [`ManifestArchiveReader::open`](crate::manifest_blocks::reader::ManifestArchiveReader::open))
-/// and name its own id. A failure there is damage to the snapshot the tree
-/// was acknowledged on, reported as such, never answered by an older
-/// generation, which would drop acknowledged edits.
+/// The choice is by name alone: [`recover`] opens the chosen snapshot and
+/// verifies it, and a failure there is damage to the snapshot the tree was
+/// acknowledged on, reported as such, never answered by an older generation,
+/// which would drop acknowledged edits.
 ///
 /// # Errors
 ///
-/// Propagates a failure to list `folder`, and reports an installed snapshot
-/// that does not open, does not name its id, or is missing its id section as
-/// [`crate::Error::ManifestFooterInvalid`] or the reader's own error.
+/// Propagates a failure to list `folder`, and refuses with
+/// [`crate::Error::InvalidVersion`] a folder without an installed snapshot
+/// whose newest snapshot is of another format.
 pub fn installed_snapshot(
     folder: &Path,
     fs: &dyn Fs,
-    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+    encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Option<VersionId>> {
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
@@ -450,28 +462,46 @@ pub fn installed_snapshot(
             logs.insert(id);
         }
     }
-    let Some(id) = snapshots.into_iter().filter(|id| logs.contains(id)).max() else {
-        return Ok(None);
-    };
+    let installed = snapshots
+        .iter()
+        .copied()
+        .filter(|id| logs.contains(id))
+        .max();
+    if installed.is_none()
+        && let Some(newest) = snapshots.iter().copied().max()
+    {
+        // No installed snapshot. A store of another format is still refused
+        // as such rather than taken for a new tree: a 5.x store makes a
+        // rotated snapshot's log only at its first edit, so its newest
+        // snapshot may have none. A snapshot that does not open here is a
+        // write that never completed, which proves nothing either way.
+        if let Ok(mut archive) = open_snapshot(folder, newest, fs, encryption.cloned()) {
+            check_format(&mut archive)?;
+        }
+    }
+    Ok(installed)
+}
 
+/// Opens the snapshot `v{id}` in `folder`: its footer (or the head mirror)
+/// verifies and decrypts under `encryption`.
+///
+/// # Errors
+///
+/// Returns the reader's error for a snapshot that does not open.
+pub fn open_snapshot(
+    folder: &Path,
+    id: VersionId,
+    fs: &dyn Fs,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<crate::manifest_blocks::reader::ManifestArchiveReader> {
     // The runtime is a placeholder: the reader's ECC decisions are per-Block
     // and self-describing, not driven by it.
-    let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
+    crate::manifest_blocks::reader::ManifestArchiveReader::open(
         &folder.join(alloc::format!("v{id}")),
         fs,
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         encryption,
-    )?;
-    let named = archive.read_section("version_id")?;
-    let named = <[u8; 8]>::try_from(named.as_slice()).map_err(|_| {
-        crate::Error::ManifestFooterInvalid("manifest version_id section is not 8 bytes")
-    })?;
-    if u64::from_le_bytes(named) != id {
-        return Err(crate::Error::ManifestFooterInvalid(
-            "manifest snapshot names another version than its file",
-        ));
-    }
-    Ok(Some(id))
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,8 +517,8 @@ pub struct RecoveredTable {
 #[derive(Debug)]
 pub struct Recovery {
     pub tree_type: TreeType,
-    /// Version id of the on-disk snapshot the `CURRENT` pointer references —
-    /// the base the edit log is replayed on top of. The snapshot file
+    /// Version id of the installed on-disk snapshot: the base the edit log
+    /// is replayed on top of. The snapshot file
     /// `v{snapshot_id}` and its log `edits-{snapshot_id}` are the generation
     /// that must survive orphan cleanup; intermediate versions live only in the
     /// log. Equals [`Self::curr_version_id`] when the log is empty (just after a
@@ -637,38 +667,37 @@ pub fn recover(
     mode: ManifestRecoveryMode,
     encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Recovery> {
-    let curr_version_id = installed_snapshot(folder, fs, encryption.clone())?.ok_or(
+    let curr_version_id = installed_snapshot(folder, fs, encryption.as_ref())?.ok_or(
         crate::Error::ManifestFooterInvalid("the tree holds no installed manifest snapshot"),
     )?;
-    let version_file_path = folder.join(format!("v{curr_version_id}"));
 
     log::info!(
-        "Recovering current manifest at {} (mode={mode:?})",
-        version_file_path.display(),
+        "Recovering current manifest v{curr_version_id} in {} (mode={mode:?})",
+        folder.display(),
     );
 
-    let mut archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
-        &version_file_path,
-        fs,
-        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
-        encryption,
-    )?;
+    // The footer, its head-mirror fallback and the TOC checksums are checked
+    // here; a failure is damage to the installed snapshot.
+    let mut archive = open_snapshot(folder, curr_version_id, fs, encryption)?;
 
     // The format label comes first: every section below is parsed in the
-    // current layout, so a manifest of another format must be refused as
-    // such, never misread or reported as damage. Every caller shares this
-    // gate, repair included, which would otherwise rebuild an old store in
-    // the current format.
-    let format_version = archive
-        .read_section("format_version")?
-        .first()
-        .copied()
-        .ok_or(crate::Error::InvalidHeader("format_version"))?;
-    crate::FormatVersion::try_from(format_version)
-        .map_err(|()| crate::Error::InvalidVersion(format_version))?;
+    // current layout, so a manifest of another format (a 5.x one, whose
+    // snapshot names no id) must be refused as such, never misread or
+    // reported as damage. Every caller shares this gate, repair included,
+    // which would otherwise rebuild an old store in the current format.
+    check_format(&mut archive)?;
+    let named = archive.read_section("version_id")?;
+    let named = <[u8; 8]>::try_from(named.as_slice()).map_err(|_| {
+        crate::Error::ManifestFooterInvalid("manifest version_id section is not 8 bytes")
+    })?;
+    if u64::from_le_bytes(named) != curr_version_id {
+        return Err(crate::Error::ManifestFooterInvalid(
+            "manifest snapshot names another version than its file",
+        ));
+    }
 
     // The snapshot's sections are read strictly whatever `mode` says: each is
-    // one checksummed block bound to the CURRENT digest, so it arrives whole,
+    // one checksummed block the snapshot's footer indexes, so it arrives whole,
     // and a record inside it that does not verify or decode is a writer defect
     // or a forgery, not a torn write. `mode` governs only the edit log below.
 

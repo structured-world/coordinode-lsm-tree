@@ -25,7 +25,6 @@ enum Synced {
     Blob,
     EditLog,
     Snapshot,
-    CurrentPointer,
     Other(String),
 }
 
@@ -82,8 +81,6 @@ impl Census {
             Synced::EditLog
         } else if file_name.starts_with('v') && file_name[1..].chars().all(|c| c.is_ascii_digit()) {
             Synced::Snapshot
-        } else if file_name.starts_with(".tmp_") {
-            Synced::CurrentPointer
         } else {
             Synced::Other(path.display().to_string())
         };
@@ -154,14 +151,13 @@ fn fill(tree: &AnyTree, round: u64) {
     }
 }
 
-/// What creating a tree syncs: the snapshot, the pointer to it, the tree
-/// folder once for each (its entries, the tables folder among them, are all
-/// made before), and once the folder above, for the tree folder's own name.
+/// What creating a tree syncs: the snapshot, the tree folder once (its
+/// entries, the tables folder and the snapshot's empty log among them, are
+/// all made before), and once the folder above, for the tree folder's own
+/// name.
 fn creation() -> Vec<(Synced, SyncKind)> {
     sorted(vec![
         (Synced::Snapshot, SyncKind::FileData),
-        (Synced::TreeDir, SyncKind::Directory),
-        (Synced::CurrentPointer, SyncKind::File),
         (Synced::TreeDir, SyncKind::Directory),
         (Synced::ParentDir, SyncKind::Directory),
     ])
@@ -223,6 +219,43 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
         assert_eq!(census.take(), Vec::new(), "reopening (blob: {blob})");
         drop(tree);
     }
+}
+
+/// A flush that rotates the manifest installs its fresh snapshot with two
+/// syncs: the snapshot's bytes, then the tree folder for the names of the
+/// snapshot and its empty log, which is what installs it.
+#[test]
+fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
+    let base = PathBuf::from("/census/rotating");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census {
+        base: base.clone(),
+        route: None,
+        injector: fs.injector(),
+    };
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .manifest_log_rotate_bytes(0)
+    .open()
+    .expect("open");
+    census.take();
+
+    fill(&tree, 1);
+    tree.flush_active_memtable(0).expect("flush");
+    assert_eq!(
+        census.take(),
+        sorted(vec![
+            (Synced::Table, SyncKind::FileData),
+            (Synced::TablesDir, SyncKind::Directory),
+            (Synced::Snapshot, SyncKind::FileData),
+            (Synced::TreeDir, SyncKind::Directory),
+        ]),
+        "a flush whose install rotates"
+    );
 }
 
 /// A tree whose tables live in a routed folder syncs that folder's new

@@ -26,10 +26,10 @@ use crate::path::Path;
 ///
 /// # Errors
 ///
-/// Propagates an I/O or encoding error. On an error after the log was
-/// created, the log is removed again where it can be, so the snapshot is not
-/// left installed under an install reported as failed; the caller treats the
-/// outcome as unknown regardless (see `SuperVersions::persist_change`).
+/// Propagates an I/O or encoding error. An error after the log was created
+/// (its directory sync) leaves the install's outcome unknown: the snapshot
+/// may be installed on disk or may not, and the caller treats it so (see
+/// `SuperVersions::persist_change`).
 pub fn persist_version(
     folder: &Path,
     version: &Version,
@@ -87,16 +87,7 @@ pub fn persist_version(
 
     // The snapshot's name and its log's, and every entry made in the folder
     // before (a new tree's folders), durable together.
-    if let Err(e) = fsync_directory(folder, fs, sync_mode) {
-        if let Err(removal) = fs.remove_file(&log) {
-            log::warn!(
-                "persist: could not withdraw the log {} of a failed install: {removal}",
-                log.display()
-            );
-        }
-        return Err(e.into());
-    }
-
+    fsync_directory(folder, fs, sync_mode)?;
     Ok(())
 }
 

@@ -756,7 +756,7 @@ fn crashed_store_with(
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1276,7 +1276,7 @@ fn reconciled_replay_coalesces_overlapping_loss_ranges() -> lsm_tree::Result<()>
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1407,7 +1407,7 @@ fn reconciled_replay_keeps_records_tied_with_surviving_range_tombstones() -> lsm
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1513,7 +1513,7 @@ fn reconciled_replay_restores_the_put_a_surviving_weak_delete_pairs_with() -> ls
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1628,7 +1628,7 @@ fn reconciled_replay_restores_a_weak_delete_under_a_newer_survivor() -> lsm_tree
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1729,7 +1729,7 @@ fn reconciled_replay_restores_a_put_tied_with_a_surviving_older_put() -> lsm_tre
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }
@@ -1882,7 +1882,7 @@ fn reconciled_replay_skips_operands_folded_into_surviving_values() -> lsm_tree::
         let is_version = name
             .strip_prefix('v')
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path()).expect("remove manifest file");
         }
     }

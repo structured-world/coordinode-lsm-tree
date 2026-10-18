@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! A manifest rotation that fails after writing its snapshot but before
-//! `current` names it must not block the installs that follow: the retry
-//! derives the same version id, and the snapshot left behind is garbage, not
-//! a reason to refuse every later rotation until the process restarts.
+//! A manifest rotation that fails after writing its snapshot and its log but
+//! before the directory sync that installs them must not block the installs
+//! that follow: the retry derives the same version id, and what the failed
+//! attempt left is garbage, not a reason to refuse every later rotation until
+//! the process restarts.
 
 #![cfg(feature = "std")]
 
@@ -14,8 +15,7 @@ use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 use test_log::test;
 
 #[test]
-fn a_rotation_failed_before_current_moves_does_not_block_the_next_install() -> lsm_tree::Result<()>
-{
+fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
     let fs = FaultFs::new(StdFs);
     let injector = fs.injector();
@@ -25,8 +25,8 @@ fn a_rotation_failed_before_current_moves_does_not_block_the_next_install() -> l
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        // Every install rotates, so each flush writes a fresh snapshot and
-        // repoints `current`.
+        // Every install rotates, so each flush writes and installs a fresh
+        // snapshot.
         .manifest_log_rotate_bytes(0)
         .with_fs(fs)
         .open()
@@ -37,21 +37,21 @@ fn a_rotation_failed_before_current_moves_does_not_block_the_next_install() -> l
         tree.insert("k0", "v0", 0);
         tree.flush_active_memtable(0)?;
 
-        // The next rotation writes its snapshot, then fails to repoint
-        // `current`: the snapshot stays on disk, named by nothing.
+        // The next flush syncs its table's folder, then writes its snapshot
+        // and log and fails the directory sync that would install them.
         injector.arm(
-            FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
-                .on_path("current")
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(1)
                 .once(),
         );
         tree.insert("k1", "v1", 1);
         assert!(
             tree.flush_active_memtable(1).is_err(),
-            "the armed rename must fail this install"
+            "the armed directory sync must fail this install"
         );
 
         // The retry derives the same version id. It must install, not refuse
-        // on the snapshot the failed attempt left.
+        // on what the failed attempt left.
         tree.insert("k2", "v2", 2);
         tree.flush_active_memtable(2)?;
 

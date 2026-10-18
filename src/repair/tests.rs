@@ -387,19 +387,30 @@ fn compute_table_checksum_matches_oneshot_xxh3() -> crate::Result<()> {
 }
 
 #[test]
-fn highest_existing_version_id_picks_the_max_and_ignores_non_versions() -> crate::Result<()> {
+/// A log is a generation's file too: a rebuilt snapshot under an id an
+/// orphaned log still carries would meet that log at its install.
+#[test]
+fn highest_existing_version_id_picks_the_max_over_snapshots_and_logs() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    for name in ["v2", "v10", "v3", "current", "vNaN", "notaversion"] {
+    for name in [
+        "v2",
+        "v10",
+        "v3",
+        "edits-11",
+        "vNaN",
+        "edits-x",
+        "notaversion",
+    ] {
         std::fs::write(dir.path().join(name), b"x")?;
     }
-    assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, Some(10));
+    assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, Some(11));
     Ok(())
 }
 
 #[test]
 fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("current"), b"x")?;
+    std::fs::write(dir.path().join("notaversion"), b"x")?;
     assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, None);
     Ok(())
 }
@@ -3126,8 +3137,9 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -3674,8 +3686,9 @@ fn repair_skips_salvaging_an_unreferenced_invalid_blob() -> crate::Result<()> {
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -7934,8 +7947,9 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8026,8 +8040,9 @@ fn repair_fails_when_its_own_salvage_temp_cannot_be_removed() -> crate::Result<(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8129,8 +8144,9 @@ fn repair_fails_when_a_leftover_salvage_temp_cannot_be_removed() -> crate::Resul
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8237,8 +8253,9 @@ fn repair_fails_when_a_fully_punched_blobs_drop_cannot_complete() -> crate::Resu
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8424,8 +8441,9 @@ fn repair_abort_leaves_a_fully_punched_blob_in_place() -> crate::Result<()> {
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8539,8 +8557,9 @@ fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8654,8 +8673,9 @@ fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> 
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -8957,8 +8977,9 @@ fn repair_does_not_leave_an_unrestrictable_rewrite_in_the_scan() -> crate::Resul
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -9076,20 +9097,23 @@ fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() ->
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
     let source = root.join("tables").join("0");
     assert!(memfs.exists(&source)?, "the fixture's SST is at tables/0");
 
-    // Fail the manifest commit (the CURRENT pointer's atomic swap): everything
-    // up to publication has run.
+    // Fail the manifest commit (the creation of the log that installs the
+    // rebuilt snapshot; the persist's first open of that log only measures
+    // it): everything up to publication has run.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path(crate::file::CURRENT_VERSION_FILE),
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("edits-")
+            .skip(1),
     );
     let result = Config::new(
         &root,
@@ -9180,8 +9204,9 @@ fn repair_counts_only_blob_files_that_reach_the_manifest() -> crate::Result<()> 
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -9346,8 +9371,9 @@ fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -9650,8 +9676,9 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
         let name = name.to_string_lossy();
         let is_version = name
             .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path())?;
         }
     }
@@ -9917,8 +9944,9 @@ fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -10554,8 +10582,9 @@ fn a_committed_transforming_compaction_survives_manifest_loss() -> crate::Result
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -11008,9 +11037,14 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
         tree.insert(b"b", b"v", 2);
         tree.flush_active_memtable(0)?;
     }
-    // Losing CURRENT makes the open structurally repairable BEFORE the key
-    // mismatch can surface, so the repair scan is where decrypt first fails.
-    memfs.remove_file(&root.join("current"))?;
+    // Losing the snapshot makes the open structurally repairable BEFORE the
+    // key mismatch can surface, so the repair scan is where decrypt first
+    // fails.
+    for e in memfs.read_dir(&root)? {
+        if crate::version::recovery::snapshot_id_of(&e.file_name).is_some() {
+            memfs.remove_file(&e.path)?;
+        }
+    }
 
     let wrong: Arc<dyn crate::encryption::EncryptionProvider> =
         Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x13; 32]));
@@ -11050,16 +11084,15 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
 }
 
 /// An INCONCLUSIVE post-persist probe must not claim a committed repair:
-/// with the rename refused and the pointer read failing too, nothing
-/// proves the switch, and returning `RepairedButUnopened` would hand a
-/// consumer a replay obligation against the still-unrepaired tree (its
-/// reconciliation could duplicate merge operands) while the cleanup
-/// sweeps a possibly-live generation's edit logs. The sweep arms a
-/// one-shot pointer-read fault at increasing skip counts; whenever the
-/// repair fails with `CURRENT` absent (never switched), the error must be
-/// bare.
+/// with the log's creation refused and the probe of the log failing too,
+/// nothing proves the install, and returning `RepairedButUnopened` would hand
+/// a consumer a replay obligation against the still-unrepaired tree (its
+/// reconciliation could duplicate merge operands) while the cleanup sweeps a
+/// possibly-live generation's edit logs. The sweep arms a one-shot probe
+/// fault at increasing skip counts; whenever the repair fails with no
+/// snapshot installed, the error must be bare.
 #[test]
-fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Result<()> {
+fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
@@ -11087,21 +11120,25 @@ fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Res
             let is_version = e
                 .file_name
                 .strip_prefix('v')
+                .or_else(|| e.file_name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
+            if is_version {
                 memfs.remove_file(&e.path)?;
             }
         }
 
         let fault = FaultFs::new((*memfs).clone());
+        // The persist's first open of the rebuilt log only measures it; the
+        // second creates it, and is refused.
         fault.injector().arm(
-            FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
-                .on_path("current")
+            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+                .on_path("edits-")
+                .skip(1)
                 .times(1),
         );
         fault.injector().arm(
-            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path("current")
+            FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("edits-")
                 .skip(skip)
                 .times(1),
         );
@@ -11113,12 +11150,12 @@ fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Res
         .with_fs(fault)
         .repair();
 
-        if !memfs.exists(&root.join("current"))?
+        if crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none()
             && let Err(e) = &result
         {
             assert!(
                 !matches!(e, crate::Error::RepairedButUnopened { .. }),
-                "CURRENT never switched, so no report may claim a committed \
+                "no snapshot was installed, so no report may claim a committed \
                  repair (skip {skip}): {e:?}",
             );
         }
@@ -11165,8 +11202,9 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -11190,16 +11228,15 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
     Ok(())
 }
 
-/// A `persist_version` failure AFTER its atomic `CURRENT` switch (the
-/// pointer's directory sync is the one fallible step past it) must carry
-/// the report: the pointer on disk already names the rebuilt manifest, so
-/// once the transient fault clears the retry opens it without a repair and
-/// answers with no report at all. The sweep arms a one-shot directory-sync
-/// fault at increasing skip counts until it lands in that window (the
-/// re-created `current` proves the switch happened) and asserts the error
-/// is the report-carrying kind.
+/// A `persist_version` failure AFTER it installed the rebuilt snapshot (the
+/// directory sync is the one fallible step past the log's creation) must
+/// carry the report: the snapshot on disk is installed, so once the
+/// transient fault clears the retry opens it without a repair and answers
+/// with no report at all. The sweep arms a one-shot directory-sync fault at
+/// increasing skip counts until it lands in that window (the installed
+/// snapshot proves it) and asserts the error is the report-carrying kind.
 #[test]
-fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
+fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
@@ -11227,8 +11264,9 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
             let is_version = e
                 .file_name
                 .strip_prefix('v')
+                .or_else(|| e.file_name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
+            if is_version {
                 memfs.remove_file(&e.path)?;
             }
         }
@@ -11247,20 +11285,21 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
         .with_fs(fault)
         .repair();
 
-        let switched = memfs.exists(&root.join("current"))?;
+        let switched =
+            crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_some();
         match result {
             Ok(_) => {
                 // The fault fired before any sync (or never) without
-                // reaching the post-switch window at this skip; when the
+                // reaching the post-install window at this skip; when the
                 // skip exceeds every sync the repair just succeeds — the
                 // window, if it exists, was at a smaller skip.
             }
             Err(e) if !switched => {
-                // Failed before the switch: a bare error is correct here
+                // Failed before the install: a bare error is correct here
                 // (nothing was published; the retry re-repairs).
                 assert!(
                     !matches!(e, crate::Error::RepairedButUnopened { .. }),
-                    "no report may claim a repair the pointer disproves",
+                    "no report may claim a repair the disk disproves",
                 );
             }
             Err(crate::Error::RepairedButUnopened { report, .. }) => {
@@ -11270,13 +11309,12 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
                 );
                 return Ok(());
             }
-            Err(other) => panic!(
-                "a failure after the CURRENT switch must carry the report, \
-                 got {other:?}",
-            ),
+            Err(other) => {
+                panic!("a failure after the install must carry the report, got {other:?}",)
+            }
         }
     }
-    panic!("no skip count landed the fault in the post-switch window");
+    panic!("no skip count landed the fault in the post-install window");
 }
 
 /// When the manifest itself loads CLEANLY and repair was entered over one
@@ -11630,8 +11668,9 @@ fn an_unreferenced_blob_is_removed_at_its_recovered_path() -> crate::Result<()> 
         let is_version = entry
             .file_name
             .strip_prefix('v')
+            .or_else(|| entry.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || entry.file_name == "current" {
+        if is_version {
             memfs.remove_file(&entry.path)?;
         }
     }
@@ -12565,8 +12604,9 @@ fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> 
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -12942,18 +12982,17 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
     Ok(())
 }
 
-/// The post-failure `CURRENT` probe must fail SAFE: a probe that cannot read
-/// the pointer (a transient or permission failure on its open / read) proves
-/// nothing about the switch, and treating it as "not switched" lets the
-/// still-armed guard delete replacements a PUBLISHED manifest references —
-/// a repaired tree with missing blob files. The sweep drives a directory-sync
-/// fault through every sync in the commit sequence (including the one AFTER
-/// the pointer rename) while the probe's own open is refused; whatever the
-/// outcome, a pointer that names the rebuilt version must still resolve every
-/// value.
+/// The post-failure install probe must fail SAFE: a probe that cannot stat
+/// the rebuilt log (a transient or permission failure) proves nothing about
+/// the install, and treating it as "not installed" lets the still-armed guard
+/// delete replacements a PUBLISHED manifest references: a repaired tree with
+/// missing blob files. The sweep drives a directory-sync fault through every
+/// sync in the commit sequence (including the one AFTER the log's creation)
+/// while the probe is refused; whatever the outcome, an installed rebuilt
+/// snapshot must still resolve every value.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Result<()> {
+fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -13010,8 +13049,9 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
             let is_version = e
                 .file_name
                 .strip_prefix('v')
+                .or_else(|| e.file_name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
+            if is_version {
                 memfs.remove_file(&e.path)?;
             }
         }
@@ -13025,12 +13065,11 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
         fault
             .injector()
             .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(skip));
-        // ...and the probe cannot read the pointer to find out what happened
-        // (the first `current` open is recovery's own, before the rebuild).
+        // ...and the probe cannot stat the rebuilt log to find out what
+        // happened.
         fault.injector().arm(
-            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path(crate::file::CURRENT_VERSION_FILE)
-                .skip(1),
+            FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path("edits-"),
         );
 
         let result = Config::new(
@@ -13044,10 +13083,10 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
         ))
         .repair();
 
-        // The invariant, whatever the fault timing hit: a pointer that NAMES
-        // the rebuilt version resolves every surviving value — the guard must
-        // never have deleted a file the published manifest references.
-        if memfs.exists(&root.join("current"))? {
+        // The invariant, whatever the fault timing hit: an installed rebuilt
+        // snapshot resolves every surviving value: the guard must never have
+        // deleted a file the published manifest references.
+        if crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_some() {
             let tree = Config::new(
                 &root,
                 SequenceNumberCounter::default(),
@@ -13074,10 +13113,10 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
     Ok(())
 }
 
-/// A persist failure BEFORE the `CURRENT` pointer switch must unwind the
-/// published fresh-id blob replacements. The guard was disarmed ahead of
-/// `persist_version`, whose create / encode / finish / directory-sync steps
-/// are all fallible before the switch — so a manifest-write error left the
+/// A persist failure BEFORE the install must unwind the published fresh-id
+/// blob replacements. The guard was disarmed ahead of `persist_version`,
+/// whose create / encode / finish steps are all fallible before the log
+/// installs the snapshot, so a manifest-write error left the
 /// uncommitted replacement in `blobs/`, and every failed attempt stacked
 /// another fresh-id copy (the retry salvages the damaged original again),
 /// walking recovery toward ENOSPC under exactly the tight-space conditions
@@ -13142,18 +13181,19 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
 
-    // The rebuilt manifest is `v0` (no `v*` files survive); its write dies
-    // with ENOSPC — strictly BEFORE the `CURRENT` pointer switch.
+    // The rebuilt snapshot's write (the only `v*` file left to write) dies
+    // with ENOSPC, strictly BEFORE its log installs it.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
-            .on_path(root.join("v0").to_string_lossy()),
+            .on_path(root.join("v").to_string_lossy()),
     );
     let result = Config::new(
         &root,
@@ -13171,8 +13211,8 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
         result.map(|r| r.recovered),
     );
     assert!(
-        !memfs.exists(&root.join("current"))?,
-        "self-check: the fault fired before the pointer switch",
+        crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none(),
+        "self-check: the fault fired before the install",
     );
 
     let leftover: Vec<String> = memfs
@@ -13262,8 +13302,9 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
             let is_version = e
                 .file_name
                 .strip_prefix('v')
+                .or_else(|| e.file_name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
+            if is_version {
                 memfs.remove_file(&e.path)?;
             }
         }
@@ -13403,8 +13444,9 @@ fn repair_leaves_every_table_in_place_when_the_rewrite_fails_transiently() -> cr
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -13528,8 +13570,9 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -13647,7 +13690,7 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
 /// fails, a repair that committed reopens.
 #[test]
 fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use std::sync::Arc;
 
@@ -13665,7 +13708,9 @@ fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<
                 .times(1),
         );
         let result = chained_config(&root, Arc::new(fault)).repair_with_salvage(true);
-        if result.is_ok() || !memfs.exists(&root.join("current"))? {
+        if result.is_ok()
+            || crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none()
+        {
             continue;
         }
         lost_after_commit += 1;
@@ -13801,8 +13846,9 @@ fn damage_a_table_and_its_blob(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -13887,8 +13933,9 @@ fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -14046,8 +14093,9 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -14264,8 +14312,9 @@ fn blob_tree_without_manifest(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -14773,8 +14822,9 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -14902,8 +14952,9 @@ fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::R
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -15004,8 +15055,9 @@ fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> c
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -15148,8 +15200,9 @@ fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> c
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -15513,7 +15566,7 @@ fn repair_discards_an_uncommitted_repair_replacement() -> crate::Result<()> {
 }
 
 /// A standard tree with data flushed and its manifest (version snapshots +
-/// `current`) removed — the manifest-loss fixture the progress / entry-point
+/// edit logs) removed — the manifest-loss fixture the progress / entry-point
 /// tests below repair.
 fn standard_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
@@ -15540,8 +15593,9 @@ fn standard_tree_without_manifest(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -15825,16 +15879,17 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
     let manifest_names: Vec<String> = memfs
         .read_dir(&root)?
         .into_iter()
-        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .filter(|e| e.file_name.starts_with('v') || e.file_name.starts_with("edits-"))
         .map(|e| e.file_name)
         .collect();
 
     // `WouldBlock`, not `Interrupted`: std's buffered reads transparently
     // retry EINTR, so a permanently armed Interrupted would spin forever.
     let fault = FaultFs::new((*memfs).clone());
-    fault
-        .injector()
-        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
+            .on_path(root.join("v").to_string_lossy()),
+    );
     let result = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -15853,7 +15908,7 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
     let after: Vec<String> = memfs
         .read_dir(&root)?
         .into_iter()
-        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .filter(|e| e.file_name.starts_with('v') || e.file_name.starts_with("edits-"))
         .map(|e| e.file_name)
         .collect();
     assert_eq!(
@@ -16050,8 +16105,7 @@ fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
         use crate::fs::Fs;
         let mut state = Vec::new();
         for e in memfs.read_dir(&root)? {
-            let manifest = e.file_name == "current"
-                || e.file_name.starts_with("edits-")
+            let manifest = e.file_name.starts_with("edits-")
                 || e.file_name
                     .strip_prefix('v')
                     .is_some_and(|rest| rest.parse::<u64>().is_ok());
@@ -16137,7 +16191,7 @@ fn an_aborted_repair_closes_the_descriptors_it_cached() -> crate::Result<()> {
     {
         use crate::fs::Fs;
         for e in memfs.read_dir(&root)? {
-            if e.file_name == "current" || e.file_name.starts_with('v') {
+            if e.file_name.starts_with("edits-") || e.file_name.starts_with('v') {
                 memfs.remove_file(&e.path)?;
             }
         }
@@ -16679,8 +16733,9 @@ fn assert_repair_error_removes_published_blob_replacements(
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -16841,9 +16896,10 @@ fn open_or_repair_propagates_transient_io_without_repairing() -> crate::Result<(
         .collect();
 
     let fault = FaultFs::new((*memfs).clone());
-    fault
-        .injector()
-        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
+            .on_path(root.join("v").to_string_lossy()),
+    );
     let result = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -17322,8 +17378,9 @@ fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -17417,8 +17474,9 @@ fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> cra
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -17896,8 +17954,9 @@ fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> cra
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }
@@ -18080,8 +18139,9 @@ fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             memfs.remove_file(&e.path)?;
         }
     }

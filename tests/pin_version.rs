@@ -329,13 +329,22 @@ fn restore_refuses_a_folder_holding_a_tree() -> lsm_tree::Result<()> {
         Some(&b"kept"[..])
     );
 
-    let current = std::fs::read(dst.path().join("current"))?;
+    // The manifest generation the open tree is on: its snapshots and logs.
+    let manifest = || -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dst.path())? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('v') || name.starts_with("edits-") {
+                files.push((name, std::fs::read(entry.path())?));
+            }
+        }
+        files.sort();
+        Ok(files)
+    };
+    let before = manifest()?;
     assert!(restore().is_err(), "an open tree is refused");
-    assert_eq!(
-        std::fs::read(dst.path().join("current"))?,
-        current,
-        "the open tree's pointer is untouched"
-    );
+    assert_eq!(manifest()?, before, "the open tree's manifest is untouched");
     Ok(())
 }
 

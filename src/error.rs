@@ -427,17 +427,17 @@ pub enum Error {
     /// - **Trailing size-hint corruption:** the tail's 4-byte
     ///   footer-size hint is zero or exceeds
     ///   `HEAD_FOOTER_RESERVED_SIZE` (4 KiB), or the implied
-    ///   `section_end` lands inside the head reservation. Caught
-    ///   in both the reader and `checkpoint::write_current_for_version`.
+    ///   `section_end` lands inside the head reservation.
     /// - **Writer-side invariant breach:** `write_cursor` would
     ///   overflow `u64`, an in-memory section would exceed the
     ///   on-disk Block-size cap, etc.
-    /// - **CURRENT pointer points at a missing manifest:** when
-    ///   `version::get_current_version` opens the referenced
-    ///   `v{N}` file and gets `NotFound`, the error is rewrapped
-    ///   here so `Tree::open`'s outer `Io(NotFound) => create_new`
-    ///   arm cannot mistake a half-applied recovery / corrupted
-    ///   state for a clean first-open.
+    /// - **No installed snapshot to recover:** recovery found no
+    ///   `v{N}` with its `edits-{N}` log, so `Tree::open`'s outer
+    ///   `Io(NotFound) => create_new` arm cannot mistake a
+    ///   half-applied recovery / corrupted state for a clean
+    ///   first-open.
+    /// - **Installed snapshot naming another id:** the snapshot's
+    ///   own `version_id` section differs from the id in its name.
     ManifestFooterInvalid(&'static str),
 
     /// Manifest section content failed verification or matched no

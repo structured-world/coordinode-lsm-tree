@@ -272,9 +272,9 @@ pub(crate) fn compute_table_checksum_with_overrides(
     crate::file::checksum_from_with_overrides(fs, path, start, overrides)
 }
 
-/// Highest existing `v{N}` manifest id in `folder`, if any. The rebuilt manifest
-/// uses `max + 1` so it supersedes any stale version file and the `current`
-/// pointer never races a half-written predecessor.
+/// Highest id any manifest file in `folder` carries (`v{N}` or `edits-{N}`), if
+/// any. The rebuilt manifest uses `max + 1` so it supersedes every stale
+/// generation and its install never meets a log a predecessor left.
 ///
 /// A directory-read failure is propagated (not swallowed as "no versions"): a
 /// transient scan error must not silently reset the version chain to `0` and
@@ -287,9 +287,8 @@ fn highest_existing_version_id(
         .read_dir(folder)?
         .into_iter()
         .filter_map(|e| {
-            e.file_name
-                .strip_prefix('v')
-                .and_then(|rest| rest.parse::<u64>().ok())
+            crate::version::recovery::snapshot_id_of(&e.file_name)
+                .or_else(|| crate::version::recovery::log_id_of(&e.file_name))
         })
         .max())
 }
@@ -3558,7 +3557,7 @@ impl Config {
     ///
     /// # Exclusive access
     ///
-    /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
+    /// Repair writes and installs a fresh snapshot and removes the stale
     /// `edits-*` logs in place, so it requires exclusive access to the tree
     /// directory. It acquires the same cross-process directory lock as
     /// [`Config::open`] for the duration of the call: if another live instance
@@ -4184,7 +4183,7 @@ enum InstallProbe {
     Installed,
     /// The log is ABSENT (`NotFound`): the install did not happen. Absence is
     /// conclusive — the persist makes the log only after the snapshot's
-    /// bytes, and withdraws it on a later failure where it can.
+    /// bytes, and nothing removes it after.
     NotInstalled,
     /// The log's existence cannot be told (a transient or permission failure
     /// of the probe): NO conclusion. The caller must fail SAFE — treating
@@ -4200,9 +4199,9 @@ fn probe_install(
     folder: &std::path::Path,
     version_id: u64,
 ) -> InstallProbe {
-    match fs.exists(&crate::version::edit_log::log_path(folder, version_id)) {
-        Ok(true) => InstallProbe::Installed,
-        Ok(false) => InstallProbe::NotInstalled,
+    match fs.metadata(&crate::version::edit_log::log_path(folder, version_id)) {
+        Ok(_) => InstallProbe::Installed,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => InstallProbe::NotInstalled,
         Err(_) => InstallProbe::Inconclusive,
     }
 }
@@ -4294,8 +4293,8 @@ fn repair_tree(
     salvage: bool,
     allow_resurrection: bool,
 ) -> crate::Result<RepairReport> {
-    // Hold the cross-process directory lock for the whole repair: it rewrites
-    // CURRENT, writes a fresh snapshot, and sweeps `edits-*` in place, so a
+    // Hold the cross-process directory lock for the whole repair: it writes and
+    // installs a fresh snapshot and sweeps `edits-*` in place, so a
     // concurrent open / repair of the same directory would corrupt the manifest.
     // A second acquirer fails fast with `Error::Locked`. Dropped at function
     // return, releasing the lock. The directory is expected to exist (repair
@@ -6750,9 +6749,8 @@ fn publish_repaired_manifest(
     // replacements unreferenced garbage a retry would re-derive — keeping
     // them would stack another fresh-id copy per failed attempt, walking
     // recovery toward ENOSPC under exactly the tight-space conditions it
-    // targets. The ONE fallible step after the install is the directory sync
-    // (on whose failure the persist withdraws the log where it can), so on
-    // failure the log on disk decides which world this is: a log of the
+    // targets. The ONE fallible step after the install is the directory sync,
+    // so on failure the log on disk decides which world this is: a log of the
     // rebuilt version means the manifest is or may become published and the
     // replacements are the files it references. A probe that cannot tell
     // proves nothing, and fail-safe is to PRESERVE: the worst a preserved

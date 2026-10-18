@@ -14,8 +14,9 @@
 //! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log`]).
 //!
 //! Rotation (writing a fresh snapshot and starting a new log) is driven by
-//! [`log_size`] exceeding a threshold; the snapshot switch is done atomically
-//! via the `CURRENT` pointer (see the recovery / persist layers).
+//! [`log_size`] exceeding a threshold. A snapshot's log is what installs it:
+//! recovery takes the highest `v{N}` whose `edits-{N}` exists (see the
+//! recovery / persist layers).
 
 use super::edit::{VersionEdit, replay_edits};
 use crate::fs::{Fs, FsOpenOptions, SyncMode};

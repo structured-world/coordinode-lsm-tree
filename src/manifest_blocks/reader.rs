@@ -397,13 +397,10 @@ impl ManifestArchiveReader {
         }
         // Cross-check the decoded Block's own XXH3-128 against the
         // value the TOC entry committed at write time. Without this,
-        // CURRENT-pointer validation only proves the footer payload
-        // is self-consistent (TOC bytes intact) — a forged or
-        // mis-targeted TOC entry could still point at a Block whose
-        // content differs from what the writer recorded. The TOC's
-        // `section_checksum` is what we hash into the CURRENT
-        // pointer's canonical digest, so binding it here makes the
-        // chain CURRENT → TOC → section bytes airtight.
+        // the footer's checksum only proves the TOC bytes intact: a
+        // forged or mis-targeted TOC entry could still point at a Block
+        // whose content differs from what the writer recorded. Binding
+        // it here makes the chain footer → TOC → section bytes airtight.
         if block.header.stored_checksum.into_u128() != expected_section_checksum {
             return Err(crate::Error::ManifestSectionInvalid(
                 "section Block checksum does not match TOC entry section_checksum",

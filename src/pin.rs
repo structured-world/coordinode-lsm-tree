@@ -398,7 +398,7 @@ pub fn restore(
         fs.remove_file(&entry.path)?;
     }
 
-    // The streamed files first: the pointer published below must never name a
+    // The streamed files first: the manifest installed below must never name a
     // file a power loss can still take back.
     for folder in [TABLES_FOLDER, BLOBS_FOLDER, DICTS_FOLDER] {
         let folder = root.join(folder);

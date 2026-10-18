@@ -549,12 +549,13 @@ impl SuperVersions {
     /// rotate when that log has grown past [`Self::log_rotate_bytes`] or the
     /// edit is too large for one log record.
     ///
-    /// Rotation writes a fresh full snapshot for `next`, fsyncs it, and atomically
-    /// repoints `CURRENT` (all inside [`persist_version`]); only after `CURRENT`
-    /// commits does it delete the previous snapshot file and its log. Crash points:
-    /// before the `CURRENT` switch, `CURRENT` still names the old snapshot and its
-    /// log is intact (recover old + replay); after the switch, the new snapshot is
-    /// complete and its log is empty (recover new, no edits). A torn trailing edit
+    /// Rotation writes a fresh full snapshot for `next`, syncs it, and installs it
+    /// by creating its empty log (all inside [`persist_version`]); only after the
+    /// install is durable does it delete the previous snapshot file and its log.
+    /// Crash points: before the new log exists, the old snapshot is the highest
+    /// installed one and its log is intact (recover old + replay); once it
+    /// exists, the new snapshot is complete and its log is empty (recover new, no
+    /// edits). A torn trailing edit
     /// from an interrupted append is dropped on replay — the operation that wrote
     /// it was never acknowledged upward.
     ///

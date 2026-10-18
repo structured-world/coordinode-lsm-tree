@@ -1475,7 +1475,7 @@ fn remove_staging(
 ///    `tables` into that folder's backup; one already gone was moved.
 /// 3. [`SWAPPING`] is written: the source is wholly set aside.
 /// 4. Each route folder's staged `tables` moves into it, then each staged
-///    entry into the store's folder, the version pointer last, so the store
+///    entry into the store's folder, the edit log last, so the store
 ///    opens as the converted one only once all of it is there.
 /// 5. The staging folders and the markers go, [`READY`] first: with only
 ///    [`SWAPPING`] left, a rerun has nothing to set aside.
@@ -1565,7 +1565,8 @@ fn switch(
         write_marker(&swapping, &carried.encode()?)?;
     }
 
-    // Until the converted pointer is in place, the folder holds none.
+    // Until the converted store's edit log is in place, the folder holds no
+    // installed store.
     if staging.exists() && !folder.join(GUARD).exists() {
         step()?;
         write_marker(&folder.join(GUARD), "")?;
@@ -1595,9 +1596,10 @@ fn switch(
             .map(|entry| entry.map(|e| e.file_name()))
             .filter(|name| !matches!(name, Ok(name) if name == OWNED))
             .collect::<std::io::Result<_>>()?;
-        // The version pointer last: until it is in place the folder opens as
-        // nothing, never as part of the converted store.
-        names.sort_by_key(|name| name == lsm6::file::CURRENT_VERSION_FILE);
+        // The edit log last: it is what installs the converted snapshot, so
+        // until it is in place the folder opens as nothing, never as part of
+        // the converted store.
+        names.sort_by_key(|name| name.to_str().is_some_and(|name| name.starts_with("edits-")));
         for name in names {
             let to = folder.join(&name);
             if to.exists() {

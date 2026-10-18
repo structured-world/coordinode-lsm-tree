@@ -849,7 +849,7 @@ pub fn run_checkpoint<T: AbstractTree>(
 
     // fsync each populated child directory BEFORE the root so the
     // directory entries we just created (`tables/<id>`, `blobs/<id>`,
-    // `current`, `manifest`, `v<id>`) survive a power loss. The root
+    // `v<id>`, `edits-<id>`) survive a power loss. The root
     // fsync alone only persists the existence of `tables/` and
     // `blobs/`, not their contents.
     fsync_directory(&target_root.join(TABLES_FOLDER), &**target_fs, sync_mode)?;
