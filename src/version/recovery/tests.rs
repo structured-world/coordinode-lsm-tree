@@ -483,7 +483,7 @@ fn apply_overwrites_gc_stats_when_present() {
 /// install it, so the per-Block / per-record check downstream is the one
 /// that surfaces the corruption.
 fn install_fixture(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
-    crate::version::edit_log::create_log(fs, folder, version_id)
+    crate::version::edit_log::create_log(fs, folder, version_id, crate::fs::SyncMode::Full)
 }
 
 type FixtureWriter = crate::manifest_blocks::writer::ManifestArchiveWriter;

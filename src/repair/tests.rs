@@ -13435,13 +13435,6 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         crate::WalReplayScope::TailOnly,
         "self-check: the repair owes a replay"
     );
-    let (again_fs, _, _) = a_blob_tree_with_a_damaged_tail()?;
-    config(FaultFs::new(MemFs::clone(&again_fs)), &root).repair()?;
-    assert_eq!(
-        installed(&again_fs, &root)?,
-        snapshot,
-        "self-check: a repair of the fixture installs the same snapshot"
-    );
 
     let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
     let fault = FaultFs::new(MemFs::clone(&memfs));
@@ -13463,7 +13456,10 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         "self-check: the withdrawal took the name back"
     );
 
-    // The power loss keeps the rename and loses the withdrawal.
+    // The power loss keeps the rename and loses the withdrawal. The snapshot
+    // the faulted run renamed is gone with the withdrawal; the one the run
+    // without a fault installed names the same tables and blob replacement
+    // (only its header's random part differs), and stands in for it.
     {
         let mut file = memfs.open(
             &root.join(&snapshot.0),

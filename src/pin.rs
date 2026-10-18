@@ -446,7 +446,7 @@ pub fn restore(
     file.flush()?;
     FsFile::sync_data_with(&*file, sync_mode)?;
     drop(file);
-    crate::version::edit_log::create_log(&*fs, &root, version_id)?;
+    crate::version::edit_log::create_log(&*fs, &root, version_id, sync_mode)?;
     fs.rename(&temporary, &root.join(format!("v{version_id}")))?;
     fsync_directory(&root, &*fs, sync_mode)?;
 
