@@ -83,10 +83,10 @@ fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
 }
 
 /// A tree that lived holds its history in its edit log even when no table is
-/// left (a dropped range, the retention floor it raised): a missing pointer
+/// left (a dropped range, the retention floor it raised): a lost snapshot
 /// over that log is refused, never taken for a fresh folder and created over.
 #[test]
-fn an_open_without_a_pointer_refuses_a_log_holding_edits() {
+fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     use lsm_tree::fs::Fs;
     let mem = MemFs::new();
     let fs = CrashFs::new(mem.clone());
@@ -103,8 +103,11 @@ fn an_open_without_a_pointer_refuses_a_log_holding_edits() {
         mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
         "self-check: no table is left"
     );
-    mem.remove_file(&db.join("current"))
-        .expect("lose the pointer");
+    assert!(
+        mem.metadata(&db.join("edits-0")).expect("log").len > 0,
+        "self-check: the log holds the edits"
+    );
+    mem.remove_file(&db.join("v0")).expect("lose the snapshot");
 
     assert!(
         config(&fs, false).open().is_err(),

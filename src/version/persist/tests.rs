@@ -82,7 +82,8 @@ fn a_withdrawal_that_is_not_durable_leaves_the_outcome_unknown() -> crate::Resul
             vec![
                 FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once(),
                 FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
-                    .on_path("/tree/v8")
+                    // The separator the platform joins with.
+                    .on_path(folder.join("v8").to_string_lossy())
                     .skip(1)
                     .once(),
             ],
