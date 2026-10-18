@@ -13561,6 +13561,38 @@ fn a_repair_over_an_unreported_repair_carries_its_losses() -> crate::Result<()> 
     Ok(())
 }
 
+/// A tree opened over the surviving snapshot of a repair whose report never
+/// reached the caller may rotate its manifest before `open_or_repair` runs:
+/// the report moves with the generation and is still handed out.
+#[test]
+fn an_unreported_repair_report_survives_a_manifest_rotation() -> crate::Result<()> {
+    use crate::fs::{FaultFs, MemFs};
+    use crate::{AbstractTree, RepairPolicy};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let before = crate::version::recovery::installed_snapshot(&root, &*memfs)?;
+    {
+        let tree = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+            .manifest_log_rotate_bytes(0)
+            .open()?;
+        tree.insert("rotate", "after the open", 100);
+        tree.flush_active_memtable(0)?;
+    }
+    assert_ne!(
+        crate::version::recovery::installed_snapshot(&root, &*memfs)?,
+        before,
+        "self-check: the flush rotated the manifest"
+    );
+
+    let (_, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    let Some(report) = report else {
+        panic!("the repair's report is lost with the rotation");
+    };
+    assert_eq!(report.lost_coverage, expected.lost_coverage);
+    Ok(())
+}
+
 /// A KV-separated tree at `/db` on a fresh `MemFs` whose one blob file has a
 /// damaged last frame, with every manifest file removed: a repair salvages
 /// the blob into a fresh-id replacement and rebuilds the snapshot. Returns

@@ -83,6 +83,52 @@ pub fn repair_report_name(file_name: &str) -> Option<(u64, bool)> {
     digits.parse().ok().map(|id| (id, temporary))
 }
 
+/// Carries the copy of a repair report kept for snapshot `from` in `folder`
+/// over to snapshot `to`, which a rotation is about to install.
+///
+/// The report is still owed, and an open keeps only the copy of the installed
+/// snapshot. The copy for `to` is written under a temporary name, synced and renamed,
+/// so the install's directory sync makes its name durable with the
+/// snapshot's. Returns whether there was one to carry.
+///
+/// The bytes travel as they are: the copy is sealed with the tree's
+/// encryption provider, which does not change between generations.
+///
+/// # Errors
+///
+/// Propagates a failure to read the copy or to write the new one.
+pub fn carry_repair_report(
+    fs: &dyn Fs,
+    folder: &Path,
+    from: u64,
+    to: u64,
+    sync_mode: SyncMode,
+) -> crate::Result<bool> {
+    use crate::fs::FsOpenOptions;
+    let source = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{from}"));
+    let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let len = usize::try_from(file.metadata()?.len)
+        .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
+    let bytes = read_exact(&*file, 0, len)?;
+    drop(file);
+    let target = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}"));
+    let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}.tmp"));
+    let mut copy = fs.open(
+        &temporary,
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    copy.write_all(&bytes)?;
+    copy.flush()?;
+    FsFile::sync_all_with(&*copy, sync_mode)?;
+    drop(copy);
+    fs.rename(&temporary, &target)?;
+    Ok(true)
+}
+
 /// Suffix of a manifest repair's in-progress blob salvage copy.
 pub const BLOB_SALVAGE_TMP_SUFFIX: &str = ".salvage-tmp";
 

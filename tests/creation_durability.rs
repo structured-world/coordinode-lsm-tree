@@ -31,6 +31,59 @@ fn reopen(fs: &CrashFs, blob: bool) -> AnyTree {
         .expect("the tree reopens after the power loss")
 }
 
+/// A compaction whose edit could not be synced may or may not be in the log
+/// after a power loss. An open before that power loss reads the edit and
+/// removes the tables it took out: the open makes the log it read durable
+/// before it removes any of them, so the power loss keeps the tables the log
+/// it leaves names.
+#[test]
+fn an_open_makes_the_log_it_removes_tables_by_durable_first() {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    let config = || {
+        Config::new(
+            DB,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fault.clone())
+    };
+    {
+        let tree = config().open().expect("create");
+        for i in 0..2u64 {
+            tree.insert(format!("key{i}"), "value", i);
+            tree.flush_active_memtable(0).expect("flush");
+        }
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::SyncData,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("edits-")
+            .once(),
+        );
+        assert!(
+            tree.major_compact(u64::MAX, 0).is_err(),
+            "self-check: the compaction's edit is not synced"
+        );
+    }
+    drop(config().open().expect("an open over the unsynced edit"));
+
+    crash.crash();
+    let tree = config()
+        .open()
+        .expect("the tree opens after the power loss");
+    for i in 0..2u64 {
+        assert!(
+            tree.get(format!("key{i}"), u64::MAX)
+                .expect("get")
+                .is_some(),
+            "key{i}"
+        );
+    }
+}
+
 /// A tree that creation returned survives a power loss right after it, empty.
 #[test]
 fn a_created_tree_survives_a_power_loss() {
