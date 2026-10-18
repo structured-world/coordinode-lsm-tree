@@ -58,6 +58,38 @@ fn a_log_created_over_durable_edits_stays_empty_through_a_power_loss() -> crate:
     Ok(())
 }
 
+/// A log whose emptying failed to sync is synced on the retry, though it reads
+/// empty by then: the retry must not take the unsynced length for a durable
+/// one, or a power loss brings the old edits back.
+#[test]
+fn a_log_whose_emptying_failed_to_sync_is_synced_on_the_retry() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+    crash.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    let mut scratch = Vec::new();
+    append_edit(&crash, &path, &edit(1), &mut scratch, SyncMode::Full, true)?;
+
+    let fs = FaultFs::new(crash.clone());
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(path.to_string_lossy())
+            .times(1),
+    );
+    assert!(
+        create_log(&fs, Path::new("/db"), 0, SyncMode::Full).is_err(),
+        "self-check: the first emptying fails its sync"
+    );
+    create_log(&fs, Path::new("/db"), 0, SyncMode::Full)?;
+    crash.sync_directory(Path::new("/db"))?;
+    crash.crash();
+    assert_eq!(
+        replay_log(&crash, &path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        Vec::new()
+    );
+    Ok(())
+}
+
 /// A first append whose directory sync fails writes no edit: a record left
 /// in the log would be made durable by the next append's sync, though the
 /// operation it records was reported failed.

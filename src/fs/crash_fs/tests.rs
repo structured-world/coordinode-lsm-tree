@@ -1733,3 +1733,44 @@ fn a_rename_of_a_name_remade_behind_a_lost_removal_leaves_the_old_file() {
     assert_eq!(read(&fs, "/d/old"), b"O");
     assert!(!fs.exists(Path::new("/d/moved")).unwrap());
 }
+
+/// A rename onto a name whose removal is queued behind a barrier sync is
+/// ordered behind that removal: a power loss that loses the removal leaves
+/// both files as they were.
+#[test]
+fn a_rename_onto_a_name_removed_behind_a_lost_barrier_leaves_both_files() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/a", b"A", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/b", b"B", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/a")).unwrap();
+    fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
+
+    // The first two syncs kept, the removal and all after it lost.
+    fs.crash_keeping(2);
+    assert_eq!(read(&fs, "/d/a"), b"A");
+    assert_eq!(read(&fs, "/d/b"), b"B");
+}
+
+/// A file the simulator never touched, removed behind a barrier sync, keeps
+/// the bytes it had before the run when a power loss loses the removal.
+#[test]
+fn an_untouched_file_removed_behind_a_lost_barrier_keeps_its_bytes() {
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    let mut file = mem
+        .open(
+            Path::new("/d/f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .unwrap();
+    file.write_all(b"F").unwrap();
+    drop(file);
+    let fs = CrashFs::new(mem);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/f")).unwrap();
+
+    fs.crash_keeping(0);
+    assert_eq!(read(&fs, "/d/f"), b"F");
+}

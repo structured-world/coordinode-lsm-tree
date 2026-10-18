@@ -38,8 +38,10 @@ pub fn log_path(folder: &Path, snapshot_id: super::VersionId) -> crate::path::Pa
 /// snapshot is written: the directory sync that makes the snapshot's name
 /// durable then makes the log's too, and no append has to sync it. A log
 /// left under the name is emptied, since none of its edits belongs to the
-/// snapshot being written; one that held edits is synced empty, as the
-/// directory sync makes only its name durable, not its new size.
+/// snapshot being written, and synced empty: the directory sync makes only
+/// its name durable, not its new size. Its length tells nothing here, as an
+/// earlier emptying whose sync failed leaves it reading empty while its
+/// edits are still what a power loss keeps.
 ///
 /// # Errors
 ///
@@ -51,8 +53,8 @@ pub fn create_log(
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     let path = log_path(folder, snapshot_id);
-    let held_edits = match fs.metadata(&path) {
-        Ok(meta) => meta.len > 0,
+    let existed = match fs.metadata(&path) {
+        Ok(_) => true,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => false,
         Err(e) => return Err(e.into()),
     };
@@ -60,7 +62,7 @@ pub fn create_log(
         &path,
         &FsOpenOptions::new().write(true).create(true).truncate(true),
     )?;
-    if held_edits {
+    if existed {
         file.sync_data_with(sync_mode)?;
     }
     Ok(())
