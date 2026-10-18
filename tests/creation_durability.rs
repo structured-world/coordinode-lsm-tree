@@ -112,6 +112,31 @@ fn an_open_without_a_pointer_refuses_a_log_holding_edits() {
     );
 }
 
+/// Only the exact name `v0` is what a creation cut short leaves: a snapshot
+/// spelled otherwise (`v00`, or an id past the counter's range) is not
+/// something a creation wrote, and an open without a pointer refuses it
+/// rather than create over it.
+#[test]
+fn an_open_without_a_pointer_refuses_a_snapshot_a_creation_never_names() {
+    use lsm_tree::fs::{Fs, FsOpenOptions};
+    for name in ["v00", "v18446744073709551616"] {
+        let mem = MemFs::new();
+        let fs = CrashFs::new(mem.clone());
+        let db = std::path::absolute(DB).expect("absolute path");
+        mem.create_dir_all(&db).expect("tree folder");
+        mem.open(
+            &db.join(name),
+            &FsOpenOptions::new().write(true).create(true),
+        )
+        .expect("a snapshot file");
+
+        assert!(
+            config(&fs, false).open().is_err(),
+            "{name} is a tree's state"
+        );
+    }
+}
+
 /// Flushes past a manifest rotation survive a power loss: the rotated
 /// generation's log, created with its snapshot, holds the edits after it.
 #[test]

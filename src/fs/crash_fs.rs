@@ -819,11 +819,25 @@ impl Fs for CrashFs {
         let (from, to) = (self.name_after(from), self.name_after(to));
         let (from, to) = (from.as_path(), to.as_path());
         let mut state = self.state.lock();
-        // The source's state moves with its file, under the new name.
-        let from_durable = state.durable.remove(from);
-        let from_touched = state.touched.remove(from);
+        // A removal of the source's name still queued means the file renamed
+        // was made after it: what the name had before the removal (its
+        // durable image, its entry, the syncs queued ahead of the removal)
+        // belongs to the removed file, which a power loss that loses the
+        // removal brings back under this name. Only what came after moves.
+        let remade_after = state
+            .ordered
+            .iter()
+            .rposition(|sync| matches!(sync, Ordered::Removed(name, _) if name.as_path() == from))
+            .map(|removal| removal + 1);
+        let (from_durable, from_touched) = if remade_after.is_some() {
+            (None, true)
+        } else {
+            let durable = state.durable.remove(from);
+            let touched = state.touched.remove(from);
+            state.pending_entries.remove(from);
+            (durable, touched)
+        };
         let from_group = state.link_group.remove(from);
-        state.pending_entries.remove(from);
         // The destination is replaced on disk, as a removal of that name: its
         // durable image and write-tracking go (so a replaced, previously
         // synced destination is not resurrected to its stale content on
@@ -833,7 +847,7 @@ impl Fs for CrashFs {
         // An ordered sync of the source's content follows its file; one of
         // its entry does not, since the new entry is pending until its own
         // directory is synced.
-        for sync in &mut state.ordered {
+        for sync in state.ordered.iter_mut().skip(remade_after.unwrap_or(0)) {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
                 Ordered::Image(..) | Ordered::Removed(..) => {}

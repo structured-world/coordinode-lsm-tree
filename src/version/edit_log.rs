@@ -37,17 +37,32 @@ pub fn log_path(folder: &Path, snapshot_id: super::VersionId) -> crate::path::Pa
 /// Creates the empty edit log of the snapshot `v{snapshot_id}`, as the
 /// snapshot is written: the directory sync that makes the snapshot's name
 /// durable then makes the log's too, and no append has to sync it. A log
-/// left by an earlier attempt at the same snapshot is emptied, since no edit
-/// in it belongs to a snapshot that was never installed.
+/// left under the name is emptied, since none of its edits belongs to the
+/// snapshot being written; one that held edits is synced empty, as the
+/// directory sync makes only its name durable, not its new size.
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the log cannot be created.
-pub fn create_log(fs: &dyn Fs, folder: &Path, snapshot_id: super::VersionId) -> crate::Result<()> {
-    fs.open(
-        &log_path(folder, snapshot_id),
+/// Returns an I/O error if the log cannot be created or emptied.
+pub fn create_log(
+    fs: &dyn Fs,
+    folder: &Path,
+    snapshot_id: super::VersionId,
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
+    let path = log_path(folder, snapshot_id);
+    let held_edits = match fs.metadata(&path) {
+        Ok(meta) => meta.len > 0,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    let file = fs.open(
+        &path,
         &FsOpenOptions::new().write(true).create(true).truncate(true),
     )?;
+    if held_edits {
+        file.sync_data_with(sync_mode)?;
+    }
     Ok(())
 }
 

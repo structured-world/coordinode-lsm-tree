@@ -6675,19 +6675,18 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
+    // A name is judged by its shape, digits after the prefix, not by whether
+    // the digits parse: `v00` or an id past the counter's range was not
+    // written by a creation either, and is refused rather than created over.
+    let digits = |rest: Option<&str>| {
+        rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
     for entry in &entries {
         let name = entry.file_name.as_str();
-        if name
-            .strip_prefix('v')
-            .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0))
-        {
+        if name != "v0" && digits(name.strip_prefix('v')) {
             return Ok(true);
         }
-        if name
-            .strip_prefix("edits-")
-            .is_some_and(|id| id.parse::<u64>().is_ok())
-            && config.fs.metadata(&entry.path)?.len > 0
-        {
+        if digits(name.strip_prefix("edits-")) && config.fs.metadata(&entry.path)?.len > 0 {
             return Ok(true);
         }
     }

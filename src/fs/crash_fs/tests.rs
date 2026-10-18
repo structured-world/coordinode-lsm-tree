@@ -1712,3 +1712,24 @@ fn a_name_remade_behind_a_lost_removal_keeps_the_old_file() {
     fs.crash_keeping(2);
     assert_eq!(read(&fs, "/d/old"), b"O");
 }
+
+/// A file made under the name of one removed behind a barrier sync, and then
+/// renamed away, takes only what came after the removal along: a power loss
+/// that loses the removal brings the old file back under its name, and the
+/// renamed one, never synced into its folder, is gone.
+#[test]
+fn a_rename_of_a_name_remade_behind_a_lost_removal_leaves_the_old_file() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/old", b"O", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/new", b"N", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/old")).unwrap();
+    write_synced(&fs, "/d", "/d/old", b"R", SyncMode::Barrier);
+    fs.rename(Path::new("/d/old"), Path::new("/d/moved"))
+        .unwrap();
+
+    // The first two syncs kept, the removal and all after it lost.
+    fs.crash_keeping(2);
+    assert_eq!(read(&fs, "/d/old"), b"O");
+    assert!(!fs.exists(Path::new("/d/moved")).unwrap());
+}
