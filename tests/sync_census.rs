@@ -36,6 +36,19 @@ struct Census {
 }
 
 impl Census {
+    /// A census of the syncs `injector` sees for a tree at `base`, routed to
+    /// `route` when given. The paths are made absolute as `Config` makes
+    /// them, so a sync is matched by the path the tree issues it on (on
+    /// Windows `/census` is `<drive>:\census`).
+    fn new(base: &Path, route: Option<&Path>, injector: Arc<FaultInjector>) -> Self {
+        let absolute = |path: &Path| std::path::absolute(path).expect("absolute path");
+        Self {
+            base: absolute(base),
+            route: route.map(absolute),
+            injector,
+        }
+    }
+
     fn name(&self, path: &Path, kind: SyncKind) -> (Synced, SyncKind) {
         let file_name = path
             .file_name()
@@ -153,11 +166,7 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
         let base = PathBuf::from("/census").join(if blob { "blob" } else { "standard" });
         let fs = Arc::new(FaultFs::new(MemFs::new()));
-        let census = Census {
-            base: base.clone(),
-            route: None,
-            injector: fs.injector(),
-        };
+        let census = Census::new(&base, None, fs.injector());
 
         let tree = open(&base, &fs, blob, None);
         assert_eq!(census.take(), creation(), "creating (blob: {blob})");
@@ -215,11 +224,7 @@ fn creating_a_routed_tree_syncs_the_route_once() {
     let base = PathBuf::from("/census/routed/tree");
     let route = PathBuf::from("/census/routed/hot");
     let fs = Arc::new(FaultFs::new(MemFs::new()));
-    let census = Census {
-        base: base.clone(),
-        route: Some(route.clone()),
-        injector: fs.injector(),
-    };
+    let census = Census::new(&base, Some(&route), fs.injector());
 
     let tree = open(&base, &fs, false, Some(&route));
     // The folder above the route is the one above the tree here: one sync of
@@ -249,11 +254,7 @@ fn creating_a_tree_with_a_route_inside_it_syncs_the_route() {
     let base = PathBuf::from("/census/nested/tree");
     let route = base.join("hot");
     let fs = Arc::new(FaultFs::new(MemFs::new()));
-    let census = Census {
-        base: base.clone(),
-        route: Some(route.clone()),
-        injector: fs.injector(),
-    };
+    let census = Census::new(&base, Some(&route), fs.injector());
 
     let _tree = open(&base, &fs, false, Some(&route));
     let mut expected = creation();
