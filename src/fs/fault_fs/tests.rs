@@ -899,7 +899,9 @@ fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
         Some(Err::<&(), _>(ErrorKind::PermissionDenied)),
     );
 
-    // A rule armed between the submit and the wait applies.
+    // A rule armed between the submit and the wait applies. The spent rule
+    // goes first: an exhausted rule still claims the reads it matches.
+    fs.injector().clear();
     let mut queue = fs.read_queue();
     queue.submit(read_of(2));
     fs.injector().arm(
