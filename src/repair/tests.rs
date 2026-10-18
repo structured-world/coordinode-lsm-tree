@@ -13389,25 +13389,47 @@ fn an_unknown_install_that_survived() -> crate::Result<(
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
     use crate::io::ErrorKind;
 
-    let config = a_blob_tree_config;
-    // The snapshot a repair of the fixture installs: its name and bytes.
-    let installed = |fs: &MemFs, root: &std::path::Path| -> crate::Result<(String, Vec<u8>)> {
-        let id = crate::version::recovery::installed_snapshot(root, fs)?
-            .ok_or(crate::Error::Unrecoverable)?;
-        let name = format!("v{id}");
-        let file = fs.open(
-            &root.join(&name),
-            &crate::fs::FsOpenOptions::new().read(true),
+    /// Copies the file `path` of `from` onto `to`, replacing what is there.
+    fn copy_file(from: &MemFs, to: &MemFs, path: &std::path::Path) -> crate::Result<()> {
+        let file = from.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len =
+            usize::try_from(from.metadata(path)?.len).map_err(|_| crate::Error::Unrecoverable)?;
+        let bytes = crate::file::read_exact(&*file, 0, len)?;
+        let mut copy = to.open(
+            path,
+            &crate::fs::FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
         )?;
-        let len = usize::try_from(fs.metadata(&root.join(&name))?.len)
-            .map_err(|_| crate::Error::Unrecoverable)?;
-        Ok((name, crate::file::read_exact(&*file, 0, len)?.to_vec()))
-    };
+        std::io::Write::write_all(&mut copy, &bytes)?;
+        Ok(())
+    }
+    /// Copies the folder `dir` of `from`, with all it holds, onto `to`.
+    fn copy_folder(from: &MemFs, to: &MemFs, dir: &std::path::Path) -> crate::Result<()> {
+        to.create_dir_all(dir)?;
+        for entry in from.read_dir(dir)? {
+            if entry.is_dir {
+                copy_folder(from, to, &entry.path)?;
+            } else {
+                copy_file(from, to, &entry.path)?;
+            }
+        }
+        Ok(())
+    }
+
+    let config = a_blob_tree_config;
+    // One fixture, copied: a tree's files carry random bytes, so the run
+    // without a fault and the faulted one must start from the same ones.
+    let (fixture, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let probe_fs = std::sync::Arc::new(MemFs::new());
+    copy_folder(&fixture, &probe_fs, &root)?;
+    let memfs = std::sync::Arc::new(MemFs::new());
+    copy_folder(&fixture, &memfs, &root)?;
 
     // A repair without a fault: its report, the snapshot it installs, and
     // which directory sync under the tree folder installs it (the first
     // after the snapshot's own data sync).
-    let (probe_fs, root, _) = a_blob_tree_with_a_damaged_tail()?;
     let probe = FaultFs::new(MemFs::clone(&probe_fs));
     let injector = probe.injector();
     let expected = config(probe, &root).repair()?;
@@ -13429,14 +13451,17 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         .take(snapshot_synced)
         .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
         .count();
-    let snapshot = installed(&probe_fs, &root)?;
+    let snapshot = root.join(format!(
+        "v{}",
+        crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
+            .ok_or(crate::Error::Unrecoverable)?
+    ));
     assert_ne!(
         expected.wal_replay_scope(),
         crate::WalReplayScope::TailOnly,
         "self-check: the repair owes a replay"
     );
 
-    let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
     let fault = FaultFs::new(MemFs::clone(&memfs));
     // The install's directory sync fails, and so does the withdrawal's.
     fault.injector().arm(
@@ -13452,20 +13477,20 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         result.map(|r| r.recovered),
     );
     assert!(
-        !memfs.exists(&root.join(&snapshot.0))?,
+        !memfs.exists(&snapshot)?,
         "self-check: the withdrawal took the name back"
     );
 
     // The power loss keeps the rename and loses the withdrawal. The snapshot
     // the faulted run renamed is gone with the withdrawal; the one the run
-    // without a fault installed names the same tables and blob replacement
-    // (only its header's random part differs), and stands in for it.
-    {
-        let mut file = memfs.open(
-            &root.join(&snapshot.0),
-            &crate::fs::FsOpenOptions::new().write(true).create(true),
-        )?;
-        std::io::Write::write_all(&mut file, &snapshot.1)?;
+    // without a fault installed over the same tables stands in for it, with
+    // the blob replacement it names (written with random bytes of its own).
+    copy_file(&probe_fs, &memfs, &snapshot)?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    for entry in probe_fs.read_dir(&blobs)? {
+        if !entry.is_dir {
+            copy_file(&probe_fs, &memfs, &entry.path)?;
+        }
     }
     Ok((memfs, root, expected))
 }
