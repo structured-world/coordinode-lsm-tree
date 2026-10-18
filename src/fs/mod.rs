@@ -1172,6 +1172,23 @@ pub trait Fs: Send + Sync + 'static {
         false
     }
 
+    /// Refuses `reqs` as a backend that reads by descriptor refuses a batch
+    /// whole, before it reads any of it: the error it would return for the
+    /// first request it cannot take by descriptor, judged as that request
+    /// stands now. A wrapper that takes each read through checks of its own
+    /// asks this first, so no check is spent on a batch that reads nothing.
+    ///
+    /// The default refuses nothing. `io_uring` refuses an offset that
+    /// overflows and a request longer than one read submits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the batch would fail with.
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> io::Result<()> {
+        let _ = reqs;
+        Ok(())
+    }
+
     /// Recursively creates all directories leading to `path`.
     ///
     /// # Errors

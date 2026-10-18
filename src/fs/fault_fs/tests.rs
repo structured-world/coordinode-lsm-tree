@@ -442,6 +442,26 @@ fn a_reflink_rule_matches_the_destination_path() {
     assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
 }
 
+/// The longest request [`DescriptorFs`] takes by descriptor, as the ring takes
+/// none past `i32::MAX`: a smaller cap, so a test can reach it.
+const DESCRIPTOR_READ_CAP: usize = 64;
+
+/// What [`DescriptorFs`] refuses a whole batch for before reading any of it:
+/// an offset that overflows, or a request by descriptor past the cap.
+fn check_descriptor_batch(reqs: &[BlockRead<'_>]) -> io::Result<()> {
+    for req in reqs {
+        req.offset
+            .checked_add(req.buf.filled() as u64)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "offset overflows"))?;
+        if req.file.backing_fd().is_some()
+            && req.buf.capacity() - req.buf.filled() > DESCRIPTOR_READ_CAP
+        {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "request too long"));
+        }
+    }
+    Ok(())
+}
+
 /// A backend whose files carry a descriptor and which, when `by_descriptor`,
 /// reads its batches through that descriptor past `FsFile::read_at`, as the
 /// ring does; otherwise it reads them through `read_at`, as the default does.
@@ -617,6 +637,21 @@ impl Fs for DescriptorFs {
         self.by_descriptor
     }
 
+    // Its requests by descriptor are what it refuses a batch for whole.
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> io::Result<()> {
+        if !self.by_descriptor {
+            return Ok(());
+        }
+        let by_descriptor: Vec<&BlockRead<'_>> = reqs
+            .iter()
+            .filter(|req| req.file.backing_fd().is_some())
+            .collect();
+        for req in by_descriptor {
+            check_descriptor_batch(core::slice::from_ref(req))?;
+        }
+        Ok(())
+    }
+
     fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
         Box::new(DescriptorQueue {
             fs: self,
@@ -627,11 +662,7 @@ impl Fs for DescriptorFs {
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
         // The whole batch is validated before the first read, as a backend
         // reading by descriptor must.
-        for req in reqs.iter() {
-            req.offset
-                .checked_add(req.buf.filled() as u64)
-                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "offset overflows"))?;
-        }
+        check_descriptor_batch(reqs)?;
         reqs.iter_mut().try_for_each(|req| self.read_one(req))
     }
 
@@ -1067,6 +1098,80 @@ fn a_wait_for_none_issues_the_reads_of_a_queue_that_issues_them() -> io::Result<
         Err::<&(), _>(ErrorKind::PermissionDenied),
     );
     assert_eq!(queue.outstanding(), 0);
+    Ok(())
+}
+
+/// A batch the backend refuses whole before reading any of it (a request too
+/// long for a read by descriptor) spends no rule on the requests before that
+/// one, and fails with the backend's refusal.
+#[test]
+fn a_batch_the_backend_refuses_whole_spends_no_rule() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut valid = [0u8; 16];
+    let mut too_long = [0u8; DESCRIPTOR_READ_CAP + 1];
+    let mut reqs = [
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(&mut valid),
+        },
+        BlockRead {
+            file: files[0].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(&mut too_long),
+        },
+    ];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the backend refuses the batch");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert_eq!(fs.injector().read_count(), before, "nothing was screened");
+
+    let mut buf = [0u8; 16];
+    let mut retry = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut retry)
+        .expect_err("the rule still fails the read of f1");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    Ok(())
+}
+
+/// A handle opened through the wrapper and read by another backend's batch
+/// is still taken through the read rules: the other backend cannot reach the
+/// handle's descriptor past them, and reads it through the handle.
+#[test]
+fn a_handle_read_by_another_backend_is_still_screened() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .inner
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the rule fails the read the other backend makes");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     Ok(())
 }
 

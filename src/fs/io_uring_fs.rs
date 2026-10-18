@@ -321,6 +321,29 @@ impl Fs for IoUringFs {
         true
     }
 
+    // What the ring's pre-pass refuses before submitting any of the group
+    // (see `submit_reads_multi`).
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> crate::io::Result<()> {
+        for req in reqs {
+            if req.buf.capacity() == 0 || req.file.backing_fd().is_none() {
+                continue;
+            }
+            if i32::try_from(req.buf.capacity() - req.buf.filled()).is_err() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffer exceeds i32::MAX",
+                )));
+            }
+            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submit_reads_multi: request offset overflows",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
         std::fs::create_dir_all(path).map_err(crate::io::Error::from)
     }
