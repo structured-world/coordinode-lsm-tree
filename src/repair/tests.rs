@@ -12978,6 +12978,105 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
     Ok(())
 }
 
+/// A failure writing or syncing a salvage's OUTPUT says nothing about the
+/// SOURCE's bytes: grading the source unreadable on it would exclude the
+/// source and the tables that reference it, and the cleanup after the commit
+/// would remove intact data. Whichever directory sync of the repair fails
+/// once, a retry on a healthy filesystem reads back every intact value.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    for skip in 0u64..10 {
+        let memfs = Arc::new(MemFs::new());
+        {
+            let crate::AnyTree::Blob(tree) = config(memfs.clone()).open()? else {
+                panic!("expected blob tree");
+            };
+            for i in 0..8u32 {
+                tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        // Corrupt the LAST frame, so the blob is salvaged into a replacement.
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let blob_path = memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .find(|e| !e.is_dir)
+            .expect("one blob file")
+            .path;
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        {
+            let mut file = memfs.open(
+                &blob_path,
+                &crate::fs::FsOpenOptions::new().read(true).write(true),
+            )?;
+            let byte = crate::file::read_exact(&*file, last - 8, 1)?;
+            file.seek(SeekFrom::Start(last - 8))?;
+            file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+        }
+        for e in memfs.read_dir(&root)? {
+            let is_manifest = e
+                .file_name
+                .strip_prefix('v')
+                .or_else(|| e.file_name.strip_prefix("edits-"))
+                .is_some_and(|rest| rest.parse::<u64>().is_ok());
+            if is_manifest || e.file_name == "current" {
+                memfs.remove_file(&e.path)?;
+            }
+        }
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(skip)
+                .once(),
+        );
+        let first = config(Arc::new(fault)).repair();
+
+        // The filesystem is healthy again: whatever the first attempt did, the
+        // retry (or the open of what it committed) serves every intact value.
+        let tree = config(memfs.clone()).open_or_repair(crate::repair::RepairPolicy::default());
+        let tree = match tree {
+            Ok((tree, _)) => tree,
+            Err(e) => panic!("skip={skip}: the tree does not open after {first:?}: {e:?}"),
+        };
+        for i in 0..7u32 {
+            assert!(
+                tree.get(format!("k{i:04}").as_bytes(), crate::SeqNo::MAX)?
+                    .is_some(),
+                "skip={skip}, first repair {:?}: intact k{i:04} was lost",
+                first.as_ref().map(|r| (r.recovered, r.unreadable)),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The post-failure install probe must fail SAFE: a probe that cannot stat
 /// the rebuilt snapshot's name (a transient or permission failure) proves
 /// nothing about the install, and treating it as "not installed" lets the
