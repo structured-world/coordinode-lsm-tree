@@ -6628,7 +6628,8 @@ impl Tree {
 
 /// Returns `true` if any tables folder of the tree (the primary one and every
 /// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
-/// holds an entry, or the tree folder holds a snapshot other than `v0`.
+/// holds an entry, or the tree folder holds a snapshot other than `v0` or an
+/// edit log holding an edit.
 ///
 /// Used by [`Tree::open`], for a directory with no `current` pointer, to
 /// distinguish a fresh directory or a creation that never completed (empty
@@ -6653,20 +6654,33 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
-    // A creation writes `v0`, of an empty version, before the pointer: alone
-    // it holds nothing. Any later snapshot was written by a tree that lived,
-    // or put there to refuse an open (a store mid-conversion).
+    // A creation writes `v0`, of an empty version, and its empty log before
+    // the pointer: alone they hold nothing. A later snapshot was written by a
+    // tree that lived, or put there to refuse an open (a store
+    // mid-conversion), and an edit in any log is a tree's history (a clear,
+    // the retention floor it raised) even when no table is left.
     let entries = match config.fs.read_dir(&config.path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    Ok(entries.iter().any(|entry| {
-        entry
-            .file_name
+    for entry in &entries {
+        let name = entry.file_name.as_str();
+        if name
             .strip_prefix('v')
             .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0))
-    }))
+        {
+            return Ok(true);
+        }
+        if name
+            .strip_prefix("edits-")
+            .is_some_and(|id| id.parse::<u64>().is_ok())
+            && config.fs.metadata(&entry.path)?.len > 0
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether two sightings of one table id PROVABLY hold different bytes.

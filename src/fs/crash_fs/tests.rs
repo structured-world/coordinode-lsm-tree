@@ -1668,3 +1668,20 @@ fn a_removal_behind_a_lost_barrier_sync_is_lost_with_it() {
     assert!(removed_after(2), "the syncs kept, the removal lost");
     assert!(!removed_after(3), "everything kept: the removal too");
 }
+
+/// A file made under the name of one removed behind a barrier sync is lost
+/// with that removal when a power loss keeps neither: the old file stays,
+/// with its old bytes, rather than the name going missing.
+#[test]
+fn a_name_remade_behind_a_lost_removal_keeps_the_old_file() {
+    let fs = CrashFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d")).unwrap();
+    write_synced(&fs, "/d", "/d/old", b"O", SyncMode::Full);
+    write_synced(&fs, "/d", "/d/new", b"N", SyncMode::Barrier);
+    fs.remove_file(Path::new("/d/old")).unwrap();
+    write_synced(&fs, "/d", "/d/old", b"R", SyncMode::Barrier);
+
+    // The first two syncs kept, the removal and all after it lost.
+    fs.crash_keeping(2);
+    assert_eq!(read(&fs, "/d/old"), b"O");
+}

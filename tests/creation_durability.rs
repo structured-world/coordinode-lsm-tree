@@ -82,6 +82,34 @@ fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
     );
 }
 
+/// A tree that lived holds its history in its edit log even when no table is
+/// left (a dropped range, the retention floor it raised): a missing pointer
+/// over that log is refused, never taken for a fresh folder and created over.
+#[test]
+fn an_open_without_a_pointer_refuses_a_log_holding_edits() {
+    use lsm_tree::fs::Fs;
+    let mem = MemFs::new();
+    let fs = CrashFs::new(mem.clone());
+    {
+        let tree = config(&fs, false).open().expect("create");
+        tree.insert("key", "value", 0);
+        tree.flush_active_memtable(0).expect("flush");
+        tree.drop_range::<&[u8], _>(..).expect("drop");
+    }
+    let db = std::path::Path::new(DB);
+    assert!(
+        mem.read_dir(&db.join("tables")).expect("tables").is_empty(),
+        "self-check: no table is left"
+    );
+    mem.remove_file(&db.join("current"))
+        .expect("lose the pointer");
+
+    assert!(
+        config(&fs, false).open().is_err(),
+        "a log holding edits is a tree's state"
+    );
+}
+
 /// Flushes past a manifest rotation survive a power loss: the rotated
 /// generation's log, created with its snapshot, holds the edits after it.
 #[test]

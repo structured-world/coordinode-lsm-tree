@@ -130,12 +130,13 @@ impl CrashState {
                 Ordered::Removed(..) => {}
             }
         }
-        // A removal behind a lost sync is lost with it: the file stays, as it
-        // was durable, unless its name was made durable again since.
+        // A removal behind a lost sync is lost with it, and so is everything
+        // made under that name after it: no sync that could make the new
+        // entry durable comes before the lost one. The file stays as it was
+        // durable, whatever was written to its name since.
         for sync in ordered {
-            if let Ordered::Removed(path, bytes) = sync
-                && !self.durable.contains_key(&path)
-            {
+            if let Ordered::Removed(path, bytes) = sync {
+                self.pending_entries.remove(&path);
                 self.touched.insert(path.clone());
                 self.durable.insert(path, bytes);
             }
