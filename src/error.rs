@@ -596,6 +596,11 @@ pub enum Error {
     /// reports it as failed and may be retried; the tree reopened after a
     /// crash holds either the state before it or the state it installed,
     /// whole. The payload is the failure itself.
+    ///
+    /// From a repair, the report is kept on disk with the snapshot it
+    /// describes: when that snapshot turns out installed,
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) hands the
+    /// report out; when it does not, its own repair answers with a fresh one.
     InstallOutcomeUnknown(alloc::boxed::Box<Self>),
 }
 

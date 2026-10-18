@@ -5748,6 +5748,19 @@ impl Tree {
 
         let built = (|| -> crate::Result<()> {
             (*config.fs).create_dir_all(&path)?;
+            // A repair report's copy here is from a repair whose snapshot was
+            // never installed, and could name the one this creation writes.
+            // The snapshot's directory sync makes its removal durable.
+            for dirent in (*config.fs).read_dir(&path)? {
+                if dirent.is_dir || crate::file::repair_report_name(&dirent.file_name).is_none() {
+                    continue;
+                }
+                match (*config.fs).remove_file(&dirent.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             for (tables_folder, folder_fs) in config.all_tables_folders() {
                 let covered = Arc::ptr_eq(&folder_fs, &config.fs);
                 let folder_holders = new_entry_holders(&*folder_fs, &tables_folder)?;
@@ -6678,7 +6691,11 @@ impl Tree {
             let name = &dirent.file_name;
             let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
             let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            if is_orphan_snapshot || is_orphan_log {
+            // A repair report's copy is kept only for the snapshot it
+            // describes, and only once that is the installed one.
+            let is_orphan_report = crate::file::repair_report_name(name)
+                .is_some_and(|(id, temporary)| temporary || id != snapshot_id);
+            if is_orphan_snapshot || is_orphan_log || is_orphan_report {
                 log::trace!("Cleanup orphaned manifest file {name}");
                 match fs.remove_file(&dirent.path) {
                     Ok(()) => {}

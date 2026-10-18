@@ -13319,7 +13319,11 @@ fn a_repair_whose_install_cannot_be_withdrawn_keeps_its_blob_replacements() -> c
         .position(|(path, kind)| {
             *kind != SyncKind::Directory
                 && path.parent() == Some(&*root)
-                && path.to_string_lossy().ends_with(".tmp")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str()?.strip_suffix(".tmp"))
+                    .and_then(crate::version::recovery::snapshot_id_of)
+                    .is_some()
         })
         .ok_or(crate::Error::Unrecoverable)?;
     let skip = syncs
@@ -13352,6 +13356,173 @@ fn a_repair_whose_install_cannot_be_withdrawn_keeps_its_blob_replacements() -> c
             .count(),
         2,
         "the damaged original and its replacement both stay",
+    );
+    Ok(())
+}
+
+/// The configuration the damaged-tail blob fixture is repaired and opened
+/// with, over `fs`.
+fn a_blob_tree_config(
+    fs: crate::fs::FaultFs<crate::fs::MemFs>,
+    root: &std::path::Path,
+) -> crate::Config {
+    crate::Config::new(
+        root,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(16),
+    ))
+}
+
+/// A rebuilt snapshot whose install and withdrawal both failed to sync, and
+/// which a power loss then kept: the damaged-tail blob fixture after such a
+/// repair. Returns the filesystem, the tree's folder, and the report a repair
+/// of the fixture without a fault answers with.
+fn an_unknown_install_that_survived() -> crate::Result<(
+    std::sync::Arc<crate::fs::MemFs>,
+    std::path::PathBuf,
+    crate::RepairReport,
+)> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
+    use crate::io::ErrorKind;
+
+    let config = a_blob_tree_config;
+    // The snapshot a repair of the fixture installs: its name and bytes.
+    let installed = |fs: &MemFs, root: &std::path::Path| -> crate::Result<(String, Vec<u8>)> {
+        let id = crate::version::recovery::installed_snapshot(root, fs)?
+            .ok_or(crate::Error::Unrecoverable)?;
+        let name = format!("v{id}");
+        let file = fs.open(
+            &root.join(&name),
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?;
+        let len = usize::try_from(fs.metadata(&root.join(&name))?.len)
+            .map_err(|_| crate::Error::Unrecoverable)?;
+        Ok((name, crate::file::read_exact(&*file, 0, len)?.to_vec()))
+    };
+
+    // A repair without a fault: its report, the snapshot it installs, and
+    // which directory sync under the tree folder installs it (the first
+    // after the snapshot's own data sync).
+    let (probe_fs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let probe = FaultFs::new(MemFs::clone(&probe_fs));
+    let injector = probe.injector();
+    let expected = config(probe, &root).repair()?;
+    let syncs = injector.take_syncs();
+    let snapshot_synced = syncs
+        .iter()
+        .position(|(path, kind)| {
+            *kind != SyncKind::Directory
+                && path.parent() == Some(&*root)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str()?.strip_suffix(".tmp"))
+                    .and_then(crate::version::recovery::snapshot_id_of)
+                    .is_some()
+        })
+        .ok_or(crate::Error::Unrecoverable)?;
+    let skip = syncs
+        .iter()
+        .take(snapshot_synced)
+        .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
+        .count();
+    let snapshot = installed(&probe_fs, &root)?;
+    assert_ne!(
+        expected.wal_replay_scope(),
+        crate::WalReplayScope::TailOnly,
+        "self-check: the repair owes a replay"
+    );
+    let (again_fs, _, _) = a_blob_tree_with_a_damaged_tail()?;
+    config(FaultFs::new(MemFs::clone(&again_fs)), &root).repair()?;
+    assert_eq!(
+        installed(&again_fs, &root)?,
+        snapshot,
+        "self-check: a repair of the fixture installs the same snapshot"
+    );
+
+    let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    // The install's directory sync fails, and so does the withdrawal's.
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(root.to_string_lossy())
+            .skip(skip as u64)
+            .times(2),
+    );
+    let result = config(fault, &root).repair();
+    assert!(
+        matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+        "the install can be neither made durable nor withdrawn: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        !memfs.exists(&root.join(&snapshot.0))?,
+        "self-check: the withdrawal took the name back"
+    );
+
+    // The power loss keeps the rename and loses the withdrawal.
+    {
+        let mut file = memfs.open(
+            &root.join(&snapshot.0),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?;
+        std::io::Write::write_all(&mut file, &snapshot.1)?;
+    }
+    Ok((memfs, root, expected))
+}
+
+/// A rebuilt snapshot whose install and withdrawal both fail to sync may come
+/// back after a power loss. The next `open_or_repair` then opens it without a
+/// repair, and must still hand out the report of the repair that built it,
+/// once: without it the caller never learns the WAL replay that repair owes.
+#[test]
+fn an_install_of_unknown_outcome_hands_its_report_to_the_next_open() -> crate::Result<()> {
+    use crate::RepairPolicy;
+    use crate::fs::{FaultFs, MemFs};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let (_, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    let Some(report) = report else {
+        panic!("the repair's report is lost");
+    };
+    assert_eq!(report.wal_replay_scope(), expected.wal_replay_scope());
+    assert_eq!(report.lost_coverage, expected.lost_coverage);
+    assert_eq!(report.unknowable_losses, expected.unknowable_losses);
+    assert_eq!(report.unreadable_files, expected.unreadable_files);
+
+    let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    assert!(again.is_none(), "the report is handed out once");
+    Ok(())
+}
+
+/// A repair over the surviving snapshot of a repair whose report never
+/// reached the caller owes that repair's replay as well: its report carries
+/// the earlier losses, and no later open hands the earlier report out again.
+#[test]
+fn a_repair_over_an_unreported_repair_carries_its_losses() -> crate::Result<()> {
+    use crate::RepairPolicy;
+    use crate::fs::{FaultFs, MemFs};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let report = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root).repair()?;
+    for entry in &expected.lost_coverage {
+        assert!(
+            report.lost_coverage.contains(entry),
+            "the earlier loss {entry:?} is carried"
+        );
+    }
+    assert_eq!(report.wal_replay_scope(), expected.wal_replay_scope());
+
+    let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    assert!(
+        again.is_none(),
+        "the earlier report went out with the later one"
     );
     Ok(())
 }

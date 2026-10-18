@@ -57,6 +57,32 @@ pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> 
         .and_then(|id| id.parse::<crate::TableId>().ok())
 }
 
+/// Prefix of the durable copy of a manifest repair's report.
+///
+/// `{prefix}{id}` is the copy for the rebuilt snapshot `v{id}`,
+/// `{prefix}{id}.tmp` the copy while it is written. Recognized here rather
+/// than in `repair` so an open without that (std-only) module still sweeps a
+/// copy whose snapshot was never installed.
+pub const REPAIR_REPORT_PREFIX: &str = "repair-report-";
+
+/// The snapshot id a repair report copy's name claims, and whether it is the
+/// temporary.
+///
+/// `None` for any other name, so an operator's `repair-report-notes` is never
+/// swept.
+#[must_use]
+pub fn repair_report_name(file_name: &str) -> Option<(u64, bool)> {
+    let rest = file_name.strip_prefix(REPAIR_REPORT_PREFIX)?;
+    let (digits, temporary) = match rest.strip_suffix(".tmp") {
+        Some(digits) => (digits, true),
+        None => (rest, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(|id| (id, temporary))
+}
+
 /// Suffix of a manifest repair's in-progress blob salvage copy.
 pub const BLOB_SALVAGE_TMP_SUFFIX: &str = ".salvage-tmp";
 
