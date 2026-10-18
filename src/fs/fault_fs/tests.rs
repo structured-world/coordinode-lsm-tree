@@ -813,6 +813,110 @@ fn a_queued_read_the_rules_fail_is_handed_back_by_the_next_wait() -> io::Result<
     Ok(())
 }
 
+/// A request whose offset overflows fails the whole batch before any of it is
+/// read, so the requests after it are not screened: no rule is spent on a
+/// read that never happens, and a retry still meets it.
+#[test]
+fn a_batch_failed_by_an_overflow_spends_no_rule_on_the_requests_after_it() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut bufs = [[0u8; 16]; 2];
+    let [b0, b1] = &mut bufs;
+    let mut overflowing = crate::fs::BlockBuf::new(b0);
+    overflowing.append(&[0]);
+    let mut reqs = [
+        BlockRead {
+            file: files[0].as_ref(),
+            offset: u64::MAX,
+            buf: overflowing,
+        },
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b1),
+        },
+    ];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the backend refuses an overflowing offset");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert_eq!(fs.injector().read_count(), before, "nothing was read");
+
+    let mut buf = [0u8; 16];
+    let mut retry = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut retry)
+        .expect_err("the rule still fails the read of f1");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    Ok(())
+}
+
+/// A queued read is screened when a wait issues it, as the backend's queue
+/// issues it: one never waited for spends no rule, and a rule armed after the
+/// submit but before the wait applies to it.
+#[test]
+fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files: Vec<Arc<dyn FsFile>> = two_readable(&fs)?.into_iter().map(Arc::from).collect();
+    let read_of = |tag| QueuedRead {
+        tag,
+        file: Arc::clone(&files[1]),
+        offset: 0,
+        buf: vec![0; 16],
+    };
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    // Submitted, never waited for: never read.
+    let mut queue = fs.read_queue();
+    queue.submit(read_of(0));
+    drop(queue);
+    assert_eq!(fs.injector().read_count(), before, "nothing was read");
+
+    // The rule is still there for the read a wait issues.
+    let mut queue = fs.read_queue();
+    queue.submit(read_of(1));
+    let mut done = Vec::new();
+    queue.wait(1, &mut |read| done.push(read));
+    assert_eq!(
+        done.first()
+            .map(|read| read.result.as_ref().map_err(io::Error::kind)),
+        Some(Err::<&(), _>(ErrorKind::PermissionDenied)),
+    );
+
+    // A rule armed between the submit and the wait applies.
+    let mut queue = fs.read_queue();
+    queue.submit(read_of(2));
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::Interrupted))
+            .on_path("f1")
+            .once(),
+    );
+    let mut done = Vec::new();
+    queue.wait(1, &mut |read| done.push(read));
+    assert_eq!(
+        done.first()
+            .map(|read| read.result.as_ref().map_err(io::Error::kind)),
+        Some(Err::<&(), _>(ErrorKind::Interrupted)),
+    );
+    Ok(())
+}
+
 #[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();

@@ -418,9 +418,11 @@ impl FaultInjector {
     fn screen_batch(&self, reqs: &[BlockRead<'_>]) -> (usize, Option<io::Error>) {
         for (at, req) in reqs.iter().enumerate() {
             // A request partly filled reads from `filled` bytes in. One whose
-            // offset overflows is the inner backend's to refuse.
+            // offset overflows is the inner backend's to refuse, and it refuses
+            // the whole batch before reading any of it: the requests after it
+            // are never read, so no rule may count them.
             let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
-                continue;
+                return (reqs.len(), None);
             };
             if let Some(error) = self.screen_by_fd(req.file, offset) {
                 return (at, Some(error));
@@ -681,6 +683,7 @@ impl<F: Fs> Fs for FaultFs<F> {
         Box::new(FaultReadQueue {
             inner: self.inner.read_queue(),
             injector: &self.injector,
+            submitted: Vec::new(),
             failed: Vec::new(),
         })
     }
@@ -872,36 +875,44 @@ impl<F: Fs> Fs for FaultFs<F> {
 }
 
 /// The [`ReadQueue`] of a [`FaultFs`]: the inner backend's queue, each read
-/// screened by the read rules as it is submitted. A read a rule fails never
-/// reaches the inner queue and is handed back failed by the next wait.
+/// screened by the read rules as a wait issues it, as the inner queue issues
+/// its reads: a read never waited for is never read, and a rule armed before
+/// the wait applies to it. A read a rule fails never reaches the inner queue
+/// and is handed back failed by that wait.
 struct FaultReadQueue<'a> {
     inner: Box<dyn ReadQueue + 'a>,
     injector: &'a FaultInjector,
+    /// Reads submitted since the last wait, not screened yet.
+    submitted: Vec<QueuedRead>,
     failed: Vec<ReadDone>,
 }
 
 impl ReadQueue for FaultReadQueue<'_> {
     fn submit(&mut self, read: QueuedRead) {
-        match self.injector.screen_by_fd(read.file.as_ref(), read.offset) {
-            Some(error) => self.failed.push(ReadDone {
-                tag: read.tag,
-                buf: read.buf,
-                result: Err(error),
-            }),
-            None => self.inner.submit(read),
-        }
+        self.submitted.push(read);
     }
 
     fn outstanding(&self) -> usize {
-        self.inner.outstanding() + self.failed.len()
+        self.inner.outstanding() + self.submitted.len() + self.failed.len()
     }
 
-    // A failed read is handed back only by a wait, never on its own.
+    // A submitted read is issued, and a failed one handed back, only by a
+    // wait, never on its own.
     fn held(&self) -> usize {
-        self.inner.held() + self.failed.len()
+        self.inner.held() + self.submitted.len() + self.failed.len()
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        for read in core::mem::take(&mut self.submitted) {
+            match self.injector.screen_by_fd(read.file.as_ref(), read.offset) {
+                Some(error) => self.failed.push(ReadDone {
+                    tag: read.tag,
+                    buf: read.buf,
+                    result: Err(error),
+                }),
+                None => self.inner.submit(read),
+            }
+        }
         let handed = self.failed.len();
         for done in self.failed.drain(..) {
             on_done(done);
