@@ -9,6 +9,7 @@ use crate::{
     Slice,
     fs::{Fs, FsFile, SyncMode},
 };
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::Write;
 
