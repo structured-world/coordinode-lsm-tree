@@ -811,6 +811,17 @@ impl Fs for CrashFs {
         // simulator, never below it.
         let spelled = || (self.listed_as_spelled(from), self.listed_as_spelled(to));
         let before = matches!(self.inner.same_file(from, to), Ok(true)).then(spelled);
+        // A rename that may be queued (see below) can be lost, and then both
+        // names are back as they were: files this run never touched have
+        // their bytes captured now, before the rename moves or replaces them.
+        // A symlink names no bytes of its own.
+        if from != to && !self.state.lock().ordered.is_empty() {
+            for name in [self.name_after(from), self.name_after(to)] {
+                if matches!(self.inner.read_link(&name), Ok(None)) {
+                    self.capture_first_touch(&name)?;
+                }
+            }
+        }
         self.inner.rename(from, to)?;
         // Without a file identity to go on (a backend that has none, a
         // dangling symlink), the source still being there, the link itself

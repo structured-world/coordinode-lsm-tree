@@ -303,6 +303,41 @@ fn creating_a_tree_syncs_the_folders_above_it_before_its_snapshot() {
     }
 }
 
+/// A tree made where several folders above it do not exist yet syncs each
+/// folder that gained an entry: the open makes the whole chain to lock the
+/// tree folder, and every name in it is new, not only the tree folder's.
+#[test]
+fn creating_a_tree_under_missing_folders_syncs_each_of_them() {
+    use lsm_tree::fs::Fs;
+    let root = std::path::absolute("/census/deep").expect("absolute path");
+    let base = root.join("a").join("b").join("tree");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    fs.create_dir_all(&root).expect("the folder that exists");
+
+    let _tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .open()
+    .expect("open");
+    let synced: Vec<PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| *kind == SyncKind::Directory)
+        .map(|(path, _)| path)
+        .collect();
+    for holder in [root.clone(), root.join("a"), root.join("a").join("b")] {
+        assert!(
+            synced.contains(&holder),
+            "{} gained an entry and is synced: {synced:?}",
+            holder.display()
+        );
+    }
+}
+
 /// A route whose path lies inside the tree folder but on a backend of its
 /// own holds its names on that backend: creating the tree syncs, there, every
 /// folder that gained one, the tree folder included, since the snapshot's

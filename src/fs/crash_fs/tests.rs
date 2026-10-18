@@ -1753,6 +1753,31 @@ fn a_rename_onto_a_name_removed_behind_a_lost_barrier_leaves_both_files() {
     assert_eq!(read(&fs, "/d/b"), b"B");
 }
 
+/// Two files the simulator never touched, one renamed over the other behind
+/// a barrier sync, are both back as they were when a power loss loses the
+/// rename.
+#[test]
+fn untouched_files_renamed_behind_a_lost_barrier_keep_their_bytes() {
+    let mem = MemFs::new();
+    mem.create_dir_all(Path::new("/d")).unwrap();
+    for (name, bytes) in [("/d/a", b"A"), ("/d/b", b"B")] {
+        let mut file = mem
+            .open(
+                Path::new(name),
+                &FsOpenOptions::new().write(true).create(true),
+            )
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+    let fs = CrashFs::new(mem);
+    write_synced(&fs, "/d", "/d/x", b"X", SyncMode::Barrier);
+    fs.rename(Path::new("/d/b"), Path::new("/d/a")).unwrap();
+
+    fs.crash_keeping(0);
+    assert_eq!(read(&fs, "/d/a"), b"A");
+    assert_eq!(read(&fs, "/d/b"), b"B");
+}
+
 /// A file the simulator never touched, removed behind a barrier sync, keeps
 /// the bytes it had before the run when a power loss loses the removal.
 #[test]

@@ -4586,6 +4586,9 @@ impl Tree {
         // is threaded into the constructor so it lives for the tree's lifetime.
         #[cfg(feature = "std")]
         let restoring = matches!(lock, crate::config::DirectoryLock::Held(_));
+        // The folders that gain an entry when the open makes the tree folder:
+        // a tree created here syncs each of them, though by then they exist.
+        let made_by_open = new_entry_holders(&*config.fs, &config.path)?;
         #[cfg(feature = "std")]
         let directory_lock = match lock {
             crate::config::DirectoryLock::Held(held) => held,
@@ -4720,7 +4723,8 @@ impl Tree {
                 let msg = format!(
                     "Tree::open: refusing to recover {} — `current` pointer is missing \
                      but the directory still holds version artifacts (files in a \
-                     tables folder or in blobs/, or a vN past v0). This is the on-disk signature of a half-written checkpoint \
+                     tables folder or in blobs/, a vN past v0, or an edits-N holding \
+                     edits). This is the on-disk signature of a half-written checkpoint \
                      or interrupted sealing. Remove the partial directory and retry the \
                      checkpoint, or restore `current` from a backup before reopening.",
                     config.path.display(),
@@ -4733,6 +4737,7 @@ impl Tree {
             }
             Self::create_new(
                 config,
+                &made_by_open,
                 #[cfg(feature = "std")]
                 directory_lock,
             )
@@ -5687,6 +5692,9 @@ impl Tree {
     /// Creates a new LSM-tree in a directory.
     fn create_new(
         config: Config,
+        // The folders that gained an entry when `Tree::open` made the tree
+        // folder, to lock it.
+        made_by_open: &[crate::path::PathBuf],
         // The cross-process directory lock acquired by `Tree::open`, held for
         // the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
@@ -5705,25 +5713,6 @@ impl Tree {
             }
         }
 
-        /// The folders that gain a new entry when `folder` is made on `fs`:
-        /// each one above it up to the first that exists already, which holds
-        /// the first new one. A folder that exists makes nothing new.
-        fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<PathBuf>> {
-            let mut holders = Vec::new();
-            if fs.exists(folder)? {
-                return Ok(holders);
-            }
-            let mut made = folder;
-            while let Some(holder) = made.parent() {
-                holders.push(holder.to_path_buf());
-                if fs.exists(holder)? {
-                    break;
-                }
-                made = holder;
-            }
-            Ok(holders)
-        }
-
         let path = config.path.clone();
         log::trace!("Creating LSM-tree at {}", path.display());
 
@@ -5737,13 +5726,14 @@ impl Tree {
         // durable too. A route on another backend holds its own names, even
         // one whose path lies inside the tree folder.
         let mut holders: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
-        // The open made the tree folder already, to lock it: its name in its
-        // parent is new all the same.
-        for holder in new_entry_holders(&*config.fs, &path)? {
+        // The open made the tree folder already, to lock it, and every folder
+        // above it that did not exist: their names are new all the same.
+        for holder in made_by_open
+            .iter()
+            .cloned()
+            .chain(new_entry_holders(&*config.fs, &path)?)
+        {
             once(&mut holders, &holder, &config.fs);
-        }
-        if let Some(parent) = path.parent() {
-            once(&mut holders, parent, &config.fs);
         }
         (*config.fs).create_dir_all(&path)?;
         for (tables_folder, folder_fs) in config.all_tables_folders() {
@@ -6635,6 +6625,25 @@ impl Tree {
 
         Ok(())
     }
+}
+
+/// The folders that gain a new entry when `folder` is made on `fs`: each one
+/// above it up to the first that exists already, which holds the first new
+/// one. A folder that exists makes nothing new.
+fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<crate::path::PathBuf>> {
+    let mut holders = Vec::new();
+    if fs.exists(folder)? {
+        return Ok(holders);
+    }
+    let mut made = folder;
+    while let Some(holder) = made.parent() {
+        holders.push(holder.to_path_buf());
+        if fs.exists(holder)? {
+            break;
+        }
+        made = holder;
+    }
+    Ok(holders)
 }
 
 /// Returns `true` if any tables folder of the tree (the primary one and every
