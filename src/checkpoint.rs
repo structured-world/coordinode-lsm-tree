@@ -580,6 +580,23 @@ pub fn copy_metadata(
     // which `Tree::open` refuses to create over (the partial dir must be
     // removed and the checkpoint retried). `PartialCheckpointGuard` performs
     // that removal on the normal error path.
+    //
+    // A repair report the source still owes (an ordinary open keeps it for
+    // the next repairing open) describes losses in the data just linked, so
+    // the checkpoint owes it too: copied under the checkpoint's snapshot id
+    // first, so the install's directory sync makes its name durable with
+    // the snapshot's.
+    if let Some(from) = crate::file::newest_repair_report(src_fs, src_root)? {
+        crate::file::copy_repair_report(
+            src_fs,
+            src_root,
+            from,
+            target_fs,
+            target_root,
+            version.id(),
+            sync_mode,
+        )?;
+    }
     crate::version::persist_version(
         target_root,
         version,

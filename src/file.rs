@@ -104,9 +104,52 @@ pub fn carry_repair_report(
     to: u64,
     sync_mode: SyncMode,
 ) -> crate::Result<bool> {
+    copy_repair_report(fs, folder, from, fs, folder, to, sync_mode)
+}
+
+/// The snapshot id of the newest copy of a repair report in `folder`, if any.
+///
+/// While a tree is open, every copy it holds carries the one report its
+/// opening repair left (a rotation carries the same bytes to the next
+/// snapshot), so the newest stands for all of them.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder.
+pub fn newest_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<u64>> {
+    Ok(fs
+        .read_dir(folder)?
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| match repair_report_name(&entry.file_name) {
+            Some((id, false)) => Some(id),
+            _ => None,
+        })
+        .max())
+}
+
+/// Copies the repair report kept for snapshot `from` in `src_folder` to the
+/// copy for snapshot `to` in `dst_folder`.
+///
+/// [`carry_repair_report`] does it within one folder; a checkpoint does it
+/// across, since it holds the repaired data and so owes the report its tree
+/// still owes.
+///
+/// # Errors
+///
+/// Propagates a failure to read the copy or to write the new one.
+pub fn copy_repair_report(
+    src_fs: &dyn Fs,
+    src_folder: &Path,
+    from: u64,
+    dst_fs: &dyn Fs,
+    dst_folder: &Path,
+    to: u64,
+    sync_mode: SyncMode,
+) -> crate::Result<bool> {
     use crate::fs::FsOpenOptions;
-    let source = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{from}"));
-    let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
+    let source = src_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{from}"));
+    let file = match src_fs.open(&source, &FsOpenOptions::new().read(true)) {
         Ok(file) => file,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
@@ -115,8 +158,9 @@ pub fn carry_repair_report(
         .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
     let bytes = read_exact(&*file, 0, len)?;
     drop(file);
-    let target = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}"));
-    let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}.tmp"));
+    let fs = dst_fs;
+    let target = dst_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}"));
+    let temporary = dst_folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{to}.tmp"));
     let mut copy = fs.open(
         &temporary,
         &FsOpenOptions::new().write(true).create(true).truncate(true),

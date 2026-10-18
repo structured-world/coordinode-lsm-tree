@@ -166,17 +166,26 @@ pub(super) enum Retire {
 }
 
 /// Removes every copy and its temporary, then syncs the folder once.
+///
+/// Temporaries go first, then the copies from the oldest snapshot up: the
+/// newest one carries the losses of every repair folded into it, so a removal
+/// that fails partway must leave it, not an older copy that names less.
 pub(super) fn retire(config: &Config) -> Result<(), Retire> {
-    let entries = config
+    let mut copies: Vec<(bool, u64, PathBuf)> = config
         .fs
         .read_dir(&config.path)
-        .map_err(|e| Retire::Kept(e.into()))?;
+        .map_err(|e| Retire::Kept(e.into()))?
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| {
+            let (id, temporary) = repair_report_name(&entry.file_name)?;
+            Some((!temporary, id, entry.path))
+        })
+        .collect();
+    copies.sort_unstable();
     let mut removed = false;
-    for entry in entries {
-        if entry.is_dir || repair_report_name(&entry.file_name).is_none() {
-            continue;
-        }
-        match config.fs.remove_file(&entry.path) {
+    for (_, _, path) in copies {
+        match config.fs.remove_file(&path) {
             Ok(()) => removed = true,
             Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Retire::Kept(e.into())),

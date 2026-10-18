@@ -112,6 +112,49 @@ fn retiring_removes_every_copy_and_only_those() -> crate::Result<()> {
     Ok(())
 }
 
+/// A removal that fails partway leaves the copy of the newest snapshot,
+/// which a repair over an earlier one wrote with that one's losses folded in:
+/// the copy that carries every loss is the last to go, whatever order the
+/// folder lists its files in.
+#[test]
+fn a_failed_retirement_keeps_the_newest_copy() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    // The listing order of the in-memory folder changes from one instance to
+    // the next; enough instances list the newest copy first.
+    for _ in 0..64 {
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        let config = Config::new(
+            "/db",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone());
+        fs.create_dir_all(&config.path)?;
+        let mut newest = a_report();
+        newest.lost_coverage.push((
+            PathBuf::from("/db/tables/12"),
+            UserKey::from(&b"p"[..]),
+            UserKey::from(&b"q"[..]),
+            Some(77),
+        ));
+        write(&config, 9, &a_report())?;
+        write(&config, 10, &newest)?;
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(crate::io::ErrorKind::PermissionDenied),
+            )
+            .on_path("repair-report-9"),
+        );
+
+        assert!(matches!(retire(&config), Err(Retire::Kept(_))));
+        let kept = read_all(&config, Some(10))?.ok_or(crate::Error::Unrecoverable)?;
+        assert_eq!(kept.lost_coverage, newest.lost_coverage);
+    }
+    Ok(())
+}
+
 /// The name grammar owns only the exact shapes the repair writes.
 #[test]
 fn only_the_exact_names_are_report_copies() {
@@ -122,6 +165,59 @@ fn only_the_exact_names_are_report_copies() {
     assert_eq!(repair_report_name("repair-report-9.bak"), None);
     assert_eq!(repair_report_name("repair-report-+9"), None);
     assert_eq!(repair_report_name("v9"), None);
+}
+
+/// A later repair of a salvaged replacement names the same path with a
+/// narrower range: folding keeps the earlier, wider loss beside it, so the
+/// replay still reaches every key and the higher bound, and keeps each note
+/// of a blob file salvaged twice.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn folding_keeps_every_distinct_loss_under_one_path() {
+    let narrower = (
+        PathBuf::from("/db/tables/7"),
+        UserKey::from(&b"c"[..]),
+        UserKey::from(&b"d"[..]),
+        Some(10),
+    );
+    let mut later = RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![narrower.clone()],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: vec![(PathBuf::from("/db/blobs/2"), "again".into())],
+        damaged_dictionaries: Vec::new(),
+        method: crate::repair::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    let earlier = a_report();
+    let wider = earlier
+        .lost_coverage
+        .first()
+        .cloned()
+        .expect("the earlier report names /db/tables/7");
+    crate::repair::fold_report(&mut later, earlier);
+    assert!(later.lost_coverage.contains(&narrower));
+    assert!(
+        later.lost_coverage.contains(&wider),
+        "the earlier, wider loss of the same path survives"
+    );
+    assert_eq!(
+        later.blob_files_salvaged,
+        vec![
+            (PathBuf::from("/db/blobs/2"), "again".into()),
+            (PathBuf::from("/db/blobs/2"), "salvaged".into()),
+        ],
+    );
+
+    // The same entry twice is listed once.
+    let mut twice = a_report();
+    crate::repair::fold_report(&mut twice, a_report());
+    assert_eq!(twice.lost_coverage, a_report().lost_coverage);
+    assert_eq!(twice.unreadable, 1);
 }
 
 /// Folding an earlier report adds its losses once, keeps the counts of the

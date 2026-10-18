@@ -246,13 +246,18 @@ const WARNINGS: [&str; 4] = [
 
 /// Adds what `earlier` lost to `report`: a repair over the snapshot of an
 /// earlier repair whose report never reached the caller owes that repair's
-/// replay too. The counts stay `report`'s own, describing this run; an entry
-/// for a path `report` already names is not repeated.
+/// replay too. The counts stay `report`'s own, describing this run.
+///
+/// A file left out of the manifest is listed once. A loss is listed once per
+/// distinct entry, not per path: a repair of an earlier repair's salvaged
+/// replacement names the same path with only what the replacement held, and
+/// the earlier, wider range is still owed, as is the note saying where an
+/// earlier salvage kept a damaged original.
 #[cfg(feature = "std")]
 fn fold_report(report: &mut RepairReport, earlier: RepairReport) {
-    fn add<T>(into: &mut Vec<T>, from: Vec<T>, path: impl Fn(&T) -> &std::path::Path) {
+    fn add<T>(into: &mut Vec<T>, from: Vec<T>, same: impl Fn(&T, &T) -> bool) {
         for entry in from {
-            if !into.iter().any(|known| path(known) == path(&entry)) {
+            if !into.iter().any(|known| same(known, &entry)) {
                 into.push(entry);
             }
         }
@@ -260,25 +265,33 @@ fn fold_report(report: &mut RepairReport, earlier: RepairReport) {
     add(
         &mut report.unreadable_files,
         earlier.unreadable_files,
-        |e| &e.0,
+        |a, b| a.0 == b.0,
     );
     report.unreadable = report.unreadable_files.len();
-    add(&mut report.excluded_files, earlier.excluded_files, |e| &e.0);
-    add(&mut report.lost_coverage, earlier.lost_coverage, |e| &e.0);
+    add(
+        &mut report.excluded_files,
+        earlier.excluded_files,
+        |a, b| a.0 == b.0,
+    );
+    add(
+        &mut report.lost_coverage,
+        earlier.lost_coverage,
+        PartialEq::eq,
+    );
     add(
         &mut report.unknowable_losses,
         earlier.unknowable_losses,
-        |e| e,
+        PartialEq::eq,
     );
     add(
         &mut report.blob_files_salvaged,
         earlier.blob_files_salvaged,
-        |e| &e.0,
+        PartialEq::eq,
     );
     add(
         &mut report.damaged_dictionaries,
         earlier.damaged_dictionaries,
-        |e| &e.0,
+        PartialEq::eq,
     );
     for warning in earlier.warnings {
         if !report.warnings.contains(&warning) {

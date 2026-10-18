@@ -17301,6 +17301,75 @@ fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
     Ok(())
 }
 
+/// A checkpoint of a tree that still owes a repair's report (an ordinary open
+/// keeps it for the next repairing open) holds the repaired data, so it owes
+/// the report too: opening the checkpoint with `open_or_repair` hands it out.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/checkpoint")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The copy a repair whose install outcome was unknown left for the
+    // snapshot the tree now opens.
+    let installed = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    tree.create_checkpoint(&target)?;
+    drop(tree);
+
+    let (checkpoint, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the checkpoint owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert_eq!(
+        checkpoint.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref())
+    );
+    Ok(())
+}
+
 /// A TRANSIENT I/O failure is returned for a retry, never "repaired": a
 /// repair would rebuild the manifest around files a healthy retry could still
 /// read. Proven by the manifest generation staying untouched.
