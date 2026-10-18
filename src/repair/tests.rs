@@ -13490,10 +13490,12 @@ fn an_unknown_install_that_survived() -> crate::Result<(
     copy_folder(&probe_fs, &survived, &root)?;
     let mut kept = 0;
     for entry in memfs.read_dir(&root)? {
-        if matches!(
-            crate::file::repair_report_name(&entry.file_name),
-            Some((_, false))
-        ) {
+        // The copy's own name, `repair-report-{id}`: digits after the prefix.
+        let copy = entry
+            .file_name
+            .strip_prefix("repair-report-")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        if copy {
             copy_file(&memfs, &survived, &entry.path)?;
             kept += 1;
         }
