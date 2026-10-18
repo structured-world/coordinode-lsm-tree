@@ -11226,8 +11226,9 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
 }
 
 /// A `persist_version` failure AFTER it installed the rebuilt snapshot (the
-/// directory sync is the one fallible step past the installing rename) must
-/// carry the report: the snapshot on disk is installed, so once the
+/// directory sync is the one fallible step past the installing rename, and
+/// here the withdrawal of the name fails too) must carry the report: the
+/// snapshot on disk is installed, so once the
 /// transient fault clears the retry opens it without a repair and answers
 /// with no report at all. The sweep arms a one-shot directory-sync fault at
 /// increasing skip counts until it lands in that window (the installed
@@ -11273,6 +11274,12 @@ fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> 
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
                 .skip(skip)
                 .times(1),
+        );
+        // A failed sync takes the snapshot's name back; refusing that removal
+        // keeps the snapshot installed, the case under test.
+        fault.injector().arm(
+            FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+                .on_path(root.join("v").to_string_lossy()),
         );
         let result = Config::new(
             &root,

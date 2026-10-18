@@ -6732,10 +6732,10 @@ fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<crate::pat
 ///
 /// Used by [`Tree::open`], for a directory with no installed snapshot, to
 /// distinguish a fresh directory or a creation that never completed (empty
-/// folders, a snapshot without its log: nothing of value, safe to
+/// folders, a snapshot never renamed into place: nothing of value, safe to
 /// `create_new` over) from a lost manifest, a half-written checkpoint or
 /// another interrupted sealing (files already placed: must error rather than
-/// silently overwrite).
+/// silently overwrite, and leave the files to orphan cleanup).
 ///
 /// A missing folder is treated as "no state": `create_new` is what creates
 /// the directories in the first place, so callers may invoke `Tree::open`
