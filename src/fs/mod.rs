@@ -1142,6 +1142,20 @@ pub trait Fs: Send + Sync + 'static {
         })
     }
 
+    /// Whether [`read_blocks_batched`](Self::read_blocks_batched),
+    /// [`read_blocks_batched_each`](Self::read_blocks_batched_each) and
+    /// [`read_queue`](Self::read_queue) read a file whose
+    /// [`FsFile::backing_fd`] is `Some` through that descriptor, never calling
+    /// its [`FsFile::read_at`]. A wrapper that observes reads at `read_at`
+    /// (fault injection, accounting) has to observe these in the batch call
+    /// instead.
+    ///
+    /// The default, `false`, matches the default batched read, which reads
+    /// every request through `read_at`. `io_uring` answers `true`.
+    fn reads_by_descriptor(&self) -> bool {
+        false
+    }
+
     /// Recursively creates all directories leading to `path`.
     ///
     /// # Errors

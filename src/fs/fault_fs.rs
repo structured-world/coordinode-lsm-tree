@@ -386,9 +386,10 @@ impl FaultInjector {
         }
     }
 
-    /// Takes the request of `file` at `offset` through the read rules when the
-    /// inner backend reads it by its descriptor, past `FaultFile::read_at`. A
-    /// file without one reaches `read_at`, which screens it there.
+    /// Takes the request of `file` at `offset` through the read rules when it
+    /// has a descriptor, which an inner backend that reads by descriptor reads
+    /// it by, past `FaultFile::read_at`. A file without one reaches `read_at`,
+    /// which screens it there.
     fn screen_by_fd(&self, file: &dyn FsFile, offset: u64) -> Option<io::Error> {
         let fd = file.backing_fd()?;
         self.screen_read(self.path_of(fd).as_deref(), offset)
@@ -625,11 +626,16 @@ impl<F: Fs> Fs for FaultFs<F> {
         }))
     }
 
-    // The inner backend batches and queues the reads (the ring reads a file
-    // by its descriptor, past `FaultFile::read_at`), each screened by the
-    // read rules first; a request a rule fails ends the batch there.
+    // The inner backend batches and queues the reads. One that reads a file
+    // by its descriptor (the ring) goes past `FaultFile::read_at`, so each
+    // request is screened by the read rules here first, and a request a rule
+    // fails ends the batch there. One that reads through `read_at` is
+    // screened there, and only there.
 
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        if !self.inner.reads_by_descriptor() {
+            return self.inner.read_blocks_batched(reqs);
+        }
         let (clean, failure) = self.injector.screen_batch(reqs);
         let (head, _) = reqs.split_at_mut(clean);
         self.inner.read_blocks_batched(head)?;
@@ -641,6 +647,9 @@ impl<F: Fs> Fs for FaultFs<F> {
         reqs: &mut [BlockRead<'_>],
         on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
     ) -> io::Result<()> {
+        if !self.inner.reads_by_descriptor() {
+            return self.inner.read_blocks_batched_each(reqs, on_read);
+        }
         let (clean, failure) = self.injector.screen_batch(reqs);
         let (head, _) = reqs.split_at_mut(clean);
         self.inner.read_blocks_batched_each(head, on_read)?;
@@ -648,11 +657,18 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
+        if !self.inner.reads_by_descriptor() {
+            return self.inner.read_queue();
+        }
         Box::new(FaultReadQueue {
             inner: self.inner.read_queue(),
             injector: &self.injector,
             failed: Vec::new(),
         })
+    }
+
+    fn reads_by_descriptor(&self) -> bool {
+        self.inner.reads_by_descriptor()
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {

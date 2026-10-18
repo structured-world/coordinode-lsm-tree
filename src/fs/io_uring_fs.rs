@@ -315,6 +315,12 @@ impl Fs for IoUringFs {
         Box::new(UringReadQueue::new(&self.inner))
     }
 
+    // The ring reads every request with a descriptor by that descriptor; one
+    // without is read serially through `read_at`.
+    fn reads_by_descriptor(&self) -> bool {
+        true
+    }
+
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
         std::fs::create_dir_all(path).map_err(crate::io::Error::from)
     }

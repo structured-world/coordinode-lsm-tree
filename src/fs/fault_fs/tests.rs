@@ -442,6 +442,343 @@ fn a_reflink_rule_matches_the_destination_path() {
     assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
 }
 
+/// A backend whose files carry a descriptor and which, when `by_descriptor`,
+/// reads its batches through that descriptor past `FsFile::read_at`, as the
+/// ring does; otherwise it reads them through `read_at`, as the default does.
+struct DescriptorFs {
+    mem: MemFs,
+    by_descriptor: bool,
+    paths: spin::Mutex<Vec<(i32, PathBuf)>>,
+}
+
+impl DescriptorFs {
+    fn new(by_descriptor: bool) -> Self {
+        Self {
+            mem: MemFs::new(),
+            by_descriptor,
+            paths: spin::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// One request, read the way this backend reads a batch.
+    fn read_one(&self, req: &mut BlockRead<'_>) -> io::Result<()> {
+        let offset = req
+            .offset
+            .checked_add(req.buf.filled() as u64)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "offset overflows"))?;
+        let dst = req.buf.unfilled_mut();
+        let want = dst.len();
+        let n = match req.file.backing_fd().filter(|_| self.by_descriptor) {
+            Some(fd) => {
+                let path = self
+                    .paths
+                    .lock()
+                    .iter()
+                    .find(|(open, _)| *open == fd)
+                    .map(|(_, path)| path.clone())
+                    .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "unknown descriptor"))?;
+                self.mem
+                    .open(&path, &FsOpenOptions::new().read(true))?
+                    .read_at(dst, offset)?
+            }
+            None => req.file.read_at(dst, offset)?,
+        };
+        req.buf.advance(n);
+        if n == want {
+            Ok(())
+        } else {
+            Err(io::Error::new(ErrorKind::UnexpectedEof, "short read"))
+        }
+    }
+}
+
+struct DescriptorFile {
+    inner: Box<dyn FsFile>,
+    fd: i32,
+}
+
+impl Read for DescriptorFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for DescriptorFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for DescriptorFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl FsFile for DescriptorFile {
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()
+    }
+
+    fn metadata(&self) -> io::Result<FsMetadata> {
+        self.inner.metadata()
+    }
+
+    fn set_len(&self, size: u64) -> io::Result<()> {
+        self.inner.set_len(size)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.inner.read_at(buf, offset)
+    }
+
+    fn backing_fd(&self) -> Option<i32> {
+        Some(self.fd)
+    }
+
+    fn lock_exclusive(&self) -> io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+}
+
+impl Fs for DescriptorFs {
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        let inner = self.mem.open(path, opts)?;
+        let mut paths = self.paths.lock();
+        let fd = 100 + i32::try_from(paths.len()).expect("few files");
+        paths.push((fd, path.to_path_buf()));
+        Ok(Box::new(DescriptorFile { inner, fd }))
+    }
+
+    fn reads_by_descriptor(&self) -> bool {
+        self.by_descriptor
+    }
+
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        reqs.iter_mut().try_for_each(|req| self.read_one(req))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.mem.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        self.mem.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.mem.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.mem.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.mem.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        self.mem.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        self.mem.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        self.mem.exists(path)
+    }
+}
+
+/// Writes `/d/f0` and `/d/f1`, 16 bytes each, through `fs`, and opens both
+/// for reading through it.
+fn two_readable(fs: &dyn Fs) -> io::Result<Vec<Box<dyn FsFile>>> {
+    let mut files = Vec::new();
+    for name in ["f0", "f1"] {
+        write_file(fs, name)?.write_all(&[name.as_bytes()[1]; 16])?;
+        files.push(fs.open(
+            Path::new(&format!("/d/{name}")),
+            &FsOpenOptions::new().read(true),
+        )?);
+    }
+    Ok(files)
+}
+
+/// A backend that reads its batches through `read_at` hands each request to
+/// `FaultFile::read_at`, which takes it through the read rules: the wrapper
+/// must not take it through them a second time, or every read counts twice
+/// and a `skip` / `times` rule is spent by the same request.
+#[test]
+fn a_batch_a_backend_reads_through_read_at_is_screened_once() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(false));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .skip(1)
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut bufs = [[0u8; 16]; 2];
+    let [b0, b1] = &mut bufs;
+    let mut reqs = [
+        BlockRead {
+            file: files[0].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b0),
+        },
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b1),
+        },
+    ];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the second read is failed by the rule");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(
+        fs.injector().read_count() - before,
+        2,
+        "each read counted once"
+    );
+    assert!(reqs[0].buf.is_full(), "the first read went through");
+    Ok(())
+}
+
+/// A backend that reads by descriptor is screened by the wrapper, once per
+/// request, and a request the rules fail ends the batch: the ones before it
+/// are read and handed over, it and the ones after it are not.
+#[test]
+fn a_batch_a_backend_reads_by_descriptor_is_screened_once_each() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut bufs = [[0u8; 16]; 2];
+    let [b0, b1] = &mut bufs;
+    let mut reqs = [
+        BlockRead {
+            file: files[0].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b0),
+        },
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b1),
+        },
+    ];
+    let mut handed = Vec::new();
+    let err = fs
+        .read_blocks_batched_each(&mut reqs, &mut |at, req| {
+            handed.push((at, req.buf.filled_bytes().to_vec()));
+        })
+        .expect_err("the rule fails the read of f1");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(handed, vec![(0, vec![b'0'; 16])]);
+    assert_eq!(
+        fs.injector().read_count() - before,
+        2,
+        "each read counted once"
+    );
+    Ok(())
+}
+
+/// A request on a file this wrapper did not open is still counted, and one
+/// whose offset overflows is left for the backend to refuse.
+#[test]
+fn a_descriptor_batch_counts_a_foreign_file_and_leaves_an_overflow_to_the_backend() -> io::Result<()>
+{
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    two_readable(&fs)?;
+    let foreign = fs
+        .inner
+        .open(Path::new("/d/f0"), &FsOpenOptions::new().read(true))?;
+    let before = fs.injector().read_count();
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: foreign.as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    fs.read_blocks_batched(&mut reqs)?;
+    assert!(reqs[0].buf.is_full());
+    assert_eq!(fs.injector().read_count() - before, 1);
+
+    let mut buf = [0u8; 16];
+    let mut overflowing = crate::fs::BlockBuf::new(&mut buf);
+    overflowing.append(&[0]);
+    let mut reqs = [BlockRead {
+        file: foreign.as_ref(),
+        offset: u64::MAX,
+        buf: overflowing,
+    }];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the backend refuses an overflowing offset");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        fs.injector().read_count() - before,
+        1,
+        "the overflowing request is not screened"
+    );
+    Ok(())
+}
+
+/// A queued read the rules fail never reaches the backend's queue; it is
+/// held until the next wait, which hands it back failed with the others.
+#[test]
+fn a_queued_read_the_rules_fail_is_handed_back_by_the_next_wait() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files: Vec<Arc<dyn FsFile>> = two_readable(&fs)?.into_iter().map(Arc::from).collect();
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+
+    let mut queue = fs.read_queue();
+    for (tag, file) in files.iter().enumerate() {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(file),
+            offset: 0,
+            buf: vec![0; 16],
+        });
+    }
+    assert_eq!(queue.outstanding(), 2);
+    assert_eq!(queue.held(), 2, "neither finishes without a wait");
+
+    let mut done = Vec::new();
+    queue.wait(2, &mut |read| done.push(read));
+    done.sort_by_key(|read| read.tag);
+    assert_eq!(done.len(), 2);
+    assert!(done[0].result.is_ok());
+    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(
+        done[1].result.as_ref().map_err(io::Error::kind),
+        Err::<&(), _>(ErrorKind::PermissionDenied),
+    );
+    assert_eq!(queue.outstanding(), 0);
+    Ok(())
+}
+
 #[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();

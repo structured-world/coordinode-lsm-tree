@@ -104,7 +104,7 @@ fn a_tight_space_blob_defragmentation_runs_on_io_uring() -> lsm_tree::Result<()>
                 s ^= s << 13;
                 s ^= s >> 7;
                 s ^= s << 17;
-                (s >> 24) as u8
+                s.to_le_bytes()[3]
             })
             .collect()
     };
