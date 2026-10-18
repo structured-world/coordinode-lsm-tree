@@ -4586,6 +4586,9 @@ impl Tree {
         // is threaded into the constructor so it lives for the tree's lifetime.
         #[cfg(feature = "std")]
         let restoring = matches!(lock, crate::config::DirectoryLock::Held(_));
+        // The folders that gain an entry when the open makes the tree folder:
+        // a tree created here syncs each of them, though by then they exist.
+        let made_by_open = new_entry_holders(&*config.fs, &config.path)?;
         #[cfg(feature = "std")]
         let directory_lock = match lock {
             crate::config::DirectoryLock::Held(held) => held,
@@ -4707,7 +4710,7 @@ impl Tree {
             // sealing). Silently calling `create_new` in that case
             // would overwrite the partial state with an empty tree,
             // turning a recoverable failure into data loss.
-            if has_existing_version_state(&config.path, &*config.fs)? {
+            if has_existing_version_state(&config)? {
                 // Return Error::Io(InvalidData, ...) rather than
                 // Error::Unrecoverable so callers that don't read
                 // logs still get a programmatic surface with the
@@ -4719,8 +4722,9 @@ impl Tree {
                 // to the timestamp).
                 let msg = format!(
                     "Tree::open: refusing to recover {} — `current` pointer is missing \
-                     but the directory still holds version artifacts (tables/, blobs/, \
-                     or vN). This is the on-disk signature of a half-written checkpoint \
+                     but the directory still holds version artifacts (files in a \
+                     tables folder or in blobs/, a vN past v0, or an edits-N holding \
+                     edits). This is the on-disk signature of a half-written checkpoint \
                      or interrupted sealing. Remove the partial directory and retry the \
                      checkpoint, or restore `current` from a backup before reopening.",
                     config.path.display(),
@@ -4733,6 +4737,7 @@ impl Tree {
             }
             Self::create_new(
                 config,
+                &made_by_open,
                 #[cfg(feature = "std")]
                 directory_lock,
             )
@@ -5537,6 +5542,7 @@ impl Tree {
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
+            false,
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
@@ -5686,36 +5692,90 @@ impl Tree {
     /// Creates a new LSM-tree in a directory.
     fn create_new(
         config: Config,
+        // The folders that gained an entry when `Tree::open` made the tree
+        // folder, to lock it.
+        made_by_open: &[crate::path::PathBuf],
         // The cross-process directory lock acquired by `Tree::open`, held for
         // the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
     ) -> crate::Result<Self> {
-        use crate::file::fsync_directory;
+        use crate::file::{BLOBS_FOLDER, fsync_directory};
+        use crate::fs::SyncMode;
+        use crate::path::PathBuf;
+
+        /// Adds `folder` on `fs` to `folders` unless it is there already.
+        fn once(folders: &mut Vec<(PathBuf, Arc<dyn Fs>)>, folder: &Path, fs: &Arc<dyn Fs>) {
+            if !folders
+                .iter()
+                .any(|(at, on)| at == folder && Arc::ptr_eq(on, fs))
+            {
+                folders.push((folder.to_path_buf(), Arc::clone(fs)));
+            }
+        }
 
         let path = config.path.clone();
         log::trace!("Creating LSM-tree at {}", path.display());
 
         let sync_mode = config.sync_mode;
 
+        // Every folder that gains a new entry is synced once, before the first
+        // snapshot is written, so a sync that fails fails the creation before
+        // there is a tree for a retry to open instead. The tree folder on the
+        // tree's own backend is the one exception: the directory sync that
+        // makes the snapshot's name durable makes every name made in it
+        // durable too. A route on another backend holds its own names, even
+        // one whose path lies inside the tree folder.
+        let mut holders: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
+        // The open made the tree folder already, to lock it, and every folder
+        // above it that did not exist: their names are new all the same. A
+        // folder that existed before may be one a creation left when it
+        // failed on a sync, made but not known durable, so every folder
+        // above it is synced: nothing tells how far up that creation went.
+        let tree_holders = if made_by_open.is_empty() && (*config.fs).exists(&path)? {
+            ancestors(&path)
+        } else {
+            made_by_open
+                .iter()
+                .cloned()
+                .chain(new_entry_holders(&*config.fs, &path)?)
+                .collect()
+        };
+        for holder in tree_holders {
+            once(&mut holders, &holder, &config.fs);
+        }
         (*config.fs).create_dir_all(&path)?;
-
-        // Create tables directories for all configured paths (primary + routes).
-        // create_dir_all may create both <route> and <route>/tables.
-        // Fsync the tables dir, its parent (route dir), AND the route's parent
-        // to make all newly-created directory entries durable on POSIX.
-        for (table_folder_path, folder_fs) in config.all_tables_folders() {
-            folder_fs.create_dir_all(&table_folder_path)?;
-            fsync_directory(&table_folder_path, &*folder_fs, sync_mode)?;
-            if let Some(parent) = table_folder_path.parent() {
-                fsync_directory(parent, &*folder_fs, sync_mode)?;
-                if let Some(grandparent) = parent.parent() {
-                    fsync_directory(grandparent, &*folder_fs, sync_mode)?;
+        for (tables_folder, folder_fs) in config.all_tables_folders() {
+            let covered = Arc::ptr_eq(&folder_fs, &config.fs);
+            let folder_holders = if folder_fs.exists(&tables_folder)? {
+                ancestors(&tables_folder)
+            } else {
+                new_entry_holders(&*folder_fs, &tables_folder)?
+            };
+            for holder in folder_holders {
+                if !(covered && holder == path) {
+                    once(&mut holders, &holder, &folder_fs);
                 }
             }
+            folder_fs.create_dir_all(&tables_folder)?;
         }
-
-        // IMPORTANT: fsync primary folder on Unix
-        fsync_directory(&path, &*config.fs, sync_mode)?;
+        if config.kv_separation_opts.is_some() {
+            (*config.fs).create_dir_all(&path.join(BLOBS_FOLDER))?;
+        }
+        let tree_fs = Arc::clone(&config.fs);
+        for (folder, folder_fs) in &holders {
+            // A barrier orders syncs on its own device only: the last sync of
+            // the creation on another device than the tree's is a full one.
+            let mode = if sync_mode == SyncMode::Barrier
+                && !matches!(
+                    (folder_fs.volume_id(folder), tree_fs.volume_id(&path)),
+                    (Some(a), Some(b)) if a == b
+                ) {
+                SyncMode::Full
+            } else {
+                sync_mode
+            };
+            fsync_directory(folder, &**folder_fs, mode)?;
+        }
 
         let inner = TreeInner::create_new(
             config,
@@ -6580,31 +6640,93 @@ impl Tree {
     }
 }
 
-/// Returns `true` if the directory contains version-related artifacts
-/// (a `tables/` subdir, a `blobs/` subdir, or any `vN` manifest file).
-///
-/// Used by [`Tree::open`] to distinguish a genuinely fresh directory
-/// (safe to `create_new`) from a half-written checkpoint or other
-/// interrupted sealing (must error rather than silently overwrite).
-///
-/// A missing parent directory is treated as "no state" — `create_new`
-/// is what creates the directory in the first place, so callers may
-/// invoke `Tree::open` against a path that does not exist yet.
-fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
-    if fs.exists(&folder.join(crate::file::TABLES_FOLDER))?
-        || fs.exists(&folder.join(crate::file::BLOBS_FOLDER))?
+/// Every folder above `folder`, nearest first.
+fn ancestors(folder: &Path) -> Vec<crate::path::PathBuf> {
+    let mut holders = Vec::new();
+    let mut made = folder;
+    // A relative path ends in an empty parent, which names no folder.
+    while let Some(holder) = made
+        .parent()
+        .filter(|holder| !holder.to_string_lossy().is_empty())
     {
-        return Ok(true);
+        holders.push(holder.to_path_buf());
+        made = holder;
     }
-    let entries = match fs.read_dir(folder) {
+    holders
+}
+
+/// The folders that gain a new entry when `folder` is made on `fs`: each one
+/// above it up to the first that exists already, which holds the first new
+/// one. A folder that exists makes nothing new.
+fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<crate::path::PathBuf>> {
+    let mut holders = Vec::new();
+    if fs.exists(folder)? {
+        return Ok(holders);
+    }
+    let mut made = folder;
+    while let Some(holder) = made.parent() {
+        holders.push(holder.to_path_buf());
+        if fs.exists(holder)? {
+            break;
+        }
+        made = holder;
+    }
+    Ok(holders)
+}
+
+/// Returns `true` if any tables folder of the tree (the primary one and every
+/// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
+/// holds a file, or the tree folder holds a snapshot other than `v0` or an
+/// edit log holding an edit.
+///
+/// Used by [`Tree::open`], for a directory with no `current` pointer, to
+/// distinguish a fresh directory or a creation that never completed (empty
+/// folders, the first snapshot the pointer never named: nothing of value,
+/// safe to `create_new` over) from a lost pointer, a half-written checkpoint
+/// or another interrupted sealing (files already placed: must error rather
+/// than silently overwrite).
+///
+/// A missing folder is treated as "no state": `create_new` is what creates
+/// the directories in the first place, so callers may invoke `Tree::open`
+/// against a path that does not exist yet.
+fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
+    let blobs = (
+        config.path.join(crate::file::BLOBS_FOLDER),
+        Arc::clone(&config.fs),
+    );
+    // Files only: a folder there holds no table itself. A level route inside
+    // the primary tables folder is one, empty after a creation cut short or
+    // when made in advance, and is listed here as a tables folder of its own.
+    for (folder, fs) in config.all_tables_folders().into_iter().chain([blobs]) {
+        match fs.read_dir(&folder) {
+            Ok(entries) if entries.iter().any(|entry| !entry.is_dir) => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // A creation writes `v0`, of an empty version, and its empty log before
+    // the pointer: alone they hold nothing. A later snapshot was written by a
+    // tree that lived, or put there to refuse an open (a store
+    // mid-conversion), and an edit in any log is a tree's history (a clear,
+    // the retention floor it raised) even when no table is left.
+    let entries = match config.fs.read_dir(&config.path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
-    for entry in entries {
-        let name = &entry.file_name;
-        if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|c| c.is_ascii_digit())
-        {
+    // A name is judged by its shape, digits after the prefix, not by whether
+    // the digits parse: `v00` or an id past the counter's range was not
+    // written by a creation either, and is refused rather than created over.
+    let digits = |rest: Option<&str>| {
+        rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    };
+    for entry in &entries {
+        let name = entry.file_name.as_str();
+        if name != "v0" && digits(name.strip_prefix('v')) {
+            return Ok(true);
+        }
+        if digits(name.strip_prefix("edits-")) && config.fs.metadata(&entry.path)?.len > 0 {
             return Ok(true);
         }
     }

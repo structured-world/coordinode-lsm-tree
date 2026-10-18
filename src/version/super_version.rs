@@ -328,12 +328,18 @@ impl SuperVersions {
     /// The seed version's seqno is the recovered
     /// [`retention_floor`](Version::retention_floor), below which the data a
     /// snapshot saw may be gone (`0` on a fresh create).
+    ///
+    /// `log_entry_synced` says the snapshot's log is known to have a durable
+    /// name: a fresh create's, made by the persist under its directory sync.
+    /// A log found at open is not known to: a process that died before its
+    /// directory sync leaves a name the page cache still shows.
     pub fn new(
         version: Version,
         comparator: &SharedComparator,
         sync_mode: SyncMode,
         snapshot_id: VersionId,
         log_rotate_bytes: u64,
+        log_entry_synced: bool,
     ) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
@@ -353,7 +359,7 @@ impl SuperVersions {
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
-            log_entry_synced: false,
+            log_entry_synced,
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
@@ -560,7 +566,7 @@ impl SuperVersions {
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         sync_mode: SyncMode,
     ) -> crate::Result<()> {
-        let log_path = tree_path.join(format!("edits-{}", self.snapshot_id));
+        let log_path = edit_log::log_path(tree_path, self.snapshot_id);
 
         // Cached log size when available; measure once otherwise (fresh open
         // with a recovered log, or after an append error of unknown extent).
@@ -620,10 +626,10 @@ impl SuperVersions {
             sync_mode,
         )?;
         self.snapshot_id = next.id();
-        // The new generation starts with an empty log (created lazily on the
-        // first append).
+        // The new generation starts with the empty log the persist created,
+        // its name durable under the persist's directory sync.
         self.log_bytes = Some(0);
-        self.log_entry_synced = false;
+        self.log_entry_synced = true;
 
         // The durable commit point of a rotation is the CURRENT repoint inside
         // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting

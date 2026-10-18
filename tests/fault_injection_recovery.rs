@@ -144,21 +144,27 @@ fn blob_files_of_an_acknowledged_write_survive_a_crash() -> lsm_tree::Result<()>
 #[test]
 fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> {
     let crash = CrashFs::new(MemFs::new());
-    let fault = FaultFs::new(crash.clone());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
     let injector = fault.injector();
     let db = "/db";
-
-    {
-        let tree = lsm_tree::Config::new(
+    let open = || {
+        lsm_tree::Config::new(
             db,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_shared_fs(Arc::new(fault))
-        .open()?;
+        .with_shared_fs(fault.clone())
+        .open()
+    };
 
-        // A flush syncs its table's directory, then, on the first edit of a
-        // generation, the log's: fail the second.
+    {
+        // A log found at open is not trusted to have a durable name (a
+        // created tree's is, made under its snapshot's directory sync).
+        drop(open()?);
+        let tree = open()?;
+
+        // A flush syncs its table's directory, then, on the first edit after
+        // the open, the log's: fail the second.
         injector.arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
                 .skip(1)
@@ -189,8 +195,9 @@ fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> 
     Ok(())
 }
 
-/// Exhaustive crash-point sweep: for every durability barrier (`sync_all` on a
-/// table, `sync_data` on the manifest edit log) of a flush workload, fail that one barrier,
+/// Exhaustive crash-point sweep: for every durability barrier (`sync_data` on a
+/// table and on the manifest edit log, `sync_all` wherever one is still issued)
+/// of a flush workload, fail that one barrier,
 /// simulate a power loss, reopen, and assert recovery yields a *consistent
 /// prefix* of the inserted keys.
 ///

@@ -354,7 +354,7 @@ impl BlobTree {
         config: Config,
         #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
     ) -> crate::Result<Self> {
-        use crate::file::{BLOBS_FOLDER, fsync_directory};
+        use crate::file::BLOBS_FOLDER;
 
         let index = crate::Tree::open(
             config,
@@ -362,18 +362,27 @@ impl BlobTree {
             lock,
         )?;
 
+        // The folder's name is an entry of the tree folder, and a blob file in
+        // it must not be named by the manifest before that entry is durable.
+        // A new tree made the folder before its first snapshot, whose
+        // directory sync covered the name, and an opened one syncs the tree
+        // folder at its first edit append (the log found at open is not
+        // trusted to have a durable name), which is the only way a blob file
+        // comes to be named. A name found here may not be durable yet (a
+        // process that died before its sync leaves one the page cache still
+        // shows), and that first append covers it. A folder this open makes,
+        // though, may come after the first append: the open itself installs
+        // an edit when it registers a dictionary. Its name is synced here.
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
+        let made = !(*index.config.fs).exists(&blobs_folder)?;
         (*index.config.fs).create_dir_all(&blobs_folder)?;
-        fsync_directory(&blobs_folder, &*index.config.fs, index.config.sync_mode)?;
-        // The folder's own name is an entry of the tree folder, durable only
-        // once that is synced: without it, a power loss after the first
-        // acknowledged write could lose the folder, and every blob file in it,
-        // while the manifest still names them.
-        fsync_directory(
-            &index.config.path,
-            &*index.config.fs,
-            index.config.sync_mode,
-        )?;
+        if made {
+            crate::file::fsync_directory(
+                &index.config.path,
+                &*index.config.fs,
+                index.config.sync_mode,
+            )?;
+        }
 
         let blob_file_id_to_continue_with = index
             .current_version()

@@ -39,8 +39,9 @@
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
 //! even when its content was synced. The directory synced is matched by what
 //! the backend reports as the same directory, so any spelling of it covers
-//! its entries. Removed entries are not brought back, and directories
-//! themselves are not rolled back. Opens, operations that make or remove
+//! its entries. Removed entries are not brought back, except a durable file
+//! removed behind a [`SyncMode::Barrier`] sync a power loss loses (see
+//! below), and directories themselves are not rolled back. Opens, operations that make or remove
 //! entries, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
@@ -106,6 +107,22 @@ enum Ordered {
     Image(PathBuf, Vec<u8>),
     /// The entries a directory sync covered.
     Entries(Vec<PathBuf>),
+    /// A removal issued behind an ordered sync: a barrier keeps it behind
+    /// that sync, so a power loss that loses the sync loses the removal too
+    /// and leaves the file as the syncs before it made it. The flag says the
+    /// name's entry was not durable yet when it was removed.
+    Removed(PathBuf, bool),
+    /// A rename issued behind an ordered sync, kept or lost whole: kept, the
+    /// destination's old file and the source's name are gone and the
+    /// destination holds `bytes`; lost, both names are as the syncs before it
+    /// left them. The flags say each name's entry was not durable yet.
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+        from_pending: bool,
+        to_pending: bool,
+        bytes: Option<Vec<u8>>,
+    },
 }
 
 impl CrashState {
@@ -113,7 +130,40 @@ impl CrashState {
     /// issued, and drops the rest.
     fn settle(&mut self, count: usize) {
         let ordered = core::mem::take(&mut self.ordered);
-        for sync in ordered.into_iter().take(count) {
+        // A kept rename made its destination's entry with it: the entry is
+        // durable from there, unless a later KEPT step takes the name again
+        // and leaves whatever holds it then to its own sync. A lost step
+        // changes nothing on disk, so the name keeps the renamed file.
+        let renamed_durable: Vec<PathBuf> = ordered
+            .iter()
+            .enumerate()
+            .take(count)
+            .filter_map(|(at, sync)| match sync {
+                Ordered::Renamed { to, .. } => Some((at, to)),
+                _ => None,
+            })
+            .filter(|&(at, to)| {
+                !ordered
+                    .iter()
+                    .take(count)
+                    .skip(at + 1)
+                    .any(|later| match later {
+                        Ordered::Removed(name, _) => name == to,
+                        Ordered::Renamed {
+                            from: source,
+                            to: target,
+                            ..
+                        } => source == to || target == to,
+                        _ => false,
+                    })
+            })
+            .map(|(_, to)| to.clone())
+            .collect();
+        for to in &renamed_durable {
+            self.pending_entries.remove(to);
+        }
+        let mut ordered = ordered.into_iter();
+        for sync in ordered.by_ref().take(count) {
             match sync {
                 Ordered::Image(path, bytes) => self.set_durable(&path, bytes),
                 Ordered::Entries(entries) => {
@@ -121,6 +171,48 @@ impl CrashState {
                         self.pending_entries.remove(entry);
                     }
                 }
+                // Kept, in its place: the file is gone from here on, and an
+                // image of a file made under its name later still lands.
+                Ordered::Removed(path, _) => {
+                    self.durable.remove(&path);
+                }
+                Ordered::Renamed {
+                    from, to, bytes, ..
+                } => {
+                    self.durable.remove(&to);
+                    self.durable.remove(&from);
+                    if let Some(bytes) = bytes {
+                        self.set_durable(&to, bytes);
+                    }
+                }
+            }
+        }
+        // A removal behind a lost sync is lost with it, and so is everything
+        // made under that name after it: no sync that could make the new
+        // entry durable comes before the lost one. The file stays as the kept
+        // syncs left it; an entry made only after the removal is dropped,
+        // one that was pending before it stays pending. A lost rename leaves
+        // both of its names so.
+        for sync in ordered {
+            match sync {
+                Ordered::Removed(path, false) => {
+                    self.pending_entries.remove(&path);
+                }
+                Ordered::Renamed {
+                    from,
+                    to,
+                    from_pending,
+                    to_pending,
+                    ..
+                } => {
+                    if !from_pending {
+                        self.pending_entries.remove(&from);
+                    }
+                    if !to_pending {
+                        self.pending_entries.remove(&to);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -141,6 +233,7 @@ impl CrashState {
                 entries.retain(|entry| entry != path);
                 true
             }
+            Ordered::Removed(..) | Ordered::Renamed { .. } => true,
         });
     }
 
@@ -703,9 +796,31 @@ impl Fs for CrashFs {
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let _namespace = self.namespace.lock();
+        // A removal that may be queued (see below) can be lost, and then the
+        // file is back as it was: a file this run never touched has its bytes
+        // captured now, before they are gone. A symlink names no bytes of
+        // its own.
+        let queued = !self.state.lock().ordered.is_empty();
+        if queued {
+            let name = self.name_after(path);
+            if matches!(self.inner.read_link(&name), Ok(None)) {
+                self.capture_first_touch(&name)?;
+            }
+        }
         self.inner.remove_file(path)?;
         let name = self.name_after(path);
-        self.state.lock().forget_name(&name);
+        let mut state = self.state.lock();
+        // Behind an ordered sync, the removal is ordered too: a power loss
+        // that keeps only a prefix of the syncs may lose it, so what the file
+        // went through stays queued, in order, for the crash to replay. A
+        // name with hard links keeps the immediate removal.
+        if !state.ordered.is_empty() && state.names_of(&name).len() == 1 {
+            let was_pending = state.pending_entries.contains(&name);
+            state.touched.insert(name.clone());
+            state.ordered.push(Ordered::Removed(name, was_pending));
+        } else {
+            state.forget_name(&name);
+        }
         Ok(())
     }
 
@@ -733,7 +848,8 @@ impl Fs for CrashFs {
         state.touched.retain(|k| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
         state.ordered.retain_mut(|sync| match sync {
-            Ordered::Image(name, _) => !name.starts_with(path),
+            Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
+            Ordered::Renamed { from, to, .. } => !from.starts_with(path) && !to.starts_with(path),
             Ordered::Entries(entries) => {
                 entries.retain(|entry| !entry.starts_with(path));
                 true
@@ -764,6 +880,17 @@ impl Fs for CrashFs {
         // simulator, never below it.
         let spelled = || (self.listed_as_spelled(from), self.listed_as_spelled(to));
         let before = matches!(self.inner.same_file(from, to), Ok(true)).then(spelled);
+        // A rename that may be queued (see below) can be lost, and then both
+        // names are back as they were: files this run never touched have
+        // their bytes captured now, before the rename moves or replaces them.
+        // A symlink names no bytes of its own.
+        if from != to && !self.state.lock().ordered.is_empty() {
+            for name in [self.name_after(from), self.name_after(to)] {
+                if matches!(self.inner.read_link(&name), Ok(None)) {
+                    self.capture_first_touch(&name)?;
+                }
+            }
+        }
         self.inner.rename(from, to)?;
         // Without a file identity to go on (a backend that has none, a
         // dangling symlink), the source still being there, the link itself
@@ -783,6 +910,68 @@ impl Fs for CrashFs {
         let (from, to) = (self.name_after(from), self.name_after(to));
         let (from, to) = (from.as_path(), to.as_path());
         let mut state = self.state.lock();
+        // Behind an ordered sync, the rename is ordered too, as a removal is,
+        // and as one step: a power loss that keeps only a prefix of the syncs
+        // either keeps it whole or loses it, and with it everything after,
+        // leaving both names as the kept syncs made them. Kept, the
+        // destination's old file and the source's name are gone and the
+        // destination holds the bytes the source had durable or queued by
+        // then. Names with hard links keep the immediate rename.
+        if !state.ordered.is_empty()
+            && state.names_of(from).len() == 1
+            && state.names_of(to).len() <= 1
+        {
+            // The last queued step that took the source's name from the file
+            // it held (a removal, a rename away or onto it): what the name
+            // had before belongs to that file. The file renamed now has only
+            // what that step and the ones after gave it.
+            let since = state.ordered.iter().rposition(|sync| match sync {
+                Ordered::Removed(name, _) => name.as_path() == from,
+                Ordered::Renamed {
+                    from: source,
+                    to: target,
+                    ..
+                } => source.as_path() == from || target.as_path() == from,
+                _ => false,
+            });
+            let queued = state
+                .ordered
+                .iter()
+                .skip(since.unwrap_or(0))
+                .rev()
+                .find_map(|sync| match sync {
+                    Ordered::Image(name, bytes) if name.as_path() == from => Some(bytes.clone()),
+                    Ordered::Renamed {
+                        to: target,
+                        bytes: Some(bytes),
+                        ..
+                    } if target.as_path() == from => Some(bytes.clone()),
+                    _ => None,
+                });
+            let bytes = queued.or_else(|| {
+                since
+                    .is_none()
+                    .then(|| state.durable.get(from).cloned())
+                    .flatten()
+            });
+            let to_pending = state.pending_entries.contains(to);
+            let from_pending = state.pending_entries.contains(from);
+            state.ordered.push(Ordered::Renamed {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                from_pending,
+                to_pending,
+                bytes,
+            });
+            state.touched.insert(from.to_path_buf());
+            state.touched.insert(to.to_path_buf());
+            // The destination's entry is new until its directory is synced.
+            state.pending_entries.insert(to.to_path_buf());
+            if let Some(group) = state.link_group.remove(from) {
+                state.link_group.insert(to.to_path_buf(), group);
+            }
+            return Ok(());
+        }
         // The source's state moves with its file, under the new name.
         let from_durable = state.durable.remove(from);
         let from_touched = state.touched.remove(from);
@@ -800,7 +989,7 @@ impl Fs for CrashFs {
         for sync in &mut state.ordered {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
-                Ordered::Image(..) => {}
+                Ordered::Image(..) | Ordered::Removed(..) | Ordered::Renamed { .. } => {}
                 Ordered::Entries(entries) => entries.retain(|entry| entry != from),
             }
         }

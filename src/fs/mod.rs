@@ -68,7 +68,7 @@ pub use crash_fs::CrashFs;
 #[cfg(all(test, feature = "std"))]
 pub(crate) use fault_fs::ReadHook;
 #[cfg(feature = "std")]
-pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, SyncKind};
 pub use mem_fs::MemFs;
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;

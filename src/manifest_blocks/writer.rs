@@ -367,7 +367,8 @@ impl ManifestArchiveWriter {
             }
         }
 
-        self.file.sync_all_with(self.sync_mode)?;
+        // Data and size are all a read of the snapshot needs, so `sync_data`.
+        self.file.sync_data_with(self.sync_mode)?;
         Ok(payload)
     }
 
