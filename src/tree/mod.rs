@@ -4707,7 +4707,7 @@ impl Tree {
             // sealing). Silently calling `create_new` in that case
             // would overwrite the partial state with an empty tree,
             // turning a recoverable failure into data loss.
-            if has_existing_version_state(&config.path, &*config.fs)? {
+            if has_existing_version_state(&config)? {
                 // Return Error::Io(InvalidData, ...) rather than
                 // Error::Unrecoverable so callers that don't read
                 // logs still get a programmatic surface with the
@@ -4719,8 +4719,8 @@ impl Tree {
                 // to the timestamp).
                 let msg = format!(
                     "Tree::open: refusing to recover {} — `current` pointer is missing \
-                     but the directory still holds version artifacts (tables/, blobs/, \
-                     or vN). This is the on-disk signature of a half-written checkpoint \
+                     but the directory still holds version artifacts (files in a \
+                     tables folder or in blobs/). This is the on-disk signature of a half-written checkpoint \
                      or interrupted sealing. Remove the partial directory and retry the \
                      checkpoint, or restore `current` from a backup before reopening.",
                     config.path.display(),
@@ -6626,37 +6626,31 @@ impl Tree {
     }
 }
 
-/// Returns `true` if the directory contains version-related artifacts
-/// (a file in `tables/` or `blobs/`, or any `vN` manifest file).
+/// Returns `true` if any tables folder of the tree (the primary one and every
+/// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
+/// holds an entry.
 ///
-/// Used by [`Tree::open`] to distinguish a genuinely fresh directory
-/// (safe to `create_new`) from a half-written checkpoint or other
-/// interrupted sealing (must error rather than silently overwrite). Empty
-/// folders hold nothing to lose: a creation a power loss cut short leaves
-/// them, and creating the tree over them again is what finishes it.
+/// Used by [`Tree::open`], for a directory with no `current` pointer, to
+/// distinguish a fresh directory or a creation that never completed (empty
+/// folders, a snapshot the pointer never named: nothing of value, safe to
+/// `create_new` over) from a lost pointer, a half-written checkpoint or
+/// another interrupted sealing (files already placed: must error rather than
+/// silently overwrite).
 ///
-/// A missing parent directory is treated as "no state" — `create_new`
-/// is what creates the directory in the first place, so callers may
-/// invoke `Tree::open` against a path that does not exist yet.
-fn has_existing_version_state(folder: &Path, fs: &dyn Fs) -> crate::Result<bool> {
-    for data in [crate::file::TABLES_FOLDER, crate::file::BLOBS_FOLDER] {
-        match fs.read_dir(&folder.join(data)) {
+/// A missing folder is treated as "no state": `create_new` is what creates
+/// the directories in the first place, so callers may invoke `Tree::open`
+/// against a path that does not exist yet.
+fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
+    let blobs = (
+        config.path.join(crate::file::BLOBS_FOLDER),
+        Arc::clone(&config.fs),
+    );
+    for (folder, fs) in config.all_tables_folders().into_iter().chain([blobs]) {
+        match fs.read_dir(&folder) {
             Ok(entries) if !entries.is_empty() => return Ok(true),
             Ok(_) => {}
             Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
-        }
-    }
-    let entries = match fs.read_dir(folder) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in entries {
-        let name = &entry.file_name;
-        if name.starts_with('v') && name.len() > 1 && name[1..].bytes().all(|c| c.is_ascii_digit())
-        {
-            return Ok(true);
         }
     }
     Ok(false)
