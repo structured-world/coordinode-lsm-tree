@@ -563,6 +563,13 @@ impl Fs for DescriptorFs {
     }
 
     fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        // The whole batch is validated before the first read, as a backend
+        // reading by descriptor must.
+        for req in reqs.iter() {
+            req.offset
+                .checked_add(req.buf.filled() as u64)
+                .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "offset overflows"))?;
+        }
         reqs.iter_mut().try_for_each(|req| self.read_one(req))
     }
 
@@ -919,7 +926,8 @@ fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
     );
 
     // A rule armed between the submit and the wait applies. The spent rule
-    // goes first: an exhausted rule still claims the reads it matches.
+    // is cleared first, since an exhausted rule still claims the reads it
+    // matches: only the rule armed below is there when the wait runs.
     fs.injector().clear();
     let mut queue = fs.read_queue();
     queue.submit(read_of(2));

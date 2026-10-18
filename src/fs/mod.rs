@@ -1152,6 +1152,11 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// The default, `false`, matches the default batched read, which reads
     /// every request through `read_at`. `io_uring` answers `true`.
+    ///
+    /// A backend answering `true` validates every descriptor-backed request
+    /// of a batch (its `offset` plus the bytes already filled fits a `u64`)
+    /// before it issues any descriptor read: a wrapper screens the batch as
+    /// a whole, and a batch it would refuse must read nothing.
     fn reads_by_descriptor(&self) -> bool {
         false
     }
