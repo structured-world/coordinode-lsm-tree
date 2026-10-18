@@ -6776,20 +6776,18 @@ fn publish_repaired_manifest(
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
         Ok(()) => published_blob_replacements.disarm(),
-        // The persist renamed the snapshot into place and could not make its
-        // withdrawal durable: a power loss may bring the name back, so its
-        // absence proves nothing.
-        Err(e @ crate::Error::InstallOutcomeUnknown(_)) => {
-            published_blob_replacements.disarm();
-            return Err(e);
-        }
         Err(e) => match probe_install(&*config.fs, &config.path, version_id) {
-            InstallProbe::NotInstalled => return Err(e),
+            // When the persist renamed the snapshot into place and could not
+            // make its withdrawal durable, a power loss may bring the name
+            // back: its absence proves nothing then.
+            InstallProbe::NotInstalled if !matches!(e, crate::Error::InstallOutcomeUnknown(_)) => {
+                return Err(e);
+            }
             InstallProbe::Installed => {
                 published_blob_replacements.disarm();
                 post_commit_error = Some(e);
             }
-            InstallProbe::Inconclusive => {
+            InstallProbe::NotInstalled | InstallProbe::Inconclusive => {
                 published_blob_replacements.disarm();
                 return Err(e);
             }
