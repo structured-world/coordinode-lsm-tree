@@ -234,11 +234,7 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
 fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
     let base = PathBuf::from("/census/rotating");
     let fs = Arc::new(FaultFs::new(MemFs::new()));
-    let census = Census {
-        base: base.clone(),
-        route: None,
-        injector: fs.injector(),
-    };
+    let census = Census::new(&base, None, fs.injector());
     let tree = Config::new(
         &base,
         SequenceNumberCounter::default(),
