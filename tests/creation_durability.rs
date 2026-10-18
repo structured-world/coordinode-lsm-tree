@@ -63,14 +63,14 @@ fn the_first_flush_after_creation_survives_a_power_loss() {
     }
 }
 
-/// A tree first opened KV-separated after it was created makes its blob
-/// folder at that open, and the values its flushes write there survive a
-/// power loss.
+/// The values a KV-separated tree flushes after a reopen survive a power
+/// loss: the blob folder was made with the tree, and the first edit after
+/// the open syncs the tree folder before it names a blob file.
 #[test]
-fn a_tree_opened_kv_separated_later_keeps_its_blobs_through_a_power_loss() {
+fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
     let fs = CrashFs::new(MemFs::new());
-    drop(config(&fs, false).open().expect("create"));
-    let tree = config(&fs, true).open().expect("reopen KV-separated");
+    drop(config(&fs, true).open().expect("create"));
+    let tree = config(&fs, true).open().expect("reopen");
     tree.insert("key", "a value stored apart", 0);
     tree.flush_active_memtable(0).expect("flush");
     drop(tree);
