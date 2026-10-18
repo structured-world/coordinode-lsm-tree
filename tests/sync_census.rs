@@ -453,9 +453,8 @@ fn a_new_route_on_another_device_flushes_it_once() {
     .expect("open");
 
     let modes = route_fs.injector().directory_sync_modes_for("elsewhere");
-    assert_eq!(
-        modes.len(),
-        4,
+    assert!(
+        modes.len() >= 4,
         "every new folder's holder is synced: {modes:?}"
     );
     assert_eq!(

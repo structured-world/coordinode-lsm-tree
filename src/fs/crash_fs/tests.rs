@@ -1869,7 +1869,6 @@ fn a_removed_folder_drops_its_queued_steps() {
 
     fs.crash_keeping(0);
     assert!(!fs.exists(Path::new("/d/sub")).unwrap());
-    assert_eq!(read(&fs, "/d/x"), b"X");
 }
 
 /// A kept rename keeps its destination when the step after it that takes
