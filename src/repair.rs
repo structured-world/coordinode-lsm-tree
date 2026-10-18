@@ -4177,49 +4177,33 @@ impl<'a> PublishedBlobReplacements<'a> {
     }
 }
 
-/// What the on-disk `CURRENT` pointer says about a failed `persist_version`:
-/// did its atomic pointer switch happen before the error?
-enum CurrentProbe {
-    /// The pointer names the rebuilt version: the switch happened.
-    Switched,
-    /// The pointer is ABSENT (`NotFound`) or names another version: the
-    /// switch did not happen. Absence is conclusive — a successful rename
-    /// leaves the pointer in place, so `NotFound` means the rename never
-    /// ran; and an OLDER tree's surviving pointer names a lower version id
-    /// (the rebuild allocates `max(v*) + 1`), so it never false-positives.
-    NotSwitched,
-    /// The pointer cannot be read (a transient or permission failure on its
-    /// open or read, or a short pointer): NO conclusion. The caller must
-    /// fail SAFE — treating this as "not switched" would delete files a
-    /// possibly-published manifest references.
+/// What the disk says about a failed `persist_version`: was the rebuilt
+/// snapshot installed (its edit log made) before the error?
+enum InstallProbe {
+    /// The rebuilt snapshot's log exists: it is, or may become, installed.
+    Installed,
+    /// The log is ABSENT (`NotFound`): the install did not happen. Absence is
+    /// conclusive — the persist makes the log only after the snapshot's
+    /// bytes, and withdraws it on a later failure where it can.
+    NotInstalled,
+    /// The log's existence cannot be told (a transient or permission failure
+    /// of the probe): NO conclusion. The caller must fail SAFE — treating
+    /// this as "not switched" would delete files a possibly-published
+    /// manifest references.
     Inconclusive,
 }
 
 /// The post-failure probe deciding if a failed `persist_version` died before
-/// or after its atomic pointer switch.
-fn probe_current(
+/// or after it installed the snapshot.
+fn probe_install(
     fs: &dyn crate::fs::Fs,
     folder: &std::path::Path,
     version_id: u64,
-) -> CurrentProbe {
-    let file = match fs.open(
-        &folder.join(crate::file::CURRENT_VERSION_FILE),
-        &crate::fs::FsOpenOptions::new().read(true),
-    ) {
-        Ok(file) => file,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return CurrentProbe::NotSwitched,
-        Err(_) => return CurrentProbe::Inconclusive,
-    };
-    let Ok(bytes) = crate::file::read_exact(&*file, 0, 8) else {
-        return CurrentProbe::Inconclusive;
-    };
-    let Ok(raw) = <[u8; 8]>::try_from(bytes.as_ref()) else {
-        return CurrentProbe::Inconclusive;
-    };
-    if u64::from_le_bytes(raw) == version_id {
-        CurrentProbe::Switched
-    } else {
-        CurrentProbe::NotSwitched
+) -> InstallProbe {
+    match fs.exists(&crate::version::edit_log::log_path(folder, version_id)) {
+        Ok(true) => InstallProbe::Installed,
+        Ok(false) => InstallProbe::NotInstalled,
+        Err(_) => InstallProbe::Inconclusive,
     }
 }
 
@@ -6761,43 +6745,43 @@ fn publish_repaired_manifest(
         config.sync_mode,
     );
     // The guard stays ARMED until the commit is decided: every fallible
-    // `persist_version` step before its atomic `CURRENT` switch (manifest
-    // create / encode / finish / directory sync, and the switch's own
-    // rename) leaves the replacements unreferenced garbage a retry would
-    // re-derive — keeping them would stack another fresh-id copy per failed
-    // attempt, walking recovery toward ENOSPC under exactly the tight-space
-    // conditions it targets. The ONE fallible step after the switch is the
-    // pointer's directory sync, so on failure the pointer on disk decides
-    // which world this is: a `CURRENT` naming the rebuilt version means the
-    // manifest is published and the replacements are the files it
-    // references. A probe that cannot READ the pointer proves nothing, and
-    // fail-safe is to PRESERVE: the worst a preserved orphan costs is disk
-    // space a later successful repair's reference filtering reclaims, while
-    // a wrong deletion breaks a published manifest permanently.
-    // A failure after a PROVEN switch must still CARRY the report: the
-    // pointer on disk already names the rebuilt manifest, so the retry
-    // opens it without a repair and answers with no report at all — losing
-    // the replay obligation exactly like a cleanup failure would. Recording
-    // the error routes it through the same report-carrying exit. A proven
-    // NOT-SWITCHED failure returns bare (nothing was published, the guard
-    // stays armed, the retry's own repair produces a fresh report). An
-    // INCONCLUSIVE probe also returns bare: without proof of the switch the
-    // report may describe a repair that never committed, and a consumer
-    // replaying its obligation against the still-live OLD generation could
-    // duplicate merge operands — while the blob replacements are preserved
-    // (the probe's own fail-safe: their worst cost is disk space) and no
-    // post-commit cleanup runs, so nothing of a possibly-live generation
-    // is touched.
+    // `persist_version` step before it installs the snapshot (manifest
+    // create / encode / finish, and the log's creation) leaves the
+    // replacements unreferenced garbage a retry would re-derive — keeping
+    // them would stack another fresh-id copy per failed attempt, walking
+    // recovery toward ENOSPC under exactly the tight-space conditions it
+    // targets. The ONE fallible step after the install is the directory sync
+    // (on whose failure the persist withdraws the log where it can), so on
+    // failure the log on disk decides which world this is: a log of the
+    // rebuilt version means the manifest is or may become published and the
+    // replacements are the files it references. A probe that cannot tell
+    // proves nothing, and fail-safe is to PRESERVE: the worst a preserved
+    // orphan costs is disk space a later successful repair's reference
+    // filtering reclaims, while a wrong deletion breaks a published manifest
+    // permanently.
+    // A failure after a PROVEN install must still CARRY the report: the
+    // rebuilt snapshot is installed on disk, so the retry opens it without a
+    // repair and answers with no report at all — losing the replay
+    // obligation exactly like a cleanup failure would. Recording the error
+    // routes it through the same report-carrying exit. A proven NOT-INSTALLED
+    // failure returns bare (nothing was published, the guard stays armed,
+    // the retry's own repair produces a fresh report). An INCONCLUSIVE probe
+    // also returns bare: without proof of the install the report may
+    // describe a repair that never committed, and a consumer replaying its
+    // obligation against the still-live OLD generation could duplicate merge
+    // operands — while the blob replacements are preserved (the probe's own
+    // fail-safe: their worst cost is disk space) and no post-commit cleanup
+    // runs, so nothing of a possibly-live generation is touched.
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
         Ok(()) => published_blob_replacements.disarm(),
-        Err(e) => match probe_current(&*config.fs, &config.path, version_id) {
-            CurrentProbe::NotSwitched => return Err(e),
-            CurrentProbe::Switched => {
+        Err(e) => match probe_install(&*config.fs, &config.path, version_id) {
+            InstallProbe::NotInstalled => return Err(e),
+            InstallProbe::Installed => {
                 published_blob_replacements.disarm();
                 post_commit_error = Some(e);
             }
-            CurrentProbe::Inconclusive => {
+            InstallProbe::Inconclusive => {
                 published_blob_replacements.disarm();
                 return Err(e);
             }

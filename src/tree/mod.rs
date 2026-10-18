@@ -4649,18 +4649,14 @@ impl Tree {
             return Err(crate::Error::InvalidVersion(1));
         }
 
-        // Decide between recovery and fresh creation atomically by attempting
-        // to read the CURRENT version file. This avoids a TOCTOU race that
-        // would occur if we probed with exists() first.
-        let recovering = match crate::version::recovery::get_current_version(
+        // Recover when the tree holds an installed snapshot, verified here;
+        // create one otherwise.
+        let recovering = crate::version::recovery::installed_snapshot(
             &config.path,
             &*config.fs,
             config.encryption.clone(),
-        ) {
-            Ok(_) => true,
-            Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e),
-        };
+        )?
+        .is_some();
 
         // Load the tree's own dictionaries before anything opens a table: a
         // table resolves the dictionary id it recorded against this set, so an
@@ -4704,12 +4700,13 @@ impl Tree {
                 directory_lock,
             )
         } else {
-            // Missing CURRENT MUST coincide with a directory that
-            // has no version artifacts; otherwise we are looking at
-            // a half-written checkpoint (or other interrupted
-            // sealing). Silently calling `create_new` in that case
-            // would overwrite the partial state with an empty tree,
-            // turning a recoverable failure into data loss.
+            // No installed snapshot MUST coincide with a directory whose
+            // tables and blob folders hold nothing; otherwise we are looking
+            // at a half-written checkpoint (or other interrupted sealing),
+            // and calling `create_new` would overwrite the partial state with
+            // an empty tree, turning a recoverable failure into data loss.
+            // What a creation that never completed leaves (its empty folders,
+            // a snapshot without its log) holds no data and is created over.
             if has_existing_version_state(&config)? {
                 // Return Error::Io(InvalidData, ...) rather than
                 // Error::Unrecoverable so callers that don't read
@@ -4721,12 +4718,13 @@ impl Tree {
                 // chain; the log line records the diagnosis next
                 // to the timestamp).
                 let msg = format!(
-                    "Tree::open: refusing to recover {} — `current` pointer is missing \
-                     but the directory still holds version artifacts (files in a \
-                     tables folder or in blobs/, a vN past v0, or an edits-N holding \
-                     edits). This is the on-disk signature of a half-written checkpoint \
-                     or interrupted sealing. Remove the partial directory and retry the \
-                     checkpoint, or restore `current` from a backup before reopening.",
+                    "Tree::open: refusing to recover {} — it holds no installed manifest \
+                     snapshot (a v<N> with its edits-<N>) but still holds a tree's state \
+                     (files in its tables/ or blobs/ folder, or an edits-N holding \
+                     edits). This is the on-disk signature of a half-written \
+                     checkpoint or interrupted sealing. Remove the partial directory and \
+                     retry the checkpoint, or restore the snapshot from a backup before \
+                     reopening.",
                     config.path.display(),
                 );
                 log::error!("{msg}");
@@ -5410,15 +5408,18 @@ impl Tree {
         // NOTE: the version file is read twice (here for metadata, then inside
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
-        // Version id of the on-disk snapshot CURRENT references. This is the
-        // base the edit log replays on top of; the live version id can be higher
-        // (it has no `v{id}` file of its own). Threaded into the version history
+        // Version id of the installed on-disk snapshot. This is the base the
+        // edit log replays on top of; the live version id can be higher (it
+        // has no `v{id}` file of its own). Threaded into the version history
         // so the next persist appends to / rotates the right snapshot's log.
-        let snapshot_id = crate::version::recovery::get_current_version(
+        let snapshot_id = crate::version::recovery::installed_snapshot(
             &config.path,
             &*config.fs,
             config.encryption.clone(),
-        )?;
+        )?
+        .ok_or(crate::Error::ManifestFooterInvalid(
+            "the tree holds no installed manifest snapshot",
+        ))?;
         {
             let version_id = snapshot_id;
             let manifest_path = config.path.join(format!("v{version_id}"));
@@ -6650,7 +6651,8 @@ impl Tree {
     /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
     /// rotation can leak an old snapshot or its log; this sweeps them on open.
-    /// The live snapshot and log are exactly the generation `CURRENT` points at.
+    /// The live snapshot and log are the installed generation. A `current`
+    /// file, which no V6 code writes or reads, goes too.
     ///
     /// # Behavior change vs pre-Fs-trait code
     ///
@@ -6676,7 +6678,7 @@ impl Tree {
             let name = &dirent.file_name;
             let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
             let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            if is_orphan_snapshot || is_orphan_log {
+            if is_orphan_snapshot || is_orphan_log || name == "current" {
                 log::trace!("Cleanup orphaned manifest file {name}");
                 match fs.remove_file(&dirent.path) {
                     Ok(()) => {}
@@ -6726,15 +6728,14 @@ fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<crate::pat
 
 /// Returns `true` if any tables folder of the tree (the primary one and every
 /// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
-/// holds a file, or the tree folder holds a snapshot other than `v0` or an
-/// edit log holding an edit.
+/// holds a file, or the tree folder holds an edit log holding an edit.
 ///
-/// Used by [`Tree::open`], for a directory with no `current` pointer, to
+/// Used by [`Tree::open`], for a directory with no installed snapshot, to
 /// distinguish a fresh directory or a creation that never completed (empty
-/// folders, the first snapshot the pointer never named: nothing of value,
-/// safe to `create_new` over) from a lost pointer, a half-written checkpoint
-/// or another interrupted sealing (files already placed: must error rather
-/// than silently overwrite).
+/// folders, a snapshot without its log: nothing of value, safe to
+/// `create_new` over) from a lost manifest, a half-written checkpoint or
+/// another interrupted sealing (files already placed: must error rather than
+/// silently overwrite).
 ///
 /// A missing folder is treated as "no state": `create_new` is what creates
 /// the directories in the first place, so callers may invoke `Tree::open`
@@ -6755,25 +6756,23 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
-    // A creation writes `v0`, of an empty version, and its empty log before
-    // the pointer: alone they hold nothing. A later snapshot was written by a
-    // tree that lived, or put there to refuse an open (a store
-    // mid-conversion), and an edit in any log is a tree's history (a clear,
-    // the retention floor it raised) even when no table is left.
+    // An edit in any log is a tree's history (a clear, the retention floor it
+    // raised) even when no table is left and its snapshot is lost.
     let entries = match config.fs.read_dir(&config.path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     // A name is judged by its shape, digits after the prefix, not by whether
-    // the digits parse: `v00` or an id past the counter's range was not
-    // written by a creation either, and is refused rather than created over.
+    // the digits parse: a snapshot whose id is past the counter's range is
+    // no installed one, yet no creation wrote it either, and it is refused
+    // rather than created over.
     let digits = |rest: Option<&str>| {
         rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
     for entry in &entries {
         let name = entry.file_name.as_str();
-        if name != "v0" && digits(name.strip_prefix('v')) {
+        if digits(name.strip_prefix('v')) {
             return Ok(true);
         }
         if digits(name.strip_prefix("edits-")) && config.fs.metadata(&entry.path)?.len > 0 {

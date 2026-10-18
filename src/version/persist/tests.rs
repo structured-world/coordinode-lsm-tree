@@ -1,7 +1,8 @@
-use super::clear_unnamed_snapshot;
-use crate::file::CURRENT_VERSION_FILE;
-use crate::fs::{Fs, FsOpenOptions, MemFs};
+use super::persist_version;
+use crate::fs::{Fs, FsOpenOptions, MemFs, SyncMode};
 use crate::path::Path;
+use crate::version::{Version, recovery::installed_snapshot};
+use alloc::sync::Arc;
 
 /// Writes `bytes` to `path`, creating it.
 fn put(fs: &MemFs, path: &Path, bytes: &[u8]) -> crate::Result<()> {
@@ -10,42 +11,40 @@ fn put(fs: &MemFs, path: &Path, bytes: &[u8]) -> crate::Result<()> {
     Ok(())
 }
 
-/// `CURRENT` naming version `id`: the id, a checksum and its type tag.
-fn current_naming(id: u64) -> Vec<u8> {
-    let mut bytes = id.to_le_bytes().to_vec();
-    bytes.extend_from_slice(&[0; 16]);
-    bytes.push(0);
-    bytes
+fn persist(fs: &MemFs, folder: &Path, id: u64) -> crate::Result<()> {
+    persist_version(
+        folder,
+        &Version::new(id, crate::TreeType::Standard),
+        "default",
+        fs,
+        Arc::default(),
+        None,
+        SyncMode::Normal,
+    )
 }
 
-/// A snapshot `CURRENT` does not name is a failed attempt's leftover and goes,
-/// so the rotation can create it; one `CURRENT` names is the live manifest and
-/// must be refused, never removed.
+/// A snapshot and log of the id being installed, left by a failed attempt
+/// (an empty log), are replaced; a log holding edits is a live generation's
+/// and is refused, never removed.
 #[test]
-fn clear_unnamed_snapshot_removes_only_a_snapshot_current_does_not_name() -> crate::Result<()> {
+fn an_install_replaces_a_failed_attempt_and_refuses_a_live_generation() -> crate::Result<()> {
     let fs = MemFs::new();
     let folder = Path::new("/tree");
     fs.create_dir_all(folder)?;
-    put(&fs, &folder.join(CURRENT_VERSION_FILE), &current_naming(7))?;
 
-    let live = folder.join("v7");
-    put(&fs, &live, b"live")?;
-    let leftover = folder.join("v8");
-    put(&fs, &leftover, b"partial")?;
+    put(&fs, &folder.join("v8"), b"partial")?;
+    put(&fs, &folder.join("edits-8"), b"")?;
+    persist(&fs, folder, 8)?;
+    assert_eq!(installed_snapshot(folder, &fs, None)?, Some(8));
 
+    put(&fs, &folder.join("edits-8"), b"an edit")?;
     assert!(
-        clear_unnamed_snapshot(folder, &live, 7, &fs).is_err(),
-        "the snapshot CURRENT names must be refused"
+        persist(&fs, folder, 8).is_err(),
+        "a snapshot whose log holds edits is live"
     );
-    assert!(fs.metadata(&live).is_ok(), "the live snapshot must stay");
-
-    clear_unnamed_snapshot(folder, &leftover, 8, &fs)?;
     assert!(
-        fs.metadata(&leftover).is_err(),
-        "the leftover must be removed"
+        fs.metadata(&folder.join("v8")).is_ok(),
+        "the live snapshot stays"
     );
-
-    // Nothing there: nothing to do.
-    clear_unnamed_snapshot(folder, &folder.join("v9"), 9, &fs)?;
     Ok(())
 }

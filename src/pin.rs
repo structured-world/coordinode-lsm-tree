@@ -366,7 +366,6 @@ pub fn restore(
     let fs = Arc::clone(&config.fs);
     let root = config.path.clone();
     let sync_mode = config.sync_mode;
-    let runtime = Arc::new(config.initial_runtime_config.clone());
 
     // Exclusive from the first write to the open: no other opener may see the
     // folder before the memtable contents are in.
@@ -380,8 +379,7 @@ pub fn restore(
     let resuming = fs.exists(&marker)?;
     for entry in fs.read_dir(&root)? {
         let name = &entry.file_name;
-        let manifest_file = name == crate::file::CURRENT_VERSION_FILE
-            || name.starts_with("edits-")
+        let manifest_file = name.starts_with("edits-")
             || name
                 .strip_prefix('v')
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()));
@@ -434,16 +432,11 @@ pub fn restore(
     )?;
     file.write_all(manifest)?;
     file.flush()?;
-    FsFile::sync_all_with(&*file, sync_mode)?;
+    FsFile::sync_data_with(&*file, sync_mode)?;
     drop(file);
-    crate::checkpoint::write_current_for_version(
-        &*fs,
-        &root,
-        version_id,
-        runtime,
-        config.encryption.clone(),
-        sync_mode,
-    )?;
+    // Its log installs the snapshot, made only once the snapshot's bytes are
+    // synced, and one directory sync makes both names durable.
+    crate::version::edit_log::create_log(&*fs, &root, version_id)?;
     fsync_directory(&root, &*fs, sync_mode)?;
 
     let seqno = Arc::clone(&config.seqno);

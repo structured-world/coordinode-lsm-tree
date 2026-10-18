@@ -260,12 +260,12 @@ pub struct SuperVersions {
     /// version persist this history performs. Immutable for the tree's life.
     sync_mode: SyncMode,
 
-    /// Version id of the on-disk snapshot the `CURRENT` pointer references. Each
-    /// version upgrade appends a [`VersionEdit`](crate::version::edit::VersionEdit)
-    /// to the log `edits-{snapshot_id}` instead of rewriting the whole manifest;
-    /// once that log grows past [`Self::log_rotate_bytes`] the next upgrade
-    /// rotates — writes a fresh snapshot, repoints `CURRENT`, starts an empty
-    /// log — and this id advances to the new snapshot's.
+    /// Version id of the installed on-disk snapshot. Each version upgrade
+    /// appends a [`VersionEdit`](crate::version::edit::VersionEdit) to the log
+    /// `edits-{snapshot_id}` instead of rewriting the whole manifest; once that
+    /// log grows past [`Self::log_rotate_bytes`] the next upgrade rotates —
+    /// writes and installs a fresh snapshot with an empty log — and this id
+    /// advances to the new snapshot's.
     snapshot_id: VersionId,
 
     /// Edit-log size (bytes) past which the next upgrade rotates instead of
@@ -286,6 +286,14 @@ pub struct SuperVersions {
     /// directory sync failed leaves a log that is not empty yet may still
     /// vanish, and a log found at open may not have been synced before.
     log_entry_synced: bool,
+
+    /// Whether a rotation failed since the last that succeeded. A failed one
+    /// may still have installed its snapshot on disk (its log made before the
+    /// failure can survive), and recovery would then replay that snapshot's
+    /// log, not the current one: an edit appended to the current log would be
+    /// lost. So the next persist rotates too, writing a snapshot of the whole
+    /// state that supersedes either outcome.
+    rotation_pending: bool,
 
     /// Reusable payload-assembly buffer for edit appends — the scratch
     /// `edit_log::append_edit` documents as reusable; allocating it per
@@ -320,7 +328,7 @@ pub struct SuperVersions {
 
 impl SuperVersions {
     /// Builds the in-memory version history. `snapshot_id` is the version id of
-    /// the on-disk snapshot `CURRENT` points at — `version.id()` on a fresh
+    /// the installed on-disk snapshot — `version.id()` on a fresh
     /// create (the first persist writes that snapshot), or the recovered
     /// snapshot id on open (which may be `< version.id()` when edits were
     /// replayed on top of it).
@@ -360,6 +368,7 @@ impl SuperVersions {
             log_rotate_bytes,
             log_bytes: None,
             log_entry_synced,
+            rotation_pending: false,
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
@@ -578,7 +587,7 @@ impl SuperVersions {
             n
         };
 
-        if log_size < self.log_rotate_bytes {
+        if log_size < self.log_rotate_bytes && !self.rotation_pending {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
             match edit_log::append_edit(
@@ -614,9 +623,9 @@ impl SuperVersions {
             }
         }
 
-        // Rotation: write `next` as a fresh full snapshot and repoint CURRENT.
+        // Rotation: write `next` as a fresh full snapshot and install it.
         let old_snapshot = self.snapshot_id;
-        persist_version(
+        if let Err(e) = persist_version(
             tree_path,
             next,
             &self.comparator_name,
@@ -624,21 +633,26 @@ impl SuperVersions {
             runtime,
             encryption,
             sync_mode,
-        )?;
+        ) {
+            self.rotation_pending = true;
+            return Err(e);
+        }
+        self.rotation_pending = false;
         self.snapshot_id = next.id();
         // The new generation starts with the empty log the persist created,
         // its name durable under the persist's directory sync.
         self.log_bytes = Some(0);
         self.log_entry_synced = true;
 
-        // The durable commit point of a rotation is the CURRENT repoint inside
-        // `persist_version` above — past it, the rotation has SUCCEEDED. Deleting
-        // the old generation's log + snapshot is pure garbage collection, so it
-        // is best-effort: a failure here must NOT propagate, or the caller
-        // (`upgrade_version_with_seqno`) would skip `append_version` /
-        // `fetch_max` and keep stale in-memory state while CURRENT already names
-        // the new snapshot — an on-disk/in-memory divergence. A leaked old file
-        // is harmless and swept by `cleanup_orphaned_version` on the next open.
+        // The durable commit point of a rotation is the install inside
+        // `persist_version` above (its log, synced into the directory) — past
+        // it, the rotation has SUCCEEDED. Deleting the old generation's log +
+        // snapshot is pure garbage collection, so it is best-effort: a failure
+        // here must NOT propagate, or the caller (`upgrade_version_with_seqno`)
+        // would skip `append_version` / `fetch_max` and keep stale in-memory
+        // state while the new snapshot is installed on disk — an on-disk /
+        // in-memory divergence. A leaked old generation is never chosen (its id
+        // is lower) and is swept by `cleanup_orphaned_version` on the next open.
         if let Err(e) = remove_if_present(fs, &log_path) {
             log::warn!(
                 "rotation: failed to remove old edit log {}: {e}",

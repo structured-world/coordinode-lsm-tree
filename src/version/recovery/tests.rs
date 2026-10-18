@@ -475,53 +475,36 @@ fn apply_overwrites_gc_stats_when_present() {
     assert_eq!(rec.gc_stats, gc, "GC stats overwritten from the edit");
 }
 
-/// Write a CURRENT pointer so `recover()` can find the version file.
+/// Installs the `v{id}` manifest a fixture wrote, so `recover()` takes it:
+/// its empty edit log is what installs it.
 ///
-/// Must be called AFTER the `v{id}` manifest file exists — the
-/// pointer's checksum is the canonical digest derived from the
-/// manifest's parsed footer (TOC + per-section XXH3-128s) via
-/// [`crate::manifest_blocks::current_digest::compute`]. Fixtures
-/// that test corruption-recovery typically write the corrupted
-/// manifest first, then call this to stamp the CURRENT pointer
-/// — the digest binds the TOC (which the corruption inside a
-/// section payload doesn't touch), so `get_current_version`
-/// accepts the pointer and the per-Block / per-record check
-/// downstream is the one that surfaces the corruption.
+/// Must be called AFTER the `v{id}` manifest file exists. Fixtures that
+/// test corruption-recovery write the corrupted manifest first, then
+/// install it, so the per-Block / per-record check downstream is the one
+/// that surfaces the corruption.
 fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
-    let manifest_path = folder.join(format!("v{version_id}"));
-    let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
-        &manifest_path,
-        fs,
-        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
-        None,
-    )?;
-    let checksum = crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
-    let path = folder.join(CURRENT_VERSION_FILE);
-    let mut f = fs.open(
-        &path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
-    )?;
-    f.write_u64::<LittleEndian>(version_id)?;
-    f.write_u128::<LittleEndian>(checksum)?;
-    f.write_u8(0)?; // checksum type
-    Ok(())
+    crate::version::edit_log::create_log(fs, folder, version_id)
 }
 
 type FixtureWriter = crate::manifest_blocks::writer::ManifestArchiveWriter;
 
 /// Open a Blocks-based manifest writer at `folder/v{id}` with
-/// the default runtime config. Centralizes the create-new +
+/// the default runtime config, its `version_id` section already written,
+/// as every snapshot names its own id. Centralizes the create-new +
 /// runtime-snapshot boilerplate every fixture would otherwise
 /// repeat verbatim.
 fn open_fixture_writer(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<FixtureWriter> {
     let path = folder.join(format!("v{id}"));
-    FixtureWriter::create(
+    let mut writer = FixtureWriter::create(
         &path,
         fs,
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
-    )
+    )?;
+    writer.start("version_id")?;
+    writer.write_u64::<LittleEndian>(id)?;
+    Ok(writer)
 }
 
 /// Append the sections every manifest opens with: `format_version` (the

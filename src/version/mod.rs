@@ -1362,6 +1362,12 @@ impl Version {
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V6.into())?;
 
+        // The snapshot names its own version: recovery reads a snapshot by
+        // the id in its file name, and a file holding another version under
+        // that name (a copy, a rename gone wrong) must not pass for it.
+        writer.start("version_id")?;
+        writer.write_u64::<LittleEndian>(self.id())?;
+
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
 

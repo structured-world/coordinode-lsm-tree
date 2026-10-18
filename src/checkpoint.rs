@@ -17,7 +17,8 @@
 //! 3. Snapshot the current `Version`; iterate its tables (and blob files,
 //!    for [`BlobTree`](crate::blob_tree::BlobTree)) and hard-link each one into `target/tables/` (or
 //!    `target/blobs/`).
-//! 4. Copy the manifest, version file (`v<id>`), and `current` pointer.
+//! 4. Copy the manifest and install the version file (`v<id>`, with its
+//!    empty edit log).
 //! 5. Drop the pause guard — queued deletions run.
 
 // `Path`, `io::{Read, Write}` and `io::copy` come from `std::*` because
@@ -26,7 +27,7 @@
 // host `fs` module's std dependency rather than introducing a new one.
 use crate::{
     AbstractTree, CheckpointInfo,
-    file::{BLOBS_FOLDER, CURRENT_VERSION_FILE, DICTS_FOLDER, TABLES_FOLDER, fsync_directory},
+    file::{BLOBS_FOLDER, DICTS_FOLDER, TABLES_FOLDER, fsync_directory},
     fs::{Fs, FsFile, FsOpenOptions, SyncMode},
     version::Version,
     vlog::BlobFile,
@@ -514,77 +515,11 @@ fn copy_metadata_file_optional(
     Ok(())
 }
 
-/// Writes the checkpoint's `current` pointer for the captured
-/// `version_id`.
+/// Replicates manifest + installs `v<id>` in the checkpoint.
 ///
-/// The original source-tree `CURRENT` may have advanced concurrently
-/// between when we captured `version` and when we get here — copying it
-/// verbatim would risk pointing the checkpoint at a `v<N+1>` that we
-/// never linked. Instead we write a fresh `current` file in the same
-/// wire format as [`crate::version::persist_version`]: `u64 version_id`
-/// + `u128 checksum` + `u8 checksum_type`.
-///
-/// The checksum field is the canonical CURRENT digest produced by
-/// [`crate::manifest_blocks::current_digest::compute`]: an XXH3-128
-/// over (`version_id`, `layout_version`, flags, sorted TOC tuples
-/// with each section's own Block-level XXH3-128). Reusing the exact
-/// path `get_current_version` re-derives on `Tree::open` guarantees
-/// bit-identical digest computation between writer and reader. A
-/// section-byte swap is caught (changes the per-section checksum in
-/// the TOC), a tail-only torn write is recovered via the head mirror
-/// before the digest is computed, and a per-Block ECC repair on
-/// section read does not invalidate the digest (the TOC-bound
-/// section checksum was stamped at writer-time, not derived from
-/// on-disk bytes).
-pub fn write_current_for_version(
-    target_fs: &dyn Fs,
-    target_root: &Path,
-    version_id: u64,
-    runtime: Arc<crate::runtime_config::RuntimeConfig>,
-    encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
-    sync_mode: SyncMode,
-) -> crate::Result<()> {
-    use crate::checksum::ChecksumType;
-    use crate::file::rewrite_atomic;
-    use crate::io::{LittleEndian, WriteBytesExt};
-    use crate::manifest_blocks::{current_digest, reader::ManifestArchiveReader};
-
-    let manifest_path = target_root.join(format!("v{version_id}"));
-    // Open the freshly-written manifest through the same reader
-    // `get_current_version` will use, derive the canonical CURRENT
-    // digest from its parsed footer, and stamp the pointer. Using
-    // the reader here (vs. re-reading raw bytes ourselves) guarantees
-    // bit-identical digest computation between writer and reader
-    // paths: any mismatch is a real bug, not a derivation drift.
-    //
-    // Runtime + encryption come from the checkpoint driver and
-    // mirror the snapshot used by the preceding `persist_version`
-    // call — otherwise the reader would try to decode an
-    // encryption-wrapped manifest without the provider and fail to
-    // produce the footer, leaving the checkpoint with a dangling
-    // (manifest written, no CURRENT) state.
-    let archive = ManifestArchiveReader::open(&manifest_path, target_fs, runtime, encryption)?;
-    let checksum = current_digest::compute(version_id, archive.footer())?;
-
-    let mut content = vec![];
-    content.write_u64::<LittleEndian>(version_id)?;
-    content.write_u128::<LittleEndian>(checksum)?;
-    content.write_u8(u8::from(ChecksumType::Xxh3))?;
-
-    rewrite_atomic(
-        &target_root.join(CURRENT_VERSION_FILE),
-        &content,
-        target_fs,
-        sync_mode,
-    )?;
-    Ok(())
-}
-
-/// Replicates manifest + `v<id>` + writes a fresh `current` pointer.
-///
-/// Best-effort-copies the manifest from the source tree, then writes
-/// `v<id>` and `current` into the checkpoint directory from the
-/// captured in-memory `Version` rather than copying the source file.
+/// Best-effort-copies the manifest from the source tree, then writes and
+/// installs `v<id>` (with its empty edit log) into the checkpoint directory
+/// from the captured in-memory `Version` rather than copying the source file.
 ///
 /// `version` is the captured snapshot held by the checkpoint driver
 /// from `tree.current_version()`. Writing it through
@@ -594,9 +529,10 @@ pub fn write_current_for_version(
 /// snapshot is fully reconstructible from memory, so checkpoint creation
 /// does not fail under that race. `comparator_name` is required to encode the
 /// version through the same wire-format path the live tree uses (see
-/// [`crate::version::persist_version`]'s signature). `current` is
-/// then written via [`write_current_for_version`] referencing the
-/// freshly-persisted `version.id()`.
+/// [`crate::version::persist_version`]'s signature). The snapshot is
+/// the captured `version.id()` (NOT the source's newest), so a concurrent
+/// install of `v<N+1>` on the source can never leave the checkpoint naming
+/// a version whose tables it did not link.
 #[expect(
     clippy::too_many_arguments,
     reason = "checkpoint metadata copy threads (src fs+root, target fs+root, version, \
@@ -638,34 +574,17 @@ pub fn copy_metadata(
     // driver — Tree::create_checkpoint loads it via load_full() on
     // the source tree's RuntimeConfigHandle so the checkpoint sees
     // exactly the config in effect at capture.
+    //
+    // Installed LAST, after every table and blob file is linked: a crash
+    // before it leaves the checkpoint with files but no installed snapshot,
+    // which `Tree::open` refuses to create over (the partial dir must be
+    // removed and the checkpoint retried). `PartialCheckpointGuard` performs
+    // that removal on the normal error path.
     crate::version::persist_version(
         target_root,
         version,
         comparator_name,
         target_fs,
-        Arc::clone(&runtime),
-        encryption.clone(),
-        sync_mode,
-    )?;
-    // CURRENT pointer is generated fresh for the captured `version_id`
-    // (NOT copied from source) so a concurrent publish to `v<N+1>` on
-    // the source can never leave the checkpoint pointing at a version
-    // we did not link. Written LAST so a crash before this point leaves
-    // the checkpoint with a version file but no CURRENT pointer:
-    // `Tree::open` on such a directory will fail to recover (no valid
-    // pointer to load) — the partial dir must be removed and the
-    // checkpoint retried. `PartialCheckpointGuard` performs that
-    // removal on the normal error path; an unclean crash (no Drop) is
-    // the only case the operator must clean up manually.
-    //
-    // The runtime + encryption snapshot here MUST match what
-    // `persist_version` above used — the helper reopens the manifest
-    // via `ManifestArchiveReader`, and an encrypted manifest reopened
-    // without its provider would fail to decode the footer Block.
-    write_current_for_version(
-        target_fs,
-        target_root,
-        version.id(),
         runtime,
         encryption,
         sync_mode,
