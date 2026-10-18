@@ -4724,9 +4724,9 @@ impl Tree {
                 // to the timestamp).
                 let msg = format!(
                     "Tree::open: refusing to recover {} — it holds no installed manifest \
-                     snapshot (a v<N>) but still holds a tree's state (files in its \
-                     tables/ or blobs/ folder, or an edits-N holding edits). This is \
-                     the on-disk signature of a half-written \
+                     snapshot (a v<N>) but its tables/ or blobs/ folder holds files, \
+                     or an edits-N holds edits. This is the on-disk signature of a \
+                     half-written \
                      checkpoint or interrupted sealing. Remove the partial directory and \
                      retry the checkpoint, or restore the snapshot from a backup before \
                      reopening.",
