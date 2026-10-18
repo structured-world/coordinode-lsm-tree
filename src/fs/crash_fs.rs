@@ -39,8 +39,9 @@
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
 //! even when its content was synced. The directory synced is matched by what
 //! the backend reports as the same directory, so any spelling of it covers
-//! its entries. Removed entries are not brought back, and directories
-//! themselves are not rolled back. Opens, operations that make or remove
+//! its entries. Removed entries are not brought back, except a durable file
+//! removed behind a [`SyncMode::Barrier`] sync a power loss loses (see
+//! below), and directories themselves are not rolled back. Opens, operations that make or remove
 //! entries, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
@@ -106,6 +107,11 @@ enum Ordered {
     Image(PathBuf, Vec<u8>),
     /// The entries a directory sync covered.
     Entries(Vec<PathBuf>),
+    /// A removal issued behind an ordered sync: a barrier keeps it behind
+    /// that sync, so a power loss that loses the sync loses the removal too
+    /// and leaves the file as the syncs before it made it. The flag says the
+    /// name's entry was not durable yet when it was removed.
+    Removed(PathBuf, bool),
 }
 
 impl CrashState {
@@ -113,7 +119,8 @@ impl CrashState {
     /// issued, and drops the rest.
     fn settle(&mut self, count: usize) {
         let ordered = core::mem::take(&mut self.ordered);
-        for sync in ordered.into_iter().take(count) {
+        let mut ordered = ordered.into_iter();
+        for sync in ordered.by_ref().take(count) {
             match sync {
                 Ordered::Image(path, bytes) => self.set_durable(&path, bytes),
                 Ordered::Entries(entries) => {
@@ -121,6 +128,23 @@ impl CrashState {
                         self.pending_entries.remove(entry);
                     }
                 }
+                // Kept, in its place: the file is gone from here on, and an
+                // image of a file made under its name later still lands.
+                Ordered::Removed(path, _) => {
+                    self.durable.remove(&path);
+                }
+            }
+        }
+        // A removal behind a lost sync is lost with it, and so is everything
+        // made under that name after it: no sync that could make the new
+        // entry durable comes before the lost one. The file stays as the kept
+        // syncs left it; an entry made only after the removal is dropped,
+        // one that was pending before it stays pending.
+        for sync in ordered {
+            if let Ordered::Removed(path, was_pending) = sync
+                && !was_pending
+            {
+                self.pending_entries.remove(&path);
             }
         }
     }
@@ -141,6 +165,7 @@ impl CrashState {
                 entries.retain(|entry| entry != path);
                 true
             }
+            Ordered::Removed(..) => true,
         });
     }
 
@@ -705,7 +730,18 @@ impl Fs for CrashFs {
         let _namespace = self.namespace.lock();
         self.inner.remove_file(path)?;
         let name = self.name_after(path);
-        self.state.lock().forget_name(&name);
+        let mut state = self.state.lock();
+        // Behind an ordered sync, the removal is ordered too: a power loss
+        // that keeps only a prefix of the syncs may lose it, so what the file
+        // went through stays queued, in order, for the crash to replay. A
+        // name with hard links keeps the immediate removal.
+        if !state.ordered.is_empty() && state.names_of(&name).len() == 1 {
+            let was_pending = state.pending_entries.contains(&name);
+            state.touched.insert(name.clone());
+            state.ordered.push(Ordered::Removed(name, was_pending));
+        } else {
+            state.forget_name(&name);
+        }
         Ok(())
     }
 
@@ -733,7 +769,7 @@ impl Fs for CrashFs {
         state.touched.retain(|k| !k.starts_with(path));
         state.pending_entries.retain(|k| !k.starts_with(path));
         state.ordered.retain_mut(|sync| match sync {
-            Ordered::Image(name, _) => !name.starts_with(path),
+            Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
             Ordered::Entries(entries) => {
                 entries.retain(|entry| !entry.starts_with(path));
                 true
@@ -800,7 +836,7 @@ impl Fs for CrashFs {
         for sync in &mut state.ordered {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
-                Ordered::Image(..) => {}
+                Ordered::Image(..) | Ordered::Removed(..) => {}
                 Ordered::Entries(entries) => entries.retain(|entry| entry != from),
             }
         }

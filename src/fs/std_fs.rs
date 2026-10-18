@@ -138,6 +138,14 @@ impl FsFile for File {
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        // Off macOS every mode is the same `fdatasync`, which spares the
+        // metadata a read does not need (timestamps).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = mode;
+            Self::sync_data(self).map_err(io::Error::from)
+        }
+        #[cfg(target_os = "macos")]
         match mode {
             SyncMode::Full => Self::sync_data(self).map_err(io::Error::from),
             // On macOS `sync_data` is `F_FULLFSYNC` too, and a plain `fsync`

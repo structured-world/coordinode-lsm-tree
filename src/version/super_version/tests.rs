@@ -61,6 +61,7 @@ fn history_at_floor(floor: SeqNo) -> SuperVersions {
         SyncMode::Normal,
         7,
         1024 * 1024,
+        false,
     )
 }
 

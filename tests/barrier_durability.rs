@@ -520,6 +520,169 @@ fn a_power_loss_keeps_an_ordered_prefix_of_barrier_flushes() -> lsm_tree::Result
     Ok(())
 }
 
+/// A tree under `SyncMode::Barrier` on `fs`, KV-separated when `blob`, its
+/// levels routed to a folder inside the tree folder when `nested`.
+fn barrier_config(fs: &CrashFs, blob: bool, nested: bool) -> Config {
+    let base = base();
+    let config = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fs.clone()))
+    .sync_mode(SyncMode::Barrier);
+    let config = if nested {
+        config.level_routes(vec![LevelRoute {
+            levels: 0..7,
+            path: base.join("hot"),
+            fs: Arc::new(fs.clone()),
+        }])
+    } else {
+        config
+    };
+    if blob {
+        config.with_kv_separation(Some(
+            lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+        ))
+    } else {
+        config
+    }
+}
+
+/// Runs `workload` on a fresh device once to count the syncs it leaves
+/// ordered, then again for each prefix of them a power loss can keep, and
+/// hands what survived to `check`.
+fn every_prefix(
+    workload: &dyn Fn(&CrashFs) -> lsm_tree::Result<()>,
+    check: &dyn Fn(&CrashFs, &str) -> lsm_tree::Result<()>,
+) -> lsm_tree::Result<()> {
+    let probe = CrashFs::new(MemFs::new());
+    workload(&probe)?;
+    let ordered = probe.ordered_syncs();
+    for kept in 0..=ordered {
+        let fs = CrashFs::new(MemFs::new());
+        workload(&fs)?;
+        fs.crash_keeping(kept);
+        check(&fs, &format!("{kept} of {ordered} kept"))?;
+    }
+    Ok(())
+}
+
+/// Reopens the tree on what `fs` kept, KV-separated when `blob`, with its
+/// levels routed inside the tree folder when `nested`.
+fn reopen_kept(fs: &CrashFs, blob: bool, nested: bool, what: &str) -> AnyTree {
+    let base = base();
+    let inner = fs.inner();
+    let config = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(&inner))
+    .sync_mode(SyncMode::Barrier);
+    let config = if nested {
+        config.level_routes(vec![LevelRoute {
+            levels: 0..7,
+            path: base.join("hot"),
+            fs: inner,
+        }])
+    } else {
+        config
+    };
+    let config = if blob {
+        config.with_kv_separation(Some(
+            lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+        ))
+    } else {
+        config
+    };
+    config
+        .open()
+        .unwrap_or_else(|e| panic!("{what}: the tree does not reopen: {e}"))
+}
+
+/// A power loss during the creation of a tree, at any prefix of its ordered
+/// syncs, leaves a folder that opens: a new tree or the created one.
+#[test]
+fn a_power_loss_during_creation_leaves_a_folder_that_opens() -> lsm_tree::Result<()> {
+    for (blob, nested) in [(false, false), (true, false), (false, true)] {
+        every_prefix(
+            &|fs| barrier_config(fs, blob, nested).open().map(drop),
+            &|fs, what| {
+                reopen_kept(fs, blob, nested, what);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A power loss during a compaction, at any prefix of its ordered syncs,
+/// reopens with every key the flushes before it made durable.
+#[test]
+fn a_power_loss_during_a_compaction_keeps_the_flushed_keys() -> lsm_tree::Result<()> {
+    for (blob, nested) in [(false, false), (true, false), (false, true)] {
+        every_prefix(
+            &|fs| {
+                let tree = barrier_config(fs, blob, nested).open()?;
+                for i in 0..KEYS {
+                    tree.insert(key(i), "v", i as u64);
+                    tree.flush_active_memtable(0)?;
+                }
+                tree.sync_devices()?;
+                tree.major_compact(64 * 1024 * 1024, 0)?;
+                Ok(())
+            },
+            &|fs, what| {
+                let tree = reopen_kept(fs, blob, nested, what);
+                for i in 0..KEYS {
+                    assert!(
+                        tree.get(key(i), u64::MAX)?.is_some(),
+                        "{what} (blob {blob}, nested {nested}): key {i} was lost"
+                    );
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// A power loss during flushes of a KV-separated tree, or of one whose tables
+/// live in a route inside the tree folder, keeps an ordered prefix of them,
+/// each surviving key readable in full.
+#[test]
+fn a_power_loss_keeps_an_ordered_prefix_of_blob_and_routed_flushes() -> lsm_tree::Result<()> {
+    for (blob, nested) in [(true, false), (false, true)] {
+        every_prefix(
+            &|fs| {
+                let tree = barrier_config(fs, blob, nested).open()?;
+                tree.sync_devices()?;
+                for i in 0..KEYS {
+                    tree.insert(key(i), "a value long enough", i as u64);
+                    tree.flush_active_memtable(0)?;
+                }
+                Ok(())
+            },
+            &|fs, what| {
+                let tree = reopen_kept(fs, blob, nested, what);
+                let mut prefix = 0;
+                while prefix < KEYS && tree.get(key(prefix), u64::MAX)?.is_some() {
+                    prefix += 1;
+                }
+                for i in prefix..KEYS {
+                    assert!(
+                        tree.get(key(i), u64::MAX)?.is_none(),
+                        "{what} (blob {blob}, nested {nested}): key {i} survived without key {prefix}"
+                    );
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// With the tables on one device and the manifest on another, every pair of
 /// prefixes the two devices can keep is a tree that reopens: the manifest
 /// never names a table its device lost.

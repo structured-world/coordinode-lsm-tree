@@ -442,6 +442,21 @@ fn a_reflink_rule_matches_the_destination_path() {
     assert_eq!(matched.kind(), ErrorKind::PermissionDenied);
 }
 
+/// `clear` resets every observation, the sync log among them: syncs from
+/// before it never reach a later `take_syncs`.
+#[test]
+fn clear_drops_the_syncs_observed_before_it() -> io::Result<()> {
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d"))?;
+    fs.sync_directory(Path::new("/d"))?;
+    fs.injector().clear();
+    assert!(
+        fs.injector().take_syncs().is_empty(),
+        "a sync from before the clear"
+    );
+    Ok(())
+}
+
 #[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();

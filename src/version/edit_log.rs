@@ -28,6 +28,29 @@ use crate::path::Path;
 #[cfg(feature = "std")]
 use std::io::{Seek, SeekFrom};
 
+/// The edit log of the snapshot `v{snapshot_id}` in the tree folder `folder`.
+#[must_use]
+pub fn log_path(folder: &Path, snapshot_id: super::VersionId) -> crate::path::PathBuf {
+    folder.join(alloc::format!("edits-{snapshot_id}"))
+}
+
+/// Creates the empty edit log of the snapshot `v{snapshot_id}`, as the
+/// snapshot is written: the directory sync that makes the snapshot's name
+/// durable then makes the log's too, and no append has to sync it. A log
+/// left by an earlier attempt at the same snapshot is emptied, since no edit
+/// in it belongs to a snapshot that was never installed.
+///
+/// # Errors
+///
+/// Returns an I/O error if the log cannot be created.
+pub fn create_log(fs: &dyn Fs, folder: &Path, snapshot_id: super::VersionId) -> crate::Result<()> {
+    fs.open(
+        &log_path(folder, snapshot_id),
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    Ok(())
+}
+
 /// Appends one framed [`VersionEdit`] to the log at `path` (created on first
 /// write) and syncs its data per `sync_mode`, so the edit is durable before the caller
 /// acknowledges the flush / compaction. `scratch` is reused for payload
