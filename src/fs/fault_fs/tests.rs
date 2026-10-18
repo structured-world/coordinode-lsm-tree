@@ -1148,6 +1148,52 @@ fn a_batch_the_backend_refuses_whole_spends_no_rule() -> io::Result<()> {
     Ok(())
 }
 
+/// A wrapper over another wrapper screens each read of a batch with its own
+/// rules too: the inner wrapper showing the descriptor to the backend below
+/// does not let the read past the outer one.
+#[test]
+fn nested_wrappers_each_screen_a_batch_read() -> io::Result<()> {
+    let fs = FaultFs::new(FaultFs::new(DescriptorFs::new(true)));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the outer rule fails the read");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(
+        fs.injector().read_count(),
+        before + 1,
+        "the outer wrapper counts it"
+    );
+
+    let mut buf = [0u8; 16];
+    let mut retry = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    fs.read_blocks_batched(&mut retry)?;
+    assert_eq!(buf, [b'1'; 16]);
+    assert_eq!(
+        fs.inner.injector().read_count(),
+        1,
+        "the inner one counts the read made"
+    );
+    Ok(())
+}
+
 /// A handle opened through the wrapper and read by another backend's batch
 /// is still taken through the read rules: the other backend cannot reach the
 /// handle's descriptor past them, and reads it through the handle.

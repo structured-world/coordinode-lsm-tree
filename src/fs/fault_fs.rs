@@ -299,10 +299,6 @@ pub struct FaultInjector {
     /// Whether a removal of a file with an open handle fails, as on a backend
     /// that refuses to unlink an open file.
     refuse_open_removal: core::sync::atomic::AtomicBool,
-    /// The threads inside a batch or a queue wait of a wrapper sharing this
-    /// injector: only there does a handle show the inner backend its
-    /// descriptor, so no other backend reads it past the read rules.
-    lent: spin::Mutex<Vec<std::thread::ThreadId>>,
     /// Called on a positional read at the paired offset of a file whose path
     /// contains the paired text, before the read is served, so a test can
     /// hold a read in flight while other readers run.
@@ -313,6 +309,37 @@ pub struct FaultInjector {
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
 pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+
+std::thread_local! {
+    /// How deep this thread is in batches and queue waits of fault wrappers:
+    /// only there does a handle show its descriptor, so no backend reads one
+    /// past the read rules of the wrappers it was opened through. Per thread,
+    /// not per wrapper, so a wrapper over another one sees the descriptor
+    /// the inner one shows, and each screens the read with its own rules.
+    static LENDING: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Runs `f` with the descriptors of fault-wrapped handles shown, on this
+/// thread only.
+fn lend_descriptors<R>(f: impl FnOnce() -> R) -> R {
+    /// Takes the thread's loan back however `f` ends.
+    struct Loan;
+    impl Drop for Loan {
+        fn drop(&mut self) {
+            // Every loan is taken back once, after it was given.
+            LENDING.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    // As deep as wrappers are nested in one another, far below `u32::MAX`.
+    LENDING.with(|depth| depth.set(depth.get() + 1));
+    let _loan = Loan;
+    f()
+}
+
+/// Whether this thread is inside a call that shows the descriptors.
+fn descriptors_lent() -> bool {
+    LENDING.with(|depth| depth.get() > 0)
+}
 
 /// A handle open through a [`FaultFs`].
 struct OpenHandle {
@@ -381,31 +408,6 @@ impl FaultInjector {
                 open.current = to.to_path_buf();
             }
         }
-    }
-
-    /// Runs `f` with the descriptors of this injector's handles shown to the
-    /// inner backend, on this thread only.
-    fn lend<R>(&self, f: impl FnOnce() -> R) -> R {
-        /// Takes the thread's loan back however `f` ends.
-        struct Loan<'a>(&'a spin::Mutex<Vec<std::thread::ThreadId>>);
-        impl Drop for Loan<'_> {
-            fn drop(&mut self) {
-                let me = std::thread::current().id();
-                let mut lent = self.0.lock();
-                if let Some(at) = lent.iter().position(|id| *id == me) {
-                    lent.swap_remove(at);
-                }
-            }
-        }
-        self.lent.lock().push(std::thread::current().id());
-        let _loan = Loan(&self.lent);
-        f()
-    }
-
-    /// Whether this thread is inside a call that lends the descriptors.
-    fn lent_here(&self) -> bool {
-        let me = std::thread::current().id();
-        self.lent.lock().contains(&me)
     }
 
     /// The path the read rules match a read of the handle the inner backend
@@ -671,7 +673,9 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::Open));
         }
         let inner = self.inner.open(path, opts)?;
-        let handle = self.injector.note_opened(path, inner.backing_fd());
+        // The descriptor a wrapper below shows only while lent.
+        let fd = lend_descriptors(|| inner.backing_fd());
+        let handle = self.injector.note_opened(path, fd);
         Ok(Box::new(FaultFile {
             inner,
             path: path.to_path_buf(),
@@ -690,7 +694,7 @@ impl<F: Fs> Fs for FaultFs<F> {
         if !self.inner.reads_by_descriptor() {
             return self.inner.read_blocks_batched(reqs);
         }
-        self.injector.lend(|| {
+        lend_descriptors(|| {
             // A batch the backend refuses whole reads nothing: no rule is
             // spent on it.
             self.inner.check_descriptor_batch(reqs)?;
@@ -709,7 +713,7 @@ impl<F: Fs> Fs for FaultFs<F> {
         if !self.inner.reads_by_descriptor() {
             return self.inner.read_blocks_batched_each(reqs, on_read);
         }
-        self.injector.lend(|| {
+        lend_descriptors(|| {
             self.inner.check_descriptor_batch(reqs)?;
             let (clean, failure) = self.injector.screen_batch(reqs);
             let (head, _) = reqs.split_at_mut(clean);
@@ -719,8 +723,7 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> io::Result<()> {
-        self.injector
-            .lend(|| self.inner.check_descriptor_batch(reqs))
+        lend_descriptors(|| self.inner.check_descriptor_batch(reqs))
     }
 
     fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
@@ -957,8 +960,7 @@ impl ReadQueue for FaultReadQueue<'_> {
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
-        let injector = self.injector;
-        injector.lend(|| self.wait_lent(min, on_done));
+        lend_descriptors(|| self.wait_lent(min, on_done));
     }
 
     fn set_wake(&mut self, wake: Arc<dyn ReadWake>) -> bool {
@@ -1128,12 +1130,12 @@ impl FsFile for FaultFile {
         self.inner.read_at(buf, offset)
     }
 
-    // Shown only inside a batch or a queue wait of the wrapper that opened
-    // the handle, which screens each read by it: any other backend reading
-    // the descriptor would go past the read rules, so it gets none and reads
-    // through `read_at`.
+    // Shown only inside a batch or a queue wait of a fault wrapper, which
+    // screens each read by it with its rules before its inner backend reads
+    // it, layer by layer: any other backend reading the descriptor would go
+    // past the read rules, so it gets none and reads through `read_at`.
     fn backing_fd(&self) -> Option<i32> {
-        if self.injector.lent_here() {
+        if descriptors_lent() {
             self.inner.backing_fd()
         } else {
             None
