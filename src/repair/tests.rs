@@ -11276,10 +11276,12 @@ fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> 
                 .times(1),
         );
         // A failed sync takes the snapshot's name back; refusing that removal
-        // keeps the snapshot installed, the case under test.
+        // keeps the snapshot installed, the case under test. The persist's
+        // first removal is of a leftover temporary, before anything is written.
         fault.injector().arm(
             FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
-                .on_path(root.join("v").to_string_lossy()),
+                .on_path(root.join("v").to_string_lossy())
+                .skip(1),
         );
         let result = Config::new(
             &root,
