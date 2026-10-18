@@ -935,6 +935,88 @@ fn a_queued_read_is_screened_when_a_wait_issues_it() -> io::Result<()> {
             .map(|read| read.result.as_ref().map_err(io::Error::kind)),
         Some(Err::<&(), _>(ErrorKind::Interrupted)),
     );
+
+    // A wait for none may leave a read held in the backend's queue: it
+    // screens nothing, and the read stays held for a wait for some, which
+    // screens and issues it.
+    fs.injector().clear();
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+    let mut queue = fs.read_queue();
+    queue.submit(read_of(3));
+    queue.wait(0, &mut |_| {});
+    assert_eq!(
+        fs.injector().read_count(),
+        before,
+        "a wait for none screened"
+    );
+    assert_eq!(queue.held(), 1, "the read is held for a wait for some");
+    let mut done = Vec::new();
+    queue.wait(1, &mut |read| done.push(read));
+    assert_eq!(
+        done.first()
+            .map(|read| read.result.as_ref().map_err(io::Error::kind)),
+        Some(Err::<&(), _>(ErrorKind::PermissionDenied)),
+    );
+    Ok(())
+}
+
+/// The backend reads the requests that have a descriptor first and the rest
+/// on their own after: an overflow among the rest does not stop the reads by
+/// descriptor, which are screened as they are read.
+#[test]
+fn an_overflow_without_a_descriptor_leaves_the_descriptor_reads_screened() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    let plain = MemFs::new();
+    plain.create_dir_all(Path::new("/p"))?;
+    plain
+        .open(
+            Path::new("/p/f"),
+            &FsOpenOptions::new().write(true).create(true),
+        )?
+        .write_all(&[0; 16])?;
+    let undescribed = plain.open(Path::new("/p/f"), &FsOpenOptions::new().read(true))?;
+    assert!(
+        undescribed.backing_fd().is_none(),
+        "self-check: no descriptor"
+    );
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    let before = fs.injector().read_count();
+
+    let mut bufs = [[0u8; 16]; 2];
+    let [b0, b1] = &mut bufs;
+    let mut overflowing = crate::fs::BlockBuf::new(b1);
+    overflowing.append(&[0]);
+    let mut reqs = [
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(b0),
+        },
+        BlockRead {
+            file: undescribed.as_ref(),
+            offset: u64::MAX,
+            buf: overflowing,
+        },
+    ];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the batch fails");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::PermissionDenied,
+        "the read by descriptor was screened"
+    );
+    assert_eq!(fs.injector().read_count() - before, 1);
     Ok(())
 }
 

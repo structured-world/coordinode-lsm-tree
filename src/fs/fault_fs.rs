@@ -417,11 +417,16 @@ impl FaultInjector {
     /// a rule fails: how many come before it, and its error.
     fn screen_batch(&self, reqs: &[BlockRead<'_>]) -> (usize, Option<io::Error>) {
         // A request partly filled reads from `filled` bytes in. One whose
-        // offset overflows is the inner backend's to refuse, and it refuses the
-        // whole batch before reading any of it, wherever that request stands:
-        // none of the batch is read, so no rule may count any of it.
+        // offset overflows is the inner backend's to refuse. Among the requests
+        // it reads by descriptor, it refuses them all before reading any,
+        // wherever that request stands: none is read, so no rule may count
+        // any. A request without a descriptor is read on its own after them,
+        // so its overflow leaves theirs to be read, and screened.
         let resume = |req: &BlockRead<'_>| req.offset.checked_add(req.buf.filled() as u64);
-        if reqs.iter().any(|req| resume(req).is_none()) {
+        if reqs
+            .iter()
+            .any(|req| req.file.backing_fd().is_some() && resume(req).is_none())
+        {
             return (reqs.len(), None);
         }
         for (at, req) in reqs.iter().enumerate() {
@@ -877,10 +882,13 @@ impl<F: Fs> Fs for FaultFs<F> {
 }
 
 /// The [`ReadQueue`] of a [`FaultFs`]: the inner backend's queue, each read
-/// screened by the read rules as a wait issues it, as the inner queue issues
-/// its reads: a read never waited for is never read, and a rule armed before
-/// the wait applies to it. A read a rule fails never reaches the inner queue
-/// and is handed back failed by that wait.
+/// screened by the read rules as a wait that is sure to issue it does: a
+/// read never issued spends no rule, and a rule armed before the issuing
+/// wait applies to it. A wait for none may leave a read held in the inner
+/// queue, so it neither screens nor hands over the reads submitted since;
+/// they count as held, and the next wait for some issues them. A read a rule
+/// fails never reaches the inner queue and is handed back failed by that
+/// wait.
 struct FaultReadQueue<'a> {
     inner: Box<dyn ReadQueue + 'a>,
     injector: &'a FaultInjector,
@@ -905,6 +913,11 @@ impl ReadQueue for FaultReadQueue<'_> {
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
+        if min == 0 {
+            // Only what the inner queue has issued already, and is ready.
+            self.inner.wait(0, on_done);
+            return;
+        }
         for read in core::mem::take(&mut self.submitted) {
             match self.injector.screen_by_fd(read.file.as_ref(), read.offset) {
                 Some(error) => self.failed.push(ReadDone {
