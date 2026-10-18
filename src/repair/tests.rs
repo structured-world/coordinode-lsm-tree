@@ -13482,17 +13482,28 @@ fn an_unknown_install_that_survived() -> crate::Result<(
     );
 
     // The power loss keeps the rename and loses the withdrawal. The snapshot
-    // the faulted run renamed is gone with the withdrawal; the one the run
-    // without a fault installed over the same tables stands in for it, with
-    // the blob replacement it names (written with random bytes of its own).
-    copy_file(&probe_fs, &memfs, &snapshot)?;
-    let blobs = root.join(crate::file::BLOBS_FOLDER);
-    for entry in probe_fs.read_dir(&blobs)? {
-        if !entry.is_dir {
-            copy_file(&probe_fs, &memfs, &entry.path)?;
+    // the faulted run renamed is gone with the withdrawal, and the files it
+    // names carry random bytes no other run reproduces; the tree the run
+    // without a fault installed over the same fixture stands in for it,
+    // beside the copy of the report the faulted run kept.
+    let survived = std::sync::Arc::new(MemFs::new());
+    copy_folder(&probe_fs, &survived, &root)?;
+    let mut kept = 0;
+    for entry in memfs.read_dir(&root)? {
+        if matches!(
+            crate::file::repair_report_name(&entry.file_name),
+            Some((_, false))
+        ) {
+            copy_file(&memfs, &survived, &entry.path)?;
+            kept += 1;
         }
     }
-    Ok((memfs, root, expected))
+    assert_eq!(kept, 1, "self-check: the faulted run kept its report");
+    assert!(
+        survived.exists(&snapshot)?,
+        "self-check: the snapshot is back"
+    );
+    Ok((survived, root, expected))
 }
 
 /// A rebuilt snapshot whose install and withdrawal both fail to sync may come
