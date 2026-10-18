@@ -419,9 +419,10 @@ impl FaultInjector {
         // A request partly filled reads from `filled` bytes in. One whose
         // offset overflows is the inner backend's to refuse. Among the requests
         // it reads by descriptor, it refuses them all before reading any,
-        // wherever that request stands: none is read, so no rule may count
-        // any. A request without a descriptor is read on its own after them,
-        // so its overflow leaves theirs to be read, and screened.
+        // wherever that request stands, as `Fs::reads_by_descriptor` requires
+        // of it: none is read, so no rule may count any. A request without a
+        // descriptor is read on its own after them, so its overflow leaves
+        // theirs to be read, and screened.
         let resume = |req: &BlockRead<'_>| req.offset.checked_add(req.buf.filled() as u64);
         if reqs
             .iter()
