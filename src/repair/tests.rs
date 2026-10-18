@@ -17370,6 +17370,74 @@ fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A copy of the report that is gone when the checkpoint opens it (a
+/// rotation carried the report to its next snapshot and removed the old
+/// copy) is looked for again: the checkpoint still carries the report.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_checkpoint_carries_the_report_past_a_copy_a_rotation_removed() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/checkpoint")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let installed = fs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    // The copy the checkpoint picks is gone by the time it opens it.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::NotFound))
+            .on_path(root.join("repair-report-").to_string_lossy())
+            .once(),
+    );
+    tree.create_checkpoint(&target)?;
+    drop(tree);
+
+    let (_, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the checkpoint owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    Ok(())
+}
+
 /// A TRANSIENT I/O failure is returned for a retry, never "repaired": a
 /// repair would rebuild the manifest around files a healthy retry could still
 /// read. Proven by the manifest generation staying untouched.
