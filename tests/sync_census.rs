@@ -439,9 +439,17 @@ fn a_failed_creation_that_keeps_its_folders_syncs_them() {
         .map(|(path, _)| path)
         .collect();
     assert_eq!(
-        synced.iter().filter(|path| **path == root).count(),
-        2,
-        "the failed sync of the root and the one that makes it durable: {synced:?}"
+        synced,
+        vec![
+            // The rule matches every path under the root: the first sync,
+            // of the nearest holder, is the one that fails.
+            root.join("a").join("b"),
+            // Then every holder, the failed one included, is made durable.
+            root.join("a").join("b"),
+            root.join("a"),
+            root.clone(),
+        ],
+        "the failed sync and the ones that make every kept name durable"
     );
 }
 
