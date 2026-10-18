@@ -130,6 +130,33 @@ impl CrashState {
     /// issued, and drops the rest.
     fn settle(&mut self, count: usize) {
         let ordered = core::mem::take(&mut self.ordered);
+        // A kept rename made its destination's entry with it: the entry is
+        // durable from there, unless a step after it, kept or lost, takes the
+        // name again and leaves whatever holds it then to its own sync.
+        let renamed_durable: Vec<PathBuf> = ordered
+            .iter()
+            .enumerate()
+            .take(count)
+            .filter_map(|(at, sync)| match sync {
+                Ordered::Renamed { to, .. } => Some((at, to)),
+                _ => None,
+            })
+            .filter(|&(at, to)| {
+                !ordered.iter().skip(at + 1).any(|later| match later {
+                    Ordered::Removed(name, _) => name == to,
+                    Ordered::Renamed {
+                        from: source,
+                        to: target,
+                        ..
+                    } => source == to || target == to,
+                    _ => false,
+                })
+            })
+            .map(|(_, to)| to.clone())
+            .collect();
+        for to in &renamed_durable {
+            self.pending_entries.remove(to);
+        }
         let mut ordered = ordered.into_iter();
         for sync in ordered.by_ref().take(count) {
             match sync {
