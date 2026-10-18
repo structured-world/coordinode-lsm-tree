@@ -311,34 +311,64 @@ pub struct FaultInjector {
 pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
 
 std::thread_local! {
-    /// How deep this thread is in batches and queue waits of fault wrappers:
-    /// only there does a handle show its descriptor, so no backend reads one
-    /// past the read rules of the wrappers it was opened through. Per thread,
-    /// not per wrapper, so a wrapper over another one sees the descriptor
-    /// the inner one shows, and each screens the read with its own rules.
-    static LENDING: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// The injectors whose batches and queue waits this thread is inside:
+    /// only there does a handle opened through that injector's wrapper show
+    /// its descriptor, so no backend reads one past the read rules of the
+    /// wrapper it was opened through, another wrapper's included.
+    static LENT: core::cell::RefCell<Vec<usize>> = const { core::cell::RefCell::new(Vec::new()) };
+    /// How deep this thread is in a lent handle asking the handle it wraps
+    /// for its descriptor: a wrapper over another one sees the descriptor the
+    /// inner handle holds, and each screens the read with its own rules.
+    static PASSING: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
 }
 
-/// Runs `f` with the descriptors of fault-wrapped handles shown, on this
-/// thread only.
-fn lend_descriptors<R>(f: impl FnOnce() -> R) -> R {
+/// The identity a loan is kept under: the injector's address.
+fn loan_key(injector: &FaultInjector) -> usize {
+    core::ptr::from_ref(injector) as usize
+}
+
+/// Runs `f` with the descriptors of the handles opened through `injector`'s
+/// wrapper shown, on this thread only.
+fn lend_descriptors<R>(injector: &FaultInjector, f: impl FnOnce() -> R) -> R {
     /// Takes the thread's loan back however `f` ends.
-    struct Loan;
+    struct Loan(usize);
     impl Drop for Loan {
         fn drop(&mut self) {
-            // Every loan is taken back once, after it was given.
-            LENDING.with(|depth| depth.set(depth.get() - 1));
+            LENT.with(|lent| {
+                let mut lent = lent.borrow_mut();
+                if let Some(at) = lent.iter().rposition(|key| *key == self.0) {
+                    lent.remove(at);
+                }
+            });
         }
     }
-    // As deep as wrappers are nested in one another, far below `u32::MAX`.
-    LENDING.with(|depth| depth.set(depth.get() + 1));
-    let _loan = Loan;
+    let key = loan_key(injector);
+    LENT.with(|lent| lent.borrow_mut().push(key));
+    let _loan = Loan(key);
     f()
 }
 
-/// Whether this thread is inside a call that shows the descriptors.
-fn descriptors_lent() -> bool {
-    LENDING.with(|depth| depth.get() > 0)
+/// Runs `f`, a lent handle asking the handle it wraps for its descriptor.
+fn pass_through<R>(f: impl FnOnce() -> R) -> R {
+    /// Ends the pass however `f` ends.
+    struct Pass;
+    impl Drop for Pass {
+        fn drop(&mut self) {
+            // Every pass ends once, after it began.
+            PASSING.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    // As deep as wrappers are nested in one another, far below `u32::MAX`.
+    PASSING.with(|depth| depth.set(depth.get() + 1));
+    let _pass = Pass;
+    f()
+}
+
+/// Whether a handle opened through `injector`'s wrapper shows its descriptor
+/// here: inside that wrapper's loan, or asked by a lent handle wrapping it.
+fn descriptors_lent(injector: &FaultInjector) -> bool {
+    PASSING.with(|depth| depth.get() > 0)
+        || LENT.with(|lent| lent.borrow().contains(&loan_key(injector)))
 }
 
 /// A handle open through a [`FaultFs`].
@@ -449,22 +479,71 @@ impl FaultInjector {
     }
 
     /// Screens `reqs` in order as [`Self::screen_by_fd`] does, up to the first
-    /// a rule fails: how many come before it, and its error.
-    fn screen_batch(&self, reqs: &[BlockRead<'_>]) -> (usize, Option<io::Error>) {
+    /// a rule fails: how many come before it, its error, and what screening
+    /// spent on each request screened, the failing one included, so what was
+    /// spent on a request the inner backend never read can be given back.
+    fn screen_batch(&self, reqs: &[BlockRead<'_>]) -> (usize, Option<io::Error>, Vec<Screened>) {
         // A request partly filled reads from `filled` bytes in. A batch the
         // inner backend refuses whole was turned away before this, by its
         // `Fs::check_descriptor_batch`. A request without a descriptor whose
         // offset overflows is read on its own after the others, so they are
         // read, and screened.
         let resume = |req: &BlockRead<'_>| req.offset.checked_add(req.buf.filled() as u64);
+        let mut spent = Vec::with_capacity(reqs.len());
         for (at, req) in reqs.iter().enumerate() {
             let offset = resume(req).unwrap_or(req.offset);
             let len = req.buf.capacity() - req.buf.filled();
-            if let Some(error) = self.screen_by_fd(req.file, offset, len) {
-                return (at, Some(error));
+            // A request with nothing to read, or without a descriptor, is not
+            // screened here: nothing is counted or spent for it.
+            let fd = if len == 0 {
+                None
+            } else {
+                req.file.backing_fd()
+            };
+            let Some(fd) = fd else {
+                spent.push(Screened::Not);
+                continue;
+            };
+            let path = self.path_of(fd);
+            self.count_read();
+            #[cfg(test)]
+            if let Some(path) = &path {
+                self.run_read_hooks(path, offset);
+            }
+            let (fault, rule) = self.check_read_at_traced(path.as_deref(), offset);
+            spent.push(Screened::Counted(rule));
+            if let Some(Fault::Error(kind)) = fault {
+                return (at, Some(fault_error(kind, FaultOp::ReadAt)), spent);
             }
         }
-        (reqs.len(), None)
+        (reqs.len(), None, spent)
+    }
+
+    /// Gives back what screening spent on the requests at `unread`: the read
+    /// count and the rule budget. Increments only, so a concurrent screening
+    /// of other reads loses nothing.
+    fn refund(&self, spent: &[Screened], unread: impl IntoIterator<Item = usize>) {
+        let mut rules = self.rules.lock();
+        for at in unread {
+            let Some(Screened::Counted(rule)) = spent.get(at) else {
+                continue;
+            };
+            self.reads
+                .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+            match rule {
+                Some((index, Spent::Skip)) => {
+                    if let Some(rule) = rules.get_mut(*index) {
+                        rule.skip += 1;
+                    }
+                }
+                Some((index, Spent::Count)) => {
+                    if let Some(rule) = rules.get_mut(*index) {
+                        rule.count += 1;
+                    }
+                }
+                Some((_, Spent::Nothing)) | None => {}
+            }
+        }
     }
 
     /// Arms `rule`. Rules are evaluated in arm order; the first rule that
@@ -597,22 +676,62 @@ impl FaultInjector {
         None
     }
 
+    /// [`Self::check_read_at`], also saying which rule matched and what it
+    /// spent, so the occurrence can be given back.
+    fn check_read_at_traced(
+        &self,
+        path: Option<&Path>,
+        offset: u64,
+    ) -> (Option<Fault>, Option<(usize, Spent)>) {
+        let mut rules = self.rules.lock();
+        for (index, rule) in rules.iter_mut().enumerate() {
+            if !rule.matches_read_at(path, offset) {
+                continue;
+            }
+            let (fault, spent) = Self::fire_traced(rule);
+            return (fault, Some((index, spent)));
+        }
+        (None, None)
+    }
+
     /// Advances a matched rule's skip/fire budget and returns the [`Fault`] to
     /// apply, or `None` when the rule is still skipping or is exhausted. The
     /// first matching rule owns the occurrence.
     fn fire(rule: &mut FaultRule) -> Option<Fault> {
+        Self::fire_traced(rule).0
+    }
+
+    /// [`Self::fire`], also saying which budget it spent.
+    fn fire_traced(rule: &mut FaultRule) -> (Option<Fault>, Spent) {
         if rule.skip > 0 {
             rule.skip -= 1;
-            return None;
+            return (None, Spent::Skip);
         }
         if rule.count == 0 {
-            return None;
+            return (None, Spent::Nothing);
         }
-        if rule.count != u64::MAX {
-            rule.count -= 1;
+        if rule.count == u64::MAX {
+            return (Some(rule.fault), Spent::Nothing);
         }
-        Some(rule.fault)
+        rule.count -= 1;
+        (Some(rule.fault), Spent::Count)
     }
+}
+
+/// What a rule spent on one occurrence.
+#[derive(Clone, Copy)]
+enum Spent {
+    Skip,
+    Count,
+    Nothing,
+}
+
+/// What screening did with one request of a batch.
+enum Screened {
+    /// Not screened here: nothing to read, or no descriptor.
+    Not,
+    /// Counted as a read, and the rule that matched it and what it spent.
+    Counted(Option<(usize, Spent)>),
 }
 
 /// Builds the [`io::Error`] an [`Fault::Error`] surfaces, tagged with the op.
@@ -664,6 +783,43 @@ impl<F: Fs> FaultFs<F> {
     pub fn injector(&self) -> Arc<FaultInjector> {
         Arc::clone(&self.injector)
     }
+
+    /// Reads `reqs` through an inner backend that reads by descriptor: each
+    /// request is screened by the read rules first, and a request a rule
+    /// fails ends the batch there. When the inner backend fails, what was
+    /// spent on the requests it never read (those after its failing one, and
+    /// the one this layer would have failed) is given back: they were not
+    /// read, so a rule's budget is still owed to a read of them.
+    fn read_screened(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
+    ) -> io::Result<()> {
+        lend_descriptors(&self.injector, || {
+            // A batch the backend refuses whole reads nothing: no rule is
+            // spent on it.
+            self.inner.check_descriptor_batch(reqs)?;
+            let (clean, failure, spent) = self.injector.screen_batch(reqs);
+            let (head, _) = reqs.split_at_mut(clean);
+            let mut read = alloc::vec![false; clean];
+            let result = self.inner.read_blocks_batched_each(head, &mut |at, req| {
+                if let Some(done) = read.get_mut(at) {
+                    *done = true;
+                }
+                on_read(at, req);
+            });
+            if let Err(e) = result {
+                // The first request not handed over is the one that failed:
+                // it was read. Every other one not handed over was not.
+                let failed = read.iter().position(|done| !done);
+                let unread = (0..spent.len())
+                    .filter(|&at| !read.get(at).copied().unwrap_or(false) && Some(at) != failed);
+                self.injector.refund(&spent, unread);
+                return Err(e);
+            }
+            failure.map_or(Ok(()), Err)
+        })
+    }
 }
 
 impl<F: Fs> Fs for FaultFs<F> {
@@ -673,8 +829,8 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::Open));
         }
         let inner = self.inner.open(path, opts)?;
-        // The descriptor a wrapper below shows only while lent.
-        let fd = lend_descriptors(|| inner.backing_fd());
+        // The descriptor a wrapper below shows only to a handle wrapping it.
+        let fd = pass_through(|| inner.backing_fd());
         let handle = self.injector.note_opened(path, fd);
         Ok(Box::new(FaultFile {
             inner,
@@ -694,15 +850,7 @@ impl<F: Fs> Fs for FaultFs<F> {
         if !self.inner.reads_by_descriptor() {
             return self.inner.read_blocks_batched(reqs);
         }
-        lend_descriptors(|| {
-            // A batch the backend refuses whole reads nothing: no rule is
-            // spent on it.
-            self.inner.check_descriptor_batch(reqs)?;
-            let (clean, failure) = self.injector.screen_batch(reqs);
-            let (head, _) = reqs.split_at_mut(clean);
-            self.inner.read_blocks_batched(head)?;
-            failure.map_or(Ok(()), Err)
-        })
+        self.read_screened(reqs, &mut |_, _| {})
     }
 
     fn read_blocks_batched_each(
@@ -713,17 +861,11 @@ impl<F: Fs> Fs for FaultFs<F> {
         if !self.inner.reads_by_descriptor() {
             return self.inner.read_blocks_batched_each(reqs, on_read);
         }
-        lend_descriptors(|| {
-            self.inner.check_descriptor_batch(reqs)?;
-            let (clean, failure) = self.injector.screen_batch(reqs);
-            let (head, _) = reqs.split_at_mut(clean);
-            self.inner.read_blocks_batched_each(head, on_read)?;
-            failure.map_or(Ok(()), Err)
-        })
+        self.read_screened(reqs, on_read)
     }
 
     fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> io::Result<()> {
-        lend_descriptors(|| self.inner.check_descriptor_batch(reqs))
+        lend_descriptors(&self.injector, || self.inner.check_descriptor_batch(reqs))
     }
 
     fn read_queue(&self) -> Box<dyn ReadQueue + '_> {
@@ -960,7 +1102,8 @@ impl ReadQueue for FaultReadQueue<'_> {
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
-        lend_descriptors(|| self.wait_lent(min, on_done));
+        let injector = self.injector;
+        lend_descriptors(injector, || self.wait_lent(min, on_done));
     }
 
     fn set_wake(&mut self, wake: Arc<dyn ReadWake>) -> bool {
@@ -1130,13 +1273,15 @@ impl FsFile for FaultFile {
         self.inner.read_at(buf, offset)
     }
 
-    // Shown only inside a batch or a queue wait of a fault wrapper, which
-    // screens each read by it with its rules before its inner backend reads
-    // it, layer by layer: any other backend reading the descriptor would go
-    // past the read rules, so it gets none and reads through `read_at`.
+    // Shown only inside a batch or a queue wait of the wrapper this handle
+    // was opened through, which screens each read by it with its rules
+    // before its inner backend reads it, layer by layer through a wrapper
+    // below: any other backend reading the descriptor, another wrapper's
+    // included, would go past these read rules, so it gets none and reads
+    // through `read_at`.
     fn backing_fd(&self) -> Option<i32> {
-        if descriptors_lent() {
-            self.inner.backing_fd()
+        if descriptors_lent(&self.injector) {
+            pass_through(|| self.inner.backing_fd())
         } else {
             None
         }

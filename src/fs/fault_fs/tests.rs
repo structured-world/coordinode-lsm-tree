@@ -1148,6 +1148,82 @@ fn a_batch_the_backend_refuses_whole_spends_no_rule() -> io::Result<()> {
     Ok(())
 }
 
+/// A handle opened through one wrapper and read in another wrapper's batch
+/// shows that other wrapper no descriptor: it is read through the handle,
+/// and the rules of the wrapper it was opened through fail it.
+#[test]
+fn a_handle_read_in_another_wrappers_batch_keeps_its_rules() -> io::Result<()> {
+    let opened = FaultFs::new(DescriptorFs::new(true));
+    let other = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&opened)?;
+    opened.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = other
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the opening wrapper's rule fails the read");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    Ok(())
+}
+
+/// When the inner of two nested wrappers fails a batch on an earlier
+/// request, the later request the outer one would have failed is never
+/// read: the outer rule is still owed, and fails the read of it on a retry.
+#[test]
+fn an_outer_rule_is_kept_for_a_request_the_inner_layer_never_read() -> io::Result<()> {
+    let fs = FaultFs::new(FaultFs::new(DescriptorFs::new(true)));
+    let files = two_readable(&fs)?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    fs.inner.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::NotFound))
+            .on_path("f0")
+            .once(),
+    );
+
+    let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+    let mut reqs = [
+        BlockRead {
+            file: files[0].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(&mut a),
+        },
+        BlockRead {
+            file: files[1].as_ref(),
+            offset: 0,
+            buf: crate::fs::BlockBuf::new(&mut b),
+        },
+    ];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the inner rule fails the first request");
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+
+    let mut buf = [0u8; 16];
+    let mut retry = [BlockRead {
+        file: files[1].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut retry)
+        .expect_err("the outer rule is still owed");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    Ok(())
+}
+
 /// A wrapper over another wrapper screens each read of a batch with its own
 /// rules too: the inner wrapper showing the descriptor to the backend below
 /// does not let the read past the outer one.
