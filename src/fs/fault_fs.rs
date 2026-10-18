@@ -293,10 +293,8 @@ pub struct FaultInjector {
     /// several sections of one file can open it once and lend the handle, or
     /// open it per section; only the count tells the two apart.
     opens: core::sync::atomic::AtomicUsize,
-    /// Every handle open now, by id, with the descriptor the inner backend
-    /// reads it by, if any, and the path of the file it holds; a rename moves
-    /// the file under its open handles.
-    open_handles: spin::Mutex<Vec<(u64, Option<i32>, PathBuf)>>,
+    /// Every handle open now.
+    open_handles: spin::Mutex<Vec<OpenHandle>>,
     next_handle: core::sync::atomic::AtomicU64,
     /// Whether a removal of a file with an open handle fails, as on a backend
     /// that refuses to unlink an open file.
@@ -311,6 +309,19 @@ pub struct FaultInjector {
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
 pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+
+/// A handle open through a [`FaultFs`].
+struct OpenHandle {
+    id: u64,
+    /// The descriptor the inner backend reads it by, if any.
+    fd: Option<i32>,
+    /// The path it was opened at: the one its reads are matched against,
+    /// through `FaultFile::read_at` or by its descriptor alike.
+    opened: PathBuf,
+    /// The path of the file it holds now: a rename moves the file under its
+    /// open handles.
+    current: PathBuf,
+}
 
 impl FaultInjector {
     /// Creates an injector with no rules (every operation passes untouched).
@@ -335,7 +346,7 @@ impl FaultInjector {
                 .open_handles
                 .lock()
                 .iter()
-                .any(|(_, _, open)| open == path)
+                .any(|open| open.current == path)
     }
 
     /// Records a handle opened on `path`, read by the inner backend through
@@ -344,32 +355,39 @@ impl FaultInjector {
         let id = self
             .next_handle
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        self.open_handles.lock().push((id, fd, path.to_path_buf()));
+        self.open_handles.lock().push(OpenHandle {
+            id,
+            fd,
+            opened: path.to_path_buf(),
+            current: path.to_path_buf(),
+        });
         id
     }
 
     fn note_closed(&self, handle: u64) {
         let mut open = self.open_handles.lock();
-        if let Some(at) = open.iter().position(|(id, ..)| *id == handle) {
+        if let Some(at) = open.iter().position(|open| open.id == handle) {
             open.swap_remove(at);
         }
     }
 
     fn note_renamed(&self, from: &Path, to: &Path) {
-        for (.., path) in self.open_handles.lock().iter_mut() {
-            if path == from {
-                *path = to.to_path_buf();
+        for open in self.open_handles.lock().iter_mut() {
+            if open.current == from {
+                open.current = to.to_path_buf();
             }
         }
     }
 
-    /// The path of the open file the inner backend reads through `fd`.
+    /// The path the read rules match a read of the handle the inner backend
+    /// reads through `fd` against: the one it was opened at, as
+    /// `FaultFile::read_at` matches it.
     fn path_of(&self, fd: i32) -> Option<PathBuf> {
         self.open_handles
             .lock()
             .iter()
-            .find(|(_, open, _)| *open == Some(fd))
-            .map(|(.., path)| path.clone())
+            .find(|open| open.fd == Some(fd))
+            .map(|open| open.opened.clone())
     }
 
     /// Takes a positional read of `path` at `offset` through the read rules:

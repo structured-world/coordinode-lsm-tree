@@ -583,7 +583,14 @@ impl Fs for DescriptorFs {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.mem.rename(from, to)
+        self.mem.rename(from, to)?;
+        // A descriptor follows its file through a rename.
+        for (_, path) in self.paths.lock().iter_mut() {
+            if path == from {
+                *path = to.to_path_buf();
+            }
+        }
+        Ok(())
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
@@ -696,6 +703,33 @@ fn a_batch_a_backend_reads_by_descriptor_is_screened_once_each() -> io::Result<(
         2,
         "each read counted once"
     );
+    Ok(())
+}
+
+/// A handle's reads are matched against the path it was opened at whichever
+/// way they are read: a rename after the open changes neither a direct
+/// `read_at` nor a read the backend makes by the handle's descriptor.
+#[test]
+fn a_renamed_handle_is_matched_by_its_open_path_by_descriptor_too() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files = two_readable(&fs)?;
+    fs.rename(Path::new("/d/f0"), Path::new("/d/g0"))?;
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("/d/f0")
+            .once(),
+    );
+
+    let mut buf = [0u8; 16];
+    let mut reqs = [BlockRead {
+        file: files[0].as_ref(),
+        offset: 0,
+        buf: crate::fs::BlockBuf::new(&mut buf),
+    }];
+    let err = fs
+        .read_blocks_batched(&mut reqs)
+        .expect_err("the rule names the path the handle was opened at");
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     Ok(())
 }
 
