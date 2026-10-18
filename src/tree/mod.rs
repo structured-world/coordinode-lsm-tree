@@ -4720,7 +4720,7 @@ impl Tree {
                 let msg = format!(
                     "Tree::open: refusing to recover {} — `current` pointer is missing \
                      but the directory still holds version artifacts (files in a \
-                     tables folder or in blobs/). This is the on-disk signature of a half-written checkpoint \
+                     tables folder or in blobs/, or a vN past v0). This is the on-disk signature of a half-written checkpoint \
                      or interrupted sealing. Remove the partial directory and retry the \
                      checkpoint, or restore `current` from a backup before reopening.",
                     config.path.display(),
@@ -6628,14 +6628,14 @@ impl Tree {
 
 /// Returns `true` if any tables folder of the tree (the primary one and every
 /// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
-/// holds an entry.
+/// holds an entry, or the tree folder holds a snapshot other than `v0`.
 ///
 /// Used by [`Tree::open`], for a directory with no `current` pointer, to
 /// distinguish a fresh directory or a creation that never completed (empty
-/// folders, a snapshot the pointer never named: nothing of value, safe to
-/// `create_new` over) from a lost pointer, a half-written checkpoint or
-/// another interrupted sealing (files already placed: must error rather than
-/// silently overwrite).
+/// folders, the first snapshot the pointer never named: nothing of value,
+/// safe to `create_new` over) from a lost pointer, a half-written checkpoint
+/// or another interrupted sealing (files already placed: must error rather
+/// than silently overwrite).
 ///
 /// A missing folder is treated as "no state": `create_new` is what creates
 /// the directories in the first place, so callers may invoke `Tree::open`
@@ -6653,7 +6653,20 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(false)
+    // A creation writes `v0`, of an empty version, before the pointer: alone
+    // it holds nothing. Any later snapshot was written by a tree that lived,
+    // or put there to refuse an open (a store mid-conversion).
+    let entries = match config.fs.read_dir(&config.path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(entries.iter().any(|entry| {
+        entry
+            .file_name
+            .strip_prefix('v')
+            .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id != 0))
+    }))
 }
 
 /// Whether two sightings of one table id PROVABLY hold different bytes.
