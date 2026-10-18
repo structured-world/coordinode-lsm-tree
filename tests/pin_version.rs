@@ -424,9 +424,14 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     let layout = pin.layout()?;
 
     let injector = Arc::new(FaultInjector::new());
-    // The edit log is first touched once the manifest is published: failing it
-    // stops the restore between the publication and the memtable flush.
-    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("edits-"));
+    // The edit log is created before the manifest is published and next
+    // opened by the open that follows it: failing that open stops the restore
+    // between the publication and the memtable flush.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
     let interrupted = Config::new(
         dst.path(),
         SequenceNumberCounter::default(),

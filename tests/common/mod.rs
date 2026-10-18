@@ -79,23 +79,17 @@ pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The id of the tree's installed manifest snapshot: the highest `N` with
-/// both `v{N}` and its log `edits-{N}`.
+/// The id of the tree's installed manifest snapshot: the highest `N` of a
+/// `v{N}` (a snapshot not yet installed carries a temporary name).
 pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
-    let mut snapshots = Vec::new();
-    let mut logs = std::collections::HashSet::new();
+    let mut installed = None;
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if let Some(id) = name
-            .strip_prefix("edits-")
-            .and_then(|r| r.parse::<u64>().ok())
-        {
-            logs.insert(id);
-        } else if let Some(id) = name.strip_prefix('v').and_then(|r| r.parse::<u64>().ok()) {
-            snapshots.push(id);
+        if let Some(id) = name.strip_prefix('v').and_then(|r| r.parse::<u64>().ok()) {
+            installed = installed.max(Some(id));
         }
     }
-    Ok(snapshots.into_iter().filter(|id| logs.contains(id)).max())
+    Ok(installed)
 }
 
 /// Returns the SST file paths under `<dir>/tables/`, sorted by id.

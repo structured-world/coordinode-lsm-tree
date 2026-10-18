@@ -201,7 +201,7 @@ fn the_install_after_a_failed_rotation_rotates_instead_of_appending() -> crate::
     assert_eq!(history.snapshot_id, 1, "the install rotated");
     assert!(!history.rotation_pending, "a successful rotation clears it");
     assert_eq!(
-        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs, None)?,
+        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs)?,
         Some(1)
     );
     Ok(())
@@ -232,7 +232,7 @@ fn a_rotation_failing_at_its_directory_sync_marks_the_next_to_rotate() -> crate:
     assert!(!history.rotation_pending);
     assert_eq!(history.snapshot_id, 1);
     assert_eq!(
-        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs, None)?,
+        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs)?,
         Some(1)
     );
     Ok(())

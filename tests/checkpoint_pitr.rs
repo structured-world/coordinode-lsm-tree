@@ -723,11 +723,11 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A checkpoint whose snapshot was never installed (its edit log missing,
-/// what a crash before the install leaves) MUST be rejected by `Tree::open`
-/// rather than silently treated as fresh-tree state: its tables are there.
-/// This regression test removes the log after a successful checkpoint and
-/// asserts open returns an error.
+/// A checkpoint whose snapshot was never installed (still under its
+/// temporary name, what a crash before the rename leaves) MUST be rejected by
+/// `Tree::open` rather than silently treated as fresh-tree state: its tables
+/// are there. This regression test moves the snapshot back to its temporary
+/// name after a successful checkpoint and asserts open returns an error.
 #[test_log::test]
 fn checkpoint_open_rejects_an_uninstalled_snapshot() -> lsm_tree::Result<()> {
     let src_dir = tempfile::tempdir()?;
@@ -742,11 +742,14 @@ fn checkpoint_open_rejects_an_uninstalled_snapshot() -> lsm_tree::Result<()> {
     tree.create_checkpoint(&dst_path)?;
     drop(tree);
 
-    // Tamper: delete the edit log that installs the checkpoint's snapshot,
-    // which the checkpoint makes last.
+    // Tamper: undo the rename that installs the checkpoint's snapshot, which
+    // the checkpoint makes last.
     let id = common::installed_snapshot_id(&dst_path)?
         .expect("checkpoint sealing must have installed a snapshot");
-    std::fs::remove_file(dst_path.join(format!("edits-{id}")))?;
+    std::fs::rename(
+        dst_path.join(format!("v{id}")),
+        dst_path.join(format!("v{id}.tmp")),
+    )?;
 
     // Open MUST fail (no fresh-tree fallback) so callers detect the
     // half-written checkpoint instead of mistaking it for empty data.

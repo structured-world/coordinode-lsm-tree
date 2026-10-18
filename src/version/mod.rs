@@ -31,7 +31,7 @@ mod super_version;
 mod tests;
 
 pub use blob_file_list::BlobFileList;
-pub use persist::persist_version;
+pub use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub use run::Run;
 pub use super_version::RetentionEffect;
 pub use super_version::SnapshotRef;

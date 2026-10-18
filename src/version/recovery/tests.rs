@@ -475,8 +475,8 @@ fn apply_overwrites_gc_stats_when_present() {
     assert_eq!(rec.gc_stats, gc, "GC stats overwritten from the edit");
 }
 
-/// Installs the `v{id}` manifest a fixture wrote, so `recover()` takes it:
-/// its empty edit log is what installs it.
+/// Gives the `v{id}` manifest a fixture wrote under its installed name the
+/// empty edit log an install makes beside it.
 ///
 /// Must be called AFTER the `v{id}` manifest file exists. Fixtures that
 /// test corruption-recovery write the corrupted manifest first, then

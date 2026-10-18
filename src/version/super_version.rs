@@ -288,8 +288,8 @@ pub struct SuperVersions {
     log_entry_synced: bool,
 
     /// Whether a rotation failed since the last that succeeded. A failed one
-    /// may still have installed its snapshot on disk (its log made before the
-    /// failure can survive), and recovery would then replay that snapshot's
+    /// may still have installed its snapshot on disk (its rename made before
+    /// the failure can survive), and recovery would then replay that snapshot's
     /// log, not the current one: an edit appended to the current log would be
     /// lost. So the next persist rotates too, writing a snapshot of the whole
     /// state that supersedes either outcome.
@@ -549,13 +549,13 @@ impl SuperVersions {
     /// rotate when that log has grown past [`Self::log_rotate_bytes`] or the
     /// edit is too large for one log record.
     ///
-    /// Rotation writes a fresh full snapshot for `next`, syncs it, and installs it
-    /// by creating its empty log (all inside [`persist_version`]); only after the
-    /// install is durable does it delete the previous snapshot file and its log.
-    /// Crash points: before the new log exists, the old snapshot is the highest
-    /// installed one and its log is intact (recover old + replay); once it
-    /// exists, the new snapshot is complete and its log is empty (recover new, no
-    /// edits). A torn trailing edit
+    /// Rotation writes a fresh full snapshot for `next` under a temporary name,
+    /// syncs it, and installs it by renaming it (all inside [`persist_version`]);
+    /// only after the install is durable does it delete the previous snapshot
+    /// file and its log. Crash points: before the rename is durable, the old
+    /// snapshot is the highest one and its log is intact (recover old +
+    /// replay); once it is, the new snapshot is complete and its log is empty
+    /// (recover new, no edits). A torn trailing edit
     /// from an interrupted append is dropped on replay — the operation that wrote
     /// it was never acknowledged upward.
     ///

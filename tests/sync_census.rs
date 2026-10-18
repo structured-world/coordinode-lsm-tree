@@ -79,7 +79,13 @@ impl Census {
             Synced::Blob
         } else if file_name.starts_with("edits-") {
             Synced::EditLog
-        } else if file_name.starts_with('v') && file_name[1..].chars().all(|c| c.is_ascii_digit()) {
+        } else if file_name
+            .strip_prefix('v')
+            .map(|rest| rest.strip_suffix(".tmp").unwrap_or(rest))
+            .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        {
+            // A snapshot is synced under its temporary name, before the rename
+            // that installs it.
             Synced::Snapshot
         } else {
             Synced::Other(path.display().to_string())
@@ -223,7 +229,7 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
 
 /// A flush that rotates the manifest installs its fresh snapshot with two
 /// syncs: the snapshot's bytes, then the tree folder for the names of the
-/// snapshot and its empty log, which is what installs it.
+/// renamed snapshot and its empty log.
 #[test]
 fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
     let base = PathBuf::from("/census/rotating");

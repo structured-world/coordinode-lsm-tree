@@ -9106,14 +9106,12 @@ fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() ->
     let source = root.join("tables").join("0");
     assert!(memfs.exists(&source)?, "the fixture's SST is at tables/0");
 
-    // Fail the manifest commit (the creation of the log that installs the
-    // rebuilt snapshot; the persist's first open of that log only measures
-    // it): everything up to publication has run.
+    // Fail the manifest commit (the rename that installs the rebuilt
+    // snapshot): everything up to publication has run.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path("edits-")
-            .skip(1),
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path(root.join("v").to_string_lossy()),
     );
     let result = Config::new(
         &root,
@@ -11084,8 +11082,8 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
 }
 
 /// An INCONCLUSIVE post-persist probe must not claim a committed repair:
-/// with the log's creation refused and the probe of the log failing too,
-/// nothing proves the install, and returning `RepairedButUnopened` would hand
+/// with the installing rename refused and the probe of the snapshot's name
+/// failing too, nothing proves the install, and returning `RepairedButUnopened` would hand
 /// a consumer a replay obligation against the still-unrepaired tree (its
 /// reconciliation could duplicate merge operands) while the cleanup sweeps a
 /// possibly-live generation's edit logs. The sweep arms a one-shot probe
@@ -11128,17 +11126,16 @@ fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Res
         }
 
         let fault = FaultFs::new((*memfs).clone());
-        // The persist's first open of the rebuilt log only measures it; the
-        // second creates it, and is refused.
+        let snapshot = root.join("v").to_string_lossy().into_owned();
+        // The rename that installs the rebuilt snapshot is refused.
         fault.injector().arm(
-            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
-                .on_path("edits-")
-                .skip(1)
+            FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+                .on_path(snapshot.clone())
                 .times(1),
         );
         fault.injector().arm(
             FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path("edits-")
+                .on_path(snapshot)
                 .skip(skip)
                 .times(1),
         );
@@ -11150,7 +11147,7 @@ fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Res
         .with_fs(fault)
         .repair();
 
-        if crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none()
+        if crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none()
             && let Err(e) = &result
         {
             assert!(
@@ -11229,7 +11226,7 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
 }
 
 /// A `persist_version` failure AFTER it installed the rebuilt snapshot (the
-/// directory sync is the one fallible step past the log's creation) must
+/// directory sync is the one fallible step past the installing rename) must
 /// carry the report: the snapshot on disk is installed, so once the
 /// transient fault clears the retry opens it without a repair and answers
 /// with no report at all. The sweep arms a one-shot directory-sync fault at
@@ -11285,8 +11282,7 @@ fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> 
         .with_fs(fault)
         .repair();
 
-        let switched =
-            crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_some();
+        let switched = crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_some();
         match result {
             Ok(_) => {
                 // The fault fired before any sync (or never) without
@@ -12983,11 +12979,12 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
 }
 
 /// The post-failure install probe must fail SAFE: a probe that cannot stat
-/// the rebuilt log (a transient or permission failure) proves nothing about
-/// the install, and treating it as "not installed" lets the still-armed guard
-/// delete replacements a PUBLISHED manifest references: a repaired tree with
-/// missing blob files. The sweep drives a directory-sync fault through every
-/// sync in the commit sequence (including the one AFTER the log's creation)
+/// the rebuilt snapshot's name (a transient or permission failure) proves
+/// nothing about the install, and treating it as "not installed" lets the
+/// still-armed guard delete replacements a PUBLISHED manifest references: a
+/// repaired tree with missing blob files. The sweep drives a directory-sync
+/// fault through every sync in the commit sequence (including the one AFTER
+/// the installing rename)
 /// while the probe is refused; whatever the outcome, an installed rebuilt
 /// snapshot must still resolve every value.
 #[test]
@@ -13065,11 +13062,11 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
         fault
             .injector()
             .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(skip));
-        // ...and the probe cannot stat the rebuilt log to find out what
-        // happened.
+        // ...and the probe cannot stat the rebuilt snapshot's name to find out
+        // what happened.
         fault.injector().arm(
             FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path("edits-"),
+                .on_path(root.join("v").to_string_lossy()),
         );
 
         let result = Config::new(
@@ -13086,7 +13083,7 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
         // The invariant, whatever the fault timing hit: an installed rebuilt
         // snapshot resolves every surviving value: the guard must never have
         // deleted a file the published manifest references.
-        if crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_some() {
+        if crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_some() {
             let tree = Config::new(
                 &root,
                 SequenceNumberCounter::default(),
@@ -13189,7 +13186,7 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
     }
 
     // The rebuilt snapshot's write (the only `v*` file left to write) dies
-    // with ENOSPC, strictly BEFORE its log installs it.
+    // with ENOSPC, strictly BEFORE its rename installs it.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
@@ -13211,7 +13208,7 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
         result.map(|r| r.recovered),
     );
     assert!(
-        crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none(),
+        crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none(),
         "self-check: the fault fired before the install",
     );
 
@@ -13708,8 +13705,7 @@ fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<
                 .times(1),
         );
         let result = chained_config(&root, Arc::new(fault)).repair_with_salvage(true);
-        if result.is_ok()
-            || crate::version::recovery::installed_snapshot(&root, &*memfs, None)?.is_none()
+        if result.is_ok() || crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none()
         {
             continue;
         }

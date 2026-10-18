@@ -301,9 +301,10 @@ const SWAPPING: &str = "convert-to-v6.swapping";
 const OWNED: &str = "convert-to-v6.owned";
 
 /// Keeps a tree from being created in the store's folder while the switch has
-/// set the source aside and not yet put the converted pointer in place: an
-/// open of either format refuses to start a new tree over a folder without a
-/// pointer that holds a manifest file. No version takes this number.
+/// set the source aside and not yet put the converted snapshot in place: a
+/// 5.x open refuses to start a new tree over a folder without a pointer that
+/// holds a manifest file, and a 6.0 open takes it for the highest snapshot,
+/// which does not open. No version takes this number.
 const GUARD: &str = "v18446744073709551615";
 
 /// Converts the store in `folder` in place, leaving the source's entries in
@@ -1475,7 +1476,7 @@ fn remove_staging(
 ///    `tables` into that folder's backup; one already gone was moved.
 /// 3. [`SWAPPING`] is written: the source is wholly set aside.
 /// 4. Each route folder's staged `tables` moves into it, then each staged
-///    entry into the store's folder, the edit log last, so the store
+///    entry into the store's folder, the snapshot last, so the store
 ///    opens as the converted one only once all of it is there.
 /// 5. The staging folders and the markers go, [`READY`] first: with only
 ///    [`SWAPPING`] left, a rerun has nothing to set aside.
@@ -1565,7 +1566,7 @@ fn switch(
         write_marker(&swapping, &carried.encode()?)?;
     }
 
-    // Until the converted store's edit log is in place, the folder holds no
+    // Until the converted store's snapshot is in place, the folder holds no
     // installed store.
     if staging.exists() && !folder.join(GUARD).exists() {
         step()?;
@@ -1596,10 +1597,14 @@ fn switch(
             .map(|entry| entry.map(|e| e.file_name()))
             .filter(|name| !matches!(name, Ok(name) if name == OWNED))
             .collect::<std::io::Result<_>>()?;
-        // The edit log last: it is what installs the converted snapshot, so
+        // The snapshot last: its name is what installs the converted store, so
         // until it is in place the folder opens as nothing, never as part of
         // the converted store.
-        names.sort_by_key(|name| name.to_str().is_some_and(|name| name.starts_with("edits-")));
+        names.sort_by_key(|name| {
+            name.to_str()
+                .and_then(|name| name.strip_prefix('v'))
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        });
         for name in names {
             let to = folder.join(&name);
             if to.exists() {

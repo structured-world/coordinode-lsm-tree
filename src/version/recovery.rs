@@ -426,12 +426,11 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
 /// The id of the installed snapshot of the tree in `folder`, or `None` when
 /// the tree has none (a new tree, or one whose creation never completed).
 ///
-/// A snapshot is installed once its edit log exists: a rotation syncs the
-/// bytes of `v{id}` before it creates `edits-{id}`, and one directory sync
-/// makes both names durable, so a log that survived proves the snapshot's
-/// bytes did. The highest id with both is the tree's; a `v{id}` without its
-/// log is a rotation that never completed and is passed over, and an older
-/// generation a rotation left behind is never chosen, being lower.
+/// A snapshot is installed once it carries its name `v{id}`: it is written
+/// under a temporary name, its bytes synced, and only then renamed, so the
+/// name never holds a snapshot whose bytes were not durable first. The
+/// highest id is the tree's; an older generation a rotation left behind is
+/// never chosen, being lower, and a temporary is not a snapshot at all.
 ///
 /// The choice is by name alone: [`recover`] opens the chosen snapshot and
 /// verifies it, and a failure there is damage to the snapshot the tree was
@@ -440,46 +439,18 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
 ///
 /// # Errors
 ///
-/// Propagates a failure to list `folder`, and refuses with
-/// [`crate::Error::InvalidVersion`] a folder without an installed snapshot
-/// whose newest snapshot is of another format.
-pub fn installed_snapshot(
-    folder: &Path,
-    fs: &dyn Fs,
-    encryption: Option<&alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
-) -> crate::Result<Option<VersionId>> {
+/// Propagates a failure to list `folder`.
+pub fn installed_snapshot(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<VersionId>> {
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut snapshots = Vec::new();
-    let mut logs = crate::HashSet::default();
-    for entry in entries.iter().filter(|entry| !entry.is_dir) {
-        if let Some(id) = snapshot_id_of(&entry.file_name) {
-            snapshots.push(id);
-        } else if let Some(id) = log_id_of(&entry.file_name) {
-            logs.insert(id);
-        }
-    }
-    let installed = snapshots
+    Ok(entries
         .iter()
-        .copied()
-        .filter(|id| logs.contains(id))
-        .max();
-    if installed.is_none()
-        && let Some(newest) = snapshots.iter().copied().max()
-    {
-        // No installed snapshot. A store of another format is still refused
-        // as such rather than taken for a new tree: a 5.x store makes a
-        // rotated snapshot's log only at its first edit, so its newest
-        // snapshot may have none. A snapshot that does not open here is a
-        // write that never completed, which proves nothing either way.
-        if let Ok(mut archive) = open_snapshot(folder, newest, fs, encryption.cloned()) {
-            check_format(&mut archive)?;
-        }
-    }
-    Ok(installed)
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| snapshot_id_of(&entry.file_name))
+        .max())
 }
 
 /// Opens the snapshot `v{id}` in `folder`: its footer (or the head mirror)
@@ -667,7 +638,7 @@ pub fn recover(
     mode: ManifestRecoveryMode,
     encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
 ) -> crate::Result<Recovery> {
-    let curr_version_id = installed_snapshot(folder, fs, encryption.as_ref())?.ok_or(
+    let curr_version_id = installed_snapshot(folder, fs)?.ok_or(
         crate::Error::ManifestFooterInvalid("the tree holds no installed manifest snapshot"),
     )?;
 

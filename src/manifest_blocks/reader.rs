@@ -262,8 +262,17 @@ impl ManifestArchiveReader {
                 // `ManifestFooterInvalid` would send `open_or_repair` into a
                 // rebuild under the wrong key, excluding every table it
                 // cannot decrypt.
+                //
+                // A copy that could not be READ (a transient or environmental
+                // I/O failure) says nothing about its bytes either: collapsing
+                // it would send a retryable hiccup into a manifest rebuild.
                 for err in [tail_err, head_err] {
-                    if matches!(err, crate::Error::Decrypt(_)) {
+                    let propagate = match &err {
+                        crate::Error::Decrypt(_) => true,
+                        crate::Error::Io(e) => e.kind().is_environmental(),
+                        _ => false,
+                    };
+                    if propagate {
                         return Err(err);
                     }
                 }

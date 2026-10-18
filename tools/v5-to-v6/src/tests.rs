@@ -140,10 +140,15 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
             let finished_unbroken = interrupted.is_ok();
 
             // A switch stopped with neither the source's pointer nor the
-            // converted store's edit log in the folder: a tree opened there is
+            // converted store's snapshot in the folder: a tree opened there is
             // refused rather than started fresh over it.
             let installed = std::fs::read_dir(folder.path())?.any(|entry| {
-                entry.is_ok_and(|e| e.file_name().to_string_lossy().starts_with("edits-"))
+                entry.is_ok_and(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .strip_prefix('v')
+                        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                })
             });
             if !installed
                 && !folder

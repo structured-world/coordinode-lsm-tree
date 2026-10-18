@@ -426,17 +426,28 @@ pub fn restore(
         fsync_directory(&root, &*fs, sync_mode)?;
     }
 
+    // Written under a temporary name and renamed once its bytes are synced:
+    // the name installs the snapshot, and one directory sync makes it and the
+    // empty log durable.
+    let temporary = root.join(format!(
+        "v{version_id}{}",
+        crate::version::SNAPSHOT_TEMPORARY_SUFFIX
+    ));
+    if let Err(e) = fs.remove_file(&temporary)
+        && e.kind() != crate::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
     let mut file = fs.open(
-        &root.join(format!("v{version_id}")),
+        &temporary,
         &FsOpenOptions::new().write(true).create_new(true),
     )?;
     file.write_all(manifest)?;
     file.flush()?;
     FsFile::sync_data_with(&*file, sync_mode)?;
     drop(file);
-    // Its log installs the snapshot, made only once the snapshot's bytes are
-    // synced, and one directory sync makes both names durable.
     crate::version::edit_log::create_log(&*fs, &root, version_id)?;
+    fs.rename(&temporary, &root.join(format!("v{version_id}")))?;
     fsync_directory(&root, &*fs, sync_mode)?;
 
     let seqno = Arc::clone(&config.seqno);

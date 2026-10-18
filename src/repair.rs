@@ -4177,17 +4177,17 @@ impl<'a> PublishedBlobReplacements<'a> {
 }
 
 /// What the disk says about a failed `persist_version`: was the rebuilt
-/// snapshot installed (its edit log made) before the error?
+/// snapshot installed (renamed to its name) before the error?
 enum InstallProbe {
-    /// The rebuilt snapshot's log exists: it is, or may become, installed.
+    /// The rebuilt snapshot's name exists: it is, or may become, installed.
     Installed,
-    /// The log is ABSENT (`NotFound`): the install did not happen. Absence is
-    /// conclusive — the persist makes the log only after the snapshot's
-    /// bytes, and nothing removes it after.
+    /// The name is ABSENT (`NotFound`): the install did not happen. Absence
+    /// is conclusive: the rebuilt id is above every manifest file on disk, so
+    /// only the persist's rename makes the name, and nothing removes it after.
     NotInstalled,
-    /// The log's existence cannot be told (a transient or permission failure
-    /// of the probe): NO conclusion. The caller must fail SAFE — treating
-    /// this as "not switched" would delete files a possibly-published
+    /// The name's existence cannot be told (a transient or permission failure
+    /// of the probe): NO conclusion. The caller must fail SAFE: treating
+    /// this as "not installed" would delete files a possibly-published
     /// manifest references.
     Inconclusive,
 }
@@ -4199,7 +4199,7 @@ fn probe_install(
     folder: &std::path::Path,
     version_id: u64,
 ) -> InstallProbe {
-    match fs.metadata(&crate::version::edit_log::log_path(folder, version_id)) {
+    match fs.metadata(&folder.join(format!("v{version_id}"))) {
         Ok(_) => InstallProbe::Installed,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => InstallProbe::NotInstalled,
         Err(_) => InstallProbe::Inconclusive,
@@ -6745,13 +6745,13 @@ fn publish_repaired_manifest(
     );
     // The guard stays ARMED until the commit is decided: every fallible
     // `persist_version` step before it installs the snapshot (manifest
-    // create / encode / finish, and the log's creation) leaves the
-    // replacements unreferenced garbage a retry would re-derive — keeping
+    // create / encode / finish, the log's creation, and the rename) leaves the
+    // replacements unreferenced garbage a retry would re-derive; keeping
     // them would stack another fresh-id copy per failed attempt, walking
     // recovery toward ENOSPC under exactly the tight-space conditions it
     // targets. The ONE fallible step after the install is the directory sync,
-    // so on failure the log on disk decides which world this is: a log of the
-    // rebuilt version means the manifest is or may become published and the
+    // so on failure the name on disk decides which world this is: the rebuilt
+    // snapshot under its name means the manifest is or may become published and the
     // replacements are the files it references. A probe that cannot tell
     // proves nothing, and fail-safe is to PRESERVE: the worst a preserved
     // orphan costs is disk space a later successful repair's reference

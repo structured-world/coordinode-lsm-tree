@@ -4652,11 +4652,7 @@ impl Tree {
         // Recover when the tree holds an installed snapshot, create one
         // otherwise. The installed snapshot is opened here, which reads its
         // footer under the configured provider.
-        let installed = crate::version::recovery::installed_snapshot(
-            &config.path,
-            &*config.fs,
-            config.encryption.as_ref(),
-        )?;
+        let installed = crate::version::recovery::installed_snapshot(&config.path, &*config.fs)?;
         if let Some(id) = installed {
             crate::version::recovery::open_snapshot(
                 &config.path,
@@ -4728,9 +4724,9 @@ impl Tree {
                 // to the timestamp).
                 let msg = format!(
                     "Tree::open: refusing to recover {} — it holds no installed manifest \
-                     snapshot (a v<N> with its edits-<N>) but still holds a tree's state \
-                     (files in its tables/ or blobs/ folder, or an edits-N holding \
-                     edits). This is the on-disk signature of a half-written \
+                     snapshot (a v<N>) but still holds a tree's state (files in its \
+                     tables/ or blobs/ folder, or an edits-N holding edits). This is \
+                     the on-disk signature of a half-written \
                      checkpoint or interrupted sealing. Remove the partial directory and \
                      retry the checkpoint, or restore the snapshot from a backup before \
                      reopening.",
@@ -5421,14 +5417,10 @@ impl Tree {
         // edit log replays on top of; the live version id can be higher (it
         // has no `v{id}` file of its own). Threaded into the version history
         // so the next persist appends to / rotates the right snapshot's log.
-        let snapshot_id = crate::version::recovery::installed_snapshot(
-            &config.path,
-            &*config.fs,
-            config.encryption.as_ref(),
-        )?
-        .ok_or(crate::Error::ManifestFooterInvalid(
-            "the tree holds no installed manifest snapshot",
-        ))?;
+        let snapshot_id = crate::version::recovery::installed_snapshot(&config.path, &*config.fs)?
+            .ok_or(crate::Error::ManifestFooterInvalid(
+                "the tree holds no installed manifest snapshot",
+            ))?;
         {
             let version_id = snapshot_id;
             let manifest_path = config.path.join(format!("v{version_id}"));
