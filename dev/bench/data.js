@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792279740092,
+  "lastUpdate": 1792403056111,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -48488,6 +48488,90 @@ window.BENCHMARK_DATA = {
             "value": 309998.6778246392,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.1us | P99.9: 95.7us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd0ed3f4e60c7c404a196d336db499a0f9fee06d",
+          "message": "perf(tree): sync each new directory entry once (#938)\n\n## Summary\n- Tree creation, the first flush and the open of a KV-separated tree\nsync each new directory entry once, after every entry in that directory\nexists.\n- Table, blob and snapshot files are synced with `sync_data`, which is\n`fdatasync` off macOS.\n- Replaces #936 (same branch, history squashed into one commit).\n\n## Changes\n- Tree creation makes every folder it writes into, then syncs each\nfolder that gained an entry once, on its own backend, before the first\nsnapshot: from each new folder up to the first that existed, routed\ntables folders included; a folder that existed before gives the ones\nabove it no new entry, and they are not synced. Under barrier syncs the\nlast sync on each other device than the tree's is a full one.\n- A failed creation, or an open that fails after making the tree folder,\ntakes back the folders it made, deepest first: the tree folder with what\nwas put in it, every other folder only while empty, since no lock covers\na folder above the tree. A folder it cannot remove has its holders\nsynced, so a retry never finds a folder whose name is not durable; an\nopen that cannot take the lock only syncs them.\n- A snapshot's edit log is created with the snapshot, under the same\ndirectory sync, so the first append syncs no directory. Repair keeps\nthat log when it sweeps the stale ones.\n- Opening a KV-separated tree that makes its blob folder syncs the tree\nfolder; one that finds it makes no sync.\n- Without a current pointer, open creates a tree only over what a\ncreation cut short leaves (empty folders, a lone `v0`, an empty log);\nfiles in a tables folder or `blobs/`, a later snapshot or a log holding\nan edit are refused as a tree's state.\n- `Fs::remove_dir` removes an empty directory and only an empty one (the\ndefault reports `Unsupported`); `Fs::symlink` and `Fs::symlink_to_dir`\nmake and inspect symbolic links on backends that report them.\n- `FaultFs` records every sync by path and kind (`SyncKind`,\n`take_syncs`) and each directory sync's mode. `CrashFs` orders a removal\nand a rename behind a barrier sync as steps among the syncs\n(`ordered_steps`), each kept or lost whole; a lost step puts back the\nfile it took, a hard link as a link and a symbolic link with its kind.\n\n| Operation | Syncs before | Syncs after |\n|---|---|---|\n| create a tree | 8 | 5 |\n| first flush after creation | 4 | 3 |\n| reopen a KV-separated tree | 2 | 0 |\n\n## Testing\n- A sync census over `FaultFs` pins the syncs of each operation\n(standard, KV-separated and routed trees, a failed creation). Crash\nsweeps over every prefix of ordered steps cover creation, flushes,\nrenames, removals and a compaction; crash tests keep a created tree, its\nfirst flush, a later KV-separated open and a manifest rotation through a\npower loss. Failed creations and opens are checked to take back only\ntheir own folders.\n- fmt, clippy in every CI configuration, the full nextest suite, doc\ntests, the doc build, the no-std check, sst-dump and the converter pass\non Linux.\n\nCloses #926\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved crash recovery for files, directories, and links during\ninterrupted operations.\n* Strengthened durability when creating, opening, flushing, and\nrecovering trees, including trees with separated blob storage or routed\ntables.\n* Fixed recovery handling for edit logs and newly created folders,\nhelping prevent lost data or leftover partial state.\n* **New Features**\n* Added directory removal and symbolic-link support across filesystem\nbackends.\n  * Added filesystem sync tracking for diagnostics and testing.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-19T12:20:38+03:00",
+          "tree_id": "14e9ae34aeae9d45752468a0738f86225bb1f777",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dd0ed3f4e60c7c404a196d336db499a0f9fee06d"
+        },
+        "date": 1792403054877,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 116464.50651556332,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 21.9us | P99.9: 37.8us\nthreads: 1 | elapsed: 4.60s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2345505.400062946,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 5.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 609357.6742475027,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.6us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 370323.42913259135,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 9.4us | P99.9: 33.4us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2331847.2859221366,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 4.9us | P99.9: 7.7us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 227997.00172086892,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 12.5us | P99.9: 33.9us\nthreads: 1 | elapsed: 0.88s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 126225.95626763276,
+            "unit": "ops/sec",
+            "extra": "P50: 6.9us | P99: 21.1us | P99.9: 54.3us\nthreads: 1 | elapsed: 1.58s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 683368.1967855761,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.0us | P99.9: 12.5us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 645375.746601319,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 2.1us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 312740.9903886687,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 13.9us | P99.9: 84.4us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
