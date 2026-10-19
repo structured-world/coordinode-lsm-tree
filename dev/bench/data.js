@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792403064912,
+  "lastUpdate": 1792410841591,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -49418,6 +49418,90 @@ window.BENCHMARK_DATA = {
             "value": 312740.9903886687,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 13.9us | P99.9: 84.4us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3d1ae065f64d8c8c09e02859b5e95bc08c763c0c",
+          "message": "fix(fs): delegate the std capabilities of IoUringFs (#939)\n\n## Summary\n\n- A tree on the `io_uring` backend gets every file-system capability the\nsame files have under `StdFs`: tight-space compaction runs, table and\nblob prefix punches land, checkpoints clone where the file system\nclones, deferred reclaims can read link counts, SSTs opt out of\ncopy-on-write, and readahead advice reaches the kernel.\n- `FaultFs` over the ring exercises the ring's batches and read queue,\nits read rules screening each read once.\n- Replaces #935 (same branch, history squashed into one commit).\n\n## Changes\n\n- `IoUringFs` delegates `capabilities`, `punch_hole`, `reflink_file`,\n`try_disable_cow` and `hard_link_count` to the std backend; its files\ndelegate `hint` (fadvise on the same descriptor). The sync variants stay\non the ring: on Linux every `SyncMode` is the same `fsync` /\n`fdatasync`.\n- `Fs::reads_by_descriptor` says whether a backend's batched reads and\nread queue read a descriptor-backed file past `FsFile::read_at`;\n`Fs::check_descriptor_batch` says what such a backend refuses its\ndescriptor requests for together. `ReadQueue::take_kept` hands back the\nreads a wait for none kept rather than issued (`io_uring`: those with no\nroom on its channel). The defaults are `false`, nothing and none;\n`IoUringFs` answers all three.\n- `FaultFs` forwards `read_blocks_batched`, `read_blocks_batched_each`\nand `read_queue` to its inner backend. Over a backend that reads by\ndescriptor, each request is screened by the read rules first; a request\na rule fails ends a batch there and comes back failed from a queue, and\nevery request handed down counts as a read. A queued read the inner\nqueue keeps is screened again by the wait that issues it. A batch whose\ndescriptor requests the backend refuses goes down as it came. What\nscreening spent is given back only into the injector state it was spent\nfrom. A handle shows its descriptor only inside its own wrapper's batch\nor queue wait, layer by layer through nested wrappers, so no other\nbackend reads it past the rules. Over any other backend the requests are\nscreened at `read_at`, and only there.\n\n## Testing\n\nfmt, clippy (all features and default), the full nextest suite in both\nconfigurations, doc tests, docs, the no-std check, `tools/sst-dump`, the\nbench tests and the 5.x converter pass on Linux (btrfs). Tests on\n`io_uring` cover the capabilities matching the std backend, a punched\nhole, path link counts, an independent clone, read rules on queued and\nbatched reads, and tight-space compaction, blob defragmentation and a\nreflinked checkpoint end to end; a test backend that reads by descriptor\nor through `read_at` covers both screening paths, nested wrappers,\nhandles read by another wrapper, kept queued reads, refused descriptor\ngroups and refunds across a clear on every platform.\n\n## Related\n\n- #924: the same capability methods for the raw `no_std` `io_uring`\nbackend, which needs its own syscalls.\n\nCloses #920\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Batched and queued reads now handle descriptor-based requests more\nreliably, including validation of request sizes and offsets and clearer\nhandling of requests that cannot be issued immediately.\n* Fault-injection rules are applied consistently to positional, batched,\nand queued reads, including when reads are deferred or handled through\nnested filesystem wrappers.\n* The `io_uring` filesystem now supports additional filesystem\ncapabilities, including hole punching, reflinks, hard-link counts, and\nfile hints.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-19T11:39:14Z",
+          "tree_id": "417bf824a2e28de27b0ebf7f394bad162fe8b47c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3d1ae065f64d8c8c09e02859b5e95bc08c763c0c"
+        },
+        "date": 1792410840344,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 120598.11720900863,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 17.0us | P99.9: 31.1us\nthreads: 1 | elapsed: 4.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2539341.9292850913,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.8us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 566897.272446053,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 3.7us | P99.9: 14.0us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 401284.9231522016,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 9.2us | P99.9: 38.9us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2258725.5868186015,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 5.1us | P99.9: 7.8us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 197906.4292247735,
+            "unit": "ops/sec",
+            "extra": "P50: 3.8us | P99: 18.2us | P99.9: 35.2us\nthreads: 1 | elapsed: 1.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 118344.87198202056,
+            "unit": "ops/sec",
+            "extra": "P50: 7.1us | P99: 33.1us | P99.9: 50.5us\nthreads: 1 | elapsed: 1.69s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 564107.9316618554,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 3.8us | P99.9: 17.6us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 721883.2675485924,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 291029.65973481553,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 17.8us | P99.9: 98.9us\nthreads: 1 | elapsed: 0.69s | num: 200000 | iterations: 3"
           }
         ]
       }
