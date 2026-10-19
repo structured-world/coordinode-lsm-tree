@@ -142,15 +142,6 @@ fn checkpoint_binds_restrict_sidecar_to_captured_view_not_live_file() -> crate::
     Ok(())
 }
 
-// Removed: `write_current_for_version_rejects_corrupt_footer_size_hint`.
-// The checkpoint write path now goes through
-// `ManifestArchiveReader::open` (canonical CURRENT digest path),
-// which has head-mirror fallback for a torn tail size hint —
-// recovery succeeds instead of erroring, which is the correct
-// behaviour. Tail / head-mirror bounds checks are covered by
-// `manifest_blocks::reader::tests::reader_fails_when_tail_corrupt_and_no_mirror`
-// and siblings.
-
 /// A [`Fs`] over `StdFs` that ADVERTISES reflink support and implements
 /// `reflink_file` as a plain byte copy (the semantics a real clone gives the
 /// caller: an independent destination inode). Used to drive the checkpoint's

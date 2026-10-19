@@ -13,16 +13,17 @@ const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
 /// Keep in sync with the copy in the `lsm-tree` crate's `tests/repair.rs` (a
 /// separate crate, so the helper cannot be shared directly): both encode the
-/// manifest file-naming convention (`v{N}` + `current`).
+/// manifest file-naming convention (`v{N}` + `edits-{N}`).
 fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_version = name
+        let is_manifest = name
             .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_manifest {
             std::fs::remove_file(entry.path())?;
         }
     }

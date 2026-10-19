@@ -1,7 +1,13 @@
-use byteorder::{LittleEndian, ReadBytesExt};
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, get_tmp_folder};
-use std::{fs::File, path::Path};
+use std::path::Path;
 use test_log::test;
+
+mod common;
+
+/// The id of the installed manifest snapshot.
+fn installed(path: &Path) -> lsm_tree::Result<u64> {
+    Ok(common::installed_snapshot_id(path)?.expect("the tree holds an installed snapshot"))
+}
 
 /// Read the `format_version` byte from the current manifest by
 /// opening it through the (private) `ManifestArchiveReader` test
@@ -10,7 +16,7 @@ use test_log::test;
 /// extraction so the test cannot accidentally observe a corrupted
 /// byte that the Block layer would have rejected.
 fn read_manifest_format_version(path: &Path) -> lsm_tree::Result<u8> {
-    let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    let curr_version_id = installed(path)?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
     let mut archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
         &manifest_path,
@@ -34,7 +40,7 @@ fn read_manifest_format_version(path: &Path) -> lsm_tree::Result<u8> {
 /// layer rather than at the Block-XXH3 layer.
 fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result<()> {
     use std::io::Write;
-    let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    let curr_version_id = installed(path)?;
     let manifest_path = path.join(format!("v{curr_version_id}"));
 
     // Reconstruct: read every existing section, drop the file, then
@@ -72,34 +78,6 @@ fn rewrite_manifest_format_version(path: &Path, version: u8) -> lsm_tree::Result
         w.write_all(&payload)?;
     }
     w.finish()?;
-
-    // CURRENT pointer carries the canonical digest over the
-    // manifest's parsed footer (TOC + per-section XXH3-128s) —
-    // recompute it from the rewritten manifest so
-    // `get_current_version` lets the test reach the version-policy
-    // code path it actually wants to exercise (otherwise the digest
-    // mismatch surfaces first as ChecksumMismatch).
-    use byteorder::WriteBytesExt as _;
-    let archive = lsm_tree::manifest_blocks::reader::ManifestArchiveReader::open(
-        &manifest_path,
-        &lsm_tree::fs::StdFs,
-        std::sync::Arc::new(lsm_tree::runtime_config::RuntimeConfig::default()),
-        None,
-    )?;
-    let checksum =
-        lsm_tree::manifest_blocks::current_digest::compute(curr_version_id, archive.footer())?;
-    let mut content: Vec<u8> = Vec::new();
-    content.write_u64::<byteorder::LittleEndian>(curr_version_id)?;
-    content.write_u128::<byteorder::LittleEndian>(checksum)?;
-    content.write_u8(0)?; // xxh3
-    let current_path = path.join("current");
-    let mut current_file = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(&current_path)?;
-    current_file.write_all(&content)?;
-    current_file.sync_all()?;
 
     Ok(())
 }
@@ -234,8 +212,8 @@ fn tree_rejects_unsupported_manifest_version() -> lsm_tree::Result<()> {
 fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree::Result<()> {
     // Under the incremental manifest a version upgrade appends a VersionEdit to
     // the snapshot's `edits-{snapshot_id}` log rather than writing a full
-    // `v{id}` per version. So only the snapshot file (`v0`, which CURRENT points
-    // at) exists on disk; intermediate versions live in the log. On reopen the
+    // `v{id}` per version. So only the snapshot file (`v0`, the installed one)
+    // exists on disk; intermediate versions live in the log. On reopen the
     // snapshot is loaded and the log replayed, and orphan-cleanup keeps exactly
     // that one snapshot generation (`v0` + `edits-0`).
     let folder = get_tmp_folder();
@@ -281,11 +259,11 @@ fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree:
             SequenceNumberCounter::default(),
         )
         .open()?;
-        // CURRENT still points at the v0 snapshot, with its edit log layered on
-        // top — both survive orphan cleanup; there is no v1/v2 to clean.
+        // The v0 snapshot is still the installed one, with its edit log layered
+        // on top: both survive orphan cleanup; there is no v1/v2 to clean.
         assert!(
             path.join("v0").try_exists()?,
-            "the snapshot CURRENT references is preserved across reopen"
+            "the installed snapshot is preserved across reopen"
         );
         assert!(
             path.join("edits-0").try_exists()?,
@@ -557,7 +535,7 @@ fn repair_clears_torn_edit_log_tail_and_reopens_under_default() -> lsm_tree::Res
 }
 
 /// Rotation: with a tiny rotate threshold every upgrade after the first writes
-/// a fresh full snapshot, repoints CURRENT, and garbage-collects the previous
+/// and installs a fresh full snapshot, and garbage-collects the previous
 /// snapshot + its edit log — leaving exactly one live `v{id}` generation. After
 /// several rotating flushes the tree reopens cleanly and all keys read back.
 ///
@@ -586,7 +564,7 @@ fn tree_rotates_snapshot_and_gcs_old_generation() -> lsm_tree::Result<()> {
             tree.flush_active_memtable(i)?;
 
             // Exactly one `v{id}` snapshot file exists at any time after a
-            // rotation (the old one is deleted once CURRENT is repointed).
+            // rotation (the old one is deleted once the new one is installed).
             let snapshots = std::fs::read_dir(path)?
                 .filter_map(Result::ok)
                 .filter(|e| {
@@ -602,9 +580,8 @@ fn tree_rotates_snapshot_and_gcs_old_generation() -> lsm_tree::Result<()> {
 
             // The other half of the generation-GC contract: a rotation deletes
             // the previous snapshot's edit log. At most one `edits-*` may exist
-            // at any point (the current snapshot's, present after an append and
-            // gone right after a rotate). A rotation that leaked old logs would
-            // accumulate them and trip this bound.
+            // at any point (the current snapshot's, made with it). A rotation
+            // that leaked old logs would accumulate them and trip this bound.
             let edit_logs = std::fs::read_dir(path)?
                 .filter_map(Result::ok)
                 .filter(|e| {
@@ -1118,23 +1095,11 @@ fn tree_open_with_page_ecc_on_feature_off_build_errors() {
     }
 }
 
+/// A tree whose installed snapshot file was deleted, its log and tables
+/// still there, is not a fresh directory: opening it fails rather than
+/// creating an empty tree over the tables, and leaves the log as it was.
 #[test]
-fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() -> lsm_tree::Result<()>
-{
-    // Regression: CURRENT pointing at a missing v{N} manifest file
-    // is half-applied recovery / corruption, NOT a fresh-init
-    // signal. Tree::open used to silently fall through its
-    // `Err(Io(NotFound)) => create_new` arm in this state because
-    // the manifest open inside `get_current_version` surfaced the
-    // same NotFound the CURRENT-absent path uses — and the
-    // has_existing_version_state probe didn't catch the case
-    // because CURRENT itself was still present. Result: opening a
-    // tree with a deleted manifest would clobber CURRENT with a
-    // fresh v0 instead of erroring, turning a recoverable failure
-    // into silent data loss. The fix in `get_current_version`
-    // rewraps the manifest open's NotFound as
-    // ManifestFooterInvalid so the outer Tree::open match never
-    // mistakes it for "no CURRENT".
+fn tree_open_with_a_deleted_snapshot_errors_not_recreates() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let path = folder.path();
 
@@ -1149,9 +1114,9 @@ fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() ->
         tree.flush_active_memtable(0)?;
     }
 
-    let curr_version_id = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
-    let manifest_path = path.join(format!("v{curr_version_id}"));
-    std::fs::remove_file(&manifest_path)?;
+    let curr_version_id = installed(path)?;
+    let log = std::fs::read(path.join(format!("edits-{curr_version_id}")))?;
+    std::fs::remove_file(path.join(format!("v{curr_version_id}")))?;
 
     let result = Config::new(
         path,
@@ -1159,26 +1124,28 @@ fn tree_open_with_missing_manifest_but_present_current_errors_not_recreates() ->
         SequenceNumberCounter::default(),
     )
     .open();
-
     match result {
         Ok(_) => panic!(
-            "Tree::open with CURRENT present but manifest v{curr_version_id} deleted \
-             MUST surface an error — silently re-creating from scratch would clobber \
-             the user's CURRENT pointer and lose the half-applied recovery signal"
+            "Tree::open with snapshot v{curr_version_id} deleted MUST surface an error: \
+             silently re-creating from scratch would overwrite the tree its tables hold"
         ),
-        Err(lsm_tree::Error::ManifestFooterInvalid(_)) => {}
-        Err(e) => panic!("expected ManifestFooterInvalid for missing manifest, got {e:?}"),
+        Err(lsm_tree::Error::Io(e)) => {
+            assert_eq!(e.kind(), lsm_tree::io::ErrorKind::InvalidData, "{e}");
+        }
+        Err(e) => panic!("expected the refusal to create over existing tables, got {e:?}"),
     }
 
-    // The whole point of the regression is preventing CURRENT
-    // clobber. Erroring is necessary but not sufficient — a future
-    // implementation could satisfy the error-variant check above
-    // and still rewrite the pointer on its way out. Re-read CURRENT
-    // and assert it still points at the original version.
-    let still_current = File::open(path.join("current"))?.read_u64::<LittleEndian>()?;
+    // Erroring is necessary but not sufficient: a failed open must not
+    // write a fresh snapshot or touch the log on its way out.
     assert_eq!(
-        still_current, curr_version_id,
-        "failed Tree::open must not rewrite the CURRENT pointer"
+        common::installed_snapshot_id(path)?,
+        None,
+        "failed Tree::open must not install a snapshot"
+    );
+    assert_eq!(
+        std::fs::read(path.join(format!("edits-{curr_version_id}")))?,
+        log,
+        "failed Tree::open must not touch the log"
     );
 
     Ok(())

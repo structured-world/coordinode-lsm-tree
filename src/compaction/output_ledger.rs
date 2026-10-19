@@ -131,6 +131,24 @@ impl OutputLedger {
         self.0.files.lock().clear();
     }
 
+    /// Leaves every recorded file in place, after an install whose outcome is
+    /// unknown: a power loss may still make it the installed one, naming
+    /// them. Their bytes stay held in the tree's quota; the next open's
+    /// orphan sweep removes the ones no version names.
+    pub fn keep_uninstalled(&self) {
+        let outputs = core::mem::take(&mut *self.0.files.lock());
+        let room = self.0.room.lock().take();
+        if let Some(room) = &room {
+            // `None` once a file's length cannot be read: the room keeps all
+            // it granted.
+            let kept = outputs.iter().try_fold(0u64, |sum, output| {
+                Some(sum + output.fs.metadata(&output.path).ok()?.len)
+            });
+            room.strand(kept);
+        }
+        drop(room);
+    }
+
     /// Deletes every recorded file, then gives the run's room back. Called
     /// once the run has returned, when no handle it opened on these files is
     /// left: each one's cached descriptor is evicted first, since a backend

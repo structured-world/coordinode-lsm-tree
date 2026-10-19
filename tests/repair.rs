@@ -3,8 +3,8 @@
 
 //! Disaster-recovery: rebuilding the manifest from on-disk SSTs.
 //!
-//! The contract under test: after the manifest (and its `current` pointer) is
-//! gone, `Config::repair` reconstructs a manifest from the SST files alone such
+//! The contract under test: after the manifest (its snapshots and edit logs)
+//! is gone, `Config::repair` reconstructs a manifest from the SST files alone such
 //! that every previously written key is still readable on reopen. Recent
 //! unlogged version edits may be lost, but no readable SST's data is dropped.
 
@@ -1870,8 +1870,8 @@ fn open_or_repair_propagates_a_wrong_key_decrypt_failure() -> lsm_tree::Result<(
             let name = entry?.file_name().to_string_lossy().into_owned();
             if name
                 .strip_prefix('v')
+                .or_else(|| name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok())
-                || name == "current"
             {
                 names.push(name);
             }

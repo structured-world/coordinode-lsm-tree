@@ -329,13 +329,22 @@ fn restore_refuses_a_folder_holding_a_tree() -> lsm_tree::Result<()> {
         Some(&b"kept"[..])
     );
 
-    let current = std::fs::read(dst.path().join("current"))?;
+    // The manifest generation the open tree is on: its snapshots and logs.
+    let manifest = || -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dst.path())? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('v') || name.starts_with("edits-") {
+                files.push((name, std::fs::read(entry.path())?));
+            }
+        }
+        files.sort();
+        Ok(files)
+    };
+    let before = manifest()?;
     assert!(restore().is_err(), "an open tree is refused");
-    assert_eq!(
-        std::fs::read(dst.path().join("current"))?,
-        current,
-        "the open tree's pointer is untouched"
-    );
+    assert_eq!(manifest()?, before, "the open tree's manifest is untouched");
     Ok(())
 }
 
@@ -415,9 +424,14 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     let layout = pin.layout()?;
 
     let injector = Arc::new(FaultInjector::new());
-    // The edit log is first touched once the manifest is published: failing it
-    // stops the restore between the publication and the memtable flush.
-    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("edits-"));
+    // The edit log is created before the manifest is published and next
+    // opened by the open that follows it: failing that open stops the restore
+    // between the publication and the memtable flush.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
     let interrupted = Config::new(
         dst.path(),
         SequenceNumberCounter::default(),

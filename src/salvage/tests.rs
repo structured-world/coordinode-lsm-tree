@@ -5751,6 +5751,54 @@ fn salvage_drops_a_corrupted_columnar_block_and_keeps_the_rest() -> crate::Resul
     Ok(())
 }
 
+/// A columnar block the salvage cannot write to its OUTPUT is a destination
+/// failure, whatever the I/O error's kind: the salvage reports it as one,
+/// so repair stops instead of grading the intact source as damage.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_block_the_output_cannot_take_fails_as_an_output_failure() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+
+    let dir = tempdir()?;
+    let source = dir.path().join("source");
+    let dest = dir.path().join("salvaged");
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+
+    // Without deletes, every block takes the unmasked path.
+    let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true)
+        .use_row_group_size(256);
+    for i in 0..20_000u32 {
+        writer.write(iv(i))?;
+    }
+    assert!(
+        writer.finish()?.is_some(),
+        "source columnar SST is non-empty"
+    );
+
+    // Each write of the output in turn fails, until the salvage gets
+    // through.
+    let mut failed = 0;
+    for skip in 0u64.. {
+        let faulty = FaultFs::new(StdFs);
+        faulty.injector().arm(
+            FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other))
+                .on_path("salvaged")
+                .skip(skip)
+                .once(),
+        );
+        let faulty: Arc<dyn Fs> = Arc::new(faulty);
+        match salvage_sst(&source, dest.clone(), &faulty) {
+            Ok(_) => break,
+            Err(crate::Error::SalvageOutput(_)) => failed += 1,
+            Err(e) => panic!("write {skip} of the output failed as {e:?}"),
+        }
+    }
+    assert!(failed > 1, "the output takes more than one write");
+    Ok(())
+}
+
 /// A columnar block whose outer `ColumnBatch` frame decodes but whose row
 /// materialization fails (an invalid value-type byte in an otherwise
 /// checksum-consistent block) is dropped like any other block-local decode
@@ -8530,10 +8578,12 @@ fn publish_fails_when_the_temp_name_cannot_be_dropped() -> crate::Result<()> {
 
     let result = salvage_sst(&source, dest.clone(), &fs);
     assert!(
-        result.as_ref().is_err_and(
-            |e| matches!(e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
-        ),
-        "a stuck temp name must fail the salvage, not be shrugged off: {result:?}",
+        result.as_ref().is_err_and(|e| matches!(
+            e,
+            crate::Error::SalvageOutput(e)
+                if matches!(&**e, crate::Error::Io(e) if e.kind() == ErrorKind::PermissionDenied)
+        )),
+        "a stuck temp name must fail the salvage as a destination failure: {result:?}",
     );
     // The freshly linked destination must be unwound with the error: left
     // installed, a retry after the filesystem is fixed would bounce off
@@ -8626,9 +8676,11 @@ fn publish_refuses_to_replace_a_concurrently_created_destination_without_hard_li
 
     let result = salvage_sst(&source, dest.clone(), &fs);
     assert!(
-        result.as_ref().is_err_and(
-            |e| matches!(e, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::AlreadyExists)
-        ),
+        result.as_ref().is_err_and(|e| matches!(
+            e,
+            crate::Error::SalvageOutput(e)
+                if matches!(&**e, crate::Error::Io(e) if e.kind() == crate::io::ErrorKind::AlreadyExists)
+        )),
         "the publish must refuse the taken destination, not replace it: {result:?}",
     );
     assert_eq!(
