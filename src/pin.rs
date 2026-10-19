@@ -419,25 +419,34 @@ pub fn restore(
     // wrote. Any other tree is never published over: its open would sweep
     // that tree's manifest and tables as orphans of the restored layout.
     let resuming = fs.exists(&marker)?;
-    for entry in fs.read_dir(&root)? {
-        let name = &entry.file_name;
-        let manifest_file = name.starts_with("edits-")
+    let dirents = fs.read_dir(&root)?;
+    let manifest_file = |name: &str| {
+        name.starts_with("edits-")
             || name
                 .strip_prefix('v')
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()));
-        if !manifest_file {
-            continue;
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
+    };
+    // Judged before anything goes: a tree found here keeps every file,
+    // its report copy included.
+    if !resuming && let Some(entry) = dirents.iter().find(|entry| manifest_file(&entry.file_name)) {
+        return Err(crate::Error::from(crate::io::Error::new(
+            crate::io::ErrorKind::AlreadyExists,
+            format!(
+                "restore_pinned: {} already holds a tree ({})",
+                root.display(),
+                entry.file_name
+            ),
+        )));
+    }
+    // The interrupted restore's manifest goes, and so does any report copy:
+    // one it wrote under the snapshot id this restore installs again would
+    // otherwise be handed out for a layout that owes no report.
+    for dirent in dirents {
+        if manifest_file(&dirent.file_name)
+            || crate::file::repair_report_name(&dirent.file_name).is_some()
+        {
+            fs.remove_file(&dirent.path)?;
         }
-        if !resuming {
-            return Err(crate::Error::from(crate::io::Error::new(
-                crate::io::ErrorKind::AlreadyExists,
-                format!(
-                    "restore_pinned: {} already holds a tree ({name})",
-                    root.display()
-                ),
-            )));
-        }
-        fs.remove_file(&entry.path)?;
     }
 
     // The streamed files first: the manifest installed below must never name a

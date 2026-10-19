@@ -31,6 +31,58 @@ fn reopen(fs: &CrashFs, blob: bool) -> AnyTree {
         .expect("the tree reopens after the power loss")
 }
 
+/// A flush whose edit could not be synced is still in the log a later open
+/// reads, and that open shows its keys as persisted, so a caller may trim its
+/// own log by them. The open removes nothing, yet it makes the log it read
+/// durable before it returns the tree: a power loss then keeps the keys the
+/// open showed.
+#[test]
+fn an_open_that_removes_nothing_still_makes_the_log_it_read_durable() {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    let config = || {
+        Config::new(
+            DB,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fault.clone())
+    };
+    {
+        let tree = config().open().expect("create");
+        tree.insert("key", "value", 0);
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::SyncData,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("edits-")
+            .once(),
+        );
+        assert!(
+            tree.flush_active_memtable(0).is_err(),
+            "self-check: the flush's edit is not synced"
+        );
+    }
+    {
+        let tree = config().open().expect("an open over the unsynced edit");
+        assert!(
+            tree.get("key", u64::MAX).expect("get").is_some(),
+            "self-check: the open shows the flushed key"
+        );
+    }
+
+    crash.crash();
+    let tree = config()
+        .open()
+        .expect("the tree opens after the power loss");
+    assert!(
+        tree.get("key", u64::MAX).expect("get").is_some(),
+        "the key the open showed survives the power loss"
+    );
+}
+
 /// A compaction whose edit could not be synced may or may not be in the log
 /// after a power loss. An open before that power loss reads the edit and
 /// removes the tables it took out: the open makes the log it read durable

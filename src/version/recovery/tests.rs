@@ -1220,16 +1220,17 @@ fn a_store_with_a_version_pointer_is_refused_as_another_format() -> crate::Resul
 fn a_snapshot_under_another_number_is_refused() -> crate::Result<()> {
     use std::io::{Read, Write};
     let fs = std::sync::Arc::new(MemFs::new());
-    let folder = Path::new("/renumbered");
-    drop(
-        crate::Config::new(
-            folder,
-            crate::SequenceNumberCounter::default(),
-            crate::SequenceNumberCounter::default(),
-        )
-        .with_shared_fs(fs.clone())
-        .open()?,
-    );
+    let config = crate::Config::new(
+        "/renumbered",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    // The folder as the config resolved it: on Windows a rooted path without a
+    // drive is made absolute, so the literal spelling names another folder.
+    let folder = config.path.clone();
+    let folder = folder.as_path();
+    drop(config.open()?);
     let id = installed_snapshot(folder, &*fs)?.ok_or(crate::Error::Unrecoverable)?;
     let mut bytes = Vec::new();
     fs.open(
@@ -1259,6 +1260,52 @@ fn a_snapshot_under_another_number_is_refused() -> crate::Result<()> {
         ),
         "got {err:?}",
     );
+    Ok(())
+}
+
+/// Only the spelling the engine writes names a snapshot or an edit log: a
+/// leading zero is a file it never made, and taking it for one would open
+/// another name than the one listed.
+#[test]
+fn only_canonical_ids_name_a_snapshot_or_a_log() {
+    assert_eq!(snapshot_id_of("v0"), Some(0));
+    assert_eq!(snapshot_id_of("v10"), Some(10));
+    assert_eq!(snapshot_id_of("v010"), None);
+    assert_eq!(snapshot_id_of("v00"), None);
+    assert_eq!(log_id_of("edits-0"), Some(0));
+    assert_eq!(log_id_of("edits-07"), None);
+}
+
+/// A stray file spelled like a higher snapshot with a leading zero is not the
+/// installed snapshot: the tree opens on the one it wrote.
+#[test]
+fn a_stray_zero_padded_snapshot_name_does_not_hide_the_installed_one() -> crate::Result<()> {
+    use crate::AbstractTree;
+    let fs = std::sync::Arc::new(MemFs::new());
+    let config = crate::Config::new(
+        "/zero-padded",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let folder = config.path.clone();
+    {
+        let tree = config.open()?;
+        tree.insert("key", "value", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    fs.open(
+        &folder.join("v0100"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?;
+    let tree = crate::Config::new(
+        &folder,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .open()?;
+    assert!(tree.get("key", crate::MAX_SEQNO)?.is_some());
     Ok(())
 }
 

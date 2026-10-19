@@ -55,7 +55,7 @@ pub const REPAIR_TMP_SUFFIX: &str = ".repair-tmp";
 pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> {
     file_name
         .strip_suffix(REPAIR_TMP_SUFFIX)
-        .and_then(|id| id.parse::<crate::TableId>().ok())
+        .and_then(canonical_id)
 }
 
 /// Prefix of the durable copy of a manifest repair's report.
@@ -78,10 +78,20 @@ pub fn repair_report_name(file_name: &str) -> Option<(u64, bool)> {
         Some(digits) => (digits, true),
         None => (rest, false),
     };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok().map(|id| (id, temporary))
+    canonical_id(digits).map(|id| (id, temporary))
+}
+
+/// The id `digits` spells in the form the engine writes ids into names.
+///
+/// Decimal, with no sign and no leading zero. Any other spelling names a file
+/// the engine never made; taking it for an id would make a lookup by that id
+/// open another name than the one listed.
+#[must_use]
+pub fn canonical_id(digits: &str) -> Option<u64> {
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if canonical { digits.parse().ok() } else { None }
 }
 
 /// Carries the copy of a repair report kept for snapshot `from` in `folder`
@@ -116,7 +126,7 @@ pub fn carry_repair_report(
 /// `folder`, sealed as they lie; `None` when there is none.
 fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
     use crate::fs::FsOpenOptions;
-    let source = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"));
+    let source = repair_report_path(folder, id);
     let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
         Ok(file) => file,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
@@ -160,11 +170,19 @@ pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Ve
     }
 }
 
+/// The copy of a repair report for snapshot `id` in `folder`.
+#[must_use]
+pub fn repair_report_path(folder: &Path, id: u64) -> crate::path::PathBuf {
+    folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"))
+}
+
 /// Writes `bytes` as the copy of a repair report for snapshot `id` in
 /// `folder`.
 ///
 /// Under a temporary name, synced and renamed, so the directory sync that
-/// installs the snapshot makes its name durable with the snapshot's.
+/// installs the snapshot makes its name durable with the snapshot's. A
+/// temporary a failed write leaves is removed when it can be; an open sweeps
+/// one that is not.
 ///
 /// # Errors
 ///
@@ -177,18 +195,30 @@ pub fn write_repair_report(
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     use crate::fs::FsOpenOptions;
-    let target = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"));
+    let target = repair_report_path(folder, id);
     let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"));
-    let mut copy = fs.open(
-        &temporary,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
-    )?;
-    copy.write_all(bytes)?;
-    copy.flush()?;
-    FsFile::sync_all_with(&*copy, sync_mode)?;
-    drop(copy);
-    fs.rename(&temporary, &target)?;
-    Ok(())
+    let publish = (|| -> crate::Result<()> {
+        let mut copy = fs.open(
+            &temporary,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        copy.write_all(bytes)?;
+        copy.flush()?;
+        FsFile::sync_all_with(&*copy, sync_mode)?;
+        drop(copy);
+        fs.rename(&temporary, &target)?;
+        Ok(())
+    })();
+    if publish.is_err()
+        && let Err(e) = fs.remove_file(&temporary)
+        && e.kind() != crate::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove {} ({e}); the next open sweeps it",
+            temporary.display(),
+        );
+    }
+    publish
 }
 
 /// Suffix of a manifest repair's in-progress blob salvage copy.
@@ -217,14 +247,14 @@ pub enum BlobDirEntry {
 impl BlobDirEntry {
     /// Classifies a file name in a `blobs/` folder.
     ///
-    /// Ownership is exact-shape: the id must parse as a number, so a foreign
-    /// name that merely ends in an owned suffix (an operator's
-    /// `notes.salvage-tmp`) is [`Foreign`](Self::Foreign).
+    /// Ownership is exact-shape: the id must be spelled as the engine writes
+    /// it (see [`canonical_id`]), so a foreign name that merely ends in an
+    /// owned suffix (an operator's `notes.salvage-tmp`) is
+    /// [`Foreign`](Self::Foreign).
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(crate::vlog::BlobFileId) -> Self| {
-            rest.parse::<crate::vlog::BlobFileId>()
-                .map_or(Self::Foreign, make)
+            canonical_id(rest).map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(BLOB_SALVAGE_TMP_SUFFIX) {
             return owned_id(rest, Self::SalvageTmp);
@@ -281,20 +311,8 @@ impl DictDirEntry {
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(DictId) -> Self| {
-            // Canonical spelling, checked without formatting the id back: the
-            // parser already accepted only digits after an optional sign, so
-            // requiring a DIGIT first rejects `+1`, and rejecting a leading zero
-            // on anything longer than one character rejects `01` and `00` while
-            // keeping `0` itself.
-            let canonical = || {
-                let mut bytes = rest.bytes();
-                bytes.next().is_some_and(|first| {
-                    first.is_ascii_digit() && (first != b'0' || rest.len() == 1)
-                })
-            };
-            rest.parse::<DictId>()
-                .ok()
-                .filter(|_| canonical())
+            canonical_id(rest)
+                .and_then(|id| DictId::try_from(id).ok())
                 .map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(DICT_TMP_SUFFIX) {
@@ -356,7 +374,7 @@ impl TableDirEntry {
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(crate::TableId) -> Self| {
-            rest.parse::<crate::TableId>().map_or(Self::Foreign, make)
+            canonical_id(rest).map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(".heal-attest.tmp") {
             return owned_id(rest, Self::HealAttestTmp);
@@ -366,7 +384,7 @@ impl TableDirEntry {
         }
         if let Some((id, seq)) = file_name.split_once(".healtmp-") {
             // BOTH halves must parse: `5.healtmp-backup` is not owned.
-            if seq.parse::<u64>().is_ok() {
+            if canonical_id(seq).is_some() {
                 return owned_id(id, Self::HealTmp);
             }
             return Self::Foreign;
@@ -386,9 +404,7 @@ impl TableDirEntry {
         if let Some(rest) = file_name.strip_suffix(REPAIR_TMP_SUFFIX) {
             return owned_id(rest, Self::RepairTmp);
         }
-        file_name
-            .parse::<crate::TableId>()
-            .map_or(Self::Foreign, Self::Table)
+        owned_id(file_name, Self::Table)
     }
 }
 

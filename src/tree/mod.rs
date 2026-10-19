@@ -5592,6 +5592,8 @@ impl Tree {
         #[cfg(feature = "std")]
         stop_signal.wake_on_stop(&compaction_rate_limiter);
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
+        // The open installed the recovered state as its own snapshot.
+        let snapshot_id = version.id();
         let mut super_versions = SuperVersions::new(
             version,
             &comparator,
@@ -5910,13 +5912,7 @@ impl Tree {
         // must preserve. Intermediate versions live only in the edit log, so the
         // latest version id (`version.id()`) has no `v{id}` file of its own.
         let snapshot_id = recovery.snapshot_id;
-        let mut sweep = OpenSweep {
-            tree_path,
-            snapshot_id,
-            fs: &*config.fs,
-            sync_mode: config.sync_mode,
-            view_durable: false,
-        };
+        let mut sweep = OpenSweep::default();
 
         let mut table_map = {
             let mut result: crate::HashMap<
@@ -6097,7 +6093,7 @@ impl Tree {
                             "Removing abandoned heal copy: {}",
                             table_file_path.display()
                         );
-                        sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A crashed attestation publish: either the live sidecar it
@@ -6108,7 +6104,7 @@ impl Tree {
                             "Removing abandoned heal-attest temp: {}",
                             table_file_path.display()
                         );
-                        sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A LIVE table's pending attestation is preserved (the next
@@ -6121,7 +6117,7 @@ impl Tree {
                                 "Removing orphaned heal attestation (its table is gone): {}",
                                 table_file_path.display()
                             );
-                            sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6131,7 +6127,7 @@ impl Tree {
                             "Removing abandoned restrict-bound temp: {}",
                             table_file_path.display()
                         );
-                        sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A LIVE table's restriction bound is preserved (manifest
@@ -6143,7 +6139,7 @@ impl Tree {
                                 "Removing orphaned restrict-bound sidecar (its table is gone): {}",
                                 table_file_path.display()
                             );
-                            sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6228,9 +6224,9 @@ impl Tree {
                                 let companion =
                                     crate::restrict_bound::sidecar_path(&table_file_path);
                                 if folder_fs.exists(&companion)? {
-                                    sweep.remove(folder_fs.as_ref(), &companion)?;
+                                    sweep.remove(folder_fs, &companion);
                                 }
-                                sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                                sweep.remove(folder_fs, &table_file_path);
                             }
                         }
                         // Without the repair module nothing here can verify or
@@ -6259,9 +6255,9 @@ impl Tree {
                                 crate::file::REPAIR_TMP_SUFFIX
                             ));
                             if folder_fs.exists(&companion)? {
-                                sweep.remove(folder_fs.as_ref(), &companion)?;
+                                sweep.remove(folder_fs, &companion);
                             }
-                            sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6276,7 +6272,7 @@ impl Tree {
                                 "Removing orphaned repair-replacement sidecar: {}",
                                 table_file_path.display()
                             );
-                            sweep.remove(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6484,9 +6480,9 @@ impl Tree {
             // fail the next open, so it goes with the temp.
             let companion = crate::restrict_bound::sidecar_path(&temp_path);
             if temp_fs.exists(&companion)? {
-                sweep.remove(temp_fs.as_ref(), &companion)?;
+                sweep.remove(&temp_fs, &companion);
             }
-            sweep.remove(temp_fs.as_ref(), &temp_path)?;
+            sweep.remove(&temp_fs, &temp_path);
         }
 
         if tables.len() < cnt {
@@ -6597,12 +6593,37 @@ impl Tree {
         #[cfg(feature = "std")]
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
-        // NOTE: Cleanup old versions
-        // But only after we definitely recovered the latest version.
-        // Preserve the installed snapshot (and its `edits-` log): the
-        // latest version id has no file of its own under the incremental
-        // manifest, so cleaning by it would delete the live snapshot.
-        Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs, &mut sweep)?;
+        // The state this open recovered becomes durable before the tree is
+        // served: a caller takes the persisted seqno of the tree it opened as
+        // the point up to which its own log may be trimmed, and what was read
+        // may be an edit or a snapshot name whose sync failed, which a power
+        // loss can still take back. Syncing the files read is no proof (a
+        // sync after a failed one may report success for pages the kernel
+        // already dropped), so the recovered state is written as a fresh
+        // snapshot under the next id, installed as a rotation installs one:
+        // its bytes synced, renamed into place, the folder synced. An owed
+        // repair report moves to it first, as a rotation moves one.
+        let version = version.reinstalled();
+        crate::file::carry_repair_report(
+            &*config.fs,
+            tree_path,
+            snapshot_id,
+            version.id(),
+            config.sync_mode,
+        )?;
+        crate::version::persist_version(
+            tree_path,
+            &version,
+            config.comparator.name(),
+            &*config.fs,
+            Arc::new(config.initial_runtime_config.clone()),
+            config.encryption.clone(),
+            config.sync_mode,
+        )?;
+
+        // Everything of the generation read goes, now that it is superseded:
+        // its snapshot, its log, a report copy the fresh one carries.
+        Self::cleanup_orphaned_version(tree_path, version.id(), &config.fs, &mut sweep)?;
 
         // A copy the digest rejected goes only once its id has a winner: with
         // one it is provably superseded, without one it may be all that is
@@ -6620,22 +6641,23 @@ impl Tree {
             {
                 let companion = crate::restrict_bound::sidecar_path(&path);
                 if copy_fs.exists(&companion)? {
-                    sweep.remove(copy_fs.as_ref(), &companion)?;
+                    sweep.remove(&copy_fs, &companion);
                 }
             }
-            sweep.remove(copy_fs.as_ref(), &path)?;
+            sweep.remove(&copy_fs, &path);
         }
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
-            sweep.remove(orphan_fs.as_ref(), &table_path)?;
+            sweep.remove(&orphan_fs, &table_path);
         }
 
         for blob_file_path in orphaned_blob_files {
             log::debug!("Deleting orphaned blob file {}", blob_file_path.display());
-            sweep.remove(&*config.fs, &blob_file_path)?;
+            sweep.remove(&config.fs, &blob_file_path);
         }
 
+        sweep.finish()?;
         Ok(version)
     }
 
@@ -6703,8 +6725,8 @@ impl Tree {
     fn cleanup_orphaned_version(
         path: &Path,
         snapshot_id: crate::version::VersionId,
-        fs: &dyn crate::fs::Fs,
-        sweep: &mut OpenSweep<'_>,
+        fs: &Arc<dyn crate::fs::Fs>,
+        sweep: &mut OpenSweep,
     ) -> crate::Result<()> {
         let snapshot_str = format!("v{snapshot_id}");
         let log_str = format!("edits-{snapshot_id}");
@@ -6723,7 +6745,7 @@ impl Tree {
                 .is_some_and(|(id, temporary)| temporary || id != snapshot_id);
             if is_orphan_snapshot || is_orphan_log || is_orphan_report {
                 log::trace!("Cleanup orphaned manifest file {name}");
-                sweep.remove(fs, &dirent.path)?;
+                sweep.remove(fs, &dirent.path);
             }
         }
 
@@ -6810,51 +6832,36 @@ fn made_folders(folder: &Path, holders: &[crate::path::PathBuf]) -> Vec<crate::p
     made
 }
 
-/// Removes what an open finds no version names, once the manifest it judged
-/// that by is durable.
+/// What an open finds no version names, removed only once the state it judged
+/// that by is installed as a fresh snapshot.
 ///
 /// What an open reads may be what a failed sync left: an edit in the log that
 /// was never synced, or a snapshot name whose install or withdrawal was never
-/// made durable. A removal judged by that may become durable while the
-/// manifest does not, and a power loss then brings back a manifest naming a
-/// file that is gone. So the first removal makes the manifest the open read
-/// durable first, the installed snapshot's log and then the tree folder; an
-/// open that removes nothing syncs nothing.
-struct OpenSweep<'a> {
-    tree_path: &'a Path,
-    snapshot_id: crate::version::VersionId,
-    fs: &'a dyn Fs,
-    sync_mode: crate::fs::SyncMode,
-    view_durable: bool,
+/// made durable. Syncing those files again proves nothing (a sync after a
+/// failed one may report success for pages the kernel already dropped), so the
+/// open writes the state it recovered as a new snapshot instead, and a removal
+/// judged by that state runs after it is durable.
+#[derive(Default)]
+struct OpenSweep {
+    pending: Vec<(Arc<dyn Fs>, crate::path::PathBuf)>,
 }
 
-impl OpenSweep<'_> {
-    /// Removes `path` from `fs`, a file already gone included.
-    fn remove(&mut self, fs: &dyn Fs, path: &Path) -> crate::Result<()> {
-        if !self.view_durable {
-            // A removal on another device must not become durable before the
-            // manifest does: a barrier orders the syncs of its own device only.
-            let mode = match self.sync_mode {
-                crate::fs::SyncMode::Barrier => crate::fs::SyncMode::Full,
-                mode => mode,
-            };
-            let log = crate::version::edit_log::log_path(self.tree_path, self.snapshot_id);
-            match self
-                .fs
-                .open(&log, &crate::fs::FsOpenOptions::new().write(true))
-            {
-                Ok(file) => file.sync_data_with(mode)?,
+impl OpenSweep {
+    /// Queues `path` on `fs` for removal.
+    fn remove(&mut self, fs: &Arc<dyn Fs>, path: &Path) {
+        self.pending.push((Arc::clone(fs), path.to_path_buf()));
+    }
+
+    /// Removes every queued file, a file already gone included.
+    fn finish(self) -> crate::Result<()> {
+        for (fs, path) in self.pending {
+            match fs.remove_file(&path) {
+                Ok(()) => {}
                 Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            crate::file::fsync_directory(self.tree_path, self.fs, mode)?;
-            self.view_durable = true;
         }
-        match fs.remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        Ok(())
     }
 }
 

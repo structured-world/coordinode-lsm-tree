@@ -110,7 +110,10 @@ writes). Trim against the persisted one only.
 ## 3. Recovery replay
 
 On `Config::open` the engine recovers its state from the persisted SSTs alone (it
-has no log of its own to replay). After open:
+has no log of its own to replay). Before the open returns, it installs the state
+it recovered as a fresh manifest snapshot, so `get_highest_persisted_seqno()`
+after an open names data a power loss keeps, even when an earlier flush ended
+in `Error::InstallOutcomeUnknown`. After open:
 
 1. Recover from your **trim watermark `W`**, not the raw persisted maximum. `W` is
    the gap-free applied-and-persisted prefix you trimmed to (section 2); replay

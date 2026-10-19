@@ -67,6 +67,71 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
     Ok(())
 }
 
+/// The highest snapshot id in `dir`.
+fn installed(dir: &std::path::Path) -> lsm_tree::Result<u64> {
+    let mut highest = None;
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix('v'))
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            highest = highest.max(Some(id));
+        }
+    }
+    highest.ok_or(lsm_tree::Error::Unrecoverable)
+}
+
+/// A rotation that cannot carry the repair report the tree still owes fails
+/// before it installs anything, and the next install rotates again and
+/// carries it: the report stays with the installed snapshot throughout.
+#[test]
+fn a_rotation_that_cannot_carry_the_owed_report_is_retried() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = |fs: FaultFs<StdFs>| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .manifest_log_rotate_bytes(0)
+        .with_fs(fs)
+    };
+    {
+        let tree = config(FaultFs::new(StdFs)).open()?;
+        tree.insert("k0", "v0", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let owed = format!("repair-report-{}", installed(dir.path())?);
+    std::fs::write(dir.path().join(&owed), b"an owed report")?;
+
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = config(fs).open()?;
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("repair-report-")
+            .once(),
+    );
+    tree.insert("k1", "v1", 1);
+    assert!(
+        tree.flush_active_memtable(1).is_err(),
+        "the rotation cannot read the report it carries"
+    );
+    tree.insert("k2", "v2", 2);
+    tree.flush_active_memtable(2)?;
+
+    let carried = dir
+        .path()
+        .join(format!("repair-report-{}", installed(dir.path())?));
+    assert_eq!(std::fs::read(&carried)?, b"an owed report");
+    for k in ["k0", "k1", "k2"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after the retry");
+    }
+    Ok(())
+}
+
 /// An install whose directory sync fails is withdrawn: the operation that
 /// asked for it reports the failure and removes what it wrote for it (a
 /// compaction its outputs), so the snapshot it named must not stay in place

@@ -760,3 +760,6 @@ impl From<std::io::Error> for Error {
 
 /// Tree result
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests;

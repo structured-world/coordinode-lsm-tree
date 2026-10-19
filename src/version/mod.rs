@@ -535,6 +535,14 @@ impl Version {
         self.with_id_and_dicts(self.id, dicts)
     }
 
+    /// This version under the next id, unchanged otherwise: what an open
+    /// installs as a fresh snapshot of the state it recovered. A new id, so
+    /// the snapshot it writes never replaces the one it was read from.
+    #[must_use]
+    pub(crate) fn reinstalled(&self) -> Self {
+        self.with_id_and_dicts(self.id + 1, self.dicts.to_vec())
+    }
+
     fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {
         Self {
             inner: Arc::new(VersionInner {

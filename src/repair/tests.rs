@@ -6,6 +6,21 @@ use super::{
 use crate::fs::StdFs;
 use test_log::test;
 
+/// Removes every manifest snapshot and edit log in `root`: the manifest loss
+/// a repair is run for.
+fn remove_manifest(fs: &dyn crate::fs::Fs, root: &std::path::Path) -> crate::Result<()> {
+    use crate::version::recovery::{log_id_of, snapshot_id_of};
+    for entry in fs.read_dir(root)? {
+        if snapshot_id_of(&entry.file_name)
+            .or_else(|| log_id_of(&entry.file_name))
+            .is_some()
+        {
+            fs.remove_file(&entry.path)?;
+        }
+    }
+    Ok(())
+}
+
 /// `toc_may_hide_deletions` must PROPAGATE a transient open failure rather than
 /// grade it `true` (fail closed): on a table `repair_with_salvage` already found
 /// corrupt, a `true` verdict drops the table — losing the healthy
@@ -3132,16 +3147,7 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
         b"k0004",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The stale sidecar cannot be cleaned up: the id must not be handed out
     // in the first place, AND the repair must fail rather than succeed over
@@ -3681,16 +3687,7 @@ fn repair_skips_salvaging_an_unreferenced_invalid_blob() -> crate::Result<()> {
         f.seek(SeekFrom::Start(last - 8))?;
         f.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Any WRITE into a salvage temp proves a salvage was attempted — and
     // stands in for the tight-space abort it can cause.
@@ -7942,16 +7939,7 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     open_config().repair()?;
 
@@ -8035,16 +8023,7 @@ fn repair_fails_when_its_own_salvage_temp_cannot_be_removed() -> crate::Result<(
         f.seek(SeekFrom::Start(data_start))?;
         f.write_all(&garbage)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Every removal of the salvage temp fails persistently — including the
     // salvage's own internal discard — so the temp survives to the cleanup.
@@ -8139,16 +8118,7 @@ fn repair_fails_when_a_leftover_salvage_temp_cannot_be_removed() -> crate::Resul
         )?;
         f.write_all(b"partial salvage bytes")?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. (The filter has no separator, so it
     // matches Windows paths too.)
@@ -8248,16 +8218,7 @@ fn repair_fails_when_a_fully_punched_blobs_drop_cannot_complete() -> crate::Resu
         (data.pos(), data.pos() + data.len())
     };
     memfs.punch_hole(&blob_path, data_start, data_end - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. The path filter avoids a separator so
     // it also matches Windows paths (`...\blobs\0`); the only file removed
@@ -8436,16 +8397,7 @@ fn repair_abort_leaves_a_fully_punched_blob_in_place() -> crate::Result<()> {
         (data.pos(), data.pos() + data.len())
     };
     memfs.punch_hole(&blob_path, data_start, data_end - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The abort: a transient fault on the NEXT blob file's probe — strictly
     // after the scan met (and, pre-fix, removed) the fully punched blob 0.
@@ -8552,16 +8504,7 @@ fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate
         b"k0001",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = Config::new(
         &root,
@@ -8668,16 +8611,7 @@ fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> 
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     config().repair()?;
     assert!(
@@ -8972,16 +8906,7 @@ fn repair_does_not_leave_an_unrestrictable_rewrite_in_the_scan() -> crate::Resul
         b"k0001",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The copy's own sidecar cannot be written (so it would be adopted
     // unrestricted) and it cannot be removed either.
@@ -9092,16 +9017,7 @@ fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() ->
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let source = root.join("tables").join("0");
     assert!(memfs.exists(&source)?, "the fixture's SST is at tables/0");
 
@@ -9197,16 +9113,7 @@ fn repair_counts_only_blob_files_that_reach_the_manifest() -> crate::Result<()> 
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     Config::new(
         &root,
@@ -9364,16 +9271,7 @@ fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<(
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. The path filter carries no separator so
     // it matches Windows paths too.
@@ -9937,16 +9835,7 @@ fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::
             std::io::Write::write_all(&mut f, &bytes)?;
         }
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert_eq!(
@@ -10575,16 +10464,7 @@ fn a_committed_transforming_compaction_survives_manifest_loss() -> crate::Result
     }
 
     // Manifest loss on top.
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -11090,7 +10970,7 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
 /// snapshot installed, the error must be bare.
 #[test]
 fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
@@ -11113,16 +10993,7 @@ fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Res
             tree.insert(b"a", b"v", 1);
             tree.flush_active_memtable(0)?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .or_else(|| e.file_name.strip_prefix("edits-"))
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
 
         let fault = FaultFs::new((*memfs).clone());
         let snapshot = root.join("v").to_string_lossy().into_owned();
@@ -11194,16 +11065,7 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
         )?;
         std::io::Write::write_all(&mut f, &[0xEE; 64])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let progress = Arc::new(crate::RecoveryProgress::default());
     Config::new(
@@ -11234,7 +11096,7 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
 /// snapshot proves it) and asserts the error is the report-carrying kind.
 #[test]
 fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
@@ -11257,16 +11119,7 @@ fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> 
             tree.insert(b"a", b"v", 1);
             tree.flush_active_memtable(0)?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .or_else(|| e.file_name.strip_prefix("edits-"))
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
 
         let fault = FaultFs::new((*memfs).clone());
         fault.injector().arm(
@@ -11668,16 +11521,7 @@ fn an_unreferenced_blob_is_removed_at_its_recovered_path() -> crate::Result<()> 
     // Lose the manifest too: with a clean one the pre-scan sweep removes the
     // file by its own directory entry, which never exercises the rebuild's
     // unreferenced-blob path.
-    for entry in memfs.read_dir(&root)? {
-        let is_version = entry
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| entry.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&entry.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert!(
@@ -12580,7 +12424,6 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
 /// the same mismatch error a healthy open raises.
 #[test]
 fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::sync::Arc;
 
@@ -12604,16 +12447,7 @@ fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> 
         tree.insert(b"k", vec![b'v'; 64], 1);
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let result = Config::new(
         &root,
@@ -13047,16 +12881,7 @@ fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
             file.seek(SeekFrom::Start(last - 8))?;
             file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_manifest = e
-                .file_name
-                .strip_prefix('v')
-                .or_else(|| e.file_name.strip_prefix("edits-"))
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_manifest {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
 
         let fault = FaultFs::new((*memfs).clone());
         fault.injector().arm(
@@ -13149,16 +12974,7 @@ fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Resu
             file.seek(SeekFrom::Start(last - 8))?;
             file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .or_else(|| e.file_name.strip_prefix("edits-"))
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
         Ok(memfs)
     };
 
@@ -13724,16 +13540,7 @@ fn a_blob_tree_with_a_damaged_tail() -> crate::Result<(
         file.seek(SeekFrom::Start(last - 8))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     Ok((memfs, root, blob_path))
 }
 
@@ -13799,16 +13606,7 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
             file.seek(SeekFrom::Start(last - 8))?;
             file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .or_else(|| e.file_name.strip_prefix("edits-"))
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
         let corrupted = read_all(&fs_dyn, &blob_path)?;
         Ok((memfs, blob_path, corrupted))
     };
@@ -13941,16 +13739,7 @@ fn repair_leaves_every_table_in_place_when_the_rewrite_fails_transiently() -> cr
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Fault the rewrite's reads of the source SST with a RETRYABLE kind.
     let fault = FaultFs::new((*memfs).clone());
@@ -14067,16 +13856,7 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -14342,16 +14122,7 @@ fn damage_a_table_and_its_blob(
         file.seek(SeekFrom::Start(at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -14429,16 +14200,7 @@ fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = |fs: Arc<dyn Fs>| {
         Config::new(
@@ -14589,16 +14351,7 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
 
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = |fs: Arc<dyn Fs>| {
         Config::new(
@@ -14779,7 +14532,6 @@ fn blob_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
 ) -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
 
     {
@@ -14808,16 +14560,7 @@ fn blob_tree_without_manifest(
         }
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -15318,16 +15061,7 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -15448,16 +15182,7 @@ fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::R
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -15551,16 +15276,7 @@ fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> c
     }
 
     // The manifest is lost, and with it the owner's table.
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let tables = root.join(crate::file::TABLES_FOLDER);
     let owner = memfs
         .read_dir(&tables)?
@@ -15696,16 +15412,7 @@ fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> c
         tree.flush_active_memtable(0)?;
     }
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let tables = root.join(crate::file::TABLES_FOLDER);
     let owner = memfs
         .read_dir(&tables)?
@@ -16072,7 +15779,6 @@ fn standard_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
 ) -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     {
@@ -16089,16 +15795,7 @@ fn standard_tree_without_manifest(
         tree.insert(b"k", b"v", 1);
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -16688,14 +16385,7 @@ fn an_aborted_repair_closes_the_descriptors_it_cached() -> crate::Result<()> {
             tree.flush_active_memtable(0)?;
         }
     }
-    {
-        use crate::fs::Fs;
-        for e in memfs.read_dir(&root)? {
-            if e.file_name.starts_with("edits-") || e.file_name.starts_with('v') {
-                memfs.remove_file(&e.path)?;
-            }
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The last table scanned cannot be opened, after the others were.
     let cache = Arc::new(DescriptorTable::new(16));
@@ -17233,16 +16923,7 @@ fn assert_repair_error_removes_published_blob_replacements(
         }
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
 
@@ -18100,16 +17781,7 @@ fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert_eq!(
@@ -18196,18 +17868,9 @@ fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> cra
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&memfs, &root)?;
 
-    // The salvage runs and commits; removing the superseded original then
+    //The salvage runs and commits; removing the superseded original then
     // fails, which fails the repair AFTER the replacement is durable.
     injector.arm(
         FaultRule::new(
@@ -18676,16 +18339,7 @@ fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> cra
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
@@ -18861,16 +18515,7 @@ fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
         file.seek(SeekFrom::Start(at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .or_else(|| e.file_name.strip_prefix("edits-"))
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair_with_salvage(true)?;
     assert_eq!(

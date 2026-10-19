@@ -171,7 +171,7 @@ fn creation() -> Vec<(Synced, SyncKind)> {
 
 /// Creating, flushing, compacting, dropping and reopening a tree, standard
 /// and KV-separated, each syncs only what it makes durable: a new entry's
-/// folder once, a written file once.
+/// folder once, a written file once, and a reopen the snapshot it installs.
 #[test]
 fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
@@ -220,9 +220,18 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             "dropping every key (blob: {blob})"
         );
 
+        // A reopen installs what it recovered as a fresh snapshot, so what it
+        // serves is durable whatever the syncs before it reported.
         drop(tree);
         let tree = open(&base, &fs, blob, None);
-        assert_eq!(census.take(), Vec::new(), "reopening (blob: {blob})");
+        assert_eq!(
+            census.take(),
+            sorted(vec![
+                (Synced::Snapshot, SyncKind::FileData),
+                (Synced::TreeDir, SyncKind::Directory),
+            ]),
+            "reopening (blob: {blob})"
+        );
         drop(tree);
     }
 }

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::SequenceNumberCounter;
+use crate::file::repair_report_path as path;
 use crate::fs::{Fs, MemFs};
 use std::sync::Arc;
 
@@ -213,6 +214,13 @@ fn a_copy_that_does_not_decrypt_leaves_the_loss_unscoped() -> crate::Result<()> 
     fs.create_dir_all(&sealed_under(1).path)?;
     write(&sealed_under(1), 9, &a_report())?;
 
+    let own = read_all(&sealed_under(1), None)?.ok_or(crate::Error::Unrecoverable)?;
+    assert_eq!(
+        format!("{own:?}"),
+        format!("{:?}", a_report()),
+        "under its own key the copy reads back as its report"
+    );
+
     let back = read_all(&sealed_under(2), None)?.ok_or(crate::Error::Unrecoverable)?;
     assert_eq!(back.wal_replay_scope(), crate::WalReplayScope::FullHistory);
     assert_eq!(back.unknowable_losses, vec![path(&sealed_under(2).path, 9)]);
@@ -297,6 +305,27 @@ fn only_the_exact_names_are_report_copies() {
     assert_eq!(repair_report_name("repair-report-9.bak"), None);
     assert_eq!(repair_report_name("repair-report-+9"), None);
     assert_eq!(repair_report_name("v9"), None);
+    // Only the spelling the repair writes: a leading zero names a file the
+    // engine never made, and reading it back by its id would open another.
+    assert_eq!(repair_report_name("repair-report-09"), None);
+    assert_eq!(repair_report_name("repair-report-00.tmp"), None);
+    assert_eq!(repair_report_name("repair-report-0"), Some((0, false)));
+}
+
+/// A file spelled like a copy but not as the repair writes one is not a copy:
+/// the owed report is looked up by its canonical name, so taking the stray
+/// spelling for one would look for a file that is never there, forever.
+#[test]
+fn a_stray_spelling_is_no_owed_report() -> crate::Result<()> {
+    let fs = Arc::new(MemFs::new());
+    let config = config(&fs);
+    fs.create_dir_all(&config.path)?;
+    fs.open(
+        &config.path.join("repair-report-01"),
+        &FsOpenOptions::new().write(true).create(true),
+    )?;
+    assert!(crate::file::owed_repair_report(&*fs, &config.path)?.is_none());
+    Ok(())
 }
 
 /// A later repair of a salvaged replacement names the same path with a

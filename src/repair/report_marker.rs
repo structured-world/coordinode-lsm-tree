@@ -22,7 +22,7 @@
 
 use super::RepairReport;
 use crate::config::Config;
-use crate::file::{REPAIR_REPORT_PREFIX, repair_report_name};
+use crate::file::repair_report_name;
 use crate::fs::FsOpenOptions;
 use crate::{Slice, UserKey};
 use std::path::{Path, PathBuf};
@@ -33,11 +33,6 @@ const MAGIC: &[u8; 8] = b"LSMRPRT1";
 
 /// Length of the trailing XXH3-64 over everything before it.
 const CHECKSUM_LEN: usize = 8;
-
-/// The copy of the report on rebuilt snapshot `id`.
-pub(super) fn path(folder: &Path, id: u64) -> PathBuf {
-    folder.join(format!("{REPAIR_REPORT_PREFIX}{id}"))
-}
 
 /// Writes the copy of `report` for the rebuilt snapshot `id`: under a
 /// temporary name, synced, renamed onto its name, and the folder synced, so
@@ -52,34 +47,11 @@ pub(super) fn write(config: &Config, id: u64, report: &RepairReport) -> crate::R
         Some(enc) => enc.encrypt(&plain)?,
         None => plain,
     };
-    let path = path(&config.path, id);
-    let mut temporary = path.clone().into_os_string();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    let fs = &*config.fs;
-    let publish = (|| -> crate::Result<()> {
-        let mut file = fs.open(
-            &temporary,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        file.write_all(&content)?;
-        file.flush()?;
-        crate::fs::FsFile::sync_all_with(&*file, config.sync_mode)?;
-        drop(file);
-        fs.rename(&temporary, &path)?;
-        fs.sync_directory_with(&config.path, config.sync_mode)?;
-        Ok(())
-    })();
-    if publish.is_err()
-        && let Err(e) = fs.remove_file(&temporary)
-        && e.kind() != crate::io::ErrorKind::NotFound
-    {
-        log::warn!(
-            "repair: could not remove {} ({e}); the next open sweeps it",
-            temporary.display(),
-        );
-    }
-    publish
+    crate::file::write_repair_report(&*config.fs, &config.path, id, &content, config.sync_mode)?;
+    config
+        .fs
+        .sync_directory_with(&config.path, config.sync_mode)?;
+    Ok(())
 }
 
 /// The copies in the tree folder (only the one on snapshot `only`, when

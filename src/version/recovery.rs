@@ -413,21 +413,13 @@ const PREVIOUS_FORMAT: u8 = 5;
 /// The version id `name` holds as a snapshot (`v{id}`), if it is one.
 #[must_use]
 pub fn snapshot_id_of(name: &str) -> Option<VersionId> {
-    let digits = name.strip_prefix('v')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+    crate::file::canonical_id(name.strip_prefix('v')?)
 }
 
 /// The snapshot id whose edit log `name` is (`edits-{id}`), if it is one.
 #[must_use]
 pub fn log_id_of(name: &str) -> Option<VersionId> {
-    let digits = name.strip_prefix("edits-")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+    crate::file::canonical_id(name.strip_prefix("edits-")?)
 }
 
 /// The id of the installed snapshot of the tree in `folder`, or `None` when

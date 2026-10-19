@@ -496,6 +496,84 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A restore resumed over an interrupted one installs the snapshot the
+/// interrupted one may already have named a repair report after. A layout
+/// carrying no report must not inherit that copy: an open would hand it out as
+/// a replay the restored tree owes.
+#[test]
+fn a_resumed_restore_drops_the_report_copy_the_interrupted_one_left() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+    let layout = pin.layout()?;
+
+    let injector = Arc::new(FaultInjector::new());
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
+    let interrupted = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(FaultFs::with_injector(StdFs, Arc::clone(&injector)))
+    .restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    );
+    assert!(interrupted.is_err(), "the fault stopped the restore");
+    drop(interrupted);
+
+    // The copy an interrupted restore of a layout that owed a report wrote
+    // under the snapshot it installed.
+    let snapshot = std::fs::read_dir(dst.path())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix('v')?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("the interrupted restore installed a snapshot");
+    let stale = dst.path().join(format!("repair-report-{snapshot}"));
+    std::fs::write(&stale, b"a report the restored layout does not owe")?;
+
+    drop(
+        Config::new(
+            dst.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(
+            &layout,
+            pin.memtable_entries(),
+            pin.memtable_range_tombstones(),
+        )?,
+    );
+    let (_tree, report) = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(
+        report.is_none(),
+        "the restored tree owes no report: {report:?}"
+    );
+    assert!(!stale.exists(), "the stale copy is gone");
+    Ok(())
+}
+
 /// A pinned file describes itself: a table has a level, a blob file none, the
 /// size and the bytes read through the pin are the file's, and a table's heal
 /// attestation is reported when one lies beside it.

@@ -1290,6 +1290,73 @@ fn salvage_publishes_the_mid_copy_when_hard_link_is_unsupported() -> crate::Resu
     Ok(())
 }
 
+/// A MID publish that cannot claim `dest` (the link fails, or on a backend
+/// without links the rename after the claim does) is a failure of the OUTPUT:
+/// the salvage reports it as one, so repair stops instead of grading the
+/// source as damage, and it leaves neither `dest` nor its temp copy behind.
+///
+/// `lz4`-gated for the same reason as the tests around it: the MID attempt
+/// only runs when the meta mirrors diverge.
+#[cfg(feature = "lz4")]
+#[test]
+fn a_mid_publish_that_cannot_claim_the_destination_fails_as_an_output_failure() -> crate::Result<()>
+{
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    use crate::io::ErrorKind;
+
+    for unsupported_link in [false, true] {
+        let dir = tempdir()?;
+        let source = dir.path().join("source");
+        let dest = dir.path().join("salvaged");
+        let fault = FaultFs::new(StdFs);
+        let injector = fault.injector();
+        let fs: Arc<dyn Fs> = Arc::new(fault);
+
+        let mut writer = Writer::new(source.clone(), 0, 0, Arc::clone(&fs))?;
+        for i in 0u64..100 {
+            writer.write(InternalValue::from_components(
+                format!("key-{i:03}").into_bytes(),
+                format!("val-{i:03}").into_bytes(),
+                i + 1,
+                ValueType::Value,
+            ))?;
+        }
+        assert!(writer.finish()?.is_some(), "source SST is non-empty");
+        crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
+
+        if unsupported_link {
+            injector.arm(FaultRule::new(
+                FaultOp::HardLink,
+                Fault::Error(ErrorKind::Unsupported),
+            ));
+            injector.arm(
+                FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+                    .on_path(dest.to_string_lossy()),
+            );
+        } else {
+            injector.arm(FaultRule::new(
+                FaultOp::HardLink,
+                Fault::Error(ErrorKind::Other),
+            ));
+        }
+
+        let result = salvage_sst(&source, dest.clone(), &fs);
+        assert!(
+            matches!(result, Err(crate::Error::SalvageOutput(_))),
+            "unsupported link: {unsupported_link}: {result:?}",
+        );
+        assert!(!dest.exists(), "no claim is left at the destination");
+        for entry in std::fs::read_dir(dir.path())? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(".healtmp-"),
+                "the temp copy does not survive, found {name:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The MID publish must claim `dest` with an atomic no-replace operation, never
 /// a blind rename that clobbers an unowned file. When `dest` is already
 /// occupied, the tail attempt's `create_new` open fails against it (so the MID
@@ -5778,9 +5845,11 @@ fn a_columnar_block_the_output_cannot_take_fails_as_an_output_failure() -> crate
     );
 
     // Each write of the output in turn fails, until the salvage gets
-    // through.
+    // through. Bounded, so a fault that keeps firing fails the test instead
+    // of running it forever.
     let mut failed = 0;
-    for skip in 0u64.. {
+    let mut succeeded = false;
+    for skip in 0u64..10_000 {
         let faulty = FaultFs::new(StdFs);
         faulty.injector().arm(
             FaultRule::new(FaultOp::Write, Fault::Error(crate::io::ErrorKind::Other))
@@ -5790,11 +5859,24 @@ fn a_columnar_block_the_output_cannot_take_fails_as_an_output_failure() -> crate
         );
         let faulty: Arc<dyn Fs> = Arc::new(faulty);
         match salvage_sst(&source, dest.clone(), &faulty) {
-            Ok(_) => break,
-            Err(crate::Error::SalvageOutput(_)) => failed += 1,
+            Ok(_) => {
+                succeeded = true;
+                break;
+            }
+            Err(crate::Error::SalvageOutput(_)) => {
+                failed += 1;
+                assert!(
+                    !dest.exists(),
+                    "a failed attempt leaves no partial output behind (write {skip})"
+                );
+            }
             Err(e) => panic!("write {skip} of the output failed as {e:?}"),
         }
     }
+    assert!(
+        succeeded,
+        "the salvage never got through the injected faults"
+    );
     assert!(failed > 1, "the output takes more than one write");
     Ok(())
 }
