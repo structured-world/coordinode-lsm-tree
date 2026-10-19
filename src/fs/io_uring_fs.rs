@@ -315,6 +315,35 @@ impl Fs for IoUringFs {
         Box::new(UringReadQueue::new(&self.inner))
     }
 
+    // The ring reads every request with a descriptor by that descriptor; one
+    // without is read serially through `read_at`.
+    fn reads_by_descriptor(&self) -> bool {
+        true
+    }
+
+    // What the ring's pre-pass refuses before submitting any of the group
+    // (see `submit_reads_multi`).
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> crate::io::Result<()> {
+        for req in reqs {
+            if req.buf.capacity() == 0 || req.file.backing_fd().is_none() {
+                continue;
+            }
+            if i32::try_from(req.buf.capacity() - req.buf.filled()).is_err() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffer exceeds i32::MAX",
+                )));
+            }
+            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submit_reads_multi: request offset overflows",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
         std::fs::create_dir_all(path).map_err(crate::io::Error::from)
     }
@@ -466,6 +495,32 @@ impl Fs for IoUringFs {
         // not the I/O submission path.
         super::StdFs.volume_id(path)
     }
+
+    // The file system's capabilities, and the operations they gate, are the
+    // mount's and go through the same syscalls as on `StdFs`; the ring has no
+    // opcode for any of them. `sync_directory_with`, `sync_device` and the
+    // files' `sync_*_with` keep the trait defaults: on Linux every `SyncMode`
+    // is the same `fsync` / `fdatasync`, which these handles issue on the ring.
+
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        super::StdFs.capabilities(path)
+    }
+
+    fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
+        super::StdFs.try_disable_cow(path)
+    }
+
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        super::StdFs.punch_hole(path, offset, len)
+    }
+
+    fn reflink_file(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
+        super::StdFs.reflink_file(src, dst)
+    }
+
+    fn hard_link_count(&self, path: &Path) -> crate::io::Result<u64> {
+        super::StdFs.hard_link_count(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +637,11 @@ impl FsFile for IoUringFile {
 
     fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
         FsFile::set_write_lifetime(&self.file, lifetime)
+    }
+
+    fn hint(&self, hint: super::FileHint) -> crate::io::Result<()> {
+        // `posix_fadvise` on the descriptor the ring reads through.
+        FsFile::hint(&self.file, hint)
     }
 
     fn lock_exclusive(&self) -> crate::io::Result<()> {
@@ -1530,13 +1590,23 @@ impl<'r> UringReadQueue<'r> {
         }
         let first = self.base + self.sent.len();
         let mut reads = Vec::with_capacity(self.submitted.len());
-        for mut read in core::mem::take(&mut self.submitted) {
+        // A wait for none reads nothing serially: a read without a descriptor
+        // stays submitted, in its place among any the channel has no room
+        // for, for the wait that reads it or a wrapper that takes it back.
+        let mut deferred: Vec<(usize, QueuedRead)> = Vec::new();
+        // The submission place of each read sent below, in order.
+        let mut places: Vec<usize> = Vec::new();
+        for (place, mut read) in core::mem::take(&mut self.submitted).into_iter().enumerate() {
             if read.buf.is_empty() {
                 self.finished.push(done(read, Ok(())));
                 continue;
             }
             let Some(fd) = read.file.backing_fd() else {
-                self.serial.push(read);
+                if block {
+                    self.serial.push(read);
+                } else {
+                    deferred.push((place, read));
+                }
                 continue;
             };
             let Ok(len) = i32::try_from(read.buf.len()) else {
@@ -1559,8 +1629,11 @@ impl<'r> UringReadQueue<'r> {
                 offset: read.offset,
             });
             self.sent.push_back(Some(read));
+            places.push(place);
         }
         if reads.is_empty() {
+            self.submitted
+                .extend(deferred.into_iter().map(|(_, read)| read));
             return;
         }
         let count = reads.len();
@@ -1579,11 +1652,20 @@ impl<'r> UringReadQueue<'r> {
                 // in the kernel's hands: the reads go back to wait their turn.
                 Err(TrySend::Full) => {
                     let kept = self.sent.split_off(first - self.base);
-                    self.submitted.extend(kept.into_iter().flatten());
+                    let mut back: Vec<(usize, QueuedRead)> = places
+                        .into_iter()
+                        .zip(kept.into_iter().flatten())
+                        .chain(deferred)
+                        .collect();
+                    back.sort_unstable_by_key(|(place, _)| *place);
+                    self.submitted
+                        .extend(back.into_iter().map(|(_, read)| read));
                     return;
                 }
             }
         };
+        self.submitted
+            .extend(deferred.into_iter().map(|(_, read)| read));
         match sent {
             Ok(()) => self.on_ring += count,
             // Nothing was queued: the submission went down with the send, so
@@ -1671,6 +1753,18 @@ impl ReadQueue for UringReadQueue<'_> {
         // room or no lock, are sent only by a later wait: no completion
         // wakes a caller for them.
         self.serial.len() + self.submitted.len()
+    }
+
+    fn issues_at_wait_for_none(&self) -> bool {
+        // It sends what fits on the ring; a read that does not fit waits for
+        // the next wait.
+        true
+    }
+
+    // What a wait for none put back for want of room on the channel: a wait
+    // sends everything submitted, so nothing else is left there.
+    fn take_kept(&mut self) -> Vec<QueuedRead> {
+        core::mem::take(&mut self.submitted)
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
