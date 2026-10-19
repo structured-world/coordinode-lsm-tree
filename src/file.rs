@@ -55,7 +55,7 @@ pub const REPAIR_TMP_SUFFIX: &str = ".repair-tmp";
 pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> {
     file_name
         .strip_suffix(REPAIR_TMP_SUFFIX)
-        .and_then(canonical_id)
+        .and_then(|id| id.parse::<crate::TableId>().ok())
 }
 
 /// Prefix of the durable copy of a manifest repair's report.
@@ -247,14 +247,14 @@ pub enum BlobDirEntry {
 impl BlobDirEntry {
     /// Classifies a file name in a `blobs/` folder.
     ///
-    /// Ownership is exact-shape: the id must be spelled as the engine writes
-    /// it (see [`canonical_id`]), so a foreign name that merely ends in an
-    /// owned suffix (an operator's `notes.salvage-tmp`) is
-    /// [`Foreign`](Self::Foreign).
+    /// Ownership is exact-shape: the id must parse as a number, so a foreign
+    /// name that merely ends in an owned suffix (an operator's
+    /// `notes.salvage-tmp`) is [`Foreign`](Self::Foreign).
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(crate::vlog::BlobFileId) -> Self| {
-            canonical_id(rest).map_or(Self::Foreign, make)
+            rest.parse::<crate::vlog::BlobFileId>()
+                .map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(BLOB_SALVAGE_TMP_SUFFIX) {
             return owned_id(rest, Self::SalvageTmp);
@@ -374,7 +374,7 @@ impl TableDirEntry {
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(crate::TableId) -> Self| {
-            canonical_id(rest).map_or(Self::Foreign, make)
+            rest.parse::<crate::TableId>().map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(".heal-attest.tmp") {
             return owned_id(rest, Self::HealAttestTmp);
@@ -384,7 +384,7 @@ impl TableDirEntry {
         }
         if let Some((id, seq)) = file_name.split_once(".healtmp-") {
             // BOTH halves must parse: `5.healtmp-backup` is not owned.
-            if canonical_id(seq).is_some() {
+            if seq.parse::<u64>().is_ok() {
                 return owned_id(id, Self::HealTmp);
             }
             return Self::Foreign;
@@ -404,7 +404,9 @@ impl TableDirEntry {
         if let Some(rest) = file_name.strip_suffix(REPAIR_TMP_SUFFIX) {
             return owned_id(rest, Self::RepairTmp);
         }
-        owned_id(file_name, Self::Table)
+        file_name
+            .parse::<crate::TableId>()
+            .map_or(Self::Foreign, Self::Table)
     }
 }
 

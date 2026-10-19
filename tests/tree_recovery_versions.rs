@@ -214,8 +214,9 @@ fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree:
     // the snapshot's `edits-{snapshot_id}` log rather than writing a full
     // `v{id}` per version. So only the snapshot file (`v0`, the installed one)
     // exists on disk; intermediate versions live in the log. On reopen the
-    // snapshot is loaded and the log replayed, and orphan-cleanup keeps exactly
-    // that one snapshot generation (`v0` + `edits-0`).
+    // snapshot is loaded and the log replayed, and the recovered version (2)
+    // is installed as one fresh generation (`v3` + `edits-3`), which replaces
+    // the one it was read from.
     let folder = get_tmp_folder();
 
     let path = folder.path();
@@ -259,18 +260,19 @@ fn version_upgrades_on_reopen_replay_from_one_snapshot_generation() -> lsm_tree:
             SequenceNumberCounter::default(),
         )
         .open()?;
-        // The v0 snapshot is still the installed one, with its edit log layered
-        // on top: both survive orphan cleanup; there is no v1/v2 to clean.
+        // The recovered state is one fresh generation; the one it was read
+        // from is gone, and no per-version snapshot was ever written.
         assert!(
-            path.join("v0").try_exists()?,
-            "the installed snapshot is preserved across reopen"
+            path.join("v3").try_exists()?,
+            "the reopen installs the recovered version as a fresh snapshot"
         );
         assert!(
-            path.join("edits-0").try_exists()?,
-            "its edit log is preserved"
+            path.join("edits-3").try_exists()?,
+            "with its own empty edit log"
         );
-        assert!(!path.join("v1").try_exists()?);
-        assert!(!path.join("v2").try_exists()?);
+        for gone in ["v0", "edits-0", "v1", "v2"] {
+            assert!(!path.join(gone).try_exists()?, "{gone} is not left behind");
+        }
 
         // The replayed edits reconstruct both flushed tables.
         assert!(tree.contains_key("a", 1)?);
