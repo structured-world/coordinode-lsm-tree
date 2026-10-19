@@ -507,9 +507,6 @@ impl CrashFs {
         link_group.retain(|name, _| durable.contains_key(name));
     }
 
-    /// Captures what the name `name` holds before a queued step may take it,
-    /// on its first touch this run: a file's bytes as its durable image, a
-    /// symbolic link's target as the link to put back.
     /// Purges the crash state of every tracked path under the removed folder
     /// `path`, so a crash neither resurrects nor panics recreating a file
     /// whose parent is gone.
@@ -543,6 +540,9 @@ impl CrashFs {
         });
     }
 
+    /// Captures what the name `name` holds before a queued step may take it,
+    /// on its first touch this run: a file's bytes as its durable image, a
+    /// symbolic link's target as the link to put back.
     fn capture_name(&self, name: &Path) -> io::Result<()> {
         match self.inner.read_link(name) {
             Ok(None) => self.capture_first_touch(name),

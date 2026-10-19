@@ -170,6 +170,9 @@ struct FailFs {
     /// The first sync of the first path fails, after another process made
     /// the second path, a file, in a folder the creation made.
     sibling_on_sync: std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
+    /// Another opener puts a file of its own in the tree folder right after
+    /// this open makes the folder, before this open takes its lock.
+    foreign_in_tree: bool,
 }
 
 impl lsm_tree::fs::Fs for FailFs {
@@ -182,7 +185,17 @@ impl lsm_tree::fs::Fs for FailFs {
     }
 
     fn create_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
-        self.inner.create_dir_all(path)
+        let made = !self.inner.exists(path)?;
+        self.inner.create_dir_all(path)?;
+        if made && self.foreign_in_tree && path == self.tree {
+            self.inner
+                .open(
+                    &self.tree.join("foreign"),
+                    &lsm_tree::fs::FsOpenOptions::new().write(true).create(true),
+                )
+                .expect("another opener's file");
+        }
+        Ok(())
     }
 
     fn read_dir(
@@ -243,6 +256,7 @@ impl lsm_tree::fs::Fs for FailFs {
 fn nested_tree(
     fail_exists: Option<&str>,
     sibling_on_sync: Option<(&str, &str)>,
+    foreign_in_tree: bool,
 ) -> (MemFs, std::path::PathBuf, Config) {
     use lsm_tree::fs::Fs;
     let absolute = |path: &str| std::path::absolute(path).expect("absolute path");
@@ -256,6 +270,7 @@ fn nested_tree(
         sibling_on_sync: std::sync::Mutex::new(
             sibling_on_sync.map(|(when, sibling)| (absolute(when), absolute(sibling))),
         ),
+        foreign_in_tree,
     };
     let config = Config::new(
         &tree,
@@ -271,7 +286,7 @@ fn nested_tree(
 #[test]
 fn a_failed_creation_keeps_what_another_process_made_above_the_tree() {
     use lsm_tree::fs::Fs;
-    let (inner, tree, config) = nested_tree(None, Some(("/base/new", "/base/new/other")));
+    let (inner, tree, config) = nested_tree(None, Some(("/base/new", "/base/new/other")), false);
     assert!(config.open().is_err(), "the sync of /base/new fails");
     let other = std::path::absolute("/base/new/other").expect("absolute path");
     assert!(
@@ -291,7 +306,7 @@ fn a_failed_creation_keeps_what_another_process_made_above_the_tree() {
 fn a_failed_open_takes_back_the_folders_it_made() {
     use lsm_tree::fs::Fs;
     for probe in ["/base/new/tree", "/base/new/tree/version"] {
-        let (inner, _, config) = nested_tree(Some(probe), None);
+        let (inner, _, config) = nested_tree(Some(probe), None, false);
         assert!(config.open().is_err(), "the probe of {probe} fails");
         let made = std::path::absolute("/base/new").expect("absolute path");
         assert!(
@@ -299,6 +314,27 @@ fn a_failed_open_takes_back_the_folders_it_made() {
             "{probe}: the folders the open made are taken back"
         );
     }
+}
+
+/// An open that fails before it creates anything takes back only what is
+/// empty: what another opener put in the tree folder between this open
+/// making it and taking its lock stays, and so does the folder.
+#[test]
+fn a_failed_open_keeps_what_another_opener_put_in_the_tree_folder() {
+    use lsm_tree::fs::Fs;
+    let (inner, tree, config) = nested_tree(Some("/base/new/tree/version"), None, true);
+    assert!(
+        config.open().is_err(),
+        "the probe of the version marker fails"
+    );
+    assert!(
+        inner.exists(&tree.join("foreign")).expect("probe"),
+        "the other opener's file survives the failed open"
+    );
+    assert!(
+        !inner.exists(&tree.join("LOCK")).expect("probe"),
+        "this open's lock file is taken back"
+    );
 }
 
 /// A level route inside the primary tables folder is a folder there, not a

@@ -4752,16 +4752,30 @@ impl Tree {
             Ok(recovering) => recovering,
             Err(e) => {
                 if !made_by_open.is_empty() {
-                    // The lock file lies in the tree folder: released first,
-                    // so the folder can go on a platform that keeps an open
-                    // file from being removed.
+                    // Another opener may have filled the folder between the
+                    // probe that found it missing and this open's lock: only
+                    // what is empty is taken back. The lock file goes while
+                    // the lock is held, so no opener is left holding the lock
+                    // of a file another one can make anew; where an open
+                    // file cannot be removed it stays, and so does the folder.
                     #[cfg(feature = "std")]
-                    drop(directory_lock);
+                    {
+                        let lock_file = config.path.join(crate::config::DIRECTORY_LOCK_FILE);
+                        if let Err(e) = config.fs.remove_file(&lock_file)
+                            && e.kind() != crate::io::ErrorKind::NotFound
+                        {
+                            log::warn!(
+                                "Tree::open: could not remove {} after a failed open ({e})",
+                                lock_file.display()
+                            );
+                        }
+                        drop(directory_lock);
+                    }
                     let made = made_folders(&config.path, &made_by_open)
                         .into_iter()
                         .map(|folder| (folder, Arc::clone(&config.fs)))
                         .collect();
-                    undo_creation(&config.path, &config.fs, made, &open_holders);
+                    undo_creation(None, made, &open_holders);
                 }
                 return Err(e);
             }
@@ -5844,7 +5858,7 @@ impl Tree {
         match created {
             Ok(inner) => Ok(Self(Arc::new(inner))),
             Err(e) => {
-                undo_creation(&path, &config_fs, made, &holders);
+                undo_creation(Some((&path, &config_fs)), made, &holders);
                 Err(e)
             }
         }
@@ -6705,25 +6719,26 @@ impl Tree {
     }
 }
 
-/// Takes back what a failed creation of the tree at `tree` on `tree_fs` made:
-/// the folders in `made`, so a retry makes them anew and syncs the folders
-/// `holders` that gained their names; or, where one cannot be removed, those
-/// syncs now, since a retry finds it existing and syncs nothing for it.
+/// Takes back what a failed creation made: the folders in `made`, so a retry
+/// makes them anew and syncs the folders `holders` that gained their names;
+/// or, where one cannot be removed, those syncs now, since a retry finds it
+/// existing and syncs nothing for it. `tree` names the tree folder (on its
+/// backend) when everything in it is the creation's own.
 fn undo_creation(
-    tree: &Path,
-    tree_fs: &Arc<dyn Fs>,
+    tree: Option<(&Path, &Arc<dyn Fs>)>,
     mut made: Vec<(crate::path::PathBuf, Arc<dyn Fs>)>,
     holders: &[(crate::path::PathBuf, Arc<dyn Fs>)],
 ) {
     // Deepest first, so a folder is empty when its turn comes. The tree folder
-    // goes with what the creation put in it; a folder outside it is shared
-    // with whatever else lives above the tree, no lock covers it, and another
-    // process may have made an entry there since it was found missing: it is
-    // removed only while empty.
+    // goes with what the creation put in it; any other folder is shared with
+    // whatever else may have been put there since it was found missing, which
+    // no lock kept out: it is removed only while empty.
     made.sort_by_key(|(folder, _)| core::cmp::Reverse(folder.components().count()));
     let mut left = false;
     for (folder, folder_fs) in &made {
-        let removed = if folder == tree && Arc::ptr_eq(folder_fs, tree_fs) {
+        let own =
+            tree.is_some_and(|(tree, tree_fs)| folder == tree && Arc::ptr_eq(folder_fs, tree_fs));
+        let removed = if own {
             folder_fs.remove_dir_all(folder)
         } else {
             folder_fs.remove_dir(folder)
