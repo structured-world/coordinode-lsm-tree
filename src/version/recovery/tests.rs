@@ -1325,6 +1325,42 @@ fn an_open_refuses_a_renumbered_snapshot_before_it_touches_the_dictionaries() ->
     Ok(())
 }
 
+/// An open installs what it recovered under the next version id. At the top
+/// of the id space there is none: the open refuses before it writes or
+/// removes anything, and the snapshot it found stays as it was.
+#[test]
+fn an_open_at_the_last_version_id_refuses_and_keeps_the_snapshot() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let config = crate::Config::new(
+        "/last-id",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let folder = config.path.clone();
+    fs.create_dir_all(&folder.join(crate::file::TABLES_FOLDER))?;
+    crate::version::persist_version(
+        &folder,
+        &crate::version::Version::new(u64::MAX, crate::TreeType::Standard),
+        crate::comparator::default_comparator().name(),
+        &*fs,
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+
+    assert!(
+        config.open().is_err(),
+        "no version id is left to install under"
+    );
+    assert_eq!(
+        installed_snapshot(&folder, &*fs)?,
+        Some(u64::MAX),
+        "the snapshot found is left as it was"
+    );
+    Ok(())
+}
+
 /// A snapshot whose `version_id` section is not one id wide does not say
 /// which version it is: recovery refuses it as damage rather than read a
 /// guess.

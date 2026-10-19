@@ -538,9 +538,26 @@ impl Version {
     /// This version under the next id, unchanged otherwise: what an open
     /// installs as a fresh snapshot of the state it recovered. A new id, so
     /// the snapshot it writes never replaces the one it was read from.
-    #[must_use]
-    pub(crate) fn reinstalled(&self) -> Self {
-        self.with_id_and_dicts(self.id + 1, self.dicts.to_vec())
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Unrecoverable`] when the id space is exhausted: the
+    /// next id must leave room for the edit after it, which takes one more,
+    /// as a repair leaves room when it picks the id it rebuilds under.
+    pub(crate) fn reinstalled(&self) -> crate::Result<Self> {
+        let next = self
+            .id
+            .checked_add(1)
+            .filter(|next| *next != VersionId::MAX)
+            .ok_or_else(|| {
+                log::error!(
+                    "the version id space is exhausted (v{} is installed); the tree \
+                     cannot install another snapshot",
+                    self.id
+                );
+                crate::Error::Unrecoverable
+            })?;
+        Ok(self.with_id_and_dicts(next, self.dicts.to_vec()))
     }
 
     fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {

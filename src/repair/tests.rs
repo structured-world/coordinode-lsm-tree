@@ -16752,6 +16752,63 @@ impl crate::fs::Fs for HookFs {
     }
 }
 
+/// `open_or_repair` holds the report of the repair it ran only in memory until
+/// it returns, and the open that follows the repair can be cut short (a crash
+/// of the process). So the report's copy stays on disk through that open, and
+/// the next call hands it out then; it is retired only once the open has
+/// succeeded and the report is about to be returned.
+#[test]
+fn open_or_repair_keeps_the_report_copy_through_the_open_after_its_repair() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    standard_tree_without_manifest(&memfs, &root)?;
+
+    // The repair installs v0; the open after it installs v1. When that open
+    // installs, a copy must still carry the report.
+    let copy_held = Arc::new(AtomicBool::new(false));
+    let probe = (*memfs).clone();
+    let probe_root = root.clone();
+    let held = Arc::clone(&copy_held);
+    let fs = HookFs {
+        inner: (*memfs).clone(),
+        on: HookOn::RenameTo,
+        needle: root.join("v1").to_string_lossy().into_owned(),
+        fired: AtomicBool::new(false),
+        hook: Box::new(move || {
+            let found = probe.read_dir(&probe_root).is_ok_and(|entries| {
+                entries
+                    .iter()
+                    .any(|e| crate::file::repair_report_name(&e.file_name).is_some())
+            });
+            held.store(found, Ordering::SeqCst);
+        }),
+    };
+
+    let (_tree, report) = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .open_or_repair(RepairPolicy::default())?;
+    assert!(report.is_some(), "self-check: the open was repaired");
+    assert!(
+        copy_held.load(Ordering::SeqCst),
+        "the report's copy is still on disk while the open after the repair runs"
+    );
+    let left = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .any(|e| crate::file::repair_report_name(&e.file_name).is_some());
+    assert!(!left, "and retired once the report is handed out");
+    Ok(())
+}
+
 /// A cancel that lands while the LAST file is being processed must still
 /// abort the repair: per-file boundaries only run before a file starts, so
 /// without a final boundary before the commit the request would be silently

@@ -3668,7 +3668,7 @@ impl Config {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair(&self) -> crate::Result<RepairReport> {
-        repair_tree(self, false, false)
+        repair_tree(self, false, false, ReportCopy::Retire)
     }
 
     /// Like [`repair`](Self::repair), but when an SST fails whole-file recovery
@@ -3706,7 +3706,7 @@ impl Config {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair_with_salvage(&self, salvage: bool) -> crate::Result<RepairReport> {
-        repair_tree(self, salvage, false)
+        repair_tree(self, salvage, false, ReportCopy::Retire)
     }
 
     /// Like [`repair_with_salvage`](Self::repair_with_salvage), but with an
@@ -3742,7 +3742,7 @@ impl Config {
         salvage: bool,
         allow_resurrection: bool,
     ) -> crate::Result<RepairReport> {
-        repair_tree(self, salvage, allow_resurrection)
+        repair_tree(self, salvage, allow_resurrection, ReportCopy::Retire)
     }
 
     /// Opens the tree, and when the open fails STRUCTURALLY, repairs per
@@ -3826,23 +3826,38 @@ impl Config {
                 },
             },
             Err(e) if is_repairable_structural(&e) => {
-                let report =
-                    retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
+                // The report's copy stays through the open that follows: until
+                // this call returns, the report lives only in memory, and a
+                // crash during that open would otherwise leave a committed
+                // repair whose next open answers `None`.
+                let report = repair_tree(
+                    &retry,
+                    policy.salvage,
+                    policy.allow_resurrection,
+                    ReportCopy::Keep,
+                )?;
                 // The follow-up open's failure must not DROP the report: the
                 // repair is committed, so the caller's retry opens a healthy
                 // tree without a repair and answers `None`, and an
                 // external-WAL consumer would never learn the replay
                 // obligation the report carries. Ship it WITH the error.
-                let tree = match retry.open() {
-                    Ok(tree) => tree,
-                    Err(cause) => {
-                        return Err(crate::Error::RepairedButUnopened {
+                // Either way the report leaves this call now, so its copy is
+                // retired; a copy that cannot be removed still carries it, and
+                // the call fails without it rather than hand it out twice.
+                // Cloned: the open consumes its config, and the retirement
+                // after it reads the same folder.
+                let opened = retry.clone().open();
+                match (opened, report_marker::retire(&retry)) {
+                    (_, Err(report_marker::Retire::Kept(e))) => Err(e),
+                    (Ok(tree), Ok(())) => Ok((tree, Some(report))),
+                    (Ok(_), Err(report_marker::Retire::Unsynced(cause)))
+                    | (Err(cause), Ok(()) | Err(report_marker::Retire::Unsynced(_))) => {
+                        Err(crate::Error::RepairedButUnopened {
                             report: alloc::boxed::Box::new(report),
                             cause: alloc::boxed::Box::new(cause),
-                        });
+                        })
                     }
-                };
-                Ok((tree, Some(report)))
+                }
             }
             Err(e) => Err(e),
         }
@@ -4388,10 +4403,22 @@ fn publish_recovery_bytes_total(config: &Config) {
     progress.set_bytes_total(total);
 }
 
+/// Whether a repair retires its report's copy as it returns the report, or
+/// leaves it to the caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportCopy {
+    /// The report reaches the caller with this call: the copy goes now.
+    Retire,
+    /// The report is held only in memory past this call (an open still
+    /// follows): the copy stays until the caller is about to return it.
+    Keep,
+}
+
 fn repair_tree(
     config: &Config,
     salvage: bool,
     allow_resurrection: bool,
+    copy: ReportCopy,
 ) -> crate::Result<RepairReport> {
     // Hold the cross-process directory lock for the whole repair: it writes and
     // installs a fresh snapshot and sweeps `edits-*` in place, so a
@@ -4502,7 +4529,10 @@ fn repair_tree(
     );
     #[cfg(zstd_any)]
     let rebuilt = set_aside_damaged_dictionaries(config, damaged_dictionaries, rebuilt);
-    retire_report_copy(config, rebuilt)
+    match copy {
+        ReportCopy::Retire => retire_report_copy(config, rebuilt),
+        ReportCopy::Keep => rebuilt,
+    }
 }
 
 /// Removes the report's kept copy as the report is handed to the caller, so

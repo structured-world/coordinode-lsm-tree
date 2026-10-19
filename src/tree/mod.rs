@@ -6592,7 +6592,7 @@ impl Tree {
         // snapshot under the next id, installed as a rotation installs one:
         // its bytes synced, renamed into place, the folder synced. An owed
         // repair report moves to it first, as a rotation moves one.
-        let version = version.reinstalled();
+        let version = version.reinstalled()?;
         crate::file::carry_repair_report(
             &*config.fs,
             tree_path,
