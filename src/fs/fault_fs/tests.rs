@@ -1346,6 +1346,49 @@ fn a_read_a_queue_keeps_at_a_wait_for_none_is_screened_when_issued() -> io::Resu
     Ok(())
 }
 
+/// Over a wrapper over the backend, a read kept at a wait for none comes back
+/// through both: the outer wrapper's rule armed before the issuing wait
+/// applies to it, and the outer wrapper counts it once.
+#[test]
+fn a_kept_read_comes_back_through_nested_wrappers() -> io::Result<()> {
+    let fs = FaultFs::new(FaultFs::new(DescriptorFs::eager()));
+    let files: Vec<Arc<dyn FsFile>> = two_readable(&fs)?.into_iter().map(Arc::from).collect();
+    fs.inner
+        .inner
+        .keeping_waits
+        .store(1, core::sync::atomic::Ordering::Relaxed);
+    let before = fs.injector().read_count();
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 1,
+        file: Arc::clone(&files[1]),
+        offset: 0,
+        buf: vec![0; 16],
+    });
+    let mut done = Vec::new();
+    queue.wait(0, &mut |read| done.push(read));
+    assert!(
+        done.is_empty(),
+        "self-check: the backend's queue kept the read"
+    );
+
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+    queue.wait(1, &mut |read| done.push(read));
+    assert_eq!(
+        done.first()
+            .map(|read| read.result.as_ref().map_err(io::Error::kind)),
+        Some(Err::<&(), _>(ErrorKind::PermissionDenied)),
+        "the outer rule armed before the issuing wait applies"
+    );
+    assert_eq!(fs.injector().read_count() - before, 1);
+    Ok(())
+}
+
 /// A batch whose requests by descriptor the backend refuses together still
 /// has its other requests read, as the backend reads them unwrapped, and
 /// spends no rule on the refused ones.

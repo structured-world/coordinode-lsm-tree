@@ -1231,6 +1231,13 @@ impl ReadQueue for FaultReadQueue<'_> {
         self.inner.issues_at_wait_for_none()
     }
 
+    // What the last wait for none got back from the queue below, unscreened
+    // here again: a wrapper above takes it back the same way, and screens it
+    // at the wait that issues it.
+    fn take_kept(&mut self) -> Vec<QueuedRead> {
+        core::mem::take(&mut self.submitted)
+    }
+
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
         let injector = self.injector;
         lend_descriptors(injector, || self.wait_lent(min, on_done));
