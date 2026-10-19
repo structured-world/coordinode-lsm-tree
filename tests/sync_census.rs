@@ -495,8 +495,11 @@ fn a_new_route_on_another_device_flushes_it_once() {
     tree_fs
         .create_dir_all(base.parent().expect("a parent"))
         .expect("the tree's parent");
+    // Absolute as the route is: on Windows `/elsewhere` is `<drive>:\elsewhere`,
+    // and a root made under another spelling would leave the route's chain
+    // running up to the drive, past the folders this test watches.
     route_fs
-        .create_dir_all(std::path::Path::new("/elsewhere"))
+        .create_dir_all(&std::path::absolute("/elsewhere").expect("absolute path"))
         .expect("the route's root");
     let _tree = Config::new(
         &base,
