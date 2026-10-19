@@ -139,12 +139,24 @@ fn an_interrupted_switch_is_finished_by_the_next_run() -> Result<(), Box<dyn std
             });
             let finished_unbroken = interrupted.is_ok();
 
-            // A switch stopped with neither pointer in the folder: a tree
-            // opened there is refused rather than started fresh over it.
-            if !folder
-                .path()
-                .join(lsm5::file::CURRENT_VERSION_FILE)
-                .exists()
+            // A switch stopped with neither the source's pointer nor the
+            // converted store's snapshot in the folder: a tree opened there is
+            // refused rather than started fresh over it. The guard is named
+            // like a snapshot but is the switch's own, there to refuse it.
+            let installed = std::fs::read_dir(folder.path())?.any(|entry| {
+                entry.is_ok_and(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name != GUARD
+                        && name.strip_prefix('v').is_some_and(|id| {
+                            !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+                        })
+                })
+            });
+            if !installed
+                && !folder
+                    .path()
+                    .join(lsm5::file::CURRENT_VERSION_FILE)
+                    .exists()
             {
                 let v6 = lsm6::Config::new(
                     folder.path(),

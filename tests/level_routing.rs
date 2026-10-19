@@ -944,8 +944,8 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
             .filter(|n| {
                 n.strip_prefix('v')
+                    .or_else(|| n.strip_prefix("edits-"))
                     .is_some_and(|rest| rest.parse::<u64>().is_ok())
-                    || n == "current"
             })
             .collect();
         names.sort();
@@ -965,6 +965,46 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
         manifest_names(),
         "an auto-repair would have rewritten the manifest generation",
     );
+    Ok(())
+}
+
+/// A tree whose manifest is gone while its tables live only in a route is not
+/// a fresh directory: opening it refuses instead of creating an empty tree
+/// over them, which would leave the routed tables unreferenced and have a
+/// later open sweep them as orphans.
+#[test]
+fn open_refuses_a_lost_manifest_over_routed_tables() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let tree = three_tier_config(dir.path()).open()?;
+        tree.insert("a", "value_a", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    let hot_tables = dir.path().join("hot").join("tables");
+    let routed = || -> std::io::Result<usize> { Ok(std::fs::read_dir(&hot_tables)?.count()) };
+    assert_eq!(routed()?, 1, "the flush wrote its table to the hot route");
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("primary").join("tables"))?.count(),
+        0,
+        "nothing lies in the primary tables folder"
+    );
+    for entry in std::fs::read_dir(dir.path().join("primary"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name
+            .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
+            .is_some_and(|rest| rest.parse::<u64>().is_ok())
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+
+    assert!(
+        three_tier_config(dir.path()).open().is_err(),
+        "a lost manifest over routed tables must not open as a new tree"
+    );
+    assert_eq!(routed()?, 1, "the routed table survives the refused open");
     Ok(())
 }
 

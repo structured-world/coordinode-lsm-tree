@@ -14,8 +14,9 @@
 //! `AbsoluteConsistency` surfaces it for deliberate repair (see [`replay_log`]).
 //!
 //! Rotation (writing a fresh snapshot and starting a new log) is driven by
-//! [`log_size`] exceeding a threshold; the snapshot switch is done atomically
-//! via the `CURRENT` pointer (see the recovery / persist layers).
+//! [`log_size`] exceeding a threshold. Recovery takes the highest `v{N}` and
+//! replays its `edits-{N}`; a log that is not there is empty (see the
+//! recovery / persist layers).
 
 use super::edit::{VersionEdit, replay_edits};
 use crate::fs::{Fs, FsOpenOptions, SyncMode};
@@ -88,8 +89,9 @@ pub fn create_log(
 ///
 /// # Errors
 ///
-/// Returns an I/O error if the open, write, or fsync fails, or an encoding
-/// error from [`VersionEdit::encode`].
+/// Returns an I/O error if the open, the directory sync or the write fails,
+/// an encoding error from [`VersionEdit::encode`], and
+/// [`crate::Error::InstallOutcomeUnknown`] when the record's sync fails.
 pub fn append_edit(
     fs: &dyn Fs,
     path: &Path,
@@ -114,11 +116,16 @@ pub fn append_edit(
         // sync although the operation it records was reported failed.
         crate::file::fsync_directory(crate::file::entry_directory(path), fs, sync_mode)?;
     }
+    // A write that fails leaves the record short of its last byte, a torn
+    // tail replay drops: the edit is not installed.
     super::framing::write_frame(&mut file, scratch)?;
     // `sync_data` persists the file size with the data (its contract, POSIX
     // `fdatasync`), which is all replay reads; the log's name is covered by
-    // the directory sync above.
-    file.sync_data_with(sync_mode).map_err(crate::Error::from)?;
+    // the directory sync above. A sync that fails leaves the whole record
+    // written, which a power loss may keep: the edit's outcome is unknown.
+    file.sync_data_with(sync_mode).map_err(|e| {
+        crate::Error::InstallOutcomeUnknown(alloc::boxed::Box::new(crate::Error::from(e)))
+    })?;
     // The framing header (u32 len + u64 XXH3) precedes the payload on disk.
     let appended = u64::try_from(super::framing::FRAME_HEADER_LEN + scratch.len())
         .map_err(|_| crate::Error::Unrecoverable)?;

@@ -149,7 +149,13 @@ including versions at or below `W` — while `get_highest_persisted_seqno()`
 stays high because neighbouring tables survived. The standard `seqno > W` tail
 replay from section 3 does not cover such a mid-history hole, and blindly
 widening the replay would double-fold merge operands that DID survive. After
-any repair, derive the obligation from the report instead:
+any repair, derive the obligation from the report instead. The report reaches
+you once per committed repair: from the call that repaired, from
+`Error::RepairedButUnopened` when a step after the commit failed, or, when the
+install's outcome was unknown (`Error::InstallOutcomeUnknown`) and its
+snapshot survived, from the next `open_or_repair`, which finds it kept on disk
+beside that snapshot. A repair over such a snapshot carries the earlier
+repair's losses in its own report.
 
 1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
    `lost_coverage` (which covers excluded tables AND kept lossy salvaged

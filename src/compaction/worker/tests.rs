@@ -888,8 +888,9 @@ fn manifest_loss_in_the_unwritten_sidecar_window_resolves_to_one_history() -> cr
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             mem.remove_file(&e.path)?;
         }
     }
@@ -1362,8 +1363,9 @@ fn tight_space_sidecar_fault_must_not_resurrect_evicted_deletes() -> crate::Resu
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             shared.remove_file(&e.path)?;
         }
     }

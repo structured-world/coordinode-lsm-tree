@@ -757,7 +757,7 @@ fn open_or_repair_propagates_a_comparator_mismatch_without_repairing() -> lsm_tr
         let mut names: Vec<String> = std::fs::read_dir(&folder)
             .expect("read dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('v') || n == "current")
+            .filter(|n| n.starts_with('v') || n.starts_with("edits-"))
             .collect();
         names.sort();
         names

@@ -202,8 +202,8 @@ impl core::fmt::Debug for LevelRoute {
 /// inside a record.
 ///
 /// The manifest is a snapshot plus an append-only edit log. The snapshot's
-/// sections are checksummed blocks bound to the `CURRENT` digest, so they are
-/// read whole or not at all and no mode relaxes them. The only damage an
+/// sections are checksummed blocks its checksummed footer indexes, so they
+/// are read whole or not at all and no mode relaxes them. The only damage an
 /// append can leave that is not already covered is a torn last record: power
 /// was lost mid-append, so the operation it records was never acknowledged.
 /// This is the one thing a mode chooses.
@@ -1503,8 +1503,8 @@ impl Config {
     /// [`Error::InvalidHeader`](crate::Error::InvalidHeader) for a layout too
     /// short to hold its header; [`Error::Locked`](crate::Error::Locked) when
     /// another instance holds the folder; an `AlreadyExists` I/O error, before
-    /// anything is written, when the folder already holds a tree (a `current`
-    /// pointer or a manifest file) that no interrupted restore left; otherwise
+    /// anything is written, when the folder already holds a tree (a manifest
+    /// snapshot or edit log) that no interrupted restore left; otherwise
     /// the failures of the syncs, the
     /// manifest write, [`Self::open`] and the flush.
     #[cfg(feature = "std")]
