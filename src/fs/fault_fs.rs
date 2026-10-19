@@ -129,6 +129,24 @@ pub enum FaultOp {
     /// makes the probe answer `None`, as a backend that cannot tell the
     /// volume of that path does.
     VolumeId,
+    /// [`Fs::remove_dir_all`]: the removal of a directory and all it holds.
+    RemoveDirAll,
+}
+
+/// What a sync seen by a [`FaultFs`] made durable (see
+/// [`FaultInjector::take_syncs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum SyncKind {
+    /// A file's data and metadata: [`FsFile::sync_all`] and its mode variant.
+    File,
+    /// A file's data and the size a read of it needs: [`FsFile::sync_data`]
+    /// and its mode variant.
+    FileData,
+    /// A directory's entries: [`Fs::sync_directory`] and its mode variant.
+    Directory,
+    /// Everything synced on a device before: [`Fs::sync_device`].
+    Device,
 }
 
 /// What a matched [`FaultRule`] does to the operation.
@@ -280,6 +298,12 @@ pub struct FaultInjector {
     /// mode a component synced its files at (e.g. a salvage writer honouring
     /// `Config::sync_mode`), which the pass-through delegation cannot show.
     sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
+    /// Observed `(path, mode)` pairs from every `sync_directory_with`, in call
+    /// order: which of a directory's syncs flush the device is a cost.
+    directory_sync_log: spin::Mutex<Vec<(PathBuf, SyncMode)>>,
+    /// Every sync of any kind, with its path, in call order: how many syncs
+    /// an operation costs is part of what it does.
+    syncs: spin::Mutex<Vec<(PathBuf, SyncKind)>>,
     /// Observed `(path, offset, len)` of every `start_writeback`, in call
     /// order: a writeback changes no byte, so only this shows it was asked.
     writeback_log: spin::Mutex<Vec<(PathBuf, u64, u64)>>,
@@ -425,11 +449,26 @@ impl FaultInjector {
     pub fn clear(&self) {
         self.rules.lock().clear();
         self.sync_log.lock().clear();
+        self.directory_sync_log.lock().clear();
+        self.syncs.lock().clear();
         self.writeback_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();
         self.reads.store(0, core::sync::atomic::Ordering::Relaxed);
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records one sync of `kind` on `path`.
+    fn note_sync(&self, path: &Path, kind: SyncKind) {
+        self.syncs.lock().push((path.to_path_buf(), kind));
+    }
+
+    /// Every sync, of any kind and mode, issued since the last call, in call
+    /// order: a file sync with the file's path, a directory or device sync
+    /// with the directory's.
+    #[must_use]
+    pub fn take_syncs(&self) -> Vec<(PathBuf, SyncKind)> {
+        core::mem::take(&mut *self.syncs.lock())
     }
 
     /// Records one file-level mode-carrying sync observation (see
@@ -443,6 +482,18 @@ impl FaultInjector {
     #[must_use]
     pub fn sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
         self.sync_log
+            .lock()
+            .iter()
+            .filter(|(p, _)| p.to_string_lossy().contains(substr))
+            .map(|(_, m)| *m)
+            .collect()
+    }
+
+    /// The [`SyncMode`]s of the directory syncs of folders whose path contains
+    /// `substr`, in call order.
+    #[must_use]
+    pub fn directory_sync_modes_for(&self, substr: &str) -> Vec<SyncMode> {
+        self.directory_sync_log
             .lock()
             .iter()
             .filter(|(p, _)| p.to_string_lossy().contains(substr))
@@ -607,6 +658,9 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDirAll, Some(path)) {
+            return Err(fault_error(kind, FaultOp::RemoveDirAll));
+        }
         self.inner.remove_dir_all(path)
     }
 
@@ -625,6 +679,14 @@ impl<F: Fs> Fs for FaultFs<F> {
             return Err(fault_error(kind, FaultOp::Metadata));
         }
         self.inner.read_link(path)
+    }
+
+    fn symlink(&self, target: &Path, link: &Path, to_dir: bool) -> io::Result<()> {
+        self.inner.symlink(target, link, to_dir)
+    }
+
+    fn symlink_to_dir(&self, path: &Path) -> io::Result<bool> {
+        self.inner.symlink_to_dir(path)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -646,6 +708,7 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        self.injector.note_sync(path, SyncKind::Directory);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncDirectory, Some(path)) {
             return Err(fault_error(kind, FaultOp::SyncDirectory));
         }
@@ -653,6 +716,11 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn sync_directory_with(&self, path: &Path, mode: SyncMode) -> io::Result<()> {
+        self.injector.note_sync(path, SyncKind::Directory);
+        self.injector
+            .directory_sync_log
+            .lock()
+            .push((path.to_path_buf(), mode));
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncDirectory, Some(path)) {
             return Err(fault_error(kind, FaultOp::SyncDirectory));
         }
@@ -660,6 +728,7 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
+        self.injector.note_sync(path, SyncKind::Device);
         self.inner.sync_device(path)
     }
 
@@ -826,6 +895,7 @@ impl std::io::Seek for FaultFile {
 
 impl FsFile for FaultFile {
     fn sync_all(&self) -> io::Result<()> {
+        self.injector.note_sync(&self.path, SyncKind::File);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncAll, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncAll));
         }
@@ -833,6 +903,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        self.injector.note_sync(&self.path, SyncKind::FileData);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncData, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncData));
         }
@@ -840,6 +911,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_all_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.note_sync(&self.path, SyncKind::File);
         self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncAll, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncAll));
@@ -848,6 +920,7 @@ impl FsFile for FaultFile {
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        self.injector.note_sync(&self.path, SyncKind::FileData);
         self.injector.record_sync(&self.path, mode);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncData, Some(&self.path)) {
             return Err(fault_error(kind, FaultOp::SyncData));

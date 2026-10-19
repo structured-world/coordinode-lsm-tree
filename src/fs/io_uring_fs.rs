@@ -371,6 +371,14 @@ impl Fs for IoUringFs {
         super::StdFs.read_link(path)
     }
 
+    fn symlink(&self, target: &Path, link: &Path, to_dir: bool) -> crate::io::Result<()> {
+        super::StdFs.symlink(target, link, to_dir)
+    }
+
+    fn symlink_to_dir(&self, path: &Path) -> crate::io::Result<bool> {
+        super::StdFs.symlink_to_dir(path)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         std::fs::rename(from, to).map_err(crate::io::Error::from)
     }

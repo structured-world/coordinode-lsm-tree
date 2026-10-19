@@ -68,7 +68,7 @@ pub use crash_fs::CrashFs;
 #[cfg(all(test, feature = "std"))]
 pub(crate) use fault_fs::ReadHook;
 #[cfg(feature = "std")]
-pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule};
+pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, SyncKind};
 pub use mem_fs::MemFs;
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;
@@ -1246,6 +1246,38 @@ pub trait Fs: Send + Sync + 'static {
     fn read_link(&self, path: &Path) -> io::Result<Option<PathBuf>> {
         let _ = path;
         Ok(None)
+    }
+
+    /// Makes `link` a symbolic link to `target`, stored as given: the inverse
+    /// of [`read_link`](Self::read_link), for a backend that reports links.
+    /// `to_dir` is the kind a platform that tells links to directories from
+    /// links to files (Windows) records, as
+    /// [`symlink_to_dir`](Self::symlink_to_dir) reports it; others ignore it.
+    ///
+    /// The default refuses with [`io::ErrorKind::Unsupported`]: a backend
+    /// without symbolic links ([`MemFs`]) has none to make.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the link cannot be made.
+    fn symlink(&self, target: &Path, link: &Path, to_dir: bool) -> io::Result<()> {
+        let _ = (target, link, to_dir);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this backend has no symbolic links",
+        ))
+    }
+
+    /// Whether the symbolic link `path` was made as a link to a directory,
+    /// the kind Windows records with the link whatever its target is now;
+    /// `false` on a platform that records no kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if `path` cannot be inspected.
+    fn symlink_to_dir(&self, path: &Path) -> io::Result<bool> {
+        let _ = path;
+        Ok(false)
     }
 
     /// Renames a file from `from` to `to`.

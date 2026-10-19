@@ -37,6 +37,85 @@ fn the_first_append_to_a_log_in_the_current_directory_syncs_it() -> crate::Resul
     Ok(())
 }
 
+/// A log created over one that holds durable edits is empty after a power
+/// loss: the edits of the old file never replay over the snapshot the new
+/// log belongs to.
+#[test]
+fn a_log_created_over_durable_edits_stays_empty_through_a_power_loss() -> crate::Result<()> {
+    let fs = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    let mut scratch = Vec::new();
+    append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Full, true)?;
+
+    create_log(&fs, Path::new("/db"), 0, SyncMode::Full)?;
+    fs.sync_directory(Path::new("/db"))?;
+    fs.crash();
+    assert_eq!(
+        replay_log(&fs, &path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        Vec::new()
+    );
+    Ok(())
+}
+
+/// A log whose emptying failed to sync is synced on the retry, though it reads
+/// empty by then: the retry must not take the unsynced length for a durable
+/// one, or a power loss brings the old edits back.
+#[test]
+fn a_log_whose_emptying_failed_to_sync_is_synced_on_the_retry() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let crash = crate::fs::CrashFs::new(crate::fs::MemFs::new());
+    crash.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    let mut scratch = Vec::new();
+    append_edit(&crash, &path, &edit(1), &mut scratch, SyncMode::Full, true)?;
+
+    let fs = FaultFs::new(crash.clone());
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(path.to_string_lossy())
+            .times(1),
+    );
+    assert!(
+        create_log(&fs, Path::new("/db"), 0, SyncMode::Full).is_err(),
+        "self-check: the first emptying fails its sync"
+    );
+    create_log(&fs, Path::new("/db"), 0, SyncMode::Full)?;
+    crash.sync_directory(Path::new("/db"))?;
+    crash.crash();
+    assert_eq!(
+        replay_log(&crash, &path, ManifestRecoveryMode::AbsoluteConsistency)?,
+        Vec::new()
+    );
+    Ok(())
+}
+
+/// A probe of the log's name that fails for another reason than its absence
+/// fails the creation: whether a log is there to empty is not known.
+#[test]
+fn a_failed_probe_of_the_log_fails_its_creation() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::Metadata,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("edits-0"),
+    );
+    let Err(crate::Error::Io(e)) = create_log(&fs, Path::new("/db"), 0, SyncMode::Full) else {
+        panic!("the probe's failure is the creation's");
+    };
+    assert_eq!(e.kind(), crate::io::ErrorKind::PermissionDenied);
+    fs.injector().clear();
+    assert!(
+        !fs.exists(&log_path(Path::new("/db"), 0))?,
+        "no log is made"
+    );
+    Ok(())
+}
+
 /// A first append whose directory sync fails writes no edit: a record left
 /// in the log would be made durable by the next append's sync, though the
 /// operation it records was reported failed.
