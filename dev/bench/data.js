@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792403061052,
+  "lastUpdate": 1792403064912,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -50944,6 +50944,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.629215097,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd0ed3f4e60c7c404a196d336db499a0f9fee06d",
+          "message": "perf(tree): sync each new directory entry once (#938)\n\n## Summary\n- Tree creation, the first flush and the open of a KV-separated tree\nsync each new directory entry once, after every entry in that directory\nexists.\n- Table, blob and snapshot files are synced with `sync_data`, which is\n`fdatasync` off macOS.\n- Replaces #936 (same branch, history squashed into one commit).\n\n## Changes\n- Tree creation makes every folder it writes into, then syncs each\nfolder that gained an entry once, on its own backend, before the first\nsnapshot: from each new folder up to the first that existed, routed\ntables folders included; a folder that existed before gives the ones\nabove it no new entry, and they are not synced. Under barrier syncs the\nlast sync on each other device than the tree's is a full one.\n- A failed creation, or an open that fails after making the tree folder,\ntakes back the folders it made, deepest first: the tree folder with what\nwas put in it, every other folder only while empty, since no lock covers\na folder above the tree. A folder it cannot remove has its holders\nsynced, so a retry never finds a folder whose name is not durable; an\nopen that cannot take the lock only syncs them.\n- A snapshot's edit log is created with the snapshot, under the same\ndirectory sync, so the first append syncs no directory. Repair keeps\nthat log when it sweeps the stale ones.\n- Opening a KV-separated tree that makes its blob folder syncs the tree\nfolder; one that finds it makes no sync.\n- Without a current pointer, open creates a tree only over what a\ncreation cut short leaves (empty folders, a lone `v0`, an empty log);\nfiles in a tables folder or `blobs/`, a later snapshot or a log holding\nan edit are refused as a tree's state.\n- `Fs::remove_dir` removes an empty directory and only an empty one (the\ndefault reports `Unsupported`); `Fs::symlink` and `Fs::symlink_to_dir`\nmake and inspect symbolic links on backends that report them.\n- `FaultFs` records every sync by path and kind (`SyncKind`,\n`take_syncs`) and each directory sync's mode. `CrashFs` orders a removal\nand a rename behind a barrier sync as steps among the syncs\n(`ordered_steps`), each kept or lost whole; a lost step puts back the\nfile it took, a hard link as a link and a symbolic link with its kind.\n\n| Operation | Syncs before | Syncs after |\n|---|---|---|\n| create a tree | 8 | 5 |\n| first flush after creation | 4 | 3 |\n| reopen a KV-separated tree | 2 | 0 |\n\n## Testing\n- A sync census over `FaultFs` pins the syncs of each operation\n(standard, KV-separated and routed trees, a failed creation). Crash\nsweeps over every prefix of ordered steps cover creation, flushes,\nrenames, removals and a compaction; crash tests keep a created tree, its\nfirst flush, a later KV-separated open and a manifest rotation through a\npower loss. Failed creations and opens are checked to take back only\ntheir own folders.\n- fmt, clippy in every CI configuration, the full nextest suite, doc\ntests, the doc build, the no-std check, sst-dump and the converter pass\non Linux.\n\nCloses #926\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved crash recovery for files, directories, and links during\ninterrupted operations.\n* Strengthened durability when creating, opening, flushing, and\nrecovering trees, including trees with separated blob storage or routed\ntables.\n* Fixed recovery handling for edit logs and newly created folders,\nhelping prevent lost data or leftover partial state.\n* **New Features**\n* Added directory removal and symbolic-link support across filesystem\nbackends.\n  * Added filesystem sync tracking for diagnostics and testing.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-19T12:20:38+03:00",
+          "tree_id": "14e9ae34aeae9d45752468a0738f86225bb1f777",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dd0ed3f4e60c7c404a196d336db499a0f9fee06d"
+        },
+        "date": 1792403063692,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 527.645,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 81.710957ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 123.504,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 54.376193ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 478.019,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 103.678511ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4082.581,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9767.573,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.863,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.573055,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.617940316,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.047,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 79.822847,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.604503195,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
