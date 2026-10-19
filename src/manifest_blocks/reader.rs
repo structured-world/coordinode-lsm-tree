@@ -262,8 +262,17 @@ impl ManifestArchiveReader {
                 // `ManifestFooterInvalid` would send `open_or_repair` into a
                 // rebuild under the wrong key, excluding every table it
                 // cannot decrypt.
+                //
+                // A copy that could not be READ (a transient or environmental
+                // I/O failure) says nothing about its bytes either: collapsing
+                // it would send a retryable hiccup into a manifest rebuild.
                 for err in [tail_err, head_err] {
-                    if matches!(err, crate::Error::Decrypt(_)) {
+                    let propagate = match &err {
+                        crate::Error::Decrypt(_) => true,
+                        crate::Error::Io(e) => e.kind().is_environmental(),
+                        _ => false,
+                    };
+                    if propagate {
                         return Err(err);
                     }
                 }
@@ -397,13 +406,10 @@ impl ManifestArchiveReader {
         }
         // Cross-check the decoded Block's own XXH3-128 against the
         // value the TOC entry committed at write time. Without this,
-        // CURRENT-pointer validation only proves the footer payload
-        // is self-consistent (TOC bytes intact) — a forged or
-        // mis-targeted TOC entry could still point at a Block whose
-        // content differs from what the writer recorded. The TOC's
-        // `section_checksum` is what we hash into the CURRENT
-        // pointer's canonical digest, so binding it here makes the
-        // chain CURRENT → TOC → section bytes airtight.
+        // the footer's checksum only proves the TOC bytes intact: a
+        // forged or mis-targeted TOC entry could still point at a Block
+        // whose content differs from what the writer recorded. Binding
+        // it here makes the chain footer → TOC → section bytes airtight.
         if block.header.stored_checksum.into_u128() != expected_section_checksum {
             return Err(crate::Error::ManifestSectionInvalid(
                 "section Block checksum does not match TOC entry section_checksum",

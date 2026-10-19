@@ -13,6 +13,8 @@ use lsm_tree::{
 };
 use std::sync::Arc;
 
+mod common;
+
 fn open_tree<P: AsRef<std::path::Path>>(path: P) -> lsm_tree::Result<AnyTree> {
     Config::new(
         path,
@@ -721,13 +723,13 @@ fn checkpoint_failure_leaves_source_intact() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A checkpoint whose `current` pointer is missing (the crash-recovery
-/// hole described in `write_current_for_version`) MUST be rejected by
-/// `Tree::open` rather than silently treated as fresh-tree state. This
-/// regression test removes the file after a successful checkpoint and
-/// asserts open returns an error.
+/// A checkpoint whose snapshot was never installed (still under its
+/// temporary name, what a crash before the rename leaves) MUST be rejected by
+/// `Tree::open` rather than silently treated as fresh-tree state: its tables
+/// are there. This regression test moves the snapshot back to its temporary
+/// name after a successful checkpoint and asserts open returns an error.
 #[test_log::test]
-fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
+fn checkpoint_open_rejects_an_uninstalled_snapshot() -> lsm_tree::Result<()> {
     let src_dir = tempfile::tempdir()?;
     let dst_dir = tempfile::tempdir()?;
     let dst_path = dst_dir.path().join("checkpoint");
@@ -740,21 +742,21 @@ fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
     tree.create_checkpoint(&dst_path)?;
     drop(tree);
 
-    // Tamper: delete the `current` pointer that
-    // `write_current_for_version` writes last during checkpoint sealing.
-    let current = dst_path.join("current");
-    assert!(
-        current.exists(),
-        "checkpoint sealing must have produced a `current` pointer",
-    );
-    std::fs::remove_file(&current)?;
+    // Tamper: undo the rename that installs the checkpoint's snapshot, which
+    // the checkpoint makes last.
+    let id = common::installed_snapshot_id(&dst_path)?
+        .expect("checkpoint sealing must have installed a snapshot");
+    std::fs::rename(
+        dst_path.join(format!("v{id}")),
+        dst_path.join(format!("v{id}.tmp")),
+    )?;
 
     // Open MUST fail (no fresh-tree fallback) so callers detect the
     // half-written checkpoint instead of mistaking it for empty data.
     // The error carries the path + remediation hint so a programmatic
     // caller can surface it without reading logs.
     let err = match open_tree(&dst_path) {
-        Ok(_) => panic!("open_tree on a checkpoint with no `current` must error, got Ok"),
+        Ok(_) => panic!("open_tree on a checkpoint with no installed snapshot must error, got Ok"),
         Err(e) => e,
     };
     match err {
@@ -763,7 +765,7 @@ fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
         {
             let msg = io_err.to_string();
             assert!(
-                msg.contains("current") && msg.contains("version artifacts"),
+                msg.contains("no installed manifest snapshot") && msg.contains("holds files"),
                 "error must explain the half-written-checkpoint condition, got: {msg}",
             );
         }
@@ -772,11 +774,11 @@ fn checkpoint_open_rejects_missing_current_pointer() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Same crash-recovery contract as above, but for a `current` file that
-/// exists yet contains garbage instead of a valid version pointer.
-/// `Tree::open` MUST refuse to interpret the directory as a fresh tree.
+/// Same crash-recovery contract as above, but for an installed snapshot
+/// that holds garbage. `Tree::open` MUST refuse it as damage, never fall
+/// back to treating the directory as a fresh tree.
 #[test_log::test]
-fn checkpoint_open_rejects_corrupt_current_pointer() -> lsm_tree::Result<()> {
+fn checkpoint_open_rejects_a_corrupt_installed_snapshot() -> lsm_tree::Result<()> {
     let src_dir = tempfile::tempdir()?;
     let dst_dir = tempfile::tempdir()?;
     let dst_path = dst_dir.path().join("checkpoint");
@@ -789,28 +791,28 @@ fn checkpoint_open_rejects_corrupt_current_pointer() -> lsm_tree::Result<()> {
     tree.create_checkpoint(&dst_path)?;
     drop(tree);
 
-    let current = dst_path.join("current");
-    std::fs::write(&current, b"this is not a valid version pointer")?;
+    let id = common::installed_snapshot_id(&dst_path)?
+        .expect("checkpoint sealing must have installed a snapshot");
+    let snapshot = dst_path.join(format!("v{id}"));
+    std::fs::write(&snapshot, b"this is not a valid manifest snapshot")?;
 
-    // Assert the specific failure mode the parser catches.
-    // `get_current_version` reads `u64 version_id | u128 checksum |
-    // u8 checksum_type` and rejects any checksum_type byte that
-    // isn't 0 (xxh3) with `Error::InvalidTag(("ChecksumType", _))`.
-    // Writing 36 bytes of junk guarantees we hit that branch — checking
-    // for InvalidTag instead of just `is_err()` ensures a future refactor
-    // that masks the corruption behind a different error path fails the
-    // test instead of silently passing.
-    let err = match open_tree(&dst_path) {
-        Ok(_) => panic!("open_tree on a checkpoint with corrupt `current` must error, got Ok"),
-        Err(e) => e,
-    };
-    match err {
-        lsm_tree::Error::InvalidTag((field, _)) => assert_eq!(
-            field, "ChecksumType",
-            "expected ChecksumType InvalidTag from corrupt `current`, got field {field}",
-        ),
-        other => panic!("expected Error::InvalidTag(ChecksumType, _), got {other:?}"),
-    }
+    // The snapshot is installed (its log is there), so it is the tree's and
+    // its damage is reported as such: no fresh tree is created over it, and
+    // the files stay for a repair to work from.
+    assert!(
+        open_tree(&dst_path).is_err(),
+        "open_tree on a checkpoint with a corrupt installed snapshot must error, got Ok",
+    );
+    assert_eq!(
+        common::installed_snapshot_id(&dst_path)?,
+        Some(id),
+        "a failed open must not install another snapshot"
+    );
+    assert_eq!(
+        std::fs::read(&snapshot)?,
+        b"this is not a valid manifest snapshot",
+        "a failed open must not rewrite the damaged snapshot"
+    );
     Ok(())
 }
 
@@ -840,22 +842,14 @@ fn checkpoint_survives_concurrent_manifest_gc_of_captured_version() -> lsm_tree:
     }
     tree.flush_active_memtable(0)?;
 
-    // Identify the live version file the same way recovery does — read
-    // the version id out of `current` rather than picking the first
-    // matching `vN` from `read_dir`. read_dir's order is unspecified and
-    // multiple vN files may coexist (the previous flush leaves the prior
-    // version around for snapshot readers until manifest GC runs), so a
-    // naive .find() could remove a STALE file and silently turn the
-    // test into a no-op that passes even when the race fix regresses.
-    //
-    // The `current` wire format is `u64 version_id | u128 checksum |
-    // u8 checksum_type` — the first 8 LE bytes give us the live id.
-    let current_bytes = std::fs::read(src_dir.path().join("current"))?;
-    let version_id = u64::from_le_bytes(
-        current_bytes[..8]
-            .try_into()
-            .expect("`current` stores the version id in the first 8 bytes"),
-    );
+    // Identify the live version file the same way recovery does, as the
+    // installed snapshot (the highest `vN` with its log), rather than
+    // picking the first matching `vN` from `read_dir`. read_dir's order is
+    // unspecified and multiple vN files may coexist, so a naive .find()
+    // could remove a STALE file and silently turn the test into a no-op
+    // that passes even when the race fix regresses.
+    let version_id = common::installed_snapshot_id(src_dir.path())?
+        .expect("the source tree holds an installed snapshot");
     let live_v = format!("v{version_id}");
     std::fs::remove_file(src_dir.path().join(&live_v))?;
 

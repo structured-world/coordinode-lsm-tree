@@ -237,8 +237,7 @@ pub struct TreeInner {
     /// ([`crate::Tree::runtime_config`] /
     /// [`crate::Tree::update_runtime_config`]). Manifest-touching
     /// write paths — `version::persist_version`,
-    /// `compaction::worker::Options`,
-    /// `checkpoint::write_current_for_version`, and the flush /
+    /// `compaction::worker::Options`, and the flush /
     /// ingestion sites that drive them — load a snapshot of this
     /// handle to pick the manifest writer's `BlockTransform`
     /// variant (footer mirror on/off, `page_ecc`, encryption). SST
@@ -355,8 +354,8 @@ impl TreeInner {
         #[cfg(feature = "std")]
         stop_signal.wake_on_stop(&compaction_rate_limiter);
 
-        // The first persist above wrote the full snapshot `v{version.id()}` and
-        // pointed CURRENT at it, so that id is the initial manifest snapshot.
+        // The first persist above wrote and installed the full snapshot
+        // `v{version.id()}`, so that id is the initial manifest snapshot.
         let snapshot_id = version.id();
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
         let mut super_versions = SuperVersions::new(

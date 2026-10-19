@@ -20,7 +20,7 @@
 /// | `manifest_layout_version` | `u8` in manifest Footer Block | Manifest file structure (footer fields, TOC encoding, head-mirror geometry) |
 ///
 /// A block format bump does NOT force a manifest layout bump and
-/// vice versa. The CURRENT pointer's canonical digest binds the
+/// vice versa. The manifest's checksummed footer carries the
 /// manifest layout version (so a manifest-only break is detected
 /// at recovery), and the manifest's `format_version` section binds
 /// this enum (so a block-format-only break is detected at

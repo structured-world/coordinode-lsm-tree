@@ -148,6 +148,96 @@ fn replaced_version_lives_on_in_the_reader_that_resolved_it() -> crate::Result<(
     Ok(())
 }
 
+/// A history over `fs` at `/tree`, its snapshot `v0` installed, whose log
+/// is far below the rotation threshold.
+fn installed_history(fs: &dyn crate::fs::Fs) -> crate::Result<SuperVersions> {
+    let folder = crate::path::Path::new("/tree");
+    fs.create_dir_all(folder)?;
+    let version = Version::new(0, crate::TreeType::Standard);
+    crate::version::persist_version(
+        folder,
+        &version,
+        default_comparator().name(),
+        fs,
+        Arc::default(),
+        None,
+        SyncMode::Normal,
+    )?;
+    Ok(SuperVersions::new(
+        version,
+        &default_comparator(),
+        SyncMode::Normal,
+        0,
+        1024 * 1024,
+        true,
+    ))
+}
+
+fn persist_next(history: &mut SuperVersions, fs: &dyn crate::fs::Fs) -> crate::Result<()> {
+    let prior = Version::new(0, crate::TreeType::Standard);
+    let next = Version::new(1, crate::TreeType::Standard);
+    history.persist_change(
+        crate::path::Path::new("/tree"),
+        &prior,
+        &next,
+        fs,
+        Arc::default(),
+        None,
+        SyncMode::Normal,
+    )
+}
+
+/// After a rotation failed, the next install rotates even when its edit
+/// would fit the current log: the failed one may have installed its
+/// snapshot on disk, and an edit appended to the older log would then be
+/// lost at recovery, which replays the newer snapshot's log.
+#[test]
+fn the_install_after_a_failed_rotation_rotates_instead_of_appending() -> crate::Result<()> {
+    let fs = crate::fs::MemFs::new();
+    let mut history = installed_history(&fs)?;
+    history.rotation_pending = true;
+
+    persist_next(&mut history, &fs)?;
+    assert_eq!(history.snapshot_id, 1, "the install rotated");
+    assert!(!history.rotation_pending, "a successful rotation clears it");
+    assert_eq!(
+        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs)?,
+        Some(1)
+    );
+    Ok(())
+}
+
+/// A rotation whose directory sync fails leaves its outcome unknown, so it
+/// marks the next install to rotate, and that install replaces what the
+/// failed one left and installs.
+#[test]
+fn a_rotation_failing_at_its_directory_sync_marks_the_next_to_rotate() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    let mut history = installed_history(&fs)?;
+    history.log_rotate_bytes = 0;
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+
+    assert!(persist_next(&mut history, &fs).is_err());
+    assert!(history.rotation_pending, "the next install must rotate");
+    assert_eq!(history.snapshot_id, 0, "the history stays on its snapshot");
+
+    persist_next(&mut history, &fs)?;
+    assert!(!history.rotation_pending);
+    assert_eq!(history.snapshot_id, 1);
+    assert_eq!(
+        crate::version::recovery::installed_snapshot(crate::path::Path::new("/tree"), &fs)?,
+        Some(1)
+    );
+    Ok(())
+}
+
 #[test]
 fn new_history_seeds_the_floor_as_the_boundary() {
     // A history built from a recovered version reads with that version's
