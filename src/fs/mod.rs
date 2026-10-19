@@ -901,6 +901,17 @@ pub trait ReadQueue {
         self.outstanding()
     }
 
+    /// Whether a [`wait`](Self::wait) for none issues the reads submitted
+    /// since the last wait, rather than leave them for a wait for some. A
+    /// wrapper that takes each read through checks of its own as it is issued
+    /// passes the reads on at such a wait only when this is `true`.
+    ///
+    /// The default, `false`, matches a queue that reads only while it is
+    /// waited on for at least one read. `io_uring` answers `true`.
+    fn issues_at_wait_for_none(&self) -> bool {
+        false
+    }
+
     /// Issues every read not yet issued, then hands reads to `on_done` as they
     /// finish, each once, until at least `min` have been handed over in this
     /// call or none is left outstanding. A read that has finished by then is
@@ -1140,6 +1151,42 @@ pub trait Fs: Send + Sync + 'static {
             fs: self,
             submitted: Vec::new(),
         })
+    }
+
+    /// Whether [`read_blocks_batched`](Self::read_blocks_batched),
+    /// [`read_blocks_batched_each`](Self::read_blocks_batched_each) and
+    /// [`read_queue`](Self::read_queue) read a file whose
+    /// [`FsFile::backing_fd`] is `Some` through that descriptor, never calling
+    /// its [`FsFile::read_at`]. A wrapper that observes reads at `read_at`
+    /// (fault injection, accounting) has to observe these in the batch call
+    /// instead.
+    ///
+    /// The default, `false`, matches the default batched read, which reads
+    /// every request through `read_at`. `io_uring` answers `true`.
+    ///
+    /// A backend answering `true` validates every descriptor-backed request
+    /// of a batch (its `offset` plus the bytes already filled fits a `u64`)
+    /// before it issues any descriptor read: a wrapper screens the batch as
+    /// a whole, and a batch it would refuse must read nothing.
+    fn reads_by_descriptor(&self) -> bool {
+        false
+    }
+
+    /// Refuses `reqs` as a backend that reads by descriptor refuses a batch
+    /// whole, before it reads any of it: the error it would return for the
+    /// first request it cannot take by descriptor, judged as that request
+    /// stands now. A wrapper that takes each read through checks of its own
+    /// asks this first, so no check is spent on a batch that reads nothing.
+    ///
+    /// The default refuses nothing. `io_uring` refuses an offset that
+    /// overflows and a request longer than one read submits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error the batch would fail with.
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> io::Result<()> {
+        let _ = reqs;
+        Ok(())
     }
 
     /// Recursively creates all directories leading to `path`.

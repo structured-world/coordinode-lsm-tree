@@ -315,6 +315,35 @@ impl Fs for IoUringFs {
         Box::new(UringReadQueue::new(&self.inner))
     }
 
+    // The ring reads every request with a descriptor by that descriptor; one
+    // without is read serially through `read_at`.
+    fn reads_by_descriptor(&self) -> bool {
+        true
+    }
+
+    // What the ring's pre-pass refuses before submitting any of the group
+    // (see `submit_reads_multi`).
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> crate::io::Result<()> {
+        for req in reqs {
+            if req.buf.capacity() == 0 || req.file.backing_fd().is_none() {
+                continue;
+            }
+            if i32::try_from(req.buf.capacity() - req.buf.filled()).is_err() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "buffer exceeds i32::MAX",
+                )));
+            }
+            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
+                return Err(crate::io::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "submit_reads_multi: request offset overflows",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
         std::fs::create_dir_all(path).map_err(crate::io::Error::from)
     }
@@ -454,6 +483,32 @@ impl Fs for IoUringFs {
         // not the I/O submission path.
         super::StdFs.volume_id(path)
     }
+
+    // The file system's capabilities, and the operations they gate, are the
+    // mount's and go through the same syscalls as on `StdFs`; the ring has no
+    // opcode for any of them. `sync_directory_with`, `sync_device` and the
+    // files' `sync_*_with` keep the trait defaults: on Linux every `SyncMode`
+    // is the same `fsync` / `fdatasync`, which these handles issue on the ring.
+
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        super::StdFs.capabilities(path)
+    }
+
+    fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
+        super::StdFs.try_disable_cow(path)
+    }
+
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        super::StdFs.punch_hole(path, offset, len)
+    }
+
+    fn reflink_file(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
+        super::StdFs.reflink_file(src, dst)
+    }
+
+    fn hard_link_count(&self, path: &Path) -> crate::io::Result<u64> {
+        super::StdFs.hard_link_count(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +625,11 @@ impl FsFile for IoUringFile {
 
     fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
         FsFile::set_write_lifetime(&self.file, lifetime)
+    }
+
+    fn hint(&self, hint: super::FileHint) -> crate::io::Result<()> {
+        // `posix_fadvise` on the descriptor the ring reads through.
+        FsFile::hint(&self.file, hint)
     }
 
     fn lock_exclusive(&self) -> crate::io::Result<()> {
@@ -1659,6 +1719,12 @@ impl ReadQueue for UringReadQueue<'_> {
         // room or no lock, are sent only by a later wait: no completion
         // wakes a caller for them.
         self.serial.len() + self.submitted.len()
+    }
+
+    fn issues_at_wait_for_none(&self) -> bool {
+        // It sends what fits on the ring; a read that does not fit waits for
+        // the next wait.
+        true
     }
 
     fn wait(&mut self, min: usize, on_done: &mut dyn FnMut(ReadDone)) {
