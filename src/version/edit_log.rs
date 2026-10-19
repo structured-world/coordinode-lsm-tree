@@ -28,6 +28,46 @@ use crate::path::Path;
 #[cfg(feature = "std")]
 use std::io::{Seek, SeekFrom};
 
+/// The edit log of the snapshot `v{snapshot_id}` in the tree folder `folder`.
+#[must_use]
+pub fn log_path(folder: &Path, snapshot_id: super::VersionId) -> crate::path::PathBuf {
+    folder.join(alloc::format!("edits-{snapshot_id}"))
+}
+
+/// Creates the empty edit log of the snapshot `v{snapshot_id}`, as the
+/// snapshot is written: the directory sync that makes the snapshot's name
+/// durable then makes the log's too, and no append has to sync it. A log
+/// left under the name is emptied, since none of its edits belongs to the
+/// snapshot being written, and synced empty: the directory sync makes only
+/// its name durable, not its new size. Its length tells nothing here, as an
+/// earlier emptying whose sync failed leaves it reading empty while its
+/// edits are still what a power loss keeps.
+///
+/// # Errors
+///
+/// Returns an I/O error if the log cannot be created or emptied.
+pub fn create_log(
+    fs: &dyn Fs,
+    folder: &Path,
+    snapshot_id: super::VersionId,
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
+    let path = log_path(folder, snapshot_id);
+    let existed = match fs.metadata(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    let file = fs.open(
+        &path,
+        &FsOpenOptions::new().write(true).create(true).truncate(true),
+    )?;
+    if existed {
+        file.sync_data_with(sync_mode)?;
+    }
+    Ok(())
+}
+
 /// Appends one framed [`VersionEdit`] to the log at `path` (created on first
 /// write) and syncs its data per `sync_mode`, so the edit is durable before the caller
 /// acknowledges the flush / compaction. `scratch` is reused for payload

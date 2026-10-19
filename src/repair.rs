@@ -6818,7 +6818,8 @@ fn publish_repaired_manifest(
     // edit log so nothing is replayed on top of it: the lost manifest's
     // generation left its log under an OLDER snapshot id (the rebuilt snapshot
     // uses `max(v*) + 1`), so removing only `edits-{version_id}` would normally
-    // miss it. Drop all `edits-*` — none belong to the fresh snapshot. Runs
+    // miss it. Drop every `edits-*` but the fresh snapshot's own, which the
+    // persist created empty so its first append syncs no directory. Runs
     // only on a PROVEN commit (like every cleanup below): a recorded
     // post-commit error skips it, and the retry finishes the sweep.
     //
@@ -6827,10 +6828,14 @@ fn publish_repaired_manifest(
     // never read; the next open recognizes it as an orphan log and sweeps it
     // again. Nothing observes the window, so the barrier would buy nothing.
     if post_commit_error.is_none() {
+        let fresh_log = crate::version::edit_log::log_path(&config.path, version_id);
         match config.fs.read_dir(&config.path) {
             Ok(dirents) => {
                 for dirent in dirents {
-                    if dirent.is_dir || !dirent.file_name.starts_with("edits-") {
+                    if dirent.is_dir
+                        || !dirent.file_name.starts_with("edits-")
+                        || dirent.path == fresh_log
+                    {
                         continue;
                     }
                     match config.fs.remove_file(&dirent.path) {

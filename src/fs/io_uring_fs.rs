@@ -356,6 +356,10 @@ impl Fs for IoUringFs {
         std::fs::remove_dir_all(path).map_err(crate::io::Error::from)
     }
 
+    fn remove_dir(&self, path: &Path) -> crate::io::Result<()> {
+        std::fs::remove_dir(path).map_err(crate::io::Error::from)
+    }
+
     fn same_file(&self, a: &Path, b: &Path) -> crate::io::Result<bool> {
         // Filesystem OBJECT identity (device + inode), same contract as the
         // std backend: bind-mount aliases keep distinct canonical spellings
@@ -369,6 +373,14 @@ impl Fs for IoUringFs {
 
     fn read_link(&self, path: &Path) -> crate::io::Result<Option<crate::path::PathBuf>> {
         super::StdFs.read_link(path)
+    }
+
+    fn symlink(&self, target: &Path, link: &Path, to_dir: bool) -> crate::io::Result<()> {
+        super::StdFs.symlink(target, link, to_dir)
+    }
+
+    fn symlink_to_dir(&self, path: &Path) -> crate::io::Result<bool> {
+        super::StdFs.symlink_to_dir(path)
     }
 
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {

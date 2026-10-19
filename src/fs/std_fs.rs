@@ -138,6 +138,14 @@ impl FsFile for File {
     }
 
     fn sync_data_with(&self, mode: SyncMode) -> io::Result<()> {
+        // Off macOS every mode is the same `fdatasync`, which spares the
+        // metadata a read does not need (timestamps).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = mode;
+            Self::sync_data(self).map_err(io::Error::from)
+        }
+        #[cfg(target_os = "macos")]
         match mode {
             SyncMode::Full => Self::sync_data(self).map_err(io::Error::from),
             // On macOS `sync_data` is `F_FULLFSYNC` too, and a plain `fsync`
@@ -383,6 +391,10 @@ impl Fs for StdFs {
         std::fs::remove_dir_all(path).map_err(io::Error::from)
     }
 
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path).map_err(io::Error::from)
+    }
+
     fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
         // Filesystem OBJECT identity, not canonical spellings: bind-mount
         // aliases of one directory keep their two mount-point spellings
@@ -426,6 +438,44 @@ impl Fs for StdFs {
             Ok(_) => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(io::Error::from(e)),
+        }
+    }
+
+    fn symlink(&self, target: &Path, link: &Path, to_dir: bool) -> io::Result<()> {
+        #[cfg(unix)]
+        let made = {
+            // Unix records no kind with a link.
+            let _ = to_dir;
+            std::os::unix::fs::symlink(target, link)
+        };
+        // Windows records the kind with the link, whatever the target is
+        // now, so the caller names it.
+        #[cfg(windows)]
+        let made = if to_dir {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let made: std::io::Result<()> = {
+            let _ = (target, link, to_dir);
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        };
+        made.map_err(io::Error::from)
+    }
+
+    fn symlink_to_dir(&self, path: &Path) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            Ok(std::fs::symlink_metadata(path)?
+                .file_type()
+                .is_symlink_dir())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Ok(false)
         }
     }
 

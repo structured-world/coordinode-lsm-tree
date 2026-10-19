@@ -628,7 +628,8 @@ impl Writer {
         metadata.encode_into(&mut self.writer)?;
 
         let mut checksum = self.writer.into_inner()?;
-        FsFile::sync_all_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
+        // Data and size are all a read of the file needs, so `sync_data`.
+        FsFile::sync_data_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
         let checksum = checksum.checksum();
 
         Ok((metadata, checksum))

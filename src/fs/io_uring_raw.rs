@@ -1352,6 +1352,11 @@ impl Fs for IoUringRawFs {
         unlinkat_raw(&path_to_cstring(path)?, true)
     }
 
+    fn remove_dir(&self, path: &Path) -> crate::io::Result<()> {
+        // rmdir(2) through unlinkat: the kernel refuses a non-empty directory.
+        unlinkat_raw(&path_to_cstring(path)?, true)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         renameat2_raw(&path_to_cstring(from)?, &path_to_cstring(to)?)
     }
