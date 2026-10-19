@@ -14925,12 +14925,15 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
     // commits, then punch the prefix it declares dead — and persist that
     // version, so the manifest carries the frontier in `blob_restrictions`
     // exactly as a real reclaim leaves it.
-    let (tables, blob_files) = {
+    let (tables, blob_files, installed) = {
         let tree = match config().open()? {
             crate::AnyTree::Blob(t) => t,
             crate::AnyTree::Standard(_) => panic!("expected blob tree"),
         };
         let version = tree.index.current_version();
+        // The open installed this version as its snapshot; the one written
+        // below has to be newer to be the installed one after it.
+        let installed = version.id();
         let blob = version
             .blob_files
             .iter()
@@ -14957,11 +14960,11 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
         let tables: Vec<_> = version.iter_tables().cloned().collect();
         let mut map = crate::HashMap::default();
         map.insert(restricted.id(), restricted);
-        (tables, BlobFileList::new(map))
+        (tables, BlobFileList::new(map), installed)
     };
     let run = Arc::new(Run::new(tables).expect("non-empty run"));
     let version = Version::from_levels(
-        2,
+        installed + 1,
         crate::TreeType::Blob,
         alloc::vec![Level::from_runs(alloc::vec![run])],
         blob_files,
