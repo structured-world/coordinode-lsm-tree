@@ -43,7 +43,7 @@ fn config(dir: &Path, fs: &IoUringFs) -> Config {
 /// A table over the tree's quota is rewritten in slices, each consumed input
 /// prefix punched as it goes, and every key reads back, also after a reopen.
 #[test]
-fn a_tight_space_compaction_runs_on_io_uring() -> lsm_tree::Result<()> {
+fn a_tight_space_compaction_on_io_uring_rewrites_in_slices() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let Some(fs) = io_uring_punching(folder.path())? else {
         return Ok(());
@@ -94,7 +94,7 @@ fn a_tight_space_compaction_runs_on_io_uring() -> lsm_tree::Result<()> {
 /// in slices, the relocated prefixes punched as it goes: the footprint
 /// shrinks and every key keeps its latest value.
 #[test]
-fn a_tight_space_blob_defragmentation_runs_on_io_uring() -> lsm_tree::Result<()> {
+fn a_tight_space_blob_defragmentation_on_io_uring_reclaims_space() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let Some(fs) = io_uring_punching(folder.path())? else {
         return Ok(());
