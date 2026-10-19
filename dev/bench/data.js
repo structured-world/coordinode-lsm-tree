@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792410846939,
+  "lastUpdate": 1792410850901,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -51964,6 +51964,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.604503195,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3d1ae065f64d8c8c09e02859b5e95bc08c763c0c",
+          "message": "fix(fs): delegate the std capabilities of IoUringFs (#939)\n\n## Summary\n\n- A tree on the `io_uring` backend gets every file-system capability the\nsame files have under `StdFs`: tight-space compaction runs, table and\nblob prefix punches land, checkpoints clone where the file system\nclones, deferred reclaims can read link counts, SSTs opt out of\ncopy-on-write, and readahead advice reaches the kernel.\n- `FaultFs` over the ring exercises the ring's batches and read queue,\nits read rules screening each read once.\n- Replaces #935 (same branch, history squashed into one commit).\n\n## Changes\n\n- `IoUringFs` delegates `capabilities`, `punch_hole`, `reflink_file`,\n`try_disable_cow` and `hard_link_count` to the std backend; its files\ndelegate `hint` (fadvise on the same descriptor). The sync variants stay\non the ring: on Linux every `SyncMode` is the same `fsync` /\n`fdatasync`.\n- `Fs::reads_by_descriptor` says whether a backend's batched reads and\nread queue read a descriptor-backed file past `FsFile::read_at`;\n`Fs::check_descriptor_batch` says what such a backend refuses its\ndescriptor requests for together. `ReadQueue::take_kept` hands back the\nreads a wait for none kept rather than issued (`io_uring`: those with no\nroom on its channel). The defaults are `false`, nothing and none;\n`IoUringFs` answers all three.\n- `FaultFs` forwards `read_blocks_batched`, `read_blocks_batched_each`\nand `read_queue` to its inner backend. Over a backend that reads by\ndescriptor, each request is screened by the read rules first; a request\na rule fails ends a batch there and comes back failed from a queue, and\nevery request handed down counts as a read. A queued read the inner\nqueue keeps is screened again by the wait that issues it. A batch whose\ndescriptor requests the backend refuses goes down as it came. What\nscreening spent is given back only into the injector state it was spent\nfrom. A handle shows its descriptor only inside its own wrapper's batch\nor queue wait, layer by layer through nested wrappers, so no other\nbackend reads it past the rules. Over any other backend the requests are\nscreened at `read_at`, and only there.\n\n## Testing\n\nfmt, clippy (all features and default), the full nextest suite in both\nconfigurations, doc tests, docs, the no-std check, `tools/sst-dump`, the\nbench tests and the 5.x converter pass on Linux (btrfs). Tests on\n`io_uring` cover the capabilities matching the std backend, a punched\nhole, path link counts, an independent clone, read rules on queued and\nbatched reads, and tight-space compaction, blob defragmentation and a\nreflinked checkpoint end to end; a test backend that reads by descriptor\nor through `read_at` covers both screening paths, nested wrappers,\nhandles read by another wrapper, kept queued reads, refused descriptor\ngroups and refunds across a clear on every platform.\n\n## Related\n\n- #924: the same capability methods for the raw `no_std` `io_uring`\nbackend, which needs its own syscalls.\n\nCloses #920\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Batched and queued reads now handle descriptor-based requests more\nreliably, including validation of request sizes and offsets and clearer\nhandling of requests that cannot be issued immediately.\n* Fault-injection rules are applied consistently to positional, batched,\nand queued reads, including when reads are deferred or handled through\nnested filesystem wrappers.\n* The `io_uring` filesystem now supports additional filesystem\ncapabilities, including hole punching, reflinks, hard-link counts, and\nfile hints.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-19T11:39:14Z",
+          "tree_id": "417bf824a2e28de27b0ebf7f394bad162fe8b47c",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3d1ae065f64d8c8c09e02859b5e95bc08c763c0c"
+        },
+        "date": 1792410849743,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 571.063,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 82.885808ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 191.626,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.630453ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 472.901,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.257037ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4267.675,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9922.694,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 31.471,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 88.014847,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.699255826,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 25.359,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 81.002495,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.674881781,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
