@@ -1346,6 +1346,37 @@ fn a_read_a_queue_keeps_at_a_wait_for_none_is_screened_when_issued() -> io::Resu
     Ok(())
 }
 
+/// A wait whose failed reads already make up its `min` still issues the
+/// reads it screened and handed to a queue that issues only at a wait for
+/// some: each read it counted is read by it, not by a later wait.
+#[test]
+fn a_wait_met_by_failed_reads_still_issues_the_ones_it_handed_on() -> io::Result<()> {
+    let fs = FaultFs::new(DescriptorFs::new(true));
+    let files: Vec<Arc<dyn FsFile>> = two_readable(&fs)?.into_iter().map(Arc::from).collect();
+    fs.injector().arm(
+        FaultRule::new(FaultOp::ReadAt, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("f1")
+            .once(),
+    );
+
+    let mut queue = fs.read_queue();
+    for (tag, file) in files.iter().enumerate() {
+        queue.submit(QueuedRead {
+            tag,
+            file: Arc::clone(file),
+            offset: 0,
+            buf: vec![0; 16],
+        });
+    }
+    let mut done = Vec::new();
+    queue.wait(1, &mut |read| done.push(read));
+    done.sort_by_key(|read| read.tag);
+    assert_eq!(done.len(), 2, "the read handed on was issued by this wait");
+    assert_eq!(done[0].buf, vec![b'0'; 16]);
+    assert_eq!(queue.outstanding(), 0);
+    Ok(())
+}
+
 /// Over a wrapper over the backend, a read kept at a wait for none comes back
 /// through both: the outer wrapper's rule armed before the issuing wait
 /// applies to it, and the outer wrapper counts it once.

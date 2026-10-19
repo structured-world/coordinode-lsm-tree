@@ -1803,6 +1803,52 @@ fn a_read_queue_hands_back_reads_of_several_submissions() -> io::Result<()> {
     Ok(())
 }
 
+/// A read without a descriptor, which only a wait for some reads, is left
+/// submitted by a wait for none, so a wrapper takes it back with the reads
+/// that wait kept, and reads it at the wait that issues it.
+#[test]
+fn a_wait_for_none_keeps_a_read_without_a_descriptor_for_take_kept() -> io::Result<()> {
+    let Some(fs) = try_io_uring() else {
+        return Ok(());
+    };
+    let mem = crate::fs::MemFs::new();
+    mem.create_dir_all(Path::new("/d"))?;
+    mem.open(
+        Path::new("/d/f"),
+        &FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(&[7; 16])?;
+    let file: Arc<dyn FsFile> =
+        Arc::from(mem.open(Path::new("/d/f"), &FsOpenOptions::new().read(true))?);
+    assert!(file.backing_fd().is_none(), "self-check: no descriptor");
+
+    let mut queue = fs.read_queue();
+    queue.submit(QueuedRead {
+        tag: 3,
+        file,
+        offset: 0,
+        buf: vec![0; 16],
+    });
+    let mut done = Vec::new();
+    queue.wait(0, &mut |read| done.push(read));
+    assert!(done.is_empty(), "a wait for none reads nothing serially");
+    let kept = queue.take_kept();
+    assert_eq!(
+        kept.iter().map(|read| read.tag).collect::<Vec<_>>(),
+        vec![3],
+        "the read is handed back"
+    );
+    assert_eq!(queue.outstanding(), 0, "the queue no longer holds it");
+
+    for read in kept {
+        queue.submit(read);
+    }
+    queue.wait(1, &mut |read| done.push(read));
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].buf, vec![7; 16]);
+    Ok(())
+}
+
 /// Counts the wakes a queue gives it.
 struct CountWake(core::sync::atomic::AtomicUsize);
 

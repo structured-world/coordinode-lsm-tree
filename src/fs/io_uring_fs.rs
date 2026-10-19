@@ -1590,13 +1590,23 @@ impl<'r> UringReadQueue<'r> {
         }
         let first = self.base + self.sent.len();
         let mut reads = Vec::with_capacity(self.submitted.len());
-        for mut read in core::mem::take(&mut self.submitted) {
+        // A wait for none reads nothing serially: a read without a descriptor
+        // stays submitted, in its place among any the channel has no room
+        // for, for the wait that reads it or a wrapper that takes it back.
+        let mut deferred: Vec<(usize, QueuedRead)> = Vec::new();
+        // The submission place of each read sent below, in order.
+        let mut places: Vec<usize> = Vec::new();
+        for (place, mut read) in core::mem::take(&mut self.submitted).into_iter().enumerate() {
             if read.buf.is_empty() {
                 self.finished.push(done(read, Ok(())));
                 continue;
             }
             let Some(fd) = read.file.backing_fd() else {
-                self.serial.push(read);
+                if block {
+                    self.serial.push(read);
+                } else {
+                    deferred.push((place, read));
+                }
                 continue;
             };
             let Ok(len) = i32::try_from(read.buf.len()) else {
@@ -1619,8 +1629,11 @@ impl<'r> UringReadQueue<'r> {
                 offset: read.offset,
             });
             self.sent.push_back(Some(read));
+            places.push(place);
         }
         if reads.is_empty() {
+            self.submitted
+                .extend(deferred.into_iter().map(|(_, read)| read));
             return;
         }
         let count = reads.len();
@@ -1639,11 +1652,20 @@ impl<'r> UringReadQueue<'r> {
                 // in the kernel's hands: the reads go back to wait their turn.
                 Err(TrySend::Full) => {
                     let kept = self.sent.split_off(first - self.base);
-                    self.submitted.extend(kept.into_iter().flatten());
+                    let mut back: Vec<(usize, QueuedRead)> = places
+                        .into_iter()
+                        .zip(kept.into_iter().flatten())
+                        .chain(deferred)
+                        .collect();
+                    back.sort_unstable_by_key(|(place, _)| *place);
+                    self.submitted
+                        .extend(back.into_iter().map(|(_, read)| read));
                     return;
                 }
             }
         };
+        self.submitted
+            .extend(deferred.into_iter().map(|(_, read)| read));
         match sent {
             Ok(()) => self.on_ring += count,
             // Nothing was queued: the submission went down with the send, so

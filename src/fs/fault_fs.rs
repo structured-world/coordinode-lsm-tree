@@ -1257,6 +1257,7 @@ impl FaultReadQueue<'_> {
             self.inner.wait(0, on_done);
             return;
         }
+        let mut sent = 0usize;
         for read in core::mem::take(&mut self.submitted) {
             let len = read.buf.len();
             let (error, spent) = self
@@ -1271,6 +1272,7 @@ impl FaultReadQueue<'_> {
             } else {
                 self.screened.push((read.buf.as_ptr() as usize, spent));
                 self.inner.submit(read);
+                sent += 1;
             }
         }
         let handed = self.failed.len();
@@ -1278,8 +1280,14 @@ impl FaultReadQueue<'_> {
             on_done(done);
         }
         // What the failed reads already handed over counts toward `min`; past
-        // it the inner queue only hands over what is ready.
-        self.inner.wait(min.saturating_sub(handed), on_done);
+        // it the inner queue only hands over what is ready. A queue that
+        // issues only at a wait for some is still made to issue what this
+        // wait handed it: this wait counted those reads, so it reads them.
+        let mut inner_min = min.saturating_sub(handed);
+        if inner_min == 0 && sent > 0 && !self.inner.issues_at_wait_for_none() {
+            inner_min = 1;
+        }
+        self.inner.wait(inner_min, on_done);
         // A read the inner queue kept rather than issued (a ring with no room
         // at a wait for none) was not read: what screening spent on it is
         // given back, and the wait that issues it screens it then.
