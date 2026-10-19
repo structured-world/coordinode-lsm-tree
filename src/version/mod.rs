@@ -31,7 +31,7 @@ mod super_version;
 mod tests;
 
 pub use blob_file_list::BlobFileList;
-pub use persist::persist_version;
+pub use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub use run::Run;
 pub use super_version::RetentionEffect;
 pub use super_version::SnapshotRef;
@@ -533,6 +533,14 @@ impl Version {
     #[must_use]
     pub(crate) fn with_dicts(&self, dicts: Vec<crate::file::DictId>) -> Self {
         self.with_id_and_dicts(self.id, dicts)
+    }
+
+    /// This version under the next id, unchanged otherwise: what an open
+    /// installs as a fresh snapshot of the state it recovered. A new id, so
+    /// the snapshot it writes never replaces the one it was read from.
+    #[must_use]
+    pub(crate) fn reinstalled(&self) -> Self {
+        self.with_id_and_dicts(self.id + 1, self.dicts.to_vec())
     }
 
     fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {
@@ -1361,6 +1369,12 @@ impl Version {
 
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V6.into())?;
+
+        // The snapshot names its own version: recovery reads a snapshot by
+        // the id in its file name, and a file holding another version under
+        // that name (a copy, a rename gone wrong) must not pass for it.
+        writer.start("version_id")?;
+        writer.write_u64::<LittleEndian>(self.id())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;

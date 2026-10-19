@@ -39,7 +39,7 @@ mod zstd_dict {
         )
     }
 
-    /// Removes the manifest and its version pointer, so the next open has to
+    /// Removes the manifest snapshots and their logs, so the next open has to
     /// rebuild from the tables on disk.
     ///
     /// Asserts that it removed something: matching by name means a change to the
@@ -52,10 +52,11 @@ mod zstd_dict {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_version = name
+            let is_manifest = name
                 .strip_prefix('v')
+                .or_else(|| name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || name == "current" {
+            if is_manifest {
                 std::fs::remove_file(entry.path())?;
                 removed += 1;
             }
@@ -1411,6 +1412,47 @@ mod zstd_dict {
         Ok(())
     }
 
+    #[test]
+    fn a_kept_report_names_the_dictionary_the_repair_set_aside() -> lsm_tree::Result<()> {
+        use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+        // A repair that ends before its report reaches the caller leaves the
+        // report's copy behind, and the next open hands that copy out. The
+        // dictionary is set aside before the copy is retired, so the copy has
+        // to name it: the open finds the dictionary gone from its name and has
+        // nothing else to say where its bytes went.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+        damage_the_dictionary(dir.path(), dict_id)?;
+
+        let fs = FaultFs::new(StdFs);
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("repair-report-"),
+        );
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        assert!(
+            make_config(dir.path()).with_fs(fs).repair().is_err(),
+            "the copy cannot be retired, so the report stays in it",
+        );
+        assert!(aside.exists(), "self-check: the dictionary was set aside");
+
+        let (_tree, report) =
+            make_config(dir.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
+        let report = report.expect("the open hands out the kept report");
+        assert!(
+            report.damaged_dictionaries.iter().any(|(p, _)| *p == aside),
+            "the kept report names where the dictionary went: {:?}",
+            report.damaged_dictionaries,
+        );
+        Ok(())
+    }
+
     /// Flips one bit of the dictionary stored under `id`, so its bytes no longer
     /// hash to the name they are filed under.
     fn damage_the_dictionary(dir: &std::path::Path, id: u32) -> lsm_tree::Result<()> {
@@ -1443,10 +1485,9 @@ mod zstd_dict {
     /// The manifest files the tree root holds.
     fn manifest_names(dir: &std::path::Path) -> lsm_tree::Result<Vec<String>> {
         names_in(dir, |name| {
-            name == "current"
-                || name
-                    .strip_prefix('v')
-                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
+            name.strip_prefix('v')
+                .or_else(|| name.strip_prefix("edits-"))
+                .is_some_and(|rest| rest.parse::<u64>().is_ok())
         })
     }
 

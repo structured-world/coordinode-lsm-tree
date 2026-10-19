@@ -453,6 +453,69 @@ fn open_rewrites_a_missing_restriction_sidecar() -> crate::Result<()> {
     Ok(())
 }
 
+/// The sidecar an open derives from the manifest it read is only as good as
+/// that manifest: an open whose install of the recovered state fails has not
+/// made that manifest durable, so it must not leave a sidecar a manifest-loss
+/// repair would then trust over an older generation's tables.
+#[test]
+fn an_open_whose_install_fails_leaves_no_sidecar_it_derived() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs};
+
+    let dir = tempfile::tempdir()?;
+    let mem = crate::fs::MemFs::with_capacity(u64::MAX);
+    let fs: Arc<dyn Fs> = Arc::new(mem.clone());
+    let reopened = tight_space_crash_and_reopen(
+        dir.path(),
+        Arc::clone(&fs),
+        |used| mem.set_capacity(used + used / 4),
+        || mem.punched_bytes(),
+    )?;
+    let version = reopened.current_version();
+    let Some(restricted) = version
+        .iter_tables()
+        .find(|t| t.restrict_lower_bound().is_some())
+    else {
+        panic!("the crashed tight-space slice must leave a restricted table");
+    };
+    let sidecar = crate::restrict_bound::sidecar_path(&restricted.path);
+    fs.remove_file(&sidecar)?;
+    drop(version);
+    drop(reopened);
+
+    // The install renames the fresh snapshot into place; that rename fails.
+    let faulty = FaultFs::new(mem.clone());
+    faulty.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(dir.path().join("v").to_string_lossy())
+            .once(),
+    );
+    let failed = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(faulty))
+    .open();
+    assert!(failed.is_err(), "self-check: the install failed");
+    assert!(
+        fs.metadata(&sidecar).is_err(),
+        "no sidecar is published for a manifest the open did not install",
+    );
+
+    let _tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(mem))
+    .open()?;
+    assert!(
+        fs.metadata(&sidecar).is_ok(),
+        "the open that installs the manifest republishes it",
+    );
+    Ok(())
+}
+
 /// A real-on-disk [`Fs`](crate::fs::Fs) wrapper (over
 /// [`StdFs`](crate::fs::StdFs)) that simulates disk pressure for the tight-space
 /// compaction test while keeping every byte in a real file under the test's
@@ -888,8 +951,9 @@ fn manifest_loss_in_the_unwritten_sidecar_window_resolves_to_one_history() -> cr
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             mem.remove_file(&e.path)?;
         }
     }
@@ -1362,8 +1426,9 @@ fn tight_space_sidecar_fault_must_not_resurrect_evicted_deletes() -> crate::Resu
         let is_version = e
             .file_name
             .strip_prefix('v')
+            .or_else(|| e.file_name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
+        if is_version {
             shared.remove_file(&e.path)?;
         }
     }

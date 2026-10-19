@@ -504,7 +504,7 @@ pub(crate) fn salvage_with_context(
             && let Err(e) = fs.sync_directory_with(entry_directory(written), options.sync_mode)
         {
             discard_partial(fs, written);
-            return Err(e.into());
+            return Err(output_failure(e));
         }
         return Ok(report);
     }
@@ -711,7 +711,7 @@ fn next_arb_temp(
         match fs.exists(&candidate) {
             Ok(false) => return Ok(candidate),
             Ok(true) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(output_failure(e)),
         }
     }
 }
@@ -732,8 +732,9 @@ fn publish_from_temp(
     dest: &std::path::Path,
     options: &SalvageOptions,
 ) -> crate::Result<SalvageReport> {
+    // Every failure from here on is the destination's.
     let already_exists = || {
-        crate::Error::Io(crate::io::Error::new(
+        output_failure(crate::io::Error::new(
             crate::io::ErrorKind::AlreadyExists,
             "salvage destination already exists",
         ))
@@ -785,7 +786,7 @@ fn publish_from_temp(
                         // `AlreadyExists` against our own leftover.
                         discard_partial(fs, dest);
                         discard_partial(fs, temp);
-                        return Err(e.into());
+                        return Err(output_failure(e));
                     }
                 }
                 Err(e) if e.kind() == crate::io::ErrorKind::AlreadyExists => {
@@ -794,13 +795,13 @@ fn publish_from_temp(
                 }
                 Err(e) => {
                     discard_partial(fs, temp);
-                    return Err(e.into());
+                    return Err(output_failure(e));
                 }
             }
         }
         Err(e) => {
             discard_partial(fs, temp);
-            return Err(e.into());
+            return Err(output_failure(e));
         }
     }
     // Drop the temp name BEFORE the durability sync, so one sync below covers
@@ -820,7 +821,7 @@ fn publish_from_temp(
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
         Err(e) => {
             discard_partial(fs, dest);
-            return Err(e.into());
+            return Err(output_failure(e));
         }
     }
     // `dest` now links the copy and the temp name is gone, but both directory
@@ -830,7 +831,7 @@ fn publish_from_temp(
     // the repair caller both see the destination free.
     if let Err(e) = fs.sync_directory_with(entry_directory(dest), options.sync_mode) {
         discard_partial(fs, dest);
-        return Err(e.into());
+        return Err(output_failure(e));
     }
     rep.salvaged_path = Some(dest.to_path_buf());
     Ok(rep)
@@ -1157,7 +1158,8 @@ fn salvage_attempt(
         options.output_id.unwrap_or(table.metadata.id),
         0,
         Arc::clone(fs),
-    )?
+    )
+    .map_err(output_failure)?
     .mirror_from(
         &table.metadata,
         table.has_zone_map(),
@@ -1287,6 +1289,16 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
             "salvage: could not remove the incomplete destination {}: {e}",
             dest.display(),
         );
+    }
+}
+
+/// Marks a failure to write, finish or make durable a salvage's OUTPUT, so a
+/// recovery tells it from damage to the source (see
+/// [`crate::Error::SalvageOutput`]). One already marked stays as it is.
+fn output_failure(e: impl Into<crate::Error>) -> crate::Error {
+    match e.into() {
+        e @ crate::Error::SalvageOutput(_) => e,
+        e => crate::Error::SalvageOutput(alloc::boxed::Box::new(e)),
     }
 }
 
@@ -2326,7 +2338,7 @@ fn salvage_blocks(
                                     end_key.as_ref(),
                                 ));
                             }
-                            Err(e) => return Err(e),
+                            Err(e) => return Err(output_failure(e)),
                         }
                     }
                     // Wholly-deleted block: nothing to recover, nothing lost.
@@ -2597,7 +2609,7 @@ fn salvage_blocks(
                                             end_key.as_ref(),
                                         ));
                                     }
-                                    Err(e) => return Err(e),
+                                    Err(e) => return Err(output_failure(e)),
                                 }
                             }
                             // An ENVIRONMENTAL I/O read is retryable and propagates,
@@ -2858,7 +2870,7 @@ fn salvage_blocks(
                                         end_key.as_ref(),
                                     ));
                                 }
-                                Err(e) => return Err(e),
+                                Err(e) => return Err(output_failure(e)),
                             }
                         }
                         Err(e) => dropped.push(DroppedBlock {
@@ -2933,7 +2945,9 @@ fn salvage_blocks(
         writer.own_blob_objects(derived_owned_cells);
         // The caller syncs the destination's directory: the publish after its
         // rename, or the direct path once the attempt returns.
-        writer.finish_deferring_dir_sync(None)?;
+        writer
+            .finish_deferring_dir_sync(None)
+            .map_err(output_failure)?;
     } else {
         drop(writer);
     }
@@ -3307,7 +3321,8 @@ pub(crate) fn salvage_blob_file_on(
     // synced below, so the recovered file survives a power loss the moment the
     // report claims success.
     let sync_mode = crate::fs::SyncMode::Full;
-    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)?
+    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)
+        .map_err(output_failure)?
         .use_sync_mode(sync_mode)
         .use_compression(compression)
         .use_clock(clock.cloned());
@@ -3458,7 +3473,9 @@ pub(crate) fn salvage_blob_file_on(
                     // recorded per record because compressor output is not
                     // stable across versions, so the source handle's size
                     // cannot be assumed to survive the round-trip.
-                    let on_disk_size = writer.write(&entry.key, entry.seqno, &value)?;
+                    let on_disk_size = writer
+                        .write(&entry.key, entry.seqno, &value)
+                        .map_err(output_failure)?;
                     offset_remap.push((
                         entry.offset,
                         BlobRecordRelocation {
@@ -3534,7 +3551,7 @@ pub(crate) fn salvage_blob_file_on(
             // propagating.
             if let Err(e) = writer.finish() {
                 discard_partial(fs, &dest);
-                return Err(e);
+                return Err(output_failure(e));
             }
             // The writer synced the file's bytes; sync the parent directory too
             // so the new directory entry is durable before the report claims
@@ -3545,7 +3562,7 @@ pub(crate) fn salvage_blob_file_on(
             // a caller never sees a salvaged_path whose entry is not durable.
             if let Err(e) = fs.sync_directory_with(entry_directory(&dest), sync_mode) {
                 discard_partial(fs, &dest);
-                return Err(e.into());
+                return Err(output_failure(e));
             }
             Some(dest)
         }

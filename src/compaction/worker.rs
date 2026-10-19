@@ -204,9 +204,14 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     // Every file the run created that it did not install goes now, whichever
     // writer made it and wherever the run stopped: the handles on them
     // dropped as the run returned. The run's room goes back once they are
-    // gone.
-    opts.outputs
-        .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
+    // gone. An install whose outcome is unknown may still name them after a
+    // power loss, so they stay.
+    if matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))) {
+        opts.outputs.keep_uninstalled();
+    } else {
+        opts.outputs
+            .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
+    }
     // Charged whether or not the run succeeded: a tight-space pass that fails
     // after installing slices leaves them installed, and what they read and
     // wrote was done.

@@ -9,6 +9,7 @@ use crate::{
     Slice,
     fs::{Fs, FsFile, SyncMode},
 };
+use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::Write;
 
@@ -29,7 +30,6 @@ pub const BLOBS_FOLDER: &str = "blobs";
 /// and immutable once written; and rather than in each SST because every table
 /// compressed against one would then carry its own copy.
 pub const DICTS_FOLDER: &str = "dicts";
-pub const CURRENT_VERSION_FILE: &str = "current";
 
 /// Marks a tree folder whose restore has not finished.
 ///
@@ -56,6 +56,169 @@ pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> 
     file_name
         .strip_suffix(REPAIR_TMP_SUFFIX)
         .and_then(|id| id.parse::<crate::TableId>().ok())
+}
+
+/// Prefix of the durable copy of a manifest repair's report.
+///
+/// `{prefix}{id}` is the copy for the rebuilt snapshot `v{id}`,
+/// `{prefix}{id}.tmp` the copy while it is written. Recognized here rather
+/// than in `repair` so an open without that (std-only) module still sweeps a
+/// copy whose snapshot was never installed.
+pub const REPAIR_REPORT_PREFIX: &str = "repair-report-";
+
+/// The snapshot id a repair report copy's name claims, and whether it is the
+/// temporary.
+///
+/// `None` for any other name, so an operator's `repair-report-notes` is never
+/// swept.
+#[must_use]
+pub fn repair_report_name(file_name: &str) -> Option<(u64, bool)> {
+    let rest = file_name.strip_prefix(REPAIR_REPORT_PREFIX)?;
+    let (digits, temporary) = match rest.strip_suffix(".tmp") {
+        Some(digits) => (digits, true),
+        None => (rest, false),
+    };
+    canonical_id(digits).map(|id| (id, temporary))
+}
+
+/// The id `digits` spells in the form the engine writes ids into names.
+///
+/// Decimal, with no sign and no leading zero. Any other spelling names a file
+/// the engine never made; taking it for an id would make a lookup by that id
+/// open another name than the one listed.
+#[must_use]
+pub fn canonical_id(digits: &str) -> Option<u64> {
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if canonical { digits.parse().ok() } else { None }
+}
+
+/// Carries the copy of a repair report kept for snapshot `from` in `folder`
+/// over to snapshot `to`, which a rotation is about to install.
+///
+/// The report is still owed, and an open keeps only the copy of the installed
+/// snapshot. The copy for `to` is written under a temporary name, synced and renamed,
+/// so the install's directory sync makes its name durable with the
+/// snapshot's. Returns whether there was one to carry.
+///
+/// The bytes travel as they are: the copy is sealed with the tree's
+/// encryption provider, which does not change between generations.
+///
+/// # Errors
+///
+/// Propagates a failure to read the copy or to write the new one.
+pub fn carry_repair_report(
+    fs: &dyn Fs,
+    folder: &Path,
+    from: u64,
+    to: u64,
+    sync_mode: SyncMode,
+) -> crate::Result<bool> {
+    let Some(bytes) = read_repair_report(fs, folder, from)? else {
+        return Ok(false);
+    };
+    write_repair_report(fs, folder, to, &bytes, sync_mode)?;
+    Ok(true)
+}
+
+/// The bytes of the copy of a repair report kept for snapshot `id` in
+/// `folder`, sealed as they lie; `None` when there is none.
+fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
+    use crate::fs::FsOpenOptions;
+    let source = repair_report_path(folder, id);
+    let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let len = usize::try_from(file.metadata()?.len)
+        .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
+    Ok(Some(read_exact(&*file, 0, len)?.to_vec()))
+}
+
+/// The repair report the tree in `folder` still owes, sealed as its copies
+/// lie; `None` when it owes none.
+///
+/// While a tree is open, every copy it holds carries the one report its
+/// opening repair left, so the newest stands for all of them. A rotation
+/// carries it to its next snapshot and then removes the old copy, so a copy
+/// gone when read means a newer one is there: the newest is looked for
+/// again. A copy is retired only by the repairing open, never while the
+/// tree is open.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder or read a copy.
+pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Vec<u8>>> {
+    loop {
+        let newest = fs
+            .read_dir(folder)?
+            .into_iter()
+            .filter(|entry| !entry.is_dir)
+            .filter_map(|entry| match repair_report_name(&entry.file_name) {
+                Some((id, false)) => Some(id),
+                _ => None,
+            })
+            .max();
+        let Some(id) = newest else {
+            return Ok(None);
+        };
+        if let Some(bytes) = read_repair_report(fs, folder, id)? {
+            return Ok(Some(bytes));
+        }
+    }
+}
+
+/// The copy of a repair report for snapshot `id` in `folder`.
+#[must_use]
+pub fn repair_report_path(folder: &Path, id: u64) -> crate::path::PathBuf {
+    folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"))
+}
+
+/// Writes `bytes` as the copy of a repair report for snapshot `id` in
+/// `folder`.
+///
+/// Under a temporary name, synced and renamed, so the directory sync that
+/// installs the snapshot makes its name durable with the snapshot's. A
+/// temporary a failed write leaves is removed when it can be; an open sweeps
+/// one that is not.
+///
+/// # Errors
+///
+/// Propagates a failure to write, sync or rename the copy.
+pub fn write_repair_report(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: u64,
+    bytes: &[u8],
+    sync_mode: SyncMode,
+) -> crate::Result<()> {
+    use crate::fs::FsOpenOptions;
+    let target = repair_report_path(folder, id);
+    let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"));
+    let publish = (|| -> crate::Result<()> {
+        let mut copy = fs.open(
+            &temporary,
+            &FsOpenOptions::new().write(true).create(true).truncate(true),
+        )?;
+        copy.write_all(bytes)?;
+        copy.flush()?;
+        FsFile::sync_all_with(&*copy, sync_mode)?;
+        drop(copy);
+        fs.rename(&temporary, &target)?;
+        Ok(())
+    })();
+    if publish.is_err()
+        && let Err(e) = fs.remove_file(&temporary)
+        && e.kind() != crate::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove {} ({e}); the next open sweeps it",
+            temporary.display(),
+        );
+    }
+    publish
 }
 
 /// Suffix of a manifest repair's in-progress blob salvage copy.
@@ -148,20 +311,8 @@ impl DictDirEntry {
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(DictId) -> Self| {
-            // Canonical spelling, checked without formatting the id back: the
-            // parser already accepted only digits after an optional sign, so
-            // requiring a DIGIT first rejects `+1`, and rejecting a leading zero
-            // on anything longer than one character rejects `01` and `00` while
-            // keeping `0` itself.
-            let canonical = || {
-                let mut bytes = rest.bytes();
-                bytes.next().is_some_and(|first| {
-                    first.is_ascii_digit() && (first != b'0' || rest.len() == 1)
-                })
-            };
-            rest.parse::<DictId>()
-                .ok()
-                .filter(|_| canonical())
+            canonical_id(rest)
+                .and_then(|id| DictId::try_from(id).ok())
                 .map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(DICT_TMP_SUFFIX) {

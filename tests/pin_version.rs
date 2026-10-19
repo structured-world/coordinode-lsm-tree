@@ -297,6 +297,38 @@ fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
     restore_matches_the_source(true)
 }
 
+/// A layout is named and versioned: one of another version, or one that does
+/// not start with the name at all, is refused before the restore writes
+/// anything.
+#[test]
+fn restore_refuses_a_layout_of_another_version() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let layout = tree.pin().layout()?;
+
+    let mut other_version = layout.clone();
+    other_version[4] = other_version[4].wrapping_add(1);
+    let unnamed = layout[5..].to_vec();
+    for (what, bytes) in [("another version", other_version), ("no name", unnamed)] {
+        let dst = tempfile::tempdir()?;
+        let target = dst.path().join("restored");
+        let result = Config::new(
+            &target,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(&bytes, [], []);
+        assert!(
+            matches!(result, Err(lsm_tree::Error::InvalidHeader(_))),
+            "{what}: refused as a layout of another shape"
+        );
+        assert!(!target.exists(), "{what}: nothing is written");
+    }
+    Ok(())
+}
+
 /// A restore never publishes over a tree already in the target folder, closed
 /// or open: it refuses before writing anything, and that tree stays as it was.
 #[test]
@@ -329,13 +361,22 @@ fn restore_refuses_a_folder_holding_a_tree() -> lsm_tree::Result<()> {
         Some(&b"kept"[..])
     );
 
-    let current = std::fs::read(dst.path().join("current"))?;
+    // The manifest generation the open tree is on: its snapshots and logs.
+    let manifest = || -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dst.path())? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('v') || name.starts_with("edits-") {
+                files.push((name, std::fs::read(entry.path())?));
+            }
+        }
+        files.sort();
+        Ok(files)
+    };
+    let before = manifest()?;
     assert!(restore().is_err(), "an open tree is refused");
-    assert_eq!(
-        std::fs::read(dst.path().join("current"))?,
-        current,
-        "the open tree's pointer is untouched"
-    );
+    assert_eq!(manifest()?, before, "the open tree's manifest is untouched");
     Ok(())
 }
 
@@ -415,9 +456,14 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     let layout = pin.layout()?;
 
     let injector = Arc::new(FaultInjector::new());
-    // The edit log is first touched once the manifest is published: failing it
-    // stops the restore between the publication and the memtable flush.
-    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("edits-"));
+    // The edit log is created before the manifest is published and next
+    // opened by the open that follows it: failing that open stops the restore
+    // between the publication and the memtable flush.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
     let interrupted = Config::new(
         dst.path(),
         SequenceNumberCounter::default(),
@@ -447,6 +493,143 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
         pin.memtable_range_tombstones(),
     )?;
     assert_eq!(read_at(&restored, pin.seqno())?, expected);
+    Ok(())
+}
+
+/// A restore resumed over an interrupted one installs the snapshot the
+/// interrupted one may already have named a repair report after. A layout
+/// carrying no report must not inherit that copy: an open would hand it out as
+/// a replay the restored tree owes.
+#[test]
+fn a_resumed_restore_drops_the_report_copy_the_interrupted_one_left() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+    let layout = pin.layout()?;
+
+    let injector = Arc::new(FaultInjector::new());
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
+    let interrupted = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(FaultFs::with_injector(StdFs, Arc::clone(&injector)))
+    .restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    );
+    assert!(interrupted.is_err(), "the fault stopped the restore");
+    drop(interrupted);
+
+    // The copy an interrupted restore of a layout that owed a report wrote
+    // under the snapshot it installed.
+    let snapshot = std::fs::read_dir(dst.path())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix('v')?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("the interrupted restore installed a snapshot");
+    let stale = dst.path().join(format!("repair-report-{snapshot}"));
+    std::fs::write(&stale, b"a report the restored layout does not owe")?;
+
+    drop(
+        Config::new(
+            dst.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(
+            &layout,
+            pin.memtable_entries(),
+            pin.memtable_range_tombstones(),
+        )?,
+    );
+    let (_tree, report) = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    assert!(
+        report.is_none(),
+        "the restored tree owes no report: {report:?}"
+    );
+    assert!(!stale.exists(), "the stale copy is gone");
+    Ok(())
+}
+
+/// A report copy cut to zero bytes still says a repair lost something it can
+/// no longer scope, so the whole history is owed. A pin of such a tree carries
+/// that copy as it is, empty, and the restored tree hands the same obligation
+/// out rather than none.
+#[test]
+fn a_restore_keeps_an_owed_report_whose_copy_is_empty() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    {
+        let tree = open(src.path(), false, &visible)?;
+        write_history(&tree, &visible)?;
+    }
+    let installed = std::fs::read_dir(src.path())?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix('v')?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .expect("the source has an installed snapshot");
+    std::fs::write(src.path().join(format!("repair-report-{installed}")), b"")?;
+
+    let tree = open(src.path(), false, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+    let layout = pin.layout()?;
+    drop(
+        Config::new(
+            dst.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(
+            &layout,
+            pin.memtable_entries(),
+            pin.memtable_range_tombstones(),
+        )?,
+    );
+
+    let (_restored, report) = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open_or_repair(lsm_tree::RepairPolicy::default())?;
+    let report = report.expect("the restored tree owes the source's report");
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::FullHistory,
+        "an empty copy leaves the loss unscoped"
+    );
     Ok(())
 }
 

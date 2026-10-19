@@ -6,6 +6,21 @@ use super::{
 use crate::fs::StdFs;
 use test_log::test;
 
+/// Removes every manifest snapshot and edit log in `root`: the manifest loss
+/// a repair is run for.
+fn remove_manifest(fs: &dyn crate::fs::Fs, root: &std::path::Path) -> crate::Result<()> {
+    use crate::version::recovery::{log_id_of, snapshot_id_of};
+    for entry in fs.read_dir(root)? {
+        if snapshot_id_of(&entry.file_name)
+            .or_else(|| log_id_of(&entry.file_name))
+            .is_some()
+        {
+            fs.remove_file(&entry.path)?;
+        }
+    }
+    Ok(())
+}
+
 /// `toc_may_hide_deletions` must PROPAGATE a transient open failure rather than
 /// grade it `true` (fail closed): on a table `repair_with_salvage` already found
 /// corrupt, a `true` verdict drops the table — losing the healthy
@@ -386,20 +401,30 @@ fn compute_table_checksum_matches_oneshot_xxh3() -> crate::Result<()> {
     Ok(())
 }
 
+/// A log is a generation's file too: a rebuilt snapshot under an id an
+/// orphaned log still carries would meet that log at its install.
 #[test]
-fn highest_existing_version_id_picks_the_max_and_ignores_non_versions() -> crate::Result<()> {
+fn highest_existing_version_id_picks_the_max_over_snapshots_and_logs() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    for name in ["v2", "v10", "v3", "current", "vNaN", "notaversion"] {
+    for name in [
+        "v2",
+        "v10",
+        "v3",
+        "edits-11",
+        "vNaN",
+        "edits-x",
+        "notaversion",
+    ] {
         std::fs::write(dir.path().join(name), b"x")?;
     }
-    assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, Some(10));
+    assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, Some(11));
     Ok(())
 }
 
 #[test]
 fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
-    std::fs::write(dir.path().join("current"), b"x")?;
+    std::fs::write(dir.path().join("notaversion"), b"x")?;
     assert_eq!(highest_existing_version_id(&StdFs, dir.path())?, None);
     Ok(())
 }
@@ -3122,15 +3147,7 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
         b"k0004",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The stale sidecar cannot be cleaned up: the id must not be handed out
     // in the first place, AND the repair must fail rather than succeed over
@@ -3670,15 +3687,7 @@ fn repair_skips_salvaging_an_unreferenced_invalid_blob() -> crate::Result<()> {
         f.seek(SeekFrom::Start(last - 8))?;
         f.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Any WRITE into a salvage temp proves a salvage was attempted — and
     // stands in for the tight-space abort it can cause.
@@ -7930,15 +7939,7 @@ fn repair_seeds_garbage_accounting_for_a_punched_blob_prefix() -> crate::Result<
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     open_config().repair()?;
 
@@ -8022,15 +8023,7 @@ fn repair_fails_when_its_own_salvage_temp_cannot_be_removed() -> crate::Result<(
         f.seek(SeekFrom::Start(data_start))?;
         f.write_all(&garbage)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Every removal of the salvage temp fails persistently — including the
     // salvage's own internal discard — so the temp survives to the cleanup.
@@ -8125,15 +8118,7 @@ fn repair_fails_when_a_leftover_salvage_temp_cannot_be_removed() -> crate::Resul
         )?;
         f.write_all(b"partial salvage bytes")?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. (The filter has no separator, so it
     // matches Windows paths too.)
@@ -8233,15 +8218,7 @@ fn repair_fails_when_a_fully_punched_blobs_drop_cannot_complete() -> crate::Resu
         (data.pos(), data.pos() + data.len())
     };
     memfs.punch_hole(&blob_path, data_start, data_end - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. The path filter avoids a separator so
     // it also matches Windows paths (`...\blobs\0`); the only file removed
@@ -8420,15 +8397,7 @@ fn repair_abort_leaves_a_fully_punched_blob_in_place() -> crate::Result<()> {
         (data.pos(), data.pos() + data.len())
     };
     memfs.punch_hole(&blob_path, data_start, data_end - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The abort: a transient fault on the NEXT blob file's probe — strictly
     // after the scan met (and, pre-fix, removed) the fully punched blob 0.
@@ -8535,15 +8504,7 @@ fn repair_rewrites_a_restricted_table_that_references_a_reshaped_blob() -> crate
         b"k0001",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = Config::new(
         &root,
@@ -8650,15 +8611,7 @@ fn repair_swaps_a_routed_rewrite_through_its_own_backend() -> crate::Result<()> 
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     config().repair()?;
     assert!(
@@ -8953,15 +8906,7 @@ fn repair_does_not_leave_an_unrestrictable_rewrite_in_the_scan() -> crate::Resul
         b"k0001",
         crate::fs::SyncMode::Normal,
     )?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The copy's own sidecar cannot be written (so it would be adopted
     // unrestricted) and it cannot be removed either.
@@ -9072,24 +9017,16 @@ fn repair_keeps_the_rewrite_source_in_place_until_the_manifest_is_committed() ->
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let source = root.join("tables").join("0");
     assert!(memfs.exists(&source)?, "the fixture's SST is at tables/0");
 
-    // Fail the manifest commit (the CURRENT pointer's atomic swap): everything
-    // up to publication has run.
+    // Fail the manifest commit (the rename that installs the rebuilt
+    // snapshot): everything up to publication has run.
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
         FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
-            .on_path(crate::file::CURRENT_VERSION_FILE),
+            .on_path(root.join("v").to_string_lossy()),
     );
     let result = Config::new(
         &root,
@@ -9176,15 +9113,7 @@ fn repair_counts_only_blob_files_that_reach_the_manifest() -> crate::Result<()> 
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     Config::new(
         &root,
@@ -9342,15 +9271,7 @@ fn repair_fails_when_an_unreferenced_blob_cannot_be_removed() -> crate::Result<(
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Its removal fails PERSISTENTLY. The path filter carries no separator so
     // it matches Windows paths too.
@@ -9650,8 +9571,9 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
         let name = name.to_string_lossy();
         let is_version = name
             .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_version {
             std::fs::remove_file(entry.path())?;
         }
     }
@@ -9913,15 +9835,7 @@ fn a_committed_empty_compaction_republishes_inputs_on_manifest_loss() -> crate::
             std::io::Write::write_all(&mut f, &bytes)?;
         }
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert_eq!(
@@ -10550,15 +10464,7 @@ fn a_committed_transforming_compaction_survives_manifest_loss() -> crate::Result
     }
 
     // Manifest loss on top.
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -11008,9 +10914,14 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
         tree.insert(b"b", b"v", 2);
         tree.flush_active_memtable(0)?;
     }
-    // Losing CURRENT makes the open structurally repairable BEFORE the key
-    // mismatch can surface, so the repair scan is where decrypt first fails.
-    memfs.remove_file(&root.join("current"))?;
+    // Losing the snapshot makes the open structurally repairable BEFORE the
+    // key mismatch can surface, so the repair scan is where decrypt first
+    // fails.
+    for e in memfs.read_dir(&root)? {
+        if crate::version::recovery::snapshot_id_of(&e.file_name).is_some() {
+            memfs.remove_file(&e.path)?;
+        }
+    }
 
     let wrong: Arc<dyn crate::encryption::EncryptionProvider> =
         Arc::new(crate::encryption::Aes256GcmProvider::new(&[0x13; 32]));
@@ -11050,17 +10961,16 @@ fn a_repair_under_the_wrong_encryption_key_fails_closed() -> crate::Result<()> {
 }
 
 /// An INCONCLUSIVE post-persist probe must not claim a committed repair:
-/// with the rename refused and the pointer read failing too, nothing
-/// proves the switch, and returning `RepairedButUnopened` would hand a
-/// consumer a replay obligation against the still-unrepaired tree (its
-/// reconciliation could duplicate merge operands) while the cleanup
-/// sweeps a possibly-live generation's edit logs. The sweep arms a
-/// one-shot pointer-read fault at increasing skip counts; whenever the
-/// repair fails with `CURRENT` absent (never switched), the error must be
-/// bare.
+/// with the installing rename refused and the probe of the snapshot's name
+/// failing too, nothing proves the install, and returning `RepairedButUnopened` would hand
+/// a consumer a replay obligation against the still-unrepaired tree (its
+/// reconciliation could duplicate merge operands) while the cleanup sweeps a
+/// possibly-live generation's edit logs. The sweep arms a one-shot probe
+/// fault at increasing skip counts; whenever the repair fails with no
+/// snapshot installed, the error must be bare.
 #[test]
-fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+fn an_inconclusive_install_probe_never_claims_a_committed_repair() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
@@ -11083,25 +10993,19 @@ fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Res
             tree.insert(b"a", b"v", 1);
             tree.flush_active_memtable(0)?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
 
         let fault = FaultFs::new((*memfs).clone());
+        let snapshot = root.join("v").to_string_lossy().into_owned();
+        // The rename that installs the rebuilt snapshot is refused.
         fault.injector().arm(
             FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
-                .on_path("current")
+                .on_path(snapshot.clone())
                 .times(1),
         );
         fault.injector().arm(
-            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path("current")
+            FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path(snapshot)
                 .skip(skip)
                 .times(1),
         );
@@ -11113,12 +11017,12 @@ fn an_inconclusive_current_probe_never_claims_a_committed_repair() -> crate::Res
         .with_fs(fault)
         .repair();
 
-        if !memfs.exists(&root.join("current"))?
+        if crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none()
             && let Err(e) = &result
         {
             assert!(
                 !matches!(e, crate::Error::RepairedButUnopened { .. }),
-                "CURRENT never switched, so no report may claim a committed \
+                "no snapshot was installed, so no report may claim a committed \
                  repair (skip {skip}): {e:?}",
             );
         }
@@ -11161,15 +11065,7 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
         )?;
         std::io::Write::write_all(&mut f, &[0xEE; 64])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let progress = Arc::new(crate::RecoveryProgress::default());
     Config::new(
@@ -11190,17 +11086,17 @@ fn repair_progress_credits_a_removed_temp_companion() -> crate::Result<()> {
     Ok(())
 }
 
-/// A `persist_version` failure AFTER its atomic `CURRENT` switch (the
-/// pointer's directory sync is the one fallible step past it) must carry
-/// the report: the pointer on disk already names the rebuilt manifest, so
-/// once the transient fault clears the retry opens it without a repair and
-/// answers with no report at all. The sweep arms a one-shot directory-sync
-/// fault at increasing skip counts until it lands in that window (the
-/// re-created `current` proves the switch happened) and asserts the error
-/// is the report-carrying kind.
+/// A `persist_version` failure AFTER it installed the rebuilt snapshot (the
+/// directory sync is the one fallible step past the installing rename, and
+/// here the withdrawal of the name fails too) must carry the report: the
+/// snapshot on disk is installed, so once the
+/// transient fault clears the retry opens it without a repair and answers
+/// with no report at all. The sweep arms a one-shot directory-sync fault at
+/// increasing skip counts until it lands in that window (the installed
+/// snapshot proves it) and asserts the error is the report-carrying kind.
 #[test]
-fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
     use std::sync::Arc;
@@ -11223,21 +11119,21 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
             tree.insert(b"a", b"v", 1);
             tree.flush_active_memtable(0)?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
 
         let fault = FaultFs::new((*memfs).clone());
         fault.injector().arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
                 .skip(skip)
                 .times(1),
+        );
+        // A failed sync takes the snapshot's name back; refusing that removal
+        // keeps the snapshot installed, the case under test. The persist's
+        // first removal is of a leftover temporary, before anything is written.
+        fault.injector().arm(
+            FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+                .on_path(root.join("v").to_string_lossy())
+                .skip(1),
         );
         let result = Config::new(
             &root,
@@ -11247,20 +11143,20 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
         .with_fs(fault)
         .repair();
 
-        let switched = memfs.exists(&root.join("current"))?;
+        let switched = crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_some();
         match result {
             Ok(_) => {
                 // The fault fired before any sync (or never) without
-                // reaching the post-switch window at this skip; when the
+                // reaching the post-install window at this skip; when the
                 // skip exceeds every sync the repair just succeeds — the
                 // window, if it exists, was at a smaller skip.
             }
             Err(e) if !switched => {
-                // Failed before the switch: a bare error is correct here
+                // Failed before the install: a bare error is correct here
                 // (nothing was published; the retry re-repairs).
                 assert!(
                     !matches!(e, crate::Error::RepairedButUnopened { .. }),
-                    "no report may claim a repair the pointer disproves",
+                    "no report may claim a repair the disk disproves",
                 );
             }
             Err(crate::Error::RepairedButUnopened { report, .. }) => {
@@ -11270,13 +11166,12 @@ fn a_switched_current_sync_failure_carries_the_report() -> crate::Result<()> {
                 );
                 return Ok(());
             }
-            Err(other) => panic!(
-                "a failure after the CURRENT switch must carry the report, \
-                 got {other:?}",
-            ),
+            Err(other) => {
+                panic!("a failure after the install must carry the report, got {other:?}",)
+            }
         }
     }
-    panic!("no skip count landed the fault in the post-switch window");
+    panic!("no skip count landed the fault in the post-install window");
 }
 
 /// When the manifest itself loads CLEANLY and repair was entered over one
@@ -11626,15 +11521,7 @@ fn an_unreferenced_blob_is_removed_at_its_recovered_path() -> crate::Result<()> 
     // Lose the manifest too: with a clean one the pre-scan sweep removes the
     // file by its own directory entry, which never exercises the rebuild's
     // unreferenced-blob path.
-    for entry in memfs.read_dir(&root)? {
-        let is_version = entry
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || entry.file_name == "current" {
-            memfs.remove_file(&entry.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert!(
@@ -12537,7 +12424,6 @@ fn blob_salvage_never_allocates_a_missing_referenced_id() -> crate::Result<()> {
 /// the same mismatch error a healthy open raises.
 #[test]
 fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::sync::Arc;
 
@@ -12561,15 +12447,7 @@ fn repair_rejects_blob_backed_ssts_without_kv_separation() -> crate::Result<()> 
         tree.insert(b"k", vec![b'v'; 64], 1);
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let result = Config::new(
         &root,
@@ -12942,18 +12820,108 @@ fn open_or_repair_carries_the_report_when_the_follow_up_open_fails() -> crate::R
     Ok(())
 }
 
-/// The post-failure `CURRENT` probe must fail SAFE: a probe that cannot read
-/// the pointer (a transient or permission failure on its open / read) proves
-/// nothing about the switch, and treating it as "not switched" lets the
-/// still-armed guard delete replacements a PUBLISHED manifest references —
-/// a repaired tree with missing blob files. The sweep drives a directory-sync
-/// fault through every sync in the commit sequence (including the one AFTER
-/// the pointer rename) while the probe's own open is refused; whatever the
-/// outcome, a pointer that names the rebuilt version must still resolve every
-/// value.
+/// A failure writing or syncing a salvage's OUTPUT says nothing about the
+/// SOURCE's bytes: grading the source unreadable on it would exclude the
+/// source and the tables that reference it, and the cleanup after the commit
+/// would remove intact data. Whichever directory sync of the repair fails
+/// once, a retry on a healthy filesystem reads back every intact value.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Result<()> {
+fn a_failed_salvage_output_never_costs_the_source() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let root = std::path::absolute("/db")?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let config = |fs: Arc<dyn Fs>| {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+
+    for skip in 0u64..10 {
+        let memfs = Arc::new(MemFs::new());
+        {
+            let crate::AnyTree::Blob(tree) = config(memfs.clone()).open()? else {
+                panic!("expected blob tree");
+            };
+            for i in 0..8u32 {
+                tree.insert(format!("k{i:04}").as_bytes(), vec![b'v'; 64], u64::from(i));
+            }
+            tree.flush_active_memtable(0)?;
+        }
+        // Corrupt the LAST frame, so the blob is salvaged into a replacement.
+        let fs_dyn: Arc<dyn Fs> = memfs.clone();
+        let blob_path = memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .find(|e| !e.is_dir)
+            .expect("one blob file")
+            .path;
+        let last = crate::vlog::BlobFileScanner::new(&blob_path, &*fs_dyn, 0)?
+            .collect::<crate::Result<Vec<_>>>()?
+            .last()
+            .expect("a last frame")
+            .frame_end;
+        {
+            let mut file = memfs.open(
+                &blob_path,
+                &crate::fs::FsOpenOptions::new().read(true).write(true),
+            )?;
+            let byte = crate::file::read_exact(&*file, last - 8, 1)?;
+            file.seek(SeekFrom::Start(last - 8))?;
+            file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+        }
+        remove_manifest(&*memfs, &root)?;
+
+        let fault = FaultFs::new((*memfs).clone());
+        fault.injector().arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(skip)
+                .once(),
+        );
+        let first = config(Arc::new(fault)).repair();
+
+        // The filesystem is healthy again: whatever the first attempt did, the
+        // retry (or the open of what it committed) serves every intact value.
+        let tree = config(memfs.clone()).open_or_repair(crate::repair::RepairPolicy::default());
+        let tree = match tree {
+            Ok((tree, _)) => tree,
+            Err(e) => panic!("skip={skip}: the tree does not open after {first:?}: {e:?}"),
+        };
+        for i in 0..7u32 {
+            assert!(
+                tree.get(format!("k{i:04}").as_bytes(), crate::SeqNo::MAX)?
+                    .is_some(),
+                "skip={skip}, first repair {:?}: intact k{i:04} was lost",
+                first.as_ref().map(|r| (r.recovered, r.unreadable)),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The post-failure install probe must fail SAFE: a probe that cannot stat
+/// the rebuilt snapshot's name (a transient or permission failure) proves
+/// nothing about the install, and treating it as "not installed" lets the
+/// still-armed guard delete replacements a PUBLISHED manifest references: a
+/// repaired tree with missing blob files. The sweep drives a directory-sync
+/// fault through every sync in the commit sequence (including the one AFTER
+/// the installing rename)
+/// while the probe is refused; whatever the outcome, an installed rebuilt
+/// snapshot must still resolve every value.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn an_unreadable_install_probe_preserves_published_replacements() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
@@ -13006,15 +12974,7 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
             file.seek(SeekFrom::Start(last - 8))?;
             file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
         Ok(memfs)
     };
 
@@ -13025,12 +12985,11 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
         fault
             .injector()
             .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).skip(skip));
-        // ...and the probe cannot read the pointer to find out what happened
-        // (the first `current` open is recovery's own, before the rebuild).
+        // ...and the probe cannot stat the rebuilt snapshot's name to find out
+        // what happened.
         fault.injector().arm(
-            FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::PermissionDenied))
-                .on_path(crate::file::CURRENT_VERSION_FILE)
-                .skip(1),
+            FaultRule::new(FaultOp::Metadata, Fault::Error(ErrorKind::PermissionDenied))
+                .on_path(root.join("v").to_string_lossy()),
         );
 
         let result = Config::new(
@@ -13044,10 +13003,10 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
         ))
         .repair();
 
-        // The invariant, whatever the fault timing hit: a pointer that NAMES
-        // the rebuilt version resolves every surviving value — the guard must
-        // never have deleted a file the published manifest references.
-        if memfs.exists(&root.join("current"))? {
+        // The invariant, whatever the fault timing hit: an installed rebuilt
+        // snapshot resolves every surviving value: the guard must never have
+        // deleted a file the published manifest references.
+        if crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_some() {
             let tree = Config::new(
                 &root,
                 SequenceNumberCounter::default(),
@@ -13074,10 +13033,10 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
     Ok(())
 }
 
-/// A persist failure BEFORE the `CURRENT` pointer switch must unwind the
-/// published fresh-id blob replacements. The guard was disarmed ahead of
-/// `persist_version`, whose create / encode / finish / directory-sync steps
-/// are all fallible before the switch — so a manifest-write error left the
+/// A persist failure BEFORE the install must unwind the published fresh-id
+/// blob replacements. The guard was disarmed ahead of `persist_version`,
+/// whose create / encode / finish steps are all fallible before the log
+/// installs the snapshot, so a manifest-write error left the
 /// uncommitted replacement in `blobs/`, and every failed attempt stacked
 /// another fresh-id copy (the retry salvages the damaged original again),
 /// walking recovery toward ENOSPC under exactly the tight-space conditions
@@ -13087,6 +13046,449 @@ fn an_unreadable_current_probe_preserves_published_replacements() -> crate::Resu
 fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let (memfs, root, blob_path) = a_blob_tree_with_a_damaged_tail()?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+
+    // The rebuilt snapshot's write (the only `v*` file left to write) dies
+    // with ENOSPC, strictly BEFORE its rename installs it.
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
+            .on_path(root.join("v").to_string_lossy()),
+    );
+    let result = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .repair();
+    assert!(
+        result.is_err(),
+        "the manifest write fault must fail the repair: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none(),
+        "self-check: the fault fired before the install",
+    );
+
+    let leftover: Vec<String> = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.file_name)
+        .collect();
+    assert_eq!(
+        leftover,
+        vec![
+            blob_path
+                .file_name()
+                .expect("blob file name")
+                .to_string_lossy()
+                .to_string()
+        ],
+        "an uncommitted fresh-id replacement must be unwound, or every \
+         failed attempt stacks another copy",
+    );
+    Ok(())
+}
+
+/// An install whose withdrawal is not durable may come back after a power
+/// loss: the rebuilt snapshot's name is gone now, but it can still be the
+/// installed one, naming the fresh-id blob replacement, which therefore stays.
+#[test]
+fn a_repair_whose_install_cannot_be_withdrawn_keeps_its_blob_replacements() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
+    use crate::io::ErrorKind;
+    use crate::{Config, KvSeparationOptions, SequenceNumberCounter};
+
+    let repair = |fs: FaultFs<MemFs>, root: &std::path::Path| {
+        Config::new(
+            root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs)
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+        .repair()
+    };
+
+    // A repair of the same tree without a fault tells which directory sync
+    // under the tree folder installs the rebuilt snapshot: the first after
+    // the snapshot's own data sync.
+    let (probe_fs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let under_root = |path: &std::path::Path| path.starts_with(&root);
+    let probe = FaultFs::new(MemFs::clone(&probe_fs));
+    let injector = probe.injector();
+    repair(probe, &root)?;
+    let syncs = injector.take_syncs();
+    let snapshot_synced = syncs
+        .iter()
+        .position(|(path, kind)| {
+            *kind != SyncKind::Directory
+                && path.parent() == Some(&*root)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str()?.strip_suffix(".tmp"))
+                    .and_then(crate::version::recovery::snapshot_id_of)
+                    .is_some()
+        })
+        .ok_or(crate::Error::Unrecoverable)?;
+    let skip = syncs
+        .iter()
+        .take(snapshot_synced)
+        .filter(|(path, kind)| *kind == SyncKind::Directory && under_root(path))
+        .count();
+
+    let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    // The install's directory sync fails, and so does the withdrawal's.
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(root.to_string_lossy())
+            .skip(skip as u64)
+            .times(2),
+    );
+    let result = repair(fault, &root);
+    assert!(
+        matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+        "the install can be neither made durable nor withdrawn: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert_eq!(
+        memfs
+            .read_dir(&blobs)?
+            .into_iter()
+            .filter(|e| !e.is_dir)
+            .count(),
+        2,
+        "the damaged original and its replacement both stay",
+    );
+    Ok(())
+}
+
+/// An install whose name cannot be taken back after its directory sync failed
+/// is still visible, yet a power loss may undo it. Until a directory sync has
+/// made it durable the repair has not committed, so it must not answer as a
+/// committed repair, nor retire the copy that carries its report.
+#[test]
+fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_copy() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
+    use crate::io::ErrorKind;
+
+    // A repair of the same tree without a fault tells which directory sync
+    // under the tree folder installs the rebuilt snapshot, and its id.
+    let (probe_fs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let probe = FaultFs::new(MemFs::clone(&probe_fs));
+    let injector = probe.injector();
+    a_blob_tree_config(probe, &root).repair()?;
+    let syncs = injector.take_syncs();
+    let snapshot_synced = syncs
+        .iter()
+        .position(|(path, kind)| {
+            *kind != SyncKind::Directory
+                && path.parent() == Some(&*root)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str()?.strip_suffix(".tmp"))
+                    .and_then(crate::version::recovery::snapshot_id_of)
+                    .is_some()
+        })
+        .ok_or(crate::Error::Unrecoverable)?;
+    let skip = syncs
+        .iter()
+        .take(snapshot_synced)
+        .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
+        .count();
+    let id = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
+        .ok_or(crate::Error::Unrecoverable)?;
+
+    let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    // The install's directory sync fails and so does every later one of the
+    // tree folder; the withdrawal cannot remove the name (its first removal
+    // under that name is the persist's own leftover temporary).
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(root.to_string_lossy())
+            .skip(skip as u64),
+    );
+    fault.injector().arm(
+        FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
+            .on_path(root.join(format!("v{id}")).to_string_lossy())
+            .skip(1)
+            .times(1),
+    );
+    let result = a_blob_tree_config(fault, &root).repair();
+    assert!(
+        matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+        "an install no sync made durable is not a committed repair: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        memfs.exists(&root.join(format!("v{id}")))?,
+        "self-check: the name could not be withdrawn",
+    );
+    assert!(
+        memfs.exists(&root.join(format!("repair-report-{id}")))?,
+        "the copy stays: the next open hands it out once the snapshot is installed",
+    );
+    Ok(())
+}
+
+/// The configuration the damaged-tail blob fixture is repaired and opened
+/// with, over `fs`.
+fn a_blob_tree_config(
+    fs: crate::fs::FaultFs<crate::fs::MemFs>,
+    root: &std::path::Path,
+) -> crate::Config {
+    crate::Config::new(
+        root,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .with_kv_separation(Some(
+        crate::KvSeparationOptions::default().separation_threshold(16),
+    ))
+}
+
+/// A rebuilt snapshot whose install and withdrawal both failed to sync, and
+/// which a power loss then kept: the damaged-tail blob fixture after such a
+/// repair. Returns the filesystem, the tree's folder, and the report a repair
+/// of the fixture without a fault answers with.
+fn an_unknown_install_that_survived() -> crate::Result<(
+    std::sync::Arc<crate::fs::MemFs>,
+    std::path::PathBuf,
+    crate::RepairReport,
+)> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
+    use crate::io::ErrorKind;
+
+    /// Copies the file `path` of `from` onto `to`, replacing what is there.
+    fn copy_file(from: &MemFs, to: &MemFs, path: &std::path::Path) -> crate::Result<()> {
+        let file = from.open(path, &crate::fs::FsOpenOptions::new().read(true))?;
+        let len =
+            usize::try_from(from.metadata(path)?.len).map_err(|_| crate::Error::Unrecoverable)?;
+        let bytes = crate::file::read_exact(&*file, 0, len)?;
+        let mut copy = to.open(
+            path,
+            &crate::fs::FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )?;
+        std::io::Write::write_all(&mut copy, &bytes)?;
+        Ok(())
+    }
+    /// Copies the folder `dir` of `from`, with all it holds, onto `to`.
+    fn copy_folder(from: &MemFs, to: &MemFs, dir: &std::path::Path) -> crate::Result<()> {
+        to.create_dir_all(dir)?;
+        for entry in from.read_dir(dir)? {
+            if entry.is_dir {
+                copy_folder(from, to, &entry.path)?;
+            } else {
+                copy_file(from, to, &entry.path)?;
+            }
+        }
+        Ok(())
+    }
+
+    let config = a_blob_tree_config;
+    // One fixture, copied: a tree's files carry random bytes, so the run
+    // without a fault and the faulted one must start from the same ones.
+    let (fixture, root, _) = a_blob_tree_with_a_damaged_tail()?;
+    let probe_fs = std::sync::Arc::new(MemFs::new());
+    copy_folder(&fixture, &probe_fs, &root)?;
+    let memfs = std::sync::Arc::new(MemFs::new());
+    copy_folder(&fixture, &memfs, &root)?;
+
+    // A repair without a fault: its report, the snapshot it installs, and
+    // which directory sync under the tree folder installs it (the first
+    // after the snapshot's own data sync).
+    let probe = FaultFs::new(MemFs::clone(&probe_fs));
+    let injector = probe.injector();
+    let expected = config(probe, &root).repair()?;
+    let syncs = injector.take_syncs();
+    let snapshot_synced = syncs
+        .iter()
+        .position(|(path, kind)| {
+            *kind != SyncKind::Directory
+                && path.parent() == Some(&*root)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str()?.strip_suffix(".tmp"))
+                    .and_then(crate::version::recovery::snapshot_id_of)
+                    .is_some()
+        })
+        .ok_or(crate::Error::Unrecoverable)?;
+    let skip = syncs
+        .iter()
+        .take(snapshot_synced)
+        .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
+        .count();
+    let snapshot = root.join(format!(
+        "v{}",
+        crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
+            .ok_or(crate::Error::Unrecoverable)?
+    ));
+    assert_ne!(
+        expected.wal_replay_scope(),
+        crate::WalReplayScope::TailOnly,
+        "self-check: the repair owes a replay"
+    );
+
+    let fault = FaultFs::new(MemFs::clone(&memfs));
+    // The install's directory sync fails, and so does the withdrawal's.
+    fault.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(root.to_string_lossy())
+            .skip(skip as u64)
+            .times(2),
+    );
+    let result = config(fault, &root).repair();
+    assert!(
+        matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))),
+        "the install can be neither made durable nor withdrawn: {:?}",
+        result.map(|r| r.recovered),
+    );
+    assert!(
+        !memfs.exists(&snapshot)?,
+        "self-check: the withdrawal took the name back"
+    );
+
+    // The power loss keeps the rename and loses the withdrawal. The snapshot
+    // the faulted run renamed is gone with the withdrawal, and the files it
+    // names carry random bytes no other run reproduces; the tree the run
+    // without a fault installed over the same fixture stands in for it,
+    // beside the copy of the report the faulted run kept.
+    let survived = std::sync::Arc::new(MemFs::new());
+    copy_folder(&probe_fs, &survived, &root)?;
+    let mut kept = 0;
+    for entry in memfs.read_dir(&root)? {
+        // The copy's own name, `repair-report-{id}`: digits after the prefix.
+        let copy = entry
+            .file_name
+            .strip_prefix("repair-report-")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        if copy {
+            copy_file(&memfs, &survived, &entry.path)?;
+            kept += 1;
+        }
+    }
+    assert_eq!(kept, 1, "self-check: the faulted run kept its report");
+    assert!(
+        survived.exists(&snapshot)?,
+        "self-check: the snapshot is back"
+    );
+    Ok((survived, root, expected))
+}
+
+/// A rebuilt snapshot whose install and withdrawal both fail to sync may come
+/// back after a power loss. The next `open_or_repair` then opens it without a
+/// repair, and must still hand out the report of the repair that built it,
+/// once: without it the caller never learns the WAL replay that repair owes.
+#[test]
+fn an_install_of_unknown_outcome_hands_its_report_to_the_next_open() -> crate::Result<()> {
+    use crate::RepairPolicy;
+    use crate::fs::{FaultFs, MemFs};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let (_, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    let Some(report) = report else {
+        panic!("the repair's report is lost");
+    };
+    assert_eq!(report.wal_replay_scope(), expected.wal_replay_scope());
+    assert_eq!(report.lost_coverage, expected.lost_coverage);
+    assert_eq!(report.unknowable_losses, expected.unknowable_losses);
+    assert_eq!(report.unreadable_files, expected.unreadable_files);
+
+    let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    assert!(again.is_none(), "the report is handed out once");
+    Ok(())
+}
+
+/// A repair over the surviving snapshot of a repair whose report never
+/// reached the caller owes that repair's replay as well: its report carries
+/// the earlier losses, and no later open hands the earlier report out again.
+#[test]
+fn a_repair_over_an_unreported_repair_carries_its_losses() -> crate::Result<()> {
+    use crate::RepairPolicy;
+    use crate::fs::{FaultFs, MemFs};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let report = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root).repair()?;
+    for entry in &expected.lost_coverage {
+        assert!(
+            report.lost_coverage.contains(entry),
+            "the earlier loss {entry:?} is carried"
+        );
+    }
+    assert_eq!(report.wal_replay_scope(), expected.wal_replay_scope());
+
+    let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    assert!(
+        again.is_none(),
+        "the earlier report went out with the later one"
+    );
+    Ok(())
+}
+
+/// A tree opened over the surviving snapshot of a repair whose report never
+/// reached the caller may rotate its manifest before `open_or_repair` runs:
+/// the report moves with the generation and is still handed out.
+#[test]
+fn an_unreported_repair_report_survives_a_manifest_rotation() -> crate::Result<()> {
+    use crate::fs::{FaultFs, MemFs};
+    use crate::{AbstractTree, RepairPolicy};
+
+    let (memfs, root, expected) = an_unknown_install_that_survived()?;
+    let before = crate::version::recovery::installed_snapshot(&root, &*memfs)?;
+    {
+        let tree = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+            .manifest_log_rotate_bytes(0)
+            .open()?;
+        tree.insert("rotate", "after the open", 100);
+        tree.flush_active_memtable(0)?;
+    }
+    assert_ne!(
+        crate::version::recovery::installed_snapshot(&root, &*memfs)?,
+        before,
+        "self-check: the flush rotated the manifest"
+    );
+
+    let (_, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+        .open_or_repair(RepairPolicy::default())?;
+    let Some(report) = report else {
+        panic!("the repair's report is lost with the rotation");
+    };
+    assert_eq!(report.lost_coverage, expected.lost_coverage);
+    Ok(())
+}
+
+/// A KV-separated tree at `/db` on a fresh `MemFs` whose one blob file has a
+/// damaged last frame, with every manifest file removed: a repair salvages
+/// the blob into a fresh-id replacement and rebuilds the snapshot. Returns
+/// the filesystem, the tree's folder and the blob file's path.
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_blob_tree_with_a_damaged_tail() -> crate::Result<(
+    std::sync::Arc<crate::fs::MemFs>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+)> {
+    use crate::fs::{Fs, MemFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
@@ -13138,62 +13540,8 @@ fn a_failed_manifest_write_unwinds_published_blob_replacements() -> crate::Resul
         file.seek(SeekFrom::Start(last - 8))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
-
-    // The rebuilt manifest is `v0` (no `v*` files survive); its write dies
-    // with ENOSPC — strictly BEFORE the `CURRENT` pointer switch.
-    let fault = FaultFs::new((*memfs).clone());
-    fault.injector().arm(
-        FaultRule::new(FaultOp::Write, Fault::Error(ErrorKind::StorageFull))
-            .on_path(root.join("v0").to_string_lossy()),
-    );
-    let result = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_fs(fault)
-    .with_kv_separation(Some(
-        KvSeparationOptions::default().separation_threshold(16),
-    ))
-    .repair();
-    assert!(
-        result.is_err(),
-        "the manifest write fault must fail the repair: {:?}",
-        result.map(|r| r.recovered),
-    );
-    assert!(
-        !memfs.exists(&root.join("current"))?,
-        "self-check: the fault fired before the pointer switch",
-    );
-
-    let leftover: Vec<String> = memfs
-        .read_dir(&blobs)?
-        .into_iter()
-        .filter(|e| !e.is_dir)
-        .map(|e| e.file_name)
-        .collect();
-    assert_eq!(
-        leftover,
-        vec![
-            blob_path
-                .file_name()
-                .expect("blob file name")
-                .to_string_lossy()
-                .to_string()
-        ],
-        "an uncommitted fresh-id replacement must be unwound, or every \
-         failed attempt stacks another copy",
-    );
-    Ok(())
+    remove_manifest(&*memfs, &root)?;
+    Ok((memfs, root, blob_path))
 }
 
 #[test]
@@ -13258,15 +13606,7 @@ fn repair_never_half_publishes_a_salvaged_blob_under_transient_faults() -> crate
             file.seek(SeekFrom::Start(last - 8))?;
             file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
         }
-        for e in memfs.read_dir(&root)? {
-            let is_version = e
-                .file_name
-                .strip_prefix('v')
-                .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || e.file_name == "current" {
-                memfs.remove_file(&e.path)?;
-            }
-        }
+        remove_manifest(&*memfs, &root)?;
         let corrupted = read_all(&fs_dyn, &blob_path)?;
         Ok((memfs, blob_path, corrupted))
     };
@@ -13399,15 +13739,7 @@ fn repair_leaves_every_table_in_place_when_the_rewrite_fails_transiently() -> cr
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // Fault the rewrite's reads of the source SST with a RETRYABLE kind.
     let fault = FaultFs::new((*memfs).clone());
@@ -13524,15 +13856,7 @@ fn repair_salvages_a_frame_corrupt_blob_and_remaps_handles() -> crate::Result<()
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -13647,7 +13971,7 @@ fn a_salvaged_table_referencing_a_salvaged_blob_publishes_its_remapped_rewrite()
 /// fails, a repair that committed reopens.
 #[test]
 fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
     use crate::io::ErrorKind;
     use std::sync::Arc;
 
@@ -13665,7 +13989,8 @@ fn a_chained_rewrite_survives_its_swap_lost_after_the_commit() -> crate::Result<
                 .times(1),
         );
         let result = chained_config(&root, Arc::new(fault)).repair_with_salvage(true);
-        if result.is_ok() || !memfs.exists(&root.join("current"))? {
+        if result.is_ok() || crate::version::recovery::installed_snapshot(&root, &*memfs)?.is_none()
+        {
             continue;
         }
         lost_after_commit += 1;
@@ -13797,15 +14122,7 @@ fn damage_a_table_and_its_blob(
         file.seek(SeekFrom::Start(at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -13883,15 +14200,7 @@ fn a_failed_repair_leaves_the_originals_intact_and_the_retry_succeeds() -> crate
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = |fs: Arc<dyn Fs>| {
         Config::new(
@@ -14042,15 +14351,7 @@ fn a_retry_handles_damage_that_appeared_after_the_failed_attempt() -> crate::Res
 
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let config = |fs: Arc<dyn Fs>| {
         Config::new(
@@ -14231,7 +14532,6 @@ fn blob_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
 ) -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
 
     {
@@ -14260,15 +14560,7 @@ fn blob_tree_without_manifest(
         }
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -14633,12 +14925,15 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
     // commits, then punch the prefix it declares dead — and persist that
     // version, so the manifest carries the frontier in `blob_restrictions`
     // exactly as a real reclaim leaves it.
-    let (tables, blob_files) = {
+    let (tables, blob_files, installed) = {
         let tree = match config().open()? {
             crate::AnyTree::Blob(t) => t,
             crate::AnyTree::Standard(_) => panic!("expected blob tree"),
         };
         let version = tree.index.current_version();
+        // The open installed this version as its snapshot; the one written
+        // below has to be newer to be the installed one after it.
+        let installed = version.id();
         let blob = version
             .blob_files
             .iter()
@@ -14665,11 +14960,11 @@ fn a_clean_manifest_frontier_survives_a_backend_that_cannot_probe_holes() -> cra
         let tables: Vec<_> = version.iter_tables().cloned().collect();
         let mut map = crate::HashMap::default();
         map.insert(restricted.id(), restricted);
-        (tables, BlobFileList::new(map))
+        (tables, BlobFileList::new(map), installed)
     };
     let run = Arc::new(Run::new(tables).expect("non-empty run"));
     let version = Version::from_levels(
-        2,
+        installed + 1,
         crate::TreeType::Blob,
         alloc::vec![Level::from_runs(alloc::vec![run])],
         blob_files,
@@ -14769,15 +15064,7 @@ fn repair_rewrites_tables_with_handles_below_a_blob_frontier() -> crate::Result<
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -14898,15 +15185,7 @@ fn repair_rewrites_cell_rows_with_references_below_a_blob_frontier() -> crate::R
             .pos()
     };
     memfs.punch_hole(&blob_path, data_start, frontier - data_start)?;
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = Config::new(
         &root,
@@ -15000,15 +15279,7 @@ fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> c
     }
 
     // The manifest is lost, and with it the owner's table.
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let tables = root.join(crate::file::TABLES_FOLDER);
     let owner = memfs
         .read_dir(&tables)?
@@ -15144,15 +15415,7 @@ fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> c
         tree.flush_active_memtable(0)?;
     }
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let tables = root.join(crate::file::TABLES_FOLDER);
     let owner = memfs
         .read_dir(&tables)?
@@ -15513,13 +15776,12 @@ fn repair_discards_an_uncommitted_repair_replacement() -> crate::Result<()> {
 }
 
 /// A standard tree with data flushed and its manifest (version snapshots +
-/// `current`) removed — the manifest-loss fixture the progress / entry-point
+/// edit logs) removed — the manifest-loss fixture the progress / entry-point
 /// tests below repair.
 fn standard_tree_without_manifest(
     memfs: &std::sync::Arc<crate::fs::MemFs>,
     root: &std::path::Path,
 ) -> crate::Result<()> {
-    use crate::fs::Fs;
     use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     {
@@ -15536,15 +15798,7 @@ fn standard_tree_without_manifest(
         tree.insert(b"k", b"v", 1);
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&**memfs, root)?;
     Ok(())
 }
 
@@ -15825,16 +16079,17 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
     let manifest_names: Vec<String> = memfs
         .read_dir(&root)?
         .into_iter()
-        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .filter(|e| e.file_name.starts_with('v') || e.file_name.starts_with("edits-"))
         .map(|e| e.file_name)
         .collect();
 
     // `WouldBlock`, not `Interrupted`: std's buffered reads transparently
     // retry EINTR, so a permanently armed Interrupted would spin forever.
     let fault = FaultFs::new((*memfs).clone());
-    fault
-        .injector()
-        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
+            .on_path(root.join("v").to_string_lossy()),
+    );
     let result = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -15853,7 +16108,7 @@ fn repair_propagates_a_transient_manifest_probe_failure() -> crate::Result<()> {
     let after: Vec<String> = memfs
         .read_dir(&root)?
         .into_iter()
-        .filter(|e| e.file_name.starts_with('v') || e.file_name == "current")
+        .filter(|e| e.file_name.starts_with('v') || e.file_name.starts_with("edits-"))
         .map(|e| e.file_name)
         .collect();
     assert_eq!(
@@ -16050,8 +16305,7 @@ fn repair_propagates_an_exhausted_descriptor_table() -> crate::Result<()> {
         use crate::fs::Fs;
         let mut state = Vec::new();
         for e in memfs.read_dir(&root)? {
-            let manifest = e.file_name == "current"
-                || e.file_name.starts_with("edits-")
+            let manifest = e.file_name.starts_with("edits-")
                 || e.file_name
                     .strip_prefix('v')
                     .is_some_and(|rest| rest.parse::<u64>().is_ok());
@@ -16134,14 +16388,7 @@ fn an_aborted_repair_closes_the_descriptors_it_cached() -> crate::Result<()> {
             tree.flush_active_memtable(0)?;
         }
     }
-    {
-        use crate::fs::Fs;
-        for e in memfs.read_dir(&root)? {
-            if e.file_name == "current" || e.file_name.starts_with('v') {
-                memfs.remove_file(&e.path)?;
-            }
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     // The last table scanned cannot be opened, after the others were.
     let cache = Arc::new(DescriptorTable::new(16));
@@ -16226,7 +16473,11 @@ fn repair_propagates_a_full_destination_during_salvage() -> crate::Result<()> {
     .with_fs(fault)
     .repair_with_salvage(true);
     assert!(
-        matches!(result, Err(crate::Error::Io(ref e)) if e.kind() == ErrorKind::StorageFull),
+        matches!(
+            result,
+            Err(crate::Error::SalvageOutput(ref e))
+                if matches!(**e, crate::Error::Io(ref e) if e.kind() == ErrorKind::StorageFull)
+        ),
         "a full destination must abort the repair, never grade the source: {:?}",
         result.map(|r| (r.recovered, r.unreadable)),
     );
@@ -16675,15 +16926,7 @@ fn assert_repair_error_removes_published_blob_replacements(
         }
         tree.flush_active_memtable(0)?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
     let blobs = root.join(crate::file::BLOBS_FOLDER);
     punch_and_corrupt_blob(&memfs, &blobs.join("0"))?;
 
@@ -16811,6 +17054,228 @@ fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
     Ok(())
 }
 
+/// A checkpoint of a tree that still owes a repair's report (an ordinary open
+/// keeps it for the next repairing open) holds the repaired data, so it owes
+/// the report too: opening the checkpoint with `open_or_repair` hands it out.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/checkpoint")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    // The copy a repair whose install outcome was unknown left for the
+    // snapshot the tree now opens.
+    let installed = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    tree.create_checkpoint(&target)?;
+    drop(tree);
+
+    let (checkpoint, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the checkpoint owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert_eq!(
+        checkpoint.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref())
+    );
+    Ok(())
+}
+
+/// A tree restored from a pin of a tree that still owes a repair's report
+/// holds that repair's data, so it owes the report too: the pin's layout
+/// carries it, and a repairing open of the restored tree hands it out.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_pinned_restore_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/restored")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let installed = memfs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    let pin = tree.pin();
+    memfs.create_dir_all(&target.join("tables"))?;
+    for table in pin.tables() {
+        let mut bytes = Vec::new();
+        table.open()?.read_to_end(&mut bytes)?;
+        memfs
+            .open(
+                &target.join("tables").join(table.id().to_string()),
+                &FsOpenOptions::new().write(true).create_new(true),
+            )?
+            .write_all(&bytes)?;
+    }
+    let layout = pin.layout()?;
+    drop(config(&target).restore_pinned(
+        &layout,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    )?);
+    drop(pin);
+    drop(tree);
+
+    let (restored, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the restored tree owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert_eq!(
+        restored.get(b"k", u64::MAX)?.as_deref(),
+        Some(b"v".as_ref())
+    );
+    Ok(())
+}
+
+/// A copy of the report that is gone when the checkpoint opens it (a
+/// rotation carried the report to its next snapshot and removed the old
+/// copy) is looked for again: the checkpoint still carries the report.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_checkpoint_carries_the_report_past_a_copy_a_rotation_removed() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    use std::sync::Arc;
+
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let root = std::path::absolute("/db")?;
+    let target = std::path::absolute("/checkpoint")?;
+    let config = |path: &std::path::Path| {
+        Config::new(
+            path,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+    };
+    {
+        let tree = config(&root).open()?;
+        tree.insert(b"k", b"v", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let installed = fs
+        .read_dir(&root)?
+        .into_iter()
+        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
+        .max()
+        .expect("the tree has a snapshot");
+    let owed = super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+    };
+    super::report_marker::write(&config(&root), installed, &owed)?;
+
+    let tree = config(&root).open()?;
+    // The copy the checkpoint picks is gone by the time it opens it.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::NotFound))
+            .on_path(root.join("repair-report-").to_string_lossy())
+            .once(),
+    );
+    tree.create_checkpoint(&target)?;
+    drop(tree);
+
+    let (_, report) = config(&target).open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the checkpoint owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    Ok(())
+}
+
 /// A TRANSIENT I/O failure is returned for a retry, never "repaired": a
 /// repair would rebuild the manifest around files a healthy retry could still
 /// read. Proven by the manifest generation staying untouched.
@@ -16841,9 +17306,10 @@ fn open_or_repair_propagates_transient_io_without_repairing() -> crate::Result<(
         .collect();
 
     let fault = FaultFs::new((*memfs).clone());
-    fault
-        .injector()
-        .arm(FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock)).on_path("current"));
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Read, Fault::Error(ErrorKind::WouldBlock))
+            .on_path(root.join("v").to_string_lossy()),
+    );
     let result = Config::new(
         &root,
         SequenceNumberCounter::default(),
@@ -17318,15 +17784,7 @@ fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair()?;
     assert_eq!(
@@ -17413,17 +17871,9 @@ fn a_salvaged_blob_is_reported_even_when_its_original_cannot_be_removed() -> cra
         file.seek(SeekFrom::Start(flip_at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&memfs, &root)?;
 
-    // The salvage runs and commits; removing the superseded original then
+    //The salvage runs and commits; removing the superseded original then
     // fails, which fails the repair AFTER the replacement is durable.
     injector.arm(
         FaultRule::new(
@@ -17892,15 +18342,7 @@ fn repair_syncs_the_blobs_directory_after_removing_an_unreferenced_file() -> cra
     w.write(b"z", 9, &[b'z'; 300])?;
     w.finish()?;
 
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let fault = FaultFs::new((*memfs).clone());
     fault.injector().arm(
@@ -18076,15 +18518,7 @@ fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
         file.seek(SeekFrom::Start(at))?;
         file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
     }
-    for e in memfs.read_dir(&root)? {
-        let is_version = e
-            .file_name
-            .strip_prefix('v')
-            .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || e.file_name == "current" {
-            memfs.remove_file(&e.path)?;
-        }
-    }
+    remove_manifest(&*memfs, &root)?;
 
     let report = config().repair_with_salvage(true)?;
     assert_eq!(
