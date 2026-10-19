@@ -201,6 +201,23 @@ fn raw_fs_read_link_reports_only_symlinks() {
     );
 }
 
+/// A symbolic link the raw backend makes holds its target as given, so a
+/// crash simulator over this backend can put a lost link back.
+#[test]
+fn raw_fs_symlink_makes_a_link_read_link_reads_back() {
+    use crate::fs::Fs;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let link = tmp.path().join("link");
+    fs.symlink(std::path::Path::new("elsewhere"), &link, false)
+        .expect("symlink");
+    assert_eq!(
+        fs.read_link(&link).expect("read_link"),
+        Some(crate::path::PathBuf::from("elsewhere"))
+    );
+}
+
 #[test]
 fn raw_file_append_writes_accumulate_at_eof() {
     // O_APPEND writes always land at end of file: two sequential appends

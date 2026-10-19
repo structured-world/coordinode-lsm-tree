@@ -916,6 +916,32 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        let mut state = write_state(&self.state)?;
+        if state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path is not a directory: {}", path.display()),
+            ));
+        }
+        if !state.dirs.contains(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("path not found: {}", path.display()),
+            ));
+        }
+        let holds = |entry: &Path| entry != path && entry.starts_with(path);
+        if state.files.keys().any(|p| holds(p)) || state.dirs.iter().any(|p| holds(p)) {
+            return Err(io::Error::other(format!(
+                "directory not empty: {}",
+                path.display()
+            )));
+        }
+        state.dirs.remove(path);
+        state.dirs.insert(PathBuf::from("/"));
+        Ok(())
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         ensure_non_empty_path(from)?;
         ensure_non_empty_path(to)?;

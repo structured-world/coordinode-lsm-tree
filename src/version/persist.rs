@@ -58,8 +58,10 @@ pub fn persist_version(
     let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption, sync_mode)?;
     version.encode_into(&mut writer, comparator_name)?;
     let footer = writer.finish()?;
+    super::edit_log::create_log(fs, folder, version.id(), sync_mode)?;
 
-    // IMPORTANT: fsync folder on Unix
+    // The snapshot's name and its log's, and every entry made in the folder
+    // before (a new tree's folders), durable before `CURRENT` names them.
     fsync_directory(folder, fs, sync_mode)?;
 
     // CURRENT pointer carries a content-binding XXH3-128 over the

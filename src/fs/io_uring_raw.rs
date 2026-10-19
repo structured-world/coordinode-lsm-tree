@@ -756,6 +756,25 @@ pub fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Erro
     Ok(())
 }
 
+/// `symlinkat(target, AT_FDCWD, link)`: makes `link` a symbolic link holding
+/// `target`, which is stored as given and need not exist.
+///
+/// # Errors
+/// Returns an [`Error`] if the `symlinkat` syscall fails.
+pub fn symlinkat_raw(target: &core::ffi::CStr, link: &core::ffi::CStr) -> Result<(), Error> {
+    // SAFETY: both paths are valid NUL-terminated C strings the kernel reads.
+    unsafe {
+        syscall3(
+            Sysno::symlinkat,
+            target.as_ptr() as usize,
+            AT_FDCWD as usize,
+            link.as_ptr() as usize,
+        )
+    }
+    .map_err(|e| err("symlinkat", e))?;
+    Ok(())
+}
+
 /// `renameat2(AT_FDCWD, from, AT_FDCWD, to, 0)` — rename, replacing the
 /// destination (the plain `rename(2)` behaviour).
 ///
@@ -1352,6 +1371,11 @@ impl Fs for IoUringRawFs {
         unlinkat_raw(&path_to_cstring(path)?, true)
     }
 
+    fn remove_dir(&self, path: &Path) -> crate::io::Result<()> {
+        // rmdir(2) through unlinkat: the kernel refuses a non-empty directory.
+        unlinkat_raw(&path_to_cstring(path)?, true)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
         renameat2_raw(&path_to_cstring(from)?, &path_to_cstring(to)?)
     }
@@ -1363,6 +1387,11 @@ impl Fs for IoUringRawFs {
         let ia = statx_identity_raw(&path_to_cstring(a)?)?;
         let ib = statx_identity_raw(&path_to_cstring(b)?)?;
         Ok(ia == ib)
+    }
+
+    // Linux records no kind with a link: `to_dir` matters only on Windows.
+    fn symlink(&self, target: &Path, link: &Path, _to_dir: bool) -> crate::io::Result<()> {
+        symlinkat_raw(&path_to_cstring(target)?, &path_to_cstring(link)?)
     }
 
     fn read_link(&self, path: &Path) -> crate::io::Result<Option<crate::path::PathBuf>> {
