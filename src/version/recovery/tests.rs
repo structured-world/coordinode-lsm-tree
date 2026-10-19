@@ -1263,6 +1263,42 @@ fn a_snapshot_under_another_number_is_refused() -> crate::Result<()> {
     Ok(())
 }
 
+/// A snapshot whose `version_id` section is not one id wide does not say
+/// which version it is: recovery refuses it as damage rather than read a
+/// guess.
+#[test]
+fn a_snapshot_whose_version_id_is_not_one_id_wide_is_refused() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/narrow-id");
+    fs.create_dir_all(folder)?;
+    let mut w = FixtureWriter::create(
+        &folder.join("v1"),
+        &fs,
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+    w.start("version_id")?;
+    w.write_u32::<LittleEndian>(1)?;
+    write_header(&mut w)?;
+    write_empty_tables(&mut w)?;
+    write_empty_blob_files(&mut w)?;
+    write_empty_blob_gc_stats(&mut w)?;
+    w.finish()?;
+    install_fixture(folder, 1, &fs)?;
+
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("a narrow version id must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestFooterInvalid("manifest version_id section is not 8 bytes")
+        ),
+        "got {err:?}",
+    );
+    Ok(())
+}
+
 /// Only the spelling the engine writes names a snapshot or an edit log: a
 /// leading zero is a file it never made, and taking it for one would open
 /// another name than the one listed.
