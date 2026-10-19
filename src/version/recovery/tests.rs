@@ -1160,6 +1160,58 @@ fn recover_refuses_a_manifest_of_another_format_version() -> crate::Result<()> {
     Ok(())
 }
 
+/// A store of the format before this one keeps a version pointer beside its
+/// snapshots, and a higher snapshot its writer left before rewriting the
+/// pointer (one cut short by a crash) is not the store's. Neither an open nor
+/// a repair may take that leftover for the installed snapshot, which an open
+/// would answer with damage and a repair with a silent, lossy rebuild in this
+/// format: the store is refused as one of another format, for the offline
+/// converter, which reads it through its own engine and pointer.
+#[test]
+fn a_store_with_a_version_pointer_is_refused_as_another_format() -> crate::Result<()> {
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let fs = crate::fs::StdFs;
+    let folder = dir.path();
+    fs.create_dir_all(&folder.join(crate::file::TABLES_FOLDER))?;
+    write_manifest_labelled(folder, &fs, 5)?;
+    fs.open(
+        &folder.join("current"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"1")?;
+    // The next generation, cut short before the pointer named it.
+    fs.open(
+        &folder.join("v2"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"torn")?;
+
+    let config = || {
+        crate::Config::new(
+            folder,
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+    };
+    match config().open() {
+        Err(crate::Error::InvalidVersion(5)) => {}
+        Err(e) => panic!("open: expected InvalidVersion(5), got {e:?}"),
+        Ok(_) => panic!("open: a store with a version pointer opened"),
+    }
+    match config().repair() {
+        Err(crate::Error::InvalidVersion(5)) => {}
+        Err(e) => panic!("repair: expected InvalidVersion(5), got {e:?}"),
+        Ok(_) => panic!("repair: a store with a version pointer was rebuilt"),
+    }
+    assert_eq!(
+        std::fs::read(folder.join("v2"))?,
+        b"torn",
+        "the store is left as it was"
+    );
+    Ok(())
+}
+
 /// Repair consults the committed manifest before rebuilding, and a manifest
 /// of another format must stop it there. Read as "no manifest", the rebuild
 /// would republish the old store in the current format and drop what only the

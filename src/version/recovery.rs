@@ -403,6 +403,13 @@ fn check_format(
     Ok(())
 }
 
+/// The name of the version pointer the format before this one kept beside its
+/// snapshots.
+const PREVIOUS_FORMAT_POINTER: &str = "current";
+
+/// The on-disk format that kept a version pointer.
+const PREVIOUS_FORMAT: u8 = 5;
+
 /// The version id `name` holds as a snapshot (`v{id}`), if it is one.
 #[must_use]
 pub fn snapshot_id_of(name: &str) -> Option<VersionId> {
@@ -437,15 +444,28 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
 /// acknowledged on, reported as such, never answered by an older generation,
 /// which would drop acknowledged edits.
 ///
+/// A folder with a version pointer (`current`) holds a store of the format
+/// before this one, whose writer made a snapshot durable before it rewrote the
+/// pointer: a higher snapshot there may be one that was never installed. Such
+/// a store is refused as [`crate::Error::InvalidVersion`], for the offline
+/// converter, which reads it by its pointer; this engine writes no pointer.
+///
 /// # Errors
 ///
-/// Propagates a failure to list `folder`.
+/// Propagates a failure to list `folder`, and refuses a store with a version
+/// pointer.
 pub fn installed_snapshot(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<VersionId>> {
     let entries = match fs.read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    if entries
+        .iter()
+        .any(|entry| !entry.is_dir && entry.file_name == PREVIOUS_FORMAT_POINTER)
+    {
+        return Err(crate::Error::InvalidVersion(PREVIOUS_FORMAT));
+    }
     Ok(entries
         .iter()
         .filter(|entry| !entry.is_dir)

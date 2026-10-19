@@ -27,6 +27,12 @@ use crate::{
 use alloc::sync::Arc;
 use std::io::Read;
 
+/// What a [`PinnedVersion::layout`] starts with.
+const LAYOUT_MAGIC: [u8; 4] = *b"LSMP";
+
+/// The shape of the layout after its magic; a restore refuses any other.
+const LAYOUT_VERSION: u8 = 1;
+
 /// A file a [`PinnedVersion`] holds in place: a table, a blob file or a
 /// compression dictionary.
 #[derive(Clone)]
@@ -295,9 +301,13 @@ impl PinnedVersion {
             .encode_into(&mut writer, &self.comparator_name)?;
         writer.finish()?;
 
+        // Named and versioned first, so a restore refuses a layout of another
+        // shape rather than misread it.
+        let mut layout = LAYOUT_MAGIC.to_vec();
+        layout.push(LAYOUT_VERSION);
+        layout.extend_from_slice(&self.version.id().to_le_bytes());
         // The pin's seqno rides along: the restored tree's counters start at
         // it, so a later write there lands above what the pin served.
-        let mut layout = self.version.id().to_le_bytes().to_vec();
         layout.extend_from_slice(&self.seqno.to_le_bytes());
         // The owed report, sealed as its copies lie, behind its length; an
         // empty one when none is owed.
@@ -370,7 +380,16 @@ pub fn restore(
     use crate::file::{BLOBS_FOLDER, DICTS_FOLDER, TABLES_FOLDER, fsync_directory};
     use std::io::Write;
 
-    let (id, rest) = layout
+    let rest = layout
+        .strip_prefix(LAYOUT_MAGIC.as_slice())
+        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
+    let (version, rest) = rest
+        .split_first()
+        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
+    if *version != LAYOUT_VERSION {
+        return Err(crate::Error::InvalidHeader("pinned layout version"));
+    }
+    let (id, rest) = rest
         .split_first_chunk::<8>()
         .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
     let (pin_seqno, rest) = rest

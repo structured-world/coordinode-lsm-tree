@@ -297,6 +297,38 @@ fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
     restore_matches_the_source(true)
 }
 
+/// A layout is named and versioned: one of another version, or one that does
+/// not start with the name at all, is refused before the restore writes
+/// anything.
+#[test]
+fn restore_refuses_a_layout_of_another_version() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let layout = tree.pin().layout()?;
+
+    let mut other_version = layout.clone();
+    other_version[4] = other_version[4].wrapping_add(1);
+    let unnamed = layout[5..].to_vec();
+    for (what, bytes) in [("another version", other_version), ("no name", unnamed)] {
+        let dst = tempfile::tempdir()?;
+        let target = dst.path().join("restored");
+        let result = Config::new(
+            &target,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(&bytes, [], []);
+        assert!(
+            matches!(result, Err(lsm_tree::Error::InvalidHeader(_))),
+            "{what}: refused as a layout of another shape"
+        );
+        assert!(!target.exists(), "{what}: nothing is written");
+    }
+    Ok(())
+}
+
 /// A restore never publishes over a tree already in the target folder, closed
 /// or open: it refuses before writing anything, and that tree stays as it was.
 #[test]
