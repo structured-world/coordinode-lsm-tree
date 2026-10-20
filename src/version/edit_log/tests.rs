@@ -19,21 +19,57 @@ fn edit(id: u64) -> VersionEdit {
     }
 }
 
-/// A log named by a bare file name lies in the current directory: its first
-/// append syncs that directory as `.`, the name every backend accepts, not
-/// as the empty parent the name has, so its entry survives a crash.
-#[test]
-fn the_first_append_to_a_log_in_the_current_directory_syncs_it() -> crate::Result<()> {
-    let fs = crate::fs::CrashFs::new(crate::fs::MemFs::new());
-    let path = Path::new("edits-0");
-    let mut scratch = Vec::new();
-    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true)?;
-
-    fs.crash();
-    assert_eq!(
-        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
-        vec![edit(1)]
+/// An empty log at `path`, as the install of its snapshot makes one.
+fn new_log(fs: &dyn Fs, path: &Path) {
+    drop(
+        fs.open(path, &FsOpenOptions::new().write(true).create_new(true))
+            .expect("a new log"),
     );
+}
+
+/// An append whose write fails partway leaves no part of its record behind:
+/// the log still ends on a record boundary, so the strict recovery mode
+/// replays it rather than refusing a tail no edit was acknowledged for.
+#[test]
+fn an_append_whose_write_fails_partway_leaves_the_log_whole() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    new_log(&fs, &path);
+    let mut scratch = Vec::new();
+    append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Normal)?;
+
+    // A frame is written as its length, its digest, then its payload: the
+    // payload's write is the one that stalls, after the header went out.
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(0)).skip(2));
+    scratch.clear();
+    assert!(append_edit(&fs, &path, &edit(2), &mut scratch, SyncMode::Normal).is_err());
+    fs.injector().clear();
+
+    let edits = replay_log(&fs, &path, ManifestRecoveryMode::AbsoluteConsistency)?;
+    assert_eq!(edits.len(), 1, "only the acknowledged edit");
+    Ok(())
+}
+
+/// An append goes to the log its snapshot's install made durable by name. A
+/// log that is not there fails the append, which makes none: one made by the
+/// append would lie under a name no sync covers, and a power loss would take
+/// every edit acknowledged in it.
+#[test]
+fn an_append_to_a_log_that_is_not_there_fails_and_makes_none() -> crate::Result<()> {
+    let fs = crate::fs::MemFs::new();
+    fs.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    let mut scratch = Vec::new();
+    let Err(crate::Error::Io(e)) =
+        append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Normal)
+    else {
+        panic!("an append to a log that is not there fails");
+    };
+    assert_eq!(e.kind(), crate::io::ErrorKind::NotFound);
+    assert!(!fs.exists(&path)?, "no log is made");
     Ok(())
 }
 
@@ -46,7 +82,9 @@ fn a_log_created_over_durable_edits_stays_empty_through_a_power_loss() -> crate:
     fs.create_dir_all(Path::new("/db"))?;
     let path = log_path(Path::new("/db"), 0);
     let mut scratch = Vec::new();
-    append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Full, true)?;
+    create_log(&fs, Path::new("/db"), 0, SyncMode::Full)?;
+    fs.sync_directory(Path::new("/db"))?;
+    append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Full)?;
 
     create_log(&fs, Path::new("/db"), 0, SyncMode::Full)?;
     fs.sync_directory(Path::new("/db"))?;
@@ -68,7 +106,9 @@ fn a_log_whose_emptying_failed_to_sync_is_synced_on_the_retry() -> crate::Result
     crash.create_dir_all(Path::new("/db"))?;
     let path = log_path(Path::new("/db"), 0);
     let mut scratch = Vec::new();
-    append_edit(&crash, &path, &edit(1), &mut scratch, SyncMode::Full, true)?;
+    create_log(&crash, Path::new("/db"), 0, SyncMode::Full)?;
+    crash.sync_directory(Path::new("/db"))?;
+    append_edit(&crash, &path, &edit(1), &mut scratch, SyncMode::Full)?;
 
     let fs = FaultFs::new(crash.clone());
     fs.injector().arm(
@@ -116,33 +156,6 @@ fn a_failed_probe_of_the_log_fails_its_creation() -> crate::Result<()> {
     Ok(())
 }
 
-/// A first append whose directory sync fails writes no edit: a record left
-/// in the log would be made durable by the next append's sync, though the
-/// operation it records was reported failed.
-#[test]
-fn a_first_append_whose_directory_sync_fails_writes_nothing() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
-
-    let fs = FaultFs::new(MemFs::new());
-    fs.create_dir_all(Path::new("/db"))?;
-    fs.injector().arm(
-        FaultRule::new(
-            FaultOp::SyncDirectory,
-            Fault::Error(crate::io::ErrorKind::Other),
-        )
-        .once(),
-    );
-    let path = Path::new("/db/edits-0");
-    let mut scratch = Vec::new();
-    assert!(append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true).is_err());
-    assert_eq!(
-        replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
-        Vec::new(),
-        "the failed append left no record"
-    );
-    Ok(())
-}
-
 /// An append syncs the log's data, not its full metadata: a record and the
 /// length that reaches it are what replay reads, and `fdatasync` makes both
 /// durable, so a backend refusing every full sync still takes the append.
@@ -157,9 +170,10 @@ fn an_append_syncs_the_data_of_the_log_not_its_metadata() -> crate::Result<()> {
         Fault::Error(crate::io::ErrorKind::Other),
     ));
     let path = Path::new("/db/edits-0");
+    new_log(&fs, path);
     let mut scratch = Vec::new();
-    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal, true)?;
-    append_edit(&fs, path, &edit(2), &mut scratch, SyncMode::Normal, false)?;
+    append_edit(&fs, path, &edit(1), &mut scratch, SyncMode::Normal)?;
+    append_edit(&fs, path, &edit(2), &mut scratch, SyncMode::Normal)?;
     assert_eq!(
         replay_log(&fs, path, ManifestRecoveryMode::AbsoluteConsistency)?,
         alloc::vec![edit(1), edit(2)],
@@ -171,10 +185,11 @@ fn an_append_syncs_the_data_of_the_log_not_its_metadata() -> crate::Result<()> {
 fn append_then_replay_roundtrips_all_edits() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-0");
+    new_log(&StdFs, &path);
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=4).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
     }
     let replayed =
         replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay");
@@ -204,7 +219,7 @@ fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
         ..Default::default()
     };
 
-    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal, false)?;
+    let appended = append_edit(&StdFs, &path, &wide, &mut scratch, SyncMode::Normal)?;
     assert_eq!(appended, None);
     assert!(!path.exists(), "a declined edit must not create the log");
     Ok(())
@@ -227,17 +242,10 @@ fn replay_absent_log_is_empty() {
 /// (a power-loss-interrupted append). Returns the path.
 fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
     let path = dir.join("edits-torn");
+    new_log(&StdFs, &path);
     let mut scratch = Vec::new();
     for i in 1..=count {
-        append_edit(
-            &StdFs,
-            &path,
-            &edit(i),
-            &mut scratch,
-            SyncMode::Normal,
-            false,
-        )
-        .expect("append");
+        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
     }
     let clean = log_size(&StdFs, &path).expect("size");
     append_edit(
@@ -246,7 +254,6 @@ fn log_with_torn_tail(dir: &std::path::Path, count: u64) -> std::path::PathBuf {
         &edit(count + 1),
         &mut scratch,
         SyncMode::Normal,
-        false,
     )
     .expect("append");
     let f = std::fs::OpenOptions::new()
@@ -300,10 +307,11 @@ fn clean_log_replays_under_strict() {
     // healthy open would fail under the default AbsoluteConsistency mode.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-clean");
+    new_log(&StdFs, &path);
     let mut scratch = Vec::new();
     let edits: Vec<VersionEdit> = (1..=3).map(edit).collect();
     for e in &edits {
-        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal, false).expect("append");
+        append_edit(&StdFs, &path, e, &mut scratch, SyncMode::Normal).expect("append");
     }
     let replayed = replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
         .expect("strict must accept a clean log");
@@ -317,17 +325,10 @@ fn checksum_mismatch_tail_aborts_in_every_mode() {
     // unacknowledged write, so every mode rejects it.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-bitrot");
+    new_log(&StdFs, &path);
     let mut scratch = Vec::new();
     for i in 1..=3 {
-        append_edit(
-            &StdFs,
-            &path,
-            &edit(i),
-            &mut scratch,
-            SyncMode::Normal,
-            false,
-        )
-        .expect("append");
+        append_edit(&StdFs, &path, &edit(i), &mut scratch, SyncMode::Normal).expect("append");
     }
     // Flip the last payload byte of the final (fully written) record.
     let mut bytes = std::fs::read(&path).expect("read");
@@ -356,27 +357,12 @@ fn checksum_mismatch_tail_aborts_in_every_mode() {
 fn log_size_grows_with_appends() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-size");
+    new_log(&StdFs, &path);
     let mut scratch = Vec::new();
     let s0 = log_size(&StdFs, &path).expect("size");
-    append_edit(
-        &StdFs,
-        &path,
-        &edit(1),
-        &mut scratch,
-        SyncMode::Normal,
-        false,
-    )
-    .expect("append");
+    append_edit(&StdFs, &path, &edit(1), &mut scratch, SyncMode::Normal).expect("append");
     let s1 = log_size(&StdFs, &path).expect("size");
-    append_edit(
-        &StdFs,
-        &path,
-        &edit(2),
-        &mut scratch,
-        SyncMode::Normal,
-        false,
-    )
-    .expect("append");
+    append_edit(&StdFs, &path, &edit(2), &mut scratch, SyncMode::Normal).expect("append");
     let s2 = log_size(&StdFs, &path).expect("size");
     assert_eq!(s0, 0);
     assert!(s1 > s0 && s2 > s1, "log grows with each appended edit");

@@ -191,6 +191,9 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
         work: Arc::default(),
         ..opts.clone()
     };
+    // Outputs an earlier run kept go first, once superseded, so this run is
+    // not checked against quota they no longer need.
+    remove_superseded_outputs(opts);
     let result = run_compaction(opts);
     // A run its room stopped declined, as one the gate skips does: its
     // inputs are as they were, and only its outputs go, below.
@@ -204,9 +207,18 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     // Every file the run created that it did not install goes now, whichever
     // writer made it and wherever the run stopped: the handles on them
     // dropped as the run returned. The run's room goes back once they are
-    // gone.
-    opts.outputs
-        .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
+    // gone. An install whose outcome is unknown may still name them after a
+    // power loss, so they stay until a later install supersedes it.
+    if matches!(result, Err(crate::Error::InstallOutcomeUnknown(_))) {
+        let kept = opts.outputs.keep_uninstalled();
+        opts.version_history.write().keep_outputs(kept);
+    } else {
+        opts.outputs
+            .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
+    }
+    // This run's install may be the rotation that superseded kept outputs,
+    // and another install may have rotated since this run's failed.
+    remove_superseded_outputs(opts);
     // Charged whether or not the run succeeded: a tight-space pass that fails
     // after installing slices leaves them installed, and what they read and
     // wrote was done.
@@ -216,6 +228,18 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     let mut result = result?;
     result.work = work;
     Ok(result)
+}
+
+/// Removes the outputs kept after an install of unknown outcome that a
+/// rotation has superseded since, and gives their quota back.
+fn remove_superseded_outputs(opts: &Options) {
+    if !opts.version_history.read().holds_kept_outputs() {
+        return;
+    }
+    let superseded = opts.version_history.write().take_superseded_outputs();
+    for kept in superseded {
+        kept.remove(opts.tree_id, opts.config.descriptor_table.as_deref());
+    }
 }
 
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {

@@ -29,7 +29,6 @@ pub const BLOBS_FOLDER: &str = "blobs";
 /// and immutable once written; and rather than in each SST because every table
 /// compressed against one would then carry its own copy.
 pub const DICTS_FOLDER: &str = "dicts";
-pub const CURRENT_VERSION_FILE: &str = "current";
 
 /// Marks a tree folder whose restore has not finished.
 ///
@@ -56,6 +55,19 @@ pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> 
     file_name
         .strip_suffix(REPAIR_TMP_SUFFIX)
         .and_then(|id| id.parse::<crate::TableId>().ok())
+}
+
+/// The id `digits` spells in the form the engine writes ids into names.
+///
+/// Decimal, with no sign and no leading zero. Any other spelling names a file
+/// the engine never made; taking it for an id would make a lookup by that id
+/// open another name than the one listed.
+#[must_use]
+pub fn canonical_id(digits: &str) -> Option<u64> {
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if canonical { digits.parse().ok() } else { None }
 }
 
 /// Suffix of a manifest repair's in-progress blob salvage copy.
@@ -148,20 +160,8 @@ impl DictDirEntry {
     #[must_use]
     pub fn classify(file_name: &str) -> Self {
         let owned_id = |rest: &str, make: fn(DictId) -> Self| {
-            // Canonical spelling, checked without formatting the id back: the
-            // parser already accepted only digits after an optional sign, so
-            // requiring a DIGIT first rejects `+1`, and rejecting a leading zero
-            // on anything longer than one character rejects `01` and `00` while
-            // keeping `0` itself.
-            let canonical = || {
-                let mut bytes = rest.bytes();
-                bytes.next().is_some_and(|first| {
-                    first.is_ascii_digit() && (first != b'0' || rest.len() == 1)
-                })
-            };
-            rest.parse::<DictId>()
-                .ok()
-                .filter(|_| canonical())
+            canonical_id(rest)
+                .and_then(|id| DictId::try_from(id).ok())
                 .map_or(Self::Foreign, make)
         };
         if let Some(rest) = file_name.strip_suffix(DICT_TMP_SUFFIX) {

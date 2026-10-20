@@ -129,7 +129,7 @@ fn repair_leaves_foreign_files_alone() -> lsm_tree::Result<()> {
             let is_version = entry_name
                 .strip_prefix('v')
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || entry_name == "current" {
+            if is_version {
                 std::fs::remove_file(entry.path())?;
             }
         }

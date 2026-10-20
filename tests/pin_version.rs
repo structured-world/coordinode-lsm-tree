@@ -297,6 +297,38 @@ fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
     restore_matches_the_source(true)
 }
 
+/// A layout is named and versioned: one of another version, or one that does
+/// not start with the name at all, is refused before the restore writes
+/// anything.
+#[test]
+fn restore_refuses_a_layout_of_another_version() -> lsm_tree::Result<()> {
+    let src = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let layout = tree.pin().layout()?;
+
+    let mut other_version = layout.clone();
+    other_version[4] = other_version[4].wrapping_add(1);
+    let unnamed = layout[5..].to_vec();
+    for (what, bytes) in [("another version", other_version), ("no name", unnamed)] {
+        let dst = tempfile::tempdir()?;
+        let target = dst.path().join("restored");
+        let result = Config::new(
+            &target,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .restore_pinned(&bytes, [], []);
+        assert!(
+            matches!(result, Err(lsm_tree::Error::InvalidHeader(_))),
+            "{what}: refused as a layout of another shape"
+        );
+        assert!(!target.exists(), "{what}: nothing is written");
+    }
+    Ok(())
+}
+
 /// A restore never publishes over a tree already in the target folder, closed
 /// or open: it refuses before writing anything, and that tree stays as it was.
 #[test]
@@ -329,13 +361,22 @@ fn restore_refuses_a_folder_holding_a_tree() -> lsm_tree::Result<()> {
         Some(&b"kept"[..])
     );
 
-    let current = std::fs::read(dst.path().join("current"))?;
+    // The manifest generation the open tree is on: its snapshots and logs.
+    let manifest = || -> std::io::Result<Vec<(String, Vec<u8>)>> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dst.path())? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('v') || name.starts_with("edits-") {
+                files.push((name, std::fs::read(entry.path())?));
+            }
+        }
+        files.sort();
+        Ok(files)
+    };
+    let before = manifest()?;
     assert!(restore().is_err(), "an open tree is refused");
-    assert_eq!(
-        std::fs::read(dst.path().join("current"))?,
-        current,
-        "the open tree's pointer is untouched"
-    );
+    assert_eq!(manifest()?, before, "the open tree's manifest is untouched");
     Ok(())
 }
 
@@ -370,6 +411,57 @@ fn restored_tree_writes_above_the_restored_data() -> lsm_tree::Result<()> {
     assert_eq!(
         restored.get("k01", SeqNo::MAX)?.as_deref(),
         Some(&b"after"[..])
+    );
+    Ok(())
+}
+
+/// A restore that cannot clear a temporary snapshot an earlier attempt left
+/// fails with that removal's error rather than writing over it.
+#[test]
+fn a_restore_that_cannot_clear_a_stale_temporary_snapshot_fails() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+    // What an earlier, interrupted attempt left under the restore's
+    // temporary snapshot name.
+    let stale = dst
+        .path()
+        .join(format!("v{}.tmp", tree.current_version().id()));
+    std::fs::write(&stale, b"stale")?;
+
+    let fs = std::sync::Arc::new(FaultFs::new(StdFs));
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .on_path(stale.to_string_lossy()),
+    );
+    let refused = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .restore_pinned(
+        &pin.layout()?,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    );
+    assert!(
+        matches!(&refused, Err(lsm_tree::Error::Io(e)) if e.kind() == lsm_tree::io::ErrorKind::PermissionDenied),
+        "{:?}",
+        refused.err()
+    );
+    assert_eq!(
+        std::fs::read(&stale)?,
+        b"stale",
+        "nothing is written over it"
     );
     Ok(())
 }
@@ -415,9 +507,14 @@ fn an_interrupted_restore_is_refused_and_resumed() -> lsm_tree::Result<()> {
     let layout = pin.layout()?;
 
     let injector = Arc::new(FaultInjector::new());
-    // The edit log is first touched once the manifest is published: failing it
-    // stops the restore between the publication and the memtable flush.
-    injector.arm(FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other)).on_path("edits-"));
+    // The edit log is created before the manifest is published and next
+    // opened by the open that follows it: failing that open stops the restore
+    // between the publication and the memtable flush.
+    injector.arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .skip(1),
+    );
     let interrupted = Config::new(
         dst.path(),
         SequenceNumberCounter::default(),

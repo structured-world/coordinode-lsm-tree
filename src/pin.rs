@@ -27,6 +27,12 @@ use crate::{
 use alloc::sync::Arc;
 use std::io::Read;
 
+/// What a [`PinnedVersion::layout`] starts with.
+const LAYOUT_MAGIC: [u8; 4] = *b"LSMP";
+
+/// The shape of the layout after its magic; a restore refuses any other.
+const LAYOUT_VERSION: u8 = 1;
+
 /// A file a [`PinnedVersion`] holds in place: a table, a blob file or a
 /// compression dictionary.
 #[derive(Clone)]
@@ -264,8 +270,10 @@ impl PinnedVersion {
 
     /// The version descriptor a manifest would hold for the pinned files
     /// (levels, runs, restrictions, blob files, dictionaries, the retention
-    /// floor), serialized in memory, sealed with the tree's encryption
-    /// provider when it has one. Opaque: hand it to
+    /// floor, a repair report the tree still owes: the pinned files hold
+    /// that repair's data, so the restored tree owes it too), serialized in
+    /// memory, sealed with the tree's encryption provider when it has one.
+    /// Opaque: hand it to
     /// [`Config::restore_pinned`](crate::Config::restore_pinned).
     ///
     /// # Errors
@@ -285,9 +293,13 @@ impl PinnedVersion {
             .encode_into(&mut writer, &self.comparator_name)?;
         writer.finish()?;
 
+        // Named and versioned first, so a restore refuses a layout of another
+        // shape rather than misread it.
+        let mut layout = LAYOUT_MAGIC.to_vec();
+        layout.push(LAYOUT_VERSION);
+        layout.extend_from_slice(&self.version.id().to_le_bytes());
         // The pin's seqno rides along: the restored tree's counters start at
         // it, so a later write there lands above what the pin served.
-        let mut layout = self.version.id().to_le_bytes().to_vec();
         layout.extend_from_slice(&self.seqno.to_le_bytes());
         fs.open(path, &FsOpenOptions::new().read(true))?
             .read_to_end(&mut layout)?;
@@ -354,7 +366,16 @@ pub fn restore(
     use crate::file::{BLOBS_FOLDER, DICTS_FOLDER, TABLES_FOLDER, fsync_directory};
     use std::io::Write;
 
-    let (id, rest) = layout
+    let rest = layout
+        .strip_prefix(LAYOUT_MAGIC.as_slice())
+        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
+    let (version, rest) = rest
+        .split_first()
+        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
+    if *version != LAYOUT_VERSION {
+        return Err(crate::Error::InvalidHeader("pinned layout version"));
+    }
+    let (id, rest) = rest
         .split_first_chunk::<8>()
         .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
     let (pin_seqno, manifest) = rest
@@ -366,7 +387,6 @@ pub fn restore(
     let fs = Arc::clone(&config.fs);
     let root = config.path.clone();
     let sync_mode = config.sync_mode;
-    let runtime = Arc::new(config.initial_runtime_config.clone());
 
     // Exclusive from the first write to the open: no other opener may see the
     // folder before the memtable contents are in.
@@ -378,29 +398,38 @@ pub fn restore(
     // wrote. Any other tree is never published over: its open would sweep
     // that tree's manifest and tables as orphans of the restored layout.
     let resuming = fs.exists(&marker)?;
-    for entry in fs.read_dir(&root)? {
-        let name = &entry.file_name;
-        let manifest_file = name == crate::file::CURRENT_VERSION_FILE
-            || name.starts_with("edits-")
-            || name
-                .strip_prefix('v')
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()));
-        if !manifest_file {
-            continue;
+    let dirents = fs.read_dir(&root)?;
+    use crate::version::recovery::{ManifestFile, manifest_file_of};
+    let manifest_file = |name: &str| manifest_file_of(name).is_some();
+    let installed_manifest = |name: &str| {
+        matches!(
+            manifest_file_of(name),
+            Some(ManifestFile::Snapshot(_) | ManifestFile::Log(_))
+        )
+    };
+    // Judged before anything goes: a tree found here keeps every file.
+    if !resuming
+        && let Some(entry) = dirents
+            .iter()
+            .find(|entry| installed_manifest(&entry.file_name))
+    {
+        return Err(crate::Error::from(crate::io::Error::new(
+            crate::io::ErrorKind::AlreadyExists,
+            format!(
+                "restore_pinned: {} already holds a tree ({})",
+                root.display(),
+                entry.file_name
+            ),
+        )));
+    }
+    // The interrupted restore's manifest goes.
+    for dirent in dirents {
+        if manifest_file(&dirent.file_name) {
+            fs.remove_file(&dirent.path)?;
         }
-        if !resuming {
-            return Err(crate::Error::from(crate::io::Error::new(
-                crate::io::ErrorKind::AlreadyExists,
-                format!(
-                    "restore_pinned: {} already holds a tree ({name})",
-                    root.display()
-                ),
-            )));
-        }
-        fs.remove_file(&entry.path)?;
     }
 
-    // The streamed files first: the pointer published below must never name a
+    // The streamed files first: the manifest installed below must never name a
     // file a power loss can still take back.
     for folder in [TABLES_FOLDER, BLOBS_FOLDER, DICTS_FOLDER] {
         let folder = root.join(folder);
@@ -428,22 +457,28 @@ pub fn restore(
         fsync_directory(&root, &*fs, sync_mode)?;
     }
 
+    // Written under a temporary name and renamed once its bytes are synced:
+    // the name installs the snapshot, and one directory sync makes it and the
+    // empty log durable.
+    let temporary = root.join(format!(
+        "v{version_id}{}",
+        crate::version::SNAPSHOT_TEMPORARY_SUFFIX
+    ));
+    if let Err(e) = fs.remove_file(&temporary)
+        && e.kind() != crate::io::ErrorKind::NotFound
+    {
+        return Err(e.into());
+    }
     let mut file = fs.open(
-        &root.join(format!("v{version_id}")),
+        &temporary,
         &FsOpenOptions::new().write(true).create_new(true),
     )?;
     file.write_all(manifest)?;
     file.flush()?;
-    FsFile::sync_all_with(&*file, sync_mode)?;
+    FsFile::sync_data_with(&*file, sync_mode)?;
     drop(file);
-    crate::checkpoint::write_current_for_version(
-        &*fs,
-        &root,
-        version_id,
-        runtime,
-        config.encryption.clone(),
-        sync_mode,
-    )?;
+    crate::version::edit_log::create_log(&*fs, &root, version_id, sync_mode)?;
+    fs.rename(&temporary, &root.join(format!("v{version_id}")))?;
     fsync_directory(&root, &*fs, sync_mode)?;
 
     let seqno = Arc::clone(&config.seqno);

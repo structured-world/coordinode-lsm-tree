@@ -40,8 +40,8 @@ pub struct CheckpointInfo {
     /// the SSTs, the blob files, and the `.restrict-bound` sidecar that belongs
     /// to a tight-space-restricted SST (per-table state, written beside its
     /// table, that a restore needs to recover the exact bound). Tree-level
-    /// metadata — the manifest, the version pointer, the config, and the
-    /// compression dictionaries under `dicts/` — is NOT counted: this figure
+    /// metadata (the manifest snapshot and its edit log, the config, and the
+    /// compression dictionaries under `dicts/`) is NOT counted: this figure
     /// describes the captured data, not the whole directory. A checkpoint of a
     /// dictionary-compressed tree therefore holds a little more on disk than
     /// this reports, by the size of the dictionaries it carries (order 100 KiB
@@ -53,7 +53,7 @@ pub struct CheckpointInfo {
     /// reports them PHYSICALLY, so the two differ by exactly the bytes a
     /// tight-space reclaim punched out and agree everywhere else.
     pub total_bytes: u64,
-    /// The version ID embedded in the checkpoint's `current` pointer.
+    /// The version ID of the manifest snapshot the checkpoint installs.
     pub version_id: u64,
     /// Lower-bound visible-seqno watermark for the snapshot.
     ///
@@ -509,7 +509,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// - the active memtable could not be flushed,
     /// - `target_path` already exists (to prevent accidental overwrites),
     /// - a hard link / copy fall-back could not be created, or
-    /// - the manifest / version pointer files could not be replicated.
+    /// - the manifest files could not be replicated.
     ///
     /// On error any partial checkpoint files are removed automatically
     /// (best-effort) so callers can safely retry against the same path.
@@ -554,6 +554,43 @@ pub trait AbstractTree: sealed::Sealed {
     /// ```
     #[cfg(feature = "std")]
     fn pin(&self) -> crate::PinnedVersion;
+
+    /// Stops the tree owing the repair report with this
+    /// [`RepairReport::id`](crate::RepairReport::id), installing a version
+    /// that no longer carries it: no later
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) hands it out.
+    ///
+    /// A repair's report stays in the tree until this call, so a process that
+    /// ends before the caller acted on it gets it again. Call it once the
+    /// report's replay obligation is met. Returns `false`, changing nothing,
+    /// when the tree owes no report or owes one with another id.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the install's failure; the report is then still owed, or,
+    /// on [`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown),
+    /// may be after a power loss.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    ///
+    /// let config = Config::new(
+    ///     "/var/lib/mydb",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// );
+    /// let (tree, repaired) = config.open_or_repair(RepairPolicy::default())?;
+    /// if let Some(report) = repaired {
+    ///     // Replay the external log as `report.wal_replay_scope()` requires,
+    ///     // then let the tree forget the report.
+    ///     tree.acknowledge_repair_report(report.id)?;
+    /// }
+    /// # Ok::<_, lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool>;
 
     /// Seals the active memtable and flushes it, with every memtable sealed
     /// before it, to tables: the durability barrier for a caller that keeps

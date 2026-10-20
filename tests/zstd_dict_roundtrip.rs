@@ -39,7 +39,7 @@ mod zstd_dict {
         )
     }
 
-    /// Removes the manifest and its version pointer, so the next open has to
+    /// Removes the manifest snapshots and their logs, so the next open has to
     /// rebuild from the tables on disk.
     ///
     /// Asserts that it removed something: matching by name means a change to the
@@ -52,10 +52,11 @@ mod zstd_dict {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let is_version = name
+            let is_manifest = name
                 .strip_prefix('v')
+                .or_else(|| name.strip_prefix("edits-"))
                 .is_some_and(|rest| rest.parse::<u64>().is_ok());
-            if is_version || name == "current" {
+            if is_manifest {
                 std::fs::remove_file(entry.path())?;
                 removed += 1;
             }
@@ -1411,6 +1412,34 @@ mod zstd_dict {
         Ok(())
     }
 
+    #[test]
+    fn a_kept_report_names_the_dictionary_the_repair_set_aside() -> lsm_tree::Result<()> {
+        // A repair leaves its report in the rebuilt snapshot until it is
+        // acknowledged, and the next open hands it out. The dictionary is set
+        // aside after the commit, so the report has to name it: the open
+        // finds the dictionary gone from its name and has nothing else to say
+        // where its bytes went.
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+        damage_the_dictionary(dir.path(), dict_id)?;
+
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        make_config(dir.path()).repair()?;
+        assert!(aside.exists(), "self-check: the dictionary was set aside");
+
+        let (_tree, report) =
+            make_config(dir.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
+        let report = report.expect("the open hands out the kept report");
+        assert!(
+            report.damaged_dictionaries.iter().any(|(p, _)| *p == aside),
+            "the kept report names where the dictionary went: {:?}",
+            report.damaged_dictionaries,
+        );
+        Ok(())
+    }
+
     /// Flips one bit of the dictionary stored under `id`, so its bytes no longer
     /// hash to the name they are filed under.
     fn damage_the_dictionary(dir: &std::path::Path, id: u32) -> lsm_tree::Result<()> {
@@ -1443,10 +1472,9 @@ mod zstd_dict {
     /// The manifest files the tree root holds.
     fn manifest_names(dir: &std::path::Path) -> lsm_tree::Result<Vec<String>> {
         names_in(dir, |name| {
-            name == "current"
-                || name
-                    .strip_prefix('v')
-                    .is_some_and(|rest| rest.parse::<u64>().is_ok())
+            name.strip_prefix('v')
+                .or_else(|| name.strip_prefix("edits-"))
+                .is_some_and(|rest| rest.parse::<u64>().is_ok())
         })
     }
 
@@ -1474,6 +1502,48 @@ mod zstd_dict {
         assert_eq!(
             tree.get(b"key-00042", lsm_tree::MAX_SEQNO)?.as_deref(),
             Some(b"written-without-a-dictionary".as_slice()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dictionary_that_could_not_be_set_aside_is_reported_so() -> lsm_tree::Result<()> {
+        // The report names a damaged dictionary before the move after the
+        // commit; when that move fails, the report that leaves with the error
+        // must not claim the file is aside.
+        use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+        damage_the_dictionary(dir.path(), dict_id)?;
+
+        let fs = FaultFs::new(StdFs);
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+            )
+            .on_path(
+                dir.path()
+                    .join("dicts")
+                    .join(dict_id.to_string())
+                    .to_string_lossy(),
+            ),
+        );
+        let outcome = make_config(dir.path())
+            .with_fs(fs)
+            .open_or_repair(lsm_tree::RepairPolicy::default());
+        let Err(lsm_tree::Error::RepairedButUnopened { report, .. }) = outcome else {
+            panic!("the failed move ends the repair after its commit");
+        };
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        assert!(
+            report
+                .damaged_dictionaries
+                .iter()
+                .any(|(p, note)| *p == aside && note.ends_with("NOT moved aside")),
+            "{report:?}"
         );
         Ok(())
     }

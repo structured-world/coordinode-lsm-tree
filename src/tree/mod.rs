@@ -557,6 +557,11 @@ impl AbstractTree for Tree {
         crate::PinnedVersion::take(self)
     }
 
+    #[cfg(feature = "std")]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
+        Self::acknowledge_repair_report(self, id)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         let super_version = self.version_history.read().latest_version();
 
@@ -2101,6 +2106,48 @@ impl Tree {
                 .get(level)
                 .then(|| self.config.filter_block_partition_size_policy.get(level)),
         )
+    }
+
+    /// The encoded report of a repair the tree still owes, if any.
+    #[cfg(feature = "std")]
+    pub(crate) fn owed_repair_report(&self) -> Option<alloc::sync::Arc<[u8]>> {
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .version
+            .repair_report()
+            .map(alloc::sync::Arc::from)
+    }
+
+    /// See [`AbstractTree::acknowledge_repair_report`].
+    #[cfg(feature = "std")]
+    pub(crate) fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
+        let mut version_lock = self.version_history.write();
+        let owes_it = version_lock
+            .latest_version_ref()
+            .version
+            .repair_report()
+            .is_some_and(|owed| crate::repair::owed_report_id(owed) == id);
+        if !owes_it {
+            return Ok(false);
+        }
+        let installed = version_lock.upgrade_version(
+            &self.config.path,
+            |current| {
+                let mut copy = current.clone();
+                copy.version = copy.version.without_repair_report();
+                Ok(copy)
+            },
+            &self.config.seqno,
+            &self.config.visible_seqno,
+            &*self.config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+            // Only the report goes: every snapshot reads as before.
+            crate::version::RetentionEffect::Keep,
+        );
+        drop(version_lock);
+        installed.map(|()| true)
     }
 
     /// Stores `dict` in the tree and records it in the current version, so it
@@ -4575,7 +4622,7 @@ impl Tree {
         }
 
         // Acquire the cross-process directory lock BEFORE any manifest access
-        // (the `CURRENT` probe + `has_existing_version_state` check below, and
+        // (the installed-snapshot probe + `has_existing_version_state` check below, and
         // the recover / create paths). Acquiring it here makes `open()`
         // exclusive end-to-end: a concurrent opener fails fast with
         // `Error::Locked` instead of racing through the probe and observing a
@@ -4667,18 +4714,22 @@ impl Tree {
                 return Err(crate::Error::InvalidVersion(1));
             }
 
-            // Decide between recovery and fresh creation atomically by attempting
-            // to read the CURRENT version file. This avoids a TOCTOU race that
-            // would occur if we probed with exists() first.
-            let recovering = match crate::version::recovery::get_current_version(
-                &config.path,
-                &*config.fs,
-                config.encryption.clone(),
-            ) {
-                Ok(_) => true,
-                Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e),
-            };
+            // Recover when the tree holds an installed snapshot, create one
+            // otherwise. The installed snapshot is verified here, before the
+            // dictionaries below are read or their registrations swept: its
+            // footer under the configured provider, its format, and that it is
+            // the version its name says.
+            let installed =
+                crate::version::recovery::installed_snapshot(&config.path, &*config.fs)?;
+            if let Some(id) = installed {
+                crate::version::recovery::verify_snapshot(
+                    &config.path,
+                    id,
+                    &*config.fs,
+                    config.encryption.clone(),
+                )?;
+            }
+            let recovering = installed.is_some();
 
             // Load the tree's own dictionaries before anything opens a table: a
             // table resolves the dictionary id it recorded against this set, so an
@@ -4715,12 +4766,16 @@ impl Tree {
                 &config.current_zstd_dictionaries(),
             )?;
 
-            // Missing CURRENT MUST coincide with a directory that
-            // has no version artifacts; otherwise we are looking at
-            // a half-written checkpoint (or other interrupted
-            // sealing). Silently calling `create_new` in that case
-            // would overwrite the partial state with an empty tree,
-            // turning a recoverable failure into data loss.
+            // No installed snapshot MUST coincide with a directory whose
+            // tables and blob folders hold nothing; otherwise we are looking
+            // at a half-written checkpoint (or other interrupted sealing),
+            // and calling `create_new` would overwrite the partial state with
+            // an empty tree, turning a recoverable failure into data loss.
+            // What a creation that never completed leaves (its empty folders,
+            // a temporary snapshot never renamed into place, the empty log
+            // made before that rename) holds no data and is created over. A
+            // snapshot under its own name is installed, with or without its
+            // log, and is recovered instead.
             if !recovering && has_existing_version_state(&config)? {
                 // Return Error::Io(InvalidData, ...) rather than
                 // Error::Unrecoverable so callers that don't read
@@ -4732,12 +4787,13 @@ impl Tree {
                 // chain; the log line records the diagnosis next
                 // to the timestamp).
                 let msg = format!(
-                    "Tree::open: refusing to recover {} — `current` pointer is missing \
-                     but the directory still holds version artifacts (files in a \
-                     tables folder or in blobs/, a vN past v0, or an edits-N holding \
-                     edits). This is the on-disk signature of a half-written checkpoint \
-                     or interrupted sealing. Remove the partial directory and retry the \
-                     checkpoint, or restore `current` from a backup before reopening.",
+                    "Tree::open: refusing to recover {} — it holds no installed manifest \
+                     snapshot (a v<N>) but its tables/ or blobs/ folder holds files, \
+                     or an edits-N holds edits. This is the on-disk signature of a \
+                     half-written \
+                     checkpoint or interrupted sealing. Remove the partial directory and \
+                     retry the checkpoint, or restore the snapshot from a backup before \
+                     reopening.",
                     config.path.display(),
                 );
                 log::error!("{msg}");
@@ -5439,7 +5495,7 @@ impl Tree {
     /// Returns error, if an IO error occurred.
     #[expect(
         clippy::too_many_lines,
-        reason = "Tree::recover threads the whole open sequence (CURRENT validation, \
+        reason = "Tree::recover threads the whole open sequence (snapshot validation, \
                   Manifest decode, encryption + runtime plumbing, version recovery, \
                   TreeInner assembly) — splitting it would create helper functions whose \
                   only caller is this one site"
@@ -5463,15 +5519,14 @@ impl Tree {
         // NOTE: the version file is read twice (here for metadata, then inside
         // recover_levels for table/blob data). This is intentional — metadata
         // validation must complete before any disk-mutating recovery work.
-        // Version id of the on-disk snapshot CURRENT references. This is the
-        // base the edit log replays on top of; the live version id can be higher
-        // (it has no `v{id}` file of its own). Threaded into the version history
+        // Version id of the installed on-disk snapshot. This is the base the
+        // edit log replays on top of; the live version id can be higher (it
+        // has no `v{id}` file of its own). Threaded into the version history
         // so the next persist appends to / rotates the right snapshot's log.
-        let snapshot_id = crate::version::recovery::get_current_version(
-            &config.path,
-            &*config.fs,
-            config.encryption.clone(),
-        )?;
+        let snapshot_id = crate::version::recovery::installed_snapshot(&config.path, &*config.fs)?
+            .ok_or(crate::Error::ManifestFooterInvalid(
+                "the tree holds no installed manifest snapshot",
+            ))?;
         {
             let version_id = snapshot_id;
             let manifest_path = config.path.join(format!("v{version_id}"));
@@ -5589,13 +5644,14 @@ impl Tree {
         #[cfg(feature = "std")]
         stop_signal.wake_on_stop(&compaction_rate_limiter);
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
+        // The open installed the recovered state as its own snapshot.
+        let snapshot_id = version.id();
         let mut super_versions = SuperVersions::new(
             version,
             &comparator,
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
-            false,
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));
@@ -5890,10 +5946,11 @@ impl Tree {
             config.encryption.clone(),
         )?;
 
-        // The on-disk snapshot CURRENT points at — the generation orphan cleanup
+        // The installed on-disk snapshot: the generation orphan cleanup
         // must preserve. Intermediate versions live only in the edit log, so the
         // latest version id (`version.id()`) has no `v{id}` file of its own.
         let snapshot_id = recovery.snapshot_id;
+        let mut sweep = OpenSweep::default();
 
         let mut table_map = {
             let mut result: crate::HashMap<
@@ -6074,7 +6131,7 @@ impl Tree {
                             "Removing abandoned heal copy: {}",
                             table_file_path.display()
                         );
-                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A crashed attestation publish: either the live sidecar it
@@ -6085,7 +6142,7 @@ impl Tree {
                             "Removing abandoned heal-attest temp: {}",
                             table_file_path.display()
                         );
-                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A LIVE table's pending attestation is preserved (the next
@@ -6098,7 +6155,7 @@ impl Tree {
                                 "Removing orphaned heal attestation (its table is gone): {}",
                                 table_file_path.display()
                             );
-                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6108,7 +6165,7 @@ impl Tree {
                             "Removing abandoned restrict-bound temp: {}",
                             table_file_path.display()
                         );
-                        Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                        sweep.remove(folder_fs, &table_file_path);
                         continue;
                     }
                     // A LIVE table's restriction bound is preserved (manifest
@@ -6120,7 +6177,7 @@ impl Tree {
                                 "Removing orphaned restrict-bound sidecar (its table is gone): {}",
                                 table_file_path.display()
                             );
-                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6205,9 +6262,9 @@ impl Tree {
                                 let companion =
                                     crate::restrict_bound::sidecar_path(&table_file_path);
                                 if folder_fs.exists(&companion)? {
-                                    Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                                    sweep.remove(folder_fs, &companion);
                                 }
-                                Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                                sweep.remove(folder_fs, &table_file_path);
                             }
                         }
                         // Without the repair module nothing here can verify or
@@ -6236,9 +6293,9 @@ impl Tree {
                                 crate::file::REPAIR_TMP_SUFFIX
                             ));
                             if folder_fs.exists(&companion)? {
-                                Self::sweep_artifact(folder_fs.as_ref(), &companion)?;
+                                sweep.remove(folder_fs, &companion);
                             }
-                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6253,7 +6310,7 @@ impl Tree {
                                 "Removing orphaned repair-replacement sidecar: {}",
                                 table_file_path.display()
                             );
-                            Self::sweep_artifact(folder_fs.as_ref(), &table_file_path)?;
+                            sweep.remove(folder_fs, &table_file_path);
                         }
                         continue;
                     }
@@ -6461,9 +6518,9 @@ impl Tree {
             // fail the next open, so it goes with the temp.
             let companion = crate::restrict_bound::sidecar_path(&temp_path);
             if temp_fs.exists(&companion)? {
-                Self::sweep_artifact(temp_fs.as_ref(), &companion)?;
+                sweep.remove(&temp_fs, &companion);
             }
-            Self::sweep_artifact(temp_fs.as_ref(), &temp_path)?;
+            sweep.remove(&temp_fs, &temp_path);
         }
 
         if tables.len() < cnt {
@@ -6561,6 +6618,47 @@ impl Tree {
             }
         };
 
+        // The state this open recovered becomes durable before the tree is
+        // served: a caller takes the persisted seqno of the tree it opened as
+        // the point up to which its own log may be trimmed, and what was read
+        // may be an edit or a snapshot name whose sync failed, which a power
+        // loss can still take back. Syncing the files read is no proof (a
+        // sync after a failed one may report success for pages the kernel
+        // already dropped), so the recovered state is written as a fresh
+        // snapshot under the next id, installed as a rotation installs one:
+        // its bytes synced, renamed into place, the folder synced. A repair
+        // report the tree still owes rides in the version, so the snapshot
+        // carries it on.
+        //
+        // A tree whose id reached the top half of the range goes back to id
+        // 0 instead. Recovery takes the snapshot with the highest id, so no
+        // other may be left above the new one: every manifest file but the
+        // snapshot read goes, durably, before the install, and that snapshot
+        // goes, durably, right after it. A power loss in between leaves the
+        // snapshot read as the highest, which a reopen installs again.
+        let renumbered = version.is_renumbered_on_open();
+        if renumbered {
+            log::warn!(
+                "version {} is in the top half of the id range; reinstalling the tree as \
+                 version 0",
+                version.id()
+            );
+            Self::remove_manifests_but(tree_path, snapshot_id, &config.fs, config.sync_mode)?;
+        }
+        let version = version.reinstalled();
+        crate::version::persist_version(
+            tree_path,
+            &version,
+            config.comparator.name(),
+            &*config.fs,
+            Arc::new(config.initial_runtime_config.clone()),
+            config.encryption.clone(),
+            config.sync_mode,
+        )?;
+        if renumbered {
+            Self::remove_manifests_but(tree_path, version.id(), &config.fs, config.sync_mode)?;
+        }
+
         // Republish any restriction sidecar that never landed. The sidecar is
         // written AFTER its slice commits, so a failure (or a crash) in that
         // window leaves a committed restriction with no `.restrict-bound` file.
@@ -6569,17 +6667,17 @@ impl Tree {
         // the slice output and publish BOTH histories, applying every merge
         // operand of the consumed prefix twice (operands are deliberately never
         // deduplicated across sources). The manifest is the authority for the
-        // bound, so derive the missing sidecar from it here and the window
-        // closes at the next open rather than staying open forever.
+        // bound, so the missing sidecar is derived from it here, once the
+        // install above made that manifest durable: derived from a manifest
+        // still in an unsynced log, it would outlive that manifest when a
+        // power loss takes it back, and drop an input prefix whose
+        // replacement went with it.
         #[cfg(feature = "std")]
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
-        // NOTE: Cleanup old versions
-        // But only after we definitely recovered the latest version.
-        // Preserve the snapshot CURRENT references (and its `edits-` log) — the
-        // latest version id has no file of its own under the incremental
-        // manifest, so cleaning by it would delete the live snapshot.
-        Self::cleanup_orphaned_version(tree_path, snapshot_id, &*config.fs)?;
+        // Everything of the generation read goes, now that it is superseded:
+        // its snapshot and its log.
+        Self::cleanup_orphaned_version(tree_path, version.id(), &config.fs, &mut sweep)?;
 
         // A copy the digest rejected goes only once its id has a winner: with
         // one it is provably superseded, without one it may be all that is
@@ -6597,22 +6695,23 @@ impl Tree {
             {
                 let companion = crate::restrict_bound::sidecar_path(&path);
                 if copy_fs.exists(&companion)? {
-                    Self::sweep_artifact(copy_fs.as_ref(), &companion)?;
+                    sweep.remove(&copy_fs, &companion);
                 }
             }
-            Self::sweep_artifact(copy_fs.as_ref(), &path)?;
+            sweep.remove(&copy_fs, &path);
         }
 
         for (table_path, orphan_fs) in orphaned_tables {
             log::debug!("Deleting orphaned table {}", table_path.display());
-            orphan_fs.remove_file(&table_path)?;
+            sweep.remove(&orphan_fs, &table_path);
         }
 
         for blob_file_path in orphaned_blob_files {
             log::debug!("Deleting orphaned blob file {}", blob_file_path.display());
-            (*config.fs).remove_file(&blob_file_path)?;
+            sweep.remove(&config.fs, &blob_file_path);
         }
 
+        sweep.finish()?;
         Ok(version)
     }
 
@@ -6663,23 +6762,11 @@ impl Tree {
         Ok(())
     }
 
-    /// Removes a recovery-swept artifact (an abandoned heal copy / temp / marker),
-    /// treating a concurrent removal (`NotFound`) as success. A benign race (a
-    /// retry, or another scanner that already swept it) must not fail recovery,
-    /// matching [`Self::cleanup_orphaned_version`].
-    fn sweep_artifact(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
-        match fs.remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Removes stale manifest files left by older generations: every `v{id}`
     /// snapshot except the live one (`v{snapshot_id}`) and every `edits-{id}`
     /// log except the live snapshot's (`edits-{snapshot_id}`). A crashed
     /// rotation can leak an old snapshot or its log; this sweeps them on open.
-    /// The live snapshot and log are exactly the generation `CURRENT` points at.
+    /// The live snapshot and log are the installed generation.
     ///
     /// # Behavior change vs pre-Fs-trait code
     ///
@@ -6692,29 +6779,58 @@ impl Tree {
     fn cleanup_orphaned_version(
         path: &Path,
         snapshot_id: crate::version::VersionId,
-        fs: &dyn crate::fs::Fs,
+        fs: &Arc<dyn crate::fs::Fs>,
+        sweep: &mut OpenSweep,
     ) -> crate::Result<()> {
-        let snapshot_str = format!("v{snapshot_id}");
-        let log_str = format!("edits-{snapshot_id}");
-
+        use crate::version::recovery::{ManifestFile, manifest_file_of};
         for dirent in fs.read_dir(path)? {
             if dirent.is_dir {
                 continue;
             }
-
-            let name = &dirent.file_name;
-            let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
-            let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            if is_orphan_snapshot || is_orphan_log {
-                log::trace!("Cleanup orphaned manifest file {name}");
-                match fs.remove_file(&dirent.path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+            let orphan = match manifest_file_of(&dirent.file_name) {
+                Some(ManifestFile::Snapshot(id) | ManifestFile::Log(id)) => id != snapshot_id,
+                Some(ManifestFile::Temporary(_)) => true,
+                None => false,
+            };
+            if orphan {
+                log::trace!("Cleanup orphaned manifest file {}", dirent.file_name);
+                sweep.remove(fs, &dirent.path);
             }
         }
 
+        Ok(())
+    }
+
+    /// Removes every manifest file [`Self::cleanup_orphaned_version`] finds
+    /// stale beside snapshot `keep`, at once rather than after the install,
+    /// and makes the removals durable.
+    ///
+    /// The snapshots go first, durably, and only then their logs: a snapshot
+    /// that outlives its log would be recovered without the edits in it.
+    fn remove_manifests_but(
+        path: &Path,
+        keep: crate::version::VersionId,
+        fs: &Arc<dyn crate::fs::Fs>,
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::Result<()> {
+        use crate::version::recovery::{ManifestFile, manifest_file_of};
+        let mut snapshots = OpenSweep::default();
+        for dirent in fs.read_dir(path)? {
+            let other = match manifest_file_of(&dirent.file_name) {
+                Some(ManifestFile::Snapshot(id)) => id != keep,
+                Some(ManifestFile::Temporary(_)) => true,
+                Some(ManifestFile::Log(_)) | None => false,
+            };
+            if !dirent.is_dir && other {
+                snapshots.remove(fs, &dirent.path);
+            }
+        }
+        snapshots.finish()?;
+        crate::file::fsync_directory(path, &**fs, sync_mode)?;
+        let mut rest = OpenSweep::default();
+        Self::cleanup_orphaned_version(path, keep, fs, &mut rest)?;
+        rest.finish()?;
+        crate::file::fsync_directory(path, &**fs, sync_mode)?;
         Ok(())
     }
 }
@@ -6798,6 +6914,45 @@ fn made_folders(folder: &Path, holders: &[crate::path::PathBuf]) -> Vec<crate::p
     made
 }
 
+/// What an open finds no version names, removed only once the state it judged
+/// that by is installed as a fresh snapshot.
+///
+/// What an open reads may be what a failed sync left: an edit in the log that
+/// was never synced, or a snapshot name whose install or withdrawal was never
+/// made durable. Syncing those files again proves nothing (a sync after a
+/// failed one may report success for pages the kernel already dropped), so the
+/// open writes the state it recovered as a new snapshot instead, and a removal
+/// judged by that state runs after it is durable.
+#[derive(Default)]
+struct OpenSweep {
+    pending: Vec<(Arc<dyn Fs>, crate::path::PathBuf)>,
+}
+
+impl OpenSweep {
+    /// Queues `path` on `fs` for removal.
+    fn remove(&mut self, fs: &Arc<dyn Fs>, path: &Path) {
+        self.pending.push((Arc::clone(fs), path.to_path_buf()));
+    }
+
+    /// Removes every queued file, a file already gone included, and fails
+    /// with the first removal that failed. Each removal is tried: one file
+    /// that cannot go must not keep the others, the generation an open
+    /// superseded among them, from going.
+    fn finish(self) -> crate::Result<()> {
+        let mut first = None;
+        for (fs, path) in self.pending {
+            match fs.remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
+            }
+        }
+        first.map_or(Ok(()), |e| Err(e.into()))
+    }
+}
+
 /// The folders that gain a new entry when `folder` is made on `fs`: each one
 /// above it up to the first that exists already, which holds the first new
 /// one. A folder that exists makes nothing new.
@@ -6819,15 +6974,14 @@ fn new_entry_holders(fs: &dyn Fs, folder: &Path) -> crate::Result<Vec<crate::pat
 
 /// Returns `true` if any tables folder of the tree (the primary one and every
 /// [`level_routes`](crate::Config::level_routes) one) or its `blobs/` folder
-/// holds a file, or the tree folder holds a snapshot other than `v0` or an
-/// edit log holding an edit.
+/// holds a file, or the tree folder holds an edit log holding an edit.
 ///
-/// Used by [`Tree::open`], for a directory with no `current` pointer, to
+/// Used by [`Tree::open`], for a directory with no installed snapshot, to
 /// distinguish a fresh directory or a creation that never completed (empty
-/// folders, the first snapshot the pointer never named: nothing of value,
-/// safe to `create_new` over) from a lost pointer, a half-written checkpoint
-/// or another interrupted sealing (files already placed: must error rather
-/// than silently overwrite).
+/// folders, a snapshot never renamed into place: nothing of value, safe to
+/// `create_new` over) from a lost manifest, a half-written checkpoint or
+/// another interrupted sealing (files already placed: must error rather than
+/// silently overwrite, and leave the files to orphan cleanup).
 ///
 /// A missing folder is treated as "no state": `create_new` is what creates
 /// the directories in the first place, so callers may invoke `Tree::open`
@@ -6848,28 +7002,31 @@ fn has_existing_version_state(config: &Config) -> crate::Result<bool> {
             Err(e) => return Err(e.into()),
         }
     }
-    // A creation writes `v0`, of an empty version, and its empty log before
-    // the pointer: alone they hold nothing. A later snapshot was written by a
-    // tree that lived, or put there to refuse an open (a store
-    // mid-conversion), and an edit in any log is a tree's history (a clear,
-    // the retention floor it raised) even when no table is left.
+    // A tree's history (a clear, the retention floor it raised) outlives its
+    // tables, and a lost snapshot leaves its log behind: an edit in any log,
+    // or the log of any generation past the first, which only a rotation
+    // makes, is a tree that lived. A creation cut short leaves only the
+    // first generation's empty log.
     let entries = match config.fs.read_dir(&config.path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     // A name is judged by its shape, digits after the prefix, not by whether
-    // the digits parse: `v00` or an id past the counter's range was not
-    // written by a creation either, and is refused rather than created over.
+    // the digits parse: a snapshot whose id is past the counter's range is
+    // no installed one, yet no creation wrote it either, and it is refused
+    // rather than created over.
     let digits = |rest: Option<&str>| {
         rest.is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
     };
     for entry in &entries {
         let name = entry.file_name.as_str();
-        if name != "v0" && digits(name.strip_prefix('v')) {
+        if digits(name.strip_prefix('v')) {
             return Ok(true);
         }
-        if digits(name.strip_prefix("edits-")) && config.fs.metadata(&entry.path)?.len > 0 {
+        if digits(name.strip_prefix("edits-"))
+            && (name != "edits-0" || config.fs.metadata(&entry.path)?.len > 0)
+        {
             return Ok(true);
         }
     }

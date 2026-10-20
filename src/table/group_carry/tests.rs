@@ -606,6 +606,37 @@ fn a_carried_group_cut_short_is_refused() -> crate::Result<()> {
     Ok(())
 }
 
+/// Bytes after the group's last block too few to hold a block header are a
+/// malformed group as well, refused the same way: a short read of the carried
+/// bytes is not a failure of the device being written.
+#[test]
+fn a_carried_group_with_a_torn_header_is_refused() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let candidate = first_candidate(dir.path())?;
+    let (raw, source) = raw_group(&candidate)?;
+    let Some(head) = raw.get(..3) else {
+        panic!("the group has bytes");
+    };
+    let mut torn = raw.to_vec();
+    torn.extend_from_slice(head);
+    let mut writer = columnar_writer(dir.path(), 2)?;
+
+    let result = writer.append_carried_row_group(
+        (&torn, source),
+        candidate.row_group,
+        crate::table::meta::ValueLayout::Whole,
+        &candidate.rows,
+        None,
+        &crate::comparator::default_comparator(),
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader(_))),
+        "{result:?}"
+    );
+    Ok(())
+}
+
 /// A group rebuilt around copied pages is refused, writing nothing, by a
 /// table that cannot hold it so: a row-major one, one already holding the
 /// group's tag, or rows cut into other row pages than the source's. A fresh
