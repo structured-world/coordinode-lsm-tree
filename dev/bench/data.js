@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792522324008,
+  "lastUpdate": 1792523392611,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -51278,6 +51278,90 @@ window.BENCHMARK_DATA = {
             "value": 351596.0020173313,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.0us | P99.9: 87.7us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "004f4d483744f03d5096e1da101aece35b403a40",
+          "message": "ci(deps): bump release-plz/action from 0.5.141 to 0.5.142 (#946)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.141 to 0.5.142.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.142</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>fix(deps): update rust crate git_cmd to 0.9.0 by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/565\">release-plz/action#565</a></li>\n<li>chore(deps): update dependency cargo-bins/cargo-binstall to v1.25.3\nby <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/566\">release-plz/action#566</a></li>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/567\">release-plz/action#567</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.28 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/568\">release-plz/action#568</a></li>\n<li>Update to 0.3.172 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/569\">release-plz/action#569</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.141...v0.5.142\">https://github.com/release-plz/action/compare/v0.5.141...v0.5.142</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/8921286633dfa0c4020f7f30bd1c14fe19cbb10e\"><code>8921286</code></a>\nUpdate to 0.3.172 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/569\">#569</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/81194648c7963fb535f0c069198f31d5a6a93aea\"><code>8119464</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.28 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/568\">#568</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/0b172c293e649d8dea31674a53fff4df4e57b2e4\"><code>0b172c2</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/567\">#567</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/ad3f059f53e0fda2edc9b6ec421414a73d790110\"><code>ad3f059</code></a>\nchore(deps): update dependency cargo-bins/cargo-binstall to v1.25.3 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/566\">#566</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/6dee9c5cc1009fba42dd39c10b9413e808ef9d8a\"><code>6dee9c5</code></a>\nfix(deps): update rust crate git_cmd to 0.9.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/565\">#565</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/release-plz/action/compare/f393a7b38aca9d9b4c58447b291dbac963901df6...8921286633dfa0c4020f7f30bd1c14fe19cbb10e\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-20T18:38:35Z",
+          "tree_id": "a830e5e6e22441cebf362dbc906d7d56963e9e65",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/004f4d483744f03d5096e1da101aece35b403a40"
+        },
+        "date": 1792523391436,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 106772.92243610336,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.6us | P99.9: 25.9us\nthreads: 1 | elapsed: 5.01s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2542294.9212358263,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 479645.297314325,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 4.9us | P99.9: 18.0us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 403405.9768326973,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 9.6us | P99.9: 29.0us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 1489802.5584781584,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 7.1us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.13s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 215495.961385339,
+            "unit": "ops/sec",
+            "extra": "P50: 3.7us | P99: 16.4us | P99.9: 37.1us\nthreads: 1 | elapsed: 0.93s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 124098.77330124794,
+            "unit": "ops/sec",
+            "extra": "P50: 6.9us | P99: 30.4us | P99.9: 46.0us\nthreads: 1 | elapsed: 1.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 602900.9810621808,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.6us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 712461.2562233,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 311455.9514723223,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 13.1us | P99.9: 86.8us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
