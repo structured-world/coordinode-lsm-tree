@@ -337,12 +337,14 @@ pub struct ParsedMeta {
     /// SST alone.
     pub bulk_ingested: Option<bool>,
 
-    /// L0 recency key from the required `recency` property: a flush or
-    /// ingest table's own id, a compaction output's highest recency among its
-    /// INPUTS. An output's own id says nothing about how new its content is
-    /// (ids are allocated at write start, while a newer flush with a lower id
-    /// may still install), so L0 is ordered by this key. Every table carries
-    /// it; one without it is refused as it is read.
+    /// L0 recency key from the required `recency` property: an id a flush
+    /// takes when it starts, an ingested table's own id (its install records
+    /// a later one in the manifest), a compaction output's highest recency
+    /// among its INPUTS. A table's own id says nothing about how new its
+    /// content is (a pooled file's id was taken with its batch, an output's
+    /// at write start while a newer flush may still install), so L0 is
+    /// ordered by this key. Every table carries it; one without it is refused
+    /// as it is read.
     pub recency: TableId,
 
     /// Compaction lineage from the optional `lineage` property: the sorted

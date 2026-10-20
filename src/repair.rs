@@ -4872,16 +4872,18 @@ fn scan_table_folders(
             };
             // An empty file under a table name is a pooled file a table was
             // to be written into, never a table, unless a committed manifest
-            // names it. It holds no rows, so it is no loss, and it is left
-            // for the open, which uses it again.
+            // names it. It holds no rows, so it is no loss; like every file
+            // the rebuilt manifest does not name, it goes once that manifest
+            // is durable.
             let named = manifest_referenced
                 .as_ref()
                 .is_some_and(|m| m.tables.contains_key(&table_id));
             if !named && folder_fs.metadata(&table_path)?.len == 0 {
-                log::debug!(
-                    "repair: {} is a pooled table file, not a table",
-                    table_path.display(),
-                );
+                discard_after_commit.push((
+                    Arc::clone(&folder_fs),
+                    table_path,
+                    "an empty pooled table file, no table".to_string(),
+                ));
                 continue;
             }
             scanned_table_ids.insert(table_id);
@@ -5765,15 +5767,17 @@ fn rebuild_from_scan(
             .map(|c| (c.table, c.fidelity, c.path, c.fs))
             .collect();
 
-    // Newest first, by DESCENDING recency key. For a flush / ingest table that
-    // key is its own id (ids are allocated in increasing order and flushes are
-    // serialized, so a higher id is later content). A COMPACTION output's own
-    // id is NOT that signal: the id is allocated when the compaction starts
-    // writing, while newer flushes with lower ids can install first, and an
-    // intra-L0 output is appended at the BACK of L0 regardless of its id — so
-    // outputs persist their newest INPUT's recency in meta (`recency`) and
-    // sort by it, with id as the tie-break (equal recency means one descends
-    // from the other, and the higher id is the superseding copy). A table's
+    // Newest first, by DESCENDING recency key. For a flush table that key is
+    // an id it took from the counter when it started (flushes are serialized,
+    // so a higher one is later content); its own id is not, since a pooled
+    // file's id was taken with its batch. A COMPACTION output's own id is NOT
+    // that signal either: the id is taken when the compaction starts writing,
+    // while newer flushes can install first, and an intra-L0 output is
+    // appended at the BACK of L0 regardless of its id — so outputs persist
+    // their newest INPUT's recency in meta (`recency`) and sort by it, with id
+    // as the tie-break (equal recency means one descends from the other, and
+    // an output's id is above every input's, so the higher id is the
+    // superseding copy). A table's
     // highest seqno is NOT the signal either: callers may assign seqnos
     // explicitly, so an older table can top out above a newer one on an
     // unrelated key. The key is total, so repeating a repair over the same

@@ -65,8 +65,9 @@ pub trait Aged {
     fn age(&self) -> Self::Age;
 }
 
-/// A table's age is its persisted L0 recency key: its own id for a flush or an
-/// ingest (ids are allocated in increasing order), its newest input's for a
+/// A table's age is its persisted L0 recency key: an id taken from the table id
+/// counter when a flush starts or an ingestion installs (flushes and installs
+/// are serialized, so these increase in time), its newest input's for a
 /// compaction output, so a flush landing while a compaction runs is newer
 /// than its output. Sequence numbers are no age: a caller may assign them, so
 /// two tables can hold one key at one seqno, and the newer table's must win.

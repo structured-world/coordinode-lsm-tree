@@ -216,7 +216,8 @@ fn a_pooled_file_linked_elsewhere_is_never_written() -> lsm_tree::Result<()> {
 
 /// A repair of a tree holding pooled files finds the same tables, and reports
 /// the same losses (none), as one without them: an empty file under a table
-/// name holds no rows. The open after it uses them again.
+/// name holds no rows. It removes them as it removes every file the rebuilt
+/// manifest does not name, and the tree makes new ones.
 #[test]
 fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -247,6 +248,8 @@ fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
         report.wal_replay_scope(),
         lsm_tree::WalReplayScope::TailOnly
     );
+    let (left, _) = table_files(&tables);
+    assert!(left.is_empty(), "pooled files removed: {left:?}");
 
     let (tree, _) = config(folder.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
     tree.insert("c", "1", 2);

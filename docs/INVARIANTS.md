@@ -173,6 +173,21 @@ matching entry (and add one for a new subsystem).
   ref-counting in `src/version` and the file GC in `src/compaction` /
   `src/tree`.
 
+- **A table's name is durable before the manifest edit that names it.** A
+  tables folder keeps a pool of empty files under the names of tables to come,
+  made a batch at a time with one folder sync for the batch
+  (`Config::table_file_pool`); a flush, compaction or ingestion writes into one,
+  so its install syncs the table and the edit and no folder. A table never is
+  empty, so an empty file under a table name that no version names is a pooled
+  file: an open uses it again after syncing its folder once, and a repair
+  removes it rather than count it as a lost table. A pooled file another name
+  links to (a capture of the folder) is unlinked, never written. Under
+  `SyncMode::Barrier` a folder on another device than the manifest is still
+  synced in full at the install, as that sync makes the table durable on its
+  device. Enforced in `src/table/file_pool.rs` and
+  `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
+  `tests/sync_census.rs`).
+
 - **A directory has at most one writer process.** Opening a tree acquires an
   exclusive lock on a `LOCK` file; a second open of the same directory fails with
   `Error::Locked` rather than corrupting shared state through two uncoordinated
