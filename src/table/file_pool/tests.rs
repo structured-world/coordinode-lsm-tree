@@ -194,6 +194,64 @@ fn a_folder_two_pools_name_pools_each_file_once() -> crate::Result<()> {
     Ok(())
 }
 
+/// A pooled file gone from the folder (removed by hand) is passed over for
+/// the next one.
+#[test]
+fn a_pooled_file_gone_from_the_folder_is_passed_over() -> crate::Result<()> {
+    let (_, _fault, fs, folder) = pools(2)?;
+    let pools = TableFilePools::new(SequenceNumberCounter::new(8), 2, SyncMode::Normal);
+    drop(fs.open(
+        &folder.join("7"),
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?);
+    pools.adopt(&folder, &fs, vec![6, 7]);
+
+    assert_eq!(pools.claim(&folder, &fs, None, false)?.id, 7);
+    Ok(())
+}
+
+/// A pooled file that cannot be opened fails the claim: the write that
+/// needed it reports the error rather than writing elsewhere.
+#[test]
+fn a_pooled_file_that_cannot_be_opened_fails_the_claim() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = pools(2)?;
+    pools.claim(&folder, &fs, None, true)?;
+    fault.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path(folder.join("1").to_string_lossy().into_owned())
+            .once(),
+    );
+
+    assert!(pools.claim(&folder, &fs, None, true).is_err());
+    Ok(())
+}
+
+/// A pooled file that may be shared and cannot be removed is still never
+/// written: the claim moves on, and the file stays for the next open, which
+/// pools it again.
+#[test]
+fn a_shared_pooled_file_that_cannot_be_removed_is_left() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = pools(3)?;
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::HardLinkCount,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .once(),
+    );
+
+    assert_eq!(pools.claim(&folder, &fs, None, true)?.id, 1);
+    assert!(exists(&fs, &folder, 0)?, "the file that was refused stays");
+    Ok(())
+}
+
 /// A file under a pooled name that holds bytes is not a pool file: it is
 /// neither written into nor removed.
 #[test]

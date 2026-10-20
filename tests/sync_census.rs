@@ -311,6 +311,61 @@ fn without_a_pool_each_install_syncs_the_tables_folder() {
     }
 }
 
+/// Without a pool a KV-separated tree's flush and an ingestion of either kind
+/// make their table files as they write them, so the install that names them
+/// syncs the tables folder too.
+#[test]
+fn without_a_pool_every_write_kind_syncs_the_tables_folder() {
+    for blob in [false, true] {
+        let base = PathBuf::from("/census").join(if blob {
+            "unpooled-blob"
+        } else {
+            "unpooled-standard"
+        });
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        let census = Census::new(&base, None, fs.injector());
+        let config = Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .table_file_pool(0);
+        let config = if blob {
+            config.with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(64),
+            ))
+        } else {
+            config
+        };
+        let tree = config.open().expect("open");
+        census.take();
+
+        fill(&tree, 1);
+        tree.flush_active_memtable(0).expect("flush");
+        assert!(
+            census
+                .take()
+                .contains(&(Synced::TablesDir, SyncKind::Directory)),
+            "a flush (blob: {blob})"
+        );
+
+        let mut ingestion = tree.ingestion().expect("ingestion");
+        for i in 0..100u32 {
+            ingestion
+                .write(format!("ingested{i:04}"), vec![7u8; 200])
+                .expect("write");
+        }
+        ingestion.finish().expect("finish");
+        assert!(
+            census
+                .take()
+                .contains(&(Synced::TablesDir, SyncKind::Directory)),
+            "an ingestion (blob: {blob})"
+        );
+    }
+}
+
 /// Under barrier syncs a pooled table on another device than the manifest
 /// still has its folder synced in full: that is the sync that makes the
 /// table's data durable on its device before the edit on the other one names

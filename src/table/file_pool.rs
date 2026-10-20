@@ -156,18 +156,18 @@ impl TableFilePools {
     ) -> crate::Result<Option<ClaimedFile>> {
         let mut refilled = false;
         loop {
-            if pool.ids.is_empty() {
-                if refilled || !may_refill {
-                    return Ok(None);
-                }
-                self.refill(pool)?;
-                refilled = true;
-            }
-            if !pool.synced {
+            if !pool.synced && !pool.ids.is_empty() {
                 crate::file::fsync_directory(&pool.folder, &*pool.fs, self.sync_mode)?;
                 pool.synced = true;
             }
             let Some(id) = pool.ids.pop_front() else {
+                if refilled || !may_refill {
+                    return Ok(None);
+                }
+                // Synced by the refill itself, or left unsynced for the
+                // next claim when its sync fails.
+                self.refill(pool)?;
+                refilled = true;
                 continue;
             };
             let path = pool.folder.join(id.to_string());
