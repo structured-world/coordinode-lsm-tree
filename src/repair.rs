@@ -4870,6 +4870,20 @@ fn scan_table_folders(
                 }
                 TableDirEntry::Table(id) => id,
             };
+            // An empty file under a table name is a pooled file a table was
+            // to be written into, never a table, unless a committed manifest
+            // names it. It holds no rows, so it is no loss, and it is left
+            // for the open, which uses it again.
+            let named = manifest_referenced
+                .as_ref()
+                .is_some_and(|m| m.tables.contains_key(&table_id));
+            if !named && folder_fs.metadata(&table_path)?.len == 0 {
+                log::debug!(
+                    "repair: {} is a pooled table file, not a table",
+                    table_path.display(),
+                );
+                continue;
+            }
             scanned_table_ids.insert(table_id);
 
             if let Some(p) = &config.recovery_progress {

@@ -506,7 +506,7 @@ pub struct Writer {
     /// Table file path
     pub(crate) path: PathBuf,
 
-    table_id: TableId,
+    pub(crate) table_id: TableId,
 
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
@@ -1158,6 +1158,26 @@ impl Writer {
         // error — an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
+        Self::with_file(path, table_id, initial_level, fs, file)
+    }
+
+    /// A writer into `claimed`, an empty pool file under its table's name.
+    /// The file is the writer's from here, so an init failure removes it.
+    pub(crate) fn into_claimed(
+        claimed: crate::table::file_pool::ClaimedFile,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+    ) -> crate::Result<Self> {
+        Self::with_file(claimed.path, claimed.id, initial_level, fs, claimed.file)
+    }
+
+    fn with_file(
+        path: PathBuf,
+        table_id: TableId,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+        file: Box<dyn FsFile>,
+    ) -> crate::Result<Self> {
         let writer = BufWriter::with_capacity(u16::MAX.into(), file);
         let writer = ChecksummedWriter::new(writer);
         let mut writer = crate::sfa::Writer::from_writer(writer);

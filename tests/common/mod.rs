@@ -99,11 +99,13 @@ pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u6
     Ok(installed)
 }
 
-/// Returns the SST file paths under `<dir>/tables/`, sorted by id.
+/// Returns the SST file paths under `<dir>/tables/`, sorted by id. The empty
+/// files the folder keeps for tables to come are no SSTs and are left out.
 pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))
         .expect("tables dir exists")
         .filter_map(Result::ok)
+        .filter(|e| e.metadata().is_ok_and(|m| m.len() > 0))
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()

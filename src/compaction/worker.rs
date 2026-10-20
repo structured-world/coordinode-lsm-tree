@@ -61,6 +61,9 @@ pub struct Options {
 
     pub table_id_generator: SequenceNumberCounter,
 
+    /// The tree's pooled table files, which the outputs are written into.
+    pub(crate) table_files: Arc<crate::table::file_pool::TableFilePools>,
+
     pub blob_file_id_generator: SequenceNumberCounter,
 
     /// Configuration of tree.
@@ -152,6 +155,7 @@ impl Options {
             visible_seqno: tree.config.visible_seqno.clone(),
             tree_id: tree.id,
             table_id_generator: tree.table_id_counter.clone(),
+            table_files: Arc::clone(&tree.table_files),
             blob_file_id_generator: tree.blob_file_id_counter.clone(),
             config: tree.config.clone(),
             version_history: tree.version_history.clone(),

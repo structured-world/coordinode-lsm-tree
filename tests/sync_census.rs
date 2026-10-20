@@ -169,9 +169,31 @@ fn creation() -> Vec<(Synced, SyncKind)> {
     ])
 }
 
+/// What a flush syncs once its tables folder's pool is warm: its table, the
+/// edit naming it, and for a KV-separated tree its blob file and the blob
+/// folder for that file's new name. `first` adds the tables folder, synced
+/// for the batch of pooled files the first flush makes.
+fn flush_syncs(blob: bool, first: bool) -> Vec<(Synced, SyncKind)> {
+    let mut flush = vec![
+        (Synced::Table, SyncKind::FileData),
+        (Synced::EditLog, SyncKind::FileData),
+    ];
+    if first {
+        flush.push((Synced::TablesDir, SyncKind::Directory));
+    }
+    if blob {
+        flush.push((Synced::Blob, SyncKind::FileData));
+        flush.push((Synced::BlobsDir, SyncKind::Directory));
+    }
+    sorted(flush)
+}
+
 /// Creating, flushing, compacting, dropping and reopening a tree, standard
 /// and KV-separated, each syncs only what it makes durable: a new entry's
 /// folder once, a written file once, and a reopen the snapshot it installs.
+/// A table is written into a file whose name a batch made durable, so once
+/// the batch is made a flush and a compaction sync their tables and the edit
+/// naming them, and no folder for them.
 #[test]
 fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
@@ -184,19 +206,21 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
 
         fill(&tree, 1);
         tree.flush_active_memtable(0).expect("flush");
-        let mut flush = vec![
-            (Synced::Table, SyncKind::FileData),
-            (Synced::TablesDir, SyncKind::Directory),
-            (Synced::EditLog, SyncKind::FileData),
-        ];
-        if blob {
-            flush.push((Synced::Blob, SyncKind::FileData));
-            flush.push((Synced::BlobsDir, SyncKind::Directory));
-        }
-        let flush = sorted(flush);
-        assert_eq!(census.take(), flush, "the first flush (blob: {blob})");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, true),
+            "the first flush (blob: {blob})"
+        );
 
-        for round in 2..=4 {
+        fill(&tree, 2);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, false),
+            "a flush into a pooled file (blob: {blob})"
+        );
+
+        for round in 3..=4 {
             fill(&tree, round);
             tree.flush_active_memtable(0).expect("flush");
         }
@@ -207,10 +231,9 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             census.take(),
             sorted(vec![
                 (Synced::Table, SyncKind::FileData),
-                (Synced::TablesDir, SyncKind::Directory),
                 (Synced::EditLog, SyncKind::FileData),
             ]),
-            "a compaction into one table (blob: {blob})"
+            "a compaction into one pooled file (blob: {blob})"
         );
 
         tree.drop_range::<&[u8], _>(..).expect("drop");
@@ -234,16 +257,106 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
         );
 
         // The reopen made the log it installed durable by name, so the first
-        // flush after it syncs what any flush does, not the tree folder again.
+        // flush after it does not sync the tree folder again. It takes a file
+        // the open found pooled, whose name it cannot know was ever synced,
+        // so it syncs the tables folder once for all of them.
         fill(&tree, 5);
         tree.flush_active_memtable(0).expect("flush");
         assert_eq!(
             census.take(),
-            flush,
+            flush_syncs(blob, true),
             "the first flush after reopening (blob: {blob})"
+        );
+        fill(&tree, 6);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, false),
+            "the next one (blob: {blob})"
         );
         drop(tree);
     }
+}
+
+/// Without a pool every table file is made as its table is written, and the
+/// install naming it syncs its folder.
+#[test]
+fn without_a_pool_each_install_syncs_the_tables_folder() {
+    let base = PathBuf::from("/census/unpooled");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census::new(&base, None, fs.injector());
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .table_file_pool(0)
+    .open()
+    .expect("open");
+    census.take();
+
+    for round in 1..=2 {
+        fill(&tree, round);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            sorted(vec![
+                (Synced::Table, SyncKind::FileData),
+                (Synced::TablesDir, SyncKind::Directory),
+                (Synced::EditLog, SyncKind::FileData),
+            ]),
+            "flush {round}"
+        );
+    }
+}
+
+/// Under barrier syncs a pooled table on another device than the manifest
+/// still has its folder synced in full: that is the sync that makes the
+/// table's data durable on its device before the edit on the other one names
+/// it.
+#[test]
+fn a_pooled_table_on_another_device_flushes_that_device() {
+    use lsm_tree::fs::{Fs, SyncMode};
+    let base = std::path::absolute("/census/barrier/tree").expect("absolute path");
+    let route = std::path::absolute("/elsewhere/hot").expect("absolute path");
+    let tree_fs = Arc::new(FaultFs::new(MemFs::new()));
+    let route_fs = Arc::new(FaultFs::new(MemFs::new()));
+    tree_fs
+        .create_dir_all(base.parent().expect("a parent"))
+        .expect("the tree's parent");
+    route_fs
+        .create_dir_all(route.parent().expect("a parent"))
+        .expect("the route's parent");
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(tree_fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: route.clone(),
+        fs: route_fs.clone(),
+    }])
+    .open()
+    .expect("open");
+    fill(&tree, 1);
+    tree.flush_active_memtable(0).expect("flush");
+    let before = route_fs
+        .injector()
+        .directory_sync_modes_for("elsewhere")
+        .len();
+
+    fill(&tree, 2);
+    tree.flush_active_memtable(0).expect("flush");
+    let modes = route_fs.injector().directory_sync_modes_for("elsewhere");
+    assert_eq!(
+        modes.get(before..),
+        Some(&[SyncMode::Full][..]),
+        "the route's tables folder, once, in full"
+    );
 }
 
 /// A flush that rotates the manifest installs its fresh snapshot with two

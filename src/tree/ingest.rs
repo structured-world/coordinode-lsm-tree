@@ -134,9 +134,10 @@ impl<'a> Ingestion<'a> {
         );
 
         // TODO: maybe create a PrepareMultiWriter that can be used by flush, ingest and compaction worker
-        let mut writer = MultiWriter::new(
+        let mut writer = MultiWriter::from_pool(
             folder.clone(),
-            tree.table_id_counter.clone(),
+            Arc::clone(&tree.table_files),
+            None,
             tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),
@@ -570,6 +571,7 @@ impl<'a> Ingestion<'a> {
         // Finalize the ingestion writer, writing all buffered data to disk. The
         // hold on its dictionary stays here until the tables are installed.
         let write_pin = core::mem::take(&mut self.write_pin);
+        let entries_durable = self.writer.entries_durable();
         let results = self.writer.finish()?;
 
         log::info!("Finished ingestion writer");
@@ -635,7 +637,11 @@ impl<'a> Ingestion<'a> {
                 {
                     params.metrics = self.tree.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

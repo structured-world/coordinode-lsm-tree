@@ -956,6 +956,11 @@ pub struct Config {
     /// on every upgrade, degenerating to the full-rewrite-per-version behaviour.
     pub(crate) manifest_log_rotate_bytes: u64,
 
+    /// Empty table files each tables folder creates at a time, ahead of the
+    /// tables written into them, with one folder sync for the batch. Set via
+    /// [`Config::table_file_pool`].
+    pub(crate) table_file_pool: usize,
+
     /// Retention floor a manifest REPAIR seeds the rebuilt version with: the
     /// highest snapshot seqno the repaired tree refuses to serve. The lost
     /// manifest was the only record of the floor a past GC compaction or
@@ -1237,6 +1242,7 @@ impl Default for Config {
             #[cfg(feature = "std")]
             recovery_progress: None,
             manifest_log_rotate_bytes: 1024 * 1024,
+            table_file_pool: crate::table::file_pool::DEFAULT_TABLE_FILE_POOL,
             repair_retention_floor: 0,
             compaction_rate_limit: 0,
             compaction_rate_limiter: None,
@@ -2694,6 +2700,38 @@ impl Config {
     #[must_use]
     pub fn manifest_log_rotate_bytes(mut self, bytes: u64) -> Self {
         self.manifest_log_rotate_bytes = bytes;
+        self
+    }
+
+    /// Sets how many empty table files each tables folder creates at a time,
+    /// ahead of the tables written into them (default 16).
+    ///
+    /// A new table's name has to be durable before the manifest edit that
+    /// names it, which costs a sync of its folder. A pooled file's name was
+    /// made durable with its batch, one folder sync for the whole batch, so a
+    /// flush or a compaction into one syncs its tables and the manifest edit
+    /// only. An unused pooled file is empty and takes no space; the next open
+    /// uses it again. `0` creates each table file as its table is written and
+    /// syncs the folder at every install that names one.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{Config, SequenceNumberCounter};
+    ///
+    /// let folder = tempfile::tempdir()?;
+    /// let tree = Config::new(
+    ///     &folder,
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .table_file_pool(64)
+    /// .open()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn table_file_pool(mut self, files: usize) -> Self {
+        self.table_file_pool = files;
         self
     }
 

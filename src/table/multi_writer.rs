@@ -9,7 +9,7 @@ pub use cut_alignment::Boundary;
 
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
-    Checksum, CompressionType, SequenceNumberCounter, TableId, UserKey,
+    Checksum, CompressionType, TableId, UserKey,
     blob_tree::handle::BlobIndirection,
     encryption::EncryptionProvider,
     fs::{Fs, SyncMode},
@@ -73,7 +73,13 @@ pub struct MultiWriter {
 
     results: Vec<(TableId, Checksum)>,
 
-    table_id_generator: SequenceNumberCounter,
+    /// Where each output's file comes from.
+    files: TableFiles,
+
+    /// Whether every output's directory entry was durable before its table
+    /// was written, so the install that names the outputs syncs no folder for
+    /// them.
+    entries_durable: bool,
 
     pub writer: Writer,
 
@@ -185,11 +191,10 @@ pub struct MultiWriter {
     /// L0 recency key stamped on every successor [`Writer`], preserved across
     /// rotation (see [`Writer::use_recency`]): a compaction sets its inputs'
     /// highest recency so manifest repair can place each output where its
-    /// content belongs, not where its id falls. `None` (flush / ingest)
-    /// stamps each output with ITS OWN id — the same value the repair-side
-    /// fallback derives, but persisted, so a missing key positively
-    /// identifies a LEGACY table whose provenance (flush vs compaction
-    /// output) the repair cannot know.
+    /// content belongs, not where its id falls, and a flush the id it takes
+    /// when it starts, since a pooled file's id was taken when its batch was
+    /// made. `None` (an ingest, whose install sets the recency) stamps each
+    /// output with ITS OWN id.
     recency: Option<TableId>,
 
     /// Compaction lineage stamped on this and every rotated successor (see
@@ -312,21 +317,66 @@ impl OutputLoad {
     }
 }
 
+/// Where a [`MultiWriter`]'s output files come from: its folder's pool, each
+/// id above `above` when given.
+struct TableFiles {
+    pools: Arc<super::file_pool::TableFilePools>,
+    above: Option<TableId>,
+}
+
+impl TableFiles {
+    /// A writer for the next output in `folder`, and whether its file's
+    /// directory entry is durable already.
+    fn open(
+        &self,
+        folder: &crate::path::Path,
+        level: u8,
+        fs: &Arc<dyn Fs>,
+    ) -> crate::Result<(Writer, bool)> {
+        let claimed = self.pools.claim(folder, fs, self.above)?;
+        let durable = claimed.durable_entry;
+        Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
+    }
+}
+
 impl MultiWriter {
-    /// Sets up a new `MultiWriter` at the given tables folder
+    /// A `MultiWriter` whose outputs take their ids from `table_id_generator`
+    /// and their files as they start, with no pool.
+    #[cfg(test)]
     pub fn new(
         base_path: PathBuf,
-        table_id_generator: SequenceNumberCounter,
+        table_id_generator: crate::SequenceNumberCounter,
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
     ) -> crate::Result<Self> {
-        let current_table_id = table_id_generator.next();
+        let pools = super::file_pool::TableFilePools::new(table_id_generator, 0, SyncMode::Normal);
+        Self::from_pool(
+            base_path,
+            Arc::new(pools),
+            None,
+            target_size,
+            initial_level,
+            fs,
+        )
+    }
 
-        let path = base_path.join(current_table_id.to_string());
+    /// Sets up a `MultiWriter` at the given tables folder, its outputs written
+    /// into files claimed from `pools`, each output's id above `above` when
+    /// given.
+    pub(crate) fn from_pool(
+        base_path: PathBuf,
+        pools: Arc<super::file_pool::TableFilePools>,
+        above: Option<TableId>,
+        target_size: u64,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+    ) -> crate::Result<Self> {
+        let files = TableFiles { pools, above };
         // Own-id recency until `use_recency` overrides it (see the `recency`
-        // field): a flush / ingest table's id IS its content recency.
-        let writer = Writer::new(path, current_table_id, initial_level, fs.clone())?;
+        // field).
+        let (writer, entries_durable) = files.open(&base_path, initial_level, &fs)?;
+        let current_table_id = writer.table_id;
 
         Ok(Self {
             fs,
@@ -352,7 +402,8 @@ impl MultiWriter {
 
             target_size,
             results: Vec::new(),
-            table_id_generator,
+            files,
+            entries_durable,
             writer,
 
             data_block_compression: CompressionType::None,
@@ -1134,6 +1185,13 @@ impl MultiWriter {
         self
     }
 
+    /// Whether every output's directory entry was durable before its table
+    /// was written (see [`super::Table::mark_entry_durable`]). Every output is
+    /// opened before [`Self::finish`], so this holds for all of them.
+    pub(crate) fn entries_durable(&self) -> bool {
+        self.entries_durable
+    }
+
     /// Stamps a FIXED L0 recency key on this and every rotated successor
     /// writer (see [`Writer::use_recency`]). `None` keeps the default own-id
     /// stamping (see the `recency` field): the current writer already carries
@@ -1258,10 +1316,11 @@ impl MultiWriter {
         self.output_base = None;
         self.value_layout = None;
 
-        let new_table_id = self.table_id_generator.next();
-        let path = self.base_path.join(new_table_id.to_string());
-
-        let new_writer = Writer::new(path, new_table_id, self.initial_level, self.fs.clone())?;
+        let (new_writer, durable) =
+            self.files
+                .open(&self.base_path, self.initial_level, &self.fs)?;
+        self.entries_durable &= durable;
+        let new_table_id = new_writer.table_id;
         // Recorded once it exists: a failed constructor created nothing ours.
         if let Some(outputs) = &self.outputs {
             outputs.record_table(new_table_id, new_writer.path.clone(), self.fs.clone());

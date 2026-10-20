@@ -299,6 +299,7 @@ impl<'a> BlobIngestion<'a> {
 
         // Finalize the table writer, creating index tables with blob
         // indirections pointing to the blob files we just created.
+        let entries_durable = self.table.writer.entries_durable();
         let results = self.table.writer.finish()?;
 
         #[cfg(all(test, feature = "std"))]
@@ -360,7 +361,11 @@ impl<'a> BlobIngestion<'a> {
                 {
                     params.metrics = index.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

@@ -1866,14 +1866,19 @@ impl AbstractTree for BlobTree {
         log::debug!("=> to table(s) in {}", table_folder.display());
         log::debug!("=> to blob file(s) at {}", self.blobs_folder.display());
 
-        let mut table_writer = MultiWriter::new(
+        // The flush's L0 recency, taken now, as the standard tree's flush
+        // takes it: a pooled file's id says nothing about when it was written.
+        let recency = self.index.table_id_counter.next();
+        let mut table_writer = MultiWriter::from_pool(
             table_folder.clone(),
-            self.index.table_id_counter.clone(),
+            Arc::clone(&self.index.table_files),
+            None,
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
         )?
         .set_comparator(self.index.config.comparator.clone())
+        .use_recency(Some(recency))
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
         .use_data_block_compression(data_block_compression)
@@ -2069,6 +2074,7 @@ impl AbstractTree for BlobTree {
 
         let blob_files = blob_writer.finish()?;
 
+        let entries_durable = table_writer.entries_durable();
         let result = table_writer.finish()?;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
@@ -2106,7 +2112,11 @@ impl AbstractTree for BlobTree {
                 {
                     params.metrics = self.index.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

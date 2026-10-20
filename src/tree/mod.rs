@@ -1105,14 +1105,21 @@ impl AbstractTree for Tree {
             folder.display(),
         );
 
-        let mut table_writer = MultiWriter::new(
+        // The flush's L0 recency, taken now: flushes are serialized, so it is
+        // above every table already flushed and below every one flushed later.
+        // A pooled file's id was taken when its batch was made and says
+        // nothing about when the table was written.
+        let recency = self.table_id_counter.next();
+        let mut table_writer = MultiWriter::from_pool(
             folder.clone(),
-            self.table_id_counter.clone(),
+            Arc::clone(&self.table_files),
+            None,
             self.config.table_target_size,
             0,
             level_fs.clone(),
         )?
         .set_comparator(self.config.comparator.clone())
+        .use_recency(Some(recency))
         .use_data_block_restart_interval(data_block_restart_interval)
         .use_index_block_restart_interval(index_block_restart_interval)
         .use_data_block_compression(data_block_compression)
@@ -1221,6 +1228,7 @@ impl AbstractTree for Tree {
             table_writer.write(item?)?;
         }
 
+        let entries_durable = table_writer.entries_durable();
         let result = table_writer.finish()?;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
@@ -1258,7 +1266,11 @@ impl AbstractTree for Tree {
                 {
                     params.metrics = self.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -5576,7 +5588,7 @@ impl Tree {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
 
-        let version = Self::recover_levels(
+        let (version, pooled) = Self::recover_levels(
             &config.path,
             tree_id,
             &config,
@@ -5608,15 +5620,26 @@ impl Tree {
             }
         }
 
-        // Table ids and L0 recency keys share one counter, and an ingested
-        // table's recency is an id taken at its install that no table carries:
-        // the next id has to be above both, or a flush after the reopen would
-        // lay out behind an ingestion it is newer than.
+        // Table ids and L0 recency keys share one counter, and a flushed or
+        // ingested table's recency is an id taken that no table carries: the
+        // next id has to be above both, or a flush after the reopen would lay
+        // out behind one it is newer than. The pooled files hold ids of their
+        // own, which no later table may take.
         let highest_table_id = version
             .iter_tables()
             .map(|table| table.id().max(table.l0_recency()))
+            .chain(pooled.iter().flat_map(|(_, _, ids)| ids.iter().copied()))
             .max()
             .unwrap_or_default();
+        let table_id_counter = SequenceNumberCounter::new(highest_table_id + 1);
+        let table_files = Arc::new(crate::table::file_pool::TableFilePools::new(
+            table_id_counter.clone(),
+            config.table_file_pool,
+            config.sync_mode,
+        ));
+        for (folder, folder_fs, ids) in pooled {
+            table_files.adopt(&folder, &folder_fs, ids);
+        }
 
         let comparator = config.comparator.clone();
 
@@ -5665,7 +5688,8 @@ impl Tree {
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
-            table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
+            table_id_counter,
+            table_files,
             blob_file_id_counter: SequenceNumberCounter::default(),
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
@@ -5934,7 +5958,7 @@ impl Tree {
         tree_id: TreeId,
         config: &Config,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
-    ) -> crate::Result<Version> {
+    ) -> crate::Result<(Version, PooledFiles)> {
         use crate::{TableId, file::fsync_directory};
 
         let tree_path = tree_path.as_ref();
@@ -6102,6 +6126,10 @@ impl Tree {
             .map(|(id, _)| id)
             .collect();
 
+        // The empty table files no version names, per folder: the pool each
+        // folder kept, adopted by the tree.
+        let mut pooled: PooledFiles = Vec::new();
+        let mut pooled_ids: Vec<TableId> = Vec::new();
         for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
@@ -6482,9 +6510,20 @@ impl Tree {
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
                     );
+                } else if folder_fs.metadata(&table_file_path)?.len == 0 {
+                    // No version names it and no table is empty: a pooled
+                    // file, used again rather than made anew.
+                    pooled_ids.push(table_id);
                 } else {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
+            }
+            if !pooled_ids.is_empty() {
+                pooled.push((
+                    table_base_folder.clone(),
+                    Arc::clone(folder_fs),
+                    core::mem::take(&mut pooled_ids),
+                ));
             }
         }
 
@@ -6712,7 +6751,7 @@ impl Tree {
         }
 
         sweep.finish()?;
-        Ok(version)
+        Ok((version, pooled))
     }
 
     /// Writes the `.restrict-bound` sidecar of every restricted table in
@@ -6913,6 +6952,14 @@ fn made_folders(folder: &Path, holders: &[crate::path::PathBuf]) -> Vec<crate::p
     }
     made
 }
+
+/// The empty table files an open found that no version names, per tables
+/// folder and its backend.
+type PooledFiles = Vec<(
+    crate::path::PathBuf,
+    Arc<dyn crate::fs::Fs>,
+    Vec<crate::TableId>,
+)>;
 
 /// What an open finds no version names, removed only once the state it judged
 /// that by is installed as a fresh snapshot.
