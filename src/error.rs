@@ -431,7 +431,8 @@ pub enum Error {
     ///   overflow `u64`, an in-memory section would exceed the
     ///   on-disk Block-size cap, etc.
     /// - **No installed snapshot to recover:** recovery found no
-    ///   `v{N}` with its `edits-{N}` log, so `Tree::open`'s outer
+    ///   `v{N}` in the tree folder (a missing `edits-{N}` log is
+    ///   read as empty), so `Tree::open`'s outer
     ///   `Io(NotFound) => create_new` arm cannot mistake a
     ///   half-applied recovery / corrupted state for a clean
     ///   first-open.

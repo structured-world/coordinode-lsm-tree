@@ -291,6 +291,32 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features
 
+  lint-platforms:
+    # `lint` runs on Linux, so code behind `cfg(windows)` or
+    # `cfg(target_os = "macos")` is compiled by the test jobs but never
+    # linted there. Same strict gate on the other two platforms.
+    needs: changes
+    if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: ${{ runner.os }}-cargo-clippy
+      - name: Clippy (strict)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
   test:
     needs: [changes, lint]
     # Skipped on docs-only PRs and after a lint failure (running
@@ -674,7 +700,7 @@ jobs:
   # skip only on docs-only changes or after `lint` failed, and that failure is
   # reported here on its own.
   ci-passed:
-    needs: [changes, lint, test, tools, fuzz-heal, no-std-check, cross-matrix, cross, codecov]
+    needs: [changes, lint, lint-platforms, test, tools, fuzz-heal, no-std-check, cross-matrix, cross, codecov]
     if: ${{ always() }}
     timeout-minutes: 5
     runs-on: ubuntu-latest

@@ -229,8 +229,8 @@ impl<'a> Reader<'a> {
             }
             let units: Vec<u16> = bytes
                 .chunks_exact(2)
-                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
-                .collect();
+                .map(|unit| unit.try_into().ok().map(u16::from_le_bytes))
+                .collect::<Option<_>>()?;
             Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
         }
         #[cfg(not(any(unix, windows)))]

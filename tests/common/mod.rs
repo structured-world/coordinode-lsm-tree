@@ -80,12 +80,19 @@ pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// The id of the tree's installed manifest snapshot: the highest `N` of a
-/// `v{N}` (a snapshot not yet installed carries a temporary name).
+/// `v{N}` (a snapshot not yet installed carries a temporary name). Only the
+/// canonical decimal spelling counts, as in recovery: `v007`, `v00` and
+/// `v+5` name nothing.
 pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
     let mut installed = None;
     for entry in std::fs::read_dir(dir)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if let Some(id) = name.strip_prefix('v').and_then(|r| r.parse::<u64>().ok()) {
+        let canonical = name.strip_prefix('v').filter(|r| {
+            !r.is_empty()
+                && r.bytes().all(|b| b.is_ascii_digit())
+                && (*r == "0" || !r.starts_with('0'))
+        });
+        if let Some(id) = canonical.and_then(|r| r.parse::<u64>().ok()) {
             installed = installed.max(Some(id));
         }
     }
