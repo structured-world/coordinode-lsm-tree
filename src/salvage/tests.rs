@@ -11665,36 +11665,48 @@ fn verify_metadata_bounds_keeps_a_lone_weak_tombstone_matching_the_rt_sentinel()
     Ok(())
 }
 
-/// Only a failure of the destination is marked as a salvage output failure.
-/// A verbatim copy re-checks the source bytes it carries, and damage found
-/// there keeps its own class, so a repair grades the source instead of
-/// stopping on a destination that is fine.
+/// A verbatim copy re-checks the source bytes it carries: damage found there
+/// keeps its own class, so a repair grades the source instead of stopping on
+/// a destination that is fine.
 #[test]
-fn output_failure_marks_only_failures_of_the_destination() {
+fn output_failure_of_carried_source_damage_keeps_its_class() {
     let mismatch = crate::Error::ChecksumMismatch {
         got: crate::Checksum::from_raw(1),
         expected: crate::Checksum::from_raw(2),
     };
-    assert!(
-        matches!(
-            super::output_failure(mismatch),
-            crate::Error::ChecksumMismatch { .. }
-        ),
-        "damage of the carried source is not the destination's",
-    );
+    assert!(matches!(
+        super::output_failure(mismatch),
+        crate::Error::ChecksumMismatch { .. }
+    ));
     assert!(matches!(
         super::output_failure(crate::Error::InvalidHeader("carried")),
         crate::Error::InvalidHeader("carried"),
     ));
+}
+
+/// An I/O failure of the destination stops the repair as an output failure.
+#[test]
+fn output_failure_of_destination_io_is_marked() {
     assert!(matches!(
         super::output_failure(crate::io::Error::other("device")),
         crate::Error::SalvageOutput(_),
     ));
-    let marked = super::output_failure(crate::Error::Encrypt("seal"));
+}
+
+/// Sealing the destination is part of writing it: its failure is marked,
+/// with the cause kept.
+#[test]
+fn output_failure_of_sealing_is_marked_with_its_cause() {
     assert!(matches!(
-        &marked,
-        crate::Error::SalvageOutput(inner) if matches!(**inner, crate::Error::Encrypt(_)),
+        super::output_failure(crate::Error::Encrypt("seal")),
+        crate::Error::SalvageOutput(inner) if matches!(*inner, crate::Error::Encrypt(_)),
     ));
+}
+
+/// A failure already marked passes through unwrapped once more.
+#[test]
+fn output_failure_of_a_marked_failure_is_not_marked_twice() {
+    let marked = super::output_failure(crate::Error::Encrypt("seal"));
     assert!(matches!(
         super::output_failure(marked),
         crate::Error::SalvageOutput(inner) if matches!(*inner, crate::Error::Encrypt(_)),

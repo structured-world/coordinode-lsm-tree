@@ -415,6 +415,46 @@ fn restored_tree_writes_above_the_restored_data() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A restore that cannot clear a temporary snapshot an earlier attempt left
+/// fails with that removal's error rather than writing over it.
+#[test]
+fn a_restore_that_cannot_clear_a_stale_temporary_snapshot_fails() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+    let src = tempfile::tempdir()?;
+    let dst = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
+    let tree = open(src.path(), false, &visible)?;
+    write_history(&tree, &visible)?;
+    let pin = tree.pin();
+    ship(&pin, dst.path())?;
+
+    let fs = std::sync::Arc::new(FaultFs::new(StdFs));
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .on_path(dst.path().join("v").to_string_lossy()),
+    );
+    let refused = Config::new(
+        dst.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .restore_pinned(
+        &pin.layout()?,
+        pin.memtable_entries(),
+        pin.memtable_range_tombstones(),
+    );
+    assert!(
+        matches!(&refused, Err(lsm_tree::Error::Io(e)) if e.kind() == lsm_tree::io::ErrorKind::PermissionDenied),
+        "{:?}",
+        refused.err()
+    );
+    Ok(())
+}
+
 /// A pin keeps the source folder locked: the tree it came from may be dropped,
 /// but no other opener gets the folder (and a registry of its own that knows
 /// nothing of the pin) until the pin drops.

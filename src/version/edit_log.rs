@@ -105,9 +105,20 @@ pub fn append_edit(
     let mut file = fs
         .open(path, &FsOpenOptions::new().write(true).append(true))
         .map_err(crate::Error::from)?;
-    // A write that fails leaves the record short of its last byte, a torn
-    // tail replay drops: the edit is not installed.
-    super::framing::write_frame(&mut file, scratch)?;
+    // A write that fails can leave part of the record behind, a tail the
+    // strict recovery mode refuses. It is cut off again, so the log ends on a
+    // record boundary whatever mode the next open reads it in; a cut that
+    // fails too leaves the tail the tolerant mode drops.
+    let before = file.metadata()?.len;
+    if let Err(e) = super::framing::write_frame(&mut file, scratch) {
+        if let Err(cut) = file.set_len(before) {
+            log::warn!(
+                "edit log {}: the part of a failed append stays ({cut})",
+                path.display()
+            );
+        }
+        return Err(e);
+    }
     // `sync_data` persists the file size with the data (its contract, POSIX
     // `fdatasync`), which is all replay reads; the log's name is durable
     // since its install. A sync that fails leaves the whole record written,

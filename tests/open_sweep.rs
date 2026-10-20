@@ -47,6 +47,48 @@ fn an_open_removes_sidecars_whose_table_is_gone() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// An open installs a fresh snapshot before it sweeps; an orphan it cannot
+/// remove fails the open, but every other leftover still goes, the
+/// generation it superseded included. Retried opens do not pile up one
+/// snapshot each.
+#[test]
+fn opens_failing_on_one_orphan_still_remove_the_superseded_generation() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    a_tree(folder.path())?;
+    std::fs::write(
+        folder.path().join("tables").join("99.restrict-bound"),
+        b"orphan",
+    )?;
+    let fs = std::sync::Arc::new(FaultFs::new(StdFs));
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("99.restrict-bound"),
+    );
+    for _ in 0..3 {
+        assert!(
+            config(folder.path())
+                .with_shared_fs(fs.clone())
+                .open()
+                .is_err()
+        );
+    }
+
+    let snapshots = std::fs::read_dir(folder.path())?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix('v')
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
+    assert_eq!(snapshots, 1, "only the newest generation is left");
+    Ok(())
+}
+
 /// Only names the engine writes are its manifest files: an open leaves a
 /// file of another spelling in the tree root alone.
 #[test]

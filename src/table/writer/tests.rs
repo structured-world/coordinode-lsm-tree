@@ -2,6 +2,22 @@ use super::*;
 use crate::fs::StdFs;
 use test_log::test;
 
+/// A carried frame too short for a header is a malformed copy; one whose
+/// header is long enough but not a block header keeps the decoder's answer.
+#[test]
+fn carried_header_refuses_a_short_or_foreign_frame() {
+    assert!(matches!(
+        carried_header(&[0u8; 2]),
+        Err(crate::Error::InvalidHeader(
+            "carried block header is cut short"
+        ))
+    ));
+    assert!(matches!(
+        carried_header(&[0u8; 64]),
+        Err(crate::Error::InvalidHeader("Block"))
+    ));
+}
+
 /// The encoded bytes of a `linked_blob_files` section holding `links`, as the
 /// writer lays them out.
 fn encode_links(links: &[LinkedFile]) -> Vec<u8> {

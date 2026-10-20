@@ -27,6 +27,32 @@ fn new_log(fs: &dyn Fs, path: &Path) {
     );
 }
 
+/// An append whose write fails partway leaves no part of its record behind:
+/// the log still ends on a record boundary, so the strict recovery mode
+/// replays it rather than refusing a tail no edit was acknowledged for.
+#[test]
+fn an_append_whose_write_fails_partway_leaves_the_log_whole() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    new_log(&fs, &path);
+    let mut scratch = Vec::new();
+    append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Normal)?;
+
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(5)).once());
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(0)).skip(1));
+    scratch.clear();
+    assert!(append_edit(&fs, &path, &edit(2), &mut scratch, SyncMode::Normal).is_err());
+    fs.injector().clear();
+
+    let edits = replay_log(&fs, &path, ManifestRecoveryMode::AbsoluteConsistency)?;
+    assert_eq!(edits.len(), 1, "only the acknowledged edit");
+    Ok(())
+}
+
 /// An append goes to the log its snapshot's install made durable by name. A
 /// log that is not there fails the append, which makes none: one made by the
 /// append would lie under a name no sync covers, and a power loss would take

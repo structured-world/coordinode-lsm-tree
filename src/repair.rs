@@ -3842,12 +3842,13 @@ impl Config {
                     ReportCopy::Keep,
                 )?;
                 match retry.open() {
-                    Ok(tree) => match hand_out_owed_report(tree, &path)? {
-                        // The snapshot owes it; nothing else would have
-                        // retired it in between.
-                        (tree, Some(owed)) => Ok((tree, Some(owed))),
-                        (tree, None) => Ok((tree, Some(report))),
-                    },
+                    // The snapshot owes the report it rebuilt with, which the
+                    // hand-out returns: the one this call returned is the
+                    // same report.
+                    Ok(tree) => {
+                        let (tree, owed) = hand_out_owed_report(tree, &path)?;
+                        Ok((tree, Some(owed.unwrap_or(report))))
+                    }
                     // The repair committed: the report leaves with the error,
                     // and the snapshot that owes it hands it out again, with
                     // the same id, to the call that opens it.

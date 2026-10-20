@@ -2115,7 +2115,9 @@ impl Tree {
     }
 
     /// Installs the current version without the repair report it owes, as a
-    /// snapshot of its own, before the report is handed out.
+    /// snapshot of its own, before the report is handed out. Called on a tree
+    /// [`Self::owed_repair_report`] found owing one, before the tree is
+    /// handed to anyone who could install in between.
     ///
     /// # Errors
     ///
@@ -2125,14 +2127,6 @@ impl Tree {
     #[cfg(feature = "std")]
     pub(crate) fn retire_repair_report(&self) -> crate::Result<()> {
         let mut version_lock = self.version_history.write();
-        if version_lock
-            .latest_version_ref()
-            .version
-            .repair_report()
-            .is_none()
-        {
-            return Ok(());
-        }
         version_lock.upgrade_version(
             &self.config.path,
             |current| {
@@ -4772,7 +4766,10 @@ impl Tree {
             // and calling `create_new` would overwrite the partial state with
             // an empty tree, turning a recoverable failure into data loss.
             // What a creation that never completed leaves (its empty folders,
-            // a snapshot without its log) holds no data and is created over.
+            // a temporary snapshot never renamed into place, the empty log
+            // made before that rename) holds no data and is created over. A
+            // snapshot under its own name is installed, with or without its
+            // log, and is recovered instead.
             if !recovering && has_existing_version_state(&config)? {
                 // Return Error::Io(InvalidData, ...) rather than
                 // Error::Unrecoverable so callers that don't read
@@ -6931,16 +6928,22 @@ impl OpenSweep {
         self.pending.push((Arc::clone(fs), path.to_path_buf()));
     }
 
-    /// Removes every queued file, a file already gone included.
+    /// Removes every queued file, a file already gone included, and fails
+    /// with the first removal that failed. Each removal is tried: one file
+    /// that cannot go must not keep the others, the generation an open
+    /// superseded among them, from going.
     fn finish(self) -> crate::Result<()> {
+        let mut first = None;
         for (fs, path) in self.pending {
             match fs.remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    first.get_or_insert(e);
+                }
             }
         }
-        Ok(())
+        first.map_or(Ok(()), |e| Err(e.into()))
     }
 }
 

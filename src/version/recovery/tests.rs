@@ -1413,10 +1413,20 @@ fn a_renumbering_keeps_foreign_files_in_the_tree_root() -> crate::Result<()> {
         .write_all(b"not the engine's")?;
     }
 
+    // A snapshot a cut-short install left under its temporary name is the
+    // engine's: the renumbering removes it with the other snapshots.
+    let temporary = folder.join(format!("v{}.tmp", crate::version::RENUMBER_FROM - 1));
+    fs.open(
+        &temporary,
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"torn")?;
+
     drop(top_id_config(&fs).open()?);
     for name in foreign {
         assert!(fs.exists(&folder.join(name))?, "{name} is kept");
     }
+    assert!(!fs.exists(&temporary)?, "the temporary snapshot goes");
     Ok(())
 }
 
