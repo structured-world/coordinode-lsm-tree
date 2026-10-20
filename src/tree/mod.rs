@@ -5594,7 +5594,8 @@ impl Tree {
         #[cfg(feature = "std")]
         stop_signal.wake_on_stop(&compaction_rate_limiter);
         let filter_budget = Arc::<crate::filter_budget::FilterBudget>::default();
-        // The open installed the recovered state as its own snapshot.
+        // The open installed the recovered state as its own snapshot, its
+        // empty log's name made durable by the install's folder sync.
         let snapshot_id = version.id();
         let mut super_versions = SuperVersions::new(
             version,
@@ -5602,7 +5603,7 @@ impl Tree {
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
-            false,
+            true,
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));

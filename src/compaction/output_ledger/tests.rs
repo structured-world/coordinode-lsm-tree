@@ -147,6 +147,65 @@ fn an_output_that_cannot_be_removed_keeps_its_quota_held() -> crate::Result<()> 
     Ok(())
 }
 
+/// Outputs kept after an install of unknown outcome hold their bytes of the
+/// quota while they stay, and give them back as they go; one that cannot be
+/// removed keeps its own bytes held.
+#[test]
+fn kept_outputs_hold_their_quota_until_removed() -> crate::Result<()> {
+    use crate::compaction::capacity::{CapacityPool, Demand};
+    use crate::fs::{Fault, FaultOp, FaultRule};
+
+    let fault = FaultFs::new(MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let folder = PathBuf::from("/tree/tables");
+    fs.create_dir_all(&folder)?;
+    let stuck = PathBuf::from("/tree/tables/1");
+    let removed = PathBuf::from("/tree/tables/2");
+    for (path, len) in [(&stuck, 300), (&removed, 200)] {
+        let mut file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+        file.write_all(&vec![7u8; len])?;
+    }
+
+    let tree_id = 5;
+    let pool = Arc::new(CapacityPool::default());
+    let Some(room) = pool.reserve(
+        tree_id,
+        &[Demand {
+            fs: &*fs,
+            path: &folder,
+            bytes: 1_000,
+        }],
+        None,
+    ) else {
+        panic!("an unchecked reservation is never refused");
+    };
+    let ledger = OutputLedger::default();
+    ledger.reserve(room);
+    for (id, path) in [(1, &stuck), (2, &removed)] {
+        ledger.record_table(id, path.clone(), fs.clone());
+        ledger.landed(&*fs, path)?;
+    }
+    let kept = ledger.keep_uninstalled();
+    assert!(fs.exists(&stuck)? && fs.exists(&removed)?, "kept in place");
+    assert_eq!(pool.quota_held(tree_id), 500, "held for what they take");
+
+    injector.arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("tables/1"),
+    );
+    kept.remove(tree_id, None);
+    injector.clear();
+
+    assert!(fs.exists(&stuck)?, "the fixture must refuse the removal");
+    assert!(!fs.exists(&removed)?);
+    assert_eq!(pool.quota_held(tree_id), 300, "only the stuck one holds");
+    Ok(())
+}
+
 /// A finished file lands on the volume its folder's room was reserved on,
 /// even where the backend cannot tell the file's own volume: the folder's
 /// room takes the bytes, not a pool the reservation holds nothing in.

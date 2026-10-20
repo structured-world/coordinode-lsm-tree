@@ -183,6 +183,64 @@ fn table_files(dir: &std::path::Path) -> std::io::Result<usize> {
     Ok(std::fs::read_dir(dir.join("tables"))?.count())
 }
 
+/// The names in the tree's tables folder.
+fn table_names(dir: &std::path::Path) -> std::io::Result<std::collections::BTreeSet<String>> {
+    std::fs::read_dir(dir.join("tables"))?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// The output a compaction of unknown install outcome keeps goes once a later
+/// install writes the full snapshot that supersedes the failed edit: no
+/// version names it from then on, and it is not left on disk, holding its
+/// room, until the tree is reopened.
+#[test]
+fn a_kept_output_goes_once_a_later_install_supersedes_its_edit() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = FaultFs::new(StdFs);
+    let injector = fs.injector();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(fs)
+    .open()?;
+    for (seqno, k) in (0u64..).zip(["k0", "k1"]) {
+        tree.insert(k, "v", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    let inputs = table_names(dir.path())?;
+    injector.arm(
+        FaultRule::new(FaultOp::SyncData, Fault::Error(ErrorKind::Other))
+            .on_path("edits-")
+            .once(),
+    );
+    assert!(matches!(
+        tree.major_compact(64 * 1024 * 1024, 0),
+        Err(lsm_tree::Error::InstallOutcomeUnknown(_))
+    ));
+    let kept: Vec<String> = table_names(dir.path())?
+        .difference(&inputs)
+        .cloned()
+        .collect();
+    assert_eq!(kept.len(), 1, "the compaction keeps its output");
+
+    // The retry rotates, superseding the failed edit.
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+    let names = table_names(dir.path())?;
+    for name in &kept {
+        assert!(
+            !names.contains(name),
+            "the kept output {name} goes once superseded"
+        );
+    }
+    for k in ["k0", "k1"] {
+        assert!(tree.get(k, 3)?.is_some(), "{k} must read after the retry");
+    }
+    Ok(())
+}
+
 /// A compaction whose install cannot be withdrawn leaves its outcome unknown:
 /// the snapshot naming its output may be the one a reopen finds, so the
 /// output stays and the reopen reads every key from it.

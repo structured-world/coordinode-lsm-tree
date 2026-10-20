@@ -232,6 +232,16 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             ]),
             "reopening (blob: {blob})"
         );
+
+        // The reopen made the log it installed durable by name, so the first
+        // flush after it syncs what any flush does, not the tree folder again.
+        fill(&tree, 5);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush,
+            "the first flush after reopening (blob: {blob})"
+        );
         drop(tree);
     }
 }

@@ -1120,6 +1120,17 @@ fn row_group_ref(
     })
 }
 
+/// The header of a block among bytes copied from another table. A frame too
+/// short to hold one is a malformed copy, refused as one: the short read is of
+/// bytes in memory, not a failure of the file being written.
+fn carried_header(frame: &[u8]) -> crate::Result<crate::table::block::Header> {
+    use crate::coding::Decode;
+    crate::table::block::Header::decode_from(&mut &*frame).map_err(|e| match e {
+        crate::Error::Io(_) => crate::Error::InvalidHeader("carried block header is cut short"),
+        e => e,
+    })
+}
+
 impl Writer {
     pub fn new(
         path: PathBuf,
@@ -4086,16 +4097,13 @@ impl Writer {
         columnar_columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<Option<crate::UserKey>> {
-        use crate::coding::Decode;
-
         if !self.accepts_group_tag(group_tag) {
             return Err(crate::Error::InvalidHeader(
                 "columnar: a copied row group's tag does not follow the table's last",
             ));
         }
         // The group opens with its directory, whose header gives its length.
-        let directory_len =
-            crate::table::block::Header::decode_from(&mut &*raw)?.on_disk_size_with(self.ecc);
+        let directory_len = carried_header(raw)?.on_disk_size_with(self.ecc);
         let first_key = self.append_verbatim_extent(
             (raw, source),
             uncompressed_length,
@@ -4139,9 +4147,6 @@ impl Writer {
         columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<bool> {
-        use crate::coding::Decode;
-        use crate::table::block::Header;
-
         // A table keeping a zone map needs the group's per-column statistics,
         // which only the source's zone map holds for bytes copied unread.
         if !self.use_columnar
@@ -4163,7 +4168,7 @@ impl Writer {
         let mut uncompressed = 0u64;
         let mut at = 0usize;
         while let Some(frame) = raw.get(at..).filter(|frame| !frame.is_empty()) {
-            let header = Header::decode_from(&mut &*frame)?;
+            let header = carried_header(frame)?;
             let len = header.on_disk_size_with(self.ecc) as usize;
             if len == 0 || len > frame.len() {
                 return Err(crate::Error::InvalidHeader(
@@ -4257,7 +4262,6 @@ impl Writer {
     /// Returns [`crate::Error::InvalidHeader`] when `raw` does not tile into
     /// whole blocks under this writer's ECC scheme.
     fn restamp_extent(&self, raw: &[u8], source: VerbatimSource) -> crate::Result<Vec<u8>> {
-        use crate::coding::Decode;
         use crate::table::block::{ChecksumAt, Header};
 
         let dest = self.file_writer.get_ref().position();
@@ -4267,7 +4271,7 @@ impl Writer {
             let frame = out.get_mut(at..).ok_or(crate::Error::InvalidHeader(
                 "verbatim copy: block past the extent",
             ))?;
-            let len = Header::decode_from(&mut &*frame)?.on_disk_size_with(self.ecc) as usize;
+            let len = carried_header(frame)?.on_disk_size_with(self.ecc) as usize;
             if len == 0 || len > frame.len() {
                 return Err(crate::Error::InvalidHeader(
                     "verbatim copy: extent does not tile into blocks",

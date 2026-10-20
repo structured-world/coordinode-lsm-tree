@@ -134,8 +134,9 @@ pub(super) enum Retire {
     /// A copy is still there, so it still carries the report: an open hands
     /// it out, and handing it out now as well would hand it out twice.
     Kept(crate::Error),
-    /// Every copy is gone, but the folder sync that makes that durable
-    /// failed: hand the report out now, since a copy may not come back.
+    /// Every copy is gone, the folder sync that makes that durable failed, and
+    /// no copy could be put back: hand the report out now, since none is left
+    /// to carry it.
     Unsynced(crate::Error),
 }
 
@@ -144,6 +145,11 @@ pub(super) enum Retire {
 /// Temporaries go first, then the copies from the oldest snapshot up: the
 /// newest one carries the losses of every repair folded into it, so a removal
 /// that fails partway must leave it, not an older copy that names less.
+///
+/// A removal the folder sync did not make durable may come back after a power
+/// loss, and an open would then hand the report out again. So the newest copy
+/// is put back and the report withheld ([`Retire::Kept`]): an open hands it
+/// out once, from the copy.
 pub(super) fn retire(config: &Config) -> Result<(), Retire> {
     let mut copies: Vec<(bool, u64, PathBuf)> = config
         .fs
@@ -157,6 +163,12 @@ pub(super) fn retire(config: &Config) -> Result<(), Retire> {
         })
         .collect();
     copies.sort_unstable();
+    let newest = match copies.last() {
+        Some((true, id, _)) => crate::file::read_repair_report(&*config.fs, &config.path, *id)
+            .map_err(Retire::Kept)?
+            .map(|bytes| (*id, bytes)),
+        _ => None,
+    };
     let mut removed = false;
     for (_, _, path) in copies {
         match config.fs.remove_file(&path) {
@@ -165,13 +177,42 @@ pub(super) fn retire(config: &Config) -> Result<(), Retire> {
             Err(e) => return Err(Retire::Kept(e.into())),
         }
     }
-    if removed {
-        config
+    if removed
+        && let Err(e) = config
             .fs
             .sync_directory_with(&config.path, config.sync_mode)
-            .map_err(|e| Retire::Unsynced(e.into()))?;
+    {
+        return Err(put_back(config, newest, e.into()));
     }
     Ok(())
+}
+
+/// Puts the newest copy back after its removal failed to become durable, and
+/// says whether a copy carries the report now.
+fn put_back(config: &Config, newest: Option<(u64, Vec<u8>)>, cause: crate::Error) -> Retire {
+    let Some((id, bytes)) = newest else {
+        return Retire::Unsynced(cause);
+    };
+    let restored =
+        crate::file::write_repair_report(&*config.fs, &config.path, id, &bytes, config.sync_mode)
+            .and_then(|()| {
+                Ok(config
+                    .fs
+                    .sync_directory_with(&config.path, config.sync_mode)?)
+            });
+    let Err(e) = restored else {
+        return Retire::Kept(cause);
+    };
+    log::warn!("repair: could not put the report copy back: {e}");
+    // A copy an open can still see carries the report, durable or not; only
+    // one that is surely gone leaves it to this call.
+    match config
+        .fs
+        .exists(&crate::file::repair_report_path(&config.path, id))
+    {
+        Ok(false) => Retire::Unsynced(cause),
+        Ok(true) | Err(_) => Retire::Kept(cause),
+    }
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {

@@ -4542,8 +4542,9 @@ fn repair_tree(
 /// # Errors
 ///
 /// A copy that cannot be removed fails the repair without the report: the
-/// copy still carries it, and the next open hands it out. A removal that
-/// cannot be made durable carries the report out inside
+/// copy still carries it, and the next open hands it out. So does a removal
+/// that cannot be made durable, once the copy is put back; one that cannot be
+/// put back either carries the report out inside
 /// [`crate::Error::RepairedButUnopened`].
 #[cfg(feature = "std")]
 fn retire_report_copy(

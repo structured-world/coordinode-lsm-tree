@@ -297,9 +297,9 @@ fn restored_blob_tree_reads_as_the_source_at_the_pin() -> lsm_tree::Result<()> {
     restore_matches_the_source(true)
 }
 
-/// A layout is named and versioned: one of another version, or one that does
-/// not start with the name at all, is refused before the restore writes
-/// anything.
+/// A layout is named and versioned: one of another version, one that does not
+/// start with the name at all, or one whose owed-report mark is neither of
+/// the two it can be, is refused before the restore writes anything.
 #[test]
 fn restore_refuses_a_layout_of_another_version() -> lsm_tree::Result<()> {
     let src = tempfile::tempdir()?;
@@ -311,7 +311,14 @@ fn restore_refuses_a_layout_of_another_version() -> lsm_tree::Result<()> {
     let mut other_version = layout.clone();
     other_version[4] = other_version[4].wrapping_add(1);
     let unnamed = layout[5..].to_vec();
-    for (what, bytes) in [("another version", other_version), ("no name", unnamed)] {
+    // After the name, the version, the snapshot id and the pin's seqno.
+    let mut unknown_mark = layout.clone();
+    unknown_mark[4 + 1 + 8 + 8] = 2;
+    for (what, bytes) in [
+        ("another version", other_version),
+        ("no name", unnamed),
+        ("an unknown report mark", unknown_mark),
+    ] {
         let dst = tempfile::tempdir()?;
         let target = dst.path().join("restored");
         let result = Config::new(

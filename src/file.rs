@@ -124,7 +124,11 @@ pub fn carry_repair_report(
 
 /// The bytes of the copy of a repair report kept for snapshot `id` in
 /// `folder`, sealed as they lie; `None` when there is none.
-fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
+pub(crate) fn read_repair_report(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: u64,
+) -> crate::Result<Option<Vec<u8>>> {
     use crate::fs::FsOpenOptions;
     let source = repair_report_path(folder, id);
     let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
@@ -149,8 +153,11 @@ fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Opti
 ///
 /// # Errors
 ///
-/// Propagates a failure to list the folder or read a copy.
+/// Propagates a failure to list the folder or read a copy, and fails with
+/// `NotFound` when the newest copy is still listed after it was found gone:
+/// a name that does not open (a dangling link) is no copy being rotated away.
 pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Vec<u8>>> {
+    let mut gone = None;
     loop {
         let newest = fs
             .read_dir(folder)?
@@ -167,6 +174,14 @@ pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Ve
         if let Some(bytes) = read_repair_report(fs, folder, id)? {
             return Ok(Some(bytes));
         }
+        if gone == Some(id) {
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::NotFound,
+                "a listed repair report copy does not open",
+            )
+            .into());
+        }
+        gone = Some(id);
     }
 }
 

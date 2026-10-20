@@ -82,6 +82,84 @@ fn atomic_rewrite() -> crate::Result<()> {
     Ok(())
 }
 
+/// A listed report copy that cannot be opened, a dangling link under that
+/// name, is reported instead of looked for again forever: a checkpoint or a
+/// pinned layout reading the owed report would otherwise never return.
+#[cfg(unix)]
+#[test]
+fn owed_repair_report_fails_on_a_listed_copy_it_cannot_open() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink(dir.path().join("gone"), repair_report_path(dir.path(), 4))?;
+
+    let folder = dir.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver is gone only once the test has failed already.
+        if tx
+            .send(owed_repair_report(&StdFs, &folder).map_err(|e| e.to_string()))
+            .is_err()
+        {
+            log::debug!("the test stopped waiting");
+        }
+    });
+    let Ok(answer) = rx.recv_timeout(std::time::Duration::from_secs(10)) else {
+        panic!("the owed report is answered, not looked for forever");
+    };
+    assert!(
+        answer.is_err(),
+        "an unopenable copy is an error: {answer:?}"
+    );
+
+    Ok(())
+}
+
+/// A copy whose publish fails is not published, and its temporary is removed;
+/// one that cannot be removed is left for the next open's sweep while the
+/// publish's own failure is the one reported.
+#[test]
+fn a_failed_report_copy_publish_removes_its_temporary_when_it_can() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+
+    for removable in [true, false] {
+        let fs = FaultFs::new(MemFs::new());
+        let folder = std::path::PathBuf::from("/tree");
+        fs.create_dir_all(&folder)?;
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(crate::io::ErrorKind::PermissionDenied),
+            )
+            .on_path("repair-report-"),
+        );
+        if !removable {
+            fs.injector().arm(
+                FaultRule::new(
+                    FaultOp::RemoveFile,
+                    Fault::Error(crate::io::ErrorKind::Other),
+                )
+                .on_path("repair-report-"),
+            );
+        }
+
+        let result = write_repair_report(&fs, &folder, 3, b"report", SyncMode::Normal);
+        assert!(
+            matches!(&result, Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::PermissionDenied),
+            "the publish's failure is reported: {result:?}",
+        );
+        fs.injector().clear();
+        assert!(
+            !fs.exists(&repair_report_path(&folder, 3))?,
+            "nothing is published"
+        );
+        assert_eq!(
+            fs.exists(&folder.join("repair-report-3.tmp"))?,
+            !removable,
+            "the temporary goes when it can (removable: {removable})",
+        );
+    }
+    Ok(())
+}
+
 /// Verifies that `StdFs::rename` atomically replaces an existing
 /// destination file — the contract required by `rewrite_atomic`.
 #[test]

@@ -1291,9 +1291,9 @@ fn salvage_publishes_the_mid_copy_when_hard_link_is_unsupported() -> crate::Resu
 }
 
 /// A MID publish that cannot claim `dest` (the link fails, or on a backend
-/// without links the rename after the claim does) is a failure of the OUTPUT:
-/// the salvage reports it as one, so repair stops instead of grading the
-/// source as damage, and it leaves neither `dest` nor its temp copy behind.
+/// without links the claim or the rename after it does) is a failure of the
+/// OUTPUT: the salvage reports it as one, so repair stops instead of grading
+/// the source as damage, and it leaves neither `dest` nor its temp copy behind.
 ///
 /// `lz4`-gated for the same reason as the tests around it: the MID attempt
 /// only runs when the meta mirrors diverge.
@@ -1304,10 +1304,17 @@ fn a_mid_publish_that_cannot_claim_the_destination_fails_as_an_output_failure() 
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
     use crate::io::ErrorKind;
 
-    for unsupported_link in [false, true] {
+    // Without links: the claim of `dest` fails, or the rename onto it does.
+    for (unsupported_link, failing) in [
+        (false, None),
+        (true, Some(FaultOp::Rename)),
+        (true, Some(FaultOp::Open)),
+    ] {
         let dir = tempdir()?;
         let source = dir.path().join("source");
-        let dest = dir.path().join("salvaged");
+        // The temp copies are named `salvaged.healtmp-{n}`, so a fault on
+        // this name strikes `dest` alone.
+        let dest = dir.path().join("salvaged.sst");
         let fault = FaultFs::new(StdFs);
         let injector = fault.injector();
         let fs: Arc<dyn Fs> = Arc::new(fault);
@@ -1324,14 +1331,13 @@ fn a_mid_publish_that_cannot_claim_the_destination_fails_as_an_output_failure() 
         assert!(writer.finish()?.is_some(), "source SST is non-empty");
         crate::test_forge::forge_tail_meta_value(&source, b"compression#data", &[1])?;
 
-        if unsupported_link {
+        if let Some(op) = failing {
             injector.arm(FaultRule::new(
                 FaultOp::HardLink,
                 Fault::Error(ErrorKind::Unsupported),
             ));
             injector.arm(
-                FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
-                    .on_path(dest.to_string_lossy()),
+                FaultRule::new(op, Fault::Error(ErrorKind::Other)).on_path(dest.to_string_lossy()),
             );
         } else {
             injector.arm(FaultRule::new(
@@ -1343,7 +1349,7 @@ fn a_mid_publish_that_cannot_claim_the_destination_fails_as_an_output_failure() 
         let result = salvage_sst(&source, dest.clone(), &fs);
         assert!(
             matches!(result, Err(crate::Error::SalvageOutput(_))),
-            "unsupported link: {unsupported_link}: {result:?}",
+            "unsupported link: {unsupported_link}, failing: {failing:?}: {result:?}",
         );
         assert!(!dest.exists(), "no claim is left at the destination");
         for entry in std::fs::read_dir(dir.path())? {
@@ -11657,4 +11663,40 @@ fn verify_metadata_bounds_keeps_a_lone_weak_tombstone_matching_the_rt_sentinel()
         "the rejection names the seqno#min branch specifically, got {err:?}",
     );
     Ok(())
+}
+
+/// Only a failure of the destination is marked as a salvage output failure.
+/// A verbatim copy re-checks the source bytes it carries, and damage found
+/// there keeps its own class, so a repair grades the source instead of
+/// stopping on a destination that is fine.
+#[test]
+fn output_failure_marks_only_failures_of_the_destination() {
+    let mismatch = crate::Error::ChecksumMismatch {
+        got: crate::Checksum::from_raw(1),
+        expected: crate::Checksum::from_raw(2),
+    };
+    assert!(
+        matches!(
+            super::output_failure(mismatch),
+            crate::Error::ChecksumMismatch { .. }
+        ),
+        "damage of the carried source is not the destination's",
+    );
+    assert!(matches!(
+        super::output_failure(crate::Error::InvalidHeader("carried")),
+        crate::Error::InvalidHeader("carried"),
+    ));
+    assert!(matches!(
+        super::output_failure(crate::io::Error::other("device")),
+        crate::Error::SalvageOutput(_),
+    ));
+    let marked = super::output_failure(crate::Error::Encrypt("seal"));
+    assert!(matches!(
+        &marked,
+        crate::Error::SalvageOutput(inner) if matches!(**inner, crate::Error::Encrypt(_)),
+    ));
+    assert!(matches!(
+        super::output_failure(marked),
+        crate::Error::SalvageOutput(inner) if matches!(*inner, crate::Error::Encrypt(_)),
+    ));
 }

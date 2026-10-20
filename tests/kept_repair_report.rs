@@ -95,9 +95,11 @@ fn a_kept_report_whose_copy_cannot_be_removed_is_handed_out_later() -> lsm_tree:
 }
 
 /// A removal that cannot be made durable may come back after a power loss,
-/// so the report is handed out now, inside the error.
+/// and the next call would hand the report out a second time. So the copy is
+/// put back, the call fails without the report, and the next call hands it
+/// out once.
 #[test]
-fn a_kept_report_whose_retirement_is_not_durable_rides_out_in_the_error() -> lsm_tree::Result<()> {
+fn a_kept_report_whose_retirement_is_not_durable_is_put_back() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     a_tree_owing_a_report(folder.path())?;
 
@@ -114,11 +116,54 @@ fn a_kept_report_whose_retirement_is_not_durable_rides_out_in_the_error() -> lsm
         .with_fs(fs)
         .open_or_repair(RepairPolicy::default())
     {
+        Err(lsm_tree::Error::RepairedButUnopened { .. }) => {
+            panic!("the report is handed out while a copy may come back")
+        }
+        Err(_) => {}
+        Ok((_, report)) => panic!("the retirement failed, yet the call answered {report:?}"),
+    }
+    assert!(holds_a_copy(folder.path())?, "the copy is put back");
+
+    let (_tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    assert!(report.is_some(), "the next call hands the report out");
+    assert!(!holds_a_copy(folder.path())?, "and retires the copy");
+    let (_tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    assert!(report.is_none(), "once");
+    Ok(())
+}
+
+/// When the copy can be neither retired durably nor put back, none is left to
+/// carry the report, so it is handed out now, inside the error.
+#[test]
+fn a_kept_report_that_cannot_be_put_back_rides_out_in_the_error() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    a_tree_owing_a_report(folder.path())?;
+
+    let fs = FaultFs::new(StdFs);
+    fs.injector().arm(
+        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+            .on_path(folder.path().to_string_lossy())
+            .skip(1)
+            .once(),
+    );
+    // The open carries the copy to the snapshot it installs with one rename;
+    // the next is the put-back's.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path("repair-report-")
+            .skip(1)
+            .once(),
+    );
+    match config(folder.path())
+        .with_fs(fs)
+        .open_or_repair(RepairPolicy::default())
+    {
         Err(lsm_tree::Error::RepairedButUnopened { .. }) => {}
         other => panic!(
             "expected the report inside RepairedButUnopened, got {:?}",
             other.map(|(_, report)| report)
         ),
     }
+    assert!(!holds_a_copy(folder.path())?, "no copy is left");
     Ok(())
 }

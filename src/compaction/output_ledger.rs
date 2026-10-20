@@ -133,20 +133,20 @@ impl OutputLedger {
 
     /// Leaves every recorded file in place, after an install whose outcome is
     /// unknown: a power loss may still make it the installed one, naming
-    /// them. Their bytes stay held in the tree's quota; the next open's
-    /// orphan sweep removes the ones no version names.
-    pub fn keep_uninstalled(&self) {
-        let outputs = core::mem::take(&mut *self.0.files.lock());
+    /// them. They and the quota bytes they take are handed back as
+    /// [`KeptOutputs`], to go once an install proves no version names them.
+    pub fn keep_uninstalled(&self) -> KeptOutputs {
+        let files = core::mem::take(&mut *self.0.files.lock());
         let room = self.0.room.lock().take();
-        if let Some(room) = &room {
+        let hold = room.as_ref().map(|room| {
             // `None` once a file's length cannot be read: the room keeps all
             // it granted.
-            let kept = outputs.iter().try_fold(0u64, |sum, output| {
+            room.strand(files.iter().try_fold(0u64, |sum, output| {
                 Some(sum + output.fs.metadata(&output.path).ok()?.len)
-            });
-            room.strand(kept);
-        }
+            }))
+        });
         drop(room);
+        KeptOutputs { files, hold }
     }
 
     /// Deletes every recorded file, then gives the run's room back. Called
@@ -160,42 +160,77 @@ impl OutputLedger {
         let outputs = core::mem::take(&mut *self.0.files.lock());
         // Given back once the files it covered are gone, below.
         let room = self.0.room.lock().take();
-        // `None` once a file's length cannot be read.
-        let mut stranded = Some(0u64);
-        for output in outputs {
-            let global_id = GlobalTableId::from((tree_id, output.id));
-            if let Some(descriptors) = descriptor_table {
-                match output.kind {
-                    Kind::Table => descriptors.remove_for_table(&global_id),
-                    Kind::BlobFile => descriptors.remove_for_blob_file(&global_id),
-                }
-            }
-            match output.fs.remove_file(&output.path) {
-                Ok(()) => log::debug!(
-                    "Removed uninstalled compaction output {}",
-                    output.path.display(),
-                ),
-                Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    log::warn!(
-                        "Could not remove uninstalled compaction output {} ({e}); it stays until \
-                         the next open's orphan sweep",
-                        output.path.display(),
-                    );
-                    // A length that cannot be read holds the whole grant: the
-                    // quota is a limit, and the file may take all of it.
-                    // Bounded by the bytes the run wrote.
-                    stranded = stranded
-                        .zip(output.fs.metadata(&output.path).ok())
-                        .map(|(sum, metadata)| sum + metadata.len);
-                }
-            }
-        }
+        let stranded = remove_files(outputs, tree_id, descriptor_table);
         if let Some(room) = &room {
-            room.strand(stranded);
+            // Held until the tree leaves the pool: the orphan sweep of its
+            // next open is what removes these.
+            drop(room.strand(stranded));
         }
         drop(room);
     }
+}
+
+/// The outputs of a run whose install had an unknown outcome, left on disk
+/// with the quota bytes they take.
+///
+/// The install that failed marks the next one to write a full snapshot, which
+/// supersedes the edit whichever way it went: from then on no version names
+/// these files, on disk or in memory, and [`Self::remove`] takes them.
+pub struct KeptOutputs {
+    files: Vec<Output>,
+    hold: Option<super::capacity::QuotaHold>,
+}
+
+impl KeptOutputs {
+    /// Deletes the files, as [`OutputLedger::remove_uninstalled`] deletes
+    /// uninstalled ones, and gives back the quota of each one gone.
+    pub fn remove(self, tree_id: TreeId, descriptor_table: Option<&DescriptorTable>) {
+        let stranded = remove_files(self.files, tree_id, descriptor_table);
+        if let Some(hold) = self.hold {
+            hold.release_but(stranded);
+        }
+    }
+}
+
+/// Removes `outputs`, each one's cached descriptor evicted first, and returns
+/// the bytes of those that could not be removed (`None` once a length cannot
+/// be read).
+fn remove_files(
+    outputs: Vec<Output>,
+    tree_id: TreeId,
+    descriptor_table: Option<&DescriptorTable>,
+) -> Option<u64> {
+    let mut stranded = Some(0u64);
+    for output in outputs {
+        let global_id = GlobalTableId::from((tree_id, output.id));
+        if let Some(descriptors) = descriptor_table {
+            match output.kind {
+                Kind::Table => descriptors.remove_for_table(&global_id),
+                Kind::BlobFile => descriptors.remove_for_blob_file(&global_id),
+            }
+        }
+        match output.fs.remove_file(&output.path) {
+            Ok(()) => log::debug!(
+                "Removed uninstalled compaction output {}",
+                output.path.display(),
+            ),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!(
+                    "Could not remove uninstalled compaction output {} ({e}); it stays until \
+                     the next open's orphan sweep",
+                    output.path.display(),
+                );
+                // A length that cannot be read holds the whole grant: the
+                // quota is a limit, and the file may take all of it. Bounded
+                // by the bytes the run wrote.
+                stranded = stranded
+                    .zip(output.fs.metadata(&output.path).ok())
+                    .map(|(sum, metadata)| sum + metadata.len);
+            }
+        }
+    }
+    stranded
 }
 
 #[cfg(test)]

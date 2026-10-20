@@ -1295,10 +1295,16 @@ fn discard_partial(fs: &alloc::sync::Arc<dyn crate::fs::Fs>, dest: &std::path::P
 /// Marks a failure to write, finish or make durable a salvage's OUTPUT, so a
 /// recovery tells it from damage to the source (see
 /// [`crate::Error::SalvageOutput`]). One already marked stays as it is.
+///
+/// Only an I/O failure or a failure to seal is the destination's. A verbatim
+/// copy re-reads the headers and checksums of the source bytes it carries,
+/// and what it finds wrong there keeps its own class.
 fn output_failure(e: impl Into<crate::Error>) -> crate::Error {
     match e.into() {
-        e @ crate::Error::SalvageOutput(_) => e,
-        e => crate::Error::SalvageOutput(alloc::boxed::Box::new(e)),
+        e @ (crate::Error::Io(_) | crate::Error::Encrypt(_)) => {
+            crate::Error::SalvageOutput(alloc::boxed::Box::new(e))
+        }
+        e => e,
     }
 }
 

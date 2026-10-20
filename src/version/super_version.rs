@@ -282,9 +282,9 @@ pub struct SuperVersions {
     log_bytes: Option<u64>,
 
     /// Whether the current log's directory entry is known durable: synced by
-    /// an append of this history. Not the log's size: a first append whose
-    /// directory sync failed leaves a log that is not empty yet may still
-    /// vanish, and a log found at open may not have been synced before.
+    /// the persist that made it or by an append of this history. Not the
+    /// log's size: a first append whose directory sync failed leaves a log
+    /// that is not empty yet may still vanish.
     log_entry_synced: bool,
 
     /// Whether an install failed since the last rotation that succeeded. A
@@ -296,6 +296,16 @@ pub struct SuperVersions {
     /// next persist rotates, writing a snapshot of the whole state that
     /// supersedes either outcome.
     rotation_pending: bool,
+
+    /// The rotations that succeeded, which order a kept output against the
+    /// full snapshot that supersedes it.
+    rotations: u64,
+
+    /// Compaction outputs an install of unknown outcome left on disk, each
+    /// with the count of rotations when it was kept: the next rotation that
+    /// succeeds supersedes the edit that may name it, and from then on no
+    /// version does.
+    kept_outputs: Vec<(u64, crate::compaction::output_ledger::KeptOutputs)>,
 
     /// Reusable payload-assembly buffer for edit appends — the scratch
     /// `edit_log::append_edit` documents as reusable; allocating it per
@@ -340,9 +350,8 @@ impl SuperVersions {
     /// snapshot saw may be gone (`0` on a fresh create).
     ///
     /// `log_entry_synced` says the snapshot's log is known to have a durable
-    /// name: a fresh create's, made by the persist under its directory sync.
-    /// A log found at open is not known to: a process that died before its
-    /// directory sync leaves a name the page cache still shows.
+    /// name, as one made by a persist under its directory sync is: a fresh
+    /// create's, or the one an open installs its recovered state with.
     pub fn new(
         version: Version,
         comparator: &SharedComparator,
@@ -371,6 +380,8 @@ impl SuperVersions {
             log_bytes: None,
             log_entry_synced,
             rotation_pending: false,
+            rotations: 0,
+            kept_outputs: Vec::new(),
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
@@ -381,6 +392,30 @@ impl SuperVersions {
     /// out before them (see [`crate::blob_tree::released`]).
     pub(crate) fn released(&self) -> &Arc<crate::blob_tree::released::ReleasedObjects> {
         &self.released
+    }
+
+    /// Holds `kept`, the outputs of a compaction whose install had an unknown
+    /// outcome, until a rotation after this one supersedes that install.
+    pub(crate) fn keep_outputs(&mut self, kept: crate::compaction::output_ledger::KeptOutputs) {
+        self.kept_outputs.push((self.rotations, kept));
+    }
+
+    /// Whether outputs are held for [`Self::take_superseded_outputs`].
+    pub(crate) fn holds_kept_outputs(&self) -> bool {
+        !self.kept_outputs.is_empty()
+    }
+
+    /// The kept outputs a rotation has superseded since they were kept, for
+    /// the caller to remove: no version names them any longer.
+    pub(crate) fn take_superseded_outputs(
+        &mut self,
+    ) -> Vec<crate::compaction::output_ledger::KeptOutputs> {
+        let rotations = self.rotations;
+        let (superseded, held) = core::mem::take(&mut self.kept_outputs)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(kept_at, _)| *kept_at < rotations);
+        self.kept_outputs = held;
+        superseded.into_iter().map(|(_, kept)| kept).collect()
     }
 
     /// Makes every version this history publishes, the current one first,
@@ -650,6 +685,7 @@ impl SuperVersions {
             return Err(e);
         }
         self.rotation_pending = false;
+        self.rotations += 1;
         self.snapshot_id = next.id();
         // The new generation starts with the empty log the persist created,
         // its name durable under the persist's directory sync.
