@@ -364,7 +364,6 @@ impl TreeInner {
             sync_mode,
             snapshot_id,
             config.manifest_log_rotate_bytes,
-            true,
         );
         if config.filter_advisor.is_some() {
             super_versions = super_versions.with_filter_budget(Arc::clone(&filter_budget));

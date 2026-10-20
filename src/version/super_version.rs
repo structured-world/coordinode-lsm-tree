@@ -281,12 +281,6 @@ pub struct SuperVersions {
     /// `seek` syscall pair on every flush / compaction install.
     log_bytes: Option<u64>,
 
-    /// Whether the current log's directory entry is known durable: synced by
-    /// the persist that made it or by an append of this history. Not the
-    /// log's size: a first append whose directory sync failed leaves a log
-    /// that is not empty yet may still vanish.
-    log_entry_synced: bool,
-
     /// Whether an install failed since the last rotation that succeeded. A
     /// failed rotation may still have installed its snapshot on disk (its
     /// rename made before the failure can survive), and recovery would then
@@ -340,25 +334,19 @@ pub struct SuperVersions {
 
 impl SuperVersions {
     /// Builds the in-memory version history. `snapshot_id` is the version id of
-    /// the installed on-disk snapshot — `version.id()` on a fresh
-    /// create (the first persist writes that snapshot), or the recovered
-    /// snapshot id on open (which may be `< version.id()` when edits were
-    /// replayed on top of it).
+    /// the installed on-disk snapshot, whose log the persist that installed it
+    /// made durable by name: `version.id()`, since a create and an open both
+    /// install the version they start from.
     ///
     /// The seed version's seqno is the recovered
     /// [`retention_floor`](Version::retention_floor), below which the data a
     /// snapshot saw may be gone (`0` on a fresh create).
-    ///
-    /// `log_entry_synced` says the snapshot's log is known to have a durable
-    /// name, as one made by a persist under its directory sync is: a fresh
-    /// create's, or the one an open installs its recovered state with.
     pub fn new(
         version: Version,
         comparator: &SharedComparator,
         sync_mode: SyncMode,
         snapshot_id: VersionId,
         log_rotate_bytes: u64,
-        log_entry_synced: bool,
     ) -> Self {
         let comparator_name: Arc<str> = comparator.name().into();
 
@@ -378,7 +366,6 @@ impl SuperVersions {
             snapshot_id,
             log_rotate_bytes,
             log_bytes: None,
-            log_entry_synced,
             rotation_pending: false,
             rotations: 0,
             kept_outputs: Vec::new(),
@@ -628,17 +615,9 @@ impl SuperVersions {
         if log_size < self.log_rotate_bytes && !self.rotation_pending {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
-            match edit_log::append_edit(
-                fs,
-                &log_path,
-                &edit,
-                &mut self.edit_scratch,
-                sync_mode,
-                !self.log_entry_synced,
-            ) {
+            match edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode) {
                 Ok(Some(appended)) => {
                     self.log_bytes = Some(log_size + appended);
-                    self.log_entry_synced = true;
                     return Ok(());
                 }
                 // The edit is too large for one record and nothing was
@@ -690,7 +669,6 @@ impl SuperVersions {
         // The new generation starts with the empty log the persist created,
         // its name durable under the persist's directory sync.
         self.log_bytes = Some(0);
-        self.log_entry_synced = true;
 
         // The durable commit point of a rotation is the install inside
         // `persist_version` above (its log, synced into the directory) — past

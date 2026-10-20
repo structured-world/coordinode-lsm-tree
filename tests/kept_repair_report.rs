@@ -46,13 +46,14 @@ fn a_tree_owing_a_report(folder: &std::path::Path) -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// Whether `folder` still holds a report copy.
+/// Whether `folder` still holds a report copy (a temporary name is none: no
+/// open reads it).
 fn holds_a_copy(folder: &std::path::Path) -> lsm_tree::Result<bool> {
     for entry in std::fs::read_dir(folder)? {
         if entry?
             .file_name()
             .to_str()
-            .is_some_and(|n| n.starts_with("repair-report-"))
+            .is_some_and(|n| n.starts_with("repair-report-") && !n.ends_with(".tmp"))
         {
             return Ok(true);
         }
@@ -60,7 +61,7 @@ fn holds_a_copy(folder: &std::path::Path) -> lsm_tree::Result<bool> {
     Ok(false)
 }
 
-/// A copy that cannot be removed still carries the report, so the call fails
+/// A copy that cannot be retired still carries the report, so the call fails
 /// rather than hand it out, and the next call hands it out.
 #[test]
 fn a_kept_report_whose_copy_cannot_be_removed_is_handed_out_later() -> lsm_tree::Result<()> {
@@ -68,16 +69,13 @@ fn a_kept_report_whose_copy_cannot_be_removed_is_handed_out_later() -> lsm_tree:
     a_tree_owing_a_report(folder.path())?;
 
     let fs = FaultFs::new(StdFs);
-    // The open's own sweep removes the copy of the generation it replaces
-    // first; the second removal is the retirement.
+    // The open carries the copy to the snapshot it installs with one rename;
+    // the next sets the copy aside to retire it.
     fs.injector().arm(
-        FaultRule::new(
-            FaultOp::RemoveFile,
-            Fault::Error(ErrorKind::PermissionDenied),
-        )
-        .on_path("repair-report-")
-        .skip(1)
-        .once(),
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::PermissionDenied))
+            .on_path("repair-report-")
+            .skip(1)
+            .once(),
     );
     let first = config(folder.path())
         .with_fs(fs)
@@ -124,9 +122,10 @@ fn a_kept_report_whose_retirement_is_not_durable_is_put_back() -> lsm_tree::Resu
     }
     assert!(holds_a_copy(folder.path())?, "the copy is put back");
 
-    let (_tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    let (tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
     assert!(report.is_some(), "the next call hands the report out");
     assert!(!holds_a_copy(folder.path())?, "and retires the copy");
+    drop(tree);
     let (_tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
     assert!(report.is_none(), "once");
     Ok(())
@@ -146,12 +145,12 @@ fn a_kept_report_that_cannot_be_put_back_rides_out_in_the_error() -> lsm_tree::R
             .skip(1)
             .once(),
     );
-    // The open carries the copy to the snapshot it installs with one rename;
-    // the next is the put-back's.
+    // The open carries the copy to the snapshot it installs with one rename,
+    // the retirement sets it aside with the next; the third is the put-back's.
     fs.injector().arm(
         FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
             .on_path("repair-report-")
-            .skip(1)
+            .skip(2)
             .once(),
     );
     match config(folder.path())

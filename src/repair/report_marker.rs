@@ -148,8 +148,10 @@ pub(super) enum Retire {
 ///
 /// A removal the folder sync did not make durable may come back after a power
 /// loss, and an open would then hand the report out again. So the newest copy
-/// is put back and the report withheld ([`Retire::Kept`]): an open hands it
-/// out once, from the copy.
+/// is only set aside under its temporary name, which no open reads as a copy,
+/// until that sync succeeds; when it fails, the copy is put back and the
+/// report withheld ([`Retire::Kept`]): an open hands it out once, from the
+/// copy.
 pub(super) fn retire(config: &Config) -> Result<(), Retire> {
     let mut copies: Vec<(bool, u64, PathBuf)> = config
         .fs
@@ -163,53 +165,71 @@ pub(super) fn retire(config: &Config) -> Result<(), Retire> {
         })
         .collect();
     copies.sort_unstable();
-    let newest = match copies.last() {
-        Some((true, id, _)) => crate::file::read_repair_report(&*config.fs, &config.path, *id)
-            .map_err(Retire::Kept)?
-            .map(|bytes| (*id, bytes)),
-        _ => None,
+    let newest = match copies.pop() {
+        Some((true, id, path)) => Some((id, path)),
+        other => {
+            copies.extend(other);
+            None
+        }
     };
-    let mut removed = false;
+    let mut changed = false;
     for (_, _, path) in copies {
         match config.fs.remove_file(&path) {
-            Ok(()) => removed = true,
+            Ok(()) => changed = true,
             Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Retire::Kept(e.into())),
         }
     }
-    if removed
+    let aside = match newest {
+        Some((id, path)) => {
+            let aside = crate::file::repair_report_temporary_path(&config.path, id);
+            config
+                .fs
+                .rename(&path, &aside)
+                .map_err(|e| Retire::Kept(e.into()))?;
+            changed = true;
+            Some((path, aside))
+        }
+        None => None,
+    };
+    if changed
         && let Err(e) = config
             .fs
             .sync_directory_with(&config.path, config.sync_mode)
     {
-        return Err(put_back(config, newest, e.into()));
+        return Err(put_back(config, aside, e.into()));
+    }
+    if let Some((_, aside)) = aside
+        && let Err(e) = config.fs.remove_file(&aside)
+        && e.kind() != crate::io::ErrorKind::NotFound
+    {
+        log::warn!(
+            "could not remove {} ({e}); the next open sweeps it",
+            aside.display()
+        );
     }
     Ok(())
 }
 
-/// Puts the newest copy back after its removal failed to become durable, and
-/// says whether a copy carries the report now.
-fn put_back(config: &Config, newest: Option<(u64, Vec<u8>)>, cause: crate::Error) -> Retire {
-    let Some((id, bytes)) = newest else {
+/// Puts the newest copy, set aside as `(name, aside)`, back under its name
+/// after the sync retiring it failed, and says whether a copy carries the
+/// report now.
+fn put_back(config: &Config, aside: Option<(PathBuf, PathBuf)>, cause: crate::Error) -> Retire {
+    let Some((path, aside)) = aside else {
         return Retire::Unsynced(cause);
     };
-    let restored =
-        crate::file::write_repair_report(&*config.fs, &config.path, id, &bytes, config.sync_mode)
-            .and_then(|()| {
-                Ok(config
-                    .fs
-                    .sync_directory_with(&config.path, config.sync_mode)?)
-            });
+    let restored = config.fs.rename(&aside, &path).and_then(|()| {
+        config
+            .fs
+            .sync_directory_with(&config.path, config.sync_mode)
+    });
     let Err(e) = restored else {
         return Retire::Kept(cause);
     };
     log::warn!("repair: could not put the report copy back: {e}");
     // A copy an open can still see carries the report, durable or not; only
     // one that is surely gone leaves it to this call.
-    match config
-        .fs
-        .exists(&crate::file::repair_report_path(&config.path, id))
-    {
+    match config.fs.exists(&path) {
         Ok(false) => Retire::Unsynced(cause),
         Ok(true) | Err(_) => Retire::Kept(cause),
     }

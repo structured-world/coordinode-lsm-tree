@@ -124,11 +124,7 @@ pub fn carry_repair_report(
 
 /// The bytes of the copy of a repair report kept for snapshot `id` in
 /// `folder`, sealed as they lie; `None` when there is none.
-pub(crate) fn read_repair_report(
-    fs: &dyn Fs,
-    folder: &Path,
-    id: u64,
-) -> crate::Result<Option<Vec<u8>>> {
+fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
     use crate::fs::FsOpenOptions;
     let source = repair_report_path(folder, id);
     let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
@@ -191,6 +187,13 @@ pub fn repair_report_path(folder: &Path, id: u64) -> crate::path::PathBuf {
     folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"))
 }
 
+/// The temporary name of the copy of a repair report for snapshot `id` in
+/// `folder`: never read as a copy, and swept by an open.
+#[must_use]
+pub fn repair_report_temporary_path(folder: &Path, id: u64) -> crate::path::PathBuf {
+    folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"))
+}
+
 /// Writes `bytes` as the copy of a repair report for snapshot `id` in
 /// `folder`.
 ///
@@ -211,7 +214,7 @@ pub fn write_repair_report(
 ) -> crate::Result<()> {
     use crate::fs::FsOpenOptions;
     let target = repair_report_path(folder, id);
-    let temporary = folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"));
+    let temporary = repair_report_temporary_path(folder, id);
     let publish = (|| -> crate::Result<()> {
         let mut copy = fs.open(
             &temporary,
