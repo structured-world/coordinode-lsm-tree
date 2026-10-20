@@ -236,6 +236,35 @@ fn a_rotation_failing_at_its_directory_sync_marks_the_next_to_rotate() -> crate:
     Ok(())
 }
 
+/// Outputs kept after an install of unknown outcome are superseded by the
+/// first rotation that succeeds after that install. When another install
+/// rotated before the outputs are handed over, they are superseded already
+/// and go at once, not after one more rotation; otherwise they wait for it.
+#[test]
+fn kept_outputs_wait_only_for_the_rotation_after_their_install() {
+    use crate::compaction::output_ledger::OutputLedger;
+
+    let mut history = history_at_floor(0);
+    // The failure's mark was cleared by a rotation before the handover.
+    history.rotation_pending = false;
+    history.keep_outputs(OutputLedger::default().keep_uninstalled());
+    assert_eq!(
+        history.take_superseded_outputs().len(),
+        1,
+        "superseded already"
+    );
+
+    history.rotation_pending = true;
+    history.keep_outputs(OutputLedger::default().keep_uninstalled());
+    assert!(
+        history.take_superseded_outputs().is_empty(),
+        "the rotation is next"
+    );
+    history.rotations += 1;
+    history.rotation_pending = false;
+    assert_eq!(history.take_superseded_outputs().len(), 1);
+}
+
 #[test]
 fn new_history_seeds_the_floor_as_the_boundary() {
     // A history built from a recovered version reads with that version's

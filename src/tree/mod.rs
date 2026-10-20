@@ -6778,16 +6778,30 @@ impl Tree {
     /// Removes every manifest file [`Self::cleanup_orphaned_version`] finds
     /// stale beside snapshot `keep`, at once rather than after the install,
     /// and makes the removals durable.
+    ///
+    /// The snapshots go first, durably, and only then their logs: a snapshot
+    /// that outlives its log would be recovered without the edits in it.
     fn remove_manifests_but(
         path: &Path,
         keep: crate::version::VersionId,
         fs: &Arc<dyn crate::fs::Fs>,
         sync_mode: crate::fs::SyncMode,
     ) -> crate::Result<()> {
-        let mut sweep = OpenSweep::default();
-        Self::cleanup_orphaned_version(path, keep, fs, &mut sweep)?;
-        sweep.finish()?;
-        crate::file::fsync_directory(path, &**fs, sync_mode)?;
+        let mut stale = OpenSweep::default();
+        Self::cleanup_orphaned_version(path, keep, fs, &mut stale)?;
+        let groups: [Vec<_>; 2] = stale
+            .pending
+            .into_iter()
+            .partition::<Vec<_>, _>(|(_, file)| {
+                file.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('v'))
+            })
+            .into();
+        for group in groups {
+            OpenSweep { pending: group }.finish()?;
+            crate::file::fsync_directory(path, &**fs, sync_mode)?;
+        }
         Ok(())
     }
 }

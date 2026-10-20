@@ -215,9 +215,10 @@ pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     } else {
         opts.outputs
             .remove_uninstalled(opts.tree_id, opts.config.descriptor_table.as_deref());
-        // This run's install may be the rotation that superseded them.
-        remove_superseded_outputs(opts);
     }
+    // This run's install may be the rotation that superseded kept outputs,
+    // and another install may have rotated since this run's failed.
+    remove_superseded_outputs(opts);
     // Charged whether or not the run succeeded: a tight-space pass that fails
     // after installing slices leaves them installed, and what they read and
     // wrote was done.

@@ -296,10 +296,10 @@ pub struct SuperVersions {
     rotations: u64,
 
     /// Compaction outputs an install of unknown outcome left on disk, each
-    /// with the count of rotations when it was kept: the next rotation that
-    /// succeeds supersedes the edit that may name it, and from then on no
-    /// version does.
-    kept_outputs: Vec<(u64, crate::compaction::output_ledger::KeptOutputs)>,
+    /// with the count of rotations a rotation has to pass to supersede the
+    /// edit that may name them, `None` once one has: from then on no version
+    /// does.
+    kept_outputs: Vec<(Option<u64>, crate::compaction::output_ledger::KeptOutputs)>,
 
     /// Reusable payload-assembly buffer for edit appends — the scratch
     /// `edit_log::append_edit` documents as reusable; allocating it per
@@ -382,9 +382,16 @@ impl SuperVersions {
     }
 
     /// Holds `kept`, the outputs of a compaction whose install had an unknown
-    /// outcome, until a rotation after this one supersedes that install.
+    /// outcome, until a rotation after that install supersedes it.
+    ///
+    /// The failed install marked the next one to rotate, and only a rotation
+    /// that succeeds clears the mark: with it cleared, one has succeeded since
+    /// the failure (another install may have rotated before this call), and
+    /// the outputs are superseded already. With it set, the next install is
+    /// that rotation.
     pub(crate) fn keep_outputs(&mut self, kept: crate::compaction::output_ledger::KeptOutputs) {
-        self.kept_outputs.push((self.rotations, kept));
+        let until = self.rotation_pending.then_some(self.rotations);
+        self.kept_outputs.push((until, kept));
     }
 
     /// Whether outputs are held for [`Self::take_superseded_outputs`].
@@ -400,7 +407,7 @@ impl SuperVersions {
         let rotations = self.rotations;
         let (superseded, held) = core::mem::take(&mut self.kept_outputs)
             .into_iter()
-            .partition::<Vec<_>, _>(|(kept_at, _)| *kept_at < rotations);
+            .partition::<Vec<_>, _>(|(until, _)| until.is_none_or(|kept_at| kept_at < rotations));
         self.kept_outputs = held;
         superseded.into_iter().map(|(_, kept)| kept).collect()
     }

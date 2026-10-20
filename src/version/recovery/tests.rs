@@ -1396,6 +1396,53 @@ fn an_open_at_the_top_of_the_id_range_reinstalls_the_tree_as_version_0() -> crat
     Ok(())
 }
 
+/// A renumbering that fails while removing the snapshot it read must not
+/// have removed that snapshot's log first: the snapshot then stays the
+/// highest, and a reopen would recover it without the edits in its log.
+#[test]
+fn a_renumbering_cut_short_keeps_the_edits_of_the_snapshot_it_read() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let top = crate::version::RENUMBER_FROM;
+    // The listing order of the in-memory folder changes from one instance to
+    // the next; enough instances list the log before the snapshot.
+    for _ in 0..32 {
+        let fs = std::sync::Arc::new(MemFs::new());
+        // Reopened just below the top, the tree is installed as `v{top}`, and
+        // a flush records key `b` in that snapshot's log.
+        a_tree_at_version(&fs, top - 1)?;
+        {
+            let tree = top_id_config(&fs).open()?;
+            tree.insert("b", "2", 1);
+            tree.flush_active_memtable(0)?;
+        }
+
+        let fault = FaultFs::new(fs.as_ref().clone());
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(crate::io::ErrorKind::Other),
+            )
+            .on_path(format!("v{top}")),
+        );
+        let failed = crate::Config::new(
+            "/top-id",
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .open();
+        assert!(failed.is_err(), "the snapshot read cannot be removed");
+
+        let tree = top_id_config(&fs).open()?;
+        assert!(
+            tree.get("b", 3)?.is_some(),
+            "the edit in the log of the snapshot read is kept"
+        );
+    }
+    Ok(())
+}
+
 /// A renumbering that fails before the snapshot it read is durably gone
 /// leaves that snapshot the highest: the next open takes it and renumbers
 /// again.
