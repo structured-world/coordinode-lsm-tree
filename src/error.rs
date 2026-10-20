@@ -164,15 +164,14 @@ pub enum Error {
     /// repair's own post-commit cleanup, or the follow-up open inside
     /// [`Config::open_or_repair`](crate::Config::open_or_repair).
     ///
-    /// The report travels WITH the error because it exists only in that call:
-    /// the retry finds a healthy manifest (its open sweeps any cleanup
-    /// leftover itself), runs no repair, and answers `None` — an
-    /// external-WAL consumer would otherwise never learn its replay
-    /// obligation
+    /// The report travels WITH the error, so an external-WAL consumer learns
+    /// its replay obligation
     /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
-    /// and could keep stale or resurrected values. Consume the report exactly
-    /// as a successful repair's, then retry the open (`cause` is typically
-    /// transient).
+    /// whatever the retry finds. Consume the report exactly as a successful
+    /// repair's, then retry the open (`cause` is typically transient). When
+    /// the snapshot that owes the report survives, the retry hands it out
+    /// again with the same [`RepairReport::id`](crate::RepairReport::id):
+    /// skip one already applied.
     #[cfg(feature = "std")]
     RepairedButUnopened {
         /// The completed repair's report — not rederivable on a retry.
@@ -597,8 +596,8 @@ pub enum Error {
     /// crash holds either the state before it or the state it installed,
     /// whole. The payload is the failure itself.
     ///
-    /// From a repair, the report is kept on disk with the snapshot it
-    /// describes: when that snapshot turns out installed,
+    /// From a repair, the report rides in the snapshot it describes: when that
+    /// snapshot turns out installed,
     /// [`Config::open_or_repair`](crate::Config::open_or_repair) hands the
     /// report out; when it does not, its own repair answers with a fresh one.
     InstallOutcomeUnknown(alloc::boxed::Box<Self>),

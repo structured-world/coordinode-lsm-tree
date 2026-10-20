@@ -581,14 +581,8 @@ pub fn copy_metadata(
     // removed and the checkpoint retried). `PartialCheckpointGuard` performs
     // that removal on the normal error path.
     //
-    // A repair report the source still owes (an ordinary open keeps it for
-    // the next repairing open) describes losses in the data just linked, so
-    // the checkpoint owes it too: copied under the checkpoint's snapshot id
-    // first, so the install's directory sync makes its name durable with
-    // the snapshot's.
-    if let Some(report) = crate::file::owed_repair_report(src_fs, src_root)? {
-        crate::file::write_repair_report(target_fs, target_root, version.id(), &report, sync_mode)?;
-    }
+    // A repair report the source still owes describes losses in the data
+    // just linked, so the checkpoint owes it too: it rides in the version.
     crate::version::persist_version(
         target_root,
         version,

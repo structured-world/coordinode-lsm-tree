@@ -69,37 +69,3 @@ fn an_open_that_cannot_remove_an_orphan_fails() -> lsm_tree::Result<()> {
     assert!(config(folder.path()).with_fs(fs).open().is_err());
     Ok(())
 }
-
-/// A repair report's copy in a folder that holds no snapshot is from a repair
-/// whose snapshot was never installed: a creation there removes it, so the
-/// new tree hands out no report it does not owe.
-#[test]
-fn a_creation_removes_a_report_copy_no_snapshot_owns() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let copy = folder.path().join("repair-report-3");
-    std::fs::write(&copy, b"a report of a repair that never committed")?;
-
-    let (_tree, report) = config(folder.path()).open_or_repair(lsm_tree::RepairPolicy::default())?;
-    assert!(report.is_none(), "a new tree owes no report: {report:?}");
-    assert!(!copy.exists(), "the copy is removed");
-    Ok(())
-}
-
-/// A copy the creation cannot remove fails the creation: left in place it
-/// could name the snapshot the creation writes.
-#[test]
-fn a_creation_that_cannot_remove_a_report_copy_fails() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    std::fs::write(folder.path().join("repair-report-0"), b"stale")?;
-
-    let fs = FaultFs::new(StdFs);
-    fs.injector().arm(
-        FaultRule::new(
-            FaultOp::RemoveFile,
-            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
-        )
-        .on_path("repair-report-0"),
-    );
-    assert!(config(folder.path()).with_fs(fs).open().is_err());
-    Ok(())
-}

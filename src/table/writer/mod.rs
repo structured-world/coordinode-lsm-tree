@@ -1123,6 +1123,13 @@ fn row_group_ref(
 /// The header of a block among bytes copied from another table. A frame too
 /// short to hold one is a malformed copy, refused as one: the short read is of
 /// bytes in memory, not a failure of the file being written.
+#[cfg_attr(
+    not(any(feature = "std", feature = "columnar")),
+    expect(
+        dead_code,
+        reason = "only the verbatim copies of salvage and compaction read carried bytes"
+    )
+)]
 fn carried_header(frame: &[u8]) -> crate::Result<crate::table::block::Header> {
     use crate::coding::Decode;
     crate::table::block::Header::decode_from(&mut &*frame).map_err(|e| match e {

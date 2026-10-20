@@ -619,7 +619,12 @@ impl SuperVersions {
             n
         };
 
-        if log_size < self.log_rotate_bytes && !self.rotation_pending {
+        // An owed repair report lives in the snapshot alone, so a transition
+        // that changes it is written as one.
+        if log_size < self.log_rotate_bytes
+            && !self.rotation_pending
+            && prior.repair_report() == next.repair_report()
+        {
             // Common path: append the delta and fsync. No snapshot rewrite.
             let edit = next.diff(prior)?;
             match edit_log::append_edit(fs, &log_path, &edit, &mut self.edit_scratch, sync_mode) {
@@ -652,12 +657,6 @@ impl SuperVersions {
 
         // Rotation: write `next` as a fresh full snapshot and install it.
         let old_snapshot = self.snapshot_id;
-        // A repair report still owed to the caller moves to the new
-        // generation before it is installed; one left for a generation that
-        // never installs is swept by the next open.
-        let carried_report = old_snapshot != next.id()
-            && crate::file::carry_repair_report(fs, tree_path, old_snapshot, next.id(), sync_mode)
-                .inspect_err(|_| self.rotation_pending = true)?;
         if let Err(e) = persist_version(
             tree_path,
             next,
@@ -698,18 +697,6 @@ impl SuperVersions {
                 log::warn!(
                     "rotation: failed to remove old snapshot {}: {e}",
                     old_path.display()
-                );
-            }
-        }
-        if carried_report {
-            let old_report = tree_path.join(format!(
-                "{}{old_snapshot}",
-                crate::file::REPAIR_REPORT_PREFIX
-            ));
-            if let Err(e) = remove_if_present(fs, &old_report) {
-                log::warn!(
-                    "rotation: failed to remove the carried repair report {}: {e}",
-                    old_report.display()
                 );
             }
         }

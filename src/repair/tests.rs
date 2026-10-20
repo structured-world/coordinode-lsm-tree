@@ -250,6 +250,8 @@ fn wal_replay_scope_derives_from_lost_coverage() {
             damaged_dictionaries: Vec::new(),
             method: "test",
             warnings: Vec::new(),
+            id: 0,
+            includes: Vec::new(),
         }
     };
     let entry = |bound: Option<u64>| {
@@ -13179,9 +13181,10 @@ fn a_repair_whose_install_cannot_be_withdrawn_keeps_its_blob_replacements() -> c
 /// An install whose name cannot be taken back after its directory sync failed
 /// is still visible, yet a power loss may undo it. Until a directory sync has
 /// made it durable the repair has not committed, so it must not answer as a
-/// committed repair, nor retire the copy that carries its report.
+/// committed repair, nor install over it a snapshot that no longer owes its
+/// report.
 #[test]
-fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_copy() -> crate::Result<()> {
+fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_owed() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, SyncKind};
     use crate::io::ErrorKind;
 
@@ -13209,8 +13212,11 @@ fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_copy() -> cra
         .take(snapshot_synced)
         .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
         .count();
+    // The repair installs the rebuilt snapshot, then one over it that no
+    // longer owes the report.
     let id = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
-        .ok_or(crate::Error::Unrecoverable)?;
+        .ok_or(crate::Error::Unrecoverable)?
+        - 1;
 
     let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
     let fault = FaultFs::new(MemFs::clone(&memfs));
@@ -13239,8 +13245,8 @@ fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_copy() -> cra
         "self-check: the name could not be withdrawn",
     );
     assert!(
-        memfs.exists(&root.join(format!("repair-report-{id}")))?,
-        "the copy stays: the next open hands it out once the snapshot is installed",
+        crate::version::recovery::owed_repair_report(&root, &*memfs, None)?.is_some(),
+        "the visible snapshot owes the report: the next open hands it out",
     );
     Ok(())
 }
@@ -13336,11 +13342,12 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         .take(snapshot_synced)
         .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
         .count();
-    let snapshot = root.join(format!(
-        "v{}",
-        crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
-            .ok_or(crate::Error::Unrecoverable)?
-    ));
+    // A repair that hands its report out installs the rebuilt snapshot, which
+    // owes it, then one over it that does not.
+    let retired = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
+        .ok_or(crate::Error::Unrecoverable)?;
+    let rebuilt = retired - 1;
+    let snapshot = root.join(format!("v{rebuilt}"));
     assert_ne!(
         expected.wal_replay_scope(),
         crate::WalReplayScope::TailOnly,
@@ -13368,27 +13375,21 @@ fn an_unknown_install_that_survived() -> crate::Result<(
 
     // The power loss keeps the rename and loses the withdrawal. The snapshot
     // the faulted run renamed is gone with the withdrawal, and the files it
-    // names carry random bytes no other run reproduces; the tree the run
-    // without a fault installed over the same fixture stands in for it,
-    // beside the copy of the report the faulted run kept.
+    // names carry random bytes no other run reproduces; the rebuilt snapshot
+    // the run without a fault installed over the same fixture, which owes the
+    // same report, stands in for it, without the one that retired it.
     let survived = std::sync::Arc::new(MemFs::new());
     copy_folder(&probe_fs, &survived, &root)?;
-    let mut kept = 0;
-    for entry in memfs.read_dir(&root)? {
-        // The copy's own name, `repair-report-{id}`: digits after the prefix.
-        let copy = entry
-            .file_name
-            .strip_prefix("repair-report-")
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
-        if copy {
-            copy_file(&memfs, &survived, &entry.path)?;
-            kept += 1;
-        }
-    }
-    assert_eq!(kept, 1, "self-check: the faulted run kept its report");
+    survived.remove_file(&root.join(format!("v{retired}")))?;
+    survived.remove_file(&root.join(format!("edits-{retired}")))?;
+    assert_eq!(
+        crate::version::recovery::installed_snapshot(&root, &*survived)?,
+        Some(rebuilt),
+        "self-check: the rebuilt snapshot is back"
+    );
     assert!(
-        survived.exists(&snapshot)?,
-        "self-check: the snapshot is back"
+        crate::version::recovery::owed_repair_report(&root, &*survived, None)?.is_some(),
+        "self-check: it owes the report"
     );
     Ok((survived, root, expected))
 }
@@ -16754,12 +16755,12 @@ impl crate::fs::Fs for HookFs {
 
 /// `open_or_repair` holds the report of the repair it ran only in memory until
 /// it returns, and the open that follows the repair can be cut short (a crash
-/// of the process). So the report's copy stays on disk through that open, and
-/// the next call hands it out then; it is retired only once the open has
-/// succeeded and the report is about to be returned.
+/// of the process). So the installed snapshot keeps owing the report through
+/// that open, and the next call hands it out then; a snapshot that no longer
+/// owes it is installed only as the report is about to be returned.
 #[test]
-fn open_or_repair_keeps_the_report_copy_through_the_open_after_its_repair() -> crate::Result<()> {
-    use crate::fs::{Fs, MemFs};
+fn open_or_repair_keeps_the_report_owed_through_the_open_after_its_repair() -> crate::Result<()> {
+    use crate::fs::MemFs;
     use crate::{Config, RepairPolicy, SequenceNumberCounter};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -16768,28 +16769,25 @@ fn open_or_repair_keeps_the_report_copy_through_the_open_after_its_repair() -> c
     let root = std::path::absolute("/db")?;
     standard_tree_without_manifest(&memfs, &root)?;
 
-    // The repair installs v0; the open after it installs v1. When that open
-    // installs, a copy must still carry the report.
-    let copy_held = Arc::new(AtomicBool::new(false));
+    // The repair installs v0 and the open after it v1; the install that
+    // retires the report is v2. When it starts, v1 must still owe the report.
+    let owed_before = Arc::new(AtomicBool::new(false));
     let probe = (*memfs).clone();
     let probe_root = root.clone();
-    let held = Arc::clone(&copy_held);
+    let owed = Arc::clone(&owed_before);
     let fs = HookFs {
         inner: (*memfs).clone(),
         on: HookOn::RenameTo,
-        needle: root.join("v1").to_string_lossy().into_owned(),
+        needle: root.join("v2").to_string_lossy().into_owned(),
         fired: AtomicBool::new(false),
         hook: Box::new(move || {
-            let found = probe.read_dir(&probe_root).is_ok_and(|entries| {
-                entries
-                    .iter()
-                    .any(|e| crate::file::repair_report_name(&e.file_name).is_some())
-            });
-            held.store(found, Ordering::SeqCst);
+            let found = crate::version::recovery::owed_repair_report(&probe_root, &probe, None)
+                .is_ok_and(|report| report.is_some());
+            owed.store(found, Ordering::SeqCst);
         }),
     };
 
-    let (_tree, report) = Config::new(
+    let (tree, report) = Config::new(
         &root,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
@@ -16798,14 +16796,23 @@ fn open_or_repair_keeps_the_report_copy_through_the_open_after_its_repair() -> c
     .open_or_repair(RepairPolicy::default())?;
     assert!(report.is_some(), "self-check: the open was repaired");
     assert!(
-        copy_held.load(Ordering::SeqCst),
-        "the report's copy is still on disk while the open after the repair runs"
+        owed_before.load(Ordering::SeqCst),
+        "the installed snapshot owes the report while the open after the repair runs"
     );
-    let left = memfs
-        .read_dir(&root)?
-        .into_iter()
-        .any(|e| crate::file::repair_report_name(&e.file_name).is_some());
-    assert!(!left, "and retired once the report is handed out");
+    assert_eq!(
+        crate::version::recovery::owed_repair_report(&root, &*memfs, None)?,
+        None,
+        "and owes it no longer once the report is handed out"
+    );
+    drop(tree);
+    let (_tree, again) = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs((*memfs).clone())
+    .open_or_repair(RepairPolicy::default())?;
+    assert!(again.is_none(), "the report is handed out once");
     Ok(())
 }
 
@@ -17111,13 +17118,60 @@ fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
     Ok(())
 }
 
+/// The report an owing tree's tests hand it: one lost range of `root`.
+fn an_owed_report(root: &std::path::Path) -> super::RepairReport {
+    super::RepairReport {
+        recovered: 1,
+        salvaged: 1,
+        unreadable: 0,
+        unreadable_files: Vec::new(),
+        excluded_files: Vec::new(),
+        lost_coverage: vec![(
+            root.join("tables").join("3"),
+            crate::UserKey::from(&b"a"[..]),
+            crate::UserKey::from(&b"m"[..]),
+            Some(42),
+        )],
+        unknowable_losses: Vec::new(),
+        blob_files_salvaged: Vec::new(),
+        damaged_dictionaries: Vec::new(),
+        method: super::REPAIR_METHOD,
+        warnings: Vec::new(),
+        id: 5,
+        includes: Vec::new(),
+    }
+}
+
+/// Installs the tree `config` opens as a snapshot that owes `report`, as a
+/// repair whose report never reached its caller leaves one.
+fn owe_report(config: crate::Config, report: &super::RepairReport) -> crate::Result<()> {
+    use crate::AbstractTree;
+    let path = config.path.clone();
+    let fs = config.fs.clone();
+    let version = config.open()?.current_version();
+    let owing = version
+        .without_repair_report()
+        .with_repair_report(Some(std::sync::Arc::from(super::report_marker::encode(
+            report,
+        ))));
+    crate::version::persist_version(
+        &path,
+        &owing,
+        crate::comparator::default_comparator().name(),
+        &*fs,
+        std::sync::Arc::default(),
+        None,
+        crate::fs::SyncMode::Normal,
+    )
+}
+
 /// A checkpoint of a tree that still owes a repair's report (an ordinary open
 /// keeps it for the next repairing open) holds the repaired data, so it owes
 /// the report too: opening the checkpoint with `open_or_repair` hands it out.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
-    use crate::fs::{Fs, MemFs};
+    use crate::fs::MemFs;
     use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
     use std::sync::Arc;
 
@@ -17137,34 +17191,8 @@ fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
         tree.insert(b"k", b"v", 0);
         tree.flush_active_memtable(0)?;
     }
-
-    // The copy a repair whose install outcome was unknown left for the
-    // snapshot the tree now opens.
-    let installed = memfs
-        .read_dir(&root)?
-        .into_iter()
-        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
-        .max()
-        .expect("the tree has a snapshot");
-    let owed = super::RepairReport {
-        recovered: 1,
-        salvaged: 1,
-        unreadable: 0,
-        unreadable_files: Vec::new(),
-        excluded_files: Vec::new(),
-        lost_coverage: vec![(
-            root.join("tables").join("3"),
-            crate::UserKey::from(&b"a"[..]),
-            crate::UserKey::from(&b"m"[..]),
-            Some(42),
-        )],
-        unknowable_losses: Vec::new(),
-        blob_files_salvaged: Vec::new(),
-        damaged_dictionaries: Vec::new(),
-        method: super::REPAIR_METHOD,
-        warnings: Vec::new(),
-    };
-    super::report_marker::write(&config(&root), installed, &owed)?;
+    let owed = an_owed_report(&root);
+    owe_report(config(&root), &owed)?;
 
     let tree = config(&root).open()?;
     tree.create_checkpoint(&target)?;
@@ -17173,6 +17201,7 @@ fn a_checkpoint_carries_the_report_its_tree_still_owes() -> crate::Result<()> {
     let (checkpoint, report) = config(&target).open_or_repair(RepairPolicy::default())?;
     let report = report.expect("the checkpoint owes the report");
     assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert_eq!(report.id, owed.id, "the same report, under its id");
     assert_eq!(
         checkpoint.get(b"k", u64::MAX)?.as_deref(),
         Some(b"v".as_ref())
@@ -17207,31 +17236,8 @@ fn a_pinned_restore_carries_the_report_its_tree_still_owes() -> crate::Result<()
         tree.insert(b"k", b"v", 0);
         tree.flush_active_memtable(0)?;
     }
-    let installed = memfs
-        .read_dir(&root)?
-        .into_iter()
-        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
-        .max()
-        .expect("the tree has a snapshot");
-    let owed = super::RepairReport {
-        recovered: 1,
-        salvaged: 1,
-        unreadable: 0,
-        unreadable_files: Vec::new(),
-        excluded_files: Vec::new(),
-        lost_coverage: vec![(
-            root.join("tables").join("3"),
-            crate::UserKey::from(&b"a"[..]),
-            crate::UserKey::from(&b"m"[..]),
-            Some(42),
-        )],
-        unknowable_losses: Vec::new(),
-        blob_files_salvaged: Vec::new(),
-        damaged_dictionaries: Vec::new(),
-        method: super::REPAIR_METHOD,
-        warnings: Vec::new(),
-    };
-    super::report_marker::write(&config(&root), installed, &owed)?;
+    let owed = an_owed_report(&root);
+    owe_report(config(&root), &owed)?;
 
     let tree = config(&root).open()?;
     let pin = tree.pin();
@@ -17265,71 +17271,47 @@ fn a_pinned_restore_carries_the_report_its_tree_still_owes() -> crate::Result<()
     Ok(())
 }
 
-/// A copy of the report that is gone when the checkpoint opens it (a
-/// rotation carried the report to its next snapshot and removed the old
-/// copy) is looked for again: the checkpoint still carries the report.
+/// The report a tree owes survives its rotations, which write the version
+/// that owes it as a snapshot of its own: a repairing open after several
+/// still hands it out, once.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn a_checkpoint_carries_the_report_past_a_copy_a_rotation_removed() -> crate::Result<()> {
-    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+fn an_owed_report_survives_the_rotations_of_its_tree() -> crate::Result<()> {
+    use crate::fs::MemFs;
     use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
     use std::sync::Arc;
 
-    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let memfs = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
-    let target = std::path::absolute("/checkpoint")?;
-    let config = |path: &std::path::Path| {
+    let config = || {
         Config::new(
-            path,
+            &root,
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_shared_fs(fs.clone())
+        .with_shared_fs(memfs.clone())
+        .manifest_log_rotate_bytes(0)
     };
+    let owed = an_owed_report(&root);
+    owe_report(config(), &owed)?;
     {
-        let tree = config(&root).open()?;
-        tree.insert(b"k", b"v", 0);
-        tree.flush_active_memtable(0)?;
+        let tree = config().open()?;
+        for seqno in 0..3 {
+            tree.insert(b"k", b"v", seqno);
+            tree.flush_active_memtable(0)?;
+        }
     }
-    let installed = fs
-        .read_dir(&root)?
-        .into_iter()
-        .filter_map(|entry| entry.file_name.strip_prefix('v')?.parse::<u64>().ok())
-        .max()
-        .expect("the tree has a snapshot");
-    let owed = super::RepairReport {
-        recovered: 1,
-        salvaged: 1,
-        unreadable: 0,
-        unreadable_files: Vec::new(),
-        excluded_files: Vec::new(),
-        lost_coverage: vec![(
-            root.join("tables").join("3"),
-            crate::UserKey::from(&b"a"[..]),
-            crate::UserKey::from(&b"m"[..]),
-            Some(42),
-        )],
-        unknowable_losses: Vec::new(),
-        blob_files_salvaged: Vec::new(),
-        damaged_dictionaries: Vec::new(),
-        method: super::REPAIR_METHOD,
-        warnings: Vec::new(),
-    };
-    super::report_marker::write(&config(&root), installed, &owed)?;
 
-    let tree = config(&root).open()?;
-    // The copy the checkpoint picks is gone by the time it opens it.
-    fs.injector().arm(
-        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::NotFound))
-            .on_path(root.join("repair-report-").to_string_lossy())
-            .once(),
+    let (tree, report) = config().open_or_repair(RepairPolicy::default())?;
+    assert_eq!(
+        report
+            .expect("the tree still owes the report")
+            .lost_coverage,
+        owed.lost_coverage
     );
-    tree.create_checkpoint(&target)?;
     drop(tree);
-
-    let (_, report) = config(&target).open_or_repair(RepairPolicy::default())?;
-    let report = report.expect("the checkpoint owes the report");
-    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    let (_tree, again) = config().open_or_repair(RepairPolicy::default())?;
+    assert!(again.is_none(), "handed out once");
     Ok(())
 }
 

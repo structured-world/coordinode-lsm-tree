@@ -19,6 +19,7 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         blob_restrictions: crate::HashMap::default(),
         retention_floor: 0,
         dicts: Vec::new(),
+        repair_report: None,
     }
 }
 

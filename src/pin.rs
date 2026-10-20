@@ -158,10 +158,6 @@ pub struct PinnedVersion {
     comparator_name: Arc<str>,
     runtime: Arc<RuntimeConfig>,
     encryption: Option<Arc<dyn EncryptionProvider>>,
-    /// The source tree's folder and its filesystem: where the repair report
-    /// the tree still owes lies, which the layout carries along.
-    tree_fs: Arc<dyn Fs>,
-    tree_path: PathBuf,
 }
 
 impl PinnedVersion {
@@ -243,8 +239,6 @@ impl PinnedVersion {
             comparator_name: tree.config.comparator.name().into(),
             runtime: tree.runtime_config.load_full(),
             encryption: tree.config.encryption.clone(),
-            tree_fs: Arc::clone(&tree.config.fs),
-            tree_path: tree.config.path.clone(),
         }
     }
 
@@ -276,17 +270,15 @@ impl PinnedVersion {
 
     /// The version descriptor a manifest would hold for the pinned files
     /// (levels, runs, restrictions, blob files, dictionaries, the retention
-    /// floor), serialized in memory, sealed with the tree's encryption
-    /// provider when it has one, with the repair report the tree still owes
-    /// when an ordinary open kept one for the next repairing open: the
-    /// pinned files hold that repair's data, so the restored tree owes it
-    /// too. Opaque: hand it to
+    /// floor, a repair report the tree still owes: the pinned files hold
+    /// that repair's data, so the restored tree owes it too), serialized in
+    /// memory, sealed with the tree's encryption provider when it has one.
+    /// Opaque: hand it to
     /// [`Config::restore_pinned`](crate::Config::restore_pinned).
     ///
     /// # Errors
     ///
-    /// Propagates an encoding or encryption failure, or a failure to read
-    /// the owed report.
+    /// Propagates an encoding or encryption failure.
     pub fn layout(&self) -> crate::Result<Vec<u8>> {
         let fs = MemFs::new();
         let path = Path::new("/layout");
@@ -309,17 +301,6 @@ impl PinnedVersion {
         // The pin's seqno rides along: the restored tree's counters start at
         // it, so a later write there lands above what the pin served.
         layout.extend_from_slice(&self.seqno.to_le_bytes());
-        // The owed report, sealed as its copies lie: a presence byte, then
-        // its length and bytes. Presence is its own field because a copy cut
-        // to zero bytes is still owed (it reads back as an unscoped loss).
-        match crate::file::owed_repair_report(&*self.tree_fs, &self.tree_path)? {
-            Some(report) => {
-                layout.push(1);
-                layout.extend_from_slice(&(report.len() as u64).to_le_bytes());
-                layout.extend_from_slice(&report);
-            }
-            None => layout.push(0),
-        }
         fs.open(path, &FsOpenOptions::new().read(true))?
             .read_to_end(&mut layout)?;
         Ok(layout)
@@ -397,26 +378,9 @@ pub fn restore(
     let (id, rest) = rest
         .split_first_chunk::<8>()
         .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
-    let (pin_seqno, rest) = rest
+    let (pin_seqno, manifest) = rest
         .split_first_chunk::<8>()
         .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
-    let (owes_report, rest) = rest
-        .split_first()
-        .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
-    let (report, manifest) = match owes_report {
-        0 => (None, rest),
-        1 => {
-            let (report_len, rest) = rest
-                .split_first_chunk::<8>()
-                .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
-            let (report, manifest) = usize::try_from(u64::from_le_bytes(*report_len))
-                .ok()
-                .and_then(|len| rest.split_at_checked(len))
-                .ok_or(crate::Error::InvalidHeader("pinned layout"))?;
-            (Some(report), manifest)
-        }
-        _ => return Err(crate::Error::InvalidHeader("pinned layout")),
-    };
     let version_id = u64::from_le_bytes(*id);
     let pin_seqno = u64::from_le_bytes(*pin_seqno);
 
@@ -441,8 +405,7 @@ pub fn restore(
                 .strip_prefix('v')
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
     };
-    // Judged before anything goes: a tree found here keeps every file,
-    // its report copy included.
+    // Judged before anything goes: a tree found here keeps every file.
     if !resuming && let Some(entry) = dirents.iter().find(|entry| manifest_file(&entry.file_name)) {
         return Err(crate::Error::from(crate::io::Error::new(
             crate::io::ErrorKind::AlreadyExists,
@@ -453,13 +416,9 @@ pub fn restore(
             ),
         )));
     }
-    // The interrupted restore's manifest goes, and so does any report copy:
-    // one it wrote under the snapshot id this restore installs again would
-    // otherwise be handed out for a layout that owes no report.
+    // The interrupted restore's manifest goes.
     for dirent in dirents {
-        if manifest_file(&dirent.file_name)
-            || crate::file::repair_report_name(&dirent.file_name).is_some()
-        {
+        if manifest_file(&dirent.file_name) {
             fs.remove_file(&dirent.path)?;
         }
     }
@@ -513,12 +472,6 @@ pub fn restore(
     FsFile::sync_data_with(&*file, sync_mode)?;
     drop(file);
     crate::version::edit_log::create_log(&*fs, &root, version_id, sync_mode)?;
-    // The report the source still owed, under the restored snapshot's id, so
-    // a repairing open of the restored tree hands it out; named before the
-    // snapshot, so the directory sync below makes both durable together.
-    if let Some(report) = report {
-        crate::file::write_repair_report(&*fs, &root, version_id, report, sync_mode)?;
-    }
     fs.rename(&temporary, &root.join(format!("v{version_id}")))?;
     fsync_directory(&root, &*fs, sync_mode)?;
 

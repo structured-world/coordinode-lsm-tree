@@ -9,7 +9,6 @@ use crate::{
     Slice,
     fs::{Fs, FsFile, SyncMode},
 };
-use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use std::io::Write;
 
@@ -58,29 +57,6 @@ pub fn table_id_from_repair_tmp_name(file_name: &str) -> Option<crate::TableId> 
         .and_then(|id| id.parse::<crate::TableId>().ok())
 }
 
-/// Prefix of the durable copy of a manifest repair's report.
-///
-/// `{prefix}{id}` is the copy for the rebuilt snapshot `v{id}`,
-/// `{prefix}{id}.tmp` the copy while it is written. Recognized here rather
-/// than in `repair` so an open without that (std-only) module still sweeps a
-/// copy whose snapshot was never installed.
-pub const REPAIR_REPORT_PREFIX: &str = "repair-report-";
-
-/// The snapshot id a repair report copy's name claims, and whether it is the
-/// temporary.
-///
-/// `None` for any other name, so an operator's `repair-report-notes` is never
-/// swept.
-#[must_use]
-pub fn repair_report_name(file_name: &str) -> Option<(u64, bool)> {
-    let rest = file_name.strip_prefix(REPAIR_REPORT_PREFIX)?;
-    let (digits, temporary) = match rest.strip_suffix(".tmp") {
-        Some(digits) => (digits, true),
-        None => (rest, false),
-    };
-    canonical_id(digits).map(|id| (id, temporary))
-}
-
 /// The id `digits` spells in the form the engine writes ids into names.
 ///
 /// Decimal, with no sign and no leading zero. Any other spelling names a file
@@ -92,164 +68,6 @@ pub fn canonical_id(digits: &str) -> Option<u64> {
         && digits.bytes().all(|b| b.is_ascii_digit())
         && (digits == "0" || !digits.starts_with('0'));
     if canonical { digits.parse().ok() } else { None }
-}
-
-/// Carries the copy of a repair report kept for snapshot `from` in `folder`
-/// over to snapshot `to`, which a rotation is about to install.
-///
-/// The report is still owed, and an open keeps only the copy of the installed
-/// snapshot. The copy for `to` is written under a temporary name, synced and renamed,
-/// so the install's directory sync makes its name durable with the
-/// snapshot's. Returns whether there was one to carry.
-///
-/// With none to carry, a copy already under `to` goes: it was left by a
-/// repair whose rebuilt snapshot `to` was never installed (a repair takes the
-/// id above the installed one, as an install does), and the snapshot about to
-/// take that id owes no report. Its removal becomes durable with the install.
-///
-/// The bytes travel as they are: the copy is sealed with the tree's
-/// encryption provider, which does not change between generations.
-///
-/// # Errors
-///
-/// Propagates a failure to read the copy, to write the new one, or to remove
-/// a stale one.
-pub fn carry_repair_report(
-    fs: &dyn Fs,
-    folder: &Path,
-    from: u64,
-    to: u64,
-    sync_mode: SyncMode,
-) -> crate::Result<bool> {
-    let Some(bytes) = read_repair_report(fs, folder, from)? else {
-        match fs.remove_file(&repair_report_path(folder, to)) {
-            Ok(()) => log::warn!(
-                "removed the report copy of snapshot {to}, which a repair never installed"
-            ),
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        return Ok(false);
-    };
-    write_repair_report(fs, folder, to, &bytes, sync_mode)?;
-    Ok(true)
-}
-
-/// The bytes of the copy of a repair report kept for snapshot `id` in
-/// `folder`, sealed as they lie; `None` when there is none.
-fn read_repair_report(fs: &dyn Fs, folder: &Path, id: u64) -> crate::Result<Option<Vec<u8>>> {
-    use crate::fs::FsOpenOptions;
-    let source = repair_report_path(folder, id);
-    let file = match fs.open(&source, &FsOpenOptions::new().read(true)) {
-        Ok(file) => file,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let len = usize::try_from(file.metadata()?.len)
-        .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
-    Ok(Some(read_exact(&*file, 0, len)?.to_vec()))
-}
-
-/// The repair report the tree in `folder` still owes, sealed as its copies
-/// lie; `None` when it owes none.
-///
-/// While a tree is open, every copy it holds carries the one report its
-/// opening repair left, so the newest stands for all of them. A rotation
-/// carries it to its next snapshot and then removes the old copy, so a copy
-/// gone when read means a newer one is there: the newest is looked for
-/// again. A copy is retired only by the repairing open, never while the
-/// tree is open.
-///
-/// # Errors
-///
-/// Propagates a failure to list the folder or read a copy, and fails with
-/// `NotFound` when the newest copy is still listed after it was found gone:
-/// a name that does not open (a dangling link) is no copy being rotated away.
-pub fn owed_repair_report(fs: &dyn Fs, folder: &Path) -> crate::Result<Option<Vec<u8>>> {
-    let mut gone = None;
-    loop {
-        let newest = fs
-            .read_dir(folder)?
-            .into_iter()
-            .filter(|entry| !entry.is_dir)
-            .filter_map(|entry| match repair_report_name(&entry.file_name) {
-                Some((id, false)) => Some(id),
-                _ => None,
-            })
-            .max();
-        let Some(id) = newest else {
-            return Ok(None);
-        };
-        if let Some(bytes) = read_repair_report(fs, folder, id)? {
-            return Ok(Some(bytes));
-        }
-        if gone == Some(id) {
-            return Err(crate::io::Error::new(
-                crate::io::ErrorKind::NotFound,
-                "a listed repair report copy does not open",
-            )
-            .into());
-        }
-        gone = Some(id);
-    }
-}
-
-/// The copy of a repair report for snapshot `id` in `folder`.
-#[must_use]
-pub fn repair_report_path(folder: &Path, id: u64) -> crate::path::PathBuf {
-    folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}"))
-}
-
-/// The temporary name of the copy of a repair report for snapshot `id` in
-/// `folder`: never read as a copy, and swept by an open.
-#[must_use]
-pub fn repair_report_temporary_path(folder: &Path, id: u64) -> crate::path::PathBuf {
-    folder.join(alloc::format!("{REPAIR_REPORT_PREFIX}{id}.tmp"))
-}
-
-/// Writes `bytes` as the copy of a repair report for snapshot `id` in
-/// `folder`.
-///
-/// Under a temporary name, synced and renamed, so the directory sync that
-/// installs the snapshot makes its name durable with the snapshot's. A
-/// temporary a failed write leaves is removed when it can be; an open sweeps
-/// one that is not.
-///
-/// # Errors
-///
-/// Propagates a failure to write, sync or rename the copy.
-pub fn write_repair_report(
-    fs: &dyn Fs,
-    folder: &Path,
-    id: u64,
-    bytes: &[u8],
-    sync_mode: SyncMode,
-) -> crate::Result<()> {
-    use crate::fs::FsOpenOptions;
-    let target = repair_report_path(folder, id);
-    let temporary = repair_report_temporary_path(folder, id);
-    let publish = (|| -> crate::Result<()> {
-        let mut copy = fs.open(
-            &temporary,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        copy.write_all(bytes)?;
-        copy.flush()?;
-        FsFile::sync_all_with(&*copy, sync_mode)?;
-        drop(copy);
-        fs.rename(&temporary, &target)?;
-        Ok(())
-    })();
-    if publish.is_err()
-        && let Err(e) = fs.remove_file(&temporary)
-        && e.kind() != crate::io::ErrorKind::NotFound
-    {
-        log::warn!(
-            "could not remove {} ({e}); the next open sweeps it",
-            temporary.display(),
-        );
-    }
-    publish
 }
 
 /// Suffix of a manifest repair's in-progress blob salvage copy.

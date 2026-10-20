@@ -445,6 +445,30 @@ pub fn verify_snapshot(
     check_identity(&mut archive, id)
 }
 
+/// The encoded report of a repair the installed snapshot of the tree in
+/// `folder` still owes; `None` when there is no snapshot or it owes none.
+///
+/// # Errors
+///
+/// Propagates a failure to list the folder or to open and verify the
+/// snapshot.
+#[cfg(feature = "std")]
+pub fn owed_repair_report(
+    folder: &Path,
+    fs: &dyn Fs,
+    encryption: Option<alloc::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
+) -> crate::Result<Option<Vec<u8>>> {
+    let Some(id) = installed_snapshot(folder, fs)? else {
+        return Ok(None);
+    };
+    let mut archive = open_snapshot(folder, id, fs, encryption)?;
+    check_identity(&mut archive, id)?;
+    if archive.section("repair_report").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(archive.read_section("repair_report")?))
+}
+
 /// The name of the version pointer the format before this one kept beside its
 /// snapshots.
 const PREVIOUS_FORMAT_POINTER: &str = "current";
@@ -583,6 +607,9 @@ pub struct Recovery {
     /// replayed edit that carries the section. Wholesale, like the restriction
     /// sets above: an edit that drops a dictionary has to be able to say so.
     pub dicts: Vec<crate::file::DictId>,
+    /// The encoded report of a repair the tree still owes, from the snapshot's
+    /// `repair_report` section. Edits never carry it: only a snapshot does.
+    pub repair_report: Option<Vec<u8>>,
 }
 
 impl Recovery {
@@ -798,6 +825,11 @@ pub fn recover(
         blob_restrictions,
         retention_floor,
         dicts,
+        repair_report: if archive.section("repair_report").is_some() {
+            Some(archive.read_section("repair_report")?)
+        } else {
+            None
+        },
     };
 
     // Replay the incremental edit log layered on top of the snapshot. The log

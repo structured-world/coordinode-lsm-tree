@@ -1,238 +1,68 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! The durable copy of a repair's report, kept beside the tree's snapshots
-//! from before the rebuilt snapshot is installed until the report is handed
-//! to the caller.
+//! The encoding of a repair's report, as the snapshot that owes it holds it.
 //!
-//! The report is the caller's only account of what the repair lost, and so
-//! of the WAL replay it owes. When the install's outcome is unknown (its
-//! directory sync and the withdrawal's both failed), the repair ends in an
-//! error, yet a power loss may still keep the rebuilt snapshot; the next open
-//! then finds a healthy tree and runs no repair. The copy, named after the
-//! snapshot it describes, outlives that: [`Config::open_or_repair`] hands it
-//! out once that snapshot is the installed one, and an open sweeps a copy
-//! whose snapshot never was.
-//!
-//! The copy describes the tree as the commit leaves it, plus the damaged
-//! dictionaries the repair sets aside right after the commit: a run that ends
-//! after moving one and before the report reaches the caller leaves only this
-//! copy to say where its bytes went. It is sealed with the tree's encryption
-//! provider, since its key ranges are the tree's keys.
+//! The report is the caller's only account of what the repair lost, and so of
+//! the WAL replay it owes. The rebuilt snapshot carries it in its
+//! `repair_report` section, from the commit until a repairing open hands it
+//! out and installs a version that no longer owes it: living in the snapshot,
+//! it is there exactly when that snapshot is installed, whatever the install's
+//! outcome. The snapshot is sealed with the tree's encryption provider, which
+//! covers the report's key ranges with it.
 
 use super::RepairReport;
-use crate::config::Config;
-use crate::file::repair_report_name;
-use crate::fs::FsOpenOptions;
 use crate::{Slice, UserKey};
 use std::path::{Path, PathBuf};
 
-/// Leading bytes of a copy, so a file of another kind under the name is
-/// refused rather than misread.
+/// Leading bytes of an encoded report, so bytes of another kind are refused
+/// rather than misread.
 const MAGIC: &[u8; 8] = b"LSMRPRT1";
 
 /// Length of the trailing XXH3-64 over everything before it.
 const CHECKSUM_LEN: usize = 8;
 
-/// Writes the copy of `report` for the rebuilt snapshot `id`: under a
-/// temporary name, synced, renamed onto its name, and the folder synced, so
-/// it is durable before the snapshot it describes can be.
-///
-/// # Errors
-///
-/// Propagates the encryption or filesystem failure; nothing is published then.
-pub(super) fn write(config: &Config, id: u64, report: &RepairReport) -> crate::Result<()> {
-    let plain = encode(report);
-    let content = match &config.encryption {
-        Some(enc) => enc.encrypt(&plain)?,
-        None => plain,
-    };
-    crate::file::write_repair_report(&*config.fs, &config.path, id, &content, config.sync_mode)?;
-    config
-        .fs
-        .sync_directory_with(&config.path, config.sync_mode)?;
-    Ok(())
-}
-
-/// The copies in the tree folder (only the one on snapshot `only`, when
-/// given), read back: the report each holds, or, for one that does not
-/// decode, a report that leaves the loss unscoped. More than one are folded
-/// into one.
-///
-/// # Errors
-///
-/// Propagates a failure to list the folder or read a copy.
-pub(super) fn read_all(config: &Config, only: Option<u64>) -> crate::Result<Option<RepairReport>> {
-    let mut found: Option<RepairReport> = None;
-    for entry in config.fs.read_dir(&config.path)? {
-        let Some((id, false)) = repair_report_name(&entry.file_name) else {
-            continue;
-        };
-        if entry.is_dir || only.is_some_and(|only| only != id) {
-            continue;
-        }
-        let report = read(config, &entry.path)?;
-        match &mut found {
-            Some(into) => super::fold_report(into, report),
-            None => found = Some(report),
-        }
-    }
-    Ok(found)
-}
-
-/// Reads the copy at `path`.
-fn read(config: &Config, path: &Path) -> crate::Result<RepairReport> {
-    let file = config.fs.open(path, &FsOpenOptions::new().read(true))?;
-    let len = usize::try_from(file.metadata()?.len)
-        .map_err(|_| crate::Error::InvalidHeader("repair report copy length"))?;
-    let content = crate::file::read_exact(&*file, 0, len)?;
-    let plain = match &config.encryption {
-        Some(enc) => match enc.decrypt(&content) {
-            Ok(plain) => Some(plain),
-            Err(e) => {
-                log::error!(
-                    "repair: the report copy {} does not decrypt: {e}",
-                    path.display()
-                );
-                None
-            }
-        },
-        None => Some(content.to_vec()),
-    };
-    Ok(plain
-        .as_deref()
-        .and_then(decode)
-        .unwrap_or_else(|| unreadable_copy(path)))
-}
-
-/// What a copy that does not decode still says: a repair lost something it
-/// can no longer scope. The copy's own path stands for the loss, which makes
+/// The report `bytes` encode, or, when they do not decode, a report that
+/// leaves the loss unscoped: a repair lost something it can no longer say.
+/// `tree` stands for the loss, which makes
 /// [`RepairReport::wal_replay_scope`] answer
 /// [`FullHistory`](super::WalReplayScope::FullHistory).
-fn unreadable_copy(path: &Path) -> RepairReport {
-    log::error!(
-        "repair: the report copy {} is damaged; its losses are unscoped",
-        path.display(),
-    );
-    RepairReport {
-        recovered: 0,
-        salvaged: 0,
-        unreadable: 0,
-        unreadable_files: Vec::new(),
-        excluded_files: Vec::new(),
-        lost_coverage: Vec::new(),
-        unknowable_losses: vec![path.to_path_buf()],
-        blob_files_salvaged: Vec::new(),
-        damaged_dictionaries: Vec::new(),
-        method: super::REPAIR_METHOD,
-        warnings: vec![super::WARN_REPORT_COPY_DAMAGED],
-    }
-}
-
-/// How the removal of the copies ended when it did not end well.
-pub(super) enum Retire {
-    /// A copy is still there, so it still carries the report: an open hands
-    /// it out, and handing it out now as well would hand it out twice.
-    Kept(crate::Error),
-    /// Every copy is gone, the folder sync that makes that durable failed, and
-    /// no copy could be put back: hand the report out now, since none is left
-    /// to carry it.
-    Unsynced(crate::Error),
-}
-
-/// Removes every copy and its temporary, then syncs the folder once.
-///
-/// Temporaries go first, then the copies from the oldest snapshot up: the
-/// newest one carries the losses of every repair folded into it, so a removal
-/// that fails partway must leave it, not an older copy that names less.
-///
-/// A removal the folder sync did not make durable may come back after a power
-/// loss, and an open would then hand the report out again. So the newest copy
-/// is only set aside under its temporary name, which no open reads as a copy,
-/// until that sync succeeds; when it fails, the copy is put back and the
-/// report withheld ([`Retire::Kept`]): an open hands it out once, from the
-/// copy.
-pub(super) fn retire(config: &Config) -> Result<(), Retire> {
-    let mut copies: Vec<(bool, u64, PathBuf)> = config
-        .fs
-        .read_dir(&config.path)
-        .map_err(|e| Retire::Kept(e.into()))?
-        .into_iter()
-        .filter(|entry| !entry.is_dir)
-        .filter_map(|entry| {
-            let (id, temporary) = repair_report_name(&entry.file_name)?;
-            Some((!temporary, id, entry.path))
-        })
-        .collect();
-    copies.sort_unstable();
-    let newest = match copies.pop() {
-        Some((true, id, path)) => Some((id, path)),
-        other => {
-            copies.extend(other);
-            None
-        }
-    };
-    let mut changed = false;
-    for (_, _, path) in copies {
-        match config.fs.remove_file(&path) {
-            Ok(()) => changed = true,
-            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Retire::Kept(e.into())),
-        }
-    }
-    let aside = match newest {
-        Some((id, path)) => {
-            let aside = crate::file::repair_report_temporary_path(&config.path, id);
-            config
-                .fs
-                .rename(&path, &aside)
-                .map_err(|e| Retire::Kept(e.into()))?;
-            changed = true;
-            Some((path, aside))
-        }
-        None => None,
-    };
-    if changed
-        && let Err(e) = config
-            .fs
-            .sync_directory_with(&config.path, config.sync_mode)
-    {
-        return Err(put_back(config, aside, e.into()));
-    }
-    if let Some((_, aside)) = aside
-        && let Err(e) = config.fs.remove_file(&aside)
-        && e.kind() != crate::io::ErrorKind::NotFound
-    {
-        log::warn!(
-            "could not remove {} ({e}); the next open sweeps it",
-            aside.display()
+pub(super) fn decode_owed(bytes: &[u8], tree: &Path) -> RepairReport {
+    decode(bytes).unwrap_or_else(|| {
+        log::error!(
+            "repair: the report owed by {} is damaged; its losses are unscoped",
+            tree.display(),
         );
-    }
-    Ok(())
+        RepairReport {
+            recovered: 0,
+            salvaged: 0,
+            unreadable: 0,
+            unreadable_files: Vec::new(),
+            excluded_files: Vec::new(),
+            lost_coverage: Vec::new(),
+            unknowable_losses: vec![tree.to_path_buf()],
+            blob_files_salvaged: Vec::new(),
+            damaged_dictionaries: Vec::new(),
+            method: super::REPAIR_METHOD,
+            warnings: vec![super::WARN_REPORT_COPY_DAMAGED],
+            id: 0,
+            includes: Vec::new(),
+        }
+    })
 }
 
-/// Puts the newest copy, set aside as `(name, aside)`, back under its name
-/// after the sync retiring it failed, and says whether a copy carries the
-/// report now.
-fn put_back(config: &Config, aside: Option<(PathBuf, PathBuf)>, cause: crate::Error) -> Retire {
-    let Some((path, aside)) = aside else {
-        return Retire::Unsynced(cause);
-    };
-    let restored = config.fs.rename(&aside, &path).and_then(|()| {
-        config
-            .fs
-            .sync_directory_with(&config.path, config.sync_mode)
-    });
-    let Err(e) = restored else {
-        return Retire::Kept(cause);
-    };
-    log::warn!("repair: could not put the report copy back: {e}");
-    // A copy an open can still see carries the report, durable or not; only
-    // one that is surely gone leaves it to this call.
-    match config.fs.exists(&path) {
-        Ok(false) => Retire::Unsynced(cause),
-        Ok(true) | Err(_) => Retire::Kept(cause),
-    }
+/// The id of `report`, rebuilt as version `version_id`: a 128-bit digest of
+/// what it says, that version and the time on the tree's `clock`, so two
+/// repairs never share one.
+pub(super) fn id_for(
+    report: &RepairReport,
+    version_id: u64,
+    clock: Option<&alloc::sync::Arc<dyn crate::time::Clock>>,
+) -> u128 {
+    let mut seed = encode(report);
+    seed.extend_from_slice(&version_id.to_le_bytes());
+    seed.extend_from_slice(&crate::time::now_on(clock).as_nanos().to_le_bytes());
+    xxhash_rust::xxh3::xxh3_128(&seed)
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
@@ -273,7 +103,8 @@ fn put_notes(out: &mut Vec<u8>, notes: &[(PathBuf, String)]) {
     }
 }
 
-fn encode(report: &RepairReport) -> Vec<u8> {
+/// The bytes the snapshot that owes `report` holds.
+pub(super) fn encode(report: &RepairReport) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     put_u64(&mut out, report.recovered as u64);
     put_u64(&mut out, report.salvaged as u64);
@@ -308,12 +139,17 @@ fn encode(report: &RepairReport) -> Vec<u8> {
         })
         .collect();
     put_bytes(&mut out, &warnings);
+    out.extend_from_slice(&report.id.to_le_bytes());
+    put_u64(&mut out, report.includes.len() as u64);
+    for id in &report.includes {
+        out.extend_from_slice(&id.to_le_bytes());
+    }
     let checksum = crate::hash::hash64(&out);
     put_u64(&mut out, checksum);
     out
 }
 
-/// A cursor over a copy's bytes; every read is bounds-checked.
+/// A cursor over an encoded report; every read is bounds-checked.
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -329,6 +165,10 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn u128(&mut self) -> Option<u128> {
+        Some(u128::from_le_bytes(self.take(16)?.try_into().ok()?))
     }
 
     /// A count of entries each at least `min` bytes long: one the remaining
@@ -424,6 +264,12 @@ fn decode(plain: &[u8]) -> Option<RepairReport> {
         .iter()
         .map(|&i| super::WARNINGS.get(usize::from(i)).copied())
         .collect::<Option<Vec<_>>>()?;
+    let id = r.u128()?;
+    let count = r.count(16)?;
+    let mut includes = Vec::with_capacity(count);
+    for _ in 0..count {
+        includes.push(r.u128()?);
+    }
     if !r.0.is_empty() {
         return None;
     }
@@ -439,6 +285,8 @@ fn decode(plain: &[u8]) -> Option<RepairReport> {
         damaged_dictionaries,
         method: super::REPAIR_METHOD,
         warnings,
+        id,
+        includes,
     })
 }
 

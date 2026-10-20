@@ -1053,6 +1053,8 @@ pub fn install_manifest(
             .collect(),
         retention_floor: image.retention_floor,
         dicts: image.dicts.clone(),
+        // An imported tree owes no repair report.
+        repair_report: None,
     };
     let version = crate::version::Version::from_recovery(
         recovery,

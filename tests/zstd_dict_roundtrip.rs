@@ -1416,11 +1416,11 @@ mod zstd_dict {
     fn a_kept_report_names_the_dictionary_the_repair_set_aside() -> lsm_tree::Result<()> {
         use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
 
-        // A repair that ends before its report reaches the caller leaves the
-        // report's copy behind, and the next open hands that copy out. The
-        // dictionary is set aside before the copy is retired, so the copy has
-        // to name it: the open finds the dictionary gone from its name and has
-        // nothing else to say where its bytes went.
+        // A repair whose report never stops being owed leaves it in the
+        // rebuilt snapshot, and the next open hands it out. The dictionary is
+        // set aside after the commit, so the report has to name it: the open
+        // finds the dictionary gone from its name and has nothing else to say
+        // where its bytes went.
         let dir = tempfile::tempdir()?;
         let dict = make_test_dictionary();
         let dict_id = dict.id();
@@ -1428,20 +1428,20 @@ mod zstd_dict {
         damage_the_dictionary(dir.path(), dict_id)?;
 
         let fs = FaultFs::new(StdFs);
-        // The repair publishes its report's copy with one rename; retiring the
-        // copy sets it aside with the next.
+        // The repair installs its rebuilt snapshot with one rename onto a
+        // snapshot name; the install that stops owing the report is the next.
         fs.injector().arm(
             FaultRule::new(
                 FaultOp::Rename,
                 Fault::Error(lsm_tree::io::ErrorKind::Other),
             )
-            .on_path("repair-report-")
+            .on_path(dir.path().join("v").to_string_lossy())
             .skip(1),
         );
         let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
         assert!(
             make_config(dir.path()).with_fs(fs).repair().is_err(),
-            "the copy cannot be retired, so the report stays in it",
+            "the report cannot stop being owed, so the rebuilt snapshot keeps it",
         );
         assert!(aside.exists(), "self-check: the dictionary was set aside");
 

@@ -237,6 +237,7 @@ impl Level {
     }
 }
 
+#[derive(Clone)]
 pub struct VersionInner {
     /// The version's ID
     id: VersionId,
@@ -282,6 +283,12 @@ pub struct VersionInner {
     /// installs, or reopening with zstd again would find tables whose
     /// dictionary the tree has forgotten.
     dicts: Arc<[crate::file::DictId]>,
+
+    /// The encoded report of a repair the tree still owes its caller, written
+    /// into every snapshot of this version and those derived from it, until a
+    /// repairing open hands it out and installs a version without it. Living
+    /// in the snapshot, it is there exactly when the snapshot is installed.
+    repair_report: Option<Arc<[u8]>>,
 
     /// The queries the tree served since it opened, by kind, shared by every
     /// version derived from this one: the read mix a compaction plans for.
@@ -420,6 +427,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -523,7 +531,43 @@ impl Version {
             .copied()
             .filter(|id| still_written.contains(id))
             .collect();
-        Self::new(self.id + 1, self.tree_type).with_dicts(dicts)
+        Self::new(self.id + 1, self.tree_type)
+            .with_dicts(dicts)
+            .with_repair_report(self.repair_report.clone())
+    }
+
+    /// The encoded report of a repair the tree still owes, if any. See
+    /// [`VersionInner::repair_report`].
+    #[must_use]
+    pub(crate) fn repair_report(&self) -> Option<&[u8]> {
+        self.repair_report.as_deref()
+    }
+
+    /// This version owing `report` instead of its own, under the SAME id: for
+    /// a version a repair or a recovery is building, not one being installed.
+    #[must_use]
+    pub(crate) fn with_repair_report(&self, report: Option<Arc<[u8]>>) -> Self {
+        Self {
+            inner: Arc::new(VersionInner {
+                repair_report: report,
+                ..VersionInner::clone(&self.inner)
+            }),
+        }
+    }
+
+    /// The next version, owing no repair report: what an install that hands
+    /// the report out writes. A snapshot holds the report, so the install
+    /// rotates.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn without_repair_report(&self) -> Self {
+        Self {
+            inner: Arc::new(VersionInner {
+                id: self.id + 1,
+                repair_report: None,
+                ..VersionInner::clone(&self.inner)
+            }),
+        }
     }
 
     /// This version with `dicts` in place of its own list, under the SAME id.
@@ -576,6 +620,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: Arc::from(dicts),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -628,6 +673,7 @@ impl Version {
                 gc_stats: Arc::default(),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                repair_report: None,
                 read_mix: Arc::default(),
             }),
         }
@@ -724,7 +770,9 @@ impl Version {
         dicts.extend(recovered.referenced_dicts());
         dicts.sort_unstable();
         dicts.dedup();
-        Ok(recovered.with_dicts(dicts))
+        Ok(recovered
+            .with_dicts(dicts)
+            .with_repair_report(recovery.repair_report.map(Arc::from)))
     }
 
     /// Creates a new pre-populated version.
@@ -744,6 +792,7 @@ impl Version {
                 gc_stats: Arc::new(gc_stats),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                repair_report: None,
                 read_mix: Arc::default(),
             }),
         }
@@ -866,6 +915,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -987,6 +1037,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         })
@@ -1089,6 +1140,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1197,6 +1249,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1255,6 +1308,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         })
@@ -1367,6 +1421,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1561,6 +1616,14 @@ impl Version {
             for id in self.dicts.iter() {
                 writer.write_u32::<LittleEndian>(*id)?;
             }
+        }
+
+        // The report of a repair the tree still owes, written only while it
+        // owes one: the snapshot holds it, so it is there exactly when this
+        // snapshot is installed.
+        if let Some(report) = &self.repair_report {
+            writer.start("repair_report")?;
+            writer.write_all(report)?;
         }
 
         Ok(())

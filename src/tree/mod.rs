@@ -2103,6 +2103,53 @@ impl Tree {
         )
     }
 
+    /// The encoded report of a repair the tree still owes, if any.
+    #[cfg(feature = "std")]
+    pub(crate) fn owed_repair_report(&self) -> Option<alloc::sync::Arc<[u8]>> {
+        self.version_history
+            .read()
+            .latest_version_ref()
+            .version
+            .repair_report()
+            .map(alloc::sync::Arc::from)
+    }
+
+    /// Installs the current version without the repair report it owes, as a
+    /// snapshot of its own, before the report is handed out.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the install's failure:
+    /// [`crate::Error::InstallOutcomeUnknown`] when a power loss may still
+    /// leave the snapshot that owes the report.
+    #[cfg(feature = "std")]
+    pub(crate) fn retire_repair_report(&self) -> crate::Result<()> {
+        let mut version_lock = self.version_history.write();
+        if version_lock
+            .latest_version_ref()
+            .version
+            .repair_report()
+            .is_none()
+        {
+            return Ok(());
+        }
+        version_lock.upgrade_version(
+            &self.config.path,
+            |current| {
+                let mut copy = current.clone();
+                copy.version = copy.version.without_repair_report();
+                Ok(copy)
+            },
+            &self.config.seqno,
+            &self.config.visible_seqno,
+            &*self.config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+            // Only the report goes: every snapshot reads as before.
+            crate::version::RetentionEffect::Keep,
+        )
+    }
+
     /// Stores `dict` in the tree and records it in the current version, so it
     /// resolves after a reopen with no dictionary supplied in the config.
     ///
@@ -5810,19 +5857,6 @@ impl Tree {
                 once(&mut holders, holder, &config.fs);
             }
             (*config.fs).create_dir_all(&path)?;
-            // A repair report's copy here is from a repair whose snapshot was
-            // never installed, and could name the one this creation writes.
-            // The snapshot's directory sync makes its removal durable.
-            for dirent in (*config.fs).read_dir(&path)? {
-                if dirent.is_dir || crate::file::repair_report_name(&dirent.file_name).is_none() {
-                    continue;
-                }
-                match (*config.fs).remove_file(&dirent.path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
             for (tables_folder, folder_fs) in config.all_tables_folders() {
                 let covered = Arc::ptr_eq(&folder_fs, &config.fs);
                 let folder_holders = new_entry_holders(&*folder_fs, &tables_folder)?;
@@ -6589,8 +6623,9 @@ impl Tree {
         // sync after a failed one may report success for pages the kernel
         // already dropped), so the recovered state is written as a fresh
         // snapshot under the next id, installed as a rotation installs one:
-        // its bytes synced, renamed into place, the folder synced. An owed
-        // repair report moves to it first, as a rotation moves one.
+        // its bytes synced, renamed into place, the folder synced. A repair
+        // report the tree still owes rides in the version, so the snapshot
+        // carries it on.
         //
         // A tree whose id reached the top half of the range goes back to id
         // 0 instead. Recovery takes the snapshot with the highest id, so no
@@ -6608,13 +6643,6 @@ impl Tree {
             Self::remove_manifests_but(tree_path, snapshot_id, &config.fs, config.sync_mode)?;
         }
         let version = version.reinstalled();
-        crate::file::carry_repair_report(
-            &*config.fs,
-            tree_path,
-            snapshot_id,
-            version.id(),
-            config.sync_mode,
-        )?;
         crate::version::persist_version(
             tree_path,
             &version,
@@ -6762,11 +6790,7 @@ impl Tree {
             let name = &dirent.file_name;
             let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
             let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            // A repair report's copy is kept only for the snapshot it
-            // describes, and only once that is the installed one.
-            let is_orphan_report = crate::file::repair_report_name(name)
-                .is_some_and(|(id, temporary)| temporary || id != snapshot_id);
-            if is_orphan_snapshot || is_orphan_log || is_orphan_report {
+            if is_orphan_snapshot || is_orphan_log {
                 log::trace!("Cleanup orphaned manifest file {name}");
                 sweep.remove(fs, &dirent.path);
             }
