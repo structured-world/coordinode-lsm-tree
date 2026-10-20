@@ -47,6 +47,25 @@ fn an_open_removes_sidecars_whose_table_is_gone() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Only names the engine writes are its manifest files: an open leaves a
+/// file of another spelling in the tree root alone.
+#[test]
+fn an_open_keeps_foreign_files_in_the_tree_root() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    a_tree(folder.path())?;
+    let foreign = ["vendor-notes.txt", "v1.bak", "edits-old", "v007"];
+    for name in foreign {
+        std::fs::write(folder.path().join(name), b"not the engine's")?;
+    }
+
+    let tree = config(folder.path()).open()?;
+    assert_eq!(tree.get("a", MAX_SEQNO)?.as_deref(), Some(&b"value"[..]));
+    for name in foreign {
+        assert!(folder.path().join(name).exists(), "{name} is kept");
+    }
+    Ok(())
+}
+
 /// An orphan the open cannot remove fails the open with the removal's error:
 /// the open does not serve a tree whose leftovers it was asked to clear.
 #[test]

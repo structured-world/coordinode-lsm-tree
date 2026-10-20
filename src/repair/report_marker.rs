@@ -45,7 +45,10 @@ pub(super) fn decode_owed(bytes: &[u8], tree: &Path) -> RepairReport {
             damaged_dictionaries: Vec::new(),
             method: super::REPAIR_METHOD,
             warnings: vec![super::WARN_REPORT_COPY_DAMAGED],
-            id: 0,
+            // The same for every hand-out of these bytes, and distinct from
+            // another repair's damaged report, which a caller deduplicating
+            // by id must not skip.
+            id: xxhash_rust::xxh3::xxh3_128(bytes),
             includes: Vec::new(),
         }
     })

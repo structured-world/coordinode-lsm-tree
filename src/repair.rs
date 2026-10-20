@@ -3828,9 +3828,9 @@ impl Config {
         let retry = self.clone();
         let path = self.path.clone();
         match self.open() {
-            // A repair whose report never reached its caller (its install had
-            // an unknown outcome, or the run ended before it returned) left
-            // the report in its snapshot, which this open installed again.
+            // A repair whose report never surely reached its caller (an
+            // install failed, or the run ended before it returned) left the
+            // report in its snapshot, which this open installed again.
             Ok(tree) => hand_out_owed_report(tree, &path),
             Err(e) if is_repairable_structural(&e) => {
                 // The rebuilt snapshot owes the report, so a crash before it
@@ -3865,12 +3865,10 @@ impl Config {
 /// Hands out the report `tree` still owes, after installing a version that
 /// no longer owes it, so no later open hands it out again.
 ///
-/// A report is handed out at least once. When that install ends with its
-/// outcome unknown, the snapshot that owes the report may survive a power
-/// loss, and the report leaves inside [`crate::Error::RepairedButUnopened`]
-/// all the same: a later open may hand it out again, carrying the same
-/// [`RepairReport::id`]. When the install fails before anything is installed,
-/// the call fails without it, and the next call hands it out.
+/// A report is handed out at least once. When that install fails, the
+/// report leaves inside [`crate::Error::RepairedButUnopened`] all the same:
+/// the snapshot that owes it may still be installed, and a later open then
+/// hands it out again, carrying the same [`RepairReport::id`].
 fn hand_out_owed_report(
     tree: crate::AnyTree,
     path: &std::path::Path,
@@ -3885,13 +3883,10 @@ fn hand_out_owed_report(
     let report = report_marker::decode_owed(&owed, path);
     match index.retire_repair_report() {
         Ok(()) => Ok((tree, Some(report))),
-        Err(cause @ crate::Error::InstallOutcomeUnknown(_)) => {
-            Err(crate::Error::RepairedButUnopened {
-                report: alloc::boxed::Box::new(report),
-                cause: alloc::boxed::Box::new(cause),
-            })
-        }
-        Err(e) => Err(e),
+        Err(cause) => Err(crate::Error::RepairedButUnopened {
+            report: alloc::boxed::Box::new(report),
+            cause: alloc::boxed::Box::new(cause),
+        }),
     }
 }
 
@@ -6843,26 +6838,19 @@ fn publish_repaired_manifest(
         levels.push(Level::empty());
     }
 
-    // Next version id after the highest existing one. The max is parsed from
-    // on-disk `v{N}` directory names, so a malformed `v{u64::MAX}` entry would
-    // overflow; reject it explicitly rather than wrapping the version counter.
-    // The rebuilt id also needs HEADROOM: publishing at `u64::MAX` itself
-    // hands the first subsequent version edit an `id + 1` overflow (a panic
-    // in checked builds, a wrap to version 0 colliding with old generation
-    // state otherwise). Mirrors the table-id and blob-id exhaustion guards.
+    // Next version id after the highest existing one: recovery takes the
+    // highest snapshot, so the rebuilt one must be above every other. Only a
+    // folder already holding `v{u64::MAX}` has no such id. A rebuilt snapshot
+    // high in the range needs no headroom for later edits: the next one comes
+    // from an open, which renumbers any tree in the top half to version 0.
     let version_id = match highest_existing_version_id(&*config.fs, &config.path)? {
-        Some(max) => {
-            let next = max.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
-            if next == u64::MAX {
-                log::error!(
-                    "repair: the version id space is exhausted (v{max} exists); a \
-                     rebuilt manifest at v{next} would make the next version edit \
-                     overflow",
-                );
-                return Err(crate::Error::Unrecoverable);
-            }
-            next
-        }
+        Some(max) => max.checked_add(1).ok_or_else(|| {
+            log::error!(
+                "repair: v{max} exists, so no snapshot id is left above it for the \
+                 rebuilt manifest",
+            );
+            crate::Error::Unrecoverable
+        })?,
         None => 0,
     };
 
@@ -7382,8 +7370,12 @@ fn publish_repaired_manifest(
     // The report reaches the caller with this call: a snapshot that owes it
     // no longer is installed under the rebuilt one, so no later open hands it
     // out again. When that install fails the report leaves all the same; the
-    // rebuilt snapshot may still owe it, and a repeat carries its id.
+    // rebuilt snapshot may still owe it, and a repeat carries its id. A
+    // rebuilt snapshot holding the last id leaves none for that install: it
+    // keeps owing the report, the open renumbers it as any tree at the top of
+    // the range, and `open_or_repair` hands the report out under the same id.
     if retire_report
+        && version_id < u64::MAX
         && let Err(cause) = crate::version::persist_version(
             &config.path,
             &version.without_repair_report(),

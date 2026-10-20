@@ -488,6 +488,35 @@ pub fn log_id_of(name: &str) -> Option<VersionId> {
     crate::file::canonical_id(name.strip_prefix("edits-")?)
 }
 
+/// A manifest file of the tree root, as the engine names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestFile {
+    /// An installed snapshot, `v{id}`.
+    Snapshot(VersionId),
+
+    /// A snapshot not yet installed, `v{id}.tmp`.
+    Temporary(VersionId),
+
+    /// The edit log of snapshot `id`, `edits-{id}`.
+    Log(VersionId),
+}
+
+/// The manifest file `name` is, if the engine could have written it. Any
+/// other name in the tree root is not the engine's to remove.
+#[must_use]
+pub fn manifest_file_of(name: &str) -> Option<ManifestFile> {
+    if let Some(id) = snapshot_id_of(name) {
+        return Some(ManifestFile::Snapshot(id));
+    }
+    if let Some(id) = name
+        .strip_suffix(super::SNAPSHOT_TEMPORARY_SUFFIX)
+        .and_then(snapshot_id_of)
+    {
+        return Some(ManifestFile::Temporary(id));
+    }
+    log_id_of(name).map(ManifestFile::Log)
+}
+
 /// The id of the installed snapshot of the tree in `folder`, or `None` when
 /// the tree has none (a new tree, or one whose creation never completed).
 ///

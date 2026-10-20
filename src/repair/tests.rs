@@ -431,19 +431,47 @@ fn highest_existing_version_id_none_when_no_versions_present() -> crate::Result<
     Ok(())
 }
 
-/// The rebuilt version id needs HEADROOM, not just non-overflow: a highest
-/// existing `v{u64::MAX - 1}` makes `checked_add` succeed and the repair
-/// publish at `u64::MAX`, and the first subsequent version edit then
-/// computes `id + 1` — an overflow panic in checked builds, a wrap to
-/// version 0 colliding with old generation state otherwise. Mirrors the
-/// table-id and blob-id exhaustion guards.
+/// A repair whose rebuilt snapshot takes the last id has none left to retire
+/// its report by: the snapshot keeps owing it, the open renumbers the tree
+/// as it does any tree at the top of the range, and `open_or_repair` hands
+/// the report out again under the id the repair returned.
 #[test]
-fn repair_rejects_an_exhausted_version_id_space() -> crate::Result<()> {
+fn a_repair_that_takes_the_last_version_id_leaves_its_report_owed() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+    };
+    {
+        let tree = config().open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    std::fs::write(dir.path().join(format!("v{}", u64::MAX - 1)), b"x")?;
+
+    let report = config().repair()?;
+    assert!(dir.path().join(format!("v{}", u64::MAX)).exists());
+
+    let (tree, owed) = config().open_or_repair(crate::RepairPolicy::default())?;
+    assert!(tree.get("a", 1)?.is_some(), "the data is kept");
+    assert_eq!(owed.map(|owed| owed.id), Some(report.id), "the same report");
+    Ok(())
+}
+
+/// A folder already holding `v{u64::MAX}` leaves no id above it for a
+/// rebuilt snapshot, which recovery must take over every other one.
+#[test]
+fn repair_rejects_a_folder_holding_the_last_version_id() -> crate::Result<()> {
     use crate::{Config, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join("tables"))?;
-    std::fs::write(dir.path().join(format!("v{}", u64::MAX - 1)), b"x")?;
+    std::fs::write(dir.path().join(format!("v{}", u64::MAX)), b"x")?;
 
     let result = Config::new(
         dir.path(),
@@ -453,8 +481,7 @@ fn repair_rejects_an_exhausted_version_id_space() -> crate::Result<()> {
     .repair();
     assert!(
         matches!(result, Err(crate::Error::Unrecoverable)),
-        "a rebuilt id of u64::MAX must fail the repair, not publish a tree \
-         whose next version edit overflows: {:?}",
+        "{:?}",
         result.map(|r| r.recovered),
     );
     Ok(())

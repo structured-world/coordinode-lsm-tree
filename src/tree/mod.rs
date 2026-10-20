@@ -6673,7 +6673,7 @@ impl Tree {
         Self::republish_missing_restriction_sidecars(&version, config)?;
 
         // Everything of the generation read goes, now that it is superseded:
-        // its snapshot, its log, a report copy the fresh one carries.
+        // its snapshot and its log.
         Self::cleanup_orphaned_version(tree_path, version.id(), &config.fs, &mut sweep)?;
 
         // A copy the digest rejected goes only once its id has a winner: with
@@ -6779,19 +6779,18 @@ impl Tree {
         fs: &Arc<dyn crate::fs::Fs>,
         sweep: &mut OpenSweep,
     ) -> crate::Result<()> {
-        let snapshot_str = format!("v{snapshot_id}");
-        let log_str = format!("edits-{snapshot_id}");
-
+        use crate::version::recovery::{ManifestFile, manifest_file_of};
         for dirent in fs.read_dir(path)? {
             if dirent.is_dir {
                 continue;
             }
-
-            let name = &dirent.file_name;
-            let is_orphan_snapshot = name.starts_with('v') && *name != snapshot_str;
-            let is_orphan_log = name.starts_with("edits-") && *name != log_str;
-            if is_orphan_snapshot || is_orphan_log {
-                log::trace!("Cleanup orphaned manifest file {name}");
+            let orphan = match manifest_file_of(&dirent.file_name) {
+                Some(ManifestFile::Snapshot(id) | ManifestFile::Log(id)) => id != snapshot_id,
+                Some(ManifestFile::Temporary(_)) => true,
+                None => false,
+            };
+            if orphan {
+                log::trace!("Cleanup orphaned manifest file {}", dirent.file_name);
                 sweep.remove(fs, &dirent.path);
             }
         }
@@ -6811,10 +6810,15 @@ impl Tree {
         fs: &Arc<dyn crate::fs::Fs>,
         sync_mode: crate::fs::SyncMode,
     ) -> crate::Result<()> {
-        let snapshot = format!("v{keep}");
+        use crate::version::recovery::{ManifestFile, manifest_file_of};
         let mut snapshots = OpenSweep::default();
         for dirent in fs.read_dir(path)? {
-            if !dirent.is_dir && dirent.file_name.starts_with('v') && dirent.file_name != snapshot {
+            let other = match manifest_file_of(&dirent.file_name) {
+                Some(ManifestFile::Snapshot(id)) => id != keep,
+                Some(ManifestFile::Temporary(_)) => true,
+                Some(ManifestFile::Log(_)) | None => false,
+            };
+            if !dirent.is_dir && other {
                 snapshots.remove(fs, &dirent.path);
             }
         }

@@ -84,28 +84,32 @@ fn a_repair_that_never_installed_hands_out_no_report() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A report whose retiring install fails before installing anything stays
-/// owed: the call fails without it, and the next call hands it out, once.
+/// A report whose retiring install fails leaves with the error: the repair
+/// committed, and a caller that takes the error for a failed open may never
+/// call `open_or_repair` again. The snapshot still owes it, so the next call
+/// hands it out again under the same id, and only then is it retired.
 #[test]
-fn a_report_whose_retiring_install_fails_is_handed_out_by_the_next_call() -> lsm_tree::Result<()> {
+fn a_report_whose_retiring_install_fails_leaves_with_the_error() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     a_tree_needing_repair(folder.path())?;
 
-    let first = config(folder.path())
+    let first = match config(folder.path())
         .with_fs(failing_snapshot_renames(folder.path(), 2))
-        .open_or_repair(RepairPolicy::default());
-    assert!(
-        matches!(first, Err(lsm_tree::Error::Io(_))),
-        "the report is withheld while a snapshot still owes it: {:?}",
-        first.map(|(_, report)| report)
-    );
+        .open_or_repair(RepairPolicy::default())
+    {
+        Err(lsm_tree::Error::RepairedButUnopened { report, .. }) => report,
+        other => panic!(
+            "expected the report inside RepairedButUnopened, got {:?}",
+            other.map(|(_, report)| report)
+        ),
+    };
 
     let (tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
-    assert!(report.is_some(), "the next call hands the report out");
+    assert_eq!(report.map(|report| report.id), Some(first.id));
     assert!(tree.get("a", 1)?.is_some());
     drop(tree);
     let (_tree, again) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
-    assert!(again.is_none(), "once");
+    assert!(again.is_none(), "retired once handed out");
     Ok(())
 }
 
@@ -117,10 +121,10 @@ fn a_report_whose_retiring_install_fails_is_handed_out_by_the_next_call() -> lsm
 fn a_report_handed_out_twice_carries_one_id() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     a_tree_needing_repair(folder.path())?;
-    let withheld = config(folder.path())
+    let unretired = config(folder.path())
         .with_fs(failing_snapshot_renames(folder.path(), 2))
         .open_or_repair(RepairPolicy::default());
-    assert!(withheld.is_err(), "self-check: the report is still owed");
+    assert!(unretired.is_err(), "self-check: the report is still owed");
 
     // The open installs the tree once and syncs the folder for it; the
     // retiring install's sync fails, and so does its withdrawal's, which

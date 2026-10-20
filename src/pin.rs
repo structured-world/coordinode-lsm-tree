@@ -399,14 +399,20 @@ pub fn restore(
     // that tree's manifest and tables as orphans of the restored layout.
     let resuming = fs.exists(&marker)?;
     let dirents = fs.read_dir(&root)?;
-    let manifest_file = |name: &str| {
-        name.starts_with("edits-")
-            || name
-                .strip_prefix('v')
-                .is_some_and(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))
+    use crate::version::recovery::{ManifestFile, manifest_file_of};
+    let manifest_file = |name: &str| manifest_file_of(name).is_some();
+    let installed_manifest = |name: &str| {
+        matches!(
+            manifest_file_of(name),
+            Some(ManifestFile::Snapshot(_) | ManifestFile::Log(_))
+        )
     };
     // Judged before anything goes: a tree found here keeps every file.
-    if !resuming && let Some(entry) = dirents.iter().find(|entry| manifest_file(&entry.file_name)) {
+    if !resuming
+        && let Some(entry) = dirents
+            .iter()
+            .find(|entry| installed_manifest(&entry.file_name))
+    {
         return Err(crate::Error::from(crate::io::Error::new(
             crate::io::ErrorKind::AlreadyExists,
             format!(

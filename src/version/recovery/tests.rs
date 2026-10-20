@@ -1397,6 +1397,29 @@ fn an_open_at_the_top_of_the_id_range_reinstalls_the_tree_as_version_0() -> crat
     Ok(())
 }
 
+/// A renumbering removes every snapshot and log but the ones it installs,
+/// and only those: a file of another spelling in the tree root is not the
+/// engine's.
+#[test]
+fn a_renumbering_keeps_foreign_files_in_the_tree_root() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, crate::version::RENUMBER_FROM)?;
+    let foreign = ["vendor-notes.txt", "v1.bak", "edits-old", "v007"];
+    for name in foreign {
+        fs.open(
+            &folder.join(name),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?
+        .write_all(b"not the engine's")?;
+    }
+
+    drop(top_id_config(&fs).open()?);
+    for name in foreign {
+        assert!(fs.exists(&folder.join(name))?, "{name} is kept");
+    }
+    Ok(())
+}
+
 /// A renumbering that fails while removing the snapshot it read must not
 /// have removed that snapshot's log first: the snapshot then stays the
 /// highest, and a reopen would recover it without the edits in its log.

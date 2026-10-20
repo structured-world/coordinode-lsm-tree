@@ -60,6 +60,25 @@ fn a_damaged_report_leaves_the_loss_unscoped() {
     assert_eq!(back.warnings, vec![crate::repair::WARN_REPORT_COPY_DAMAGED]);
 }
 
+/// A caller skips a report whose id it already applied, so two damaged
+/// reports must not share an id, while the same damaged bytes handed out
+/// twice must keep theirs.
+#[test]
+fn damaged_reports_keep_distinct_ids() {
+    let damaged = |flip: usize| {
+        let mut bytes = encode(&a_report());
+        if let Some(byte) = bytes.get_mut(flip) {
+            *byte ^= 0xFF;
+        }
+        bytes
+    };
+    let first = decode_owed(&damaged(12), Path::new("/db"));
+    let other = decode_owed(&damaged(13), Path::new("/db"));
+    let repeat = decode_owed(&damaged(12), Path::new("/db"));
+    assert_ne!(first.id, other.id);
+    assert_eq!(first.id, repeat.id);
+}
+
 /// `body` closed by its checksum, as an encoded report is: a decode that
 /// refuses it then refuses its shape, not its checksum.
 fn sealed(mut body: Vec<u8>) -> Vec<u8> {
