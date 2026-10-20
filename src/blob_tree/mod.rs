@@ -1340,6 +1340,11 @@ impl AbstractTree for BlobTree {
         crate::PinnedVersion::take(&self.index)
     }
 
+    #[cfg(feature = "std")]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
+        self.index.acknowledge_repair_report(id)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         self.index.print_trace(key)
     }

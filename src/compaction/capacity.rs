@@ -604,13 +604,13 @@ impl Reservation {
     }
 
     /// Keeps `bytes` of its tree's quota held once it goes, or the whole of
-    /// its grant when they are not known: outputs it covered could not be
-    /// removed and stay on disk until the tree's next open sweeps them,
-    /// unseen by a quota counted from the installed version. An output that
-    /// outgrew the grant, refused or not, is held whole, past the grant too.
-    /// A tree opens under a new id, so the hold ends with the tree that left
-    /// it.
-    pub(crate) fn strand(&self, bytes: Option<u64>) {
+    /// its grant when they are not known: outputs it covered stay on disk,
+    /// unseen by a quota counted from the installed version, until they are
+    /// removed or the tree's next open sweeps them. An output that outgrew
+    /// the grant, refused or not, is held whole, past the grant too. The hold
+    /// is given back with [`QuotaHold::release_but`]; one never given back
+    /// ends with the tree that left it, which opens again under a new id.
+    pub(crate) fn strand(&self, bytes: Option<u64>) -> QuotaHold {
         let mut grants = self.grants.lock();
         let (quota, granted) = grants.quota;
         let kept = bytes.unwrap_or(granted);
@@ -622,11 +622,33 @@ impl Reservation {
             // Bounded by the bytes the outputs take on disk.
             *self.pool.held.lock().entry(quota).or_default() += past_grant;
         }
+        QuotaHold {
+            pool: Arc::clone(&self.pool),
+            quota,
+            bytes: kept,
+        }
     }
 
     /// Whether the reservation stopped its compaction.
     pub(crate) fn refused(&self) -> bool {
         self.refused.load(Relaxed)
+    }
+}
+
+/// Quota bytes a reservation kept held past its end, for outputs it left on
+/// disk ([`Reservation::strand`]).
+pub struct QuotaHold {
+    pool: Arc<CapacityPool>,
+    quota: Pool,
+    bytes: u64,
+}
+
+impl QuotaHold {
+    /// Gives the hold back, all but the `still` bytes its outputs take on
+    /// disk yet (all of it when that is not known).
+    pub(crate) fn release_but(self, still: Option<u64>) {
+        let keep = still.unwrap_or(self.bytes).min(self.bytes);
+        self.pool.release(self.quota, self.bytes - keep);
     }
 }
 

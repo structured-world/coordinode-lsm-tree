@@ -911,7 +911,7 @@ impl RecordedTable {
 
 /// Writes the manifest of the tree in `folder` from `image`, whose tables are
 /// already written, each level's to the folder `tables_folder` names for it,
-/// and points `CURRENT` at it.
+/// and installs it.
 ///
 /// Every table is opened the way an open opens it before the manifest is
 /// written, so a manifest is never written over a table that does not read,
@@ -1053,6 +1053,8 @@ pub fn install_manifest(
             .collect(),
         retention_floor: image.retention_floor,
         dicts: image.dicts.clone(),
+        // An imported tree owes no repair report.
+        repair_report: None,
     };
     let version = crate::version::Version::from_recovery(
         recovery,

@@ -66,10 +66,13 @@ matching entry (and add one for a new subsystem).
 
 ## Manifest
 
-- **A manifest version installs atomically.** A new version becomes current only
-  by flipping the current pointer after the new manifest is fully written and
-  synced; a crash mid-write leaves the previous version current. Enforced in
-  `src/manifest.rs` / `src/manifest_blocks` (writer + current-pointer flip).
+- **A manifest version installs atomically.** A snapshot is written as
+  `v{N}.tmp`, its bytes synced, its empty edit log created, and a rename to
+  `v{N}` installs it; one sync of the tree folder makes both names durable.
+  Recovery takes the highest `v{N}`, so a crash before the rename leaves the
+  previous version installed, and a temporary is never read. When the folder
+  sync fails the name is taken back; when that cannot be made durable either,
+  the outcome is reported as unknown. Enforced in `src/version/persist.rs`.
 
 - **Recovery accepts only a complete prefix.** On open, the manifest is replayed
   up to the last intact, checksum-valid record; a torn tail (partial final write)

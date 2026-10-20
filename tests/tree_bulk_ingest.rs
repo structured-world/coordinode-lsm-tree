@@ -250,7 +250,18 @@ fn repair_drops_a_bulk_ingested_table() -> lsm_tree::Result<()> {
     // Lose the manifest: with a CLEAN manifest the repair would reuse the
     // recorded offset and keep the table, so only a manifest loss exercises
     // the fail-closed drop.
-    std::fs::remove_file(folder.path().join("current"))?;
+    for entry in std::fs::read_dir(folder.path())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_manifest = name
+            .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
+            .is_some_and(|rest| rest.parse::<u64>().is_ok());
+        if is_manifest {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
 
     let report = Config::new(&folder, seqno, visible_seqno).repair()?;
     assert_eq!(

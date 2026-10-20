@@ -101,7 +101,7 @@ fn golden_v5_corpus_is_refused_at_open_naming_the_converter() {
     // positive one: convert this same fixture and assert it opens and reads.
     let fixture = Path::new(FIXTURE);
     assert!(
-        fixture.join("current").exists(),
+        fixture.join("v0").exists(),
         "golden fixture missing — regenerate with `cargo test --test compat_corpus \
          -- --ignored --exact regenerate_golden_corpus`"
     );
@@ -152,7 +152,7 @@ fn repairing_a_v5_store_refuses_instead_of_discarding_its_tables() {
     // manifest's format label before it looks at a single table, so the
     // refusal is the manifest's version, whatever the tables would have said.
     let fixture = Path::new(FIXTURE);
-    assert!(fixture.join("current").exists(), "golden fixture missing");
+    assert!(fixture.join("v0").exists(), "golden fixture missing");
 
     let tmp = get_tmp_folder();
     copy_dir(fixture, tmp.path());

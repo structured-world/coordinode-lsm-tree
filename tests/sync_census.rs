@@ -25,7 +25,6 @@ enum Synced {
     Blob,
     EditLog,
     Snapshot,
-    CurrentPointer,
     Other(String),
 }
 
@@ -80,10 +79,14 @@ impl Census {
             Synced::Blob
         } else if file_name.starts_with("edits-") {
             Synced::EditLog
-        } else if file_name.starts_with('v') && file_name[1..].chars().all(|c| c.is_ascii_digit()) {
+        } else if file_name
+            .strip_prefix('v')
+            .map(|rest| rest.strip_suffix(".tmp").unwrap_or(rest))
+            .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+        {
+            // A snapshot is synced under its temporary name, before the rename
+            // that installs it.
             Synced::Snapshot
-        } else if file_name.starts_with(".tmp_") {
-            Synced::CurrentPointer
         } else {
             Synced::Other(path.display().to_string())
         };
@@ -154,14 +157,13 @@ fn fill(tree: &AnyTree, round: u64) {
     }
 }
 
-/// What creating a tree syncs: the snapshot, the pointer to it, the tree
-/// folder once for each (its entries, the tables folder among them, are all
-/// made before), and once the folder above, for the tree folder's own name.
+/// What creating a tree syncs: the snapshot, the tree folder once (its
+/// entries, the tables folder and the snapshot's empty log among them, are
+/// all made before), and once the folder above, for the tree folder's own
+/// name.
 fn creation() -> Vec<(Synced, SyncKind)> {
     sorted(vec![
         (Synced::Snapshot, SyncKind::FileData),
-        (Synced::TreeDir, SyncKind::Directory),
-        (Synced::CurrentPointer, SyncKind::File),
         (Synced::TreeDir, SyncKind::Directory),
         (Synced::ParentDir, SyncKind::Directory),
     ])
@@ -169,7 +171,7 @@ fn creation() -> Vec<(Synced, SyncKind)> {
 
 /// Creating, flushing, compacting, dropping and reopening a tree, standard
 /// and KV-separated, each syncs only what it makes durable: a new entry's
-/// folder once, a written file once.
+/// folder once, a written file once, and a reopen the snapshot it installs.
 #[test]
 fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
@@ -218,11 +220,63 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             "dropping every key (blob: {blob})"
         );
 
+        // A reopen installs what it recovered as a fresh snapshot, so what it
+        // serves is durable whatever the syncs before it reported.
         drop(tree);
         let tree = open(&base, &fs, blob, None);
-        assert_eq!(census.take(), Vec::new(), "reopening (blob: {blob})");
+        assert_eq!(
+            census.take(),
+            sorted(vec![
+                (Synced::Snapshot, SyncKind::FileData),
+                (Synced::TreeDir, SyncKind::Directory),
+            ]),
+            "reopening (blob: {blob})"
+        );
+
+        // The reopen made the log it installed durable by name, so the first
+        // flush after it syncs what any flush does, not the tree folder again.
+        fill(&tree, 5);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush,
+            "the first flush after reopening (blob: {blob})"
+        );
         drop(tree);
     }
+}
+
+/// A flush that rotates the manifest installs its fresh snapshot with two
+/// syncs: the snapshot's bytes, then the tree folder for the names of the
+/// renamed snapshot and its empty log.
+#[test]
+fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
+    let base = PathBuf::from("/census/rotating");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census::new(&base, None, fs.injector());
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .manifest_log_rotate_bytes(0)
+    .open()
+    .expect("open");
+    census.take();
+
+    fill(&tree, 1);
+    tree.flush_active_memtable(0).expect("flush");
+    assert_eq!(
+        census.take(),
+        sorted(vec![
+            (Synced::Table, SyncKind::FileData),
+            (Synced::TablesDir, SyncKind::Directory),
+            (Synced::Snapshot, SyncKind::FileData),
+            (Synced::TreeDir, SyncKind::Directory),
+        ]),
+        "a flush whose install rotates"
+    );
 }
 
 /// A tree whose tables live in a routed folder syncs that folder's new

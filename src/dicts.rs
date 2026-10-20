@@ -294,17 +294,39 @@ pub fn set_aside_if_damaged(
     encryption: Option<&dyn EncryptionProvider>,
     sync_mode: SyncMode,
 ) -> crate::Result<Option<PathBuf>> {
+    if !is_still_damaged(fs, folder, id, encryption)? {
+        return Ok(None);
+    }
+    let aside = damaged_path(folder, id);
+    fs.rename(&path_of(folder, id), &aside)?;
+    fs.sync_directory_with(folder, sync_mode)?;
+    Ok(Some(aside))
+}
+
+/// Whether the file filed under `id` exists and still fails the integrity
+/// check, so [`set_aside_if_damaged`] would move it.
+///
+/// # Errors
+///
+/// Propagates the read failures other than the integrity check and `NotFound`.
+pub fn is_still_damaged(
+    fs: &dyn Fs,
+    folder: &Path,
+    id: DictId,
+    encryption: Option<&dyn EncryptionProvider>,
+) -> crate::Result<bool> {
     match read_one(fs, folder, id, encryption) {
-        Ok(_) => Ok(None),
-        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => Ok(None),
-        Err(e) if is_damage(&e, id) => {
-            let aside = folder.join(format!("{id}{}", crate::file::DICT_DAMAGED_SUFFIX));
-            fs.rename(&path_of(folder, id), &aside)?;
-            fs.sync_directory_with(folder, sync_mode)?;
-            Ok(Some(aside))
-        }
+        Ok(_) => Ok(false),
+        Err(crate::Error::Io(e)) if e.kind() == crate::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if is_damage(&e, id) => Ok(true),
         Err(e) => Err(e),
     }
+}
+
+/// Where [`set_aside_if_damaged`] moves the dictionary filed under `id`.
+#[must_use]
+pub fn damaged_path(folder: &Path, id: DictId) -> PathBuf {
+    folder.join(format!("{id}{}", crate::file::DICT_DAMAGED_SUFFIX))
 }
 
 /// Lists the ids the folder holds, without reading a single dictionary.

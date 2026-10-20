@@ -31,7 +31,7 @@ mod super_version;
 mod tests;
 
 pub use blob_file_list::BlobFileList;
-pub use persist::persist_version;
+pub use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub use run::Run;
 pub use super_version::RetentionEffect;
 pub use super_version::SnapshotRef;
@@ -110,8 +110,13 @@ impl<'a> TransformContext<'a> {
 
 pub const DEFAULT_LEVEL_COUNT: u8 = 7;
 
-/// Monotonically increasing ID of a version.
+/// ID of a version: each install takes the one above the last, and an open
+/// of a tree whose id reached [`RENUMBER_FROM`] starts the count again at `0`.
 pub type VersionId = u64;
+
+/// The version id from which an open reinstalls the tree under id `0`: half
+/// the range, so the installs of one session can never reach the top.
+pub const RENUMBER_FROM: VersionId = 1 << 63;
 
 impl Ranged for Table {
     fn key_range(&self) -> &KeyRange {
@@ -232,6 +237,7 @@ impl Level {
     }
 }
 
+#[derive(Clone)]
 pub struct VersionInner {
     /// The version's ID
     id: VersionId,
@@ -277,6 +283,12 @@ pub struct VersionInner {
     /// installs, or reopening with zstd again would find tables whose
     /// dictionary the tree has forgotten.
     dicts: Arc<[crate::file::DictId]>,
+
+    /// The encoded report of a repair the tree still owes its caller, written
+    /// into every snapshot of this version and those derived from it, until
+    /// the caller acknowledges it and a version without it is installed. Living
+    /// in the snapshot, it is there exactly when the snapshot is installed.
+    repair_report: Option<Arc<[u8]>>,
 
     /// The queries the tree served since it opened, by kind, shared by every
     /// version derived from this one: the read mix a compaction plans for.
@@ -415,6 +427,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -518,7 +531,43 @@ impl Version {
             .copied()
             .filter(|id| still_written.contains(id))
             .collect();
-        Self::new(self.id + 1, self.tree_type).with_dicts(dicts)
+        Self::new(self.id + 1, self.tree_type)
+            .with_dicts(dicts)
+            .with_repair_report(self.repair_report.clone())
+    }
+
+    /// The encoded report of a repair the tree still owes, if any. See
+    /// [`VersionInner::repair_report`].
+    #[must_use]
+    pub(crate) fn repair_report(&self) -> Option<&[u8]> {
+        self.repair_report.as_deref()
+    }
+
+    /// This version owing `report` instead of its own, under the SAME id: for
+    /// a version a repair or a recovery is building, not one being installed.
+    #[must_use]
+    pub(crate) fn with_repair_report(&self, report: Option<Arc<[u8]>>) -> Self {
+        Self {
+            inner: Arc::new(VersionInner {
+                repair_report: report,
+                ..VersionInner::clone(&self.inner)
+            }),
+        }
+    }
+
+    /// The next version, owing no repair report: what an install that hands
+    /// the report out writes. A snapshot holds the report, so the install
+    /// rotates.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn without_repair_report(&self) -> Self {
+        Self {
+            inner: Arc::new(VersionInner {
+                id: self.id + 1,
+                repair_report: None,
+                ..VersionInner::clone(&self.inner)
+            }),
+        }
     }
 
     /// This version with `dicts` in place of its own list, under the SAME id.
@@ -535,6 +584,32 @@ impl Version {
         self.with_id_and_dicts(self.id, dicts)
     }
 
+    /// This version under the id an open installs it with, unchanged
+    /// otherwise: the next id, so the snapshot it writes never replaces the
+    /// one it was read from, or id `0` once this one is at or past
+    /// [`RENUMBER_FROM`]. See [`Self::is_renumbered_on_open`].
+    #[must_use]
+    pub(crate) fn reinstalled(&self) -> Self {
+        let next = if self.is_renumbered_on_open() {
+            0
+        } else {
+            // Below `RENUMBER_FROM`, so one more stays in range.
+            self.id + 1
+        };
+        self.with_id_and_dicts(next, self.dicts.to_vec())
+    }
+
+    /// Whether an open reinstalls this version under id `0` rather than the
+    /// next id. Every install takes one id, an open included, so a tree whose
+    /// ids reach the top of the range (in practice only one written or edited
+    /// by other means) would run out; restarting the count keeps it openable,
+    /// and a session that starts below [`RENUMBER_FROM`] cannot reach the top
+    /// by its own installs.
+    #[must_use]
+    pub(crate) fn is_renumbered_on_open(&self) -> bool {
+        self.id >= RENUMBER_FROM
+    }
+
     fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {
         Self {
             inner: Arc::new(VersionInner {
@@ -545,6 +620,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: Arc::from(dicts),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -597,6 +673,7 @@ impl Version {
                 gc_stats: Arc::default(),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                repair_report: None,
                 read_mix: Arc::default(),
             }),
         }
@@ -693,7 +770,9 @@ impl Version {
         dicts.extend(recovered.referenced_dicts());
         dicts.sort_unstable();
         dicts.dedup();
-        Ok(recovered.with_dicts(dicts))
+        Ok(recovered
+            .with_dicts(dicts)
+            .with_repair_report(recovery.repair_report.map(Arc::from)))
     }
 
     /// Creates a new pre-populated version.
@@ -713,6 +792,7 @@ impl Version {
                 gc_stats: Arc::new(gc_stats),
                 retention_floor: 0,
                 dicts: Arc::from([]),
+                repair_report: None,
                 read_mix: Arc::default(),
             }),
         }
@@ -835,6 +915,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -956,6 +1037,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         })
@@ -1058,6 +1140,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1166,6 +1249,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1224,6 +1308,7 @@ impl Version {
                 gc_stats: self.gc_stats.clone(),
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         })
@@ -1336,6 +1421,7 @@ impl Version {
                 gc_stats,
                 retention_floor: self.retention_floor,
                 dicts: self.dicts.clone(),
+                repair_report: self.repair_report.clone(),
                 read_mix: Arc::clone(&self.read_mix),
             }),
         }
@@ -1361,6 +1447,12 @@ impl Version {
 
         writer.start("format_version")?;
         writer.write_u8(FormatVersion::V6.into())?;
+
+        // The snapshot names its own version: recovery reads a snapshot by
+        // the id in its file name, and a file holding another version under
+        // that name (a copy, a rename gone wrong) must not pass for it.
+        writer.start("version_id")?;
+        writer.write_u64::<LittleEndian>(self.id())?;
 
         writer.start("crate_version")?;
         writer.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
@@ -1524,6 +1616,14 @@ impl Version {
             for id in self.dicts.iter() {
                 writer.write_u32::<LittleEndian>(*id)?;
             }
+        }
+
+        // The report of a repair the tree still owes, written only while it
+        // owes one: the snapshot holds it, so it is there exactly when this
+        // snapshot is installed.
+        if let Some(report) = &self.repair_report {
+            writer.start("repair_report")?;
+            writer.write_all(report)?;
         }
 
         Ok(())

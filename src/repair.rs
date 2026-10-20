@@ -153,6 +153,17 @@ pub struct RepairReport {
 
     /// Operator-facing caveats about the rebuilt state.
     pub warnings: Vec<&'static str>,
+
+    /// Identifies this repair's report. The tree hands a report out until
+    /// [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report)
+    /// takes this id, so it may arrive more than once; a caller that records
+    /// the ids it applied skips a repeat.
+    pub id: u128,
+
+    /// The ids of earlier reports this one takes in: they were still owed
+    /// when this repair ran, and their losses are listed here as well. A
+    /// caller that applied one of them already has replayed its losses.
+    pub includes: Vec<u128>,
 }
 
 /// What an external write-ahead log must replay after this repair, derived
@@ -224,6 +235,87 @@ impl RepairReport {
     }
 }
 
+/// [`RepairReport::method`] of every repair.
+const REPAIR_METHOD: &str = "all-to-L0 with sequence-number ordering";
+
+const WARN_ALL_AT_L0: &str =
+    "All recovered tables placed at L0; background compaction will redistribute them";
+const WARN_UNLOGGED_EDITS: &str =
+    "Recent unlogged version edits (in-flight compactions, recent deletions) are lost";
+const WARN_BLOB_FRAGMENTATION: &str = "Blob fragmentation stats reset (punched prefixes reseeded); blob GC re-learns the rest over time";
+const WARN_REPORT_COPY_DAMAGED: &str =
+    "The kept report of an earlier repair is damaged; its losses are unscoped";
+
+/// Every warning a report can carry; a kept copy of a report records each by
+/// its index here.
+const WARNINGS: [&str; 4] = [
+    WARN_ALL_AT_L0,
+    WARN_UNLOGGED_EDITS,
+    WARN_BLOB_FRAGMENTATION,
+    WARN_REPORT_COPY_DAMAGED,
+];
+
+/// Adds what `earlier` lost to `report`: a repair over the snapshot of an
+/// earlier repair whose report never reached the caller owes that repair's
+/// replay too. The counts stay `report`'s own, describing this run.
+///
+/// A file left out of the manifest is listed once. A loss is listed once per
+/// distinct entry, not per path: a repair of an earlier repair's salvaged
+/// replacement names the same path with only what the replacement held, and
+/// the earlier, wider range is still owed, as is the note saying where an
+/// earlier salvage kept a damaged original.
+#[cfg(feature = "std")]
+fn fold_report(report: &mut RepairReport, earlier: RepairReport) {
+    fn add<T>(into: &mut Vec<T>, from: Vec<T>, same: impl Fn(&T, &T) -> bool) {
+        for entry in from {
+            if !into.iter().any(|known| same(known, &entry)) {
+                into.push(entry);
+            }
+        }
+    }
+    add(
+        &mut report.unreadable_files,
+        earlier.unreadable_files,
+        |a, b| a.0 == b.0,
+    );
+    report.unreadable = report.unreadable_files.len();
+    add(
+        &mut report.excluded_files,
+        earlier.excluded_files,
+        |a, b| a.0 == b.0,
+    );
+    add(
+        &mut report.lost_coverage,
+        earlier.lost_coverage,
+        PartialEq::eq,
+    );
+    add(
+        &mut report.unknowable_losses,
+        earlier.unknowable_losses,
+        PartialEq::eq,
+    );
+    add(
+        &mut report.blob_files_salvaged,
+        earlier.blob_files_salvaged,
+        PartialEq::eq,
+    );
+    add(
+        &mut report.damaged_dictionaries,
+        earlier.damaged_dictionaries,
+        PartialEq::eq,
+    );
+    for warning in earlier.warnings {
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
+    }
+    for id in core::iter::once(earlier.id).chain(earlier.includes) {
+        if !report.includes.contains(&id) {
+            report.includes.push(id);
+        }
+    }
+}
+
 /// Streams `path` from byte `start` to end through XXH3-128. `start == 0`
 /// reproduces the whole-file digest a normal write accumulates; a non-zero
 /// `start` digests only the LIVE suffix of a tight-space RESTRICTED table,
@@ -272,9 +364,9 @@ pub(crate) fn compute_table_checksum_with_overrides(
     crate::file::checksum_from_with_overrides(fs, path, start, overrides)
 }
 
-/// Highest existing `v{N}` manifest id in `folder`, if any. The rebuilt manifest
-/// uses `max + 1` so it supersedes any stale version file and the `current`
-/// pointer never races a half-written predecessor.
+/// Highest id any manifest file in `folder` carries (`v{N}` or `edits-{N}`), if
+/// any. The rebuilt manifest uses `max + 1` so it supersedes every stale
+/// generation and its install never meets a log a predecessor left.
 ///
 /// A directory-read failure is propagated (not swallowed as "no versions"): a
 /// transient scan error must not silently reset the version chain to `0` and
@@ -287,9 +379,8 @@ fn highest_existing_version_id(
         .read_dir(folder)?
         .into_iter()
         .filter_map(|e| {
-            e.file_name
-                .strip_prefix('v')
-                .and_then(|rest| rest.parse::<u64>().ok())
+            crate::version::recovery::snapshot_id_of(&e.file_name)
+                .or_else(|| crate::version::recovery::log_id_of(&e.file_name))
         })
         .max())
 }
@@ -3556,9 +3647,17 @@ impl Config {
     /// until the next compaction re-applies the standing policy. No operand
     /// is doubled by that window.
     ///
+    /// # The report
+    ///
+    /// The rebuilt tree keeps the returned report until
+    /// [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report)
+    /// takes its id; until then [`Config::open_or_repair`] hands it out
+    /// again, so a process that ends before the report was acted on loses
+    /// nothing.
+    ///
     /// # Exclusive access
     ///
-    /// Repair rewrites `CURRENT`, writes a fresh snapshot, and removes the stale
+    /// Repair writes and installs a fresh snapshot and removes the stale
     /// `edits-*` logs in place, so it requires exclusive access to the tree
     /// directory. It acquires the same cross-process directory lock as
     /// [`Config::open`] for the duration of the call: if another live instance
@@ -3577,19 +3676,29 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
     ///
+    /// let folder = tempfile::tempdir()?;
     /// let config = Config::new(
-    ///     "/var/lib/mydb",
+    ///     &folder,
     ///     SequenceNumberCounter::default(),
     ///     SequenceNumberCounter::default(),
     /// );
+    /// {
+    ///     let tree = config.clone().open()?;
+    ///     tree.insert("a", "1", 0);
+    ///     tree.flush_active_memtable(0)?;
+    /// }
+    ///
     /// let report = config.repair()?;
     /// println!("recovered {} tables, {} unreadable", report.recovered, report.unreadable);
     ///
-    /// // `repair` borrows, so the same config opens the rebuilt tree.
-    /// let _tree = config.open()?;
+    /// // `repair` borrows, so the same config opens the rebuilt tree. Once the
+    /// // report's replay obligation is met, the tree stops owing it.
+    /// let tree = config.open()?;
+    /// assert!(tree.get("a", 1)?.is_some());
+    /// assert!(tree.acknowledge_repair_report(report.id)?);
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair(&self) -> crate::Result<RepairReport> {
@@ -3702,9 +3811,16 @@ impl Config {
     /// Propagates a transient-I/O or lock failure from the open and any
     /// repair failure. A failure of the POST-repair open surfaces as
     /// [`Error::RepairedButUnopened`](crate::Error::RepairedButUnopened),
-    /// carrying the completed [`RepairReport`]: the repair is committed, so a
-    /// retry opens without repairing and answers `None` — consume the report
-    /// from the error, or the replay obligation it names is lost.
+    /// carrying the completed [`RepairReport`]: consume it from the error.
+    ///
+    /// The rebuilt snapshot holds its report until the caller acknowledges it
+    /// with [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report),
+    /// and every call before that answers `Some(report)` again, a healthy
+    /// open included. A report is handed out at least once whatever ends the
+    /// process between the hand-out and its use; one handed out again carries
+    /// the same [`RepairReport::id`], so a caller that records the ids it
+    /// applied skips it. Acknowledge only once the report's replay obligation
+    /// is met.
     ///
     /// # Examples
     ///
@@ -3727,30 +3843,51 @@ impl Config {
         policy: RepairPolicy,
     ) -> crate::Result<(crate::AnyTree, Option<RepairReport>)> {
         let retry = self.clone();
+        let path = self.path.clone();
         match self.open() {
-            Ok(tree) => Ok((tree, None)),
+            // A report not yet acknowledged rides in the snapshot this open
+            // installed again.
+            Ok(tree) => {
+                let owed = owed_report(&tree, &path);
+                Ok((tree, owed))
+            }
             Err(e) if is_repairable_structural(&e) => {
-                let report =
-                    retry.repair_with_resurrection(policy.salvage, policy.allow_resurrection)?;
-                // The follow-up open's failure must not DROP the report: the
-                // repair is committed, so the caller's retry opens a healthy
-                // tree without a repair and answers `None`, and an
-                // external-WAL consumer would never learn the replay
-                // obligation the report carries. Ship it WITH the error.
-                let tree = match retry.open() {
-                    Ok(tree) => tree,
-                    Err(cause) => {
-                        return Err(crate::Error::RepairedButUnopened {
-                            report: alloc::boxed::Box::new(report),
-                            cause: alloc::boxed::Box::new(cause),
-                        });
-                    }
-                };
-                Ok((tree, Some(report)))
+                // The rebuilt snapshot owes the report, so a crash before it
+                // reaches the caller leaves it for the next call.
+                let report = repair_tree(&retry, policy.salvage, policy.allow_resurrection)?;
+                match retry.open() {
+                    // The snapshot owes this same report (one id), but its
+                    // copy was written before the cleanup after the commit;
+                    // this call's own report also says what that cleanup did.
+                    Ok(tree) => Ok((tree, Some(report))),
+                    // The repair committed: the report leaves with the error,
+                    // and the snapshot that owes it hands it out again, with
+                    // the same id, to the call that opens it.
+                    Err(cause) => Err(crate::Error::RepairedButUnopened {
+                        report: alloc::boxed::Box::new(report),
+                        cause: alloc::boxed::Box::new(cause),
+                    }),
+                }
             }
             Err(e) => Err(e),
         }
     }
+}
+
+/// The [`RepairReport::id`] of the report encoded as `bytes`.
+pub(crate) fn owed_report_id(bytes: &[u8]) -> u128 {
+    report_marker::owed_id(bytes)
+}
+
+/// The report `tree` owes until its caller acknowledges it.
+fn owed_report(tree: &crate::AnyTree, path: &std::path::Path) -> Option<RepairReport> {
+    let index = match tree {
+        crate::AnyTree::Standard(tree) => tree,
+        crate::AnyTree::Blob(tree) => &tree.index,
+    };
+    index
+        .owed_repair_report()
+        .map(|owed| report_marker::decode_owed(&owed, path))
 }
 
 /// Whether an `open` failure positively identifies repairable ON-DISK
@@ -4177,49 +4314,36 @@ impl<'a> PublishedBlobReplacements<'a> {
     }
 }
 
-/// What the on-disk `CURRENT` pointer says about a failed `persist_version`:
-/// did its atomic pointer switch happen before the error?
-enum CurrentProbe {
-    /// The pointer names the rebuilt version: the switch happened.
-    Switched,
-    /// The pointer is ABSENT (`NotFound`) or names another version: the
-    /// switch did not happen. Absence is conclusive — a successful rename
-    /// leaves the pointer in place, so `NotFound` means the rename never
-    /// ran; and an OLDER tree's surviving pointer names a lower version id
-    /// (the rebuild allocates `max(v*) + 1`), so it never false-positives.
-    NotSwitched,
-    /// The pointer cannot be read (a transient or permission failure on its
-    /// open or read, or a short pointer): NO conclusion. The caller must
-    /// fail SAFE — treating this as "not switched" would delete files a
-    /// possibly-published manifest references.
+/// What the disk says about a failed `persist_version`: was the rebuilt
+/// snapshot installed (renamed to its name) before the error?
+enum InstallProbe {
+    /// The rebuilt snapshot's name exists: it is, or may become, installed.
+    Installed,
+    /// The name is ABSENT (`NotFound`): the install did not happen. Absence
+    /// is conclusive: the rebuilt id is above every manifest file on disk, so
+    /// only the persist's rename makes the name, and only the persist's
+    /// withdrawal removes it after, which the persist reports as
+    /// [`crate::Error::InstallOutcomeUnknown`] unless it made the removal
+    /// durable.
+    NotInstalled,
+    /// The name's existence cannot be told (a transient or permission failure
+    /// of the probe): NO conclusion. The caller must fail SAFE: treating
+    /// this as "not installed" would delete files a possibly-published
+    /// manifest references.
     Inconclusive,
 }
 
 /// The post-failure probe deciding if a failed `persist_version` died before
-/// or after its atomic pointer switch.
-fn probe_current(
+/// or after it installed the snapshot.
+fn probe_install(
     fs: &dyn crate::fs::Fs,
     folder: &std::path::Path,
     version_id: u64,
-) -> CurrentProbe {
-    let file = match fs.open(
-        &folder.join(crate::file::CURRENT_VERSION_FILE),
-        &crate::fs::FsOpenOptions::new().read(true),
-    ) {
-        Ok(file) => file,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return CurrentProbe::NotSwitched,
-        Err(_) => return CurrentProbe::Inconclusive,
-    };
-    let Ok(bytes) = crate::file::read_exact(&*file, 0, 8) else {
-        return CurrentProbe::Inconclusive;
-    };
-    let Ok(raw) = <[u8; 8]>::try_from(bytes.as_ref()) else {
-        return CurrentProbe::Inconclusive;
-    };
-    if u64::from_le_bytes(raw) == version_id {
-        CurrentProbe::Switched
-    } else {
-        CurrentProbe::NotSwitched
+) -> InstallProbe {
+    match fs.metadata(&folder.join(format!("v{version_id}"))) {
+        Ok(_) => InstallProbe::Installed,
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => InstallProbe::NotInstalled,
+        Err(_) => InstallProbe::Inconclusive,
     }
 }
 
@@ -4310,8 +4434,8 @@ fn repair_tree(
     salvage: bool,
     allow_resurrection: bool,
 ) -> crate::Result<RepairReport> {
-    // Hold the cross-process directory lock for the whole repair: it rewrites
-    // CURRENT, writes a fresh snapshot, and sweeps `edits-*` in place, so a
+    // Hold the cross-process directory lock for the whole repair: it writes and
+    // installs a fresh snapshot and sweeps `edits-*` in place, so a
     // concurrent open / repair of the same directory would corrupt the manifest.
     // A second acquirer fails fast with `Error::Locked`. Dropped at function
     // return, releasing the lock. The directory is expected to exist (repair
@@ -4376,6 +4500,27 @@ fn repair_tree(
     #[cfg(not(feature = "std"))]
     let manifest_referenced: Option<CommittedManifest> = None;
 
+    // An earlier repair whose report never reached the caller: the installed
+    // snapshot still owes it. This rebuild replaces that snapshot, so the
+    // earlier losses travel in its report. Only that one section is read, so
+    // damage elsewhere in the snapshot does not hide it. A snapshot too
+    // damaged to say whether it owes one may: that replay is owed unscoped,
+    // since leaving it out would lose it for good. A transient failure
+    // propagates for the retry.
+    let outstanding = crate::version::recovery::owed_repair_report(
+        &config.path,
+        &*config.fs,
+        config.encryption.clone(),
+    )?
+    .map(|owed| match owed {
+        crate::version::recovery::OwedReport::Readable(bytes) => {
+            report_marker::decode_owed(&bytes, &config.path)
+        }
+        crate::version::recovery::OwedReport::Unreadable(id) => {
+            report_marker::unreadable_owed(&config.path, id)
+        }
+    });
+
     // Byte totals for the progress percentage, from an upfront listing —
     // before the scan phase starts, so `bytes_processed / bytes_total` is
     // meaningful from the first processed file.
@@ -4404,6 +4549,9 @@ fn repair_tree(
         manifest_referenced,
         scan,
         first_tree_id,
+        outstanding,
+        #[cfg(zstd_any)]
+        &damaged_dictionaries,
     );
     #[cfg(zstd_any)]
     let rebuilt = set_aside_damaged_dictionaries(config, damaged_dictionaries, rebuilt);
@@ -4411,11 +4559,14 @@ fn repair_tree(
 }
 
 /// Moves every damaged dictionary still under its name aside, now that the
-/// rebuilt manifest is durable, and records each in the report.
+/// rebuilt manifest is durable.
 ///
 /// Left under its name, a damaged dictionary would fail the open this repair
 /// was run for. One the rebuild rewrote from a supplied copy reads intact
-/// again and stays.
+/// again and stays. The report already names each one moved here: the rebuild
+/// records them before it writes the report's copy, which an open hands out
+/// when the run ends after these moves and before the report reaches the
+/// caller.
 ///
 /// # Errors
 ///
@@ -4438,21 +4589,31 @@ fn set_aside_damaged_dictionaries(
     };
     let folder = config.path.join(crate::file::DICTS_FOLDER);
     for id in damaged {
-        match crate::dicts::set_aside_if_damaged(
+        let moved = match crate::dicts::set_aside_if_damaged(
             &*config.fs,
             &folder,
             id,
             config.encryption.as_deref(),
             config.sync_mode,
         ) {
-            Ok(Some(aside)) => report.damaged_dictionaries.push((
-                aside,
-                format!("dictionary {id} failed its integrity check; moved aside"),
-            )),
-            Ok(None) => {}
+            Ok(moved) => moved.is_some(),
             Err(e) => {
                 post_commit_error.get_or_insert(e);
+                false
             }
+        };
+        // The report's entry, written before the move, says now what it did.
+        let aside = crate::dicts::damaged_path(&folder, id);
+        if let Some(entry) = report
+            .damaged_dictionaries
+            .iter_mut()
+            .find(|(path, _)| *path == aside)
+        {
+            entry.1 = if moved {
+                format!("dictionary {id} failed its integrity check; moved aside")
+            } else {
+                format!("dictionary {id} failed its integrity check; NOT moved aside")
+            };
         }
     }
     match post_commit_error {
@@ -5560,6 +5721,8 @@ fn rebuild_from_scan(
     manifest_referenced: Option<CommittedManifest>,
     scan: TableScan,
     first_tree_id: crate::tree::inner::TreeId,
+    outstanding: Option<RepairReport>,
+    #[cfg(zstd_any)] damaged_dictionaries: &[crate::file::DictId],
 ) -> crate::Result<RepairReport> {
     let TableScan {
         recovered_by_id,
@@ -6513,6 +6676,9 @@ fn rebuild_from_scan(
             blob_files_salvaged,
             salvaged,
             first_tree_id,
+            outstanding,
+            #[cfg(zstd_any)]
+            damaged_dictionaries,
         },
     )
 }
@@ -6550,6 +6716,13 @@ struct RepairPublication<'a> {
     /// The first tree id the repair handed out: the descriptors cached under
     /// it and every later id are closed before the post-commit swaps.
     first_tree_id: crate::tree::inner::TreeId,
+    /// The report of an earlier repair over the installed snapshot that never
+    /// reached the caller: its losses are owed as well.
+    outstanding: Option<RepairReport>,
+    /// Dictionaries found damaged at the start; those still damaged when the
+    /// report is assembled are set aside after the commit.
+    #[cfg(zstd_any)]
+    damaged_dictionaries: &'a [crate::file::DictId],
 }
 
 /// Phase 3 of [`repair_tree`]: commit the rebuilt manifest, then carry out
@@ -6588,6 +6761,9 @@ fn publish_repaired_manifest(
         mut blob_files_salvaged,
         salvaged,
         first_tree_id,
+        outstanding,
+        #[cfg(zstd_any)]
+        damaged_dictionaries,
     } = publication;
     // A rebuilt manifest whose highest table id is the LAST one cannot be
     // committed: the next open seeds its id allocator with `highest + 1`,
@@ -6647,26 +6823,19 @@ fn publish_repaired_manifest(
         levels.push(Level::empty());
     }
 
-    // Next version id after the highest existing one. The max is parsed from
-    // on-disk `v{N}` directory names, so a malformed `v{u64::MAX}` entry would
-    // overflow; reject it explicitly rather than wrapping the version counter.
-    // The rebuilt id also needs HEADROOM: publishing at `u64::MAX` itself
-    // hands the first subsequent version edit an `id + 1` overflow (a panic
-    // in checked builds, a wrap to version 0 colliding with old generation
-    // state otherwise). Mirrors the table-id and blob-id exhaustion guards.
+    // Next version id after the highest existing one: recovery takes the
+    // highest snapshot, so the rebuilt one must be above every other. Only a
+    // folder already holding `v{u64::MAX}` has no such id. A rebuilt snapshot
+    // high in the range needs no headroom for later edits: the next one comes
+    // from an open, which renumbers any tree in the top half to version 0.
     let version_id = match highest_existing_version_id(&*config.fs, &config.path)? {
-        Some(max) => {
-            let next = max.checked_add(1).ok_or(crate::Error::Unrecoverable)?;
-            if next == u64::MAX {
-                log::error!(
-                    "repair: the version id space is exhausted (v{max} exists); a \
-                     rebuilt manifest at v{next} would make the next version edit \
-                     overflow",
-                );
-                return Err(crate::Error::Unrecoverable);
-            }
-            next
-        }
+        Some(max) => max.checked_add(1).ok_or_else(|| {
+            log::error!(
+                "repair: v{max} exists, so no snapshot id is left above it for the \
+                 rebuilt manifest",
+            );
+            crate::Error::Unrecoverable
+        })?,
         None => 0,
     };
 
@@ -6745,6 +6914,164 @@ fn publish_repaired_manifest(
         p.set_phase(crate::RecoveryPhase::Committing);
     }
 
+    let mut warnings = vec![WARN_ALL_AT_L0, WARN_UNLOGGED_EDITS];
+    if config.kv_separation_opts.is_some() {
+        warnings.push(WARN_BLOB_FRAGMENTATION);
+    }
+
+    // Join the exclusions against the coverage captured during the scan, plus
+    // an entry per KEPT lossy salvage (see `salvaged_coverage`). An excluded
+    // TABLE whose metadata never parsed has unknowable coverage — recorded
+    // separately so `wal_replay_scope()` can force the full-history
+    // obligation instead of silently answering as if nothing was lost. Only a
+    // NUMERIC table candidate qualifies: a FOREIGN name (`notes.txt`) held no
+    // table data by definition, so its exclusion lost nothing — reporting it
+    // unknowable would demand an unbounded WAL archive over scribbles. Blob
+    // files stay out for the same reason in the other direction: losing blob
+    // content surfaces through the referencing tables (a lossy handle
+    // rewrite, or their exclusion), which ARE covered above. Provenance, not
+    // a path prefix, decides which is which: a level route may nest its
+    // tables anywhere (even under the primary tree's blobs directory), so a
+    // candidate is a table iff its parent is one of the scanned table
+    // folders.
+    let table_folders: Vec<PathBuf> = config
+        .all_tables_folders()
+        .into_iter()
+        .map(|(folder, _)| folder)
+        .collect();
+    let mut lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
+    let mut unknowable_losses: Vec<PathBuf> = Vec::new();
+    let is_table_candidate = |path: &std::path::Path| {
+        path.parent()
+            .is_some_and(|parent| table_folders.iter().any(|f| f.as_path() == parent))
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                matches!(
+                    crate::file::TableDirEntry::classify(n),
+                    crate::file::TableDirEntry::Table(_)
+                )
+            })
+    };
+    // Redundant exclusions live in `excluded_files` and never reach this
+    // loop: their content lives on in the kept tables, so they contribute
+    // no coverage. A DAMAGED duplicate does reach it — the corruption signal
+    // belongs in `unreadable_files` — but its coverage is not lost either, and
+    // an unscopable entry here would send an external WAL over the whole
+    // keyspace for a tree that lost nothing.
+    for (path, _) in &unreadable_files {
+        if redundant_unreadable.contains(path) {
+            continue;
+        }
+        match coverage_by_path.get(path) {
+            Some((lo, hi, seqno)) => {
+                lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
+            }
+            None if is_table_candidate(path) => unknowable_losses.push(path.clone()),
+            None => {}
+        }
+    }
+    lost_coverage.extend(salvaged_coverage);
+    lost_coverage.extend(
+        lineage_partial
+            .into_iter()
+            .map(|(_, path, lo, hi, bound, _)| (path, lo, hi, bound)),
+    );
+    unknowable_losses.extend(salvaged_unknowable);
+    // A table the CLEAN manifest referenced that the scan never even SAW: the
+    // file is gone, so there is no directory entry to report through — and
+    // the manifest records no key range for it, so the loss is unscopable.
+    if let Some(referenced) = manifest_referenced {
+        let primary_tables = config.path.join("tables");
+        let mut missing: Vec<TableId> = referenced
+            .tables
+            .into_keys()
+            .filter(|id| !scanned_table_ids.contains(id))
+            .collect();
+        missing.sort_unstable();
+        for id in missing {
+            log::warn!(
+                "repair: table {id} is referenced by the recovered manifest but has \
+                 no file on disk; its loss is unscopable",
+            );
+            unknowable_losses.push(primary_tables.join(id.to_string()));
+        }
+    }
+
+    // The replacements are DURABLE the moment the manifest commits, so the
+    // report names every one of them regardless of what the cleanup does: it
+    // is what rides out inside `RepairedButUnopened`, the operator's only
+    // account of which blobs were replaced. A removal after the commit only
+    // annotates its entry.
+    // The snapshot's copy is written before the cleanup and may be handed out
+    // after it, so it says what holds either way; this call's report then
+    // says what the cleanup did.
+    let salvage_report_base = blob_files_salvaged.len();
+    blob_files_salvaged.extend(stale_blob_originals.iter().map(|(path, note)| {
+        (
+            path.clone(),
+            format!("{note}; original removed once the repair finishes"),
+        )
+    }));
+
+    // Every damaged dictionary still under its name is set aside once the
+    // commit is durable (see `set_aside_damaged_dictionaries`). The report's
+    // copy below is what an open hands out when the run ends before the
+    // report reaches the caller, and by then the files may already be aside,
+    // so the copy names them now. A dictionary the store above rewrote from a
+    // supplied copy reads intact again and stays.
+    #[cfg(zstd_any)]
+    let damaged_dictionaries = {
+        let folder = config.path.join(crate::file::DICTS_FOLDER);
+        let mut entries = Vec::new();
+        for &id in damaged_dictionaries {
+            if crate::dicts::is_still_damaged(
+                &*config.fs,
+                &folder,
+                id,
+                config.encryption.as_deref(),
+            )? {
+                entries.push((
+                    crate::dicts::damaged_path(&folder, id),
+                    format!(
+                        "dictionary {id} failed its integrity check; moved aside once the \
+                         repair finishes"
+                    ),
+                ));
+            }
+        }
+        entries
+    };
+    #[cfg(not(zstd_any))]
+    let damaged_dictionaries = Vec::new();
+
+    let mut report = RepairReport {
+        recovered,
+        salvaged,
+        unreadable: unreadable_files.len(),
+        unreadable_files,
+        excluded_files,
+        lost_coverage,
+        unknowable_losses,
+        blob_files_salvaged,
+        damaged_dictionaries,
+        method: REPAIR_METHOD,
+        warnings,
+        id: 0,
+        includes: Vec::new(),
+    };
+    // Appended after this run's entries, so `salvage_report_base` still
+    // indexes them.
+    if let Some(earlier) = outstanding {
+        fold_report(&mut report, earlier);
+    }
+    report.id = report_marker::id_for(&report, version_id, config.clock.as_ref());
+
+    // The report exists only in this call, and the commit below may end with
+    // its outcome unknown: a power loss can still keep the rebuilt snapshot,
+    // and the next open then finds nothing to repair. The snapshot holds the
+    // report, so it is there exactly when the snapshot is installed, and an
+    // open hands it out from there.
+    let version = version.with_repair_report(Some(Arc::from(report_marker::encode(&report))));
+
     // Persist with the tree's own runtime config, not defaults: it drives the
     // manifest framing (checksum algorithm, page ECC, footer mirror, manifest
     // KV checksums), so defaulting it would rewrite a recovered tree's manifest
@@ -6761,43 +7088,68 @@ fn publish_repaired_manifest(
         config.sync_mode,
     );
     // The guard stays ARMED until the commit is decided: every fallible
-    // `persist_version` step before its atomic `CURRENT` switch (manifest
-    // create / encode / finish / directory sync, and the switch's own
-    // rename) leaves the replacements unreferenced garbage a retry would
-    // re-derive — keeping them would stack another fresh-id copy per failed
-    // attempt, walking recovery toward ENOSPC under exactly the tight-space
-    // conditions it targets. The ONE fallible step after the switch is the
-    // pointer's directory sync, so on failure the pointer on disk decides
-    // which world this is: a `CURRENT` naming the rebuilt version means the
-    // manifest is published and the replacements are the files it
-    // references. A probe that cannot READ the pointer proves nothing, and
-    // fail-safe is to PRESERVE: the worst a preserved orphan costs is disk
-    // space a later successful repair's reference filtering reclaims, while
-    // a wrong deletion breaks a published manifest permanently.
-    // A failure after a PROVEN switch must still CARRY the report: the
-    // pointer on disk already names the rebuilt manifest, so the retry
-    // opens it without a repair and answers with no report at all — losing
-    // the replay obligation exactly like a cleanup failure would. Recording
-    // the error routes it through the same report-carrying exit. A proven
-    // NOT-SWITCHED failure returns bare (nothing was published, the guard
-    // stays armed, the retry's own repair produces a fresh report). An
-    // INCONCLUSIVE probe also returns bare: without proof of the switch the
-    // report may describe a repair that never committed, and a consumer
-    // replaying its obligation against the still-live OLD generation could
-    // duplicate merge operands — while the blob replacements are preserved
-    // (the probe's own fail-safe: their worst cost is disk space) and no
-    // post-commit cleanup runs, so nothing of a possibly-live generation
-    // is touched.
+    // `persist_version` step before it installs the snapshot (manifest
+    // create / encode / finish, the log's creation, and the rename) leaves the
+    // replacements unreferenced garbage a retry would re-derive; keeping
+    // them would stack another fresh-id copy per failed attempt, walking
+    // recovery toward ENOSPC under exactly the tight-space conditions it
+    // targets. The ONE fallible step after the install is the directory sync,
+    // so on failure the name on disk decides which world this is: the rebuilt
+    // snapshot under its name means the manifest is or may become published and the
+    // replacements are the files it references. A probe that cannot tell
+    // proves nothing, and fail-safe is to PRESERVE: the worst a preserved
+    // orphan costs is disk space a later successful repair's reference
+    // filtering reclaims, while a wrong deletion breaks a published manifest
+    // permanently.
+    // A failure after a PROVEN install must still CARRY the report: the
+    // rebuilt snapshot is installed on disk, so the retry opens it without a
+    // repair and answers with no report at all — losing the replay
+    // obligation exactly like a cleanup failure would. Recording the error
+    // routes it through the same report-carrying exit. A proven NOT-INSTALLED
+    // failure returns bare (nothing was published, the guard stays armed,
+    // the retry's own repair produces a fresh report). An INCONCLUSIVE probe
+    // also returns bare: without proof of the install the report may
+    // describe a repair that never committed, and a consumer replaying its
+    // obligation against the still-live OLD generation could duplicate merge
+    // operands — while the blob replacements are preserved (the probe's own
+    // fail-safe: their worst cost is disk space) and no post-commit cleanup
+    // runs, so nothing of a possibly-live generation is touched. The report
+    // rides in the rebuilt snapshot on every bare exit: an open hands it out
+    // exactly when that snapshot is the installed one.
     let mut post_commit_error: Option<crate::Error> = None;
     match persisted {
         Ok(()) => published_blob_replacements.disarm(),
-        Err(e) => match probe_current(&*config.fs, &config.path, version_id) {
-            CurrentProbe::NotSwitched => return Err(e),
-            CurrentProbe::Switched => {
+        Err(e) => match probe_install(&*config.fs, &config.path, version_id) {
+            // When the persist renamed the snapshot into place and could not
+            // make its withdrawal durable, a power loss may bring the name
+            // back: its absence proves nothing then.
+            InstallProbe::NotInstalled if !matches!(e, crate::Error::InstallOutcomeUnknown(_)) => {
+                return Err(e);
+            }
+            // A visible name is not yet a durable install: the persist's own
+            // directory sync failed, so a power loss can still take the name
+            // back. Only a sync that succeeds now makes the rebuilt snapshot
+            // the installed generation; until then the repair has not
+            // committed, and answering as committed would hand out a replay
+            // scope for a generation that may not survive.
+            InstallProbe::Installed => {
                 published_blob_replacements.disarm();
+                if let Err(sync) = config
+                    .fs
+                    .sync_directory_with(&config.path, config.sync_mode)
+                {
+                    log::warn!(
+                        "repair: the rebuilt snapshot v{version_id} is visible but its \
+                         install cannot be made durable ({sync}); its report rides in it",
+                    );
+                    return Err(match e {
+                        crate::Error::InstallOutcomeUnknown(_) => e,
+                        other => crate::Error::InstallOutcomeUnknown(Box::new(other)),
+                    });
+                }
                 post_commit_error = Some(e);
             }
-            CurrentProbe::Inconclusive => {
+            InstallProbe::NotInstalled | InstallProbe::Inconclusive => {
                 published_blob_replacements.disarm();
                 return Err(e);
             }
@@ -6907,28 +7259,13 @@ fn publish_repaired_manifest(
     // FAILS. Reporting a successful repair for a tree that will not open is the
     // one outcome recovery must never produce, so the failure propagates: the
     // manifest is already durable, and a retry once the filesystem is fixed
-    // finishes the sweep on the same inputs.
-    // The replacements are DURABLE the moment the manifest commits, so the
-    // report must name every one of them regardless of what the cleanup does.
-    // Recording them only as removals succeeded left the report empty whenever
-    // an earlier post-commit step had already failed, and truncated whenever a
-    // removal failed midway — and that report is what rides out inside
-    // `RepairedButUnopened`, the operator's only account of which blobs were
-    // replaced. Build the entries first; the removal only annotates them.
-    let salvage_report_base = blob_files_salvaged.len();
-    blob_files_salvaged.extend(
-        stale_blob_originals
-            .iter()
-            .map(|(path, note)| (path.clone(), format!("{note}; original NOT removed"))),
-    );
+    // finishes the sweep on the same inputs. The report already names every
+    // replacement; a removal only annotates its entry.
+    let mut originals_removed = 0;
     if post_commit_error.is_none() {
-        for (i, (path, note)) in stale_blob_originals.iter().enumerate() {
+        for (path, _) in &stale_blob_originals {
             match discard_unreferenced(&*config.fs, path, config.sync_mode) {
-                Ok(()) => {
-                    if let Some(entry) = blob_files_salvaged.get_mut(salvage_report_base + i) {
-                        *entry = (path.clone(), format!("{note}; original removed"));
-                    }
-                }
+                Ok(()) => originals_removed += 1,
                 Err(e) => {
                     log::error!(
                         "repair: cannot remove the superseded blob original {} ({e}); \
@@ -6941,6 +7278,21 @@ fn publish_repaired_manifest(
                 }
             }
         }
+    }
+    // The originals' entries are the last ones of the list, in their order.
+    for (i, (entry, (path, note))) in report
+        .blob_files_salvaged
+        .iter_mut()
+        .skip(salvage_report_base)
+        .zip(&stale_blob_originals)
+        .enumerate()
+    {
+        let state = if i < originals_removed {
+            "original removed"
+        } else {
+            "original NOT removed"
+        };
+        *entry = (path.clone(), format!("{note}; {state}"));
     }
 
     // Everything the scan classified out of the rebuilt tree: a foreign name, a
@@ -7007,107 +7359,6 @@ fn publish_repaired_manifest(
         }
     }
 
-    let mut warnings = vec![
-        "All recovered tables placed at L0; background compaction will redistribute them",
-        "Recent unlogged version edits (in-flight compactions, recent deletions) are lost",
-    ];
-    if config.kv_separation_opts.is_some() {
-        warnings.push(
-            "Blob fragmentation stats reset (punched prefixes reseeded); blob GC re-learns the rest over time",
-        );
-    }
-
-    // Join the exclusions against the coverage captured during the scan, plus
-    // an entry per KEPT lossy salvage (see `salvaged_coverage`). An excluded
-    // TABLE whose metadata never parsed has unknowable coverage — recorded
-    // separately so `wal_replay_scope()` can force the full-history
-    // obligation instead of silently answering as if nothing was lost. Only a
-    // NUMERIC table candidate qualifies: a FOREIGN name (`notes.txt`) held no
-    // table data by definition, so its exclusion lost nothing — reporting it
-    // unknowable would demand an unbounded WAL archive over scribbles. Blob
-    // files stay out for the same reason in the other direction: losing blob
-    // content surfaces through the referencing tables (a lossy handle
-    // rewrite, or their exclusion), which ARE covered above. Provenance, not
-    // a path prefix, decides which is which: a level route may nest its
-    // tables anywhere (even under the primary tree's blobs directory), so a
-    // candidate is a table iff its parent is one of the scanned table
-    // folders.
-    let table_folders: Vec<PathBuf> = config
-        .all_tables_folders()
-        .into_iter()
-        .map(|(folder, _)| folder)
-        .collect();
-    let mut lost_coverage: Vec<(PathBuf, UserKey, UserKey, Option<SeqNo>)> = Vec::new();
-    let mut unknowable_losses: Vec<PathBuf> = Vec::new();
-    let is_table_candidate = |path: &std::path::Path| {
-        path.parent()
-            .is_some_and(|parent| table_folders.iter().any(|f| f.as_path() == parent))
-            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                matches!(
-                    crate::file::TableDirEntry::classify(n),
-                    crate::file::TableDirEntry::Table(_)
-                )
-            })
-    };
-    // Redundant exclusions live in `excluded_files` and never reach this
-    // loop: their content lives on in the kept tables, so they contribute
-    // no coverage. A DAMAGED duplicate does reach it — the corruption signal
-    // belongs in `unreadable_files` — but its coverage is not lost either, and
-    // an unscopable entry here would send an external WAL over the whole
-    // keyspace for a tree that lost nothing.
-    for (path, _) in &unreadable_files {
-        if redundant_unreadable.contains(path) {
-            continue;
-        }
-        match coverage_by_path.get(path) {
-            Some((lo, hi, seqno)) => {
-                lost_coverage.push((path.clone(), lo.clone(), hi.clone(), *seqno));
-            }
-            None if is_table_candidate(path) => unknowable_losses.push(path.clone()),
-            None => {}
-        }
-    }
-    lost_coverage.extend(salvaged_coverage);
-    lost_coverage.extend(
-        lineage_partial
-            .into_iter()
-            .map(|(_, path, lo, hi, bound, _)| (path, lo, hi, bound)),
-    );
-    unknowable_losses.extend(salvaged_unknowable);
-    // A table the CLEAN manifest referenced that the scan never even SAW: the
-    // file is gone, so there is no directory entry to report through — and
-    // the manifest records no key range for it, so the loss is unscopable.
-    if let Some(referenced) = manifest_referenced {
-        let primary_tables = config.path.join("tables");
-        let mut missing: Vec<TableId> = referenced
-            .tables
-            .into_keys()
-            .filter(|id| !scanned_table_ids.contains(id))
-            .collect();
-        missing.sort_unstable();
-        for id in missing {
-            log::warn!(
-                "repair: table {id} is referenced by the recovered manifest but has \
-                 no file on disk; its loss is unscopable",
-            );
-            unknowable_losses.push(primary_tables.join(id.to_string()));
-        }
-    }
-
-    let report = RepairReport {
-        recovered,
-        salvaged,
-        unreadable: unreadable_files.len(),
-        unreadable_files,
-        excluded_files,
-        lost_coverage,
-        unknowable_losses,
-        blob_files_salvaged,
-        damaged_dictionaries: Vec::new(),
-        method: "all-to-L0 with sequence-number ordering",
-        warnings,
-    };
-
     // A recorded post-commit failure carries the completed report out: the
     // manifest is durable, so the repair happened, and a retry once the
     // filesystem is fixed finishes the cleanup — but its own open may find
@@ -7119,6 +7370,10 @@ fn publish_repaired_manifest(
         });
     }
 
+    // The rebuilt snapshot keeps owing the report until the caller
+    // acknowledges it: a process that ends before the caller met the report's
+    // replay obligation finds it there again.
+
     // Success only: a failed run leaves the phase where it stopped, which
     // tells a progress display exactly which stage failed.
     if let Some(p) = &config.recovery_progress {
@@ -7127,6 +7382,9 @@ fn publish_repaired_manifest(
 
     Ok(report)
 }
+
+#[cfg(feature = "std")]
+mod report_marker;
 
 #[cfg(test)]
 mod tests;

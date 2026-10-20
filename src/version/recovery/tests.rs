@@ -1,6 +1,6 @@
 use super::*;
 use crate::coding::Encode;
-use crate::fs::{FsOpenOptions, MemFs};
+use crate::fs::MemFs;
 use crate::io::{LittleEndian, WriteBytesExt};
 use crate::version::edit::{AddedBlobFile, ChangedLevel, TableDesc, VersionEdit};
 use std::io::Write;
@@ -19,6 +19,7 @@ fn recovery_with(version_id: u64, table_ids: Vec<Vec<Vec<RecoveredTable>>>) -> R
         blob_restrictions: crate::HashMap::default(),
         retention_floor: 0,
         dicts: Vec::new(),
+        repair_report: None,
     }
 }
 
@@ -475,53 +476,36 @@ fn apply_overwrites_gc_stats_when_present() {
     assert_eq!(rec.gc_stats, gc, "GC stats overwritten from the edit");
 }
 
-/// Write a CURRENT pointer so `recover()` can find the version file.
+/// Gives the `v{id}` manifest a fixture wrote under its installed name the
+/// empty edit log an install makes beside it.
 ///
-/// Must be called AFTER the `v{id}` manifest file exists — the
-/// pointer's checksum is the canonical digest derived from the
-/// manifest's parsed footer (TOC + per-section XXH3-128s) via
-/// [`crate::manifest_blocks::current_digest::compute`]. Fixtures
-/// that test corruption-recovery typically write the corrupted
-/// manifest first, then call this to stamp the CURRENT pointer
-/// — the digest binds the TOC (which the corruption inside a
-/// section payload doesn't touch), so `get_current_version`
-/// accepts the pointer and the per-Block / per-record check
-/// downstream is the one that surfaces the corruption.
-fn write_current(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
-    let manifest_path = folder.join(format!("v{version_id}"));
-    let archive = crate::manifest_blocks::reader::ManifestArchiveReader::open(
-        &manifest_path,
-        fs,
-        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
-        None,
-    )?;
-    let checksum = crate::manifest_blocks::current_digest::compute(version_id, archive.footer())?;
-    let path = folder.join(CURRENT_VERSION_FILE);
-    let mut f = fs.open(
-        &path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
-    )?;
-    f.write_u64::<LittleEndian>(version_id)?;
-    f.write_u128::<LittleEndian>(checksum)?;
-    f.write_u8(0)?; // checksum type
-    Ok(())
+/// Must be called AFTER the `v{id}` manifest file exists. Fixtures that
+/// test corruption-recovery write the corrupted manifest first, then
+/// install it, so the per-Block / per-record check downstream is the one
+/// that surfaces the corruption.
+fn install_fixture(folder: &Path, version_id: u64, fs: &dyn Fs) -> crate::Result<()> {
+    crate::version::edit_log::create_log(fs, folder, version_id, crate::fs::SyncMode::Full)
 }
 
 type FixtureWriter = crate::manifest_blocks::writer::ManifestArchiveWriter;
 
 /// Open a Blocks-based manifest writer at `folder/v{id}` with
-/// the default runtime config. Centralizes the create-new +
+/// the default runtime config, its `version_id` section already written,
+/// as every snapshot names its own id. Centralizes the create-new +
 /// runtime-snapshot boilerplate every fixture would otherwise
 /// repeat verbatim.
 fn open_fixture_writer(folder: &Path, id: u64, fs: &dyn Fs) -> crate::Result<FixtureWriter> {
     let path = folder.join(format!("v{id}"));
-    FixtureWriter::create(
+    let mut writer = FixtureWriter::create(
         &path,
         fs,
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
-    )
+    )?;
+    writer.start("version_id")?;
+    writer.write_u64::<LittleEndian>(id)?;
+    Ok(writer)
 }
 
 /// Append the sections every manifest opens with: `format_version` (the
@@ -624,7 +608,7 @@ fn recover_tables(levels: u8, records: &[(u8, u32, u64)]) -> crate::Result<Recov
     let folder = Path::new("/tables");
     fs.create_dir_all(folder)?;
     write_tables(folder, 1, levels, records, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
     recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
 }
 
@@ -733,7 +717,7 @@ fn recover_rejects_corrupt_blob_file_count() -> crate::Result<()> {
     fs.create_dir_all(folder)?;
 
     write_corrupt_blob_count(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     let Err(err) = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None) else {
         panic!("corrupt blob_file_count should fail");
@@ -803,7 +787,7 @@ fn recover_rejects_a_truncated_tables_section_in_every_mode() -> crate::Result<(
     fs.create_dir_all(folder)?;
 
     write_truncated_tables_tail(folder, 1, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -841,7 +825,7 @@ fn recover_tolerate_tail_does_not_swallow_invalid_tag() -> crate::Result<()> {
     w.start("blob_gc_stats")?;
     w.write_u32::<LittleEndian>(0)?;
     w.finish()?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     let result = recover(
         folder,
@@ -881,7 +865,7 @@ fn recover_rejects_a_tables_section_cut_inside_a_frame_header() -> crate::Result
     fs.create_dir_all(folder)?;
 
     write_truncated_at_second_run(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -934,7 +918,7 @@ fn recover_rejects_a_truncated_blob_files_section_in_every_mode() -> crate::Resu
     fs.create_dir_all(folder)?;
 
     write_truncated_blob_tail(folder, 1, 5, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(e, crate::Error::InvalidHeader("blob_files section"))
@@ -967,7 +951,7 @@ fn recover_rejects_a_truncated_blob_gc_stats_section_in_every_mode() -> crate::R
     let folder = Path::new("/truncated/gc_stats");
     fs.create_dir_all(folder)?;
     write_truncated_blob_gc_stats(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(
         folder,
@@ -1060,7 +1044,7 @@ fn recover_rejects_a_corrupt_table_record_in_every_mode() -> crate::Result<()> {
     let folder = Path::new("/corrupt/table_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_mid_record_corruption(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(
@@ -1131,7 +1115,7 @@ fn recover_rejects_a_corrupt_blob_file_record_in_every_mode() -> crate::Result<(
     let folder = Path::new("/corrupt/blob_record");
     fs.create_dir_all(folder)?;
     write_manifest_with_corrupt_blob_record(folder, 1, &fs)?;
-    write_current(folder, 1, &fs)?;
+    install_fixture(folder, 1, &fs)?;
 
     assert_refused_in_every_mode(folder, &fs, |e| {
         matches!(
@@ -1155,7 +1139,7 @@ fn write_manifest_labelled(folder: &Path, fs: &dyn Fs, format_version: u8) -> cr
     write_empty_blob_files(&mut w)?;
     write_empty_blob_gc_stats(&mut w)?;
     w.finish()?;
-    write_current(folder, 1, fs)
+    install_fixture(folder, 1, fs)
 }
 
 /// Recovery reads the format version before any section: a manifest of
@@ -1174,6 +1158,497 @@ fn recover_refuses_a_manifest_of_another_format_version() -> crate::Result<()> {
         matches!(err, crate::Error::InvalidVersion(5)),
         "expected InvalidVersion(5), got {err:?}",
     );
+    Ok(())
+}
+
+/// A store of the format before this one keeps a version pointer beside its
+/// snapshots, and a higher snapshot its writer left before rewriting the
+/// pointer (one cut short by a crash) is not the store's. Neither an open nor
+/// a repair may take that leftover for the installed snapshot, which an open
+/// would answer with damage and a repair with a silent, lossy rebuild in this
+/// format: the store is refused as one of another format, for the offline
+/// converter, which reads it through its own engine and pointer.
+#[test]
+fn a_store_with_a_version_pointer_is_refused_as_another_format() -> crate::Result<()> {
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let fs = crate::fs::StdFs;
+    let folder = dir.path();
+    fs.create_dir_all(&folder.join(crate::file::TABLES_FOLDER))?;
+    write_manifest_labelled(folder, &fs, 5)?;
+    fs.open(
+        &folder.join("current"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"1")?;
+    // The next generation, cut short before the pointer named it.
+    fs.open(
+        &folder.join("v2"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"torn")?;
+
+    let config = || {
+        crate::Config::new(
+            folder,
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+    };
+    match config().open() {
+        Err(crate::Error::InvalidVersion(5)) => {}
+        Err(e) => panic!("open: expected InvalidVersion(5), got {e:?}"),
+        Ok(_) => panic!("open: a store with a version pointer opened"),
+    }
+    match config().repair() {
+        Err(crate::Error::InvalidVersion(5)) => {}
+        Err(e) => panic!("repair: expected InvalidVersion(5), got {e:?}"),
+        Ok(_) => panic!("repair: a store with a version pointer was rebuilt"),
+    }
+    assert_eq!(
+        std::fs::read(folder.join("v2"))?,
+        b"torn",
+        "the store is left as it was"
+    );
+    Ok(())
+}
+
+/// A snapshot names the version it was written for, and recovery refuses one
+/// found under another number: the highest file is the installed snapshot
+/// only if it is the one written for that number, so a copy placed under a
+/// higher name is damage, not a newer generation.
+#[test]
+fn a_snapshot_under_another_number_is_refused() -> crate::Result<()> {
+    use std::io::{Read, Write};
+    let fs = std::sync::Arc::new(MemFs::new());
+    let config = crate::Config::new(
+        "/renumbered",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    // The folder as the config resolved it: on Windows a rooted path without a
+    // drive is made absolute, so the literal spelling names another folder.
+    let folder = config.path.clone();
+    let folder = folder.as_path();
+    drop(config.open()?);
+    let id = installed_snapshot(folder, &*fs)?.ok_or(crate::Error::Unrecoverable)?;
+    let mut bytes = Vec::new();
+    fs.open(
+        &folder.join(format!("v{id}")),
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?
+    .read_to_end(&mut bytes)?;
+    fs.open(
+        &folder.join(format!("v{}", id + 1)),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(&bytes)?;
+
+    let err = recover(
+        folder,
+        &*fs,
+        ManifestRecoveryMode::AbsoluteConsistency,
+        None,
+    )
+    .expect_err("a snapshot under another number must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestFooterInvalid(
+                "manifest snapshot names another version than its file"
+            )
+        ),
+        "got {err:?}",
+    );
+    Ok(())
+}
+
+/// An open refuses a snapshot found under another number before it touches
+/// anything else in the tree: the dictionaries it would otherwise load, and
+/// the unpublished registrations it would sweep among them, belong to a tree
+/// it has not yet identified.
+#[cfg(zstd_any)]
+#[test]
+fn an_open_refuses_a_renumbered_snapshot_before_it_touches_the_dictionaries() -> crate::Result<()> {
+    use std::io::{Read, Write};
+    let fs = std::sync::Arc::new(MemFs::new());
+    let config = crate::Config::new(
+        "/renumbered-dicts",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let folder = config.path.clone();
+    drop(config.open()?);
+    let id = installed_snapshot(&folder, &*fs)?.ok_or(crate::Error::Unrecoverable)?;
+    let mut bytes = Vec::new();
+    fs.open(
+        &folder.join(format!("v{id}")),
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?
+    .read_to_end(&mut bytes)?;
+    fs.open(
+        &folder.join(format!("v{}", id + 1)),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(&bytes)?;
+    let dicts = folder.join(crate::file::DICTS_FOLDER);
+    fs.create_dir_all(&dicts)?;
+    let registration = dicts.join("7.tmp");
+    fs.open(
+        &registration,
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?;
+
+    let err = crate::Config::new(
+        &folder,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .open()
+    .err()
+    .ok_or(crate::Error::Unrecoverable)?;
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestFooterInvalid(
+                "manifest snapshot names another version than its file"
+            )
+        ),
+        "got {err:?}",
+    );
+    assert!(
+        fs.exists(&registration)?,
+        "the dictionary folder is left as it was"
+    );
+    Ok(())
+}
+
+/// A tree with key `a` at `/top-id` over `fs`, its installed snapshot
+/// rewritten as version `id`; the snapshot it had stays beside it, lower.
+fn a_tree_at_version(fs: &std::sync::Arc<MemFs>, id: u64) -> crate::Result<crate::path::PathBuf> {
+    use crate::AbstractTree;
+    let config = top_id_config(fs);
+    let folder = config.path.clone();
+    let version = {
+        let tree = config.open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        tree.current_version()
+    };
+    crate::version::persist_version(
+        &folder,
+        &version.with_id_and_dicts(id, version.dicts().to_vec()),
+        crate::comparator::default_comparator().name(),
+        &**fs,
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+    Ok(folder)
+}
+
+fn top_id_config(fs: &std::sync::Arc<MemFs>) -> crate::Config {
+    crate::Config::new(
+        "/top-id",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+}
+
+/// The snapshot names in `folder`.
+fn snapshots(fs: &MemFs, folder: &crate::path::Path) -> crate::Result<Vec<String>> {
+    let mut names: Vec<String> = fs
+        .read_dir(folder)?
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .filter(|name| name.starts_with('v'))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Every install takes one version id, an open included, so a tree whose id
+/// reached the top of the range would run out. An open there reinstalls the
+/// tree as version 0, with no snapshot left above it (the lower one an
+/// earlier generation left included, which recovery would otherwise take
+/// over the new one): the tree keeps its data and takes installs again.
+#[test]
+fn an_open_at_the_top_of_the_id_range_reinstalls_the_tree_as_version_0() -> crate::Result<()> {
+    use crate::AbstractTree;
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, u64::MAX)?;
+
+    {
+        let tree = top_id_config(&fs).open()?;
+        assert!(tree.get("a", 1)?.is_some(), "the data is kept");
+        assert_eq!(snapshots(&fs, &folder)?, vec!["v0"], "nothing above it");
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = top_id_config(&fs).open()?;
+    assert!(tree.get("a", 3)?.is_some());
+    assert!(tree.get("b", 3)?.is_some(), "the install after it is kept");
+    assert_eq!(installed_snapshot(&folder, &*fs)?, Some(2));
+    Ok(())
+}
+
+/// A snapshot whose `version_id` section is damaged but whose table of
+/// contents still reads says, through it, that it owes no report: a repair
+/// over it must not invent an unscoped loss from a report that never was.
+#[test]
+fn a_damaged_identity_section_does_not_make_a_report_owed() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, 7)?;
+    let entry_at = {
+        let archive = open_snapshot(&folder, 7, &*fs, None)?;
+        assert!(archive.section("repair_report").is_none(), "self-check");
+        let entry = archive
+            .section("version_id")
+            .ok_or(crate::Error::Unrecoverable)?;
+        entry.block_offset + u64::from(entry.block_size) - 1
+    };
+    let path = folder.join("v7");
+    let mut file = fs.open(
+        &path,
+        &crate::fs::FsOpenOptions::new().read(true).write(true),
+    )?;
+    let mut byte = [0u8; 1];
+    file.seek(std::io::SeekFrom::Start(entry_at))?;
+    std::io::Read::read_exact(&mut file, &mut byte)?;
+    file.seek(std::io::SeekFrom::Start(entry_at))?;
+    file.write_all(&[byte[0] ^ 0xFF])?;
+    drop(file);
+
+    assert_eq!(owed_repair_report(&folder, &*fs, None)?, None);
+    Ok(())
+}
+
+/// A snapshot under a name that is not its own is another generation's: what
+/// the snapshot under that name owed is not in it, so it cannot say.
+#[test]
+fn a_snapshot_naming_another_version_cannot_say_what_is_owed() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, 7)?;
+    let len = usize::try_from(fs.metadata(&folder.join("v7"))?.len)
+        .map_err(|_| crate::Error::Unrecoverable)?;
+    let bytes = crate::file::read_exact(
+        &*fs.open(
+            &folder.join("v7"),
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?,
+        0,
+        len,
+    )?;
+    fs.open(
+        &folder.join("v8"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(&bytes)?;
+
+    assert_eq!(
+        owed_repair_report(&folder, &*fs, None)?,
+        Some(OwedReport::Unreadable(8))
+    );
+    Ok(())
+}
+
+/// A renumbering removes every snapshot and log but the ones it installs,
+/// and only those: a file of another spelling in the tree root is not the
+/// engine's.
+#[test]
+fn a_renumbering_keeps_foreign_files_in_the_tree_root() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, crate::version::RENUMBER_FROM)?;
+    let foreign = ["vendor-notes.txt", "v1.bak", "edits-old", "v007"];
+    for name in foreign {
+        fs.open(
+            &folder.join(name),
+            &crate::fs::FsOpenOptions::new().write(true).create(true),
+        )?
+        .write_all(b"not the engine's")?;
+    }
+
+    // A snapshot a cut-short install left under its temporary name is the
+    // engine's: the renumbering removes it with the other snapshots.
+    let temporary = folder.join(format!("v{}.tmp", crate::version::RENUMBER_FROM - 1));
+    fs.open(
+        &temporary,
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(b"torn")?;
+
+    drop(top_id_config(&fs).open()?);
+    for name in foreign {
+        assert!(fs.exists(&folder.join(name))?, "{name} is kept");
+    }
+    assert!(!fs.exists(&temporary)?, "the temporary snapshot goes");
+    Ok(())
+}
+
+/// A renumbering that fails while removing the snapshot it read must not
+/// have removed that snapshot's log first: the snapshot then stays the
+/// highest, and a reopen would recover it without the edits in its log.
+#[test]
+fn a_renumbering_cut_short_keeps_the_edits_of_the_snapshot_it_read() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let top = crate::version::RENUMBER_FROM;
+    // The listing order of the in-memory folder changes from one instance to
+    // the next; enough instances list the log before the snapshot.
+    for _ in 0..32 {
+        let fs = std::sync::Arc::new(MemFs::new());
+        // Reopened just below the top, the tree is installed as `v{top}`, and
+        // a flush records key `b` in that snapshot's log.
+        a_tree_at_version(&fs, top - 1)?;
+        {
+            let tree = top_id_config(&fs).open()?;
+            tree.insert("b", "2", 1);
+            tree.flush_active_memtable(0)?;
+        }
+
+        let fault = FaultFs::new(fs.as_ref().clone());
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::RemoveFile,
+                Fault::Error(crate::io::ErrorKind::Other),
+            )
+            .on_path(format!("v{top}")),
+        );
+        let failed = crate::Config::new(
+            "/top-id",
+            crate::SequenceNumberCounter::default(),
+            crate::SequenceNumberCounter::default(),
+        )
+        .with_fs(fault)
+        .open();
+        assert!(failed.is_err(), "the snapshot read cannot be removed");
+
+        let tree = top_id_config(&fs).open()?;
+        assert!(
+            tree.get("b", 3)?.is_some(),
+            "the edit in the log of the snapshot read is kept"
+        );
+    }
+    Ok(())
+}
+
+/// A renumbering that fails before the snapshot it read is durably gone
+/// leaves that snapshot the highest: the next open takes it and renumbers
+/// again.
+#[test]
+fn a_renumbering_cut_short_is_done_again_by_the_next_open() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, crate::version::RENUMBER_FROM)?;
+
+    let fault = FaultFs::new(fs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .on_path(format!("v{}", crate::version::RENUMBER_FROM)),
+    );
+    let failed = crate::Config::new(
+        "/top-id",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .open();
+    assert!(failed.is_err(), "the snapshot read cannot be removed");
+
+    let tree = top_id_config(&fs).open()?;
+    assert!(tree.get("a", 1)?.is_some(), "the data is kept");
+    assert_eq!(snapshots(&fs, &folder)?, vec!["v0"]);
+    Ok(())
+}
+
+/// A snapshot whose `version_id` section is not one id wide does not say
+/// which version it is: recovery refuses it as damage rather than read a
+/// guess.
+#[test]
+fn a_snapshot_whose_version_id_is_not_one_id_wide_is_refused() -> crate::Result<()> {
+    let fs = MemFs::new();
+    let folder = Path::new("/narrow-id");
+    fs.create_dir_all(folder)?;
+    let mut w = FixtureWriter::create(
+        &folder.join("v1"),
+        &fs,
+        alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
+        None,
+        crate::fs::SyncMode::Normal,
+    )?;
+    w.start("version_id")?;
+    w.write_u32::<LittleEndian>(1)?;
+    write_header(&mut w)?;
+    write_empty_tables(&mut w)?;
+    write_empty_blob_files(&mut w)?;
+    write_empty_blob_gc_stats(&mut w)?;
+    w.finish()?;
+    install_fixture(folder, 1, &fs)?;
+
+    let err = recover(folder, &fs, ManifestRecoveryMode::AbsoluteConsistency, None)
+        .expect_err("a narrow version id must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::Error::ManifestFooterInvalid("manifest version_id section is not 8 bytes")
+        ),
+        "got {err:?}",
+    );
+    Ok(())
+}
+
+/// Only the spelling the engine writes names a snapshot or an edit log: a
+/// leading zero is a file it never made, and taking it for one would open
+/// another name than the one listed.
+#[test]
+fn only_canonical_ids_name_a_snapshot_or_a_log() {
+    assert_eq!(snapshot_id_of("v0"), Some(0));
+    assert_eq!(snapshot_id_of("v10"), Some(10));
+    assert_eq!(snapshot_id_of("v010"), None);
+    assert_eq!(snapshot_id_of("v00"), None);
+    assert_eq!(log_id_of("edits-0"), Some(0));
+    assert_eq!(log_id_of("edits-07"), None);
+}
+
+/// A stray file spelled like a higher snapshot with a leading zero is not the
+/// installed snapshot: the tree opens on the one it wrote.
+#[test]
+fn a_stray_zero_padded_snapshot_name_does_not_hide_the_installed_one() -> crate::Result<()> {
+    use crate::AbstractTree;
+    let fs = std::sync::Arc::new(MemFs::new());
+    let config = crate::Config::new(
+        "/zero-padded",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone());
+    let folder = config.path.clone();
+    {
+        let tree = config.open()?;
+        tree.insert("key", "value", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    fs.open(
+        &folder.join("v0100"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?;
+    let tree = crate::Config::new(
+        &folder,
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .open()?;
+    assert!(tree.get("key", crate::MAX_SEQNO)?.is_some());
     Ok(())
 }
 

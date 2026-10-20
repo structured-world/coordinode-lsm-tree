@@ -110,7 +110,10 @@ writes). Trim against the persisted one only.
 ## 3. Recovery replay
 
 On `Config::open` the engine recovers its state from the persisted SSTs alone (it
-has no log of its own to replay). After open:
+has no log of its own to replay). Before the open returns, it installs the state
+it recovered as a fresh manifest snapshot, so `get_highest_persisted_seqno()`
+after an open names data a power loss keeps, even when an earlier flush ended
+in `Error::InstallOutcomeUnknown`. After open:
 
 1. Recover from your **trim watermark `W`**, not the raw persisted maximum. `W` is
    the gap-free applied-and-persisted prefix you trimmed to (section 2); replay
@@ -149,7 +152,15 @@ including versions at or below `W` — while `get_highest_persisted_seqno()`
 stays high because neighbouring tables survived. The standard `seqno > W` tail
 replay from section 3 does not cover such a mid-history hole, and blindly
 widening the replay would double-fold merge operands that DID survive. After
-any repair, derive the obligation from the report instead:
+any repair, derive the obligation from the report instead. The report reaches
+you from the call that repaired, or from `Error::RepairedButUnopened` when a
+step after the commit failed, and the rebuilt tree keeps it: every later
+`open_or_repair` hands it out again, under the same `RepairReport::id`, until
+you call `AbstractTree::acknowledge_repair_report(id)`. Acknowledge only after
+the replay below is done and durable, so a process that dies in between gets
+the report again; record the ids you applied to skip a repeat. A repair over a
+tree that still owes a report carries the earlier repair's losses in its own,
+and lists the earlier id in `RepairReport::includes`.
 
 1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
    `lost_coverage` (which covers excluded tables AND kept lossy salvaged

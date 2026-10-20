@@ -57,25 +57,46 @@ pub fn proptest_config() -> ProptestConfig {
     }
 }
 
-/// Removes every `v{N}` manifest file and the `current` pointer from a tree
+/// Removes every `v{N}` manifest snapshot and `edits-{N}` log from a tree
 /// directory, simulating a manifest loss while leaving the SSTs intact.
 ///
 /// Keep in sync with the copy in `tools/sst-dump/tests/repair_smoke.rs` (a
 /// separate crate, so the helper cannot be shared directly): both encode the
-/// manifest file-naming convention (`v{N}` + `current`).
+/// manifest file-naming convention (`v{N}` + `edits-{N}`).
 pub fn nuke_manifest(dir: &std::path::Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_version = name
+        let is_manifest = name
             .strip_prefix('v')
+            .or_else(|| name.strip_prefix("edits-"))
             .is_some_and(|rest| rest.parse::<u64>().is_ok());
-        if is_version || name == "current" {
+        if is_manifest {
             std::fs::remove_file(entry.path())?;
         }
     }
     Ok(())
+}
+
+/// The id of the tree's installed manifest snapshot: the highest `N` of a
+/// `v{N}` (a snapshot not yet installed carries a temporary name). Only the
+/// canonical decimal spelling counts, as in recovery: `v007`, `v00` and
+/// `v+5` name nothing.
+pub fn installed_snapshot_id(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
+    let mut installed = None;
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        let canonical = name.strip_prefix('v').filter(|r| {
+            !r.is_empty()
+                && r.bytes().all(|b| b.is_ascii_digit())
+                && (*r == "0" || !r.starts_with('0'))
+        });
+        if let Some(id) = canonical.and_then(|r| r.parse::<u64>().ok()) {
+            installed = installed.max(Some(id));
+        }
+    }
+    Ok(installed)
 }
 
 /// Returns the SST file paths under `<dir>/tables/`, sorted by id.

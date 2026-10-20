@@ -24,8 +24,8 @@
 //!                                                  from the section Block
 //!                                                  header at write time;
 //!                                                  binds section content
-//!                                                  into the CURRENT pointer
-//!                                                  digest path, preserving
+//!                                                  into the checksummed
+//!                                                  footer, preserving
 //!                                                  per-Block ECC recovery)
 //! ```
 //!
@@ -68,17 +68,13 @@ pub struct TocEntry {
     /// [`crate::table::block::Header::stored_checksum`] at write time (an
     /// unbound manifest block's stored checksum is its payload checksum).
     ///
-    /// **Why it lives in the TOC:** the CURRENT pointer's content-
-    /// binding digest is computed over the canonical TOC tuple
-    /// `(name, offset, size, section_checksum)`. Including the
-    /// section's own XXH3-128 here transitively binds the section's
-    /// decoded content into the CURRENT digest without requiring
-    /// `get_current_version` to re-hash the raw section byte range
-    /// (which would short-circuit per-Block ECC recovery on read).
-    /// The reader cross-checks this value against the section
-    /// Block's own header on `read_section` for belt-and-braces
-    /// defence against TOC entries that point at a different
-    /// section by offset.
+    /// **Why it lives in the TOC:** the footer Block's own checksum
+    /// covers the TOC, so carrying each section's XXH3-128 here binds
+    /// every section's content to the footer without re-hashing the raw
+    /// section byte range (which would short-circuit per-Block ECC
+    /// recovery on read). The reader cross-checks this value against
+    /// the section Block's own header on `read_section`, so a TOC entry
+    /// that points at a different section by offset is refused.
     ///
     /// Set to zero only by tests that construct synthetic TOC
     /// entries; production writers always carry the real checksum.

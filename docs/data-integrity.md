@@ -199,8 +199,8 @@ Failure-mode coverage with the defaults (mirror on, ECC off, AEAD off):
 
 - **Bit-flip inside one section Block**: XXH3 surfaces it, other sections + the footer Block still read correctly (per-section isolation; see [`manifest_blocks::reader::tests::reader_isolates_corruption_to_one_section_other_sections_readable`](../src/manifest_blocks/reader.rs)).
 - **Tail footer Block corruption**: reader falls back to the head mirror at offset 0 and continues.
-- **Partial write mid-update on a fresh `v{N+1}`**: the prior version's manifest stays intact in its own `v{N}` file, and the atomic `CURRENT` rewrite either lands fully (pointing at `v{N+1}`) or stays at `v{N}`. A torn or truncated `v{N+1}` file is detected at open time: the reader's tail-footer + head-mirror probes both fail and `Tree::open` surfaces `ManifestFooterInvalid`. The head mirror inside each `v{N}` is a copy of THAT file's own tail footer Block (for tail-bit-rot recovery within one version), not a snapshot of a prior version's TOC.
-- **Accidental file substitution / mislinking**: the `CURRENT` pointer carries an XXH3-128 of the referenced `v{N}` manifest's canonical footer content (version_id + TOC entries + per-section XXH3-128 each section Block already carries in its own header); `Tree::open` recomputes this from the parsed footer on read and refuses to follow a mismatched pointer. The digest binds logical content, not raw bytes: a section bit-flip that per-Block Page ECC heals on read does NOT trip this check (the section's TOC checksum is unchanged), preserving recovery. XXH3-128 is **not** a cryptographic MAC: an adversary with write access can craft matching content. Enable `Config::with_encryption(...)` (AEAD per Block) for adversarial tamper resistance.
+- **Partial write mid-update on a fresh `v{N+1}`**: the snapshot is written as `v{N+1}.tmp` and only a rename after its bytes are synced gives it the name `v{N+1}`, so a crash mid-write leaves a temporary recovery never reads and `v{N}` installed. A name visible after a failed folder sync is taken back; one that cannot be is reported as an unknown outcome. A `v{N+1}` damaged after its install is detected at open time: the reader's tail-footer + head-mirror probes both fail and `Tree::open` surfaces `ManifestFooterInvalid`. The head mirror inside each `v{N}` is a copy of THAT file's own tail footer Block (for tail-bit-rot recovery within one version), not a snapshot of a prior version's TOC.
+- **Accidental file substitution / mislinking**: every snapshot carries a `version_id` section, and an open checks it against the id in the file's name before reading anything else, so a snapshot copied or renamed onto another id is refused. The footer's TOC holds each section's XXH3-128, which each section Block's own header carries too, so a section is bound to the footer that names it: a bit-flip that per-Block Page ECC heals on read leaves the TOC checksum unchanged and still reads. XXH3-128 is **not** a cryptographic MAC: an adversary with write access can craft matching content. Enable `Config::with_encryption(...)` (AEAD per Block) for adversarial tamper resistance.
 
 Turning ECC on (`page_ecc = true`) upgrades the first three rows from "detect and
 refuse" to "detect and recover" without any change to call sites: the Block layer
@@ -211,10 +211,10 @@ transparently emits / consumes the parity trailer per Block.
 The manifest has two parts with different failure shapes, and recovery treats
 them differently:
 
-- **The snapshot** (`v{N}`) is written whole, then published by the atomic
-  `CURRENT` rewrite. Every section is one checksummed Block bound to the TOC and
-  to the digest `CURRENT` carries, so a snapshot is either the one the writer
-  published or it is damaged. There is no torn-tail case to tolerate: any decode
+- **The snapshot** (`v{N}`) is written whole under a temporary name, then
+  installed by the rename to `v{N}`. Every section is one checksummed Block
+  bound to the TOC, and the `version_id` section to the file's name, so a
+  snapshot is either the one the writer installed or it is damaged. There is no torn-tail case to tolerate: any decode
   failure inside a snapshot section fails the open in every mode.
 - **The edit log** is appended to after the snapshot, one framed record
   (length + XXH3-64) per version edit. A power loss mid-append leaves a record
