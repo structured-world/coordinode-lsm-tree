@@ -151,7 +151,7 @@ fn an_open_uses_the_pooled_files_it_finds() -> lsm_tree::Result<()> {
         tree.insert("a", "1", 0);
         tree.flush_active_memtable(0)?;
     }
-    let (pooled, _) = table_files(&tables);
+    let (pooled, before) = table_files(&tables);
     assert_eq!(pooled.len(), 3, "self-check: the rest of the batch");
 
     let tree = config(folder.path()).table_file_pool(4).open()?;
@@ -166,17 +166,21 @@ fn an_open_uses_the_pooled_files_it_finds() -> lsm_tree::Result<()> {
             "pooled file {id} written: {written:?}"
         );
     }
-    let above = written
+    // The fourth flush found the pool empty and made a batch.
+    let fresh = written
         .iter()
         .copied()
-        .filter(|id| !pooled.contains(id))
+        .filter(|id| !pooled.contains(id) && !before.contains(id))
         .min()
         .expect("a table past the found ones");
     assert!(
-        pooled.iter().all(|id| *id < above),
+        pooled.iter().all(|id| *id < fresh),
         "a new batch's ids are above the found ones"
     );
-    assert!(now_pooled.iter().all(|id| *id > above - 1));
+    assert!(
+        now_pooled.iter().all(|id| *id > fresh),
+        "{now_pooled:?} the rest of the new batch"
+    );
     for key in ["a", "b", "c", "d", "e"] {
         assert!(tree.get(key, u64::MAX)?.is_some(), "{key}");
     }

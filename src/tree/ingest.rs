@@ -138,6 +138,7 @@ impl<'a> Ingestion<'a> {
             folder.clone(),
             Arc::clone(&tree.table_files),
             None,
+            1,
             tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),

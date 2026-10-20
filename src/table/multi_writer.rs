@@ -322,18 +322,24 @@ impl OutputLoad {
 struct TableFiles {
     pools: Arc<super::file_pool::TableFilePools>,
     above: Option<TableId>,
+    /// The outputs the write expects to make, and those it has opened.
+    expected: usize,
+    opened: usize,
 }
 
 impl TableFiles {
     /// A writer for the next output in `folder`, and whether its file's
     /// directory entry is durable already.
     fn open(
-        &self,
+        &mut self,
         folder: &crate::path::Path,
         level: u8,
         fs: &Arc<dyn Fs>,
     ) -> crate::Result<(Writer, bool)> {
-        let claimed = self.pools.claim(folder, fs, self.above)?;
+        // An estimate the write outgrew asks for no more than a batch.
+        let wanted = self.expected.saturating_sub(self.opened);
+        self.opened += 1;
+        let claimed = self.pools.claim(folder, fs, self.above, wanted)?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
     }
@@ -355,6 +361,7 @@ impl MultiWriter {
             base_path,
             Arc::new(pools),
             None,
+            1,
             target_size,
             initial_level,
             fs,
@@ -363,16 +370,23 @@ impl MultiWriter {
 
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
     /// into files claimed from `pools`, each output's id above `above` when
-    /// given.
+    /// given. `expected` is how many outputs the write expects to make, so the
+    /// pool makes room for them with one folder sync.
     pub(crate) fn from_pool(
         base_path: PathBuf,
         pools: Arc<super::file_pool::TableFilePools>,
         above: Option<TableId>,
+        expected: usize,
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
     ) -> crate::Result<Self> {
-        let files = TableFiles { pools, above };
+        let mut files = TableFiles {
+            pools,
+            above,
+            expected,
+            opened: 0,
+        };
         // Own-id recency until `use_recency` overrides it (see the `recency`
         // field).
         let (writer, entries_durable) = files.open(&base_path, initial_level, &fs)?;

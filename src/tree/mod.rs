@@ -1105,32 +1105,34 @@ impl AbstractTree for Tree {
             folder.display(),
         );
 
-        // The flush's L0 recency, taken now: flushes are serialized, so it is
-        // above every table already flushed and below every one flushed later.
-        // A pooled file's id was taken when its batch was made and says
-        // nothing about when the table was written.
-        let recency = self.table_id_counter.next();
-        let mut table_writer = MultiWriter::from_pool(
+        let table_writer = MultiWriter::from_pool(
             folder.clone(),
             Arc::clone(&self.table_files),
             None,
+            1,
             self.config.table_target_size,
             0,
             level_fs.clone(),
-        )?
-        .set_comparator(self.config.comparator.clone())
-        .use_recency(Some(recency))
-        .use_data_block_restart_interval(data_block_restart_interval)
-        .use_index_block_restart_interval(index_block_restart_interval)
-        .use_data_block_compression(data_block_compression)
-        .use_index_block_compression(index_block_compression)
-        .use_data_block_size(data_block_size)
-        .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
-        .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
-        .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
-        .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
-        .use_column_encoding(self.config.column_encoding_policy.get(0))
-        .use_data_block_hash_ratio(data_block_hash_ratio);
+        )?;
+        // The flush's L0 recency, taken once its first file is: flushes are
+        // serialized, so it is above every table already flushed and below
+        // every one flushed later. A pooled file's id was taken when its batch
+        // was made and says nothing about when the table was written.
+        let recency = self.table_id_counter.next();
+        let mut table_writer = table_writer
+            .set_comparator(self.config.comparator.clone())
+            .use_recency(Some(recency))
+            .use_data_block_restart_interval(data_block_restart_interval)
+            .use_index_block_restart_interval(index_block_restart_interval)
+            .use_data_block_compression(data_block_compression)
+            .use_index_block_compression(index_block_compression)
+            .use_data_block_size(data_block_size)
+            .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
+            .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
+            .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
+            .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
+            .use_column_encoding(self.config.column_encoding_policy.get(0))
+            .use_data_block_hash_ratio(data_block_hash_ratio);
 
         let bloom_policy = {
             use crate::config::FilterPolicyEntry::{Bloom, None};

@@ -41,14 +41,14 @@ fn claims_use_one_folder_sync_per_batch() -> crate::Result<()> {
 
     let mut ids = Vec::new();
     for _ in 0..3 {
-        let claimed = pools.claim(&folder, &fs, None)?;
+        let claimed = pools.claim(&folder, &fs, None, 1)?;
         assert!(claimed.durable_entry, "a pooled file's entry is durable");
         ids.push(claimed.id);
     }
     assert_eq!(ids, vec![0, 1, 2], "ascending, in the order made");
     assert_eq!(directory_syncs(&fault), 1, "one sync for the batch");
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_eq!(claimed.id, 3);
     assert_eq!(directory_syncs(&fault), 1, "a new batch, synced once");
     for id in 4..6 {
@@ -63,9 +63,9 @@ fn claims_use_one_folder_sync_per_batch() -> crate::Result<()> {
 #[test]
 fn a_claim_above_an_id_removes_the_pooled_files_below_it() -> crate::Result<()> {
     let (pools, _fault, fs, folder) = pools(4)?;
-    assert_eq!(pools.claim(&folder, &fs, None)?.id, 0);
+    assert_eq!(pools.claim(&folder, &fs, None, 1)?.id, 0);
 
-    let claimed = pools.claim(&folder, &fs, Some(2))?;
+    let claimed = pools.claim(&folder, &fs, Some(2), 1)?;
     assert_eq!(claimed.id, 3, "the lowest pooled id above 2");
     for id in [1, 2] {
         assert!(!exists(&fs, &folder, id)?, "pooled file {id} is removed");
@@ -78,10 +78,10 @@ fn a_claim_above_an_id_removes_the_pooled_files_below_it() -> crate::Result<()> 
 #[test]
 fn a_claim_above_every_pooled_id_makes_a_new_batch() -> crate::Result<()> {
     let (pools, fault, fs, folder) = pools(2)?;
-    pools.claim(&folder, &fs, None)?;
+    pools.claim(&folder, &fs, None, 1)?;
     directory_syncs(&fault);
 
-    let claimed = pools.claim(&folder, &fs, Some(1))?;
+    let claimed = pools.claim(&folder, &fs, Some(1), 1)?;
     assert_eq!(claimed.id, 2, "the new batch's first id");
     assert!(claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 1, "the new batch's sync");
@@ -102,12 +102,12 @@ fn an_adopted_file_is_synced_before_its_first_claim() -> crate::Result<()> {
     pools.adopt(&folder, &fs, vec![7, 5]);
     directory_syncs(&fault);
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_eq!(claimed.id, 5);
     assert!(claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 1, "the adopted entries are synced");
 
-    assert_eq!(pools.claim(&folder, &fs, None)?.id, 7);
+    assert_eq!(pools.claim(&folder, &fs, None, 1)?.id, 7);
     assert_eq!(directory_syncs(&fault), 0, "once is enough");
     Ok(())
 }
@@ -125,7 +125,7 @@ fn a_pooled_file_that_may_be_shared_is_unlinked_not_written() -> crate::Result<(
         .once(),
     );
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_eq!(claimed.id, 1, "the next pooled file");
     assert!(!exists(&fs, &folder, 0)?, "the refused one is unlinked");
     Ok(())
@@ -141,7 +141,7 @@ fn a_backend_that_cannot_count_links_still_gets_a_file() -> crate::Result<()> {
         Fault::Error(crate::io::ErrorKind::Unsupported),
     ));
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert!(!claimed.durable_entry, "made for its table, not pooled");
     assert!(exists(&fs, &folder, claimed.id)?);
     Ok(())
@@ -151,7 +151,9 @@ fn a_backend_that_cannot_count_links_still_gets_a_file() -> crate::Result<()> {
 /// neither written into nor removed.
 #[test]
 fn a_pooled_name_holding_bytes_is_left_alone() -> crate::Result<()> {
-    let (pools, _fault, fs, folder) = pools(2)?;
+    let (_, _fault, fs, folder) = pools(2)?;
+    // An open starts the counter above every file it adopts.
+    let pools = TableFilePools::new(SequenceNumberCounter::new(1), 2, SyncMode::Normal);
     drop(fs.open(
         &folder.join("0"),
         &FsOpenOptions::new().write(true).create_new(true),
@@ -160,7 +162,7 @@ fn a_pooled_name_holding_bytes_is_left_alone() -> crate::Result<()> {
     fs.open(&folder.join("0"), &FsOpenOptions::new().write(true))?
         .write_all(b"bytes")?;
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_ne!(claimed.id, 0);
     assert_eq!(fs.metadata(&folder.join("0"))?.len, 5, "left as found");
     Ok(())
@@ -173,10 +175,23 @@ fn without_a_pool_each_file_is_made_for_its_table() -> crate::Result<()> {
     let (pools, fault, fs, folder) = pools(0)?;
     pools.adopt(&folder, &fs, vec![9]);
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_eq!(claimed.id, 0);
     assert!(!claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 0);
+    Ok(())
+}
+
+/// A refill makes at least as many files as the claim says the write
+/// expects to take, so a write of many tables syncs the folder once.
+#[test]
+fn a_refill_makes_room_for_the_files_a_write_expects() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = pools(2)?;
+    for wanted in (1..=5).rev() {
+        let claimed = pools.claim(&folder, &fs, None, wanted)?;
+        assert!(claimed.durable_entry);
+    }
+    assert_eq!(directory_syncs(&fault), 1, "one batch of five");
     Ok(())
 }
 
@@ -192,10 +207,10 @@ fn a_batch_whose_sync_failed_is_synced_by_the_next_claim() -> crate::Result<()> 
         )
         .once(),
     );
-    assert!(pools.claim(&folder, &fs, None).is_err());
+    assert!(pools.claim(&folder, &fs, None, 1).is_err());
     directory_syncs(&fault);
 
-    let claimed = pools.claim(&folder, &fs, None)?;
+    let claimed = pools.claim(&folder, &fs, None, 1)?;
     assert_eq!(claimed.id, 0, "the batch made before the failure");
     assert!(claimed.durable_entry);
     assert_eq!(directory_syncs(&fault), 1, "synced before it is used");
