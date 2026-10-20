@@ -10,6 +10,19 @@ use lsm_tree::{
 };
 use std::sync::Arc;
 
+/// The table files in `folder`. The empty files a tables folder keeps for
+/// tables to come are no tables.
+fn table_files(folder: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut tables = Vec::new();
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.metadata()?.len() > 0 {
+            tables.push(entry.path());
+        }
+    }
+    Ok(tables)
+}
+
 /// Helper: create a 3-tier config (hot L0-L1 / warm L2-L4 / cold L5-L6).
 fn three_tier_config(base: &std::path::Path) -> Config {
     let hot = base.join("hot");
@@ -711,16 +724,11 @@ fn missing_table_without_routes_returns_unrecoverable() -> lsm_tree::Result<()> 
 
     // Phase 2: delete a table file to simulate corruption
     let tables_dir = dir.path().join("primary").join("tables");
-    let mut deleted = false;
-    for entry in std::fs::read_dir(&tables_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            std::fs::remove_file(entry.path())?;
-            deleted = true;
-            break;
-        }
-    }
-    assert!(deleted, "expected to delete at least one table file");
+    let table = table_files(&tables_dir)?
+        .into_iter()
+        .next()
+        .expect("expected to delete at least one table file");
+    std::fs::remove_file(table)?;
 
     // Phase 3: reopen without routes — should get Unrecoverable, not RouteMismatch
     {
@@ -756,19 +764,11 @@ fn deleted_sst_with_routes_configured_returns_unrecoverable() -> lsm_tree::Resul
 
     // Phase 2: delete a table file from the hot tier (simulates corruption)
     let hot_tables_dir = dir.path().join("hot").join("tables");
-    let mut deleted = false;
-    for entry in std::fs::read_dir(&hot_tables_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            std::fs::remove_file(entry.path())?;
-            deleted = true;
-            break;
-        }
-    }
-    assert!(
-        deleted,
-        "expected to delete at least one table file from hot tier"
-    );
+    let table = table_files(&hot_tables_dir)?
+        .into_iter()
+        .next()
+        .expect("expected to delete at least one table file from hot tier");
+    std::fs::remove_file(table)?;
 
     // Phase 3: reopen WITH THE SAME routes — L0 is covered by hot route,
     // so the missing table is corruption, NOT a route mismatch
@@ -819,25 +819,20 @@ fn mixed_missing_covered_and_uncovered_returns_unrecoverable() -> lsm_tree::Resu
     let warm_tables = dir.path().join("warm").join("tables");
     let hot_tables = dir.path().join("hot").join("tables");
     assert!(
-        std::fs::read_dir(&warm_tables)?.count() > 0,
+        !table_files(&warm_tables)?.is_empty(),
         "warm tier should have at least one table"
     );
     assert!(
-        std::fs::read_dir(&hot_tables)?.count() > 0,
+        !table_files(&hot_tables)?.is_empty(),
         "hot tier should have at least one table"
     );
 
     // Phase 2: delete a table from warm tier (covered by warm route 2..5)
-    let mut deleted = false;
-    for entry in std::fs::read_dir(&warm_tables)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            std::fs::remove_file(entry.path())?;
-            deleted = true;
-            break;
-        }
-    }
-    assert!(deleted, "expected to delete at least one warm table");
+    let table = table_files(&warm_tables)?
+        .into_iter()
+        .next()
+        .expect("expected to delete at least one warm table");
+    std::fs::remove_file(table)?;
 
     // Phase 3: reopen WITHOUT hot route (0..2 removed), WITH warm route (2..5)
     // - Warm table deleted → missing on covered level (corruption)
@@ -927,16 +922,11 @@ fn open_or_repair_propagates_a_routed_missing_table() -> lsm_tree::Result<()> {
     // The hot tier "loses" its table — indistinguishable from the tier being
     // remounted elsewhere or the route path having changed.
     let hot_tables_dir = dir.path().join("hot").join("tables");
-    let mut deleted = false;
-    for entry in std::fs::read_dir(&hot_tables_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            std::fs::remove_file(entry.path())?;
-            deleted = true;
-            break;
-        }
-    }
-    assert!(deleted, "expected to delete a hot-tier table file");
+    let table = table_files(&hot_tables_dir)?
+        .into_iter()
+        .next()
+        .expect("expected to delete a hot-tier table file");
+    std::fs::remove_file(table)?;
 
     let manifest_names = || -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir.path().join("primary"))
@@ -981,7 +971,7 @@ fn open_refuses_a_lost_manifest_over_routed_tables() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
     let hot_tables = dir.path().join("hot").join("tables");
-    let routed = || -> std::io::Result<usize> { Ok(std::fs::read_dir(&hot_tables)?.count()) };
+    let routed = || -> std::io::Result<usize> { Ok(table_files(&hot_tables)?.len()) };
     assert_eq!(routed()?, 1, "the flush wrote its table to the hot route");
     assert_eq!(
         std::fs::read_dir(dir.path().join("primary").join("tables"))?.count(),
@@ -1031,10 +1021,10 @@ fn a_stale_twin_in_an_earlier_folder_loses_to_the_manifest_digest() -> lsm_tree:
     }
 
     let routed = |base: &std::path::Path| -> std::path::PathBuf {
-        std::fs::read_dir(base.join("hot").join("tables"))
+        table_files(&base.join("hot").join("tables"))
             .expect("read hot tier")
-            .map(|e| e.expect("entry").path())
-            .find(|p| p.is_file())
+            .into_iter()
+            .next()
             .expect("the flush wrote a routed table")
     };
     let twin = routed(other.path());
@@ -1151,10 +1141,10 @@ fn a_rejected_routed_copy_is_swept_once_a_winner_is_found() -> lsm_tree::Result<
     }
 
     let routed = |base: &std::path::Path| -> std::path::PathBuf {
-        std::fs::read_dir(base.join("hot").join("tables"))
+        table_files(&base.join("hot").join("tables"))
             .expect("read hot tier")
-            .map(|e| e.expect("entry").path())
-            .find(|p| p.is_file())
+            .into_iter()
+            .next()
             .expect("the flush wrote a routed table")
     };
     let twin = routed(other.path());

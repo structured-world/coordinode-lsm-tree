@@ -36,9 +36,10 @@ fn find_table_file(dir: &Path) -> std::path::PathBuf {
     } else {
         dir.to_path_buf()
     };
+    // The empty files the folder keeps for tables to come are no tables.
     for entry in std::fs::read_dir(&search_dir).unwrap() {
         let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_file() {
+        if entry.file_type().unwrap().is_file() && entry.metadata().unwrap().len() > 0 {
             return entry.path();
         }
     }

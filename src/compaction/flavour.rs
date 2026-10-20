@@ -442,20 +442,10 @@ pub(super) fn prepare_table_writer(
     // newest input, and the id is what tells the two apart, the higher one
     // the output that supersedes it.
     let above = payload.table_ids.iter().copied().max();
-    // The outputs the inputs' bytes fill at the target size, so the pool makes
-    // room for all of them with one folder sync.
-    let input_bytes: u64 = version
-        .iter_tables()
-        .filter(|t| payload.table_ids.contains(&t.id()))
-        .map(crate::table::Table::file_size)
-        .sum();
-    let expected =
-        usize::try_from(input_bytes / payload.target_size.max(1) + 1).unwrap_or(usize::MAX);
     let mut table_writer = MultiWriter::from_pool(
         table_base_folder,
         alloc::sync::Arc::clone(&opts.table_files),
         above,
-        expected,
         payload.target_size,
         payload.dest_level,
         level_fs,

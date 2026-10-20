@@ -31,12 +31,6 @@ use spin::Mutex;
 /// Files a refill creates when the tree's configuration does not say.
 pub const DEFAULT_TABLE_FILE_POOL: usize = 16;
 
-/// The most files one refill makes for a write that expects many: past it a
-/// write of very many small tables refills again, one folder sync per this
-/// many tables, rather than holding a folder of empty files an estimate
-/// asked for and a filter may never fill.
-const MAX_REFILL: usize = 1_024;
-
 /// An empty table file, open for writing, under the name of the table about to
 /// be written into it.
 pub struct ClaimedFile {
@@ -100,9 +94,11 @@ impl TableFilePools {
     /// An empty file for the next table written into `folder`, its id above
     /// `above` when given: a compaction output's id is above its inputs', so
     /// an output and the input whose age it takes are told apart by id.
-    /// `wanted` is how many files the writer expects to take from here on: a
-    /// refill makes at least that many, so a write of many tables syncs the
-    /// folder once rather than once per batch.
+    ///
+    /// The pool is refilled only when `may_refill`: a write's first table. A
+    /// later table of a write that has run the pool dry gets a file made for
+    /// it, since the install that names it syncs the folder once for all of
+    /// them, where refills would sync it once per batch.
     ///
     /// # Errors
     ///
@@ -112,7 +108,7 @@ impl TableFilePools {
         folder: &Path,
         fs: &Arc<dyn Fs>,
         above: Option<TableId>,
-        wanted: usize,
+        may_refill: bool,
     ) -> crate::Result<ClaimedFile> {
         if self.batch == 0 {
             return self.create(folder, fs);
@@ -120,36 +116,33 @@ impl TableFilePools {
         // Held across the refill and the open, so two claims never take one
         // file.
         let mut folders = self.folders.lock();
-        let claimed = self.claim_pooled(
-            pool_of(&mut folders, folder, fs),
-            above,
-            self.batch.max(wanted.min(MAX_REFILL)),
-        );
+        let claimed = self.claim_pooled(pool_of(&mut folders, folder, fs), above, may_refill);
         drop(folders);
         match claimed? {
             Some(claimed) => Ok(claimed),
-            // A fresh batch none of whose files could be used: the backend
-            // cannot tell whether a file is shared, so no pooled file will be.
+            // The pool is dry and is not to be refilled, or a fresh batch held
+            // no file that can be used: the backend cannot tell whether a
+            // file is shared, so no pooled file will be.
             None => self.create(folder, fs),
         }
     }
 
-    /// The next file of `pool` to write a table into, refilled with `batch`
-    /// files when it runs out; `None` when a fresh batch held no file that
-    /// can be.
+    /// The next file of `pool` to write a table into, refilled when it runs
+    /// out and `may_refill`; `None` when it is dry and may not be, or a fresh
+    /// batch held no file that can be.
     fn claim_pooled(
         &self,
         pool: &mut FolderPool,
         above: Option<TableId>,
-        batch: usize,
+        may_refill: bool,
     ) -> crate::Result<Option<ClaimedFile>> {
         let mut refilled = false;
         loop {
             if pool.ids.is_empty() {
-                if refilled {
+                if refilled || !may_refill {
                     return Ok(None);
                 }
-                self.refill(pool, batch)?;
+                self.refill(pool)?;
                 refilled = true;
             }
             if !pool.synced {
@@ -188,12 +181,12 @@ impl TableFilePools {
         })
     }
 
-    /// Creates `batch` empty files in `pool`'s folder and syncs it once.
+    /// Creates a batch of empty files in `pool`'s folder and syncs it once.
     /// Whatever was created stays pooled when a later step fails, unsynced, so
     /// the next claim syncs the folder before handing one out.
-    fn refill(&self, pool: &mut FolderPool, batch: usize) -> crate::Result<()> {
+    fn refill(&self, pool: &mut FolderPool) -> crate::Result<()> {
         pool.synced = false;
-        for _ in 0..batch {
+        for _ in 0..self.batch {
             let id = self.ids.next();
             let path = pool.folder.join(id.to_string());
             drop(

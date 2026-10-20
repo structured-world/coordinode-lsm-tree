@@ -322,9 +322,9 @@ impl OutputLoad {
 struct TableFiles {
     pools: Arc<super::file_pool::TableFilePools>,
     above: Option<TableId>,
-    /// The outputs the write expects to make, and those it has opened.
-    expected: usize,
-    opened: usize,
+    /// Whether an output was opened already: only the first refills the
+    /// pool (see [`super::file_pool::TableFilePools::claim`]).
+    opened: bool,
 }
 
 impl TableFiles {
@@ -336,10 +336,9 @@ impl TableFiles {
         level: u8,
         fs: &Arc<dyn Fs>,
     ) -> crate::Result<(Writer, bool)> {
-        // An estimate the write outgrew asks for no more than a batch.
-        let wanted = self.expected.saturating_sub(self.opened);
-        self.opened += 1;
-        let claimed = self.pools.claim(folder, fs, self.above, wanted)?;
+        let may_refill = !self.opened;
+        self.opened = true;
+        let claimed = self.pools.claim(folder, fs, self.above, may_refill)?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
     }
@@ -361,7 +360,6 @@ impl MultiWriter {
             base_path,
             Arc::new(pools),
             None,
-            1,
             target_size,
             initial_level,
             fs,
@@ -370,13 +368,11 @@ impl MultiWriter {
 
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
     /// into files claimed from `pools`, each output's id above `above` when
-    /// given. `expected` is how many outputs the write expects to make, so the
-    /// pool makes room for them with one folder sync.
+    /// given.
     pub(crate) fn from_pool(
         base_path: PathBuf,
         pools: Arc<super::file_pool::TableFilePools>,
         above: Option<TableId>,
-        expected: usize,
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
@@ -384,8 +380,7 @@ impl MultiWriter {
         let mut files = TableFiles {
             pools,
             above,
-            expected,
-            opened: 0,
+            opened: false,
         };
         // Own-id recency until `use_recency` overrides it (see the `recency`
         // field).

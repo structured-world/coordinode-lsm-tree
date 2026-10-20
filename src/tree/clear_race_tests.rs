@@ -41,9 +41,16 @@ fn clear_before_install(tree: &AnyTree) {
         .arm_before_output_install(move || target.clear().expect("clear"));
 }
 
-/// The files left in `folder` under `path`, absent counting as none.
+/// The files left in `folder` under `path`, absent counting as none. The
+/// empty files the tables folder keeps for tables to come are no tables.
 fn files_in(path: &std::path::Path, folder: &str) -> usize {
-    std::fs::read_dir(path.join(folder)).map_or(0, Iterator::count)
+    let pooled = folder == crate::file::TABLES_FOLDER;
+    std::fs::read_dir(path.join(folder)).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| !pooled || entry.metadata().is_ok_and(|meta| meta.len() > 0))
+            .count()
+    })
 }
 
 /// The tree reads nothing, holds no table, leaves no table or blob file once

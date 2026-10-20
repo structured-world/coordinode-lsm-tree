@@ -28,13 +28,14 @@ fn value(i: u32) -> Vec<u8> {
     v
 }
 
-/// The single table file of the tree at `dir`.
+/// The single table file of the tree at `dir`. The empty files the folder
+/// keeps for tables to come are no tables.
 fn table_file(dir: &Path) -> PathBuf {
     let tables = dir.join(lsm_tree::file::TABLES_FOLDER);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&tables)
         .expect("tables folder")
         .map(|e| e.expect("entry").path())
-        .filter(|p| p.is_file())
+        .filter(|p| p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .collect();
     assert_eq!(files.len(), 1, "one table file: {files:?}");
     files.remove(0)

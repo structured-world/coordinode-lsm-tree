@@ -182,7 +182,13 @@ fn a_checkpoint_on_io_uring_clones_where_the_file_system_does() -> lsm_tree::Res
     let target = checkpoints.path().join("checkpoint");
     tree.create_checkpoint(&target)?;
     let clones = StdFs.capabilities(checkpoints.path()).reflink;
-    let tables = fs.read_dir(&folder.path().join(lsm_tree::file::TABLES_FOLDER))?;
+    // The empty files the folder keeps for tables to come are no tables.
+    let mut tables = Vec::new();
+    for entry in fs.read_dir(&folder.path().join(lsm_tree::file::TABLES_FOLDER))? {
+        if fs.metadata(&entry.path)?.len > 0 {
+            tables.push(entry);
+        }
+    }
     let [table] = tables.as_slice() else {
         panic!("the flush wrote one table: {tables:?}");
     };

@@ -1109,7 +1109,6 @@ impl AbstractTree for Tree {
             folder.clone(),
             Arc::clone(&self.table_files),
             None,
-            1,
             self.config.table_target_size,
             0,
             level_fs.clone(),
@@ -6512,9 +6511,13 @@ impl Tree {
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
                     );
-                } else if folder_fs.metadata(&table_file_path)?.len == 0 {
+                } else if folder_fs
+                    .metadata(&table_file_path)
+                    .is_ok_and(|meta| meta.len == 0)
+                {
                     // No version names it and no table is empty: a pooled
-                    // file, used again rather than made anew.
+                    // file, used again rather than made anew. One whose length
+                    // cannot be read is an orphan like any other.
                     pooled_ids.push(table_id);
                 } else {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));

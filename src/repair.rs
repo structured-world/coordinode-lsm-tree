@@ -4878,7 +4878,13 @@ fn scan_table_folders(
             let named = manifest_referenced
                 .as_ref()
                 .is_some_and(|m| m.tables.contains_key(&table_id));
-            if !named && folder_fs.metadata(&table_path)?.len == 0 {
+            // A file whose length cannot be read is no pooled file: it goes on
+            // to be graded as any table file is.
+            if !named
+                && folder_fs
+                    .metadata(&table_path)
+                    .is_ok_and(|meta| meta.len == 0)
+            {
                 discard_after_commit.push((
                     Arc::clone(&folder_fs),
                     table_path,

@@ -1870,7 +1870,6 @@ impl AbstractTree for BlobTree {
             table_folder.clone(),
             Arc::clone(&self.index.table_files),
             None,
-            1,
             self.index.config.table_target_size,
             0,
             level_fs.clone(),

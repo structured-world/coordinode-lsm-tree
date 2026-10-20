@@ -112,12 +112,15 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
     let fs: Arc<dyn Fs> = Arc::new(fault);
     let folder = std::path::absolute("/db").expect("absolute");
 
+    // No pooled table files: the flush's table takes id 0 and the relocation's
+    // the next, 1, which the fault below names.
     let any = Config::new(
         &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(Arc::clone(&fs))
+    .table_file_pool(0)
     .open()
     .expect("open");
     let AnyTree::Standard(tree) = any else {

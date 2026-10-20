@@ -37,13 +37,10 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         tree.insert("k0", "v0", 0);
         tree.flush_active_memtable(0)?;
 
-        // The next flush syncs its table's folder, then writes its snapshot
-        // and log and fails the directory sync that would install them.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
-                .once(),
-        );
+        // The next flush writes its table into a file pooled with the first
+        // one's, so its first directory sync is the one that would install
+        // its snapshot and log: it fails.
+        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
         tree.insert("k1", "v1", 1);
         assert!(
             tree.flush_active_memtable(1).is_err(),
@@ -93,13 +90,10 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
             tree.insert(k, "v", seqno);
             tree.flush_active_memtable(0)?;
         }
-        // The compaction syncs its output's folder, then fails the directory
-        // sync of the install that names the output.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
-                .once(),
-        );
+        // The compaction writes its output into a pooled file, so its first
+        // directory sync is that of the install that names the output: it
+        // fails.
+        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
         assert!(
             tree.major_compact(64 * 1024 * 1024, 0).is_err(),
             "the armed directory sync must fail the compaction's install"
@@ -113,16 +107,22 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
     Ok(())
 }
 
-/// The files of the tree's tables folder.
+/// The tables in the tree's tables folder.
 fn table_files(dir: &std::path::Path) -> std::io::Result<usize> {
-    Ok(std::fs::read_dir(dir.join("tables"))?.count())
+    Ok(table_names(dir)?.len())
 }
 
-/// The names in the tree's tables folder.
+/// The names of the tables in the tree's tables folder. The empty files the
+/// folder keeps for tables to come are no tables.
 fn table_names(dir: &std::path::Path) -> std::io::Result<std::collections::BTreeSet<String>> {
-    std::fs::read_dir(dir.join("tables"))?
-        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-        .collect()
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(dir.join("tables"))? {
+        let entry = entry?;
+        if entry.metadata()?.len() > 0 {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
 }
 
 /// The output a compaction of unknown install outcome keeps goes once a later
@@ -202,14 +202,11 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
             tree.insert(k, "v", seqno);
             tree.flush_active_memtable(0)?;
         }
-        // The install's directory sync fails, then the removal that would
+        // The install's directory sync fails (the output is written into a
+        // pooled file, so the first one), then the removal that would
         // withdraw its snapshot; the first removal is that of a leftover
         // temporary.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
-                .once(),
-        );
+        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
         injector.arm(
             FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
                 .on_path(snapshot)
@@ -259,12 +256,11 @@ fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::
             tree.flush_active_memtable(0)?;
         }
         assert_eq!(table_files(dir.path())?, 2);
-        // The install's directory sync fails, and so does the withdrawal's.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
-                .times(2),
-        );
+        // The install's directory sync fails, and so does the withdrawal's:
+        // the output is written into a pooled file, so these are the first
+        // two.
+        injector
+            .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).times(2));
         assert!(
             tree.major_compact(64 * 1024 * 1024, 0).is_err(),
             "the armed directory syncs must fail the compaction's install"
