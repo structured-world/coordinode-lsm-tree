@@ -446,12 +446,12 @@ pub fn verify_snapshot(
 }
 
 /// The report of a repair the installed snapshot of the tree in `folder`
-/// still owes; `None` when there is no snapshot or it owes none.
+/// still owes; `None` when there is no snapshot or it says it owes none.
 ///
 /// # Errors
 ///
-/// Propagates a failure to list the folder or to open and verify the
-/// snapshot, and an environmental failure to read the report.
+/// Propagates a failure to list the folder, and an environmental failure to
+/// read the snapshot.
 #[cfg(feature = "std")]
 pub fn owed_repair_report(
     folder: &Path,
@@ -461,20 +461,29 @@ pub fn owed_repair_report(
     let Some(id) = installed_snapshot(folder, fs)? else {
         return Ok(None);
     };
-    let mut archive = open_snapshot(folder, id, fs, encryption)?;
-    check_identity(&mut archive, id)?;
+    // A snapshot that cannot say whether it owes a report may owe one: its
+    // loss must not read as no report, or the replay it described is gone.
+    let unreadable = |e: crate::Error| {
+        if e.is_environmental() {
+            Err(e)
+        } else {
+            log::warn!("snapshot v{id} cannot say what repair report it owes: {e}");
+            Ok(Some(OwedReport::Unreadable(id)))
+        }
+    };
+    let mut archive = match open_snapshot(folder, id, fs, encryption) {
+        Ok(archive) => archive,
+        Err(e) => return unreadable(e),
+    };
+    if let Err(e) = check_identity(&mut archive, id) {
+        return unreadable(e);
+    }
     if archive.section("repair_report").is_none() {
         return Ok(None);
     }
     match archive.read_section("repair_report") {
         Ok(bytes) => Ok(Some(OwedReport::Readable(bytes))),
-        Err(e) if e.is_environmental() => Err(e),
-        // The table of contents says a report is owed, so its loss must not
-        // read as no report: the caller still owes the replay it described.
-        Err(e) => {
-            log::warn!("the report snapshot v{id} owes does not read back: {e}");
-            Ok(Some(OwedReport::Unreadable(id)))
-        }
+        Err(e) => unreadable(e),
     }
 }
 
@@ -485,7 +494,8 @@ pub enum OwedReport {
     /// The report's encoded bytes.
     Readable(Vec<u8>),
 
-    /// The section of snapshot `v{id}` that holds it is damaged.
+    /// Snapshot `v{id}`, or the section of it that holds a report, is
+    /// damaged: it may owe a report no one can read.
     Unreadable(VersionId),
 }
 

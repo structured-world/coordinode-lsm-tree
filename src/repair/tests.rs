@@ -17328,6 +17328,45 @@ fn an_owed_report_that_does_not_read_back_leaves_the_loss_unscoped() -> crate::R
     Ok(())
 }
 
+/// A snapshot too damaged to say whether it owes a report may owe one: the
+/// repair over it reports that replay as unscoped rather than dropping it.
+#[test]
+fn a_snapshot_that_cannot_say_what_it_owes_leaves_the_loss_unscoped() -> crate::Result<()> {
+    use crate::fs::{Fs, FsOpenOptions, MemFs};
+    use crate::{Config, SequenceNumberCounter};
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let root = std::path::absolute("/db")?;
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
+    };
+    owe_report(config(), &an_owed_report(&root))?;
+
+    let id = crate::version::recovery::installed_snapshot(&root, &*memfs)?
+        .ok_or(crate::Error::Unrecoverable)?;
+    let snapshot = root.join(format!("v{id}"));
+    let len =
+        usize::try_from(memfs.metadata(&snapshot)?.len).map_err(|_| crate::Error::Unrecoverable)?;
+    memfs
+        .open(&snapshot, &FsOpenOptions::new().write(true).truncate(true))?
+        .write_all(&alloc::vec![0xA5; len])?;
+
+    let report = config().repair()?;
+    assert_eq!(
+        report.wal_replay_scope(),
+        crate::WalReplayScope::FullHistory,
+        "{report:?}"
+    );
+    Ok(())
+}
+
 /// The report a tree owes survives its rotations, which write the version
 /// that owes it as a snapshot of its own: a repairing open after several
 /// still hands it out, until it is acknowledged.

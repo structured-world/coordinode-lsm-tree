@@ -73,7 +73,7 @@ swapped onto the name the manifest gives it afterwards. A crash at any earlier
 point therefore leaves the tree byte-for-byte as it was found, plus unpublished
 files a later run discards — so the retry re-derives the same answer from the
 same bytes. This is the copy-on-write discipline, not a journal: the old tree
-stays intact until the root pointer moves.
+stays intact until the rebuilt snapshot's rename installs it.
 
 **Durable intermediate state, if it exists at all, records absolute facts —
 never deltas.** A journal replays block *contents* because only absolute

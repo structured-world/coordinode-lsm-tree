@@ -4493,29 +4493,23 @@ fn repair_tree(
     // An earlier repair whose report never reached the caller: the installed
     // snapshot still owes it. This rebuild replaces that snapshot, so the
     // earlier losses travel in its report. Only that one section is read, so
-    // damage elsewhere in the snapshot does not hide it; a snapshot whose
-    // footer does not open says nothing at all, which is what the rebuild is
-    // for, while a transient failure propagates for the retry. A section the
-    // snapshot lists but cannot read still owes a replay, unscoped.
-    let outstanding = match crate::version::recovery::owed_repair_report(
+    // damage elsewhere in the snapshot does not hide it. A snapshot too
+    // damaged to say whether it owes one may: that replay is owed unscoped,
+    // since leaving it out would lose it for good. A transient failure
+    // propagates for the retry.
+    let outstanding = crate::version::recovery::owed_repair_report(
         &config.path,
         &*config.fs,
         config.encryption.clone(),
-    ) {
-        Ok(owed) => owed.map(|owed| match owed {
-            crate::version::recovery::OwedReport::Readable(bytes) => {
-                report_marker::decode_owed(&bytes, &config.path)
-            }
-            crate::version::recovery::OwedReport::Unreadable(id) => {
-                report_marker::unreadable_owed(&config.path, id)
-            }
-        }),
-        Err(e) if e.is_environmental() => return Err(e),
-        Err(e) => {
-            log::warn!("repair: the installed snapshot does not say what report it owes: {e}");
-            None
+    )?
+    .map(|owed| match owed {
+        crate::version::recovery::OwedReport::Readable(bytes) => {
+            report_marker::decode_owed(&bytes, &config.path)
         }
-    };
+        crate::version::recovery::OwedReport::Unreadable(id) => {
+            report_marker::unreadable_owed(&config.path, id)
+        }
+    });
 
     // Byte totals for the progress percentage, from an upfront listing —
     // before the scan phase starts, so `bytes_processed / bytes_total` is

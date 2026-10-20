@@ -45,13 +45,13 @@ pub(super) fn decode_owed(bytes: &[u8], tree: &Path) -> RepairReport {
     })
 }
 
-/// The report owed by `tree` when the snapshot section holding it, in
-/// snapshot `v{snapshot_id}`, does not read back: a repair lost something it
-/// can no longer say. Its id is that snapshot's, so every hand-out from it
-/// carries one id.
+/// The report `tree` may owe when its snapshot `v{snapshot_id}`, or the
+/// section of it that holds a report, does not read back: a repair may have
+/// lost something no one can say any more. Its id is that snapshot's, so
+/// every hand-out from it carries one id.
 pub(super) fn unreadable_owed(tree: &Path, snapshot_id: u64) -> RepairReport {
     log::error!(
-        "repair: the report owed by {} does not read back; its losses are unscoped",
+        "repair: whatever report {} owes does not read back; its losses are unscoped",
         tree.display(),
     );
     let mut seed = b"unreadable owed report".to_vec();
