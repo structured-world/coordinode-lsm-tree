@@ -6787,21 +6787,19 @@ impl Tree {
         fs: &Arc<dyn crate::fs::Fs>,
         sync_mode: crate::fs::SyncMode,
     ) -> crate::Result<()> {
-        let mut stale = OpenSweep::default();
-        Self::cleanup_orphaned_version(path, keep, fs, &mut stale)?;
-        let groups: [Vec<_>; 2] = stale
-            .pending
-            .into_iter()
-            .partition::<Vec<_>, _>(|(_, file)| {
-                file.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with('v'))
-            })
-            .into();
-        for group in groups {
-            OpenSweep { pending: group }.finish()?;
-            crate::file::fsync_directory(path, &**fs, sync_mode)?;
+        let snapshot = format!("v{keep}");
+        let mut snapshots = OpenSweep::default();
+        for dirent in fs.read_dir(path)? {
+            if !dirent.is_dir && dirent.file_name.starts_with('v') && dirent.file_name != snapshot {
+                snapshots.remove(fs, &dirent.path);
+            }
         }
+        snapshots.finish()?;
+        crate::file::fsync_directory(path, &**fs, sync_mode)?;
+        let mut rest = OpenSweep::default();
+        Self::cleanup_orphaned_version(path, keep, fs, &mut rest)?;
+        rest.finish()?;
+        crate::file::fsync_directory(path, &**fs, sync_mode)?;
         Ok(())
     }
 }
