@@ -82,9 +82,12 @@ fn a_repair_that_never_installed_hands_out_no_report() -> lsm_tree::Result<()> {
             .on_path(folder.path().join("v").to_string_lossy())
             .once(),
     );
+    let failed = config(folder.path()).with_fs(fs).repair();
+    assert!(failed.is_err(), "the rebuilt snapshot is not installed");
     assert!(
-        config(folder.path()).with_fs(fs).repair().is_err(),
-        "the rebuilt snapshot is not installed"
+        holds_a_copy(folder.path())?,
+        "self-check: the repair left its report's copy ({:?})",
+        failed.err()
     );
 
     let (tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
