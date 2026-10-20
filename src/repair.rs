@@ -7113,7 +7113,9 @@ fn publish_repaired_manifest(
         Err(e) => match probe_install(&*config.fs, &config.path, version_id) {
             // When the persist renamed the snapshot into place and could not
             // make its withdrawal durable, a power loss may bring the name
-            // back: its absence proves nothing then.
+            // back: its absence proves nothing then. The report's copy left
+            // under this id goes with the next install that takes the id (an
+            // open of the tree as it was), which carries no report into it.
             InstallProbe::NotInstalled if !matches!(e, crate::Error::InstallOutcomeUnknown(_)) => {
                 return Err(e);
             }
