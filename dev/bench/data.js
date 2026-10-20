@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792410850901,
+  "lastUpdate": 1792522315567,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -50348,6 +50348,90 @@ window.BENCHMARK_DATA = {
             "value": 291029.65973481553,
             "unit": "ops/sec",
             "extra": "P50: 2.6us | P99: 17.8us | P99.9: 98.9us\nthreads: 1 | elapsed: 0.69s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ff0ebfefe97ab36a323843106e35ed7126667546",
+          "message": "ci(deps): bump cargo-bins/cargo-binstall from 1.25.3 to 1.26.0 (#947)\n\nBumps\n[cargo-bins/cargo-binstall](https://github.com/cargo-bins/cargo-binstall)\nfrom 1.25.3 to 1.26.0.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/releases\">cargo-bins/cargo-binstall's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v1.26.0</h2>\n<p><em>Binstall is a tool to fetch and install Rust-based executables as\nbinaries. It aims to be a drop-in replacement for <code>cargo\ninstall</code> in most cases. Install it today with <code>cargo install\ncargo-binstall</code>, from the binaries below, or if you already have\nit, upgrade with <code>cargo binstall cargo-binstall</code>.</em></p>\n<h4>In this release:</h4>\n<ul>\n<li>reject bin names that escape the install dir, thank you <a\nhref=\"https://github.com/NotAFlightRisk\"><code>@​NotAFlightRisk</code></a>\nfor spotting and reporting this (GHSA-jxjx-4v2j-96qg <a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2712\">#2712</a>)</li>\n<li>add <code>--completions</code> flag to print shell completions (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2701\">#2701</a>)</li>\n<li>add --dns to select the DNS resolver at runtime (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/1699\">#1699</a>\n<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2709\">#2709</a>)</li>\n</ul>\n<h4>Other changes:</h4>\n<ul>\n<li>upgrade dependencies</li>\n</ul>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/8a2045612414e945291083f820cd50b4d8fc2218\"><code>8a20456</code></a>\nrelease: cargo-binstall v1.26.0 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2716\">#2716</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/e30fd6b1d4ea0ddbc9fe835eaeffd828e45e736c\"><code>e30fd6b</code></a>\nchore: release (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2713\">#2713</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/b05d5c2d95267e0173799202e9703da294473774\"><code>b05d5c2</code></a>\nfeat: add --completions flag to print shell completions (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2701\">#2701</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/a28ee7da809b0cdab14b98abfd7089856c191f8b\"><code>a28ee7d</code></a>\ndep: Upgrade transitive dependencies (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2715\">#2715</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/0c2d7a00afc5de6d5d2d5fc44922d2f6f993dda2\"><code>0c2d7a0</code></a>\nbuild(deps): bump taiki-e/install-action from 2.87.20 to 2.87.28 (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2714\">#2714</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/44dada98ea7ce44dd11aa224db6c5b1add1cf21e\"><code>44dada9</code></a>\nfeat: add --dns to select the DNS resolver at runtime (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2709\">#2709</a>)</li>\n<li><a\nhref=\"https://github.com/cargo-bins/cargo-binstall/commit/285098886c9bfc50a701e164bd10b89804836038\"><code>2850988</code></a>\nfix(bins): reject bin names that escape the install dir (<a\nhref=\"https://redirect.github.com/cargo-bins/cargo-binstall/issues/2712\">#2712</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/cargo-bins/cargo-binstall/compare/3be4ad2b146f3302f92e5956c54fedbb6ae8cccc...8a2045612414e945291083f820cd50b4d8fc2218\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\n\n[![Dependabot compatibility\nscore](https://dependabot-badges.githubapp.com/badges/compatibility_score?dependency-name=cargo-bins/cargo-binstall&package-manager=github_actions&previous-version=1.25.3&new-version=1.26.0)](https://docs.github.com/en/github/managing-security-vulnerabilities/about-dependabot-security-updates#about-compatibility-scores)\n\nDependabot will resolve any conflicts with this PR as long as you don't\nalter it yourself. You can also trigger a rebase manually by commenting\n`@dependabot rebase`.\n\n[//]: # (dependabot-automerge-start)\n[//]: # (dependabot-automerge-end)\n\n---\n\n<details>\n<summary>Dependabot commands and options</summary>\n<br />\n\nYou can trigger Dependabot actions by commenting on this PR:\n- `@dependabot rebase` will rebase this PR\n- `@dependabot recreate` will recreate this PR, overwriting any edits\nthat have been made to it\n- `@dependabot show <dependency name> ignore conditions` will show all\nof the ignore conditions of the specified dependency\n- `@dependabot ignore this major version` will close this PR and stop\nDependabot creating any more for this major version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this minor version` will close this PR and stop\nDependabot creating any more for this minor version (unless you reopen\nthe PR or upgrade to it yourself)\n- `@dependabot ignore this dependency` will close this PR and stop\nDependabot creating any more for this dependency (unless you reopen the\nPR or upgrade to it yourself)\n\n\n</details>\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-20T18:35:36Z",
+          "tree_id": "590e28ea5ba44557b4f20f649486cf3803709367",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ff0ebfefe97ab36a323843106e35ed7126667546"
+        },
+        "date": 1792522314310,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 125621.7748603096,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 21.6us | P99.9: 37.5us\nthreads: 1 | elapsed: 4.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2555094.480239615,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 724160.6718021173,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 486139.16252237686,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 22.7us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2267381.585684923,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 250352.1437607129,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 8.6us | P99.9: 20.5us\nthreads: 1 | elapsed: 0.80s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 138216.22956487816,
+            "unit": "ops/sec",
+            "extra": "P50: 6.5us | P99: 12.7us | P99.9: 27.1us\nthreads: 1 | elapsed: 1.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 735849.0398042011,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 758212.26240997,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 351596.0020173313,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.0us | P99.9: 87.7us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
           }
         ]
       }
