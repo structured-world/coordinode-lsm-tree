@@ -6591,7 +6591,23 @@ impl Tree {
         // snapshot under the next id, installed as a rotation installs one:
         // its bytes synced, renamed into place, the folder synced. An owed
         // repair report moves to it first, as a rotation moves one.
-        let version = version.reinstalled()?;
+        //
+        // A tree whose id reached the top half of the range goes back to id
+        // 0 instead. Recovery takes the snapshot with the highest id, so no
+        // other may be left above the new one: every manifest file but the
+        // snapshot read goes, durably, before the install, and that snapshot
+        // goes, durably, right after it. A power loss in between leaves the
+        // snapshot read as the highest, which a reopen installs again.
+        let renumbered = version.is_renumbered_on_open();
+        if renumbered {
+            log::warn!(
+                "version {} is in the top half of the id range; reinstalling the tree as \
+                 version 0",
+                version.id()
+            );
+            Self::remove_manifests_but(tree_path, snapshot_id, &config.fs, config.sync_mode)?;
+        }
+        let version = version.reinstalled();
         crate::file::carry_repair_report(
             &*config.fs,
             tree_path,
@@ -6608,6 +6624,9 @@ impl Tree {
             config.encryption.clone(),
             config.sync_mode,
         )?;
+        if renumbered {
+            Self::remove_manifests_but(tree_path, version.id(), &config.fs, config.sync_mode)?;
+        }
 
         // Republish any restriction sidecar that never landed. The sidecar is
         // written AFTER its slice commits, so a failure (or a crash) in that
@@ -6753,6 +6772,22 @@ impl Tree {
             }
         }
 
+        Ok(())
+    }
+
+    /// Removes every manifest file [`Self::cleanup_orphaned_version`] finds
+    /// stale beside snapshot `keep`, at once rather than after the install,
+    /// and makes the removals durable.
+    fn remove_manifests_but(
+        path: &Path,
+        keep: crate::version::VersionId,
+        fs: &Arc<dyn crate::fs::Fs>,
+        sync_mode: crate::fs::SyncMode,
+    ) -> crate::Result<()> {
+        let mut sweep = OpenSweep::default();
+        Self::cleanup_orphaned_version(path, keep, fs, &mut sweep)?;
+        sweep.finish()?;
+        crate::file::fsync_directory(path, &**fs, sync_mode)?;
         Ok(())
     }
 }

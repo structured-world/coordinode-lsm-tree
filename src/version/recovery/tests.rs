@@ -1325,39 +1325,107 @@ fn an_open_refuses_a_renumbered_snapshot_before_it_touches_the_dictionaries() ->
     Ok(())
 }
 
-/// An open installs what it recovered under the next version id. At the top
-/// of the id space there is none: the open refuses before it writes or
-/// removes anything, and the snapshot it found stays as it was.
-#[test]
-fn an_open_at_the_last_version_id_refuses_and_keeps_the_snapshot() -> crate::Result<()> {
-    let fs = std::sync::Arc::new(MemFs::new());
-    let config = crate::Config::new(
-        "/last-id",
-        crate::SequenceNumberCounter::default(),
-        crate::SequenceNumberCounter::default(),
-    )
-    .with_shared_fs(fs.clone());
+/// A tree with key `a` at `/top-id` over `fs`, its installed snapshot
+/// rewritten as version `id`; the snapshot it had stays beside it, lower.
+fn a_tree_at_version(fs: &std::sync::Arc<MemFs>, id: u64) -> crate::Result<crate::path::PathBuf> {
+    use crate::AbstractTree;
+    let config = top_id_config(fs);
     let folder = config.path.clone();
-    fs.create_dir_all(&folder.join(crate::file::TABLES_FOLDER))?;
+    let version = {
+        let tree = config.open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        tree.current_version()
+    };
     crate::version::persist_version(
         &folder,
-        &crate::version::Version::new(u64::MAX, crate::TreeType::Standard),
+        &version.with_id_and_dicts(id, version.dicts().to_vec()),
         crate::comparator::default_comparator().name(),
-        &*fs,
+        &**fs,
         alloc::sync::Arc::new(crate::runtime_config::RuntimeConfig::default()),
         None,
         crate::fs::SyncMode::Normal,
     )?;
+    Ok(folder)
+}
 
-    assert!(
-        config.open().is_err(),
-        "no version id is left to install under"
+fn top_id_config(fs: &std::sync::Arc<MemFs>) -> crate::Config {
+    crate::Config::new(
+        "/top-id",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+}
+
+/// The snapshot names in `folder`.
+fn snapshots(fs: &MemFs, folder: &crate::path::Path) -> crate::Result<Vec<String>> {
+    let mut names: Vec<String> = fs
+        .read_dir(folder)?
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .filter(|name| name.starts_with('v'))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Every install takes one version id, an open included, so a tree whose id
+/// reached the top of the range would run out. An open there reinstalls the
+/// tree as version 0, with no snapshot left above it (the lower one an
+/// earlier generation left included, which recovery would otherwise take
+/// over the new one): the tree keeps its data and takes installs again.
+#[test]
+fn an_open_at_the_top_of_the_id_range_reinstalls_the_tree_as_version_0() -> crate::Result<()> {
+    use crate::AbstractTree;
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, u64::MAX)?;
+
+    {
+        let tree = top_id_config(&fs).open()?;
+        assert!(tree.get("a", 1)?.is_some(), "the data is kept");
+        assert_eq!(snapshots(&fs, &folder)?, vec!["v0"], "nothing above it");
+        tree.insert("b", "2", 1);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let tree = top_id_config(&fs).open()?;
+    assert!(tree.get("a", 3)?.is_some());
+    assert!(tree.get("b", 3)?.is_some(), "the install after it is kept");
+    assert_eq!(installed_snapshot(&folder, &*fs)?, Some(2));
+    Ok(())
+}
+
+/// A renumbering that fails before the snapshot it read is durably gone
+/// leaves that snapshot the highest: the next open takes it and renumbers
+/// again.
+#[test]
+fn a_renumbering_cut_short_is_done_again_by_the_next_open() -> crate::Result<()> {
+    use crate::AbstractTree;
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule};
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, crate::version::RENUMBER_FROM)?;
+
+    let fault = FaultFs::new(fs.as_ref().clone());
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::RemoveFile,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .on_path(format!("v{}", crate::version::RENUMBER_FROM)),
     );
-    assert_eq!(
-        installed_snapshot(&folder, &*fs)?,
-        Some(u64::MAX),
-        "the snapshot found is left as it was"
-    );
+    let failed = crate::Config::new(
+        "/top-id",
+        crate::SequenceNumberCounter::default(),
+        crate::SequenceNumberCounter::default(),
+    )
+    .with_fs(fault)
+    .open();
+    assert!(failed.is_err(), "the snapshot read cannot be removed");
+
+    let tree = top_id_config(&fs).open()?;
+    assert!(tree.get("a", 1)?.is_some(), "the data is kept");
+    assert_eq!(snapshots(&fs, &folder)?, vec!["v0"]);
     Ok(())
 }
 

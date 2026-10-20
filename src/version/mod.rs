@@ -110,8 +110,13 @@ impl<'a> TransformContext<'a> {
 
 pub const DEFAULT_LEVEL_COUNT: u8 = 7;
 
-/// Monotonically increasing ID of a version.
+/// ID of a version: each install takes the one above the last, and an open
+/// of a tree whose id reached [`RENUMBER_FROM`] starts the count again at `0`.
 pub type VersionId = u64;
+
+/// The version id from which an open reinstalls the tree under id `0`: half
+/// the range, so the installs of one session can never reach the top.
+pub const RENUMBER_FROM: VersionId = 1 << 63;
 
 impl Ranged for Table {
     fn key_range(&self) -> &KeyRange {
@@ -535,29 +540,30 @@ impl Version {
         self.with_id_and_dicts(self.id, dicts)
     }
 
-    /// This version under the next id, unchanged otherwise: what an open
-    /// installs as a fresh snapshot of the state it recovered. A new id, so
-    /// the snapshot it writes never replaces the one it was read from.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::Unrecoverable`] when the id space is exhausted: the
-    /// next id must leave room for the edit after it, which takes one more,
-    /// as a repair leaves room when it picks the id it rebuilds under.
-    pub(crate) fn reinstalled(&self) -> crate::Result<Self> {
-        let next = self
-            .id
-            .checked_add(1)
-            .filter(|next| *next != VersionId::MAX)
-            .ok_or_else(|| {
-                log::error!(
-                    "the version id space is exhausted (v{} is installed); the tree \
-                     cannot install another snapshot",
-                    self.id
-                );
-                crate::Error::Unrecoverable
-            })?;
-        Ok(self.with_id_and_dicts(next, self.dicts.to_vec()))
+    /// This version under the id an open installs it with, unchanged
+    /// otherwise: the next id, so the snapshot it writes never replaces the
+    /// one it was read from, or id `0` once this one is at or past
+    /// [`RENUMBER_FROM`]. See [`Self::is_renumbered_on_open`].
+    #[must_use]
+    pub(crate) fn reinstalled(&self) -> Self {
+        let next = if self.is_renumbered_on_open() {
+            0
+        } else {
+            // Below `RENUMBER_FROM`, so one more stays in range.
+            self.id + 1
+        };
+        self.with_id_and_dicts(next, self.dicts.to_vec())
+    }
+
+    /// Whether an open reinstalls this version under id `0` rather than the
+    /// next id. Every install takes one id, an open included, so a tree whose
+    /// ids reach the top of the range (in practice only one written or edited
+    /// by other means) would run out; restarting the count keeps it openable,
+    /// and a session that starts below [`RENUMBER_FROM`] cannot reach the top
+    /// by its own installs.
+    #[must_use]
+    pub(crate) fn is_renumbered_on_open(&self) -> bool {
+        self.id >= RENUMBER_FROM
     }
 
     fn with_id_and_dicts(&self, id: VersionId, dicts: Vec<crate::file::DictId>) -> Self {
