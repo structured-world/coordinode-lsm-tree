@@ -1428,12 +1428,14 @@ mod zstd_dict {
         damage_the_dictionary(dir.path(), dict_id)?;
 
         let fs = FaultFs::new(StdFs);
+        // Retiring the copy first sets it aside under its temporary name; no
+        // other rename of the repair lands on a `.tmp` name.
         fs.injector().arm(
             FaultRule::new(
-                FaultOp::RemoveFile,
+                FaultOp::Rename,
                 Fault::Error(lsm_tree::io::ErrorKind::Other),
             )
-            .on_path("repair-report-"),
+            .on_path(".tmp"),
         );
         let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
         assert!(
