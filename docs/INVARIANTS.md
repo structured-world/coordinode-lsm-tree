@@ -177,7 +177,10 @@ matching entry (and add one for a new subsystem).
   tables folder keeps a pool of empty files under the names of tables to come,
   made a batch at a time with one folder sync for the batch
   (`Config::table_file_pool`); a flush, compaction or ingestion writes into one,
-  so its install syncs the table and the edit and no folder. A table never is
+  so its install syncs the table and the edit and no folder. Only a write's
+  first table refills the pool: a write that runs it dry makes the files of its
+  further tables as they start, and its install syncs their folder once. A
+  table never is
   empty, so an empty file under a table name that no version names is a pooled
   file: an open uses it again after syncing its folder once, and a repair
   removes it rather than count it as a lost table. A pooled file another name
