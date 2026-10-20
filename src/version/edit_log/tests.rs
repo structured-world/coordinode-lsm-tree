@@ -40,10 +40,10 @@ fn an_append_whose_write_fails_partway_leaves_the_log_whole() -> crate::Result<(
     let mut scratch = Vec::new();
     append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Normal)?;
 
+    // A frame is written as its length, its digest, then its payload: the
+    // payload's write is the one that stalls, after the header went out.
     fs.injector()
-        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(5)).once());
-    fs.injector()
-        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(0)).skip(1));
+        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(0)).skip(2));
     scratch.clear();
     assert!(append_edit(&fs, &path, &edit(2), &mut scratch, SyncMode::Normal).is_err());
     fs.injector().clear();
