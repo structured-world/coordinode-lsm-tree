@@ -48,7 +48,11 @@ fn build_one_sst(
     let sst = std::fs::read_dir(dir.path().join("tables"))
         .expect("tables dir")
         .filter_map(Result::ok)
-        .find(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        // The empty files the folder keeps for tables to come are no SSTs.
+        .find(|e| {
+            e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && e.metadata().is_ok_and(|m| m.len() > 0)
+        })
         .expect("at least one SST")
         .path();
     (dir, sst)

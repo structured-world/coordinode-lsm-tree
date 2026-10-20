@@ -116,8 +116,10 @@ fn repair_prints_the_wal_replay_obligation_when_coverage_is_lost()
 
     // Truncate one table to nothing readable: its metadata never parses, so
     // repair cannot scope the loss by seqno at all.
+    // The empty files the folder keeps for tables to come are no tables.
     let victim = std::fs::read_dir(dir.path().join("tables"))?
         .filter_map(Result::ok)
+        .filter(|e| e.metadata().is_ok_and(|m| m.len() > 0))
         .map(|e| e.path())
         .min()
         .ok_or("the tree wrote at least one table")?;
