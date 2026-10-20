@@ -112,15 +112,12 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
     let fs: Arc<dyn Fs> = Arc::new(fault);
     let folder = std::path::absolute("/db").expect("absolute");
 
-    // No pooled table files: the flush's table takes id 0 and the relocation's
-    // the next, 1, which the fault below names.
     let any = Config::new(
         &folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(Arc::clone(&fs))
-    .table_file_pool(0)
     .open()
     .expect("open");
     let AnyTree::Standard(tree) = any else {
@@ -144,14 +141,16 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
     );
     tree.flush_active_memtable(0).expect("flush");
 
-    // The flush wrote table 0; the relocation writes table 1. Positioned reads
-    // on that path happen only when it is REOPENED — the writer streams it out
-    // — so this fires exactly on the reopen, after finalization.
+    // The relocation writes its table under the next id the tree hands out.
+    // Positioned reads on that path happen only when it is REOPENED — the
+    // writer streams it out — so this fires exactly on the reopen, after
+    // finalization.
     //
     // The filter is built from the real path rather than written as a literal:
-    // a hardcoded `tables/1` matches nothing where the separator is `\`, and
-    // the rule would then silently never fire.
-    let relocated = folder.join("tables").join("1");
+    // a hardcoded `tables/<id>` matches nothing where the separator is `\`,
+    // and the rule would then silently never fire.
+    let relocated_name = tree.next_table_id().to_string();
+    let relocated = folder.join("tables").join(&relocated_name);
     injector.arm(
         FaultRule::new(
             FaultOp::ReadAt,
@@ -170,7 +169,7 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
         .read_dir(&folder.join("tables"))
         .expect("read tables dir")
         .into_iter()
-        .filter(|e| e.file_name == "1")
+        .filter(|e| e.file_name == relocated_name)
         .collect();
     assert!(
         orphans.is_empty(),
