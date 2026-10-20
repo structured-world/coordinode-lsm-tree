@@ -61,6 +61,42 @@ fn holds_a_copy(folder: &std::path::Path) -> lsm_tree::Result<bool> {
     Ok(false)
 }
 
+/// A repair whose snapshot was proven not installed leaves its report's copy
+/// under the id it meant to install. The next open installs the tree it finds
+/// under that same id, and must not take the copy for its own: the repair it
+/// describes never committed, and a caller replaying its losses would apply
+/// them twice.
+#[test]
+fn a_repair_that_never_installed_hands_out_no_report() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    {
+        let tree = config(folder.path()).open()?;
+        tree.insert("a", "value", 0);
+        tree.flush_active_memtable(0)?;
+    }
+
+    let fs = FaultFs::new(StdFs);
+    // The rebuilt snapshot's rename is what installs it.
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Rename, Fault::Error(ErrorKind::Other))
+            .on_path(folder.path().join("v").to_string_lossy())
+            .once(),
+    );
+    assert!(
+        config(folder.path()).with_fs(fs).repair().is_err(),
+        "the rebuilt snapshot is not installed"
+    );
+
+    let (tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    assert!(
+        report.is_none(),
+        "no report for a repair that never committed: {report:?}"
+    );
+    assert!(tree.get("a", 1)?.is_some());
+    assert!(!holds_a_copy(folder.path())?, "the stale copy is gone");
+    Ok(())
+}
+
 /// A copy that cannot be retired still carries the report, so the call fails
 /// rather than hand it out, and the next call hands it out.
 #[test]

@@ -102,12 +102,18 @@ pub fn canonical_id(digits: &str) -> Option<u64> {
 /// so the install's directory sync makes its name durable with the
 /// snapshot's. Returns whether there was one to carry.
 ///
+/// With none to carry, a copy already under `to` goes: it was left by a
+/// repair whose rebuilt snapshot `to` was never installed (a repair takes the
+/// id above the installed one, as an install does), and the snapshot about to
+/// take that id owes no report. Its removal becomes durable with the install.
+///
 /// The bytes travel as they are: the copy is sealed with the tree's
 /// encryption provider, which does not change between generations.
 ///
 /// # Errors
 ///
-/// Propagates a failure to read the copy or to write the new one.
+/// Propagates a failure to read the copy, to write the new one, or to remove
+/// a stale one.
 pub fn carry_repair_report(
     fs: &dyn Fs,
     folder: &Path,
@@ -116,6 +122,13 @@ pub fn carry_repair_report(
     sync_mode: SyncMode,
 ) -> crate::Result<bool> {
     let Some(bytes) = read_repair_report(fs, folder, from)? else {
+        match fs.remove_file(&repair_report_path(folder, to)) {
+            Ok(()) => log::warn!(
+                "removed the report copy of snapshot {to}, which a repair never installed"
+            ),
+            Err(e) if e.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         return Ok(false);
     };
     write_repair_report(fs, folder, to, &bytes, sync_mode)?;
