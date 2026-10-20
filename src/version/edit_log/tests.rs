@@ -53,6 +53,33 @@ fn an_append_whose_write_fails_partway_leaves_the_log_whole() -> crate::Result<(
     Ok(())
 }
 
+/// When the cut after a failed append fails too, the append still answers
+/// with its own failure: the cut is a cleanup, and the caller acts on why
+/// the edit was not written.
+#[test]
+fn a_failed_append_whose_cut_fails_reports_the_write() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, MemFs};
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/db"))?;
+    let path = log_path(Path::new("/db"), 0);
+    new_log(&fs, &path);
+    let mut scratch = Vec::new();
+
+    fs.injector()
+        .arm(FaultRule::new(FaultOp::Write, Fault::ShortWrite(0)).skip(2));
+    fs.injector().arm(FaultRule::new(
+        FaultOp::SetLen,
+        Fault::Error(crate::io::ErrorKind::PermissionDenied),
+    ));
+    let Err(crate::Error::Io(e)) =
+        append_edit(&fs, &path, &edit(1), &mut scratch, SyncMode::Normal)
+    else {
+        panic!("the append must fail with the write's error");
+    };
+    assert_eq!(e.kind(), crate::io::ErrorKind::WriteZero);
+    Ok(())
+}
+
 /// An append goes to the log its snapshot's install made durable by name. A
 /// log that is not there fails the append, which makes none: one made by the
 /// append would lie under a name no sync covers, and a power loss would take

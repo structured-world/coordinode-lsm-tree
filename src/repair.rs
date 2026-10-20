@@ -3676,19 +3676,29 @@ impl Config {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use lsm_tree::{Config, SequenceNumberCounter};
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
     ///
+    /// let folder = tempfile::tempdir()?;
     /// let config = Config::new(
-    ///     "/var/lib/mydb",
+    ///     &folder,
     ///     SequenceNumberCounter::default(),
     ///     SequenceNumberCounter::default(),
     /// );
+    /// {
+    ///     let tree = config.clone().open()?;
+    ///     tree.insert("a", "1", 0);
+    ///     tree.flush_active_memtable(0)?;
+    /// }
+    ///
     /// let report = config.repair()?;
     /// println!("recovered {} tables, {} unreadable", report.recovered, report.unreadable);
     ///
-    /// // `repair` borrows, so the same config opens the rebuilt tree.
-    /// let _tree = config.open()?;
+    /// // `repair` borrows, so the same config opens the rebuilt tree. Once the
+    /// // report's replay obligation is met, the tree stops owing it.
+    /// let tree = config.open()?;
+    /// assert!(tree.get("a", 1)?.is_some());
+    /// assert!(tree.acknowledge_repair_report(report.id)?);
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair(&self) -> crate::Result<RepairReport> {
@@ -7269,15 +7279,20 @@ fn publish_repaired_manifest(
             }
         }
     }
-    for (i, (path, note)) in stale_blob_originals.iter().enumerate() {
+    // The originals' entries are the last ones of the list, in their order.
+    for (i, (entry, (path, note))) in report
+        .blob_files_salvaged
+        .iter_mut()
+        .skip(salvage_report_base)
+        .zip(&stale_blob_originals)
+        .enumerate()
+    {
         let state = if i < originals_removed {
             "original removed"
         } else {
             "original NOT removed"
         };
-        if let Some(entry) = report.blob_files_salvaged.get_mut(salvage_report_base + i) {
-            *entry = (path.clone(), format!("{note}; {state}"));
-        }
+        *entry = (path.clone(), format!("{note}; {state}"));
     }
 
     // Everything the scan classified out of the rebuilt tree: a foreign name, a

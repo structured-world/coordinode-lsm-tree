@@ -1428,6 +1428,35 @@ fn a_damaged_identity_section_does_not_make_a_report_owed() -> crate::Result<()>
     Ok(())
 }
 
+/// A snapshot under a name that is not its own is another generation's: what
+/// the snapshot under that name owed is not in it, so it cannot say.
+#[test]
+fn a_snapshot_naming_another_version_cannot_say_what_is_owed() -> crate::Result<()> {
+    let fs = std::sync::Arc::new(MemFs::new());
+    let folder = a_tree_at_version(&fs, 7)?;
+    let len = usize::try_from(fs.metadata(&folder.join("v7"))?.len)
+        .map_err(|_| crate::Error::Unrecoverable)?;
+    let bytes = crate::file::read_exact(
+        &*fs.open(
+            &folder.join("v7"),
+            &crate::fs::FsOpenOptions::new().read(true),
+        )?,
+        0,
+        len,
+    )?;
+    fs.open(
+        &folder.join("v8"),
+        &crate::fs::FsOpenOptions::new().write(true).create(true),
+    )?
+    .write_all(&bytes)?;
+
+    assert_eq!(
+        owed_repair_report(&folder, &*fs, None)?,
+        Some(OwedReport::Unreadable(8))
+    );
+    Ok(())
+}
+
 /// A renumbering removes every snapshot and log but the ones it installs,
 /// and only those: a file of another spelling in the tree root is not the
 /// engine's.

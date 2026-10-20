@@ -459,16 +459,12 @@ pub fn restore(
 
     // Written under a temporary name and renamed once its bytes are synced:
     // the name installs the snapshot, and one directory sync makes it and the
-    // empty log durable.
+    // empty log durable. A temporary an earlier attempt left went with the
+    // manifest files above.
     let temporary = root.join(format!(
         "v{version_id}{}",
         crate::version::SNAPSHOT_TEMPORARY_SUFFIX
     ));
-    if let Err(e) = fs.remove_file(&temporary)
-        && e.kind() != crate::io::ErrorKind::NotFound
-    {
-        return Err(e.into());
-    }
     let mut file = fs.open(
         &temporary,
         &FsOpenOptions::new().write(true).create_new(true),
