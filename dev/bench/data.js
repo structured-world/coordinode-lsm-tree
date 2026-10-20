@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792523397783,
+  "lastUpdate": 1792523401826,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -54004,6 +54004,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.689164597,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "004f4d483744f03d5096e1da101aece35b403a40",
+          "message": "ci(deps): bump release-plz/action from 0.5.141 to 0.5.142 (#946)\n\nBumps [release-plz/action](https://github.com/release-plz/action) from\n0.5.141 to 0.5.142.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/release-plz/action/releases\">release-plz/action's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v0.5.142</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>fix(deps): update rust crate git_cmd to 0.9.0 by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/565\">release-plz/action#565</a></li>\n<li>chore(deps): update dependency cargo-bins/cargo-binstall to v1.25.3\nby <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/566\">release-plz/action#566</a></li>\n<li>chore(deps): lock file maintenance by <a\nhref=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot] in\n<a\nhref=\"https://redirect.github.com/release-plz/action/pull/567\">release-plz/action#567</a></li>\n<li>chore(deps): update dependency taiki-e/install-action to v2.87.28 by\n<a href=\"https://github.com/renovate\"><code>@​renovate</code></a>[bot]\nin <a\nhref=\"https://redirect.github.com/release-plz/action/pull/568\">release-plz/action#568</a></li>\n<li>Update to 0.3.172 by <a\nhref=\"https://github.com/marcoieni\"><code>@​marcoieni</code></a> in <a\nhref=\"https://redirect.github.com/release-plz/action/pull/569\">release-plz/action#569</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/release-plz/action/compare/v0.5.141...v0.5.142\">https://github.com/release-plz/action/compare/v0.5.141...v0.5.142</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/8921286633dfa0c4020f7f30bd1c14fe19cbb10e\"><code>8921286</code></a>\nUpdate to 0.3.172 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/569\">#569</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/81194648c7963fb535f0c069198f31d5a6a93aea\"><code>8119464</code></a>\nchore(deps): update dependency taiki-e/install-action to v2.87.28 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/568\">#568</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/0b172c293e649d8dea31674a53fff4df4e57b2e4\"><code>0b172c2</code></a>\nchore(deps): lock file maintenance (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/567\">#567</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/ad3f059f53e0fda2edc9b6ec421414a73d790110\"><code>ad3f059</code></a>\nchore(deps): update dependency cargo-bins/cargo-binstall to v1.25.3 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/566\">#566</a>)</li>\n<li><a\nhref=\"https://github.com/release-plz/action/commit/6dee9c5cc1009fba42dd39c10b9413e808ef9d8a\"><code>6dee9c5</code></a>\nfix(deps): update rust crate git_cmd to 0.9.0 (<a\nhref=\"https://redirect.github.com/release-plz/action/issues/565\">#565</a>)</li>\n<li>See full diff in <a\nhref=\"https://github.com/release-plz/action/compare/f393a7b38aca9d9b4c58447b291dbac963901df6...8921286633dfa0c4020f7f30bd1c14fe19cbb10e\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-20T18:38:35Z",
+          "tree_id": "a830e5e6e22441cebf362dbc906d7d56963e9e65",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/004f4d483744f03d5096e1da101aece35b403a40"
+        },
+        "date": 1792523400399,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 537.593,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 85.930434ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 182.523,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 55.855704ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 493.04999999999995,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 103.683541ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 6339.258000000001,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 23640.072,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.223,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 93.257727,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.675415948,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.535,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 81.919999,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.65988857,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
