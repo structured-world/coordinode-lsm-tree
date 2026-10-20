@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792531508410,
+  "lastUpdate": 1792531512462,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -55024,6 +55024,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.65988857,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ed93ef0dcf444150938981f447e810569ad988ae",
+          "message": "perf(manifest): install a snapshot by its edit log, not a pointer (#948)\n\nReplaces #945.\n\n## Summary\n- The manifest has no version pointer: a snapshot is written as\n`v{N}.tmp`, its bytes synced, and a rename to `v{N}` installs it.\nRecovery takes the highest `v{N}`.\n- Installing a snapshot costs two syncs, its bytes and its folder:\ncreating a tree syncs 3 times instead of 5, and a rotating flush 4 times\ninstead of 6. An open of an existing tree now pays those two syncs for\nthe snapshot it installs, where it paid none, and its first flush one\nfewer (the open already made the log's name durable).\n- Opening an existing tree installs the state it recovered as a fresh\nsnapshot before serving it, so the persisted seqno an open reports\nsurvives a power loss even when an earlier sync failed.\n- A repair's report lives in the snapshot it describes and stays there\nuntil the caller acknowledges it with\n`AbstractTree::acknowledge_repair_report`, so it reaches the caller at\nleast once whatever ends the process; repeats carry one id a consumer\ndeduplicates by.\n- A repair stops on a failure of its salvage output instead of dropping\nthe source it salvages.\n\n## Changes\n- `persist_version` writes the snapshot under a temporary name, syncs\nit, creates its empty log, renames it into place and syncs the folder\nonce. A log a power loss took reads as the empty log it was, and the\nfirst append syncs it. When the folder sync fails the snapshot's name is\ntaken back, so the previous generation stays installed; when the\nwithdrawal cannot be made durable the error is `InstallOutcomeUnknown`.\n- Every snapshot carries a `version_id` section. An open verifies the\ninstalled snapshot's footer, format and version id before it reads the\ndictionaries; recovery refuses a snapshot that names another id than its\nfile, and reports damage to it rather than answering with an older\ngeneration.\n- Snapshot and edit log names accept only canonical decimal ids; a\nzero-padded name is not engine state, and the open's sweep, the\nrenumbering and `restore_pinned` leave any name of another spelling in\nthe tree root alone. Tables and blob files keep recognizing an alternate\nspelling as a duplicate of the canonical file.\n- A folder holding a version pointer (`current`) is a store of the\nprevious format, whose higher snapshot may be one the pointer never\nnamed: the open, the recovery and the repair all refuse it as\n`InvalidVersion(5)` and leave it for the offline converter.\n- An open of an existing tree installs what it recovered as a snapshot\nunder the next version id, then republishes missing restriction sidecars\nand removes what that state no longer names. Re-syncing the files it\nread would prove nothing after a failed sync, so the state is written\nanew; its log is durable by name, so the first install after the open\ndoes not sync the folder again. A folder without a snapshot is created\nover only when none of its tables folders, the level routes' included,\nnor its blobs folder holds files.\n- An edit is appended only to the log its snapshot's install made\ndurable by name: a log that is not there fails the append, and the next\ninstall rotates. An append whose write fails partway is cut back off and\nthe cut synced, so the log ends on a record boundary in every recovery\nmode.\n- An open's sweep tries every removal it queued and fails with the first\nthat failed, so an orphan that cannot go does not keep the generation\nthe open superseded from going.\n- A rotation whose install fails marks the next install to rotate: the\nfailed one may be installed on disk, and an edit appended to the older\nlog would be lost at recovery.\n- A compaction whose install has an unknown outcome keeps its outputs\nand the quota they take until a later rotation succeeds; the next\ncompaction then removes them and gives the quota back.\n- The manifest reader propagates a transient or environmental I/O\nfailure of both footer copies instead of an invalid footer\n`open_or_repair` would rebuild.\n- `Error::SalvageOutput` marks an I/O or sealing failure to create,\nwrite, finish, publish or sync a salvage's output; repair stops on it\ninstead of grading the source unreadable and removing intact data.\nDamage a verbatim copy finds in the source bytes it carries keeps its\nown class.\n- A repair's report is a `repair_report` section of the rebuilt\nsnapshot, naming the damaged dictionaries it sets aside after the\ncommit. Every version transition carries the section, and a change to it\nrotates the log, so rotations, opens, checkpoints and pinned restores\nkeep an owed report without any file of their own. A rebuilt snapshot\nwhose name is visible after a failed install counts as committed only\nonce a sync of the tree folder succeeds; otherwise the repair answers\n`InstallOutcomeUnknown`.\n- `RepairReport` carries an `id` and the ids it `includes`: a later\nrepair folds the earlier unconsumed report into its own, each distinct\nloss kept. Neither `repair` nor `open_or_repair` retires a report: every\n`open_or_repair` hands an owed report out again, under its id, until\n`AbstractTree::acknowledge_repair_report(id)` installs a version without\nit (`false` when the tree owes no report of that id). `open_or_repair`\nreturns the report of the repair it ran, which says what the cleanup\nafter the commit did; the tree's copy, written before that cleanup, says\nwhat holds either way. A damaged dictionary is reported moved aside only\nonce the move succeeded. A damaged owed report, a report section the\nsnapshot lists but cannot read, or an installed snapshot too damaged to\nsay whether it owes one, leaves the loss unscoped (full-history replay)\nunder an id of its own; a snapshot whose table of contents still reads\nand lists no report owes none, whatever its identity sections say.\n- A pinned layout starts with a name and a version; a restore refuses a\nlayout of another shape before it writes anything.\n- Checkpoints, pin restore and repair install their snapshot the same\nway; repair probes the install by the rebuilt snapshot's name. The\nconverter moves the converted snapshot into the folder last.\n- An open of a tree whose version id reached 2^63 reinstalls it as\nversion 0: every other manifest file is removed durably before the\ninstall and the snapshot read right after it, so no snapshot is left\nabove the new one. A tree never runs out of version ids. A repair\nrefuses only a folder already holding `v{u64::MAX}`; a rebuilt snapshot\nthat takes the last id is renumbered by the open after it.\n- `CURRENT_VERSION_FILE` and the pointer digest are removed.\n- `structured-zstd` is updated to 0.2.3.\n- CI runs the strict clippy gate on Windows and macOS as well, so code\nbehind a platform `cfg` is linted.\n\n## Testing\n- fmt, clippy in every CI configuration, the full nextest suite, doc\ntests, the doc build, the no-std check, sst-dump, db_bench and the\nconverter pass on Linux.\n\nCloses #927",
+          "timestamp": "2026-10-21T00:08:45+03:00",
+          "tree_id": "35e0ff87a2f24c7c90c813480d39ef6c1bab7955",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ed93ef0dcf444150938981f447e810569ad988ae"
+        },
+        "date": 1792531511100,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 508.791,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.513063ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 164.548,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.981923ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 456.214,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.74785ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4429.776,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9557.75,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.655,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.835199,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.624552858,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.367,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 78.577663,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.610551359,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
