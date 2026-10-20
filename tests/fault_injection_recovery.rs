@@ -137,15 +137,12 @@ fn blob_files_of_an_acknowledged_write_survive_a_crash() -> lsm_tree::Result<()>
     Ok(())
 }
 
-/// A failed sync of the new edit log's directory fails the flush, and the
-/// next flush syncs it again: the log is no longer empty then, but its
-/// directory entry is still not durable, and a flush acknowledged over it
-/// would be lost with it.
+/// The first flush after a reopen appends to the log the reopen installed,
+/// whose name that install made durable: the flush syncs no directory for
+/// it, and what it acknowledged survives a power loss.
 #[test]
-fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> {
+fn the_first_flush_after_a_reopen_survives_a_power_loss() -> lsm_tree::Result<()> {
     let crash = CrashFs::new(MemFs::new());
-    let fault = Arc::new(FaultFs::new(crash.clone()));
-    let injector = fault.injector();
     let db = "/db";
     let open = || {
         lsm_tree::Config::new(
@@ -153,28 +150,13 @@ fn a_failed_sync_of_the_edit_log_directory_is_retried() -> lsm_tree::Result<()> 
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
-        .with_shared_fs(fault.clone())
+        .with_shared_fs(Arc::new(crash.clone()))
         .open()
     };
 
     {
-        // A log found at open is not trusted to have a durable name (a
-        // created tree's is, made under its snapshot's directory sync).
         drop(open()?);
         let tree = open()?;
-
-        // A flush syncs its table's directory, then, on the first edit after
-        // the open, the log's: fail the second.
-        injector.arm(
-            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
-                .once(),
-        );
-        tree.insert("a", "1", 0);
-        match tree.flush_active_memtable(0) {
-            Ok(_) => panic!("the injected directory sync fault must fail the flush"),
-            Err(e) => assert!(format!("{e}").contains("injected fault"), "{e}"),
-        }
         tree.insert("b", "2", 1);
         tree.flush_active_memtable(0)?;
     }

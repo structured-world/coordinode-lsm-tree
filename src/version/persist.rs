@@ -1,9 +1,8 @@
-use crate::io::{LittleEndian, WriteBytesExt};
 use crate::{
     encryption::EncryptionProvider,
-    file::{CURRENT_VERSION_FILE, fsync_directory, rewrite_atomic},
+    file::fsync_directory,
     fs::{Fs, SyncMode},
-    manifest_blocks::{current_digest, writer::ManifestArchiveWriter},
+    manifest_blocks::writer::ManifestArchiveWriter,
     runtime_config::RuntimeConfig,
     version::Version,
 };
@@ -11,15 +10,35 @@ use alloc::sync::Arc;
 
 use crate::path::Path;
 
+/// The suffix of the name a snapshot is written under until it is installed.
+pub const SNAPSHOT_TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// Crate-internal (version module is not exported).
 ///
-/// Writes a new `v{N}` manifest file using the Blocks-based layout
-/// (`manifest_layout_version` = 1) and atomically updates the
-/// `CURRENT_VERSION_FILE` pointer to reference it.
+/// Writes `version` as the snapshot `v{N}` (Blocks-based layout,
+/// `manifest_layout_version` = 1) and installs it: the snapshot is written
+/// under the temporary name `v{N}.tmp` and its bytes synced, its empty edit
+/// log `edits-{N}` is created, the snapshot is renamed to `v{N}`, and one
+/// directory sync makes both names durable. The name `v{N}` is what installs
+/// the snapshot (see [`installed_snapshot`](super::recovery::installed_snapshot)):
+/// a rename is atomic, so the name never holds a snapshot whose bytes were
+/// not synced first, and it costs no sync of its own.
 ///
-/// The pointer file is rewritten via [`rewrite_atomic`] only after
-/// the manifest itself is fully fsynced — recovery never follows
-/// `CURRENT` to a truncated/missing manifest.
+/// The log needs no sync either: until the first edit appends to it, a log a
+/// power loss took reads as the empty log it was, and that append syncs it.
+///
+/// A temporary or a log of the same id left by an earlier attempt is
+/// replaced, and so is a snapshot of that id, by the rename. Ids only grow,
+/// so one can only be the remains of an install that failed, which the
+/// caller reported as failed.
+///
+/// # Errors
+///
+/// Propagates an I/O or encoding error. When the directory sync after the
+/// rename fails, the snapshot's name is taken back first, so the previous
+/// generation stays the installed one; when the withdrawal cannot be made
+/// durable, a power loss may still keep the rename, and the error is
+/// [`crate::Error::InstallOutcomeUnknown`].
 pub fn persist_version(
     folder: &Path,
     version: &Version,
@@ -47,110 +66,79 @@ pub fn persist_version(
     );
 
     let path = folder.join(format!("v{}", version.id()));
-    clear_unnamed_snapshot(folder, &path, version.id(), fs)?;
+    let temporary = folder.join(format!("v{}{SNAPSHOT_TEMPORARY_SUFFIX}", version.id()));
+    let log = super::edit_log::log_path(folder, version.id());
+    // A log holding edits is a live generation's: nothing appends to the
+    // log of a failed install, so it is never a leftover.
+    if super::edit_log::log_size(fs, &log)? > 0 {
+        return Err(crate::Error::from(crate::io::Error::new(
+            crate::io::ErrorKind::AlreadyExists,
+            format!(
+                "manifest snapshot {} is a live generation; reopen the tree",
+                path.display()
+            ),
+        )));
+    }
+    remove_leftover(fs, &temporary)?;
 
     // Compose the Blocks-based manifest. The writer reserves the
     // 4 KiB head region on create(), accepts per-section writes
     // (each flushed as a BlockType::Manifest Block on the next
     // start() / finish()), and on finish() writes the tail footer
     // Block + size-hint trailer + optional head mirror per the
-    // runtime config.
-    let mut writer = ManifestArchiveWriter::create(&path, fs, runtime, encryption, sync_mode)?;
+    // runtime config, and syncs the file.
+    let mut writer = ManifestArchiveWriter::create(&temporary, fs, runtime, encryption, sync_mode)?;
     version.encode_into(&mut writer, comparator_name)?;
-    let footer = writer.finish()?;
+    writer.finish()?;
     super::edit_log::create_log(fs, folder, version.id(), sync_mode)?;
+    fs.rename(&temporary, &path)?;
 
     // The snapshot's name and its log's, and every entry made in the folder
-    // before (a new tree's folders), durable before `CURRENT` names them.
-    fsync_directory(folder, fs, sync_mode)?;
-
-    // CURRENT pointer carries a content-binding XXH3-128 over the
-    // canonical footer payload (version_id + layout_version + flags +
-    // sorted TOC entries that include each section's own XXH3-128
-    // from its Block header). Compared to the earlier raw-byte hash
-    // over `[HEAD_FOOTER_RESERVED_SIZE, section_end)`, this preserves
-    // per-Block Page ECC repair on read: a section bit-flip that
-    // ECC heals at decode time no longer trips this checksum,
-    // because the digest is computed from writer-time section
-    // checksums (which the section Block's own header carries on
-    // read regardless of disk corruption).
-    //
-    // Threat coverage:
-    //   T1 (mislinking) — version_id + TOC bind logical identity
-    //   T2 (half-recovery) — caught earlier by ManifestArchiveReader
-    //                        before the digest is computed
-    //   T3 (bit-rot)    — caught per-Block by XXH3; ECC repairs
-    //                     when enabled; CURRENT no longer interferes
-    //   T4 (adversarial) — out of scope; enable Config::with_encryption
-    //                      for per-Block AEAD authentication
-    let checksum = current_digest::compute(version.id(), &footer)?;
-
-    let mut current_file_content = vec![];
-    current_file_content.write_u64::<LittleEndian>(version.id())?;
-    current_file_content.write_u128::<LittleEndian>(checksum)?;
-    current_file_content.write_u8(0)?; // 0 = xxh3
-
-    rewrite_atomic(
-        &folder.join(CURRENT_VERSION_FILE),
-        &current_file_content,
-        fs,
-        sync_mode,
-    )?;
-
+    // before (a new tree's folders), durable together.
+    if let Err(e) = fsync_directory(folder, fs, sync_mode) {
+        return Err(if withdraw(folder, &path, fs, sync_mode) {
+            e.into()
+        } else {
+            crate::Error::InstallOutcomeUnknown(alloc::boxed::Box::new(e.into()))
+        });
+    }
     Ok(())
 }
 
-/// Removes a `v{id}` snapshot that `CURRENT` does not name, so the rotation
-/// about to write `v{id}` can create it.
-///
-/// Such a file is left by an attempt that failed between writing the snapshot
-/// and repointing `CURRENT` (or by a crash there). Recovery never reads it,
-/// but the writer creates the snapshot with `create_new`, and a failed install
-/// leaves the in-memory version where it was, so the retry derives the same id
-/// and would be refused on every rotation until the process restarts.
-///
-/// A `v{id}` that `CURRENT` already names is never touched: that is the state
-/// after a failure past the repoint (the directory sync), and rewriting the
-/// snapshot under the pointer that names it would break the next open.
-fn clear_unnamed_snapshot(
-    folder: &Path,
-    path: &Path,
-    id: crate::version::VersionId,
-    fs: &dyn Fs,
-) -> crate::Result<()> {
-    match fs.metadata(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+/// Takes back the name of a snapshot whose install failed at its directory
+/// sync, so the previous generation is the installed one again, and returns
+/// whether that is durable. When it is not, a power loss may still keep the
+/// rename: the install's outcome is unknown, and what the snapshot names has
+/// to stay.
+fn withdraw(folder: &Path, snapshot: &Path, fs: &dyn Fs, sync_mode: SyncMode) -> bool {
+    if let Err(e) = fs.remove_file(snapshot) {
+        log::warn!(
+            "persist: could not withdraw {} after a failed install: {e}",
+            snapshot.display()
+        );
+        return false;
     }
-    if named_by_current(folder, fs)? == Some(id) {
-        return Err(crate::Error::from(crate::io::Error::new(
-            crate::io::ErrorKind::AlreadyExists,
-            format!(
-                "manifest snapshot {} is the one CURRENT names; reopen the tree",
+    if let Err(e) = fsync_directory(folder, fs, sync_mode) {
+        log::warn!(
+            "persist: the withdrawal of {} is not durable: {e}",
+            snapshot.display()
+        );
+        return false;
+    }
+    true
+}
+
+/// Removes `path`, left by a failed install of the same id, if it exists.
+fn remove_leftover(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
+    match fs.remove_file(path) {
+        Ok(()) => {
+            log::warn!(
+                "removed {}, left by an earlier failed manifest install",
                 path.display()
-            ),
-        )));
-    }
-    log::warn!(
-        "removing manifest snapshot {} that CURRENT does not name, left by an earlier failed rotation",
-        path.display()
-    );
-    fs.remove_file(path)?;
-    Ok(())
-}
-
-/// The version id `CURRENT` names, or `None` when there is no `CURRENT` yet.
-fn named_by_current(folder: &Path, fs: &dyn Fs) -> crate::Result<Option<u64>> {
-    use crate::fs::FsOpenOptions;
-    use crate::io::{LittleEndian, ReadBytesExt};
-
-    match fs.open(
-        &folder.join(CURRENT_VERSION_FILE),
-        &FsOpenOptions::new().read(true),
-    ) {
-        Ok(mut file) => Ok(Some(file.read_u64::<LittleEndian>()?)),
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(None),
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
 }

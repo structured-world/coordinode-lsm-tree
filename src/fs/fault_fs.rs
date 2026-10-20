@@ -1057,7 +1057,7 @@ impl<F: Fs> Fs for FaultFs<F> {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         // Rename rules match the destination path: that is the stable name
-        // (manifest, version pointer) a test targets.
+        // (a published table, a sidecar) a test targets.
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::Rename, Some(to)) {
             return Err(fault_error(kind, FaultOp::Rename));
         }

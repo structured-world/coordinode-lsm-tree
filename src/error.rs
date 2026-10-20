@@ -164,15 +164,14 @@ pub enum Error {
     /// repair's own post-commit cleanup, or the follow-up open inside
     /// [`Config::open_or_repair`](crate::Config::open_or_repair).
     ///
-    /// The report travels WITH the error because it exists only in that call:
-    /// the retry finds a healthy manifest (its open sweeps any cleanup
-    /// leftover itself), runs no repair, and answers `None` — an
-    /// external-WAL consumer would otherwise never learn its replay
-    /// obligation
+    /// The report travels WITH the error, so an external-WAL consumer learns
+    /// its replay obligation
     /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
-    /// and could keep stale or resurrected values. Consume the report exactly
-    /// as a successful repair's, then retry the open (`cause` is typically
-    /// transient).
+    /// whatever the retry finds. Consume the report exactly as a successful
+    /// repair's, then retry the open (`cause` is typically transient). When
+    /// the snapshot that owes the report survives, the retry hands it out
+    /// again with the same [`RepairReport::id`](crate::RepairReport::id):
+    /// skip one already applied.
     #[cfg(feature = "std")]
     RepairedButUnopened {
         /// The completed repair's report — not rederivable on a retry.
@@ -427,17 +426,17 @@ pub enum Error {
     /// - **Trailing size-hint corruption:** the tail's 4-byte
     ///   footer-size hint is zero or exceeds
     ///   `HEAD_FOOTER_RESERVED_SIZE` (4 KiB), or the implied
-    ///   `section_end` lands inside the head reservation. Caught
-    ///   in both the reader and `checkpoint::write_current_for_version`.
+    ///   `section_end` lands inside the head reservation.
     /// - **Writer-side invariant breach:** `write_cursor` would
     ///   overflow `u64`, an in-memory section would exceed the
     ///   on-disk Block-size cap, etc.
-    /// - **CURRENT pointer points at a missing manifest:** when
-    ///   `version::get_current_version` opens the referenced
-    ///   `v{N}` file and gets `NotFound`, the error is rewrapped
-    ///   here so `Tree::open`'s outer `Io(NotFound) => create_new`
-    ///   arm cannot mistake a half-applied recovery / corrupted
-    ///   state for a clean first-open.
+    /// - **No installed snapshot to recover:** recovery found no
+    ///   `v{N}` with its `edits-{N}` log, so `Tree::open`'s outer
+    ///   `Io(NotFound) => create_new` arm cannot mistake a
+    ///   half-applied recovery / corrupted state for a clean
+    ///   first-open.
+    /// - **Installed snapshot naming another id:** the snapshot's
+    ///   own `version_id` section differs from the id in its name.
     ManifestFooterInvalid(&'static str),
 
     /// Manifest section content failed verification or matched no
@@ -577,6 +576,31 @@ pub enum Error {
     /// A caller-side error, refused before anything is written. The payload
     /// names which of these it is.
     CellRow(&'static str),
+
+    /// A salvage could not write, finish or make durable its OUTPUT: the
+    /// failure lies with the destination, not with the bytes of the file
+    /// being salvaged.
+    ///
+    /// A recovery that met it stops rather than grade the SOURCE unreadable:
+    /// that would leave intact data out of the rebuilt manifest, and the
+    /// cleanup after the commit would remove it. Fix the destination
+    /// (its space, its device) and retry.
+    SalvageOutput(alloc::boxed::Box<Self>),
+
+    /// A manifest install failed after its edit or snapshot was written, so
+    /// a power loss may still make it the installed one: what it names is
+    /// kept on disk, and the next install writes a full snapshot over it.
+    ///
+    /// The operation that asked for the install (a flush, a compaction)
+    /// reports it as failed and may be retried; the tree reopened after a
+    /// crash holds either the state before it or the state it installed,
+    /// whole. The payload is the failure itself.
+    ///
+    /// From a repair, the report rides in the snapshot it describes: when that
+    /// snapshot turns out installed,
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) hands the
+    /// report out; when it does not, its own repair answers with a fresh one.
+    InstallOutcomeUnknown(alloc::boxed::Box<Self>),
 }
 
 impl core::fmt::Display for Error {
@@ -637,6 +661,7 @@ impl core::error::Error for Error {
             // the post-commit step's own failure through the standard chain.
             #[cfg(feature = "std")]
             Self::RepairedButUnopened { cause, .. } => Some(&**cause),
+            Self::SalvageOutput(cause) | Self::InstallOutcomeUnknown(cause) => Some(&**cause),
             _ => None,
         }
     }
@@ -707,6 +732,10 @@ impl Error {
             #[cfg(zstd_any)]
             Self::ZstdDictMismatch { .. } => true,
             Self::UnsupportedFormat { .. } => true,
+            // The destination failed, whatever its kind: the source's bytes
+            // are not implicated.
+            Self::SalvageOutput(_) => true,
+            Self::InstallOutcomeUnknown(cause) => cause.is_environmental(),
             _ => false,
         }
     }
@@ -730,3 +759,6 @@ impl From<std::io::Error> for Error {
 
 /// Tree result
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests;

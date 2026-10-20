@@ -646,7 +646,13 @@ fn a_reopen_reclaims_a_committed_blob_prefix() -> crate::Result<()> {
 
     // Punch, then rebuild the manifest from the on-disk geometry so the
     // frontier is COMMITTED, exactly as a completed relocation leaves it.
-    memfs.remove_file(&root.join("current"))?;
+    for e in memfs.read_dir(&root)? {
+        if crate::version::recovery::snapshot_id_of(&e.file_name).is_some()
+            || crate::version::recovery::log_id_of(&e.file_name).is_some()
+        {
+            memfs.remove_file(&e.path)?;
+        }
+    }
     memfs.punch_hole(&blob, data_start, frontier - data_start)?;
     config().repair()?;
 
