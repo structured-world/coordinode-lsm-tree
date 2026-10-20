@@ -107,13 +107,18 @@ pub fn append_edit(
         .map_err(crate::Error::from)?;
     // A write that fails can leave part of the record behind, a tail the
     // strict recovery mode refuses. It is cut off again, so the log ends on a
-    // record boundary whatever mode the next open reads it in; a cut that
-    // fails too leaves the tail the tolerant mode drops.
+    // record boundary whatever mode the next open reads it in. The cut is
+    // synced: writeback may already have put the partial bytes on disk, and
+    // a power loss must not keep them while it loses the cut. A cut that
+    // fails leaves the tail the tolerant mode drops.
     let before = file.metadata()?.len;
     if let Err(e) = super::framing::write_frame(&mut file, scratch) {
-        if let Err(cut) = file.set_len(before) {
+        if let Err(cut) = file
+            .set_len(before)
+            .and_then(|()| file.sync_data_with(sync_mode))
+        {
             log::warn!(
-                "edit log {}: the part of a failed append stays ({cut})",
+                "edit log {}: the part of a failed append may stay ({cut})",
                 path.display()
             );
         }

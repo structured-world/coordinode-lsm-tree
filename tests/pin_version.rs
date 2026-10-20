@@ -427,6 +427,12 @@ fn a_restore_that_cannot_clear_a_stale_temporary_snapshot_fails() -> lsm_tree::R
     write_history(&tree, &visible)?;
     let pin = tree.pin();
     ship(&pin, dst.path())?;
+    // What an earlier, interrupted attempt left under the restore's
+    // temporary snapshot name.
+    let stale = dst
+        .path()
+        .join(format!("v{}.tmp", tree.current_version().id()));
+    std::fs::write(&stale, b"stale")?;
 
     let fs = std::sync::Arc::new(FaultFs::new(StdFs));
     fs.injector().arm(
@@ -434,7 +440,7 @@ fn a_restore_that_cannot_clear_a_stale_temporary_snapshot_fails() -> lsm_tree::R
             FaultOp::RemoveFile,
             Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
         )
-        .on_path(dst.path().join("v").to_string_lossy()),
+        .on_path(stale.to_string_lossy()),
     );
     let refused = Config::new(
         dst.path(),
@@ -451,6 +457,11 @@ fn a_restore_that_cannot_clear_a_stale_temporary_snapshot_fails() -> lsm_tree::R
         matches!(&refused, Err(lsm_tree::Error::Io(e)) if e.kind() == lsm_tree::io::ErrorKind::PermissionDenied),
         "{:?}",
         refused.err()
+    );
+    assert_eq!(
+        std::fs::read(&stale)?,
+        b"stale",
+        "nothing is written over it"
     );
     Ok(())
 }

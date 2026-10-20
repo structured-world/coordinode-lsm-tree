@@ -1523,6 +1523,48 @@ mod zstd_dict {
     }
 
     #[test]
+    fn a_dictionary_that_could_not_be_set_aside_is_reported_so() -> lsm_tree::Result<()> {
+        // The report names a damaged dictionary before the move after the
+        // commit; when that move fails, the report that leaves with the error
+        // must not claim the file is aside.
+        use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+        let dir = tempfile::tempdir()?;
+        let dict = make_test_dictionary();
+        let dict_id = dict.id();
+        a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
+        damage_the_dictionary(dir.path(), dict_id)?;
+
+        let fs = FaultFs::new(StdFs);
+        fs.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+            )
+            .on_path(
+                dir.path()
+                    .join("dicts")
+                    .join(dict_id.to_string())
+                    .to_string_lossy(),
+            ),
+        );
+        let outcome = make_config(dir.path())
+            .with_fs(fs)
+            .open_or_repair(lsm_tree::RepairPolicy::default());
+        let Err(lsm_tree::Error::RepairedButUnopened { report, .. }) = outcome else {
+            panic!("the failed move ends the repair after its commit");
+        };
+        let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
+        assert!(
+            report
+                .damaged_dictionaries
+                .iter()
+                .any(|(p, note)| *p == aside && note.ends_with("NOT moved aside")),
+            "{report:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[cfg(feature = "encryption")]
     fn open_or_repair_sets_aside_a_sealed_dictionary_whose_seal_broke() -> lsm_tree::Result<()> {
         // On an encrypted tree the damage shows up one step earlier: a flipped

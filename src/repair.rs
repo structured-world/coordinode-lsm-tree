@@ -154,10 +154,10 @@ pub struct RepairReport {
     /// Operator-facing caveats about the rebuilt state.
     pub warnings: Vec<&'static str>,
 
-    /// Identifies this repair's report. A report is handed out at least once:
-    /// when the install that would retire it ends with its outcome unknown, it
-    /// is handed out all the same and may be handed out again, with this same
-    /// id, so a caller that records the ids it applied skips a repeat.
+    /// Identifies this repair's report. The tree hands a report out until
+    /// [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report)
+    /// takes this id, so it may arrive more than once; a caller that records
+    /// the ids it applied skips a repeat.
     pub id: u128,
 
     /// The ids of earlier reports this one takes in: they were still owed
@@ -3647,6 +3647,14 @@ impl Config {
     /// until the next compaction re-applies the standing policy. No operand
     /// is doubled by that window.
     ///
+    /// # The report
+    ///
+    /// The rebuilt tree keeps the returned report until
+    /// [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report)
+    /// takes its id; until then [`Config::open_or_repair`] hands it out
+    /// again, so a process that ends before the report was acted on loses
+    /// nothing.
+    ///
     /// # Exclusive access
     ///
     /// Repair writes and installs a fresh snapshot and removes the stale
@@ -3684,7 +3692,7 @@ impl Config {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair(&self) -> crate::Result<RepairReport> {
-        repair_tree(self, false, false, ReportCopy::Retire)
+        repair_tree(self, false, false)
     }
 
     /// Like [`repair`](Self::repair), but when an SST fails whole-file recovery
@@ -3722,7 +3730,7 @@ impl Config {
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     pub fn repair_with_salvage(&self, salvage: bool) -> crate::Result<RepairReport> {
-        repair_tree(self, salvage, false, ReportCopy::Retire)
+        repair_tree(self, salvage, false)
     }
 
     /// Like [`repair_with_salvage`](Self::repair_with_salvage), but with an
@@ -3758,7 +3766,7 @@ impl Config {
         salvage: bool,
         allow_resurrection: bool,
     ) -> crate::Result<RepairReport> {
-        repair_tree(self, salvage, allow_resurrection, ReportCopy::Retire)
+        repair_tree(self, salvage, allow_resurrection)
     }
 
     /// Opens the tree, and when the open fails STRUCTURALLY, repairs per
@@ -3795,15 +3803,14 @@ impl Config {
     /// [`Error::RepairedButUnopened`](crate::Error::RepairedButUnopened),
     /// carrying the completed [`RepairReport`]: consume it from the error.
     ///
-    /// The rebuilt snapshot holds its report until this call hands it out and
-    /// installs a version that no longer owes it. A repair whose install ended
-    /// with an unknown outcome
-    /// ([`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown)),
-    /// or a call that ended before the report reached its caller, leaves it
-    /// there: the next call opens that snapshot without a repair and answers
-    /// `Some(report)` all the same. A report is handed out at least once; one
-    /// handed out a second time carries the same [`RepairReport::id`], so a
-    /// caller that records the ids it applied skips it.
+    /// The rebuilt snapshot holds its report until the caller acknowledges it
+    /// with [`AbstractTree::acknowledge_repair_report`](crate::AbstractTree::acknowledge_repair_report),
+    /// and every call before that answers `Some(report)` again, a healthy
+    /// open included. A report is handed out at least once whatever ends the
+    /// process between the hand-out and its use; one handed out again carries
+    /// the same [`RepairReport::id`], so a caller that records the ids it
+    /// applied skips it. Acknowledge only once the report's replay obligation
+    /// is met.
     ///
     /// # Examples
     ///
@@ -3828,27 +3835,21 @@ impl Config {
         let retry = self.clone();
         let path = self.path.clone();
         match self.open() {
-            // A repair whose report never surely reached its caller (an
-            // install failed, or the run ended before it returned) left the
-            // report in its snapshot, which this open installed again.
-            Ok(tree) => hand_out_owed_report(tree, &path),
+            // A report not yet acknowledged rides in the snapshot this open
+            // installed again.
+            Ok(tree) => {
+                let owed = owed_report(&tree, &path);
+                Ok((tree, owed))
+            }
             Err(e) if is_repairable_structural(&e) => {
                 // The rebuilt snapshot owes the report, so a crash before it
                 // reaches the caller leaves it for the next call.
-                let report = repair_tree(
-                    &retry,
-                    policy.salvage,
-                    policy.allow_resurrection,
-                    ReportCopy::Keep,
-                )?;
+                let report = repair_tree(&retry, policy.salvage, policy.allow_resurrection)?;
                 match retry.open() {
-                    // The snapshot owes the report it rebuilt with, which the
-                    // hand-out returns: the one this call returned is the
-                    // same report.
-                    Ok(tree) => {
-                        let (tree, owed) = hand_out_owed_report(tree, &path)?;
-                        Ok((tree, Some(owed.unwrap_or(report))))
-                    }
+                    // The snapshot owes this same report (one id), but its
+                    // copy was written before the cleanup after the commit;
+                    // this call's own report also says what that cleanup did.
+                    Ok(tree) => Ok((tree, Some(report))),
                     // The repair committed: the report leaves with the error,
                     // and the snapshot that owes it hands it out again, with
                     // the same id, to the call that opens it.
@@ -3863,32 +3864,20 @@ impl Config {
     }
 }
 
-/// Hands out the report `tree` still owes, after installing a version that
-/// no longer owes it, so no later open hands it out again.
-///
-/// A report is handed out at least once. When that install fails, the
-/// report leaves inside [`crate::Error::RepairedButUnopened`] all the same:
-/// the snapshot that owes it may still be installed, and a later open then
-/// hands it out again, carrying the same [`RepairReport::id`].
-fn hand_out_owed_report(
-    tree: crate::AnyTree,
-    path: &std::path::Path,
-) -> crate::Result<(crate::AnyTree, Option<RepairReport>)> {
-    let index = match &tree {
+/// The [`RepairReport::id`] of the report encoded as `bytes`.
+pub(crate) fn owed_report_id(bytes: &[u8]) -> u128 {
+    report_marker::owed_id(bytes)
+}
+
+/// The report `tree` owes until its caller acknowledges it.
+fn owed_report(tree: &crate::AnyTree, path: &std::path::Path) -> Option<RepairReport> {
+    let index = match tree {
         crate::AnyTree::Standard(tree) => tree,
         crate::AnyTree::Blob(tree) => &tree.index,
     };
-    let Some(owed) = index.owed_repair_report() else {
-        return Ok((tree, None));
-    };
-    let report = report_marker::decode_owed(&owed, path);
-    match index.retire_repair_report() {
-        Ok(()) => Ok((tree, Some(report))),
-        Err(cause) => Err(crate::Error::RepairedButUnopened {
-            report: alloc::boxed::Box::new(report),
-            cause: alloc::boxed::Box::new(cause),
-        }),
-    }
+    index
+        .owed_repair_report()
+        .map(|owed| report_marker::decode_owed(&owed, path))
 }
 
 /// Whether an `open` failure positively identifies repairable ON-DISK
@@ -4430,32 +4419,10 @@ fn publish_recovery_bytes_total(config: &Config) {
     progress.set_bytes_total(total);
 }
 
-/// What a rebuild does about reports.
-struct ReportPlan {
-    /// The report of an earlier repair the installed snapshot still owes: its
-    /// losses are owed as well.
-    outstanding: Option<RepairReport>,
-    /// Whether the report reaches the caller with this call, so the rebuilt
-    /// snapshot that owes it is replaced by one that does not.
-    retire_report: bool,
-}
-
-/// Whether the rebuilt snapshot stops owing the report as the repair returns
-/// it, or keeps owing it for the caller to hand out.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReportCopy {
-    /// The report reaches the caller with this call: a snapshot that does
-    /// not owe it is installed over the rebuilt one.
-    Retire,
-    /// An open still follows, which hands the report out from the snapshot.
-    Keep,
-}
-
 fn repair_tree(
     config: &Config,
     salvage: bool,
     allow_resurrection: bool,
-    copy: ReportCopy,
 ) -> crate::Result<RepairReport> {
     // Hold the cross-process directory lock for the whole repair: it writes and
     // installs a fresh snapshot and sweeps `edits-*` in place, so a
@@ -4578,10 +4545,7 @@ fn repair_tree(
         manifest_referenced,
         scan,
         first_tree_id,
-        ReportPlan {
-            outstanding,
-            retire_report: copy == ReportCopy::Retire,
-        },
+        outstanding,
         #[cfg(zstd_any)]
         &damaged_dictionaries,
     );
@@ -4614,21 +4578,38 @@ fn set_aside_damaged_dictionaries(
     damaged: Vec<crate::file::DictId>,
     rebuilt: crate::Result<RepairReport>,
 ) -> crate::Result<RepairReport> {
-    let (report, mut post_commit_error) = match rebuilt {
+    let (mut report, mut post_commit_error) = match rebuilt {
         Ok(report) => (report, None),
         Err(crate::Error::RepairedButUnopened { report, cause }) => (*report, Some(*cause)),
         Err(e) => return Err(e),
     };
     let folder = config.path.join(crate::file::DICTS_FOLDER);
     for id in damaged {
-        if let Err(e) = crate::dicts::set_aside_if_damaged(
+        let moved = match crate::dicts::set_aside_if_damaged(
             &*config.fs,
             &folder,
             id,
             config.encryption.as_deref(),
             config.sync_mode,
         ) {
-            post_commit_error.get_or_insert(e);
+            Ok(moved) => moved.is_some(),
+            Err(e) => {
+                post_commit_error.get_or_insert(e);
+                false
+            }
+        };
+        // The report's entry, written before the move, says now what it did.
+        let aside = crate::dicts::damaged_path(&folder, id);
+        if let Some(entry) = report
+            .damaged_dictionaries
+            .iter_mut()
+            .find(|(path, _)| *path == aside)
+        {
+            entry.1 = if moved {
+                format!("dictionary {id} failed its integrity check; moved aside")
+            } else {
+                format!("dictionary {id} failed its integrity check; NOT moved aside")
+            };
         }
     }
     match post_commit_error {
@@ -5736,13 +5717,9 @@ fn rebuild_from_scan(
     manifest_referenced: Option<CommittedManifest>,
     scan: TableScan,
     first_tree_id: crate::tree::inner::TreeId,
-    reports: ReportPlan,
+    outstanding: Option<RepairReport>,
     #[cfg(zstd_any)] damaged_dictionaries: &[crate::file::DictId],
 ) -> crate::Result<RepairReport> {
-    let ReportPlan {
-        outstanding,
-        retire_report,
-    } = reports;
     let TableScan {
         recovered_by_id,
         mut unreadable_files,
@@ -6696,7 +6673,6 @@ fn rebuild_from_scan(
             salvaged,
             first_tree_id,
             outstanding,
-            retire_report,
             #[cfg(zstd_any)]
             damaged_dictionaries,
         },
@@ -6739,9 +6715,6 @@ struct RepairPublication<'a> {
     /// The report of an earlier repair over the installed snapshot that never
     /// reached the caller: its losses are owed as well.
     outstanding: Option<RepairReport>,
-    /// Whether the report reaches the caller with this call, so the rebuilt
-    /// snapshot that owes it is replaced by one that does not.
-    retire_report: bool,
     /// Dictionaries found damaged at the start; those still damaged when the
     /// report is assembled are set aside after the commit.
     #[cfg(zstd_any)]
@@ -6785,7 +6758,6 @@ fn publish_repaired_manifest(
         salvaged,
         first_tree_id,
         outstanding,
-        retire_report,
         #[cfg(zstd_any)]
         damaged_dictionaries,
     } = publication;
@@ -7025,12 +6997,16 @@ fn publish_repaired_manifest(
     // is what rides out inside `RepairedButUnopened`, the operator's only
     // account of which blobs were replaced. A removal after the commit only
     // annotates its entry.
+    // The snapshot's copy is written before the cleanup and may be handed out
+    // after it, so it says what holds either way; this call's report then
+    // says what the cleanup did.
     let salvage_report_base = blob_files_salvaged.len();
-    blob_files_salvaged.extend(
-        stale_blob_originals
-            .iter()
-            .map(|(path, note)| (path.clone(), format!("{note}; original NOT removed"))),
-    );
+    blob_files_salvaged.extend(stale_blob_originals.iter().map(|(path, note)| {
+        (
+            path.clone(),
+            format!("{note}; original removed once the repair finishes"),
+        )
+    }));
 
     // Every damaged dictionary still under its name is set aside once the
     // commit is durable (see `set_aside_damaged_dictionaries`). The report's
@@ -7051,7 +7027,10 @@ fn publish_repaired_manifest(
             )? {
                 entries.push((
                     crate::dicts::damaged_path(&folder, id),
-                    format!("dictionary {id} failed its integrity check; moved aside"),
+                    format!(
+                        "dictionary {id} failed its integrity check; moved aside once the \
+                         repair finishes"
+                    ),
                 ));
             }
         }
@@ -7278,15 +7257,11 @@ fn publish_repaired_manifest(
     // manifest is already durable, and a retry once the filesystem is fixed
     // finishes the sweep on the same inputs. The report already names every
     // replacement; a removal only annotates its entry.
+    let mut originals_removed = 0;
     if post_commit_error.is_none() {
-        for (i, (path, note)) in stale_blob_originals.iter().enumerate() {
+        for (path, _) in &stale_blob_originals {
             match discard_unreferenced(&*config.fs, path, config.sync_mode) {
-                Ok(()) => {
-                    if let Some(entry) = report.blob_files_salvaged.get_mut(salvage_report_base + i)
-                    {
-                        *entry = (path.clone(), format!("{note}; original removed"));
-                    }
-                }
+                Ok(()) => originals_removed += 1,
                 Err(e) => {
                     log::error!(
                         "repair: cannot remove the superseded blob original {} ({e}); \
@@ -7298,6 +7273,16 @@ fn publish_repaired_manifest(
                     break;
                 }
             }
+        }
+    }
+    for (i, (path, note)) in stale_blob_originals.iter().enumerate() {
+        let state = if i < originals_removed {
+            "original removed"
+        } else {
+            "original NOT removed"
+        };
+        if let Some(entry) = report.blob_files_salvaged.get_mut(salvage_report_base + i) {
+            *entry = (path.clone(), format!("{note}; {state}"));
         }
     }
 
@@ -7376,30 +7361,9 @@ fn publish_repaired_manifest(
         });
     }
 
-    // The report reaches the caller with this call: a snapshot that owes it
-    // no longer is installed under the rebuilt one, so no later open hands it
-    // out again. When that install fails the report leaves all the same; the
-    // rebuilt snapshot may still owe it, and a repeat carries its id. A
-    // rebuilt snapshot holding the last id leaves none for that install: it
-    // keeps owing the report, the open renumbers it as any tree at the top of
-    // the range, and `open_or_repair` hands the report out under the same id.
-    if retire_report
-        && version_id < u64::MAX
-        && let Err(cause) = crate::version::persist_version(
-            &config.path,
-            &version.without_repair_report(),
-            config.comparator.name(),
-            &*config.fs,
-            Arc::new(config.initial_runtime_config.clone()),
-            config.encryption.clone(),
-            config.sync_mode,
-        )
-    {
-        return Err(crate::Error::RepairedButUnopened {
-            report: Box::new(report),
-            cause: Box::new(cause),
-        });
-    }
+    // The rebuilt snapshot keeps owing the report until the caller
+    // acknowledges it: a process that ends before the caller met the report's
+    // replay obligation finds it there again.
 
     // Success only: a failed run leaves the phase where it stopped, which
     // tells a progress display exactly which stage failed.

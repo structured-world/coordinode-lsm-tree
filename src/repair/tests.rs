@@ -13423,15 +13423,16 @@ fn an_unknown_install_that_survived() -> crate::Result<(
 
 /// A rebuilt snapshot whose install and withdrawal both fail to sync may come
 /// back after a power loss. The next `open_or_repair` then opens it without a
-/// repair, and must still hand out the report of the repair that built it,
-/// once: without it the caller never learns the WAL replay that repair owes.
+/// repair, and must still hand out the report of the repair that built it:
+/// without it the caller never learns the WAL replay that repair owes. Once
+/// acknowledged, it is handed out no more.
 #[test]
 fn an_install_of_unknown_outcome_hands_its_report_to_the_next_open() -> crate::Result<()> {
-    use crate::RepairPolicy;
     use crate::fs::{FaultFs, MemFs};
+    use crate::{AbstractTree, RepairPolicy};
 
     let (memfs, root, expected) = an_unknown_install_that_survived()?;
-    let (_, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
+    let (tree, report) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
         .open_or_repair(RepairPolicy::default())?;
     let Some(report) = report else {
         panic!("the repair's report is lost");
@@ -13440,16 +13441,19 @@ fn an_install_of_unknown_outcome_hands_its_report_to_the_next_open() -> crate::R
     assert_eq!(report.lost_coverage, expected.lost_coverage);
     assert_eq!(report.unknowable_losses, expected.unknowable_losses);
     assert_eq!(report.unreadable_files, expected.unreadable_files);
+    assert!(tree.acknowledge_repair_report(report.id)?);
+    drop(tree);
 
     let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
         .open_or_repair(RepairPolicy::default())?;
-    assert!(again.is_none(), "the report is handed out once");
+    assert!(again.is_none(), "an acknowledged report is not handed out");
     Ok(())
 }
 
 /// A repair over the surviving snapshot of a repair whose report never
 /// reached the caller owes that repair's replay as well: its report carries
-/// the earlier losses, and no later open hands the earlier report out again.
+/// the earlier losses and names it, and no later open hands the earlier report
+/// out again: what it owes now is the later one.
 #[test]
 fn a_repair_over_an_unreported_repair_carries_its_losses() -> crate::Result<()> {
     use crate::RepairPolicy;
@@ -13467,8 +13471,9 @@ fn a_repair_over_an_unreported_repair_carries_its_losses() -> crate::Result<()> 
 
     let (_, again) = a_blob_tree_config(FaultFs::new(MemFs::clone(&memfs)), &root)
         .open_or_repair(RepairPolicy::default())?;
-    assert!(
-        again.is_none(),
+    assert_eq!(
+        again.map(|again| again.id),
+        Some(report.id),
         "the earlier report went out with the later one"
     );
     Ok(())
@@ -16780,66 +16785,47 @@ impl crate::fs::Fs for HookFs {
     }
 }
 
-/// `open_or_repair` holds the report of the repair it ran only in memory until
-/// it returns, and the open that follows the repair can be cut short (a crash
-/// of the process). So the installed snapshot keeps owing the report through
-/// that open, and the next call hands it out then; a snapshot that no longer
-/// owes it is installed only as the report is about to be returned.
+/// A report handed out is still owed: a process that ends before the caller
+/// acted on it gets it again. Only an acknowledgement of its id makes the
+/// tree stop owing it, and one of another id changes nothing.
 #[test]
-fn open_or_repair_keeps_the_report_owed_through_the_open_after_its_repair() -> crate::Result<()> {
+fn a_report_stays_owed_until_its_id_is_acknowledged() -> crate::Result<()> {
     use crate::fs::MemFs;
-    use crate::{Config, RepairPolicy, SequenceNumberCounter};
+    use crate::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     let memfs = Arc::new(MemFs::new());
     let root = std::path::absolute("/db")?;
     standard_tree_without_manifest(&memfs, &root)?;
-
-    // The repair installs v0 and the open after it v1; the install that
-    // retires the report is v2. When it starts, v1 must still owe the report.
-    let owed_before = Arc::new(AtomicBool::new(false));
-    let probe = (*memfs).clone();
-    let probe_root = root.clone();
-    let owed = Arc::clone(&owed_before);
-    let fs = HookFs {
-        inner: (*memfs).clone(),
-        on: HookOn::RenameTo,
-        needle: root.join("v2").to_string_lossy().into_owned(),
-        fired: AtomicBool::new(false),
-        hook: Box::new(move || {
-            let found = crate::version::recovery::owed_repair_report(&probe_root, &probe, None)
-                .is_ok_and(|report| report.is_some());
-            owed.store(found, Ordering::SeqCst);
-        }),
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(memfs.clone())
     };
 
-    let (tree, report) = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_fs(fs)
-    .open_or_repair(RepairPolicy::default())?;
-    assert!(report.is_some(), "self-check: the open was repaired");
-    assert!(
-        owed_before.load(Ordering::SeqCst),
-        "the installed snapshot owes the report while the open after the repair runs"
-    );
-    assert_eq!(
-        crate::version::recovery::owed_repair_report(&root, &*memfs, None)?,
-        None,
-        "and owes it no longer once the report is handed out"
-    );
+    let (tree, first) = config().open_or_repair(RepairPolicy::default())?;
+    let first = first.ok_or(crate::Error::Unrecoverable)?;
+    // The process ends before the caller acted on the report.
     drop(tree);
-    let (_tree, again) = Config::new(
-        &root,
-        SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
-    )
-    .with_fs((*memfs).clone())
-    .open_or_repair(RepairPolicy::default())?;
-    assert!(again.is_none(), "the report is handed out once");
+
+    let (tree, again) = config().open_or_repair(RepairPolicy::default())?;
+    assert_eq!(
+        again.map(|again| again.id),
+        Some(first.id),
+        "handed out again"
+    );
+    assert!(
+        !tree.acknowledge_repair_report(first.id.wrapping_add(1))?,
+        "another id changes nothing"
+    );
+    assert!(tree.acknowledge_repair_report(first.id)?);
+    drop(tree);
+
+    let (_tree, after) = config().open_or_repair(RepairPolicy::default())?;
+    assert!(after.is_none(), "an acknowledged report is not handed out");
     Ok(())
 }
 
@@ -17349,7 +17335,7 @@ fn an_owed_report_that_does_not_read_back_leaves_the_loss_unscoped() -> crate::R
 
 /// The report a tree owes survives its rotations, which write the version
 /// that owes it as a snapshot of its own: a repairing open after several
-/// still hands it out, once.
+/// still hands it out, until it is acknowledged.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn an_owed_report_survives_the_rotations_of_its_tree() -> crate::Result<()> {
@@ -17379,15 +17365,12 @@ fn an_owed_report_survives_the_rotations_of_its_tree() -> crate::Result<()> {
     }
 
     let (tree, report) = config().open_or_repair(RepairPolicy::default())?;
-    assert_eq!(
-        report
-            .expect("the tree still owes the report")
-            .lost_coverage,
-        owed.lost_coverage
-    );
+    let report = report.expect("the tree still owes the report");
+    assert_eq!(report.lost_coverage, owed.lost_coverage);
+    assert!(tree.acknowledge_repair_report(report.id)?);
     drop(tree);
     let (_tree, again) = config().open_or_repair(RepairPolicy::default())?;
-    assert!(again.is_none(), "handed out once");
+    assert!(again.is_none(), "acknowledged");
     Ok(())
 }
 
@@ -17921,6 +17904,72 @@ fn an_intact_blob_duplicate_wins_over_a_salvage_of_the_canonical_copy() -> crate
             "key {i} must survive: the intact duplicate held every frame",
         );
     }
+    Ok(())
+}
+
+/// The tree's copy of the report is written before the cleanup after the
+/// commit; the report the repairing open returns says what that cleanup did.
+/// A salvaged blob's original, removed by the cleanup, is reported removed.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn open_or_repair_reports_what_the_cleanup_after_the_commit_did() -> crate::Result<()> {
+    use crate::fs::{Fs, MemFs};
+    use crate::{AbstractTree, Config, KvSeparationOptions, RepairPolicy, SequenceNumberCounter};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::Arc;
+
+    let memfs = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(memfs.clone());
+    let root = std::path::absolute("/db_cleanup_report")?;
+    let value = |i: u32| alloc::vec![b'a' + u8::try_from(i).expect("small i"); 64];
+    let config = || {
+        Config::new(
+            &root,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .with_kv_separation(Some(
+            KvSeparationOptions::default().separation_threshold(16),
+        ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..8u32 {
+            tree.insert(format!("k{i:04}").as_bytes(), value(i), u64::from(i));
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let blobs = root.join(crate::file::BLOBS_FOLDER);
+    let blob_path = memfs
+        .read_dir(&blobs)?
+        .into_iter()
+        .find(|e| !e.is_dir)
+        .expect("one blob file")
+        .path;
+    let entries: Vec<_> = crate::vlog::BlobFileScanner::new(&blob_path, &memfs, 0)?
+        .collect::<crate::Result<Vec<_>>>()?;
+    let flip_at = entries.last().expect("last frame").frame_end - 8;
+    {
+        let mut file = memfs.open(
+            &blob_path,
+            &crate::fs::FsOpenOptions::new().read(true).write(true),
+        )?;
+        let byte = crate::file::read_exact(&*file, flip_at, 1)?;
+        file.seek(SeekFrom::Start(flip_at))?;
+        file.write_all(&[byte.first().expect("one byte") ^ 0xFF])?;
+    }
+    remove_manifest(&memfs, &root)?;
+
+    let (_tree, report) = config().open_or_repair(RepairPolicy::default())?;
+    let report = report.expect("the open was repaired");
+    assert!(
+        report
+            .blob_files_salvaged
+            .iter()
+            .any(|(_, note)| note.ends_with("; original removed")),
+        "{report:?}"
+    );
     Ok(())
 }
 

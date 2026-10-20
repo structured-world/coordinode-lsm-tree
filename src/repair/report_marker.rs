@@ -5,8 +5,8 @@
 //!
 //! The report is the caller's only account of what the repair lost, and so of
 //! the WAL replay it owes. The rebuilt snapshot carries it in its
-//! `repair_report` section, from the commit until a repairing open hands it
-//! out and installs a version that no longer owes it: living in the snapshot,
+//! `repair_report` section, from the commit until the caller acknowledges it
+//! and a version that no longer owes it is installed: living in the snapshot,
 //! it is there exactly when that snapshot is installed, whatever the install's
 //! outcome. The snapshot is sealed with the tree's encryption provider, which
 //! covers the report's key ranges with it.
@@ -21,6 +21,11 @@ const MAGIC: &[u8; 8] = b"LSMRPRT1";
 
 /// Length of the trailing XXH3-64 over everything before it.
 const CHECKSUM_LEN: usize = 8;
+
+/// The id of the report `bytes` encode, as [`decode_owed`] gives it.
+pub(super) fn owed_id(bytes: &[u8]) -> u128 {
+    decode(bytes).map_or_else(|| xxhash_rust::xxh3::xxh3_128(bytes), |report| report.id)
+}
 
 /// The report `bytes` encode, or, when they do not decode, a report that
 /// leaves the loss unscoped: a repair lost something it can no longer say.

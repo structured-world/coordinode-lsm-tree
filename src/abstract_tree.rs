@@ -555,6 +555,43 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "std")]
     fn pin(&self) -> crate::PinnedVersion;
 
+    /// Stops the tree owing the repair report with this
+    /// [`RepairReport::id`](crate::RepairReport::id), installing a version
+    /// that no longer carries it: no later
+    /// [`Config::open_or_repair`](crate::Config::open_or_repair) hands it out.
+    ///
+    /// A repair's report stays in the tree until this call, so a process that
+    /// ends before the caller acted on it gets it again. Call it once the
+    /// report's replay obligation is met. Returns `false`, changing nothing,
+    /// when the tree owes no report or owes one with another id.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the install's failure; the report is then still owed, or,
+    /// on [`Error::InstallOutcomeUnknown`](crate::Error::InstallOutcomeUnknown),
+    /// may be after a power loss.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use lsm_tree::{AbstractTree, Config, RepairPolicy, SequenceNumberCounter};
+    ///
+    /// let config = Config::new(
+    ///     "/var/lib/mydb",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// );
+    /// let (tree, repaired) = config.open_or_repair(RepairPolicy::default())?;
+    /// if let Some(report) = repaired {
+    ///     // Replay the external log as `report.wal_replay_scope()` requires,
+    ///     // then let the tree forget the report.
+    ///     tree.acknowledge_repair_report(report.id)?;
+    /// }
+    /// # Ok::<_, lsm_tree::Error>(())
+    /// ```
+    #[cfg(feature = "std")]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool>;
+
     /// Seals the active memtable and flushes it, with every memtable sealed
     /// before it, to tables: the durability barrier for a caller that keeps
     /// its own journal of the writes.

@@ -168,10 +168,10 @@ pub enum Error {
     /// its replay obligation
     /// ([`RepairReport::wal_replay_scope`](crate::RepairReport::wal_replay_scope))
     /// whatever the retry finds. Consume the report exactly as a successful
-    /// repair's, then retry the open (`cause` is typically transient). When
-    /// the snapshot that owes the report survives, the retry hands it out
-    /// again with the same [`RepairReport::id`](crate::RepairReport::id):
-    /// skip one already applied.
+    /// repair's, then retry the open (`cause` is typically transient). The
+    /// snapshot keeps owing the report until it is acknowledged, so the retry
+    /// hands it out again with the same
+    /// [`RepairReport::id`](crate::RepairReport::id): skip one already applied.
     #[cfg(feature = "std")]
     RepairedButUnopened {
         /// The completed repair's report — not rederivable on a retry.

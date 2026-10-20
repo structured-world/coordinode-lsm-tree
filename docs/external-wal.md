@@ -153,12 +153,14 @@ stays high because neighbouring tables survived. The standard `seqno > W` tail
 replay from section 3 does not cover such a mid-history hole, and blindly
 widening the replay would double-fold merge operands that DID survive. After
 any repair, derive the obligation from the report instead. The report reaches
-you once per committed repair: from the call that repaired, from
-`Error::RepairedButUnopened` when a step after the commit failed, or, when the
-install's outcome was unknown (`Error::InstallOutcomeUnknown`) and its
-snapshot survived, from the next `open_or_repair`, which finds it kept on disk
-beside that snapshot. A repair over such a snapshot carries the earlier
-repair's losses in its own report.
+you from the call that repaired, or from `Error::RepairedButUnopened` when a
+step after the commit failed, and the rebuilt tree keeps it: every later
+`open_or_repair` hands it out again, under the same `RepairReport::id`, until
+you call `AbstractTree::acknowledge_repair_report(id)`. Acknowledge only after
+the replay below is done and durable, so a process that dies in between gets
+the report again; record the ids you applied to skip a repeat. A repair over a
+tree that still owes a report carries the earlier repair's losses in its own,
+and lists the earlier id in `RepairReport::includes`.
 
 1. **Ask the report.** `RepairReport::wal_replay_scope()` aggregates
    `lost_coverage` (which covers excluded tables AND kept lossy salvaged

@@ -557,6 +557,11 @@ impl AbstractTree for Tree {
         crate::PinnedVersion::take(self)
     }
 
+    #[cfg(feature = "std")]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
+        Self::acknowledge_repair_report(self, id)
+    }
+
     fn print_trace(&self, key: &[u8]) -> crate::Result<()> {
         let super_version = self.version_history.read().latest_version();
 
@@ -2114,20 +2119,19 @@ impl Tree {
             .map(alloc::sync::Arc::from)
     }
 
-    /// Installs the current version without the repair report it owes, as a
-    /// snapshot of its own, before the report is handed out. Called on a tree
-    /// [`Self::owed_repair_report`] found owing one, before the tree is
-    /// handed to anyone who could install in between.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the install's failure:
-    /// [`crate::Error::InstallOutcomeUnknown`] when a power loss may still
-    /// leave the snapshot that owes the report.
+    /// See [`AbstractTree::acknowledge_repair_report`].
     #[cfg(feature = "std")]
-    pub(crate) fn retire_repair_report(&self) -> crate::Result<()> {
+    pub(crate) fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
         let mut version_lock = self.version_history.write();
-        version_lock.upgrade_version(
+        let owes_it = version_lock
+            .latest_version_ref()
+            .version
+            .repair_report()
+            .is_some_and(|owed| crate::repair::owed_report_id(owed) == id);
+        if !owes_it {
+            return Ok(false);
+        }
+        let installed = version_lock.upgrade_version(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -2141,7 +2145,9 @@ impl Tree {
             self.0.config.encryption.clone(),
             // Only the report goes: every snapshot reads as before.
             crate::version::RetentionEffect::Keep,
-        )
+        );
+        drop(version_lock);
+        installed.map(|()| true)
     }
 
     /// Stores `dict` in the tree and records it in the current version, so it

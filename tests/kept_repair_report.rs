@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! A repair's report rides in the snapshot it describes until
-//! `open_or_repair` hands it out and installs a snapshot that no longer owes
-//! it. The report reaches the caller at least once, and a repeat carries the
-//! same id.
+//! A repair's report rides in the snapshot it describes until the caller
+//! acknowledges it. Every `open_or_repair` before that hands it out, under one
+//! id, so it reaches the caller at least once whatever ends the process.
 
 #![cfg(feature = "std")]
 
@@ -41,8 +40,7 @@ fn a_tree_needing_repair(folder: &std::path::Path) -> lsm_tree::Result<()> {
 }
 
 /// A filesystem whose renames onto snapshot names in `folder` fail after the
-/// first `skip`: the repair installs one, the open after it a second, and the
-/// install that retires the report a third.
+/// first `skip`: the repair installs one, and the open after it a second.
 fn failing_snapshot_renames(folder: &std::path::Path, skip: u64) -> FaultFs<StdFs> {
     let fs = FaultFs::new(StdFs);
     fs.injector().arm(
@@ -84,60 +82,16 @@ fn a_repair_that_never_installed_hands_out_no_report() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A report whose retiring install fails leaves with the error: the repair
-/// committed, and a caller that takes the error for a failed open may never
-/// call `open_or_repair` again. The snapshot still owes it, so the next call
-/// hands it out again under the same id, and only then is it retired.
-#[test]
-fn a_report_whose_retiring_install_fails_leaves_with_the_error() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    a_tree_needing_repair(folder.path())?;
-
-    let first = match config(folder.path())
-        .with_fs(failing_snapshot_renames(folder.path(), 2))
-        .open_or_repair(RepairPolicy::default())
-    {
-        Err(lsm_tree::Error::RepairedButUnopened { report, .. }) => report,
-        other => panic!(
-            "expected the report inside RepairedButUnopened, got {:?}",
-            other.map(|(_, report)| report)
-        ),
-    };
-
-    let (tree, report) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
-    assert_eq!(report.map(|report| report.id), Some(first.id));
-    assert!(tree.get("a", 1)?.is_some());
-    drop(tree);
-    let (_tree, again) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
-    assert!(again.is_none(), "retired once handed out");
-    Ok(())
-}
-
-/// A retiring install whose outcome is unknown may leave the snapshot that
-/// owes the report installed after a power loss, so the report is handed out
-/// now, inside the error, and a later call that finds it owed hands it out
-/// again under the same id: a caller that recorded the id skips it.
+/// The open after a repair can fail: the report leaves with the error, and
+/// the next call, which opens the rebuilt tree, hands it out again under the
+/// same id, so a caller that recorded the id skips it.
 #[test]
 fn a_report_handed_out_twice_carries_one_id() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     a_tree_needing_repair(folder.path())?;
-    let unretired = config(folder.path())
-        .with_fs(failing_snapshot_renames(folder.path(), 2))
-        .open_or_repair(RepairPolicy::default());
-    assert!(unretired.is_err(), "self-check: the report is still owed");
 
-    // The open installs the tree once and syncs the folder for it; the
-    // retiring install's sync fails, and so does its withdrawal's, which
-    // removed the name: the outcome is unknown, the old snapshot visible.
-    let fs = FaultFs::new(StdFs);
-    fs.injector().arm(
-        FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-            .on_path(folder.path().to_string_lossy())
-            .skip(1)
-            .times(2),
-    );
     let first = match config(folder.path())
-        .with_fs(fs)
+        .with_fs(failing_snapshot_renames(folder.path(), 1))
         .open_or_repair(RepairPolicy::default())
     {
         Err(lsm_tree::Error::RepairedButUnopened { report, .. }) => report,
@@ -147,9 +101,34 @@ fn a_report_handed_out_twice_carries_one_id() -> lsm_tree::Result<()> {
         ),
     };
 
-    let (_tree, again) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    let (tree, again) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
     let again = again.ok_or(lsm_tree::Error::Unrecoverable)?;
     assert_eq!(again.id, first.id, "the repeat carries the same id");
     assert_eq!(again.lost_coverage, first.lost_coverage);
+    assert!(tree.get("a", 1)?.is_some());
+    Ok(())
+}
+
+/// An acknowledgement whose install fails leaves the report owed: the next
+/// call hands it out again, and an acknowledgement that installs ends it.
+#[test]
+fn a_failed_acknowledgement_keeps_the_report_owed() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    a_tree_needing_repair(folder.path())?;
+
+    let (tree, report) = config(folder.path())
+        .with_fs(failing_snapshot_renames(folder.path(), 2))
+        .open_or_repair(RepairPolicy::default())?;
+    let report = report.ok_or(lsm_tree::Error::Unrecoverable)?;
+    assert!(tree.acknowledge_repair_report(report.id).is_err());
+    drop(tree);
+
+    let (tree, again) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    assert_eq!(again.map(|again| again.id), Some(report.id));
+    assert!(tree.acknowledge_repair_report(report.id)?);
+    drop(tree);
+
+    let (_tree, after) = config(folder.path()).open_or_repair(RepairPolicy::default())?;
+    assert!(after.is_none());
     Ok(())
 }

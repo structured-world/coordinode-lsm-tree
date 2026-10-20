@@ -285,8 +285,8 @@ pub struct VersionInner {
     dicts: Arc<[crate::file::DictId]>,
 
     /// The encoded report of a repair the tree still owes its caller, written
-    /// into every snapshot of this version and those derived from it, until a
-    /// repairing open hands it out and installs a version without it. Living
+    /// into every snapshot of this version and those derived from it, until
+    /// the caller acknowledges it and a version without it is installed. Living
     /// in the snapshot, it is there exactly when the snapshot is installed.
     repair_report: Option<Arc<[u8]>>,
 

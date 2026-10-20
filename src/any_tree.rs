@@ -241,6 +241,12 @@ impl AbstractTree for AnyTree {
         forward!(self.pin())
     }
 
+    #[cfg(feature = "std")]
+    #[inline]
+    fn acknowledge_repair_report(&self, id: u128) -> crate::Result<bool> {
+        forward!(self.acknowledge_repair_report(id))
+    }
+
     #[inline]
     fn flush_active_memtable(&self, gc_watermark: SeqNo) -> crate::Result<()> {
         forward!(self.flush_active_memtable(gc_watermark))
