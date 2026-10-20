@@ -141,15 +141,30 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
     );
     tree.flush_active_memtable(0).expect("flush");
 
-    // The relocation writes its table under the next id the tree hands out.
-    // Positioned reads on that path happen only when it is REOPENED — the
-    // writer streams it out — so this fires exactly on the reopen, after
-    // finalization.
+    // The relocation writes its table into the folder's lowest pooled file
+    // above its source, the one table the flush wrote. Positioned reads on
+    // that path happen only when it is REOPENED — the writer streams it out —
+    // so this fires exactly on the reopen, after finalization.
     //
     // The filter is built from the real path rather than written as a literal:
     // a hardcoded `tables/<id>` matches nothing where the separator is `\`,
     // and the rule would then silently never fire.
-    let relocated_name = tree.next_table_id().to_string();
+    let source_id = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| table.id())
+        .max()
+        .expect("the flushed table");
+    let relocated_name = mem
+        .read_dir(&folder.join("tables"))
+        .expect("read tables dir")
+        .into_iter()
+        .filter_map(|e| e.file_name.parse::<u64>().ok().map(|id| (id, e.path)))
+        .filter(|(id, path)| *id > source_id && mem.metadata(path).is_ok_and(|meta| meta.len == 0))
+        .map(|(id, _)| id)
+        .min()
+        .expect("a pooled file above the source")
+        .to_string();
     let relocated = folder.join("tables").join(&relocated_name);
     injector.arm(
         FaultRule::new(

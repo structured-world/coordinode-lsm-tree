@@ -17681,8 +17681,8 @@ fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
         panic!("expected a standard tree");
     };
     let mut recencies = Vec::new();
-    for (seqno, key) in [b"a", b"b"].into_iter().enumerate() {
-        tree.insert(key, b"v", seqno as u64);
+    for (seqno, key) in [(0u64, b"a"), (1, b"b")] {
+        tree.insert(key, b"v", seqno);
         tree.flush_active_memtable(0)?;
         let version = tree.current_version();
         let table = version

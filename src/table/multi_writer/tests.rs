@@ -275,7 +275,7 @@ fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
         crate::ValueType::Value,
     ))?;
 
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     assert!(
         results.len() >= 2,
         "expected 2+ output tables to verify gap, got {}",
@@ -362,7 +362,7 @@ fn clip_rt_spanning_next_table_does_not_overlap_key_ranges() -> crate::Result<()
         crate::ValueType::Value,
     ))?;
 
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     assert!(results.len() >= 2);
 
     let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
@@ -475,7 +475,7 @@ fn locator_section_round_trips_through_writer() -> crate::Result<()> {
                     crate::ValueType::Value,
                 ))?;
             }
-            let results = mw.finish()?;
+            let results = mw.finish()?.tables;
             assert_eq!(results.len(), 1, "single output table expected");
             let (table_id, checksum) = results[0];
             crate::Table::recover(crate::table::RecoverParams::new(
@@ -589,7 +589,7 @@ fn a_transform_on_the_rotation_boundary_belongs_to_the_new_output() -> crate::Re
         crate::ValueType::Value,
     ))?;
 
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     assert_eq!(
         results.len(),
         2,
@@ -670,7 +670,7 @@ fn multi_writer_rotates_under_a_non_lexicographic_comparator() -> crate::Result<
         ))?;
     }
 
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     assert_eq!(
         results.len(),
         3,
@@ -747,7 +747,7 @@ fn a_flush_cuts_each_tombstone_into_the_outputs_it_spans() -> crate::Result<()> 
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     assert_eq!(tables.len(), 4);
 
     let mut pieces: Vec<(SeqNo, Vec<u8>, Vec<u8>)> = tables
@@ -830,7 +830,7 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     assert!(tables.len() > 1, "the tombstones must spread over outputs");
 
     let mut written: Vec<_> = tables
@@ -855,6 +855,65 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
             table.range_tombstones().len(),
         );
     }
+    Ok(())
+}
+
+/// The outputs `finish` opens for tombstones past the last key count toward
+/// whether the writer's directory entries are durable: one made as its table
+/// is written, past a pool that ran dry, leaves the install to sync the
+/// folder, or a crash could lose a table the manifest names.
+#[test]
+fn an_output_opened_at_finish_counts_toward_entry_durability() -> crate::Result<()> {
+    use crate::{
+        InternalValue, UserKey,
+        fs::{StdFs, SyncMode},
+        range_tombstone::RangeTombstone,
+        table::file_pool::TableFilePools,
+    };
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    // One pooled file: the first output takes it, every later one is made.
+    let pools = Arc::new(TableFilePools::new(
+        SequenceNumberCounter::default(),
+        1,
+        SyncMode::Normal,
+    ));
+    let mut mw = super::MultiWriter::from_pool(base_path, pools, None, 12 * 1_024, 0, fs)?;
+    mw.set_range_tombstones(
+        (0..2_000usize)
+            .map(|i| {
+                let prefix = format!("z{i:08}").into_bytes();
+                let mut start = prefix.clone();
+                start.push(0);
+                let mut end = prefix;
+                end.push(1);
+                RangeTombstone::new(
+                    UserKey::from(random_bound_of(2 * i, start, 64)),
+                    UserKey::from(random_bound_of(2 * i + 1, end, 64)),
+                    5,
+                )
+            })
+            .collect(),
+    );
+    mw.write(InternalValue::from_components(
+        UserKey::from(b"a" as &[u8]),
+        b"v".to_vec(),
+        1,
+        crate::ValueType::Value,
+    ))?;
+
+    let written = mw.finish()?;
+    assert!(
+        written.tables.len() > 1,
+        "self-check: the tombstones spread over outputs opened at finish"
+    );
+    assert!(
+        !written.entries_durable,
+        "an output made past the dry pool is not durable by name"
+    );
     Ok(())
 }
 
@@ -888,7 +947,7 @@ fn a_target_below_the_table_tail_still_fills_a_block() -> crate::Result<()> {
             crate::ValueType::Value,
         ))?;
     }
-    let tables = mw.finish()?.len();
+    let tables = mw.finish()?.tables.len();
     // A 4 KiB block each, and a partial one at the end.
     let blocks = bytes / 4_096 + 1;
     assert!(
@@ -984,7 +1043,7 @@ fn outputs_of_tombstones_alone_count_their_sentinel_filter_build() -> crate::Res
             1,
             crate::ValueType::Value,
         ))?;
-        crate::Result::Ok(mw.finish()?.len())
+        crate::Result::Ok(mw.finish()?.tables.len())
     };
     let plain = outputs(None)?;
     let with_prefixes = outputs(Some(Arc::new(AllPrefixes)))?;
@@ -1148,7 +1207,7 @@ fn a_flush_counts_every_section_of_an_output_of_tombstones_alone() -> crate::Res
         1,
         crate::ValueType::Value,
     ))?;
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     assert!(tables.len() > 1, "the tombstones must spread over outputs");
     for table in &tables {
         let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
@@ -1207,7 +1266,7 @@ fn flush_outputs(
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     Ok((folder, tables))
 }
 
@@ -1475,7 +1534,7 @@ fn an_output_of_tombstones_alone_orders_its_range_by_the_comparator() -> crate::
             6,
         ),
     ]);
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
     for (table_id, checksum) in &results {
         let table = crate::Table::recover(crate::table::RecoverParams::new(
@@ -1549,7 +1608,7 @@ fn a_flush_cuts_each_zone_without_rescanning_every_tombstone() -> crate::Result<
                 crate::ValueType::Value,
             ))?;
         }
-        let outputs = mw.finish()?.len();
+        let outputs = mw.finish()?.tables.len();
         assert!(outputs >= n as usize / 2, "{outputs} outputs for {n} keys");
         Ok(comparator.0.load(Ordering::Relaxed))
     };
@@ -1601,7 +1660,7 @@ fn tombstones_open_at_the_first_key_do_not_rotate_an_empty_output() -> crate::Re
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     for table in &tables {
         assert!(
             table.metadata.item_count > 0,
@@ -1663,7 +1722,7 @@ fn a_compaction_counts_the_tombstones_starting_at_its_last_key() -> crate::Resul
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     for table in &tables {
         let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
         assert!(
@@ -1707,7 +1766,7 @@ fn a_flush_output_counts_its_key_range_widened_by_tombstones() -> crate::Result<
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
     assert!(tables.len() > 1, "the keys must spread over outputs");
     for table in &tables {
         let file_size = std::fs::metadata(base_path.join(table.id().to_string()))?.len();
@@ -1778,7 +1837,7 @@ fn a_flush_output_counts_its_tombstones_toward_a_full_table() -> crate::Result<(
             crate::ValueType::Value,
         ))?;
     }
-    let tables = recover_outputs(&base_path, &mw.finish()?)?;
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
 
     let tombstones: usize = tables.iter().map(|t| t.range_tombstones().len()).sum();
     assert_eq!(tombstones, KEYS, "each tombstone lies in one zone");
@@ -1871,7 +1930,7 @@ fn bounded_outputs(
             crate::ValueType::Value,
         ))?;
     }
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     Ok(recover_outputs(&base_path, &results)?
         .iter()
         .map(|table| {
@@ -2056,7 +2115,7 @@ fn a_key_past_twice_the_target_is_not_split() -> crate::Result<()> {
             ))?;
         }
     }
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     let tables = recover_outputs(&base_path, &results)?;
     let holding: Vec<_> = tables
         .iter()
@@ -2122,7 +2181,7 @@ fn a_reversed_comparator_aligns_as_the_byte_comparator() -> crate::Result<()> {
             crate::ValueType::Value,
         ))?;
     }
-    let results = mw.finish()?;
+    let results = mw.finish()?.tables;
     let reversed: Vec<u64> = recover_outputs(&base_path, &results)?
         .iter()
         .map(|table| table.metadata.item_count)

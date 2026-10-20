@@ -1229,8 +1229,8 @@ impl AbstractTree for Tree {
             table_writer.write(item?)?;
         }
 
-        let entries_durable = table_writer.entries_durable();
-        let result = table_writer.finish()?;
+        let written = table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -1238,7 +1238,8 @@ impl AbstractTree for Tree {
         let pin_index = self.config.index_block_pinning_policy.get(0);
 
         // Load tables
-        let tables = result
+        let tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(
@@ -6511,13 +6512,23 @@ impl Tree {
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
                     );
-                } else if folder_fs
-                    .metadata(&table_file_path)
-                    .is_ok_and(|meta| meta.len == 0)
+                } else if config.table_file_pool > 0
+                    // The counter starts above every pooled id, so one at its
+                    // top would leave it no id to hand out.
+                    && table_id < crate::seqno::MAX_SEQNO
+                    && folder_fs
+                        .metadata(&table_file_path)
+                        .is_ok_and(|meta| meta.is_file && meta.len == 0)
+                    // A table is written into a pooled file where it lies: a
+                    // symlink would take it to a file the tree never made.
+                    && folder_fs
+                        .read_link(&table_file_path)
+                        .is_ok_and(|target| target.is_none())
                 {
                     // No version names it and no table is empty: a pooled
-                    // file, used again rather than made anew. One whose length
-                    // cannot be read is an orphan like any other.
+                    // file, used again rather than made anew. Anything else
+                    // unnamed, or whose kind cannot be read, is an orphan like
+                    // any other.
                     pooled_ids.push(table_id);
                 } else {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));

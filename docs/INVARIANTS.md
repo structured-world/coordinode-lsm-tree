@@ -176,15 +176,18 @@ matching entry (and add one for a new subsystem).
 - **A table's name is durable before the manifest edit that names it.** A
   tables folder keeps a pool of empty files under the names of tables to come,
   made a batch at a time with one folder sync for the batch
-  (`Config::table_file_pool`); a flush, compaction or ingestion writes into one,
-  so its install syncs the table and the edit and no folder. Only a write's
-  first table refills the pool: a write that runs it dry makes the files of its
-  further tables as they start, and its install syncs their folder once. A
-  table never is
-  empty, so an empty file under a table name that no version names is a pooled
-  file: an open uses it again after syncing its folder once, and a repair
-  removes it rather than count it as a lost table. A pooled file another name
-  links to (a capture of the folder) is unlinked, never written. Under
+  (`Config::table_file_pool`); a flush, compaction, merge-on-read relocation or
+  ingestion writes into one, so its install syncs the table and the edit and no
+  folder. Only a write's first table refills the pool: a write that runs it dry
+  makes the files of its further tables as they start, those opened when it
+  finishes included, and its install syncs their folder once. A table is never
+  empty, so an empty regular file (not a symlink) under a table name that no
+  version names is a pooled file: an open uses it again after syncing its
+  folder once, and a repair removes it rather than count it as a lost table.
+  Each such file goes to one pool, however many routes name its folder. A
+  pooled file another name links to (a capture of the folder) is unlinked,
+  never written; a backend that cannot count links gets every file made for
+  its table instead. Under
   `SyncMode::Barrier` a folder on another device than the manifest is still
   synced in full at the install, as that sync makes the table durable on its
   device. Enforced in `src/table/file_pool.rs` and

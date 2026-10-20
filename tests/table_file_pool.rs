@@ -109,25 +109,31 @@ fn a_compaction_output_is_numbered_above_its_inputs() -> lsm_tree::Result<()> {
     tree.insert("a", "1", 0);
     tree.flush_active_memtable(0)?;
     tree.major_compact(u64::MAX, 0)?;
-    for (i, key) in ["b", "c"].into_iter().enumerate() {
-        tree.insert(key, "1", 1 + i as u64);
+    for (seqno, key) in [(1, "b"), (2, "c")] {
+        tree.insert(key, "1", seqno);
         tree.flush_active_memtable(0)?;
     }
-    let (_, hot_tables) = table_files(&hot.join("tables"));
-    let (cold_pooled, cold_tables) = table_files(&cold.join("tables"));
-    let inputs_max = hot_tables
-        .iter()
-        .chain(&cold_tables)
-        .copied()
-        .max()
-        .expect("inputs");
+    // The tables come from the tree, not from a folder listing: a replaced
+    // table's file can outlive its removal from the tree while a reader still
+    // holds it open, and Windows deletes such a file only once it is closed.
+    let live = || -> Vec<u64> {
+        let mut ids: Vec<u64> = tree
+            .current_version()
+            .iter_tables()
+            .map(|t| t.id())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let inputs_max = live().into_iter().max().expect("inputs");
+    let (cold_pooled, _) = table_files(&cold.join("tables"));
     assert!(
         cold_pooled.iter().any(|id| *id < inputs_max),
         "self-check: the cold pool holds an id below an input's: {cold_pooled:?} < {inputs_max}"
     );
 
     tree.major_compact(u64::MAX, 0)?;
-    let (_, outputs) = table_files(&cold.join("tables"));
+    let outputs = live();
     assert_eq!(outputs.len(), 1, "one output: {outputs:?}");
     assert!(
         outputs.iter().all(|id| *id > inputs_max),
@@ -155,8 +161,8 @@ fn an_open_uses_the_pooled_files_it_finds() -> lsm_tree::Result<()> {
     assert_eq!(pooled.len(), 3, "self-check: the rest of the batch");
 
     let tree = config(folder.path()).table_file_pool(4).open()?;
-    for (i, key) in ["b", "c", "d", "e"].into_iter().enumerate() {
-        tree.insert(key, "1", 1 + i as u64);
+    for (seqno, key) in [(1, "b"), (2, "c"), (3, "d"), (4, "e")] {
+        tree.insert(key, "1", seqno);
         tree.flush_active_memtable(0)?;
     }
     let (now_pooled, written) = table_files(&tables);
@@ -184,6 +190,63 @@ fn an_open_uses_the_pooled_files_it_finds() -> lsm_tree::Result<()> {
     for key in ["a", "b", "c", "d", "e"] {
         assert!(tree.get(key, u64::MAX)?.is_some(), "{key}");
     }
+    Ok(())
+}
+
+/// An empty symlink under a table name is not a file the tree made: an open
+/// does not pool it, so no table is ever written through it into the file it
+/// points to.
+#[cfg(unix)]
+#[test]
+fn an_open_pools_no_symlink() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    {
+        let tree = config(folder.path()).table_file_pool(4).open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    let (pooled, _) = table_files(&tables);
+    for id in pooled {
+        std::fs::remove_file(tables.join(id.to_string()))?;
+    }
+    let outside = folder.path().join("outside");
+    std::fs::write(&outside, b"")?;
+    std::os::unix::fs::symlink(&outside, tables.join("1000"))?;
+
+    let tree = config(folder.path()).table_file_pool(4).open()?;
+    tree.insert("b", "1", 1);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(
+        std::fs::metadata(&outside)?.len(),
+        0,
+        "no table is written through the symlink"
+    );
+    assert!(tree.get("b", u64::MAX)?.is_some());
+    Ok(())
+}
+
+/// An empty file whose name no table id can reach (the counter's top, past
+/// it) is not a pooled file: an open does not start its ids above it, which
+/// would leave none to hand out.
+#[test]
+fn an_open_pools_no_name_past_the_ids() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    {
+        let tree = config(folder.path()).open()?;
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+    }
+    for name in [i64::MAX.to_string(), u64::MAX.to_string()] {
+        std::fs::write(tables.join(name), b"")?;
+    }
+
+    let tree = config(folder.path()).open()?;
+    tree.insert("b", "1", 1);
+    tree.flush_active_memtable(0)?;
+    assert!(tree.get("a", u64::MAX)?.is_some());
+    assert!(tree.get("b", u64::MAX)?.is_some());
     Ok(())
 }
 
@@ -228,8 +291,8 @@ fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
     let tables = folder.path().join("tables");
     {
         let tree = config(folder.path()).table_file_pool(4).open()?;
-        for (i, key) in ["a", "b"].into_iter().enumerate() {
-            tree.insert(key, "1", i as u64);
+        for (seqno, key) in [(0, "a"), (1, "b")] {
+            tree.insert(key, "1", seqno);
             tree.flush_active_memtable(0)?;
         }
     }
@@ -297,7 +360,7 @@ fn fail_sync(syncs: &[(PathBuf, SyncKind)], at: usize) -> FaultRule {
         .count();
     FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other))
         .on_path(needle)
-        .skip(skip as u64)
+        .skip(u64::try_from(skip).expect("a sync count fits u64"))
         .once()
 }
 

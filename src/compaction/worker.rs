@@ -59,8 +59,6 @@ pub struct Options {
 
     pub visible_seqno: SharedSequenceNumberGenerator,
 
-    pub table_id_generator: SequenceNumberCounter,
-
     /// The tree's pooled table files, which the outputs are written into.
     pub(crate) table_files: Arc<crate::table::file_pool::TableFilePools>,
 
@@ -154,7 +152,6 @@ impl Options {
             global_seqno: tree.config.seqno.clone(),
             visible_seqno: tree.config.visible_seqno.clone(),
             tree_id: tree.id,
-            table_id_generator: tree.table_id_counter.clone(),
             table_files: Arc::clone(&tree.table_files),
             blob_file_id_generator: tree.blob_file_id_counter.clone(),
             config: tree.config.clone(),
@@ -3643,21 +3640,27 @@ fn run_merge_on_read_relocation(
     pace: &crate::table::util::Pacer,
 ) -> crate::Result<CompactionResult> {
     let dst_lvl: usize = payload.canonical_level.into();
-    let new_id = opts.table_id_generator.next();
     let (folder, level_fs) = opts.config.tables_folder_for_level(payload.dest_level);
-    let new_path = folder.join(new_id.to_string());
 
     // Write the relocated SST through the DESTINATION level's filesystem (the
-    // same one that recovers and installs it below), not the source table's.
-    let crate::table::relocate::Relocated { checksum, copied } = source
-        .relocate_columnar_with_deletes(
-            &new_path,
-            &*level_fs,
-            new_id,
-            bitmap,
-            opts.config.sync_mode,
-            Some(pace),
-        )?;
+    // same one that recovers and installs it below), not the source table's,
+    // into a pooled file numbered above the source, as any compaction output.
+    let crate::table::relocate::Relocated {
+        id: new_id,
+        path: new_path,
+        entry_durable,
+        checksum,
+        copied,
+    } = source.relocate_columnar_with_deletes(
+        || {
+            opts.table_files
+                .claim(&folder, &level_fs, Some(source.id()), true)
+        },
+        &*level_fs,
+        bitmap,
+        opts.config.sync_mode,
+        Some(pace),
+    )?;
     // Recorded once finished: the relocation unlinks its own file on a
     // failure before that.
     opts.outputs
@@ -3694,7 +3697,11 @@ fn run_merge_on_read_relocation(
         {
             params.metrics = opts.metrics.clone();
         }
-        Table::recover(params)?
+        let table = Table::recover(params)?;
+        if entry_durable {
+            table.mark_entry_durable();
+        }
+        table
     };
 
     compaction_state

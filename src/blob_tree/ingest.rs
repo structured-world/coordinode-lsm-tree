@@ -299,8 +299,8 @@ impl<'a> BlobIngestion<'a> {
 
         // Finalize the table writer, creating index tables with blob
         // indirections pointing to the blob files we just created.
-        let entries_durable = self.table.writer.entries_durable();
-        let results = self.table.writer.finish()?;
+        let written = self.table.writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         #[cfg(all(test, feature = "std"))]
         index.config.fire_before_output_install();
@@ -330,7 +330,8 @@ impl<'a> BlobIngestion<'a> {
         let pin_filter = index.config.filter_block_pinning_policy.get(0);
         let pin_index = index.config.index_block_pinning_policy.get(0);
         let table_folder = &self.table.folder;
-        let created_tables = results
+        let created_tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(

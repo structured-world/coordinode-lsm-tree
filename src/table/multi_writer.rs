@@ -1194,13 +1194,6 @@ impl MultiWriter {
         self
     }
 
-    /// Whether every output's directory entry was durable before its table
-    /// was written (see [`super::Table::mark_entry_durable`]). Every output is
-    /// opened before [`Self::finish`], so this holds for all of them.
-    pub(crate) fn entries_durable(&self) -> bool {
-        self.entries_durable
-    }
-
     /// Stamps a FIXED L0 recency key on this and every rotated successor
     /// writer (see [`Writer::use_recency`]). `None` keeps the default own-id
     /// stamping (see the `recency` field): the current writer already carries
@@ -2096,8 +2089,10 @@ impl MultiWriter {
 
     /// Finishes the last table, making sure all data is written durably
     ///
-    /// Returns the metadata of created tables
-    pub fn finish(mut self) -> crate::Result<Vec<(TableId, Checksum)>> {
+    /// Returns the created tables and whether their directory entries are
+    /// durable: the outputs opened here, for tombstones past the last key,
+    /// count as much as those opened before.
+    pub fn finish(mut self) -> crate::Result<Written> {
         self.split_tombstones_past_the_last_key()?;
 
         // Same judgment as `rotate` for the LAST output's window — by the
@@ -2154,8 +2149,20 @@ impl MultiWriter {
             }
         }
 
-        Ok(self.results)
+        Ok(Written {
+            tables: self.results,
+            entries_durable: self.entries_durable,
+        })
     }
+}
+
+/// The tables a [`MultiWriter`] wrote.
+pub struct Written {
+    pub tables: Vec<(TableId, Checksum)>,
+    /// Whether every table's directory entry was durable before its table was
+    /// written, so the install naming them syncs no folder for them (see
+    /// [`super::Table::mark_entry_durable`]).
+    pub entries_durable: bool,
 }
 
 #[cfg(test)]

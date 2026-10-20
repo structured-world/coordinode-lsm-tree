@@ -21,10 +21,11 @@ use super::block::decoder::ParsedItem;
 use super::block::{Block, BlockIdentity, BlockTransform, BlockType};
 use super::data_block::DataBlock;
 use super::delete_bitmap::DeleteBitmap;
+use super::file_pool::ClaimedFile;
 use crate::checksum::ChecksummedWriter;
 use crate::fs::{FsFile, FsOpenOptions, SyncMode};
 use crate::io::BufWriter;
-use crate::path::Path;
+use crate::path::PathBuf;
 use crate::{Checksum, InternalValue, TableId, UserValue};
 use alloc::vec::Vec;
 
@@ -35,6 +36,13 @@ const COPY_CHUNK: usize = 256 * 1024;
 /// A relocated segment's file, as written.
 #[derive(Debug)]
 pub struct Relocated {
+    /// The new table's id.
+    pub id: TableId,
+    /// The new table's file.
+    pub path: PathBuf,
+    /// Whether the file's directory entry was durable before the table was
+    /// written into it (see [`Table::mark_entry_durable`]).
+    pub entry_durable: bool,
     /// The file's checksum, for [`Table::recover`].
     pub checksum: Checksum,
     /// The bytes copied from the source as they lay: every section but the
@@ -43,12 +51,15 @@ pub struct Relocated {
 }
 
 impl Table {
-    /// Writes a new SST at `new_path` that reuses this columnar segment's data
-    /// blocks verbatim, re-points the on-disk table id to `new_table_id`, and
-    /// adds `delete_bitmap` as a positional row mask. Returns the new file's
-    /// checksum (for [`Table::recover`]) and the bytes it copied; the caller
-    /// installs and recovers it. `pace` is told how long each read of this
-    /// segment takes.
+    /// Writes a new SST into the empty file `output` opens, reusing this
+    /// columnar segment's data blocks verbatim, re-pointing the on-disk table
+    /// id to the file's, and adding `delete_bitmap` as a positional row mask.
+    /// `output` is called only once the segment is known to be relocatable,
+    /// and its file is removed on a failure after that. Returns the new file
+    /// and its checksum (for [`Table::recover`]) and the bytes it copied; the
+    /// caller installs and recovers it, and the install syncs the folder for
+    /// a file whose entry is not durable yet. `pace` is told how long each
+    /// read of this segment takes.
     ///
     /// # Errors
     ///
@@ -61,9 +72,8 @@ impl Table {
     /// copy-on-write rewrite in those cases.
     pub(crate) fn relocate_columnar_with_deletes(
         &self,
-        new_path: &Path,
+        output: impl FnOnce() -> crate::Result<ClaimedFile>,
         out_fs: &dyn crate::fs::Fs,
-        new_table_id: TableId,
         delete_bitmap: &DeleteBitmap,
         sync_mode: SyncMode,
         pace: Option<&super::util::Pacer>,
@@ -103,18 +113,23 @@ impl Table {
         let src = timed.into_inner();
         let pace = pace.map(|pace| &**pace);
 
-        // Re-encode the meta KV block with the new id AND the new delete-bitmap
-        // descriptors. The block is loaded TAIL (`meta`) since MID and TAIL carry
-        // identical content; the same patched payload is written to both sections
-        // below.
-        let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap, pace)?;
+        let ClaimedFile {
+            id: new_table_id,
+            path: new_path,
+            file: out,
+            durable_entry,
+        } = output()?;
 
-        let out = out_fs.open(new_path, &FsOpenOptions::new().write(true).create_new(true))?;
-
-        // Once the output file exists, any later failure (section copy, bitmap
-        // write, sync, directory fsync) must not leave a partial, uninstalled SST
-        // behind. Best-effort remove it before propagating the error.
-        let result = (|| -> crate::Result<Relocated> {
+        // Once the output file exists, any later failure (meta re-encode,
+        // section copy, bitmap write, sync) must not leave a partial,
+        // uninstalled SST behind. Best-effort remove it before propagating the
+        // error.
+        let result = (|| -> crate::Result<(Checksum, u64)> {
+            // Re-encode the meta KV block with the new id AND the new
+            // delete-bitmap descriptors. The block is loaded TAIL (`meta`)
+            // since MID and TAIL carry identical content; the same patched
+            // payload is written to both sections below.
+            let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap, pace)?;
             let out = BufWriter::with_capacity(u16::MAX.into(), out);
             let out = ChecksummedWriter::new(out);
             let mut writer = crate::sfa::Writer::from_writer(out);
@@ -190,22 +205,27 @@ impl Table {
             let checksum = checksummed.checksum();
             let file = checksummed.inner_mut().get_mut();
             FsFile::sync_all_with(&**file, sync_mode)?;
-            #[expect(
-                clippy::expect_used,
-                reason = "an SST path always has a parent directory (the table folder)"
-            )]
-            crate::file::fsync_directory(
-                new_path.parent().expect("table file has a parent folder"),
-                out_fs,
-                sync_mode,
-            )?;
-            Ok(Relocated { checksum, copied })
+            Ok((checksum, copied))
         })();
 
-        if result.is_err() {
-            let _ = out_fs.remove_file(new_path);
+        match result {
+            Ok((checksum, copied)) => Ok(Relocated {
+                id: new_table_id,
+                path: new_path,
+                entry_durable: durable_entry,
+                checksum,
+                copied,
+            }),
+            Err(e) => {
+                if let Err(remove) = out_fs.remove_file(&new_path) {
+                    log::warn!(
+                        "could not remove the failed relocation output {}: {remove}",
+                        new_path.display()
+                    );
+                }
+                Err(e)
+            }
         }
-        result
     }
 
     /// Loads this segment's meta KV block, replaces the `table_id` entry's value

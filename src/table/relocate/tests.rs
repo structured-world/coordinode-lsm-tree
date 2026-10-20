@@ -2,6 +2,7 @@ use super::*;
 use crate::cache::Cache;
 use crate::descriptor_table::DescriptorTable;
 use crate::fs::StdFs;
+use crate::path::Path;
 use crate::table::Writer;
 #[cfg(feature = "columnar")]
 use crate::{SeqNo, hash::hash64};
@@ -10,6 +11,17 @@ use test_log::test;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
+
+/// A new file at `path` for table `id` to be relocated into.
+fn output_at(path: &Path, id: TableId) -> crate::Result<ClaimedFile> {
+    use crate::fs::Fs;
+    Ok(ClaimedFile {
+        id,
+        path: path.to_path_buf(),
+        file: StdFs.open(path, &FsOpenOptions::new().write(true).create_new(true))?,
+        durable_entry: false,
+    })
+}
 
 fn recover_at(file: &Path, checksum: Checksum, table_id: TableId) -> crate::Result<Table> {
     #[cfg(feature = "metrics")]
@@ -63,7 +75,13 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
         bitmap.insert(row);
     }
     let out_checksum = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 1),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )?
         .checksum;
 
     let relocated = recover_at(&out_path, out_checksum, 1)?;
@@ -140,9 +158,8 @@ fn a_paced_relocation_reports_the_reads_of_its_source() -> crate::Result<()> {
     });
     let pace: Pacer = recorder.clone();
     source.relocate_columnar_with_deletes(
-        &out_path,
+        || output_at(&out_path, 1),
         &StdFs,
-        1,
         &bitmap,
         SyncMode::Normal,
         Some(&pace),
@@ -195,7 +212,13 @@ fn relocated_mor_table_passes_metadata_bounds_cross_check() -> crate::Result<()>
         bitmap.insert(row);
     }
     let out_checksum = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 1),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )?
         .checksum;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 
@@ -241,7 +264,13 @@ fn a_relocated_table_carries_a_complete_single_output_lineage() -> crate::Result
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(4);
     let out_checksum = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 9, &bitmap, SyncMode::Normal, None)?
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 9),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )?
         .checksum;
     let relocated = recover_at(&out_path, out_checksum, 9)?;
 
@@ -296,7 +325,13 @@ fn relocate_rejects_a_restricted_view() -> crate::Result<()> {
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(0);
     let err = restricted
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 1),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )
         .unwrap_err();
     assert!(
         matches!(err, crate::Error::FeatureUnsupported(_)),
@@ -325,7 +360,13 @@ fn relocate_rejects_row_major_segment() -> crate::Result<()> {
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(0);
     let err = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 1),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )
         .unwrap_err();
     assert!(
         matches!(err, crate::Error::FeatureUnsupported(_)),
@@ -396,7 +437,13 @@ fn relocated_mor_table_passes_the_blob_link_cross_check() -> crate::Result<()> {
     let mut bitmap = DeleteBitmap::new();
     bitmap.insert(3);
     let out_checksum = source
-        .relocate_columnar_with_deletes(&out_path, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .relocate_columnar_with_deletes(
+            || output_at(&out_path, 1),
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )?
         .checksum;
     let relocated = recover_at(&out_path, out_checksum, 1)?;
 

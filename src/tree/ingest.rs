@@ -571,8 +571,8 @@ impl<'a> Ingestion<'a> {
         // Finalize the ingestion writer, writing all buffered data to disk. The
         // hold on its dictionary stays here until the tables are installed.
         let write_pin = core::mem::take(&mut self.write_pin);
-        let entries_durable = self.writer.entries_durable();
-        let results = self.writer.finish()?;
+        let written = self.writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         log::info!("Finished ingestion writer");
 
@@ -606,7 +606,8 @@ impl<'a> Ingestion<'a> {
         // filter and index blocks by the L0 policy, as a flushed table does.
         let pin_filter = self.tree.config.filter_block_pinning_policy.get(0);
         let pin_index = self.tree.config.index_block_pinning_policy.get(0);
-        let created_tables = results
+        let created_tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(

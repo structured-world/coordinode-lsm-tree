@@ -1703,10 +1703,11 @@ impl StandardCompaction {
 
         let pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
-        let entries_durable = self.table_writer.entries_durable();
+        let written = self.table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
-        self.table_writer
-            .finish()?
+        written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(

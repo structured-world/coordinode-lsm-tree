@@ -144,6 +144,53 @@ fn a_backend_that_cannot_count_links_still_gets_a_file() -> crate::Result<()> {
     let claimed = pools.claim(&folder, &fs, None, true)?;
     assert!(!claimed.durable_entry, "made for its table, not pooled");
     assert!(exists(&fs, &folder, claimed.id)?);
+    directory_syncs(&fault);
+
+    // The pool is given up on, not refilled by every write only to be
+    // removed again.
+    let next = pools.claim(&folder, &fs, None, true)?;
+    assert!(!next.durable_entry);
+    assert_eq!(directory_syncs(&fault), 0, "no batch made and dropped");
+    assert_eq!(
+        fs.read_dir(&folder)?.len(),
+        2,
+        "the two tables' files, nothing pooled"
+    );
+    Ok(())
+}
+
+/// Two routes that name one folder (another backend handle, or another
+/// spelling of its path) keep two pools of it. An empty file the open found
+/// goes to one of them only: the other would hand out or remove the file the
+/// first one wrote a table into.
+#[test]
+fn a_folder_two_pools_name_pools_each_file_once() -> crate::Result<()> {
+    let mem = MemFs::new();
+    let fs_a: Arc<dyn Fs> = Arc::new(mem.clone());
+    let fs_b: Arc<dyn Fs> = Arc::new(mem);
+    let folder = PathBuf::from("/t");
+    fs_a.create_dir_all(&folder)?;
+    drop(fs_a.open(
+        &folder.join("5"),
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?);
+    // An open starts the counter above every file it adopts.
+    let pools = TableFilePools::new(SequenceNumberCounter::new(6), 4, SyncMode::Normal);
+    pools.adopt(&folder, &fs_a, vec![5]);
+    pools.adopt(&folder, &fs_b, vec![5]);
+
+    let mut claimed = pools.claim(&folder, &fs_a, None, false)?;
+    assert_eq!(claimed.id, 5);
+    claimed.file.write_all(b"a table")?;
+    drop(claimed);
+
+    let other = pools.claim(&folder, &fs_b, Some(5), false)?;
+    assert_ne!(other.id, 5);
+    assert_eq!(
+        fs_a.metadata(&folder.join("5"))?.len,
+        7,
+        "the table written into the file stays"
+    );
     Ok(())
 }
 

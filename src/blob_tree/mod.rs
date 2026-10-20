@@ -2075,8 +2075,8 @@ impl AbstractTree for BlobTree {
 
         let blob_files = blob_writer.finish()?;
 
-        let entries_durable = table_writer.entries_durable();
-        let result = table_writer.finish()?;
+        let written = table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -2084,7 +2084,8 @@ impl AbstractTree for BlobTree {
         let pin_index = self.index.config.index_block_pinning_policy.get(0);
 
         // Load tables
-        let tables = result
+        let tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(

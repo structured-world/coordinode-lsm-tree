@@ -52,6 +52,9 @@ struct FolderPool {
     /// an open adopted or a refill made before its folder sync failed, until
     /// a sync of the folder succeeds.
     synced: bool,
+    /// Set once the backend reports it cannot count a file's links: no
+    /// pooled file can be told unshared, so every file is made for its table.
+    unpooled: bool,
 }
 
 /// The pools of a tree's tables folders, and the ids their files take.
@@ -79,12 +82,21 @@ impl TableFilePools {
     /// Pools `ids`, the empty table files an open found in `folder` that no
     /// version names. Their entries may never have been synced, so the first
     /// claim syncs the folder.
+    ///
+    /// An id another pool holds already is skipped: two routes that name one
+    /// folder (another handle on its backend, another spelling of its path)
+    /// see its files twice, and two pools handing out one file would let
+    /// one remove or overwrite the table the other wrote into it.
     pub fn adopt(&self, folder: &Path, fs: &Arc<dyn Fs>, mut ids: Vec<TableId>) {
-        if self.batch == 0 || ids.is_empty() {
+        if self.batch == 0 {
+            return;
+        }
+        let mut folders = self.folders.lock();
+        ids.retain(|id| !folders.iter().any(|pool| pool.ids.contains(id)));
+        if ids.is_empty() {
             return;
         }
         ids.sort_unstable();
-        let mut folders = self.folders.lock();
         let pool = pool_of(&mut folders, folder, fs);
         pool.ids.extend(ids);
         pool.synced = false;
@@ -116,20 +128,26 @@ impl TableFilePools {
         // Held across the refill and the open, so two claims never take one
         // file.
         let mut folders = self.folders.lock();
-        let claimed = self.claim_pooled(pool_of(&mut folders, folder, fs), above, may_refill);
+        let pool = pool_of(&mut folders, folder, fs);
+        let claimed = if pool.unpooled {
+            Ok(None)
+        } else {
+            self.claim_pooled(pool, above, may_refill)
+        };
         drop(folders);
         match claimed? {
             Some(claimed) => Ok(claimed),
-            // The pool is dry and is not to be refilled, or a fresh batch held
-            // no file that can be used: the backend cannot tell whether a
-            // file is shared, so no pooled file will be.
+            // The pool is dry and is not to be refilled, or the backend
+            // cannot tell whether a file is shared, so no pooled file will be
+            // used.
             None => self.create(folder, fs),
         }
     }
 
     /// The next file of `pool` to write a table into, refilled when it runs
-    /// out and `may_refill`; `None` when it is dry and may not be, or a fresh
-    /// batch held no file that can be.
+    /// out and `may_refill`; `None` when it is dry and may not be, a fresh
+    /// batch held no file that can be used, or the backend cannot count a
+    /// file's links, which gives the pool up.
     fn claim_pooled(
         &self,
         pool: &mut FolderPool,
@@ -157,13 +175,25 @@ impl TableFilePools {
                 discard(&*pool.fs, &path);
                 continue;
             }
-            if let Some(file) = open_unshared_empty(&*pool.fs, &path)? {
-                return Ok(Some(ClaimedFile {
-                    id,
-                    path,
-                    file,
-                    durable_entry: true,
-                }));
+            match open_unshared_empty(&*pool.fs, &path)? {
+                Opened::Unshared(file) => {
+                    return Ok(Some(ClaimedFile {
+                        id,
+                        path,
+                        file,
+                        durable_entry: true,
+                    }));
+                }
+                Opened::Unusable => {}
+                Opened::LinksUncountable => {
+                    // Every other file would be refused alike: removed now,
+                    // rather than kept for claims that never come.
+                    for id in pool.ids.drain(..) {
+                        discard(&*pool.fs, &pool.folder.join(id.to_string()));
+                    }
+                    pool.unpooled = true;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -216,6 +246,7 @@ fn pool_of<'a>(
                 folder: folder.to_path_buf(),
                 ids: VecDeque::new(),
                 synced: true,
+                unpooled: false,
             });
             folders.len() - 1
         });
@@ -226,28 +257,46 @@ fn pool_of<'a>(
     &mut folders[at]
 }
 
-/// The pool file at `path`, open for writing, or `None` when it is gone or
-/// cannot be written into. One a capture hard-linked is unlinked from the
-/// pool: its inode is shared with another tree, which must never see a write.
-/// A link count that cannot be read is treated as shared.
-fn open_unshared_empty(fs: &dyn Fs, path: &Path) -> crate::Result<Option<Box<dyn FsFile>>> {
+/// What a claim finds at a pooled name.
+enum Opened {
+    /// An empty file no other name links to, open for writing.
+    Unshared(Box<dyn FsFile>),
+    /// Gone, holding bytes, or linked from elsewhere: not written into.
+    Unusable,
+    /// The backend cannot count a file's links at all.
+    LinksUncountable,
+}
+
+/// Opens the pool file at `path` for writing when it can be written into.
+/// One that holds bytes is not a pool file: only this tree writes a pool
+/// file, and only once it is claimed, so it is left to the open that finds it
+/// unnamed. One a capture hard-linked is unlinked from the pool: its inode is
+/// shared with another tree, which must never see a write. A link count that
+/// cannot be read is treated as shared.
+fn open_unshared_empty(fs: &dyn Fs, path: &Path) -> crate::Result<Opened> {
     let file = match fs.open(path, &FsOpenOptions::new().write(true)) {
         Ok(file) => file,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(Opened::Unusable),
         Err(e) => return Err(e.into()),
     };
-    if !file.hard_link_count().is_ok_and(|links| links == 1) {
-        drop(file);
-        discard(fs, path);
-        return Ok(None);
-    }
-    // Only this tree writes a pool file, and only once it is claimed: one
-    // that holds bytes is not a pool file, and it is left to the open that
-    // finds it unnamed.
+    // Checked first: whatever the link count says, a file with bytes is never
+    // removed here.
     if file.metadata()?.len != 0 {
-        return Ok(None);
+        return Ok(Opened::Unusable);
     }
-    Ok(Some(file))
+    match file.hard_link_count() {
+        Ok(1) => Ok(Opened::Unshared(file)),
+        Err(e) if e.kind() == crate::io::ErrorKind::Unsupported => {
+            drop(file);
+            discard(fs, path);
+            Ok(Opened::LinksUncountable)
+        }
+        Ok(_) | Err(_) => {
+            drop(file);
+            discard(fs, path);
+            Ok(Opened::Unusable)
+        }
+    }
 }
 
 /// Removes a pool file that will not be written into. Nothing names it, so a
