@@ -1414,11 +1414,9 @@ mod zstd_dict {
 
     #[test]
     fn a_kept_report_names_the_dictionary_the_repair_set_aside() -> lsm_tree::Result<()> {
-        use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
-
-        // A repair whose report never stops being owed leaves it in the
-        // rebuilt snapshot, and the next open hands it out. The dictionary is
-        // set aside after the commit, so the report has to name it: the open
+        // A repair leaves its report in the rebuilt snapshot until it is
+        // acknowledged, and the next open hands it out. The dictionary is set
+        // aside after the commit, so the report has to name it: the open
         // finds the dictionary gone from its name and has nothing else to say
         // where its bytes went.
         let dir = tempfile::tempdir()?;
@@ -1427,22 +1425,8 @@ mod zstd_dict {
         a_tree_holding_an_unused_dictionary(dir.path(), dict)?;
         damage_the_dictionary(dir.path(), dict_id)?;
 
-        let fs = FaultFs::new(StdFs);
-        // The repair installs its rebuilt snapshot with one rename onto a
-        // snapshot name; the install that stops owing the report is the next.
-        fs.injector().arm(
-            FaultRule::new(
-                FaultOp::Rename,
-                Fault::Error(lsm_tree::io::ErrorKind::Other),
-            )
-            .on_path(dir.path().join("v").to_string_lossy())
-            .skip(1),
-        );
         let aside = dir.path().join("dicts").join(format!("{dict_id}.damaged"));
-        assert!(
-            make_config(dir.path()).with_fs(fs).repair().is_err(),
-            "the report cannot stop being owed, so the rebuilt snapshot keeps it",
-        );
+        make_config(dir.path()).repair()?;
         assert!(aside.exists(), "self-check: the dictionary was set aside");
 
         let (_tree, report) =

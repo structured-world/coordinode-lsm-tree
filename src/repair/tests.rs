@@ -13239,11 +13239,9 @@ fn a_repair_whose_install_is_visible_but_unsynced_keeps_its_report_owed() -> cra
         .take(snapshot_synced)
         .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
         .count();
-    // The repair installs the rebuilt snapshot, then one over it that no
-    // longer owes the report.
+    // The snapshot the repair installs is the rebuilt one, owing the report.
     let id = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
-        .ok_or(crate::Error::Unrecoverable)?
-        - 1;
+        .ok_or(crate::Error::Unrecoverable)?;
 
     let (memfs, root, _) = a_blob_tree_with_a_damaged_tail()?;
     let fault = FaultFs::new(MemFs::clone(&memfs));
@@ -13369,11 +13367,9 @@ fn an_unknown_install_that_survived() -> crate::Result<(
         .take(snapshot_synced)
         .filter(|(path, kind)| *kind == SyncKind::Directory && path.starts_with(&root))
         .count();
-    // A repair that hands its report out installs the rebuilt snapshot, which
-    // owes it, then one over it that does not.
-    let retired = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
+    // The snapshot the repair installs is the rebuilt one, owing the report.
+    let rebuilt = crate::version::recovery::installed_snapshot(&root, &*probe_fs)?
         .ok_or(crate::Error::Unrecoverable)?;
-    let rebuilt = retired - 1;
     let snapshot = root.join(format!("v{rebuilt}"));
     assert_ne!(
         expected.wal_replay_scope(),
@@ -13404,11 +13400,9 @@ fn an_unknown_install_that_survived() -> crate::Result<(
     // the faulted run renamed is gone with the withdrawal, and the files it
     // names carry random bytes no other run reproduces; the rebuilt snapshot
     // the run without a fault installed over the same fixture, which owes the
-    // same report, stands in for it, without the one that retired it.
+    // same report, stands in for it.
     let survived = std::sync::Arc::new(MemFs::new());
     copy_folder(&probe_fs, &survived, &root)?;
-    survived.remove_file(&root.join(format!("v{retired}")))?;
-    survived.remove_file(&root.join(format!("edits-{retired}")))?;
     assert_eq!(
         crate::version::recovery::installed_snapshot(&root, &*survived)?,
         Some(rebuilt),
@@ -17122,9 +17116,10 @@ fn open_or_repair_repairs_a_structural_failure_only() -> crate::Result<()> {
         Some(b"v".as_ref()),
         "the repaired tree serves the flushed write",
     );
+    assert!(tree.acknowledge_repair_report(report.id)?);
     drop(tree);
 
-    // Healthy store: no repair, no report.
+    // Healthy store, its report acknowledged: no repair, no report.
     let (tree, repaired) = config().open_or_repair(RepairPolicy::default())?;
     assert!(repaired.is_none(), "a healthy open must not repair");
     assert_eq!(tree.get(b"k", u64::MAX)?.as_deref(), Some(b"v".as_ref()));
