@@ -74,6 +74,10 @@ fn a_repair_that_never_installed_hands_out_no_report() -> lsm_tree::Result<()> {
         tree.insert("a", "value", 0);
         tree.flush_active_memtable(0)?;
     }
+    // A reopen installs the tree as a snapshot with no edits after it, so the
+    // next open reinstalls it under the id above that snapshot: the id a
+    // repair takes too.
+    drop(config(folder.path()).open()?);
 
     let fs = FaultFs::new(StdFs);
     // The rebuilt snapshot's rename is what installs it.
