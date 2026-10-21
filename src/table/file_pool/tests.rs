@@ -293,6 +293,8 @@ fn a_pipe_put_under_a_pooled_name_does_not_hold_the_claim() -> crate::Result<()>
     // SAFETY: `name` is a NUL-terminated path the call only reads.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
 
+    // A claim that waited on the pipe would block here; the test runner's
+    // slow-timeout ends the test and reports it by name, so no watchdog thread.
     let mut claimed = pools.claim(&folder, &fs, None, true)?;
     assert_ne!(claimed.id, 1, "the pipe is passed over");
     claimed.file.write_all(b"a table")?;
