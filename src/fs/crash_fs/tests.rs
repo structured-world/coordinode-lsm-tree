@@ -1777,9 +1777,11 @@ fn independent_files_have_independent_durability() {
 
     fs.crash();
     assert_eq!(read(&fs, "/d/a"), b"A", "synced file survives");
-    assert!(
-        !fs.exists(Path::new("/d/b")).unwrap(),
-        "un-synced sibling vanishes independently"
+    // The directory sync made b's entry durable, not its bytes.
+    assert_eq!(
+        read(&fs, "/d/b"),
+        b"",
+        "the un-synced sibling loses its bytes independently"
     );
 }
 

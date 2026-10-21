@@ -1,5 +1,7 @@
 use super::*;
-use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, FsDirEntry, FsMetadata, MemFs, SyncKind};
+use crate::fs::{
+    Fault, FaultFs, FaultOp, FaultRule, FsCapabilities, FsDirEntry, FsMetadata, MemFs, SyncKind,
+};
 use std::io::Write;
 
 type Pools = (TableFilePools, Arc<FaultFs<MemFs>>, Arc<dyn Fs>, PathBuf);
@@ -160,10 +162,14 @@ fn a_backend_that_cannot_count_links_still_gets_a_file() -> crate::Result<()> {
 }
 
 /// One namespace behind a backend that does not report it, so two handles on
-/// it cannot be told to name one folder.
-struct Opaque(MemFs);
+/// it cannot be told to name one folder, and that reports the capabilities it
+/// is given.
+struct Opaque(MemFs, FsCapabilities);
 
 impl Fs for Opaque {
+    fn capabilities(&self, _path: &Path) -> FsCapabilities {
+        self.1
+    }
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
         self.0.open(path, opts)
     }
@@ -297,6 +303,43 @@ fn a_pipe_put_under_a_pooled_name_does_not_hold_the_claim() -> crate::Result<()>
     Ok(())
 }
 
+/// A backend whose directory sync does nothing gets no pool: the sync a
+/// pooled file saves is not there to save, and making files ahead only costs.
+/// Every claim makes its file, and the empty files an open found are removed,
+/// not pooled.
+#[test]
+fn a_backend_whose_folder_sync_does_nothing_gets_no_pool() -> crate::Result<()> {
+    let mem = MemFs::new();
+    let fs: Arc<dyn Fs> = Arc::new(Opaque(
+        mem.clone(),
+        FsCapabilities {
+            directory_sync_noop: true,
+            ..FsCapabilities::default()
+        },
+    ));
+    let folder = PathBuf::from("/t");
+    fs.create_dir_all(&folder)?;
+    drop(fs.open(
+        &folder.join("0"),
+        &FsOpenOptions::new().write(true).create_new(true),
+    )?);
+    let pools = TableFilePools::new(SequenceNumberCounter::new(1), 4, SyncMode::Normal);
+    pools.adopt(&folder, &fs, vec![0]);
+    assert!(!exists(&fs, &folder, 0)?, "a found empty file is removed");
+
+    for _ in 0..2 {
+        let claimed = pools.claim(&folder, &fs, None, true)?;
+        assert!(!claimed.durable_entry, "a file made for its table");
+    }
+    let names: Vec<String> = mem
+        .read_dir(&folder)?
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .collect();
+    assert_eq!(names.len(), 2, "no batch made ahead: {names:?}");
+    Ok(())
+}
+
 /// A table records the files its folder is writing below it, and a file
 /// leaves that list once its claim is dropped.
 #[test]
@@ -323,8 +366,8 @@ fn a_claim_lists_the_files_its_folder_writes_below_it() -> crate::Result<()> {
 #[test]
 fn a_folder_two_pools_name_pools_each_file_once() -> crate::Result<()> {
     let mem = MemFs::new();
-    let fs_a: Arc<dyn Fs> = Arc::new(Opaque(mem.clone()));
-    let fs_b: Arc<dyn Fs> = Arc::new(Opaque(mem));
+    let fs_a: Arc<dyn Fs> = Arc::new(Opaque(mem.clone(), FsCapabilities::default()));
+    let fs_b: Arc<dyn Fs> = Arc::new(Opaque(mem, FsCapabilities::default()));
     let folder = PathBuf::from("/t");
     fs_a.create_dir_all(&folder)?;
     drop(fs_a.open(

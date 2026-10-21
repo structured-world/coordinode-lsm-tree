@@ -669,6 +669,17 @@ impl Fs for StdFs {
         linux_caps::capabilities(path)
     }
 
+    /// Windows: no directory can be synced (see `sync_directory`), so the
+    /// directory sync is reported as doing nothing; every other capability
+    /// is the conservative default.
+    #[cfg(target_os = "windows")]
+    fn capabilities(&self, _path: &Path) -> super::FsCapabilities {
+        super::FsCapabilities {
+            directory_sync_noop: true,
+            ..super::FsCapabilities::default()
+        }
+    }
+
     /// Linux: O(1) clone via `ioctl(FICLONE)` (Btrfs, XFS-reflink). Falls back
     /// to the shared streamed copy when the filesystem declines the clone
     /// (non-reflink FS, cross-device); a genuine I/O error propagates.

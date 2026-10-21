@@ -329,6 +329,13 @@ pub struct FsCapabilities {
     /// false the mode is unavailable and the engine falls back to whole-output
     /// compaction.
     pub punch_hole: bool,
+
+    /// Syncing a directory does nothing on this backend (Windows has no
+    /// directory fsync; an entry is as durable as the platform makes it
+    /// without one). Work whose only gain is a directory sync it saves, such
+    /// as the table file pool, is then skipped: it would cost and save
+    /// nothing.
+    pub directory_sync_noop: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].

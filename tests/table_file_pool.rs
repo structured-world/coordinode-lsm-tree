@@ -83,6 +83,10 @@ fn a_flush_after_an_ingestion_reads_as_newer_than_it() -> lsm_tree::Result<()> {
 /// A compaction output's id is above every input's, even when its folder's
 /// pool holds files made before an input: the id is what tells an output from
 /// the input whose age it takes.
+// The tests marked `not(windows)` watch the pooled files of a folder on the
+// standard backend: Windows syncs no folder, so it keeps no pool (see
+// `windows_folders_keep_no_pool`).
+#[cfg(not(windows))]
 #[test]
 fn a_compaction_output_is_numbered_above_its_inputs() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -150,6 +154,7 @@ fn a_compaction_output_is_numbered_above_its_inputs() -> lsm_tree::Result<()> {
 /// An open uses the pooled files it finds again, lowest id first, rather than
 /// leaving them and making more; the ids it hands out after them are above
 /// every one of them.
+#[cfg(not(windows))]
 #[test]
 fn an_open_uses_the_pooled_files_it_finds() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -255,6 +260,7 @@ fn an_open_pools_no_name_past_the_ids() -> lsm_tree::Result<()> {
 /// A pooled file another name links to shares its inode with whatever made
 /// that link (a capture of the folder): it is unlinked from the pool, never
 /// written, so the other name keeps the empty file it linked.
+#[cfg(not(windows))]
 #[test]
 fn a_pooled_file_linked_elsewhere_is_never_written() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -280,6 +286,39 @@ fn a_pooled_file_linked_elsewhere_is_never_written() -> lsm_tree::Result<()> {
         "the linked file left the pool"
     );
     assert!(tree.get("b", u64::MAX)?.is_some());
+    Ok(())
+}
+
+/// Windows syncs no folder, so a pooled file would save nothing there: its
+/// folders keep no pool, every table file is made as its table is written,
+/// and an empty file under a table name is no pooled file to reuse.
+#[cfg(windows)]
+#[test]
+fn windows_folders_keep_no_pool() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    {
+        let tree = config(folder.path()).table_file_pool(4).open()?;
+        for (seqno, key) in [(0, "a"), (1, "b")] {
+            tree.insert(key, "1", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+        let (pooled, written) = table_files(&tables);
+        assert!(pooled.is_empty(), "no file made ahead: {pooled:?}");
+        assert_eq!(written.len(), 2);
+    }
+    std::fs::write(tables.join("1000"), b"")?;
+    let tree = config(folder.path()).table_file_pool(4).open()?;
+    tree.insert("c", "1", 2);
+    tree.flush_active_memtable(0)?;
+    let (pooled, _) = table_files(&tables);
+    assert!(
+        pooled.is_empty(),
+        "the empty file is not pooled: {pooled:?}"
+    );
+    for key in ["a", "b", "c"] {
+        assert!(tree.get(key, u64::MAX)?.is_some(), "{key}");
+    }
     Ok(())
 }
 
@@ -310,6 +349,7 @@ fn two_tables(folder: &Path) -> lsm_tree::Result<()> {
 /// name holds no rows. It removes them as it removes every file the rebuilt
 /// manifest does not name, lists them among the files it left out, and the
 /// tree makes new ones.
+#[cfg(not(windows))]
 #[test]
 fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -501,6 +541,7 @@ fn a_repair_counts_a_duplicate_it_leaves_out_as_its_folders_newest() -> lsm_tree
 /// A checkpoint takes the tables the version names and no pooled file, and
 /// the two trees go on apart: what either writes into its pooled files lands
 /// in no file of the other.
+#[cfg(not(windows))]
 #[test]
 fn a_checkpoint_carries_no_pooled_file_and_shares_none() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();

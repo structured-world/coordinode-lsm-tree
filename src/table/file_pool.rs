@@ -120,8 +120,9 @@ struct FolderPool {
     /// an open adopted or a refill made before its folder sync failed, until
     /// a sync of the folder succeeds.
     synced: bool,
-    /// Set once the backend reports it cannot count a file's links: no
-    /// pooled file can be told unshared, so every file is made for its table.
+    /// Set when the backend's folder sync does nothing, which a pooled file
+    /// would save, or once it reports it cannot count a file's links, so no
+    /// pooled file can be told unshared: every file is made for its table.
     unpooled: bool,
     /// The ids of the files a table is being written into (see [`Writing`]).
     writing: Arc<Mutex<Vec<TableId>>>,
@@ -168,6 +169,13 @@ impl TableFilePools {
         }
         ids.sort_unstable();
         let pool = pool_of(&mut folders, folder, fs);
+        // A folder without a pool keeps no empty file: each is an orphan.
+        if pool.unpooled {
+            for id in ids {
+                discard(&**fs, &folder.join(id.to_string()));
+            }
+            return;
+        }
         pool.ids.extend(ids);
         pool.synced = false;
         drop(folders);
@@ -337,7 +345,10 @@ fn pool_of<'a>(
                 routes: alloc::vec![route],
                 ids: VecDeque::new(),
                 synced: true,
-                unpooled: false,
+                // A pooled file saves its table's folder sync, so a backend
+                // whose folder sync does nothing gains nothing from a pool and
+                // pays for every file made ahead.
+                unpooled: fs.capabilities(folder).directory_sync_noop,
                 writing: Arc::new(Mutex::new(Vec::new())),
             });
             folders.len() - 1
