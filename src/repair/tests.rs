@@ -17771,8 +17771,9 @@ fn repair_orders_tied_overlapping_tables_by_their_recency_keys() -> crate::Resul
 }
 
 /// A flush persists the recency key it takes from the id counter once its
-/// file is claimed, as every table carries one: the manifest records the same
-/// key, and a later flush's is above it whatever ids their pooled files had.
+/// file is claimed (its file's own id when the file is made for it), as every
+/// table carries one: the manifest records the same key, and a later flush's
+/// is above it whatever ids their pooled files had.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
@@ -17802,10 +17803,16 @@ fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
             table.l0_recency(),
             "the table and the manifest record one recency",
         );
-        assert!(
-            table.metadata.recency > table.id(),
-            "taken after the table's pooled file was claimed",
-        );
+        // Windows syncs no folder, so it keeps no pool: a file made for its
+        // table carries an id taken as the flush starts, which serves.
+        if cfg!(windows) {
+            assert_eq!(table.metadata.recency, table.id(), "the file's own id");
+        } else {
+            assert!(
+                table.metadata.recency > table.id(),
+                "taken after the table's pooled file was claimed",
+            );
+        }
         recencies.push(table.metadata.recency);
     }
     assert!(
