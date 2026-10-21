@@ -161,8 +161,8 @@ fn a_backend_that_cannot_count_links_still_gets_a_file() -> crate::Result<()> {
 
 /// Two routes that name one folder (another backend handle, or another
 /// spelling of its path) keep two pools of it. An empty file the open found
-/// goes to one of them only: the other would hand out or remove the file the
-/// first one wrote a table into.
+/// goes to one of them only: the other would hand out the file the first one
+/// is about to write a table into, while it is still empty.
 #[test]
 fn a_folder_two_pools_name_pools_each_file_once() -> crate::Result<()> {
     let mem = MemFs::new();
@@ -181,11 +181,12 @@ fn a_folder_two_pools_name_pools_each_file_once() -> crate::Result<()> {
 
     let mut claimed = pools.claim(&folder, &fs_a, None, false)?;
     assert_eq!(claimed.id, 5);
+    // Claimed before the first table is written, the file is still empty
+    // and unshared: only its pool tells the second claim it is taken.
+    let other = pools.claim(&folder, &fs_b, None, false)?;
+    assert_ne!(other.id, 5, "one file handed to two tables");
     claimed.file.write_all(b"a table")?;
     drop(claimed);
-
-    let other = pools.claim(&folder, &fs_b, Some(5), false)?;
-    assert_ne!(other.id, 5);
     assert_eq!(
         fs_a.metadata(&folder.join("5"))?.len,
         7,

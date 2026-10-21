@@ -5723,6 +5723,13 @@ fn scan_table_folders(
     // does not name it is reported left out and goes once that manifest is
     // durable. One below the newest table is a table that lost its bytes,
     // reported as a loss nothing can scope.
+    //
+    // The newest table of a folder emptied to nothing reads as pooled here:
+    // nothing on disk tells the two apart. A table is synced before any edit
+    // names it, so only damage outside a crash empties one; a durable mark on
+    // every pooled file would cost a data sync per file, the sync the pool
+    // removes, and reporting every empty file as a loss would call for a full
+    // replay on every repair of a pooled tree.
     for (table_id, folder, table_path, folder_fs) in empty_unnamed {
         let newest = recovered_by_id
             .values()
