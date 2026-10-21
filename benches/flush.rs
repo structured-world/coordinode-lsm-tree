@@ -111,12 +111,17 @@ fn bench_flush(c: &mut Criterion) {
     }
 }
 
-/// A run of flushes into one tree on disk, each timed alone, with the
-/// default table file pool and with none. With the pool most flushes take a
-/// file made ahead and sync no folder, while one in a batch makes the batch:
-/// the tail percentiles show what those refills cost, against the flush that
-/// syncs its folder every time.
-fn bench_flush_series(c: &mut Criterion) {
+/// One arm of the flush series: a tree on disk and the time of each flush.
+struct SeriesArm {
+    label: &'static str,
+    _folder: tempfile::TempDir,
+    tree: AnyTree,
+    seqno: u64,
+    flushes: u64,
+    samples: Vec<Duration>,
+}
+
+impl SeriesArm {
     /// Keys per flush: small enough that the fixed cost (file, syncs, edit)
     /// is what is measured.
     const KEYS: u64 = 1_000;
@@ -124,21 +129,7 @@ fn bench_flush_series(c: &mut Criterion) {
     /// install rewrites stays the same size through the run.
     const COMPACT_EVERY: u64 = 32;
 
-    let mut group = c.benchmark_group("flush_series");
-    group.sample_size(20);
-    // Each sync mode: under `Full` every sync flushes the device cache
-    // (`F_FULLFSYNC` on macOS), the case where a folder sync costs most.
-    let modes = [
-        ("normal", lsm_tree::fs::SyncMode::Normal),
-        ("full", lsm_tree::fs::SyncMode::Full),
-    ];
-    for ((mode, sync_mode), pool) in modes
-        .into_iter()
-        .flat_map(|mode| [16, 0].map(|pool| (mode, pool)))
-    {
-        let label = format!("{mode}/pool{pool}");
-        // One tree and one sample set for every call criterion makes, so the
-        // run is one series whose refills fall once per batch.
+    fn new(label: &'static str, pool: usize, sync_mode: lsm_tree::fs::SyncMode) -> Self {
         let folder = tempfile::TempDir::new().expect("tempdir");
         let tree = Config::new(
             &folder,
@@ -149,31 +140,86 @@ fn bench_flush_series(c: &mut Criterion) {
         .sync_mode(sync_mode)
         .open()
         .expect("open");
-        let mut seqno = 0u64;
-        let mut flushes = 0u64;
-        let mut samples = Vec::new();
-        group.bench_function(label.clone(), |b| {
+        Self {
+            label,
+            _folder: folder,
+            tree,
+            seqno: 0,
+            flushes: 0,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Fills a memtable, then times its flush alone.
+    fn flush(&mut self) -> Duration {
+        for i in 0..Self::KEYS {
+            self.tree.insert(
+                format!("key_{i:08}"),
+                format!("value-{}", self.seqno),
+                self.seqno,
+            );
+            self.seqno += 1;
+        }
+        let start = Instant::now();
+        self.tree.flush_active_memtable(0).expect("flush");
+        let elapsed = start.elapsed();
+        self.samples.push(elapsed);
+        self.flushes += 1;
+        if self.flushes.is_multiple_of(Self::COMPACT_EVERY) {
+            self.tree
+                .major_compact(64 * 1024 * 1024, 0)
+                .expect("compact");
+        }
+        elapsed
+    }
+}
+
+/// A run of flushes into one tree on disk, each timed alone, with the
+/// default table file pool and with none. With the pool most flushes take a
+/// file made ahead and sync no folder, while one in a batch makes the batch:
+/// the tail percentiles show what those refills cost, against the flush that
+/// syncs its folder every time.
+///
+/// The two arms run interleaved in one loop, their order alternating every
+/// round (A B, B A), so whatever else loads the host lands on both alike
+/// rather than on whichever arm happened to run at the time.
+fn bench_flush_series(c: &mut Criterion) {
+    let mut group = c.benchmark_group("flush_series");
+    group.sample_size(20);
+    // Each sync mode: under `Full` every sync flushes the device cache
+    // (`F_FULLFSYNC` on macOS), the case where a folder sync costs most.
+    let modes = [
+        ("normal", lsm_tree::fs::SyncMode::Normal),
+        ("full", lsm_tree::fs::SyncMode::Full),
+    ];
+    for (mode, sync_mode) in modes {
+        let mut arms = [
+            SeriesArm::new("pool16", 16, sync_mode),
+            SeriesArm::new("pool0", 0, sync_mode),
+        ];
+        let mut round = 0u64;
+        group.bench_function(format!("{mode}/interleaved"), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    for i in 0..KEYS {
-                        tree.insert(format!("key_{i:08}"), format!("value-{seqno}"), seqno);
-                        seqno += 1;
+                    if round.is_multiple_of(2) {
+                        total += arms[0].flush();
+                        total += arms[1].flush();
+                    } else {
+                        total += arms[1].flush();
+                        total += arms[0].flush();
                     }
-                    let start = Instant::now();
-                    tree.flush_active_memtable(0).expect("flush");
-                    let elapsed = start.elapsed();
-                    samples.push(elapsed);
-                    total += elapsed;
-                    flushes += 1;
-                    if flushes.is_multiple_of(COMPACT_EVERY) {
-                        tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
-                    }
+                    round += 1;
                 }
                 total
             });
         });
-        report_percentiles(&format!("flush_series/{label}"), samples);
+        for arm in arms {
+            let mean = arm.samples.iter().sum::<Duration>()
+                / u32::try_from(arm.samples.len().max(1)).expect("sample count fits u32");
+            eprintln!("  [flush_series/{mode}/{}] mean={mean:?}", arm.label);
+            report_percentiles(&format!("flush_series/{mode}/{}", arm.label), arm.samples);
+        }
     }
     group.finish();
 }
