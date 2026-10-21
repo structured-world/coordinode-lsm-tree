@@ -623,22 +623,23 @@ pub(crate) struct FilterProbe<'a> {
     partitions: alloc::collections::BTreeMap<u64, crate::table::filter::block::FilterBlock>,
     /// The last key probed, so a key's older versions are not re-probed
     /// across a block boundary.
-    prev_key: Option<Vec<u8>>,
+    prev_key: Option<UserKey>,
     /// The extractor whose prefixes a full filter must also report present.
     prefix_extractor: Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>>,
 }
 
 #[cfg(feature = "std")]
 impl FilterProbe<'_> {
-    /// Probes one decoded block's keys against the filter.
+    /// Probes one decoded block's keys, whose hashes `key_hashes` holds in
+    /// entry order, against the filter.
     ///
     /// # Errors
     ///
     /// [`crate::Error::InvalidHeader`] when the filter reports an existing key
     /// (or its prefix) as definitely absent, or a partition is missing / empty
     /// for a key that exists.
-    fn check_block(&mut self, block: &DecodedBlock) -> crate::Result<()> {
-        Table::check_filter_block(self, block)
+    fn check_block(&mut self, block: &DecodedBlock, key_hashes: &[u64]) -> crate::Result<()> {
+        Table::check_filter_block(self, block, key_hashes)
     }
 }
 
@@ -4810,6 +4811,9 @@ impl Table {
         let mut layout_checked = 0usize;
         let mut locator_seen: crate::HashSet<Vec<u8>> = crate::HashSet::default();
         let mut prev_internal: Option<(UserKey, SeqNo)> = None;
+        // The hash of each entry's key of the block being checked, taken once a
+        // key for the locator and filter gates, which both probe by it.
+        let mut entry_hashes: Vec<u64> = Vec::new();
 
         // The walk's closure returns the plain engine error, so the gate that
         // produced it is recorded here and paired with it after the walk.
@@ -4858,14 +4862,33 @@ impl Table {
                 };
                 zone_checked = next;
             }
+            if locator.is_some() || filter.is_some() {
+                entry_hashes.clear();
+                let mut previous: Option<(&[u8], u64)> = None;
+                for entry in &block.entries {
+                    let key: &[u8] = &entry.key.user_key;
+                    // A key's versions are adjacent and share its hash.
+                    let hash = match previous {
+                        Some((previous, hash))
+                            if crate::comparator::same_user_key(previous, key) =>
+                        {
+                            hash
+                        }
+                        _ => crate::hash::hash64(key),
+                    };
+                    entry_hashes.push(hash);
+                    previous = Some((key, hash));
+                }
+            }
             if let Some(locator) = &locator
-                && let Err(e) = self.check_block_locator(locator, &mut locator_seen, block)
+                && let Err(e) =
+                    self.check_block_locator(locator, &mut locator_seen, block, &entry_hashes)
             {
                 failed = Some(G::Locator);
                 return Err(e);
             }
             if let Some(probe) = &mut filter
-                && let Err(e) = probe.check_block(block)
+                && let Err(e) = probe.check_block(block, &entry_hashes)
             {
                 failed = Some(G::Filter);
                 return Err(e);
@@ -5706,12 +5729,15 @@ impl Table {
     /// its newest version (blocks are sorted by key then descending seqno), so
     /// that block is the locator's expected answer and a later block's older
     /// versions must not overwrite the expectation.
+    ///
+    /// `key_hashes[i]` is the hash of `block.entries[i]`'s key.
     #[cfg(feature = "std")]
     fn check_block_locator(
         &self,
         locator: &crate::table::locator::LoadedLocator,
         seen: &mut crate::HashSet<Vec<u8>>,
         block: &DecodedBlock,
+        key_hashes: &[u64],
     ) -> crate::Result<()> {
         {
             let block_handle = block.handle;
@@ -5719,12 +5745,14 @@ impl Table {
             // reconstructed on load), so there the locator is per-block and
             // only the block-id is checked.
             let row_block = block.row.as_ref();
-            for entry in &block.entries {
-                let user_key = entry.key.user_key.to_vec();
-                if !seen.insert(user_key.clone()) {
+            debug_assert_eq!(key_hashes.len(), block.entries.len());
+            for (entry, &key_hash) in block.entries.iter().zip(key_hashes) {
+                let user_key: &[u8] = &entry.key.user_key;
+                // Copied only when first seen: the set outlives the block.
+                if seen.contains(user_key) {
                     continue;
                 }
-                let key_hash = crate::hash::hash64(&user_key);
+                seen.insert(user_key.to_vec());
                 // The writer OMITS the locator section when it cannot build one
                 // and otherwise encodes EVERY unique key, so a present locator
                 // that gives NO answer for a decoded key is a forgery — e.g. a
@@ -5757,7 +5785,7 @@ impl Table {
                     let found = block.point_read_at_slot(
                         slot,
                         is_entry,
-                        user_key.as_ref(),
+                        user_key,
                         crate::seqno::MAX_SEQNO,
                         &self.comparator,
                     )?;
@@ -6032,10 +6060,15 @@ impl Table {
     /// corruption by construction: it silently disappears the key from every
     /// read that consults the filter first.
     #[cfg(feature = "std")]
-    fn check_filter_block(probe: &mut FilterProbe<'_>, block: &DecodedBlock) -> crate::Result<()> {
+    fn check_filter_block(
+        probe: &mut FilterProbe<'_>,
+        block: &DecodedBlock,
+        key_hashes: &[u64],
+    ) -> crate::Result<()> {
         {
             let table = probe.table;
-            for entry in block.entries.iter().cloned() {
+            debug_assert_eq!(key_hashes.len(), block.entries.len());
+            for (entry, &key_hash) in block.entries.iter().zip(key_hashes) {
                 // Blocks are sorted by key then descending seqno, so a key's
                 // older versions are always adjacent — one probe per key.
                 if probe
@@ -6045,11 +6078,10 @@ impl Table {
                 {
                     continue;
                 }
-                let user_key = entry.key.user_key.to_vec();
-                let key_hash = crate::hash::hash64(&user_key);
+                let user_key: &[u8] = &entry.key.user_key;
                 let maybe_present = if let Some(idx) = &probe.index {
                     let mut iter = idx.iter(table.comparator.clone());
-                    iter.seek(&user_key, crate::seqno::MAX_SEQNO);
+                    iter.seek(user_key, crate::seqno::MAX_SEQNO);
                     let Some(part_handle) = iter.next() else {
                         // A key past the last partition is a definite miss on
                         // the read path — a false negative by construction.
@@ -6103,7 +6135,7 @@ impl Table {
                 // deliberately best-effort), so this runs only for a full
                 // filter with a configured extractor.
                 if let (Some(filter), Some(extractor)) = (&probe.full, &probe.prefix_extractor) {
-                    for prefix in extractor.prefixes(&user_key) {
+                    for prefix in extractor.prefixes(user_key) {
                         let prefix_hash = crate::hash::hash64(prefix);
                         if !filter.maybe_contains_hash(prefix_hash)? {
                             return Err(crate::Error::InvalidHeader(
@@ -6112,7 +6144,7 @@ impl Table {
                         }
                     }
                 }
-                probe.prev_key = Some(user_key);
+                probe.prev_key = Some(entry.key.user_key.clone());
             }
             Ok(())
         }
@@ -7201,7 +7233,12 @@ impl Table {
                     seqno,
                     &self.comparator,
                 )?,
-                _ => data_block.point_read_value(key, seqno, &self.comparator)?,
+                _ => data_block.point_read_value_hashed(
+                    key,
+                    Some(key_hash),
+                    seqno,
+                    &self.comparator,
+                )?,
             };
             if let Some(found) = found {
                 return Ok(Some(found));
@@ -7228,7 +7265,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+            if let Some(found) =
+                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            {
                 return Ok(Some(found));
             }
 
@@ -7344,7 +7383,7 @@ impl Table {
                 Some((slot, is_entry)) if !is_columnar => {
                     data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
                 }
-                _ => data_block.point_read(key, seqno, &self.comparator)?,
+                _ => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
             };
             if let Some(item) = found {
                 return Ok(Some((item, data_block)));
@@ -7374,7 +7413,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+            if let Some(item) =
+                data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            {
                 return Ok(Some((item, data_block)));
             }
 
@@ -7689,13 +7730,16 @@ impl Table {
             //     and retries the same key.
             while p < passing.len() {
                 let key_idx = passing[p];
-                let key = sorted_keys[key_idx].0;
+                let (key, key_hash) = sorted_keys[key_idx];
                 match self.comparator.compare(key, end_key) {
                     core::cmp::Ordering::Greater => break,
                     core::cmp::Ordering::Less => {
-                        if let Some(mut item) =
-                            data_block.point_read(key, table_seqno, &self.comparator)?
-                        {
+                        if let Some(mut item) = data_block.point_read_hashed(
+                            key,
+                            Some(key_hash),
+                            table_seqno,
+                            &self.comparator,
+                        )? {
                             // Translate table-local seqno back to
                             // the global coordinate so callers can
                             // compare results across tables /
@@ -7707,9 +7751,12 @@ impl Table {
                         p += 1;
                     }
                     core::cmp::Ordering::Equal => {
-                        if let Some(mut item) =
-                            data_block.point_read(key, table_seqno, &self.comparator)?
-                        {
+                        if let Some(mut item) = data_block.point_read_hashed(
+                            key,
+                            Some(key_hash),
+                            table_seqno,
+                            &self.comparator,
+                        )? {
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                             p += 1;
@@ -8203,11 +8250,12 @@ impl Table {
         &self,
         block: &DataBlock,
         key: &[u8],
+        key_hash: u64,
         table_seqno: SeqNo,
     ) -> crate::Result<Option<InternalValue>> {
         let global_seqno = self.global_seqno();
         Ok(block
-            .point_read(key, table_seqno, &self.comparator)?
+            .point_read_hashed(key, Some(key_hash), table_seqno, &self.comparator)?
             .map(|mut item| {
                 item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                 item

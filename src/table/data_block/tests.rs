@@ -1841,3 +1841,52 @@ fn from_column_batch_masked_returns_none_when_all_deleted() {
             .is_none()
     );
 }
+
+/// A block whose hash index is given the key hashes the table writer took is
+/// the block the encoder writes hashing every key itself, versions of a key
+/// included, and a point read given the needle's hash finds what one hashing
+/// it finds, absent keys included.
+#[test]
+fn a_hash_index_built_from_given_hashes_is_the_same_block() -> crate::Result<()> {
+    let mut items = Vec::new();
+    for key in 0..40_u32 {
+        let key = format!("key-{key:04}");
+        // Several versions of every fifth key, spanning restart intervals.
+        let versions = if key.ends_with('5') { 5 } else { 1 };
+        for seqno in (0..versions).rev() {
+            items.push(InternalValue::from_components(
+                key.as_bytes(),
+                format!("{key}@{seqno}").as_bytes(),
+                seqno,
+                Value,
+            ));
+        }
+    }
+    let hashes: Vec<u64> = items
+        .iter()
+        .map(|item| crate::hash::hash64(&item.key.user_key))
+        .collect();
+
+    let hashing = DataBlock::encode_into_vec(&items, 4, 1.33)?;
+    let mut given = Vec::new();
+    DataBlock::encode_hashed_into(&mut given, &items, Some(&hashes), 4, 1.33)?;
+    assert_eq!(given, hashing, "the same block bytes");
+
+    let block = DataBlock::new(Block {
+        data: given.into(),
+        header: Header::test_dummy(BlockType::Data),
+    });
+    assert!(block.hash_bucket_count().expect("a hash index") > 0);
+    let cmp = default_comparator();
+    for needle in ["key-0005", "key-0012", "key-0035", "key-9999", "a"] {
+        let hash = crate::hash::hash64(needle.as_bytes());
+        for seqno in [SeqNo::MAX, 3, 1] {
+            assert_eq!(
+                block.point_read_hashed(needle.as_bytes(), Some(hash), seqno, &cmp)?,
+                block.point_read(needle.as_bytes(), seqno, &cmp)?,
+                "{needle} at {seqno}"
+            );
+        }
+    }
+    Ok(())
+}

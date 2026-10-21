@@ -191,7 +191,7 @@ lz4_flex = { version = "0.14.0", optional = true, default-features = false, feat
 # SIMD kernels (dropping them leaves the scalar path), long-distance matching
 # and its hash. The trainer stays out, as the library only consumes finished
 # dictionaries; it would pull `fastrand` into every consumer.
-structured-zstd = { version = "0.2.3", optional = true, default-features = false, features = [
+structured-zstd = { version = "0.2.4", optional = true, default-features = false, features = [
     "hash",
     "ldm",
     "std",
@@ -329,7 +329,7 @@ test-log = "0.2.18"
 # rather than to the normal dependency: a dev-dependency's features do not
 # reach consumers, so none of them pays for `fastrand` (and the `std` it
 # forces) for a capability they do not use.
-structured-zstd = { version = "0.2.3", features = ["dict-builder", "lsm"] }
+structured-zstd = { version = "0.2.4", features = ["dict-builder", "lsm"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
@@ -423,6 +423,12 @@ name = "resumable_multi_get"
 harness = false
 path = "benches/resumable_multi_get.rs"
 required-features = ["io-uring"]
+
+[[bench]]
+name = "filter_build"
+harness = false
+path = "benches/filter_build.rs"
+required-features = []
 
 [[bench]]
 name = "multi_get_metadata_budget"

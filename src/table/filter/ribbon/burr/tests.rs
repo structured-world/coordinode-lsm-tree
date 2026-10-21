@@ -1672,3 +1672,59 @@ fn the_build_peak_counts_the_solver_rows_by_slot() {
         }
     }
 }
+
+/// A build writes the same bytes for the same keys, release after release: a
+/// table's filter is probed by whatever binary reads it, so how a filter is
+/// built may change only where the bytes it writes do not. Pinned as digests
+/// of the wire bytes of membership filters over several key counts and widths
+/// and of retrieval filters, the locator's kind.
+#[test]
+fn the_bytes_a_build_writes_are_pinned() {
+    let wire_digest = |filter: &super::BurrFilter| crate::hash::hash64(&filter.to_wire_bytes());
+    let mut digests = Vec::new();
+    for n in [1_u64, 64, 1_000, 20_000, 100_000] {
+        let hashes: Vec<u64> = (0..n)
+            .map(|i| crate::hash::hash64(&i.to_le_bytes()))
+            .collect();
+        for bpk in [7.0_f32, 10.0, 16.0] {
+            let n = usize::try_from(n).expect("count");
+            let builder =
+                BurrBuilder::new(BurrParams::with_bpk(n, bpk).expect("params")).expect("builder");
+            digests.push(wire_digest(
+                &builder.build_from_hashes(&hashes).expect("build"),
+            ));
+        }
+        if n >= 1_000 {
+            let locators: Vec<u64> = (0..n).map(|i| i % 4_096).collect();
+            let n = usize::try_from(n).expect("count");
+            let builder =
+                BurrBuilder::new(BurrParams::with_bpk(n, 12.0).expect("params")).expect("builder");
+            digests.push(wire_digest(
+                &builder
+                    .build_from_hashes_with_values(&hashes, &locators)
+                    .expect("build"),
+            ));
+        }
+    }
+    let pinned: [u64; 18] = [
+        3_815_365_290_552_776_906,
+        1_748_072_749_614_488_322,
+        13_563_137_826_912_793_407,
+        10_804_503_757_738_443_961,
+        676_782_044_860_804_475,
+        6_163_384_207_249_086_646,
+        10_389_659_486_369_428_261,
+        11_785_463_675_829_336_572,
+        17_106_519_233_318_779_968,
+        17_423_665_052_658_219_032,
+        10_058_191_845_073_751_368,
+        12_103_193_016_267_314_475,
+        17_770_330_224_679_762_784,
+        8_595_782_885_569_151_629,
+        8_036_833_325_504_223_231,
+        9_042_872_693_352_849_324,
+        154_090_443_446_321_825,
+        3_493_293_976_891_526_240,
+    ];
+    assert_eq!(digests, pinned, "the wire bytes of a build changed");
+}

@@ -62,8 +62,9 @@ impl Builder {
         self.0.len() as u32
     }
 
-    /// Tries to map the given key to the binary index position.
-    pub fn set(&mut self, key: &[u8], binary_index_pos: u8) -> bool {
+    /// Tries to map the key whose [`crate::hash::hash64`] is `key_hash` to
+    /// the binary index position.
+    pub fn set(&mut self, key_hash: u64, binary_index_pos: u8) -> bool {
         debug_assert!(
             binary_index_pos <= 253,
             "restart index too high for hash index"
@@ -71,7 +72,7 @@ impl Builder {
 
         assert!(self.bucket_count() > 0, "no buckets to insert into");
 
-        let bucket_pos = calculate_bucket_position(key, self.bucket_count());
+        let bucket_pos = calculate_bucket_position(key_hash, self.bucket_count());
 
         // SAFETY: We use modulo in `calculate_bucket_position`
         #[expect(unsafe_code, reason = "see safety")]

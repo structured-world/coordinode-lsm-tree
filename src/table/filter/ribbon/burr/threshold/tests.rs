@@ -44,12 +44,80 @@ fn overloaded_block_lowers_threshold_to_cap_th_offset() {
 fn partition_routes_keys_correctly() {
     // Keys at starts [0..16] in block 0, threshold = 14. Keys
     // 0..13 → kept (14 of them), 14..15 → bumped (2 of them).
-    let keys: Vec<usize> = (0..16).collect();
-    let equations: Vec<_> = (0..16).map(eq_at).collect();
+    let mut keys: Vec<u64> = (0..16).collect();
+    let mut equations: Vec<_> = (0..16).map(eq_at).collect();
     let thresholds = vec![14_u8, 16, 16, 16];
-    let (kept, bumped) = partition_keys_by_threshold(&keys, &equations, &thresholds, 16);
-    assert_eq!(kept.len(), 14);
-    assert_eq!(bumped, vec![14, 15]);
+    let mut bumped = Bumped {
+        hashes: Vec::new(),
+        values: None,
+    };
+    split_bumped(
+        &mut keys,
+        None,
+        &mut equations,
+        &thresholds,
+        16,
+        &mut bumped,
+    );
+    assert_eq!(keys, (0..14).collect::<Vec<_>>());
+    assert_eq!(equations, (0..14).map(eq_at).collect::<Vec<_>>());
+    assert_eq!(bumped.hashes, vec![14, 15]);
+}
+
+/// A retrieval split moves each value with its key, and keeps both halves in
+/// the order the keys came in, interleaved or not.
+#[test]
+fn a_split_moves_values_with_their_keys_in_order() {
+    let starts = [15, 0, 14, 1, 3, 15];
+    let mut keys: Vec<u64> = (100..106).collect();
+    let mut values: Vec<u64> = (200..206).collect();
+    let mut equations: Vec<_> = starts.iter().map(|&start| eq_at(start)).collect();
+    let thresholds = vec![14_u8, 16, 16, 16];
+    let mut bumped = Bumped {
+        hashes: alloc::vec![7],
+        values: Some(alloc::vec![8]),
+    };
+    split_bumped(
+        &mut keys,
+        Some(&mut values),
+        &mut equations,
+        &thresholds,
+        16,
+        &mut bumped,
+    );
+    assert_eq!(keys, vec![101, 103, 104]);
+    assert_eq!(values, vec![201, 203, 204]);
+    assert_eq!(equations, [0, 1, 3].map(eq_at).to_vec());
+    assert_eq!(
+        bumped.hashes,
+        vec![7, 100, 102, 105],
+        "appended after what was there"
+    );
+    assert_eq!(bumped.values, Some(vec![8, 200, 202, 205]));
+}
+
+/// The threshold is the `cap`-th smallest offset whether the block's keys
+/// arrive in order or not, and ties at it all bump.
+#[test]
+fn the_threshold_is_the_cap_th_smallest_offset_in_any_order() {
+    // cap = 14 for b = 16. Offsets 0..=12 once, then 13 twice and 15 once,
+    // given backwards: the 14th smallest (index 14) is the second 13.
+    let mut starts: Vec<usize> = (0..=12).collect();
+    starts.extend([13, 13, 15]);
+    starts.reverse();
+    let equations: Vec<_> = starts.iter().map(|&start| eq_at(start)).collect();
+    let thresholds = compute_thresholds(&equations, 64, 16);
+    assert_eq!(thresholds, vec![13, 16, 16, 16]);
+}
+
+/// A block holding exactly `cap` keys keeps them all, and one more key
+/// lowers its threshold to that key's offset when it is the largest.
+#[test]
+fn a_block_at_capacity_keeps_all_and_one_more_bumps_the_largest() {
+    let at_cap: Vec<_> = (0..14).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&at_cap, 32, 16), vec![16, 16]);
+    let over: Vec<_> = (0..14).chain([15]).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&over, 32, 16), vec![15, 16]);
 }
 
 #[test]
@@ -61,6 +129,18 @@ fn is_bumped_predicate_matches_partition() {
         // First 14 keep; last 2 bump.
         assert_eq!(bumped, i >= 14, "key {i} bumped state mismatch");
     }
+}
+
+/// The widest block, 255 rows, walks every offset `u8` holds: an underloaded
+/// one keeps everything, and an overloaded one gets its `cap`-th offset, with
+/// no offset counter running past 255.
+#[test]
+fn a_block_of_255_rows_walks_every_offset() {
+    let underloaded: Vec<_> = (0..10).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&underloaded, 255, 255), vec![255]);
+    // cap = 229 for 255 rows: one key at each of offsets 0..=254.
+    let overloaded: Vec<_> = (0..255).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&overloaded, 255, 255), vec![229]);
 }
 
 #[test]

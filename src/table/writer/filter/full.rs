@@ -180,10 +180,11 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
         self
     }
 
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
+    fn register_key(&mut self, key: &UserKey, key_hash: u64) -> crate::Result<usize> {
+        debug_assert_eq!(key_hash, crate::hash::hash64(key), "the hash of this key");
         let before = self.bloom_hash_buffer.len();
         self.keys += 1;
-        self.bloom_hash_buffer.push(crate::hash::hash64(key));
+        self.bloom_hash_buffer.push(key_hash);
 
         // A prefix the previous key had at the same position is a repeat and
         // is dropped here, so the buffer, and the estimates taken from it, hold

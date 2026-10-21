@@ -46,23 +46,24 @@ pub(crate) fn z_byte_len(m: usize, r: u8) -> Option<usize> {
         .and_then(|words| words.checked_mul(8))
 }
 
-/// Transposes row-major solution rows into the bit-sliced layout.
+/// Transposes row-major solution rows into the bit-sliced layout, as the
+/// little-endian bytes of its words, into `out`: the
+/// `z_byte_len(rows.len(), r)` bytes the payload takes, all zero.
 ///
 /// `rows[i]` holds row `i`'s value in its low `r` bits; any higher bit is
 /// ignored, so a caller that has already masked to `r` and one that has not
-/// produce the same payload. The result has `segments_for(rows.len()) * r`
-/// words, ordered segment-major.
-#[must_use]
-pub(crate) fn transpose(rows: &[u64], r: u8) -> Vec<u64> {
+/// produce the same payload. The words are ordered segment-major.
+pub(crate) fn transpose_into(rows: &[u64], r: u8, out: &mut [u8]) {
+    debug_assert_eq!(Some(out.len()), z_byte_len(rows.len(), r));
     let r = usize::from(r);
-    let mut out = alloc::vec![0u64; segments_for(rows.len()) * r];
     // Scatter rather than gather: walking the rows once and spreading each
     // row's set bits costs one iteration per SET bit, where gathering per
     // (segment, bit) pair would read all 64 rows for every one of the r
-    // columns whether or not the bit is set.
+    // columns whether or not the bit is set. Bit `k` of a little-endian
+    // word is bit `k % 8` of its byte `k / 8`.
     for (i, &row) in rows.iter().enumerate() {
-        let base = (i / SEGMENT_ROWS) * r;
-        let bit = 1u64 << (i % SEGMENT_ROWS);
+        let base = (i / SEGMENT_ROWS) * r * 8 + (i % SEGMENT_ROWS) / 8;
+        let bit = 1u8 << (i % 8);
         let mut value = if r == 64 {
             row
         } else {
@@ -72,16 +73,27 @@ pub(crate) fn transpose(rows: &[u64], r: u8) -> Vec<u64> {
             let j = value.trailing_zeros() as usize;
             value &= value - 1;
             // `j < r` because `value` was masked to r bits, and the segment
-            // index is `i / 64 < segments`, so the word index is in range.
-            if let Some(word) = out.get_mut(base + j) {
-                *word |= bit;
+            // index is `i / 64 < segments`, so the byte index is in range.
+            if let Some(byte) = out.get_mut(base + j * 8) {
+                *byte |= bit;
             }
         }
     }
-    out
 }
 
-/// Inverse of [`transpose`]: rebuilds `row_count` row-major values from the
+/// [`transpose_into`] as the payload's words.
+#[must_use]
+#[cfg(test)]
+pub(crate) fn transpose(rows: &[u64], r: u8) -> Vec<u64> {
+    let mut bytes = alloc::vec![0u8; z_byte_len(rows.len(), r).unwrap_or(0)];
+    transpose_into(rows, r, &mut bytes);
+    bytes
+        .chunks_exact(8)
+        .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
+        .collect()
+}
+
+/// Inverse of [`transpose_into`]: rebuilds `row_count` row-major values from the
 /// bit-sliced words. Used by the round-trip tests and by the diagnostic
 /// tooling that prints a layer's rows.
 #[must_use]

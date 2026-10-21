@@ -47,7 +47,7 @@ pub(super) fn tasks_for<'a>(
                     handle,
                     table_seqno,
                     special: table.is_chunk_special(),
-                    keys: positions.iter().map(|_| 0).collect(),
+                    keys: positions.iter().map(|_| (0, 0)).collect(),
                 });
             }
         }

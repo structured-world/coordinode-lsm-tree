@@ -231,7 +231,14 @@ fn burr_bytes(image: &BurrImage) -> crate::Result<Vec<u8>> {
         BurrKind::Membership => wire::BURR_FILTER_TYPE_BYTE,
         BurrKind::Retrieval => wire::BURR_RETRIEVAL_TYPE_BYTE,
     };
-    let bytes = wire::encode_layers(tag, (image.r, image.w, image.b), image.root_seed, &layers);
+    let mut bytes = Vec::new();
+    wire::encode_layers(
+        tag,
+        (image.r, image.w, image.b),
+        image.root_seed,
+        layers.iter().copied(),
+        &mut bytes,
+    );
     wire::decode_as(&bytes, tag)?;
     Ok(bytes)
 }

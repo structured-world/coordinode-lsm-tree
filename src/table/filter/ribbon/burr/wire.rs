@@ -88,7 +88,7 @@ pub(crate) const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 /// Per-layer fixed header length: m + num_blocks + z_byte_len = 12.
 pub(crate) const LAYER_HEADER_LEN: usize = 12;
 
-/// The exact number of bytes [`encode`] will produce for `filter`, without
+/// The exact number of bytes [`encode_into`] will append for `filter`, without
 /// serialising it.
 ///
 /// This is the figure memory accounting and the filter-size budget use. It is
@@ -118,28 +118,25 @@ pub(crate) fn encoded_len(filter: &BurrFilter) -> usize {
 /// One layer of a solution as [`encode_layers`] writes it: its slot count,
 /// its per-block thresholds and its rows, row-major, each row's result in
 /// its low `r` bits.
+#[derive(Clone, Copy)]
 pub(crate) struct LayerParts<'a> {
     pub(crate) m: usize,
     pub(crate) thresholds: &'a [u8],
     pub(crate) rows: &'a [u64],
 }
 
-/// Serialize a built [`BurrFilter`] into the wire format.
-pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
+/// Appends a built [`BurrFilter`] in the wire format to `buf`.
+pub(crate) fn encode_into(filter: &BurrFilter, buf: &mut Vec<u8>) {
     let params = filter.params();
-    let layers: Vec<LayerParts<'_>> = filter
-        .layers_inner()
-        .iter()
-        .map(|layer| {
-            let rows = layer.ribbon.z_raw_words();
-            debug_assert_eq!(rows.len(), layer.m, "one solver row per slot");
-            LayerParts {
-                m: layer.m,
-                thresholds: &layer.thresholds,
-                rows,
-            }
-        })
-        .collect();
+    let layers = filter.layers_inner().iter().map(|layer| {
+        let rows = layer.ribbon.z_raw_words();
+        debug_assert_eq!(rows.len(), layer.m, "one solver row per slot");
+        LayerParts {
+            m: layer.m,
+            thresholds: &layer.thresholds,
+            rows,
+        }
+    });
     // Header. The filter_type tag distinguishes a membership payload
     // (probe → bool) from a retrieval payload (recover → locator); both
     // share the rest of the layout.
@@ -151,30 +148,32 @@ pub(crate) fn encode(filter: &BurrFilter) -> Vec<u8> {
         filter_type_byte,
         (params.r, params.w, params.b),
         params.seed,
-        &layers,
-    )
+        layers,
+        buf,
+    );
 }
 
-/// Serialize a solution given as its parameters `(r, w, b)`, its root seed and
-/// its layers into the wire format, under `filter_type_byte`.
-pub(crate) fn encode_layers(
+/// Appends a solution given as its parameters `(r, w, b)`, its root seed and
+/// its layers in the wire format, under `filter_type_byte`, to `buf`.
+pub(crate) fn encode_layers<'a>(
     filter_type_byte: u8,
     (r, w, b): (u8, u8, u8),
     seed: u64,
-    layers: &[LayerParts<'_>],
-) -> Vec<u8> {
+    layers: impl Iterator<Item = LayerParts<'a>> + Clone,
+    buf: &mut Vec<u8>,
+) {
     // Pre-size the buffer to avoid reallocations: header + per-layer
     // (fixed header + thresholds + z) for every layer.
-    let estimated_size: usize = HEADER_LEN
+    let size: usize = HEADER_LEN
         + layers
-            .iter()
+            .clone()
             .map(|layer| {
                 LAYER_HEADER_LEN
                     + layer.thresholds.len()
                     + super::packed::z_byte_len(layer.m, r).unwrap_or(0)
             })
             .sum::<usize>();
-    let mut buf = Vec::with_capacity(estimated_size);
+    buf.reserve(size);
 
     buf.extend_from_slice(&MAGIC_BYTES);
     #[expect(clippy::expect_used, reason = "writing to a Vec<u8> cannot fail")]
@@ -188,7 +187,7 @@ pub(crate) fn encode_layers(
             clippy::cast_possible_truncation,
             reason = "max_layers fits u8 by construction"
         )]
-        let num_layers_u8 = layers.len() as u8;
+        let num_layers_u8 = layers.clone().count() as u8;
         buf.write_u8(num_layers_u8).expect("vec write");
         buf.write_u64::<LittleEndian>(seed).expect("vec write");
     }
@@ -243,15 +242,14 @@ pub(crate) fn encode_layers(
         // The solver works row-major — back-substitution reads rows below the
         // one it is finishing — so the transpose happens here, once per layer,
         // on the way out. The builder's row-major buffer is transient; what is
-        // stored, cached and probed is the bit-sliced form.
-        let columns = super::packed::transpose(layer.rows, r);
-        debug_assert_eq!(columns.len() * 8, z_byte_len);
-        for word in columns {
-            buf.extend_from_slice(&word.to_le_bytes());
+        // stored, cached and probed is the bit-sliced form, written straight
+        // into its place here.
+        let at = buf.len();
+        buf.resize(at + z_byte_len, 0);
+        if let Some(z) = buf.get_mut(at..) {
+            super::packed::transpose_into(layer.rows, r, z);
         }
     }
-
-    buf
 }
 
 /// Borrowed-slice view of one decoded layer.

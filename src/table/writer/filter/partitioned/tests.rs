@@ -14,7 +14,8 @@ type W = std::io::Cursor<Vec<u8>>;
 fn the_scratch_counts_the_top_level_entry_of_the_open_partition() -> crate::Result<()> {
     let scratch = |key_len: usize| -> crate::Result<u64> {
         let mut writer = PartitionedFilterWriter::new(BloomConstructionPolicy::default());
-        FilterWriter::<W>::register_key(&mut writer, &vec![b'k'; key_len].into())?;
+        let key: crate::UserKey = vec![b'k'; key_len].into();
+        FilterWriter::<W>::register_key(&mut writer, &key, crate::hash::hash64(&key))?;
         Ok(FilterWriter::<W>::finish_scratch_bytes(&writer))
     };
     let short = scratch(10)?;
@@ -117,7 +118,8 @@ mod parallel {
                     .use_encryption(self.encryption.clone())
                     .use_parallel(parallel);
             for i in 0..self.keys {
-                writer.register_key(&format!("key{i:08}").into_bytes().into())?;
+                let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
+                writer.register_key(&key, crate::hash::hash64(&key))?;
             }
             before_finish();
             let mut file = crate::sfa::Writer::from_writer(
@@ -282,9 +284,10 @@ mod parallel {
         let mut serial = PartitionedFilterWriter::new(BloomConstructionPolicy::default());
         serial.partition_size = 256;
         for i in 0..5_000u32 {
-            let key = format!("key{i:08}").into_bytes().into();
-            writer.register_key(&key)?;
-            FilterWriter::<W>::register_key(&mut serial, &key)?;
+            let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
+            let hash = crate::hash::hash64(&key);
+            writer.register_key(&key, hash)?;
+            FilterWriter::<W>::register_key(&mut serial, &key, hash)?;
         }
         let on_workers = writer.held_bytes();
         let built_here = FilterWriter::<W>::held_bytes(&serial);

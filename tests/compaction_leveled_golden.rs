@@ -129,4 +129,8 @@ fn leveled_compaction_keeps_its_fingerprint() {
 }
 
 /// What the stream ends in under the leveled strategy as it was written.
-const EXPECTED: u64 = 0xc328_82ea_28db_115b;
+///
+/// The stream's small tables close on the state their writer holds as often
+/// as on their size, so a change to what the writer counts its filter and
+/// locator builds to hold moves the fingerprint as well.
+const EXPECTED: u64 = 0x50c1_3121_5f6d_4869;

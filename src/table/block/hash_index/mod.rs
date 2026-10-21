@@ -27,17 +27,15 @@ pub use reader::Reader;
 pub(crate) const MARKER_FREE: u8 = u8::MAX - 1; // 254
 pub(crate) const MARKER_CONFLICT: u8 = u8::MAX; // 255
 
-/// Calculates the bucket index for the given key.
+/// Calculates the bucket index for the key whose [`crate::hash::hash64`] is
+/// `key_hash`: the hash the table's filter and locator take of the same key,
+/// so a caller holding it needs no second one.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the hash index has a bucket count <= u32"
 )]
-fn calculate_bucket_position(key: &[u8], bucket_count: u32) -> usize {
-    use crate::hash::hash64;
-
-    let hash = hash64(key);
-
-    (hash % u64::from(bucket_count)) as usize
+fn calculate_bucket_position(key_hash: u64, bucket_count: u32) -> usize {
+    (key_hash % u64::from(bucket_count)) as usize
 }
 
 #[cfg(test)]

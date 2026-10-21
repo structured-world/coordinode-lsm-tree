@@ -338,13 +338,16 @@ impl TableFilePools {
         let pooled = claimed?.ok_or_else(|| Writing::new(&pool.writing, self.pools.ids.next()));
         let refill = due.then(|| self.pools.reserve(pool, at, folder, fs));
         drop(folders);
+        // The write's own file is made before the refill starts, so the batch
+        // never reaches the backend ahead of the file the write waits on.
+        let claimed = match pooled {
+            Ok(claimed) => Ok(claimed),
+            Err(made) => Pools::create(folder, fs, made),
+        };
         if let Some(refill) = refill {
             self.start(refill);
         }
-        match pooled {
-            Ok(claimed) => Ok(claimed),
-            Err(made) => Pools::create(folder, fs, made),
-        }
+        claimed
     }
 
     /// Runs `refill` off this thread. A thread that cannot be started leaves

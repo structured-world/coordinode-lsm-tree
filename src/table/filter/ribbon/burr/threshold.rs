@@ -52,13 +52,14 @@ pub(crate) const fn block_capacity(b: usize) -> usize {
 ///
 /// # Algorithm
 ///
-/// 1. Bucket equations by `block_idx = start / b`. Per-bucket list of
-///    `offset = start % b` values (capped at `b - 1`).
+/// 1. Count the keys starting at each row of the layer's blocks.
 /// 2. Per block, target keep-capacity `cap = b * CAP_NUM / CAP_DEN`.
-/// 3. If the bucket has `≤ cap` keys, threshold = `b` (accept all).
-/// 4. Otherwise sort offsets ascending; the smallest `cap` offsets are
-///    kept. Threshold = the `cap`-th sorted offset (0-indexed) — keys
-///    with offset strictly less than this value are kept.
+/// 3. If the block holds `≤ cap` keys, threshold = `b` (accept all).
+/// 4. Otherwise the threshold is the `cap`-th smallest offset (0-indexed):
+///    the first offset at which the keys counted so far exceed `cap`. Keys
+///    with offset strictly less than this value are kept, the smallest `cap`
+///    of them. Counting gives that order statistic in one pass, without
+///    collecting and sorting each block's offsets.
 ///
 /// Pathological case: if `cap` keys share the same offset value (rare
 /// for well-distributed hashes), the threshold will be that offset, and
@@ -68,10 +69,8 @@ pub(crate) const fn block_capacity(b: usize) -> usize {
 #[must_use]
 #[expect(
     clippy::indexing_slicing,
-    reason = "block_idx is bounds-checked by `if block_idx < block_count`; \
-              thresholds[i] uses `i` from `block_offsets.iter().enumerate()` \
-              over a vec we just sized to block_count; offsets[cap_per_block] \
-              is gated by the earlier `if offsets.len() <= cap_per_block` early-continue"
+    reason = "a start below `rows` indexes `counts`, sized to `rows`; a block's \
+              rows `block * b .. (block + 1) * b` lie within it as `block < block_count`"
 )]
 pub(crate) fn compute_thresholds(equations: &[StandardEquation], m: usize, b: u8) -> Vec<u8> {
     debug_assert!(m > 0, "compute_thresholds requires m > 0");
@@ -81,76 +80,96 @@ pub(crate) fn compute_thresholds(equations: &[StandardEquation], m: usize, b: u8
     let block_count = m.div_ceil(b_usize);
     let cap_per_block = block_capacity(b_usize);
 
-    // First pass: count keys per block to size each bucket exactly.
-    let mut block_counts = vec![0_usize; block_count];
+    // Keys starting at each row; a start past the last block counts nowhere.
+    // A row's count is bounded by the key count, which fits `u32` for any
+    // layer a filter builds (its slots are counted in `u32` on the wire).
+    let rows = block_count * b_usize;
+    let mut counts = alloc::vec![0_u32; rows];
     for eq in equations {
-        let block_idx = eq.start / b_usize;
-        if block_idx < block_count {
-            block_counts[block_idx] += 1;
+        if eq.start < rows {
+            counts[eq.start] += 1;
         }
     }
 
-    // Second pass: collect offsets per block.
-    let mut block_offsets: Vec<Vec<u8>> = block_counts
-        .iter()
-        .map(|&n| Vec::with_capacity(n))
-        .collect();
-    for eq in equations {
-        let block_idx = eq.start / b_usize;
-        if block_idx < block_count {
-            let offset = (eq.start % b_usize) as u8;
-            block_offsets[block_idx].push(offset);
+    let mut thresholds = alloc::vec![b; block_count];
+    for (block, threshold) in thresholds.iter_mut().enumerate() {
+        let block_counts = &counts[block * b_usize..(block + 1) * b_usize];
+        let mut kept = 0_usize;
+        // `0..b` ends where the block does, so the offset never steps past
+        // `u8` even for a 255-row block.
+        for (offset, &count) in (0..b).zip(block_counts) {
+            kept += count as usize;
+            if kept > cap_per_block {
+                // More than `cap` keys start at or below this offset, at most
+                // `cap` below it: this is the `cap`-th smallest offset.
+                *threshold = offset;
+                break;
+            }
         }
-    }
-
-    // Third pass: derive each block's threshold.
-    let mut thresholds = vec![b; block_count];
-    for (i, offsets) in block_offsets.iter_mut().enumerate() {
-        if offsets.len() <= cap_per_block {
-            // Block underloaded — accept everything.
-            continue;
-        }
-        offsets.sort_unstable();
-        // The threshold is the offset value at the `cap_per_block`-th
-        // position (sorted ascending). Strict `<` against this threshold
-        // keeps exactly the `cap_per_block` smallest-offset keys (modulo
-        // ties at the boundary, which lean toward bumping — safe).
-        thresholds[i] = offsets[cap_per_block];
     }
 
     thresholds
 }
 
-/// Partition keys into (kept, bumped) according to the given thresholds.
+/// The keys a split moves to the next layer, and their values for a
+/// retrieval build, in their order.
+pub(crate) struct Bumped {
+    pub(crate) hashes: Vec<u64>,
+    pub(crate) values: Option<Vec<u64>>,
+}
+
+/// Moves the keys `thresholds` bump out of `hashes`, with the `values` and
+/// `equations` parallel to them, keeping the kept ones at the front in their
+/// order; returns the bumped ones, in their order, appended to `bumped`.
 ///
-/// Inputs are parallel slices — `keys[i]` must correspond to
-/// `equations[i]` (same hash, same layer seed). `thresholds` indexed by
-/// `block_idx = start / b`.
-///
-/// Returns `(kept, bumped)` where `kept` is built for this layer and
-/// `bumped` is forwarded to the next BuRR layer.
-pub(crate) fn partition_keys_by_threshold<K: Clone>(
-    keys: &[K],
-    equations: &[StandardEquation],
+/// `thresholds` is indexed by `block_idx = start / b`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "`at` ranges over the parallel vectors' common length and \
+              `kept <= at`, so both index within them"
+)]
+pub(crate) fn split_bumped(
+    hashes: &mut Vec<u64>,
+    mut values: Option<&mut Vec<u64>>,
+    equations: &mut Vec<StandardEquation>,
     thresholds: &[u8],
     b: u8,
-) -> (Vec<K>, Vec<K>) {
-    debug_assert_eq!(keys.len(), equations.len());
-    let b_usize = usize::from(b);
-
-    let mut kept = Vec::with_capacity(keys.len());
-    let mut bumped = Vec::with_capacity(keys.len() / 10); // expect ~10%
-    for (key, eq) in keys.iter().zip(equations.iter()) {
-        let block_idx = eq.start / b_usize;
-        let offset = (eq.start % b_usize) as u8;
-        let threshold = thresholds.get(block_idx).copied().unwrap_or(0);
-        if offset < threshold {
-            kept.push(key.clone());
+    bumped: &mut Bumped,
+) {
+    debug_assert_eq!(hashes.len(), equations.len());
+    let value_count = values.as_deref().map(Vec::len);
+    debug_assert!(value_count.is_none_or(|count| count == hashes.len()));
+    debug_assert_eq!(values.is_some(), bumped.values.is_some());
+    let moving = equations
+        .iter()
+        .filter(|eq| is_bumped(eq, thresholds, b))
+        .count();
+    bumped.hashes.reserve_exact(moving);
+    if let Some(bumped_values) = &mut bumped.values {
+        bumped_values.reserve_exact(moving);
+    }
+    let mut kept = 0;
+    for at in 0..equations.len() {
+        let eq = equations[at];
+        if is_bumped(&eq, thresholds, b) {
+            bumped.hashes.push(hashes[at]);
+            if let (Some(values), Some(bumped_values)) = (values.as_deref(), &mut bumped.values) {
+                bumped_values.push(values[at]);
+            }
         } else {
-            bumped.push(key.clone());
+            equations[kept] = eq;
+            hashes[kept] = hashes[at];
+            if let Some(values) = values.as_deref_mut() {
+                values[kept] = values[at];
+            }
+            kept += 1;
         }
     }
-    (kept, bumped)
+    equations.truncate(kept);
+    hashes.truncate(kept);
+    if let Some(values) = values {
+        values.truncate(kept);
+    }
 }
 
 /// Predicate variant: does a single equation get bumped under the given

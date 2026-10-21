@@ -74,8 +74,8 @@ impl Params {
             // seed family).
             //
             // BuRR's build path bypasses retry entirely via
-            // `build_with_seed_verbatim_from_hashes` (single verbatim-seed
-            // attempt), so retry/grow are inert for the in-crate caller.
+            // `build_from_equations` (single verbatim-seed attempt), so
+            // retry/grow are inert for the in-crate caller.
             retry_limit: 8,
             grow_limit: 0,
         };
