@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792597948024,
+  "lastUpdate": 1792597952333,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -56044,6 +56044,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.610551359,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7a76d6a793a2bcf217699a7b6127d490159c620e",
+          "message": "perf(table): write tables into pre-created files (#950)\n\n## Summary\n- Tables are written into empty files created ahead of time in batches,\nso a flush, compaction, merge-on-read relocation or ingestion install no\nlonger syncs the tables folder for every new table: one folder sync\ncovers a whole batch.\n- The pool is per tables folder, on by default, and sized by\n`Config::table_file_pool` (default 16; 0 creates each table file\ndirectly).\n\nReplaces #949 (same change, history squashed).\n\n## Changes\n- `table::file_pool`: one pool of empty `tables/{id}` files per physical\nfolder, however many routes (backend handles, path spellings the backend\nresolves to it) name it, refilled in batches with one directory sync.\nThe refill runs off the writing thread: a write's first table starts the\nnext batch once it leaves half a batch or less; a claim on a dry pool\nwaits for a refill already running (so ids stay in order) and otherwise\ngets a file made for it and starts one. Closing a tree joins its\nrefills; a refill the backend panics in is withdrawn so no claim waits\non it. A backend whose folder sync does nothing (Windows `StdFs`) keeps\nno pool. A claim opens its file without following a symbolic link or\nwaiting on a named pipe and takes it only when it is an empty regular\nfile with a single link; a file with bytes or a pipe is left on disk\nuntouched, a shared one is unlinked from the pool. A folder whose\nbackend cannot count links gives up its pool and creates every file\ndirectly.\n- The pool tracks the files of each folder that hold no table yet:\npooled, being made by a refill, or being written into. A table records\nthose ids below its own when it is finished (meta key `writing_below`);\na relocated copy records its own.\n- `FsOpenOptions::no_follow` refuses a symbolic link at the last path\ncomponent (`O_NOFOLLOW` on Unix, the link itself on Windows);\n`FsOpenOptions::no_wait` opens without waiting for the other end of a\nnamed pipe (`O_NONBLOCK` for the open only). Both are honoured by\n`StdFs` and both io_uring backends.\n- Open flags per architecture: `O_DIRECT` comes from the target's C\nlibrary (on aarch64 and arm the asm-generic bit is `O_DIRECTORY`), and\nthe raw io_uring backend uses the arm/aarch64/powerpc/m68k `O_DIRECTORY`\nand `O_NOFOLLOW`; its hand-spelled flags are checked against the C\nlibrary's at build time.\n- Writers claim from the pool (`MultiWriter::from_pool`,\n`Writer::into_claimed`). Only the first table of a write may refill the\npool; once it runs dry, the remaining tables of that write, including\nthose opened at finish for range tombstones past the last key, are\ncreated directly, and `MultiWriter::finish` reports it so the install\nsyncs the folder once.\n- Compaction outputs and merge-on-read relocations are numbered above\nevery input id; pooled ids at or below that bound are discarded. A\nrelocation no longer syncs the folder on top of the install.\n- A table written into a durable pooled file is marked `entry_durable`,\nand the install skips the folder sync when every new table carries it.\nUnder barrier sync, a folder on another device is still synced in full.\n- Flush takes its L0 recency after its first claim (its file's own id\nwhen the file is made for it), so table ids stay sequential.\n- Open adopts unreferenced empty regular files (not symlinks, not at the\ntop of the id range) back into the pool, each into one pool only, syncs\nthem before the first claim, and starts the id counter above them.\nAnything else unnamed, and every empty file when the pool is disabled,\nis an orphan.\n- Repair, for an empty table file no committed manifest names: when a\ntable of its folder above it (one that opened as a table, kept, set\naside or left out as a duplicate) does not list it in `writing_below`,\nthe file had its table written and lost its bytes, reported as a loss;\notherwise it is a pool file or an output a power loss cut short, listed\namong the excluded files and removed after the commit, not counted as a\nloss.\n- `Config::table_file_pool` builder, docs in `docs/INVARIANTS.md` and\n`docs/manifest-recovery.md`.\n\n## Testing\n- fmt, clippy (every CI configuration), full nextest, doc tests, doc\nbuild, no-std check, sst-dump and converter suites pass on Linux, and\nthe library builds for aarch64 Linux; the full suite also passes on\nWindows; a paired db_bench fillrandom/fillseq run against main shows no\nregression.\n- `benches/flush.rs` `flush_series` times flushes with and without the\npool interleaved in one run, under both sync modes: on btrfs the pool\ncuts mean flush time by about 20% and P95 by up to 28%; on ext4 over HDD\nmean and P95 by about 13%; on XFS, where a file's fsync already makes\nits new entry durable, mean and median are faster in every run and the\ntail is unchanged.\n\nCloses #928",
+          "timestamp": "2026-10-21T18:37:56+03:00",
+          "tree_id": "47a2eae9045301e87f61b6a07d8dd70cbadb02e1",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7a76d6a793a2bcf217699a7b6127d490159c620e"
+        },
+        "date": 1792597951049,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 507.37199999999996,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 81.253992ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 175.11499999999998,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 55.430626ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 473.891,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 102.365618ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4076.667,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9606.142,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 26.271,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 93.061119,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.681185177,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 60\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 29.807,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 87.425023,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.675135836,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
