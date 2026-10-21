@@ -425,6 +425,12 @@ path = "benches/resumable_multi_get.rs"
 required-features = ["io-uring"]
 
 [[bench]]
+name = "filter_build"
+harness = false
+path = "benches/filter_build.rs"
+required-features = []
+
+[[bench]]
 name = "multi_get_metadata_budget"
 harness = false
 path = "benches/multi_get_metadata_budget.rs"
