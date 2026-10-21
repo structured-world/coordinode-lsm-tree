@@ -14,6 +14,12 @@ use lsm_tree::io::ErrorKind;
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 use test_log::test;
 
+/// The folder syncs a compaction's install issues for its output's new entry
+/// before the tree folder's: none where the output is written into a pooled
+/// file, one where a folder sync does nothing and so there is no pool
+/// (Windows).
+const UNPOOLED_FOLDER_SYNCS: u64 = if cfg!(windows) { 1 } else { 0 };
+
 #[test]
 fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -202,11 +208,17 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
             tree.insert(k, "v", seqno);
             tree.flush_active_memtable(0)?;
         }
-        // The install's directory sync fails (the output is written into a
-        // pooled file, so the first one), then the removal that would
+        // The install's directory sync fails, then the removal that would
         // withdraw its snapshot; the first removal is that of a leftover
-        // temporary.
-        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
+        // temporary. The output is written into a pooled file, so the
+        // install's sync is the first one, except where a folder sync does
+        // nothing and so there is no pool (Windows): there the output's file
+        // is made for it, and the install syncs its folder first.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(UNPOOLED_FOLDER_SYNCS)
+                .once(),
+        );
         injector.arm(
             FaultRule::new(FaultOp::RemoveFile, Fault::Error(ErrorKind::Other))
                 .on_path(snapshot)
@@ -258,9 +270,12 @@ fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::
         assert_eq!(table_files(dir.path())?, 2);
         // The install's directory sync fails, and so does the withdrawal's:
         // the output is written into a pooled file, so these are the first
-        // two.
-        injector
-            .arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).times(2));
+        // two, after the output's own folder sync where there is no pool.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(UNPOOLED_FOLDER_SYNCS)
+                .times(2),
+        );
         assert!(
             tree.major_compact(64 * 1024 * 1024, 0).is_err(),
             "the armed directory syncs must fail the compaction's install"

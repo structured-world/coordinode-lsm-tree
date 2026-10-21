@@ -1347,6 +1347,7 @@ mod linux_caps {
                 reflink: true,
                 native_snapshot: true,
                 punch_hole: true,
+                ..FsCapabilities::default()
             },
             XFS => FsCapabilities {
                 copy_on_write: true,
