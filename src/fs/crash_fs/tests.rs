@@ -34,6 +34,45 @@ fn synced_content_survives_crash() {
     assert_eq!(read(&fs, "/d/a"), b"durable");
 }
 
+/// A file whose entry a directory sync made durable is still there after a
+/// power loss even when none of its bytes was ever synced: empty, the bytes
+/// written since being what no sync covered. Without that directory sync it
+/// is gone; a directory made durable the same way stays a directory, under a
+/// barrier as under a full sync.
+#[test]
+fn a_file_whose_entry_was_synced_survives_empty() {
+    for mode in [SyncMode::Full, SyncMode::Barrier] {
+        let fs = CrashFs::new(MemFs::new());
+        fs.create_dir_all(Path::new("/d")).unwrap();
+        fs.sync_directory(Path::new("/")).unwrap();
+
+        let mut kept = fs
+            .open(
+                Path::new("/d/kept"),
+                &FsOpenOptions::new().write(true).create_new(true),
+            )
+            .unwrap();
+        fs.create_dir(Path::new("/d/sub")).unwrap();
+        fs.sync_directory_with(Path::new("/d"), mode).unwrap();
+        kept.write_all(b"never synced").unwrap();
+        drop(kept);
+        drop(
+            fs.open(
+                Path::new("/d/lost"),
+                &FsOpenOptions::new().write(true).create_new(true),
+            )
+            .unwrap(),
+        );
+        // A barrier's entries are durable once the device is flushed.
+        fs.sync_device(Path::new("/d")).unwrap();
+
+        fs.crash();
+        assert_eq!(read(&fs, "/d/kept"), b"", "{mode:?}");
+        assert!(!fs.exists(Path::new("/d/lost")).unwrap(), "{mode:?}");
+        assert!(fs.metadata(Path::new("/d/sub")).unwrap().is_dir, "{mode:?}");
+    }
+}
+
 /// A new file's directory entry is durable only once its directory is synced:
 /// a file whose content was synced but whose directory never was is lost,
 /// and a sync of another directory does not save it.
