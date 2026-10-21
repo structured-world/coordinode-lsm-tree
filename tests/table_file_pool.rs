@@ -498,6 +498,68 @@ fn a_repair_counts_a_duplicate_it_leaves_out_as_its_folders_newest() -> lsm_tree
     Ok(())
 }
 
+/// A checkpoint takes the tables the version names and no pooled file, and
+/// the two trees go on apart: what either writes into its pooled files lands
+/// in no file of the other.
+#[test]
+fn a_checkpoint_carries_no_pooled_file_and_shares_none() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    let copy = folder.path().join("copy");
+    let tree = config(folder.path()).table_file_pool(4).open()?;
+    for (seqno, key) in [(0, "a"), (1, "b")] {
+        tree.insert(key, "1", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    let (pooled, written) = table_files(&tables);
+    assert!(!pooled.is_empty(), "self-check: pooled files are there");
+
+    tree.create_checkpoint(&copy)?;
+    let copy_tables = copy.join("tables");
+    let (copy_pooled, copy_written) = table_files(&copy_tables);
+    assert!(copy_pooled.is_empty(), "no pooled file: {copy_pooled:?}");
+    assert_eq!(copy_written, written, "the tables the version names");
+    let lengths = |dir: &Path, ids: &[u64]| -> Vec<u64> {
+        ids.iter()
+            .map(|id| {
+                std::fs::metadata(dir.join(id.to_string()))
+                    .map(|meta| meta.len())
+                    .unwrap_or_else(|e| panic!("{id}: {e}"))
+            })
+            .collect()
+    };
+    let copy_lengths = lengths(&copy_tables, &copy_written);
+
+    // Each tree writes into its own pooled files.
+    for (seqno, key) in [(2, "c"), (3, "d")] {
+        tree.insert(key, "1", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    let restored = config(&copy).table_file_pool(4).open()?;
+    restored.insert("e", "1", 2);
+    restored.flush_active_memtable(0)?;
+    assert_eq!(
+        lengths(&copy_tables, &copy_written),
+        copy_lengths,
+        "the copy's tables are as taken"
+    );
+    let (_, now_written) = table_files(&tables);
+    for id in &pooled {
+        assert!(
+            now_written.contains(id),
+            "the source wrote its pooled file {id}: {now_written:?}"
+        );
+    }
+    for key in ["a", "b", "c", "d"] {
+        assert!(tree.get(key, u64::MAX)?.is_some(), "source {key}");
+    }
+    for key in ["a", "b", "e"] {
+        assert!(restored.get(key, u64::MAX)?.is_some(), "copy {key}");
+    }
+    assert!(restored.get("c", u64::MAX)?.is_none(), "the copy is apart");
+    Ok(())
+}
+
 const DB: &str = "/db/tree";
 
 fn crash_config(fs: &Arc<FaultFs<CrashFs>>) -> Config {
@@ -615,6 +677,153 @@ fn a_flush_survives_a_power_loss_at_every_sync() {
             },
         );
     }
+}
+
+/// Flushes the tree it is handed while the compaction it filters is writing,
+/// then fails that compaction: a write numbered above the compaction's
+/// output installs first, and the output is left empty.
+struct FlushMidway {
+    tree: std::panic::AssertUnwindSafe<Arc<std::sync::Mutex<Option<AnyTree>>>>,
+}
+
+impl lsm_tree::compaction::filter::Factory for FlushMidway {
+    fn name(&self) -> &'static str {
+        "flush midway"
+    }
+
+    fn make_filter(
+        &self,
+        _ctx: &lsm_tree::compaction::filter::Context,
+    ) -> Box<dyn lsm_tree::compaction::filter::CompactionFilter> {
+        Box::new(FlushMidwayFilter {
+            tree: Arc::clone(&self.tree),
+        })
+    }
+}
+
+struct FlushMidwayFilter {
+    tree: Arc<std::sync::Mutex<Option<AnyTree>>>,
+}
+
+impl lsm_tree::compaction::filter::CompactionFilter for FlushMidwayFilter {
+    fn filter_item(
+        &mut self,
+        _item: lsm_tree::compaction::filter::ItemAccessor<'_>,
+        _ctx: &lsm_tree::compaction::filter::Context,
+    ) -> lsm_tree::Result<lsm_tree::compaction::filter::Verdict> {
+        let tree = self
+            .tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(tree) = tree {
+            tree.insert("late", "1", 100);
+            tree.flush_active_memtable(0)?;
+        }
+        Err(std::io::Error::other("the power goes").into())
+    }
+}
+
+/// Removes a tree's manifest on `fs`: its snapshots and edit logs.
+fn remove_manifest_on(fs: &dyn lsm_tree::fs::Fs, folder: &Path) -> lsm_tree::Result<()> {
+    for entry in fs.read_dir(folder)? {
+        if entry.file_name.starts_with('v') || entry.file_name.starts_with("edits-") {
+            fs.remove_file(&entry.path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A compaction writing into a pooled file while a flush numbered above it
+/// installs first, then a power loss: the compaction's file is left empty
+/// below an installed table. The tree reopens with every key, and a repair
+/// without a manifest finds every table, takes the empty file for an output
+/// cut short and reports no loss.
+#[test]
+fn an_output_cut_short_below_an_installed_table_is_no_loss() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::Fs;
+
+    let crash = CrashFs::new(MemFs::new());
+    let fs = Arc::new(FaultFs::new(crash.clone()));
+    let handle = Arc::new(std::sync::Mutex::new(None));
+    let tree = crash_config(&fs)
+        .with_compaction_filter_factory(Some(Arc::new(FlushMidway {
+            tree: std::panic::AssertUnwindSafe(Arc::clone(&handle)),
+        })))
+        .open()?;
+    for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
+        tree.insert(key, "1", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    let inputs: Vec<u64> = tree
+        .current_version()
+        .iter_tables()
+        .map(|t| t.id())
+        .collect();
+    *handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tree.clone());
+    assert!(
+        tree.major_compact(u64::MAX, 0).is_err(),
+        "self-check: the compaction is cut short"
+    );
+    let version = tree.current_version();
+    let Some(late) = version.iter_tables().max_by_key(|t| t.id()) else {
+        panic!("the late table");
+    };
+    let [cut_short] = late.metadata.writing_below[..] else {
+        panic!(
+            "self-check: the late table lists the output being written: {:?}",
+            late.metadata.writing_below
+        );
+    };
+    assert!(
+        inputs.iter().all(|id| *id < cut_short),
+        "self-check: {cut_short} is the output, above {inputs:?}"
+    );
+    drop(version);
+    drop(tree);
+    crash.crash();
+
+    let tables = std::path::absolute(DB)?.join("tables");
+    let cut_short_path = tables.join(cut_short.to_string());
+    assert_eq!(
+        crash.metadata(&cut_short_path)?.len,
+        0,
+        "self-check: the power loss leaves the output empty under its name"
+    );
+
+    let fs = Arc::new(FaultFs::new(crash.clone()));
+    {
+        let tree = crash_config(&fs).open()?;
+        for key in ["a", "b", "c", "late"] {
+            assert!(
+                tree.get(key, u64::MAX)?.is_some(),
+                "{key} after the power loss"
+            );
+        }
+    }
+    remove_manifest_on(&crash, &std::path::absolute(DB)?)?;
+
+    let report = crash_config(&fs).repair()?;
+    assert_eq!(report.recovered, inputs.len() + 1, "{report:?}");
+    assert!(report.unknowable_losses.is_empty(), "{report:?}");
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(path, _)| *path == cut_short_path),
+        "the output cut short is left out: {report:?}"
+    );
+    assert_eq!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::TailOnly
+    );
+    let tree = crash_config(&fs).open()?;
+    for key in ["a", "b", "c", "late"] {
+        assert!(tree.get(key, u64::MAX)?.is_some(), "{key} after the repair");
+    }
+    Ok(())
 }
 
 /// A compaction into a pooled file keeps every key through a power loss at

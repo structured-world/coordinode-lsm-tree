@@ -111,5 +111,60 @@ fn bench_flush(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_flush);
+/// A run of flushes into one tree on disk, each timed alone, with the
+/// default table file pool and with none. With the pool most flushes take a
+/// file made ahead and sync no folder, while one in a batch makes the batch:
+/// the tail percentiles show what those refills cost, against the flush that
+/// syncs its folder every time.
+fn bench_flush_series(c: &mut Criterion) {
+    /// Keys per flush: small enough that the fixed cost (file, syncs, edit)
+    /// is what is measured.
+    const KEYS: u64 = 1_000;
+    /// Flushes between compactions, outside the timing, so the version the
+    /// install rewrites stays the same size through the run.
+    const COMPACT_EVERY: u64 = 32;
+
+    let mut group = c.benchmark_group("flush_series");
+    group.sample_size(20);
+    for pool in [16, 0] {
+        let label = format!("pool{pool}");
+        group.bench_function(label.clone(), |b| {
+            let folder = tempfile::TempDir::new().expect("tempdir");
+            let tree = Config::new(
+                &folder,
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .table_file_pool(pool)
+            .open()
+            .expect("open");
+            let mut seqno = 0u64;
+            let mut flushes = 0u64;
+            let mut samples = Vec::new();
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for i in 0..KEYS {
+                        tree.insert(format!("key_{i:08}"), format!("value-{seqno}"), seqno);
+                        seqno += 1;
+                    }
+                    let start = Instant::now();
+                    tree.flush_active_memtable(0).expect("flush");
+                    let elapsed = start.elapsed();
+                    samples.push(elapsed);
+                    total += elapsed;
+                    flushes += 1;
+                    if flushes.is_multiple_of(COMPACT_EVERY) {
+                        tree.major_compact(64 * 1024 * 1024, 0).expect("compact");
+                    }
+                }
+                total
+            });
+            report_percentiles(&format!("flush_series/{label}"), samples);
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_flush, bench_flush_series);
 criterion_main!(benches);

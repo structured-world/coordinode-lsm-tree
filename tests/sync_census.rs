@@ -278,6 +278,55 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     }
 }
 
+/// Over a run of flushes the pool syncs the tables folder once per batch: 33
+/// flushes under the default batch of 16 sync it three times, at the flushes
+/// that make a batch, where 33 flushes without a pool sync it 33 times. Every
+/// flush syncs its table and its edit either way.
+#[test]
+fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
+    const FLUSHES: u64 = 33;
+    /// The batch a tree makes when its configuration does not say.
+    const DEFAULT_BATCH: usize = 16;
+    for pool in [DEFAULT_BATCH, 0] {
+        let base = PathBuf::from("/census/amortized").join(pool.to_string());
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        let census = Census::new(&base, None, fs.injector());
+        let config = Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone());
+        // The default arm sets nothing, so it runs the default batch.
+        let config = if pool == 0 {
+            config.table_file_pool(0)
+        } else {
+            config
+        };
+        let tree = config.open().expect("open");
+        census.take();
+
+        let mut folder_syncs = Vec::new();
+        for round in 1..=FLUSHES {
+            fill(&tree, round);
+            tree.flush_active_memtable(0).expect("flush");
+            let syncs = census.take();
+            let count = |synced: &Synced| syncs.iter().filter(|(s, _)| s == synced).count();
+            assert_eq!(count(&Synced::Table), 1, "flush {round} (pool {pool})");
+            assert_eq!(count(&Synced::EditLog), 1, "flush {round} (pool {pool})");
+            if count(&Synced::TablesDir) > 0 {
+                folder_syncs.push(round);
+            }
+        }
+        let expected: Vec<u64> = if pool == 0 {
+            (1..=FLUSHES).collect()
+        } else {
+            (1..=FLUSHES).step_by(pool).collect()
+        };
+        assert_eq!(folder_syncs, expected, "pool {pool}");
+    }
+}
+
 /// Without a pool every table file is made as its table is written, and the
 /// install naming it syncs its folder.
 #[test]
