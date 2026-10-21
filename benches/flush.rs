@@ -126,8 +126,17 @@ fn bench_flush_series(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("flush_series");
     group.sample_size(20);
-    for pool in [16, 0] {
-        let label = format!("pool{pool}");
+    // Each sync mode: under `Full` every sync flushes the device cache
+    // (`F_FULLFSYNC` on macOS), the case where a folder sync costs most.
+    let modes = [
+        ("normal", lsm_tree::fs::SyncMode::Normal),
+        ("full", lsm_tree::fs::SyncMode::Full),
+    ];
+    for ((mode, sync_mode), pool) in modes
+        .into_iter()
+        .flat_map(|mode| [16, 0].map(|pool| (mode, pool)))
+    {
+        let label = format!("{mode}/pool{pool}");
         // One tree and one sample set for every call criterion makes, so the
         // run is one series whose refills fall once per batch.
         let folder = tempfile::TempDir::new().expect("tempdir");
@@ -137,6 +146,7 @@ fn bench_flush_series(c: &mut Criterion) {
             SequenceNumberCounter::default(),
         )
         .table_file_pool(pool)
+        .sync_mode(sync_mode)
         .open()
         .expect("open");
         let mut seqno = 0u64;
