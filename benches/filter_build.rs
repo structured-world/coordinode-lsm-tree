@@ -9,9 +9,10 @@
 //! extractor, and with partitioned filters.
 //!
 //! Every line reports allocations and bytes allocated per build or flush, the
-//! peak of live heap above what was live when it started, and the P50 / P99
-//! of its wall time. Run it on a quiet host and compare runs of two commits
-//! interleaved, not back to back.
+//! peak of live heap above what was live when it started, and the P50 of its
+//! wall time with the P99 / P999 where the run has the samples for them. Run
+//! it on a quiet host and compare runs of two commits interleaved, not back to
+//! back.
 
 use lsm_tree::config::{LocatorPolicy, PinningPolicy};
 use lsm_tree::hash::hash64;
@@ -82,36 +83,47 @@ struct Sample {
 }
 
 /// Runs `op` once, counting what it allocates and the heap it peaks at above
-/// what was live when it started.
-fn measure(op: impl FnOnce()) -> Sample {
+/// what was live when it started; returns that and what `op` returned.
+fn measure<T>(op: impl FnOnce() -> T) -> (Sample, T) {
     let allocs = ALLOCS.load(Ordering::Relaxed);
     let bytes = BYTES.load(Ordering::Relaxed);
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let start = Instant::now();
-    op();
+    let out = op();
     let time = start.elapsed();
-    Sample {
+    let sample = Sample {
         time,
         allocs: ALLOCS.load(Ordering::Relaxed) - allocs,
         bytes: BYTES.load(Ordering::Relaxed) - bytes,
         peak: PEAK.load(Ordering::Relaxed) - base,
-    }
+    };
+    (sample, out)
 }
 
-/// Prints one line: the median of the counts and the P50 / P99 of the times.
+/// Prints one line: the median of the counts and the P50 of the times, with
+/// the P99 / P999 when there are enough samples to have one (100 / 1000);
+/// below that, the slowest sample instead.
 fn report(label: &str, mut samples: Vec<Sample>) {
     samples.sort_by_key(|s| s.time);
     let n = samples.len();
     let p50 = samples[n / 2].time;
-    let p99 = samples[(n - 1) * 99 / 100].time;
+    let mut tail = String::new();
+    for (name, per) in [("P99", 100), ("P999", 1_000)] {
+        if n >= per {
+            tail += &format!(" {name}={:?}", samples[(n - 1) * (per - 1) / per].time);
+        }
+    }
+    if n < 100 {
+        tail += &format!(" max={:?}", samples[n - 1].time);
+    }
     let median = |f: fn(&Sample) -> usize| {
         let mut v: Vec<usize> = samples.iter().map(f).collect();
         v.sort_unstable();
         v[v.len() / 2]
     };
     eprintln!(
-        "  [{label}] n={n} P50={p50:?} P99={p99:?} allocs={} alloc_bytes={} peak={}",
+        "  [{label}] n={n} P50={p50:?}{tail} allocs={} alloc_bytes={} peak={}",
         median(|s| s.allocs),
         median(|s| s.bytes),
         median(|s| s.peak),
@@ -144,6 +156,7 @@ fn filter_builds() {
                         let filter = builder.build_from_hashes_owned(input).expect("build");
                         std::hint::black_box(filter.to_wire_bytes());
                     })
+                    .0
                 })
                 .collect();
             report(&format!("membership/keys={n}/bpk={bpk}"), samples);
@@ -162,6 +175,7 @@ fn filter_builds() {
                         .expect("build");
                     std::hint::black_box(filter.to_wire_bytes());
                 })
+                .0
             })
             .collect();
         report(&format!("retrieval/keys={n}/r={r}"), samples);
@@ -186,7 +200,7 @@ impl PrefixExtractor for Colon {
     }
 }
 
-fn flushes() {
+fn flushes() -> lsm_tree::Result<()> {
     type Variant = (&'static str, fn(Config) -> Config);
     let variants: [Variant; 4] = [
         ("default", |c| c),
@@ -209,31 +223,29 @@ fn flushes() {
                 )
                 .with_fs(fs),
             )
-            .open()
-            .expect("open");
+            .open()?;
             let mut seqno = 0;
-            let samples = (0..rounds(keys as usize).min(40))
-                .map(|round| {
-                    for i in 0..keys {
-                        // Sixteen keys a group, so each group shares a prefix.
-                        tree.insert(
-                            format!("g{:06}:{:012}", i / 16, i),
-                            format!("value-{round}-{i}"),
-                            seqno,
-                        );
-                        seqno += 1;
-                    }
-                    let sample = measure(|| {
-                        tree.flush_active_memtable(0).expect("flush");
-                    });
-                    // Keep the tree from growing through the run.
-                    tree.major_compact(u64::MAX, 0).expect("compact");
-                    sample
-                })
-                .collect();
+            let mut samples = Vec::new();
+            for round in 0..rounds(keys as usize).min(40) {
+                for i in 0..keys {
+                    // Sixteen keys a group, so each group shares a prefix.
+                    tree.insert(
+                        format!("g{:06}:{:012}", i / 16, i),
+                        format!("value-{round}-{i}"),
+                        seqno,
+                    );
+                    seqno += 1;
+                }
+                let (sample, flushed) = measure(|| tree.flush_active_memtable(0));
+                flushed?;
+                samples.push(sample);
+                // Keep the tree from growing through the run.
+                tree.major_compact(u64::MAX, 0)?;
+            }
             report(&format!("flush/{name}/keys={keys}"), samples);
         }
     }
+    Ok(())
 }
 
 /// A table's filter built whole at its finish, as levels 0 to 2 build theirs
@@ -241,7 +253,7 @@ fn flushes() {
 /// the deeper levels do: what flushing a large memtable costs with each, and
 /// what a point read through each costs, of a key the tree holds and of one
 /// it does not.
-fn layouts() {
+fn layouts() -> lsm_tree::Result<()> {
     const KEYS: u64 = 1_000_000;
     const READS: u64 = 200_000;
     for (name, partitioned) in [("full", false), ("partitioned", true)] {
@@ -252,18 +264,18 @@ fn layouts() {
         )
         .with_fs(lsm_tree::fs::MemFs::new())
         .filter_block_partitioning_policy(PinningPolicy::all(partitioned))
-        .open()
-        .expect("open");
+        .open()?;
         let mut seqno = 0;
-        let flushes = (0..3)
-            .map(|round| {
-                for i in 0..KEYS {
-                    tree.insert(format!("k{i:012}"), format!("value-{round}-{i}"), seqno);
-                    seqno += 1;
-                }
-                measure(|| tree.flush_active_memtable(0).expect("flush"))
-            })
-            .collect();
+        let mut flushes = Vec::new();
+        for round in 0..3 {
+            for i in 0..KEYS {
+                tree.insert(format!("k{i:012}"), format!("value-{round}-{i}"), seqno);
+                seqno += 1;
+            }
+            let (sample, flushed) = measure(|| tree.flush_active_memtable(0));
+            flushed?;
+            flushes.push(sample);
+        }
         report(&format!("layout/{name}/flush/keys={KEYS}"), flushes);
 
         // Reads spread over the key space by a fixed multiplicative walk.
@@ -272,20 +284,20 @@ fn layouts() {
             ("present", (|i| format!("k{i:012}")) as fn(u64) -> String),
             ("absent", |i| format!("k{i:012}~")),
         ] {
-            let samples = (0..READS)
-                .map(|n| {
-                    let key = key_of(key_at(n));
-                    measure(|| {
-                        std::hint::black_box(tree.get(&key, lsm_tree::SeqNo::MAX).expect("get"));
-                    })
-                })
-                .collect();
+            let mut samples = Vec::new();
+            for n in 0..READS {
+                let key = key_of(key_at(n));
+                let (sample, got) = measure(|| tree.get(&key, lsm_tree::SeqNo::MAX));
+                std::hint::black_box(got?);
+                samples.push(sample);
+            }
             report(&format!("layout/{name}/get/{kind}"), samples);
         }
     }
+    Ok(())
 }
 
-fn main() {
+fn main() -> lsm_tree::Result<()> {
     // `cargo bench` passes `--bench`; a filter argument selects one part.
     let only: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
     if only.as_deref().is_none_or(|o| "filters".contains(o)) {
@@ -294,10 +306,11 @@ fn main() {
     }
     if only.as_deref().is_none_or(|o| "flushes".contains(o)) {
         eprintln!("[filter_build/flushes]");
-        flushes();
+        flushes()?;
     }
     if only.as_deref().is_none_or(|o| "layouts".contains(o)) {
         eprintln!("[filter_build/layouts]");
-        layouts();
+        layouts()?;
     }
+    Ok(())
 }
