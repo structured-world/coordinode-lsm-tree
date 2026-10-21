@@ -30,13 +30,17 @@ fn key(i: u32) -> String {
     format!("key-{i:05}")
 }
 
-/// Table ids with a file in the tree's tables folder.
+/// Table ids with a table in the tree's tables folder. The empty files the
+/// folder keeps for tables to come hold none.
 fn table_files(dir: &Path) -> BTreeSet<u64> {
     std::fs::read_dir(dir.join("tables"))
         .expect("the tables folder exists")
         .filter_map(|entry| {
+            let entry = entry.expect("a readable entry");
+            if entry.metadata().is_ok_and(|meta| meta.len() == 0) {
+                return None;
+            }
             entry
-                .expect("a readable entry")
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse().ok())

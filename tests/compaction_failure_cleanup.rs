@@ -36,23 +36,40 @@ fn value(i: u64, generation: u64) -> Vec<u8> {
     v
 }
 
-/// Every file name in `folder`; none when the folder does not exist.
-fn files(folder: &Path) -> std::io::Result<BTreeSet<String>> {
-    match std::fs::read_dir(folder) {
-        Ok(entries) => entries
-            .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
-        Err(e) => Err(e),
+/// Every file name in `folder`, but the empty ones when `skip_empty`; none
+/// when the folder does not exist. A file unlinked in the background between
+/// the listing and its length is gone, so it is not counted.
+fn files(folder: &Path, skip_empty: bool) -> std::io::Result<BTreeSet<String>> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if skip_empty {
+            match entry.metadata() {
+                Ok(meta) if meta.len() > 0 => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        names.insert(entry.file_name().to_string_lossy().into_owned());
     }
+    Ok(names)
 }
 
-/// The table and the blob files of the tree at `root`, as `folder/name`.
+/// The table and the blob files of the tree at `root`, as `folder/name`. An
+/// empty file under a table name is one the tables folder keeps for tables to
+/// come, which any write may make and the next one takes: no output of a
+/// compaction.
 fn on_disk(root: &Path) -> std::io::Result<BTreeSet<String>> {
     let mut all = BTreeSet::new();
     for folder in ["tables", "blobs"] {
         all.extend(
-            files(&root.join(folder))?
+            files(&root.join(folder), folder == "tables")?
                 .into_iter()
                 .map(|name| format!("{folder}/{name}")),
         );

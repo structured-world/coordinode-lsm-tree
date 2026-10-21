@@ -66,6 +66,9 @@ fn a_compaction_with_several_outputs_syncs_their_folder_once() -> lsm_tree::Resu
         SequenceNumberCounter::default(),
     )
     .with_shared_fs(fs)
+    // The folder syncs are counted: none may come from a refill running on
+    // another thread.
+    .table_file_refill_inline(true)
     .open()?;
     let mut seqno = 0;
     for _ in 0..2 {

@@ -72,12 +72,13 @@ fn ingested(folder: &std::path::Path, values: &[u32]) -> AnyTree {
     any
 }
 
-/// The encodings of every page of the value column in `folder`'s tables.
+/// The encodings of every page of the value column in `folder`'s tables. The
+/// empty files the folder keeps for tables to come hold no pages.
 fn value_encodings(folder: &std::path::Path) -> Vec<Expression> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(folder.join("tables")).expect("tables") {
         let path = entry.expect("entry").path();
-        if path.is_file() {
+        if path.is_file() && std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
             out.extend(
                 read_column_encodings(&path)
                     .expect("encodings")

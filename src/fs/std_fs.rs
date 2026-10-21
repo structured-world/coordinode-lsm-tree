@@ -335,7 +335,7 @@ impl Fs for StdFs {
             .truncate(opts.truncate)
             .append(opts.append);
 
-        // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
+        // Gate matches the `mod open_flags;` declaration in `fs/mod.rs`
         // - the submodule only exists when `feature = "std"` is on.
         // Without the gate this site would fail to compile under
         // `--no-default-features --features alloc` even before the
@@ -344,9 +344,12 @@ impl Fs for StdFs {
         // resolution-time error on top of the type-checking ones
         // already tracked under the no-std migration epic.
         #[cfg(feature = "std")]
-        super::direct_io::apply_direct_io_flag(&mut builder, opts.direct_io);
+        super::open_flags::apply_open_flags(&mut builder, opts);
 
         let file = builder.open(path)?;
+        // No open waits off Unix, so nothing is left to clear there.
+        #[cfg(all(feature = "std", unix))]
+        super::open_flags::finish_open(&file, opts)?;
         Ok(Box::new(file))
     }
 
@@ -664,6 +667,17 @@ impl Fs for StdFs {
     #[cfg(target_os = "linux")]
     fn capabilities(&self, path: &Path) -> super::FsCapabilities {
         linux_caps::capabilities(path)
+    }
+
+    /// Windows: no directory can be synced (see `sync_directory`), so the
+    /// directory sync is reported as doing nothing; every other capability
+    /// is the conservative default.
+    #[cfg(target_os = "windows")]
+    fn capabilities(&self, _path: &Path) -> super::FsCapabilities {
+        super::FsCapabilities {
+            directory_sync_noop: true,
+            ..super::FsCapabilities::default()
+        }
     }
 
     /// Linux: O(1) clone via `ioctl(FICLONE)` (Btrfs, XFS-reflink). Falls back
@@ -1333,6 +1347,7 @@ mod linux_caps {
                 reflink: true,
                 native_snapshot: true,
                 punch_hole: true,
+                ..FsCapabilities::default()
             },
             XFS => FsCapabilities {
                 copy_on_write: true,

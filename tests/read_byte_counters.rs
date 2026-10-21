@@ -270,10 +270,11 @@ fn a_block_read_rejected_as_corrupt_still_counts_its_bytes() {
     // though the get fails.
     let (folder, tree) = filled_tree(200, 64, CompressionType::None);
     let tables = folder.path().join("tables");
+    // The empty files the folder keeps for tables to come are no tables.
     let table = std::fs::read_dir(&tables)
         .expect("tables dir")
         .map(|e| e.expect("entry").path())
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .expect("one table file");
     let mut bytes = std::fs::read(&table).expect("read table");
     // The data blocks come first; a byte a little way in lands in one of them.
@@ -298,10 +299,11 @@ fn a_block_read_rejected_as_corrupt_is_not_counted_as_a_load() {
     // that was never loaded.
     let (folder, tree) = filled_tree(200, 64, CompressionType::None);
     let tables = folder.path().join("tables");
+    // The empty files the folder keeps for tables to come are no tables.
     let table = std::fs::read_dir(&tables)
         .expect("tables dir")
         .map(|e| e.expect("entry").path())
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .expect("one table file");
     let mut bytes = std::fs::read(&table).expect("read table");
     bytes[64] ^= 0xFF;

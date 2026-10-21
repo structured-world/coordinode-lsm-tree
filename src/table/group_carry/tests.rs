@@ -780,7 +780,7 @@ fn a_run_copies_a_group_only_where_its_rows_could_go() -> crate::Result<()> {
         &candidate.rows,
         None,
     )?);
-    let written = fresh.finish()?;
+    let written = fresh.finish()?.tables;
     let [(id, checksum)] = written.as_slice() else {
         panic!("one table: {written:?}");
     };

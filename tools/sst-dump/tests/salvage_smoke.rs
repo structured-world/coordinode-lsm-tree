@@ -11,7 +11,8 @@ use std::process::Command;
 const SST_DUMP_BIN: &str = env!("CARGO_BIN_EXE_sst-dump");
 
 /// Returns the lexicographically-first numerically-named SST file under
-/// `<dir>/tables/` (one flush produces exactly one).
+/// `<dir>/tables/` (one flush produces exactly one). The empty files the
+/// folder keeps for tables to come are no SSTs.
 fn sole_sst(dir: &std::path::Path) -> std::path::PathBuf {
     let mut ssts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("tables"))
         .expect("tables dir exists")
@@ -19,6 +20,7 @@ fn sole_sst(dir: &std::path::Path) -> std::path::PathBuf {
         .map(|e| e.path())
         .filter(|p| {
             p.is_file()
+                && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
                 && p.file_name()
                     .is_some_and(|n| n.to_string_lossy().chars().all(|c| c.is_ascii_digit()))
         })

@@ -708,6 +708,10 @@ impl AbstractTree for Tree {
         self.config.sync_mode
     }
 
+    fn wait_for_table_file_refills(&self) {
+        self.table_files.wait_for_refills();
+    }
+
     fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
         self.config.prefix_extractor.clone()
     }
@@ -1105,25 +1109,36 @@ impl AbstractTree for Tree {
             folder.display(),
         );
 
-        let mut table_writer = MultiWriter::new(
+        let table_writer = MultiWriter::from_pool(
             folder.clone(),
-            self.table_id_counter.clone(),
+            Arc::clone(&self.table_files),
+            None,
             self.config.table_target_size,
             0,
             level_fs.clone(),
-        )?
-        .set_comparator(self.config.comparator.clone())
-        .use_data_block_restart_interval(data_block_restart_interval)
-        .use_index_block_restart_interval(index_block_restart_interval)
-        .use_data_block_compression(data_block_compression)
-        .use_index_block_compression(index_block_compression)
-        .use_data_block_size(data_block_size)
-        .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
-        .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
-        .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
-        .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
-        .use_column_encoding(self.config.column_encoding_policy.get(0))
-        .use_data_block_hash_ratio(data_block_hash_ratio);
+        )?;
+        // The flush's L0 recency, taken once its first file is: flushes are
+        // serialized, so it is above every table already flushed and below
+        // every one flushed later. A pooled file's id was taken when its batch
+        // was made and says nothing about when the table was written; a file
+        // made now carries an id taken now, which serves.
+        let recency = table_writer
+            .first_made_now()
+            .unwrap_or_else(|| self.table_id_counter.next());
+        let mut table_writer = table_writer
+            .set_comparator(self.config.comparator.clone())
+            .use_recency(Some(recency))
+            .use_data_block_restart_interval(data_block_restart_interval)
+            .use_index_block_restart_interval(index_block_restart_interval)
+            .use_data_block_compression(data_block_compression)
+            .use_index_block_compression(index_block_compression)
+            .use_data_block_size(data_block_size)
+            .use_index_partition_size(self.config.index_block_partition_size_policy.get(0))
+            .use_filter_partition_size(self.config.filter_block_partition_size_policy.get(0))
+            .use_row_group_size(self.config.columnar_row_group_size_policy.get(0))
+            .use_columnar_page_size(self.config.columnar_page_size_policy.get(0))
+            .use_column_encoding(self.config.column_encoding_policy.get(0))
+            .use_data_block_hash_ratio(data_block_hash_ratio);
 
         let bloom_policy = {
             use crate::config::FilterPolicyEntry::{Bloom, None};
@@ -1221,7 +1236,8 @@ impl AbstractTree for Tree {
             table_writer.write(item?)?;
         }
 
-        let result = table_writer.finish()?;
+        let written = table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -1229,7 +1245,8 @@ impl AbstractTree for Tree {
         let pin_index = self.config.index_block_pinning_policy.get(0);
 
         // Load tables
-        let tables = result
+        let tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(
@@ -1258,7 +1275,11 @@ impl AbstractTree for Tree {
                 {
                     params.metrics = self.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 
@@ -5576,7 +5597,7 @@ impl Tree {
         #[cfg(feature = "metrics")]
         let metrics = Arc::new(Metrics::default());
 
-        let version = Self::recover_levels(
+        let (version, pooled) = Self::recover_levels(
             &config.path,
             tree_id,
             &config,
@@ -5608,15 +5629,27 @@ impl Tree {
             }
         }
 
-        // Table ids and L0 recency keys share one counter, and an ingested
-        // table's recency is an id taken at its install that no table carries:
-        // the next id has to be above both, or a flush after the reopen would
-        // lay out behind an ingestion it is newer than.
+        // Table ids and L0 recency keys share one counter, and a flushed or
+        // ingested table's recency is an id taken that no table carries: the
+        // next id has to be above both, or a flush after the reopen would lay
+        // out behind one it is newer than. The pooled files hold ids of their
+        // own, which no later table may take.
         let highest_table_id = version
             .iter_tables()
             .map(|table| table.id().max(table.l0_recency()))
+            .chain(pooled.iter().flat_map(|(_, _, ids)| ids.iter().copied()))
             .max()
             .unwrap_or_default();
+        let table_id_counter = SequenceNumberCounter::new(highest_table_id + 1);
+        let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
+            table_id_counter.clone(),
+            config.table_file_pool,
+            config.sync_mode,
+            config.table_file_refill,
+        ));
+        for (folder, folder_fs, ids) in pooled {
+            table_files.adopt(&folder, &folder_fs, ids);
+        }
 
         let comparator = config.comparator.clone();
 
@@ -5665,7 +5698,8 @@ impl Tree {
         let inner = TreeInner {
             id: tree_id,
             memtable_id_counter: SequenceNumberCounter::new(1),
-            table_id_counter: SequenceNumberCounter::new(highest_table_id + 1),
+            table_id_counter,
+            table_files,
             blob_file_id_counter: SequenceNumberCounter::default(),
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
@@ -5934,7 +5968,7 @@ impl Tree {
         tree_id: TreeId,
         config: &Config,
         #[cfg(feature = "metrics")] metrics: &Arc<Metrics>,
-    ) -> crate::Result<Version> {
+    ) -> crate::Result<(Version, PooledFiles)> {
         use crate::{TableId, file::fsync_directory};
 
         let tree_path = tree_path.as_ref();
@@ -6102,6 +6136,10 @@ impl Tree {
             .map(|(id, _)| id)
             .collect();
 
+        // The empty table files no version names, per folder: the pool each
+        // folder kept, adopted by the tree.
+        let mut pooled: PooledFiles = Vec::new();
+        let mut pooled_ids: Vec<TableId> = Vec::new();
         for (table_base_folder, folder_fs, dirents) in folder_scans {
             for dirent in dirents {
                 let crate::fs::FsDirEntry {
@@ -6482,9 +6520,34 @@ impl Tree {
                         "Skipping duplicate sighting of manifest table {table_id} in {}",
                         table_file_path.display(),
                     );
+                } else if config.table_file_pool > 0
+                    // The counter starts above every pooled id, so one at its
+                    // top would leave it no id to hand out.
+                    && table_id < crate::seqno::MAX_SEQNO
+                    && folder_fs
+                        .metadata(&table_file_path)
+                        .is_ok_and(|meta| meta.is_file && meta.len == 0)
+                    // A table is written into a pooled file where it lies: a
+                    // symlink would take it to a file the tree never made.
+                    && folder_fs
+                        .read_link(&table_file_path)
+                        .is_ok_and(|target| target.is_none())
+                {
+                    // No version names it and no table is empty: a pooled
+                    // file, used again rather than made anew. Anything else
+                    // unnamed, or whose kind cannot be read, is an orphan like
+                    // any other.
+                    pooled_ids.push(table_id);
                 } else {
                     orphaned_tables.push((table_file_path, folder_fs.clone()));
                 }
+            }
+            if !pooled_ids.is_empty() {
+                pooled.push((
+                    table_base_folder.clone(),
+                    Arc::clone(folder_fs),
+                    core::mem::take(&mut pooled_ids),
+                ));
             }
         }
 
@@ -6712,7 +6775,7 @@ impl Tree {
         }
 
         sweep.finish()?;
-        Ok(version)
+        Ok((version, pooled))
     }
 
     /// Writes the `.restrict-bound` sidecar of every restricted table in
@@ -6913,6 +6976,14 @@ fn made_folders(folder: &Path, holders: &[crate::path::PathBuf]) -> Vec<crate::p
     }
     made
 }
+
+/// The empty table files an open found that no version names, per tables
+/// folder and its backend.
+type PooledFiles = Vec<(
+    crate::path::PathBuf,
+    Arc<dyn crate::fs::Fs>,
+    Vec<crate::TableId>,
+)>;
 
 /// What an open finds no version names, removed only once the state it judged
 /// that by is installed as a fresh snapshot.

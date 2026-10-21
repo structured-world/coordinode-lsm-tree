@@ -379,7 +379,8 @@ fn tree_recovers_durable_prefix_when_edit_log_tail_is_torn() -> lsm_tree::Result
     Ok(())
 }
 
-/// Counts table files on disk.
+/// Counts table files on disk. The empty files the folder keeps for tables to
+/// come are no tables.
 fn table_files(dir: &Path) -> usize {
     std::fs::read_dir(dir.join("tables")).map_or(0, |it| {
         it.filter_map(Result::ok)
@@ -388,6 +389,7 @@ fn table_files(dir: &Path) -> usize {
                     .to_string_lossy()
                     .bytes()
                     .all(|c| c.is_ascii_digit())
+                    && e.metadata().is_ok_and(|m| m.len() > 0)
             })
             .count()
     })
@@ -911,13 +913,15 @@ fn tree_page_ecc_emits_parity_trailer_on_disk() -> lsm_tree::Result<()> {
     // Find the freshly-flushed SST. The default layout writes
     // table files into `<path>/tables/<table_id>`; numeric file
     // names only (the layout invariant the rest of the crate
-    // relies on too).
+    // relies on too), and the empty files the folder keeps for
+    // tables to come are no SSTs.
     let tables_dir = path.join("tables");
     let mut sst_path: Option<std::path::PathBuf> = None;
     for entry in fs::read_dir(&tables_dir)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+        if name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) && entry.metadata()?.len() > 0
+        {
             sst_path = Some(entry.path());
             break;
         }
@@ -1017,6 +1021,7 @@ fn tree_page_ecc_parity_overhead_matches_scheme() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
+    // The empty files the folder keeps for tables to come are no SSTs.
     let tables_dir = path.join("tables");
     let mut sst_path: Option<std::path::PathBuf> = None;
     for entry in fs::read_dir(&tables_dir)? {
@@ -1026,6 +1031,7 @@ fn tree_page_ecc_parity_overhead_matches_scheme() -> lsm_tree::Result<()> {
             .to_string_lossy()
             .chars()
             .all(|c| c.is_ascii_digit())
+            && entry.metadata()?.len() > 0
         {
             sst_path = Some(entry.path());
             break;

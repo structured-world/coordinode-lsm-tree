@@ -2221,7 +2221,8 @@ mod zstd_dict {
         Ok(())
     }
 
-    /// The tree's first SST, by its numeric name.
+    /// The tree's first SST, by its numeric name. The empty files the folder
+    /// keeps for tables to come are no SSTs.
     fn a_table_to_corrupt(dir: &std::path::Path) -> lsm_tree::Result<std::path::PathBuf> {
         Ok(std::fs::read_dir(dir.join("tables"))?
             .filter_map(Result::ok)
@@ -2229,6 +2230,7 @@ mod zstd_dict {
             .find(|p| {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().parse::<u64>().is_ok())
+                    && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
             })
             .expect("an SST to corrupt"))
     }

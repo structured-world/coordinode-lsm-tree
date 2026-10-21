@@ -27,7 +27,10 @@ fn tree_multi_table_ids() -> lsm_tree::Result<()> {
     tree0.insert("a", "a", 0);
     tree0.flush_active_memtable(0)?;
 
-    assert_eq!(1, tree0.next_table_id());
+    // A flush takes ids for its table, the pooled files beside it and its
+    // recency; the other tree's counter must advance by as many.
+    let after_flush = tree0.next_table_id();
+    assert!(after_flush > 0, "the flush took ids");
 
     assert_eq!(
         0,
@@ -60,7 +63,7 @@ fn tree_multi_table_ids() -> lsm_tree::Result<()> {
     tree1.insert("a", "a", 0);
     tree1.flush_active_memtable(0)?;
 
-    assert_eq!(1, tree1.next_table_id());
+    assert_eq!(after_flush, tree1.next_table_id());
 
     assert_eq!(
         0,

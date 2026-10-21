@@ -506,7 +506,7 @@ pub struct Writer {
     /// Table file path
     pub(crate) path: PathBuf,
 
-    table_id: TableId,
+    pub(crate) table_id: TableId,
 
     data_block_restart_interval: u8,
     index_block_restart_interval: u8,
@@ -841,6 +841,13 @@ pub struct Writer {
     /// the marker key `lineage_last`, only alongside `lineage`.
     lineage_last: bool,
 
+    /// This table's place among the files its folder is writing, when its
+    /// file came from the folder's pool: the ids below it still being written
+    /// when it finishes are persisted as `writing_below`, and the place is
+    /// given up once the table is synced (see
+    /// [`crate::table::file_pool::Writing`]).
+    writing: Option<crate::table::file_pool::Writing>,
+
     /// The age to record instead of the clock or the inputs' age; `None` for
     /// every table the engine writes itself.
     created_at: Option<u128>,
@@ -1158,6 +1165,29 @@ impl Writer {
         // error — an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
+        Self::with_file(path, table_id, initial_level, fs, file)
+    }
+
+    /// A writer into `claimed`, an empty pool file under its table's name.
+    /// The file is the writer's from here, so an init failure removes it.
+    pub(crate) fn into_claimed(
+        claimed: crate::table::file_pool::ClaimedFile,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+    ) -> crate::Result<Self> {
+        let mut writer =
+            Self::with_file(claimed.path, claimed.id, initial_level, fs, claimed.file)?;
+        writer.writing = Some(claimed.writing);
+        Ok(writer)
+    }
+
+    fn with_file(
+        path: PathBuf,
+        table_id: TableId,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+        file: Box<dyn FsFile>,
+    ) -> crate::Result<Self> {
         let writer = BufWriter::with_capacity(u16::MAX.into(), file);
         let writer = ChecksummedWriter::new(writer);
         let mut writer = crate::sfa::Writer::from_writer(writer);
@@ -1284,6 +1314,7 @@ impl Writer {
             lineage_prev: None,
             lineage_transformed: false,
             lineage_last: false,
+            writing: None,
             created_at: None,
             clock: None,
             key_range_cover: None,
@@ -1590,6 +1621,11 @@ impl Writer {
             lineage_prev: self.lineage_prev,
             lineage_transformed: self.lineage_transformed,
             lineage_last: self.lineage_last,
+            writing_below: self
+                .writing
+                .as_ref()
+                .map(crate::table::file_pool::Writing::below)
+                .unwrap_or_default(),
             range_tombstone_count,
             delete_bitmap_len: delete_bitmap.0,
             delete_bitmap_hash: delete_bitmap.1,
@@ -1624,6 +1660,11 @@ impl Writer {
         let has_lineage = params.lineage.is_some();
         params.lineage_transformed |= has_lineage;
         params.lineage_last |= has_lineage;
+        // From above: as many files written below this one as are recorded.
+        if self.writing.is_some() {
+            params.writing_below =
+                alloc::vec![TableId::MAX; crate::table::file_pool::WRITING_BELOW_CAP];
+        }
         let mut payload = Vec::new();
         encode_meta_payload(self.ecc, &params, &mut payload)?;
         Ok(payload.len() as u64)
@@ -5395,6 +5436,9 @@ struct MetaSectionParams<'a> {
     /// `true` writes the `lineage_last` marker (only alongside `lineage`):
     /// this output closed its compaction run.
     lineage_last: bool,
+    /// The ids below this table's of the files its folder was still writing
+    /// when it finished: written as `writing_below` when any.
+    writing_below: Vec<TableId>,
     range_tombstone_count: u64,
     /// Number of positions in this table's delete bitmap. Recorded so a reader
     /// can AUTHENTICATE the bitmap's presence: the section itself is optional
@@ -5723,6 +5767,18 @@ fn encode_meta_payload(
         if p.lineage_last {
             meta_items.push(meta("lineage_last", &[]));
         }
+    }
+
+    // The files of this table's folder still being written below it, as
+    // consecutive little-endian u64s; absent when none was. A repair without
+    // a manifest reads an empty file under such an id as an output a power
+    // loss cut short, not as a table that lost its bytes.
+    if !p.writing_below.is_empty() {
+        let mut bytes = Vec::with_capacity(p.writing_below.len() * 8);
+        for id in &p.writing_below {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        meta_items.push(meta("writing_below", &bytes));
     }
 
     // Test-only legacy simulation: drop the bitmap-content hash so the file

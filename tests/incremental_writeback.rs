@@ -100,12 +100,16 @@ fn a_tables_final_sections_are_written_back_as_they_are_written() -> lsm_tree::R
 fn assert_tail_within_a_few_steps(fs: &dyn Fs, injector: &FaultInjector) -> lsm_tree::Result<()> {
     // Absolute as the tree makes its folder (`D:\db` on Windows).
     let tables = std::path::absolute("/db/tables").expect("absolute tables folder");
-    let table = fs
-        .read_dir(&tables)?
-        .into_iter()
-        .find(|entry| !entry.is_dir)
-        .expect("the flush wrote a table");
-    let size = fs.metadata(&table.path)?.len;
+    // The empty files the folder keeps for tables to come are no tables.
+    let mut size = 0;
+    for entry in fs.read_dir(&tables)? {
+        let len = fs.metadata(&entry.path)?.len;
+        if !entry.is_dir && len > 0 {
+            size = len;
+            break;
+        }
+    }
+    assert!(size > 0, "the flush wrote a table");
     let ranges = injector.writebacks_for("tables");
     let handed = ranges.last().map_or(0, |&(offset, len)| offset + len);
     let tail = size - handed;

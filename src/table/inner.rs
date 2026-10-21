@@ -80,6 +80,11 @@ pub struct Inner {
     /// May be kept alive until all Arcs to the table have been dropped (to facilitate snapshots)
     pub is_deleted: AtomicBool,
 
+    /// Whether the directory entry naming the file was durable before the
+    /// table was written into it (a pooled file), so the install that first
+    /// names the table need not sync its folder.
+    pub(crate) entry_durable: AtomicBool,
+
     /// Tight-space punch-on-drop offset, or [`u64::MAX`] (the default) for "no
     /// punch". When a tight-space compaction restricts a table to `[K, hi)`, the
     /// PRIOR (unrestricted) view of the same physical SST is marked here with

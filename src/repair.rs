@@ -4661,6 +4661,33 @@ struct TableScan {
     scanned_table_ids: crate::HashSet<TableId>,
 }
 
+/// The tables that opened in one folder: each id with the ids below it its
+/// folder was still writing when it was finished.
+#[cfg(feature = "std")]
+type OpenedTables = crate::HashMap<PathBuf, Vec<(TableId, Vec<TableId>)>>;
+
+/// Records that `table` opened as a table in `folder`, so an empty file
+/// there below it, written by the time it was finished, is judged a table
+/// that lost its bytes.
+#[cfg(feature = "std")]
+fn note_opened(opened: &mut OpenedTables, folder: &std::path::Path, table: &Table) {
+    opened
+        .entry(folder.to_path_buf())
+        .or_default()
+        .push((table.id(), table.metadata.writing_below.clone()));
+}
+
+/// Whether one of `tables` (ids with what their folder was still writing
+/// below them) was finished after `id`'s file had its table written: one
+/// above it that does not list it.
+#[cfg(feature = "std")]
+fn written_before_one_of<'a>(
+    id: TableId,
+    mut tables: impl Iterator<Item = (TableId, &'a [TableId])>,
+) -> bool {
+    tables.any(|(table, writing_below)| id < table && !writing_below.contains(&id))
+}
+
 /// Phase 1 of [`repair_tree`]: classify every entry of every table folder and
 /// recover what can be recovered. See [`TableScan`] for what it hands on.
 ///
@@ -4715,6 +4742,16 @@ fn scan_table_folders(
     // Judged against the FINAL rebuilt set after the dedup: one whose table
     // survived is preserved, an orphan is removed post-commit.
     let mut live_sidecars: Vec<(TableId, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
+
+    // Empty files under table names no committed manifest names:
+    // `(id, folder, path, fs)`, judged against the tables their folder
+    // recovered once the scan is done.
+    let mut empty_unnamed: Vec<(TableId, PathBuf, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
+    // The files that opened as tables, per folder, whether the rebuild then
+    // keeps them, sets them aside or leaves them out as duplicates: tables
+    // written there either way, each telling which files below it were
+    // still being written when it was finished.
+    let mut opened_tables: OpenedTables = crate::HashMap::default();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -4870,6 +4907,26 @@ fn scan_table_folders(
                 }
                 TableDirEntry::Table(id) => id,
             };
+            // An empty file under a table name that no committed manifest
+            // names is judged once every table of its folder is recovered
+            // (see `empty_unnamed`). A file whose length cannot be read is
+            // graded as any table file is.
+            let named = manifest_referenced
+                .as_ref()
+                .is_some_and(|m| m.tables.contains_key(&table_id));
+            if !named
+                && folder_fs
+                    .metadata(&table_path)
+                    .is_ok_and(|meta| meta.len == 0)
+            {
+                empty_unnamed.push((
+                    table_id,
+                    table_base_folder.clone(),
+                    table_path,
+                    Arc::clone(&folder_fs),
+                ));
+                continue;
+            }
             scanned_table_ids.insert(table_id);
 
             if let Some(p) = &config.recovery_progress {
@@ -4978,6 +5035,10 @@ fn scan_table_folders(
                         folder_fs.clone(),
                         manifest_position,
                     ))
+                    // It opened as a table, so one was written into this
+                    // folder, whatever the walk below finds and wherever the
+                    // kept copy lives.
+                    .inspect(|table| note_opened(&mut opened_tables, &table_base_folder, table))
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
                     // at the trailer, meta and index, leaving every lazily-read
@@ -5093,6 +5154,7 @@ fn scan_table_folders(
             // survive elsewhere and become visible again, which no repair can
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
+                note_opened(&mut opened_tables, &table_base_folder, t);
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
                 // the LOST manifest: that open passes offset 0, so
@@ -5690,6 +5752,58 @@ fn scan_table_folders(
         }
     }
 
+    // A pooled file's id is above every table written into its folder: a
+    // claim takes the lowest pooled id, and a write numbered above an id
+    // passes over the pooled ones below it. A file being written when the
+    // power went may sit below a table another write finished first; that
+    // table lists it among the files its folder was still writing (see
+    // `file_pool::Writing`). So an empty file is a table that lost its bytes
+    // only when a table of its folder (one that opened as a table, kept, set
+    // aside or left out as a duplicate, or a salvaged copy) is above it and
+    // was finished after it was written: reported as a loss nothing can
+    // scope. Any other is a pooled file or an output the power loss cut
+    // short, never a table: it holds no rows and is no loss, and like every
+    // file the rebuilt manifest does not name it is reported left out and
+    // goes once that manifest is durable. A file with bytes that opens as no
+    // table is not counted: nothing says a table was ever written there.
+    //
+    // A table emptied to nothing with no table of its folder finished after
+    // it reads as pooled here: nothing on disk tells the two apart. A table
+    // is synced before any edit names it, so only damage outside a crash
+    // empties one; a durable mark on every pooled file would cost a data sync
+    // per file, the sync the pool removes, and reporting every empty file as
+    // a loss would call for a full replay on every repair of a pooled tree.
+    for (table_id, folder, table_path, folder_fs) in empty_unnamed {
+        let written = written_before_one_of(
+            table_id,
+            recovered_by_id
+                .values()
+                .filter(|c| c.path.parent() == Some(folder.as_path()))
+                .map(|c| (c.table.id(), c.table.metadata.writing_below.as_slice()))
+                .chain(
+                    opened_tables
+                        .get(&folder)
+                        .into_iter()
+                        .flatten()
+                        .map(|(id, below)| (*id, below.as_slice())),
+                ),
+        );
+        if written {
+            scanned_table_ids.insert(table_id);
+            set_aside_path(
+                &folder_fs,
+                &table_path,
+                "an empty table file below a table finished after it: its bytes were lost",
+                &mut unreadable_files,
+                &mut discard_after_commit,
+            );
+        } else {
+            let reason = "an empty table file no table was written into";
+            excluded_files.push((table_path.clone(), reason.to_string()));
+            discard_after_commit.push((folder_fs, table_path, reason.to_string()));
+        }
+    }
+
     Ok(TableScan {
         recovered_by_id,
         unreadable_files,
@@ -5751,15 +5865,17 @@ fn rebuild_from_scan(
             .map(|c| (c.table, c.fidelity, c.path, c.fs))
             .collect();
 
-    // Newest first, by DESCENDING recency key. For a flush / ingest table that
-    // key is its own id (ids are allocated in increasing order and flushes are
-    // serialized, so a higher id is later content). A COMPACTION output's own
-    // id is NOT that signal: the id is allocated when the compaction starts
-    // writing, while newer flushes with lower ids can install first, and an
-    // intra-L0 output is appended at the BACK of L0 regardless of its id — so
-    // outputs persist their newest INPUT's recency in meta (`recency`) and
-    // sort by it, with id as the tie-break (equal recency means one descends
-    // from the other, and the higher id is the superseding copy). A table's
+    // Newest first, by DESCENDING recency key. For a flush table that key is
+    // an id it took from the counter when it started (flushes are serialized,
+    // so a higher one is later content); its own id is not, since a pooled
+    // file's id was taken with its batch. A COMPACTION output's own id is NOT
+    // that signal either: the id is taken when the compaction starts writing,
+    // while newer flushes can install first, and an intra-L0 output is
+    // appended at the BACK of L0 regardless of its id — so outputs persist
+    // their newest INPUT's recency in meta (`recency`) and sort by it, with id
+    // as the tie-break (equal recency means one descends from the other, and
+    // an output's id is above every input's, so the higher id is the
+    // superseding copy). A table's
     // highest seqno is NOT the signal either: callers may assign seqnos
     // explicitly, so an older table can top out above a newer one on an
     // unrelated key. The key is total, so repeating a repair over the same

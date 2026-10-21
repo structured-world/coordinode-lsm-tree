@@ -438,9 +438,14 @@ pub(super) fn prepare_table_writer(
         payload.dest_level,
         boundaries.len(),
     );
-    let mut table_writer = MultiWriter::new(
+    // Every output's id is above its inputs': an output takes the age of its
+    // newest input, and the id is what tells the two apart, the higher one
+    // the output that supersedes it.
+    let above = payload.table_ids.iter().copied().max();
+    let mut table_writer = MultiWriter::from_pool(
         table_base_folder,
-        opts.table_id_generator.clone(),
+        alloc::sync::Arc::clone(&opts.table_files),
+        above,
         payload.target_size,
         payload.dest_level,
         level_fs,
@@ -1698,9 +1703,11 @@ impl StandardCompaction {
 
         let pin_filter = opts.config.filter_block_pinning_policy.get(dst_lvl);
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
+        let written = self.table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
-        self.table_writer
-            .finish()?
+        written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(
@@ -1729,7 +1736,11 @@ impl StandardCompaction {
                 {
                     params.metrics = opts.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()
     }

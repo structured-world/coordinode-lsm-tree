@@ -123,8 +123,9 @@ struct Link {
 enum Ordered {
     /// A file's content as of its sync.
     Image(PathBuf, Vec<u8>),
-    /// The entries a directory sync covered.
-    Entries(Vec<PathBuf>),
+    /// The entries a directory sync covered, each with whether it names a
+    /// regular file.
+    Entries(Vec<(PathBuf, bool)>),
     /// A removal issued behind an ordered sync: a barrier keeps it behind
     /// that sync, so a power loss that loses the sync loses the removal too
     /// and leaves the file as the syncs before it made it. The flag says the
@@ -185,8 +186,8 @@ impl CrashState {
             match sync {
                 Ordered::Image(path, bytes) => self.set_durable(&path, bytes),
                 Ordered::Entries(entries) => {
-                    for entry in &entries {
-                        self.pending_entries.remove(entry);
+                    for (entry, file) in &entries {
+                        self.entry_made_durable(entry, *file);
                     }
                 }
                 // Kept, in its place: the file is gone from here on, and an
@@ -248,6 +249,17 @@ impl CrashState {
         self.settle(self.ordered.len());
     }
 
+    /// The entry `path` made durable by a sync of its directory. A regular
+    /// file none of whose bytes was ever synced is still there after a power
+    /// loss, empty: the file was made with its entry, and the bytes written
+    /// since are what no sync covered.
+    fn entry_made_durable(&mut self, path: &Path, file: bool) {
+        self.pending_entries.remove(path);
+        if file && !self.durable.contains_key(path) {
+            self.set_durable(path, Vec::new());
+        }
+    }
+
     /// Drops what the ordered syncs still owe the name `path`, removed or
     /// replaced: a sync of its old file or its old entry does not carry over
     /// to whatever takes the name.
@@ -255,7 +267,7 @@ impl CrashState {
         self.ordered.retain_mut(|sync| match sync {
             Ordered::Image(name, _) => name != path,
             Ordered::Entries(entries) => {
-                entries.retain(|entry| entry != path);
+                entries.retain(|(entry, _)| entry != path);
                 true
             }
             Ordered::Removed(..) | Ordered::Renamed { .. } => true,
@@ -534,7 +546,7 @@ impl CrashFs {
             Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
             Ordered::Renamed { from, to, .. } => !from.starts_with(path) && !to.starts_with(path),
             Ordered::Entries(entries) => {
-                entries.retain(|entry| !entry.starts_with(path));
+                entries.retain(|(entry, _)| !entry.starts_with(path));
                 true
             }
         });
@@ -826,11 +838,20 @@ impl CrashFs {
         // the backend says about identity decides, outside the state lock.
         // The namespace is held, so the pending set cannot change meanwhile.
         let pending = self.state.lock().pending_entries.clone();
-        let covered: Vec<PathBuf> = pending
+        // Each with whether it names a regular file, which a power loss
+        // leaves in place once its entry is durable (see
+        // `CrashState::entry_made_durable`); asked of the backend here, the
+        // state lock not held.
+        let covered: Vec<(PathBuf, bool)> = pending
             .into_iter()
             .filter(|entry| {
                 let parent = crate::file::entry_directory(entry);
                 parent == directory || matches!(self.inner.same_file(parent, &directory), Ok(true))
+            })
+            .map(|entry| {
+                let file = !matches!(self.inner.read_link(&entry), Ok(Some(_)))
+                    && self.inner.metadata(&entry).is_ok_and(|meta| meta.is_file);
+                (entry, file)
             })
             .collect();
         let mut state = self.state.lock();
@@ -841,8 +862,8 @@ impl CrashFs {
             return Ok(());
         }
         state.settle_all();
-        for entry in &covered {
-            state.pending_entries.remove(entry);
+        for (entry, file) in &covered {
+            state.entry_made_durable(entry, *file);
         }
         Ok(())
     }
@@ -1144,7 +1165,7 @@ impl Fs for CrashFs {
             match sync {
                 Ordered::Image(name, _) if name.as_path() == from => *name = to.to_path_buf(),
                 Ordered::Image(..) | Ordered::Removed(..) | Ordered::Renamed { .. } => {}
-                Ordered::Entries(entries) => entries.retain(|entry| entry != from),
+                Ordered::Entries(entries) => entries.retain(|(entry, _)| entry != from),
             }
         }
         // The rename is as durable as the source was.

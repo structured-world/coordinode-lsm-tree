@@ -652,6 +652,26 @@ pub fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result
     Ok(())
 }
 
+/// Clears `O_NONBLOCK` from `fd`'s status flags, which a `no_wait` open set
+/// for the open alone.
+///
+/// # Errors
+/// Returns an [`Error`] if an `fcntl` syscall fails.
+pub fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
+    /// `F_GETFL`, the same on every Linux architecture.
+    const F_GETFL: usize = 3;
+    /// `F_SETFL`, the same on every Linux architecture.
+    const F_SETFL: usize = 4;
+    // SAFETY: `fd` is an owned descriptor; `F_GETFL` takes no argument.
+    let flags = unsafe { syscall3(Sysno::fcntl, fd as usize, F_GETFL, 0) }
+        .map_err(|e| err("fcntl(F_GETFL)", e))?;
+    let cleared = flags & !(O_NONBLOCK.unsigned_abs() as usize);
+    // SAFETY: as above; `F_SETFL` takes the flags as an integer.
+    unsafe { syscall3(Sysno::fcntl, fd as usize, F_SETFL, cleared) }
+        .map_err(|e| err("fcntl(F_SETFL)", e))?;
+    Ok(())
+}
+
 /// `lseek(fd, offset, whence)` — reposition; returns the resulting absolute
 /// offset. Used to resolve the file size (`SEEK_END`) for append / `Seek::End`.
 ///
@@ -700,17 +720,101 @@ pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
 
 // ---- Directory / path syscalls (for the `Fs` backend) ----
 //
-// These use the asm-generic flag values, authoritative on x86/x86_64, ARM,
-// AArch64, RISC-V, PowerPC, etc. (the realistic `io_uring` targets). The handful
-// of flags that diverge on MIPS / SPARC (O_APPEND / O_EXCL / O_DIRECTORY) are not
-// remapped here, matching the `direct_io` policy documented on `FsOpenOptions`.
+// `O_APPEND` and `O_EXCL` take the asm-generic values, which every realistic
+// `io_uring` target shares. The flags MIPS and SPARC move are not remapped
+// here, matching the `direct_io` policy documented on `FsOpenOptions`.
+// `O_DIRECTORY` and `O_NOFOLLOW` differ on arm, aarch64, powerpc and m68k,
+// which keep their own `fcntl.h` (`arch/arm64/include/uapi/asm/fcntl.h`:
+// `O_DIRECTORY 040000`, `O_NOFOLLOW 0100000`, `O_DIRECT 0200000`): the
+// asm-generic `O_DIRECTORY` is `O_DIRECT` there.
 
 /// Append: writes always land at end of file.
 const O_APPEND: i32 = 0o2000;
+/// Do not block in the open on a named pipe with no other end. Asm-generic
+/// (`0o4000`, arm, aarch64 and powerpc alike); MIPS and SPARC override below.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const O_NONBLOCK: i32 = 0o4000;
+/// Do not block in the open on a named pipe with no other end (MIPS: `0x80`).
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+))]
+const O_NONBLOCK: i32 = 0x80;
+/// Do not block in the open on a named pipe with no other end (SPARC:
+/// `0x4000`).
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+const O_NONBLOCK: i32 = 0x4000;
 /// Fail `open` with `EEXIST` if the path already exists (with `O_CREAT`).
 const O_EXCL: i32 = 0o200;
+/// Require the opened path to be a directory (arm, aarch64, powerpc, m68k).
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+))]
+const O_DIRECTORY: i32 = 0o40_000;
 /// Require the opened path to be a directory.
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+)))]
 const O_DIRECTORY: i32 = 0o200_000;
+/// Fail `open` with `ELOOP` if the last path component is a symbolic link
+/// (arm, aarch64, powerpc, m68k).
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+))]
+const O_NOFOLLOW: i32 = 0o100_000;
+/// Fail `open` with `ELOOP` if the last path component is a symbolic link.
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+)))]
+const O_NOFOLLOW: i32 = 0o400_000;
+
+// The open flags this module spells out match the C library's on the target,
+// checked as it builds: several differ per architecture, and a wrong one
+// opens with another flag's meaning. A comparison of constants, so nothing of
+// the C library is linked. MIPS and SPARC are left out, their divergent
+// `O_APPEND` / `O_EXCL` / `O_DIRECTORY` / `O_NOFOLLOW` not being remapped here.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const _: () = {
+    assert!(O_CREAT == libc::O_CREAT);
+    assert!(O_TRUNC == libc::O_TRUNC);
+    assert!(O_APPEND == libc::O_APPEND);
+    assert!(O_EXCL == libc::O_EXCL);
+    assert!(O_DIRECTORY == libc::O_DIRECTORY);
+    assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
+    assert!(O_NONBLOCK == libc::O_NONBLOCK);
+};
 
 /// `unlinkat` flag: remove a directory (`rmdir`) instead of a file.
 const AT_REMOVEDIR: i32 = 0x200;
@@ -1193,8 +1297,8 @@ fn path_to_cstring(path: &Path) -> Result<CString, Error> {
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "path contains an interior NUL"))
 }
 
-/// Maps [`FsOpenOptions`] to `open(2)` flags (asm-generic values; see the
-/// directory-syscall note for the MIPS / SPARC caveat on the divergent flags).
+/// Maps [`FsOpenOptions`] to `open(2)` flags (see the directory-syscall note
+/// for the per-architecture values and the MIPS / SPARC caveat).
 fn open_flags(opts: &FsOpenOptions) -> i32 {
     let mut flags = if opts.read && (opts.write || opts.append) {
         O_RDWR
@@ -1214,6 +1318,12 @@ fn open_flags(opts: &FsOpenOptions) -> i32 {
     }
     if opts.append {
         flags |= O_APPEND;
+    }
+    if opts.no_follow {
+        flags |= O_NOFOLLOW;
+    }
+    if opts.no_wait {
+        flags |= O_NONBLOCK;
     }
     flags
 }
@@ -1311,11 +1421,12 @@ impl Fs for IoUringRawFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
         let cpath = path_to_cstring(path)?;
         let fd = open_raw(&cpath, open_flags(opts), 0o644)?;
-        Ok(Box::new(IoUringRawFile::new(
-            Arc::clone(&self.ring),
-            fd,
-            opts.append,
-        )))
+        // Owns `fd` from here, so a failure below closes it.
+        let file = IoUringRawFile::new(Arc::clone(&self.ring), fd, opts.append);
+        if opts.no_wait {
+            clear_nonblock_raw(fd)?;
+        }
+        Ok(Box::new(file))
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {

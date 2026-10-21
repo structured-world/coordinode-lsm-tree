@@ -258,6 +258,65 @@ fn raw_file_append_writes_accumulate_at_eof() {
 }
 
 #[test]
+fn raw_fs_no_wait_refuses_a_pipe_with_no_reader_and_opens_a_file() {
+    // `no_wait` fails the open of a named pipe nothing reads rather than
+    // block it, and still opens a regular file, which then writes as any.
+    use crate::fs::Fs;
+    use crate::path::Path;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pipe = tmp.path().join("pipe");
+    let file = tmp.path().join("file");
+    let name = std::ffi::CString::new(pipe.to_str().expect("utf8")).expect("no NUL");
+    // SAFETY: `name` is a NUL-terminated path the call only reads.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    std::fs::write(&file, b"").expect("file");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let opts = FsOpenOptions::new().write(true).no_wait(true);
+
+    assert!(
+        fs.open(Path::new(pipe.to_str().expect("utf8")), &opts)
+            .is_err(),
+        "a pipe with no reader is refused"
+    );
+    let mut opened = fs
+        .open(Path::new(file.to_str().expect("utf8")), &opts)
+        .expect("a regular file opens");
+    opened.write_all(b"a table").expect("write");
+    drop(opened);
+    assert_eq!(std::fs::read(&file).expect("read"), b"a table");
+}
+
+#[test]
+fn raw_fs_no_follow_refuses_a_symlink_and_opens_a_file() {
+    // `no_follow` refuses a symbolic link at the last component (`ELOOP`),
+    // so nothing is written through it into the file it names, and still
+    // opens a regular file.
+    use crate::fs::Fs;
+    use crate::path::Path;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let link = tmp.path().join("link");
+    std::fs::write(&target, b"").expect("target");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let opts = FsOpenOptions::new().write(true).no_follow(true);
+
+    assert!(
+        fs.open(Path::new(link.to_str().expect("utf8")), &opts)
+            .is_err(),
+        "a symlink is refused"
+    );
+    assert!(
+        fs.open(Path::new(target.to_str().expect("utf8")), &opts)
+            .is_ok(),
+        "a regular file opens"
+    );
+}
+
+#[test]
 fn ring_setup_and_nop_round_trips() {
     let mut ring = IoUringRaw::new(8).expect("io_uring_setup + mmap should succeed");
     assert!(

@@ -16,6 +16,7 @@ pub mod columnar_cursor;
 pub mod columnar_predicate;
 pub mod data_block;
 pub mod delete_bitmap;
+pub(crate) mod file_pool;
 pub mod filter;
 #[cfg(feature = "columnar")]
 pub(crate) mod group_carry;
@@ -984,14 +985,33 @@ impl Table {
         self.metadata.id
     }
 
-    /// The table's L0 recency key, as the manifest records it: a flush
-    /// table's first table id, an ingested table's id taken when it is
+    /// The table's L0 recency key, as the manifest records it: an id a flush
+    /// takes when it starts, an ingested table's id taken when it is
     /// installed, a compaction output's highest INPUT recency. Higher = newer
     /// content; L0 is ordered by it because a table's own id is allocated at
-    /// write start and says nothing about where its content belongs.
+    /// write start, or earlier for a pooled file, and says nothing about where
+    /// its content belongs.
     #[must_use]
     pub(crate) fn l0_recency(&self) -> TableId {
         self.0.l0_recency
+    }
+
+    /// Records that the directory entry naming this table's file was durable
+    /// before the table was written into it.
+    pub(crate) fn mark_entry_durable(&self) {
+        self.0
+            .entry_durable
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the directory entry naming this table's file was durable before
+    /// the table was written into it, so the install that names it need not
+    /// sync its folder.
+    #[must_use]
+    pub(crate) fn entry_durable(&self) -> bool {
+        self.0
+            .entry_durable
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// This segment's positional delete-bitmap (rows deleted by position),
@@ -9745,6 +9765,7 @@ impl Table {
                 prefix_filter,
 
                 is_deleted: AtomicBool::default(),
+                entry_durable: AtomicBool::default(),
                 punch_on_drop: AtomicU64::new(u64::MAX),
 
                 checksum,

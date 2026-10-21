@@ -181,6 +181,12 @@ pub trait AbstractTree: sealed::Sealed {
     #[doc(hidden)]
     fn sync_mode(&self) -> crate::fs::SyncMode;
 
+    /// Waits for the table file pools to finish the refills running off the
+    /// writing threads: a test that counts the syncs an operation causes
+    /// waits for them before it counts.
+    #[doc(hidden)]
+    fn wait_for_table_file_refills(&self);
+
     /// The tree's configured prefix extractor, or `None` when it indexes no
     /// prefixes. The patrol scrub's filter cross-check reads it here so it
     /// can verify a rebuilt full filter carries the source's prefix hashes,

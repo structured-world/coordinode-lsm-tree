@@ -7981,7 +7981,22 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
     bitmap.insert(1);
     bitmap.insert(3);
     let out_checksum = source
-        .relocate_columnar_with_deletes(&out, &StdFs, 1, &bitmap, SyncMode::Normal, None)?
+        .relocate_columnar_with_deletes(
+            || {
+                use crate::fs::{Fs, FsOpenOptions};
+                Ok(crate::table::file_pool::ClaimedFile {
+                    id: 1,
+                    path: out.clone(),
+                    file: StdFs.open(&out, &FsOpenOptions::new().write(true).create_new(true))?,
+                    durable_entry: false,
+                    writing: crate::table::file_pool::Writing::alone(1),
+                })
+            },
+            &StdFs,
+            &bitmap,
+            SyncMode::Normal,
+            None,
+        )?
         .checksum;
     let relocated = recover_test_table_with_id(&out, out_checksum, 1)?;
 

@@ -14,6 +14,12 @@ use lsm_tree::io::ErrorKind;
 use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
 use test_log::test;
 
+/// The folder syncs a compaction's install issues for its output's new entry
+/// before the tree folder's: none where the output is written into a pooled
+/// file, one where a folder sync does nothing and so there is no pool
+/// (Windows).
+const UNPOOLED_FOLDER_SYNCS: u64 = if cfg!(windows) { 1 } else { 0 };
+
 #[test]
 fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tree::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -28,6 +34,9 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         // Every install rotates, so each flush writes and installs a fresh
         // snapshot.
         .manifest_log_rotate_bytes(0)
+        // The armed sync counts the folder syncs in order: none may come from
+        // a refill on another thread.
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -37,11 +46,13 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         tree.insert("k0", "v0", 0);
         tree.flush_active_memtable(0)?;
 
-        // The next flush syncs its table's folder, then writes its snapshot
-        // and log and fails the directory sync that would install them.
+        // The next flush writes its table into a file pooled with the first
+        // one's, so its first directory sync is the one that would install
+        // its snapshot and log: it fails. Where there is no pool (Windows) its
+        // file is made for it, and its install syncs the tables folder first.
         injector.arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
+                .skip(UNPOOLED_FOLDER_SYNCS)
                 .once(),
         );
         tree.insert("k1", "v1", 1);
@@ -83,6 +94,7 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -93,11 +105,13 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
             tree.insert(k, "v", seqno);
             tree.flush_active_memtable(0)?;
         }
-        // The compaction syncs its output's folder, then fails the directory
-        // sync of the install that names the output.
+        // The compaction writes its output into a pooled file, so its first
+        // directory sync is that of the install that names the output: it
+        // fails. Where there is no pool (Windows) the output's file is made
+        // for it, and the install syncs the tables folder first.
         injector.arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
+                .skip(UNPOOLED_FOLDER_SYNCS)
                 .once(),
         );
         assert!(
@@ -113,16 +127,29 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
     Ok(())
 }
 
-/// The files of the tree's tables folder.
+/// The tables in the tree's tables folder.
 fn table_files(dir: &std::path::Path) -> std::io::Result<usize> {
-    Ok(std::fs::read_dir(dir.join("tables"))?.count())
+    Ok(table_names(dir)?.len())
 }
 
-/// The names in the tree's tables folder.
+/// The names of the tables in the tree's tables folder. The empty files the
+/// folder keeps for tables to come are no tables.
 fn table_names(dir: &std::path::Path) -> std::io::Result<std::collections::BTreeSet<String>> {
-    std::fs::read_dir(dir.join("tables"))?
-        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-        .collect()
+    let mut names = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(dir.join("tables"))? {
+        let entry = entry?;
+        // A retired table the tree unlinks in the background between the
+        // listing and the stat is gone, and not counted.
+        match entry.metadata() {
+            Ok(meta) if meta.len() > 0 => {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(names)
 }
 
 /// The output a compaction of unknown install outcome keeps goes once a later
@@ -192,6 +219,7 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -204,10 +232,13 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
         }
         // The install's directory sync fails, then the removal that would
         // withdraw its snapshot; the first removal is that of a leftover
-        // temporary.
+        // temporary. The output is written into a pooled file, so the
+        // install's sync is the first one, except where a folder sync does
+        // nothing and so there is no pool (Windows): there the output's file
+        // is made for it, and the install syncs its folder first.
         injector.arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
+                .skip(UNPOOLED_FOLDER_SYNCS)
                 .once(),
         );
         injector.arm(
@@ -248,6 +279,7 @@ fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -259,10 +291,12 @@ fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::
             tree.flush_active_memtable(0)?;
         }
         assert_eq!(table_files(dir.path())?, 2);
-        // The install's directory sync fails, and so does the withdrawal's.
+        // The install's directory sync fails, and so does the withdrawal's:
+        // the output is written into a pooled file, so these are the first
+        // two, after the output's own folder sync where there is no pool.
         injector.arm(
             FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
-                .skip(1)
+                .skip(UNPOOLED_FOLDER_SYNCS)
                 .times(2),
         );
         assert!(

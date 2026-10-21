@@ -22,7 +22,9 @@ fn tree_recovery_cleanup_orphans() -> lsm_tree::Result<()> {
         assert!(folder.path().join("tables").join("1").try_exists()?);
     }
 
-    std::fs::File::create(folder.path().join("tables").join("0"))?;
+    // An orphan holding bytes, as a table no version names does; an empty
+    // file under a table name is one the folder keeps for tables to come.
+    std::fs::write(folder.path().join("tables").join("0"), b"orphan")?;
 
     {
         let _tree = Config::new(

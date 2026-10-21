@@ -360,12 +360,25 @@ fn a_failed_install_leaves_no_output_where_open_files_cannot_be_unlinked() -> cr
     use crate::fs::{Fault, FaultOp, FaultRule, StdFs};
     use crate::{AbstractTree, Config, KvSeparationOptions, SequenceNumberCounter};
 
-    /// The table and blob files under `root`, as `folder/name`.
+    /// The table and blob files under `root`, as `folder/name`. The empty
+    /// files a tables folder keeps for tables to come are none: a refill
+    /// running off the merge's thread may add a batch of them meanwhile.
     fn listing(root: &std::path::Path) -> crate::Result<std::collections::BTreeSet<String>> {
         let mut all = std::collections::BTreeSet::new();
         for folder in [crate::file::TABLES_FOLDER, crate::file::BLOBS_FOLDER] {
             for entry in std::fs::read_dir(root.join(folder))? {
-                let name = entry?.file_name().to_string_lossy().into_owned();
+                let entry = entry?;
+                if folder == crate::file::TABLES_FOLDER {
+                    // A retired input unlinked in the background between the
+                    // listing and the stat is gone, and not listed.
+                    match entry.metadata() {
+                        Ok(meta) if meta.len() == 0 => continue,
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
                 all.insert(alloc::format!("{folder}/{name}"));
             }
         }

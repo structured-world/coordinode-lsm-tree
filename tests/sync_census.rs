@@ -123,12 +123,15 @@ fn open(base: &Path, fs: &Arc<FaultFs<MemFs>>, blob: bool, route: Option<&Path>)
             fs.create_dir_all(parent).expect("the tree's parent");
         }
     }
+    // Refilled on the writing thread, so each operation's syncs are the same
+    // ones on every run.
     let config = Config::new(
         base,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(fs.clone());
+    .with_shared_fs(fs.clone())
+    .table_file_refill_inline(true);
     let config = match route {
         Some(route) => config.level_routes(vec![LevelRoute {
             levels: 0..7,
@@ -169,9 +172,31 @@ fn creation() -> Vec<(Synced, SyncKind)> {
     ])
 }
 
+/// What a flush syncs once its tables folder's pool is warm: its table, the
+/// edit naming it, and for a KV-separated tree its blob file and the blob
+/// folder for that file's new name. `first` adds the tables folder, synced
+/// for the batch of pooled files the first flush makes.
+fn flush_syncs(blob: bool, first: bool) -> Vec<(Synced, SyncKind)> {
+    let mut flush = vec![
+        (Synced::Table, SyncKind::FileData),
+        (Synced::EditLog, SyncKind::FileData),
+    ];
+    if first {
+        flush.push((Synced::TablesDir, SyncKind::Directory));
+    }
+    if blob {
+        flush.push((Synced::Blob, SyncKind::FileData));
+        flush.push((Synced::BlobsDir, SyncKind::Directory));
+    }
+    sorted(flush)
+}
+
 /// Creating, flushing, compacting, dropping and reopening a tree, standard
 /// and KV-separated, each syncs only what it makes durable: a new entry's
 /// folder once, a written file once, and a reopen the snapshot it installs.
+/// A table is written into a file whose name a batch made durable, so once
+/// the batch is made a flush and a compaction sync their tables and the edit
+/// naming them, and no folder for them.
 #[test]
 fn each_tree_operation_syncs_only_what_it_makes_durable() {
     for blob in [false, true] {
@@ -184,19 +209,21 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
 
         fill(&tree, 1);
         tree.flush_active_memtable(0).expect("flush");
-        let mut flush = vec![
-            (Synced::Table, SyncKind::FileData),
-            (Synced::TablesDir, SyncKind::Directory),
-            (Synced::EditLog, SyncKind::FileData),
-        ];
-        if blob {
-            flush.push((Synced::Blob, SyncKind::FileData));
-            flush.push((Synced::BlobsDir, SyncKind::Directory));
-        }
-        let flush = sorted(flush);
-        assert_eq!(census.take(), flush, "the first flush (blob: {blob})");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, true),
+            "the first flush (blob: {blob})"
+        );
 
-        for round in 2..=4 {
+        fill(&tree, 2);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, false),
+            "a flush into a pooled file (blob: {blob})"
+        );
+
+        for round in 3..=4 {
             fill(&tree, round);
             tree.flush_active_memtable(0).expect("flush");
         }
@@ -207,10 +234,9 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             census.take(),
             sorted(vec![
                 (Synced::Table, SyncKind::FileData),
-                (Synced::TablesDir, SyncKind::Directory),
                 (Synced::EditLog, SyncKind::FileData),
             ]),
-            "a compaction into one table (blob: {blob})"
+            "a compaction into one pooled file (blob: {blob})"
         );
 
         tree.drop_range::<&[u8], _>(..).expect("drop");
@@ -234,16 +260,216 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
         );
 
         // The reopen made the log it installed durable by name, so the first
-        // flush after it syncs what any flush does, not the tree folder again.
+        // flush after it does not sync the tree folder again. It takes a file
+        // the open found pooled, whose name it cannot know was ever synced,
+        // so it syncs the tables folder once for all of them.
         fill(&tree, 5);
         tree.flush_active_memtable(0).expect("flush");
         assert_eq!(
             census.take(),
-            flush,
+            flush_syncs(blob, true),
             "the first flush after reopening (blob: {blob})"
+        );
+        fill(&tree, 6);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            flush_syncs(blob, false),
+            "the next one (blob: {blob})"
         );
         drop(tree);
     }
+}
+
+/// Over a run of flushes the default pool, refilled off the flushing thread,
+/// syncs the tables folder once per batch, where 33 flushes without a pool
+/// sync it 33 times. The first flush finds the pool dry: its install syncs
+/// the folder for the file made for it, and the first batch is made and
+/// synced. From there a flush that leaves half a batch starts the next one:
+/// the 9th and the 25th. Every flush syncs its table and its edit either
+/// way. The refills are waited for before each count, so each lands on the
+/// flush that started it.
+#[test]
+fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
+    const FLUSHES: u64 = 33;
+    /// The batch a tree makes when its configuration does not say.
+    const DEFAULT_BATCH: usize = 16;
+    for pool in [DEFAULT_BATCH, 0] {
+        let base = PathBuf::from("/census/amortized").join(pool.to_string());
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        let census = Census::new(&base, None, fs.injector());
+        let config = Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone());
+        // The default arm sets nothing, so it runs the default batch.
+        let config = if pool == 0 {
+            config.table_file_pool(0)
+        } else {
+            config
+        };
+        let tree = config.open().expect("open");
+        census.take();
+
+        let mut folder_syncs = Vec::new();
+        for round in 1..=FLUSHES {
+            fill(&tree, round);
+            tree.flush_active_memtable(0).expect("flush");
+            tree.wait_for_table_file_refills();
+            let syncs = census.take();
+            let count = |synced: &Synced| syncs.iter().filter(|(s, _)| s == synced).count();
+            assert_eq!(count(&Synced::Table), 1, "flush {round} (pool {pool})");
+            assert_eq!(count(&Synced::EditLog), 1, "flush {round} (pool {pool})");
+            for _ in 0..count(&Synced::TablesDir) {
+                folder_syncs.push(round);
+            }
+        }
+        let expected: Vec<u64> = if pool == 0 {
+            (1..=FLUSHES).collect()
+        } else {
+            vec![1, 1, 9, 25]
+        };
+        assert_eq!(folder_syncs, expected, "pool {pool}");
+    }
+}
+
+/// Without a pool every table file is made as its table is written, and the
+/// install naming it syncs its folder.
+#[test]
+fn without_a_pool_each_install_syncs_the_tables_folder() {
+    let base = PathBuf::from("/census/unpooled");
+    let fs = Arc::new(FaultFs::new(MemFs::new()));
+    let census = Census::new(&base, None, fs.injector());
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs.clone())
+    .table_file_pool(0)
+    .open()
+    .expect("open");
+    census.take();
+
+    for round in 1..=2 {
+        fill(&tree, round);
+        tree.flush_active_memtable(0).expect("flush");
+        assert_eq!(
+            census.take(),
+            sorted(vec![
+                (Synced::Table, SyncKind::FileData),
+                (Synced::TablesDir, SyncKind::Directory),
+                (Synced::EditLog, SyncKind::FileData),
+            ]),
+            "flush {round}"
+        );
+    }
+}
+
+/// Without a pool a KV-separated tree's flush and an ingestion of either kind
+/// make their table files as they write them, so the install that names them
+/// syncs the tables folder too.
+#[test]
+fn without_a_pool_every_write_kind_syncs_the_tables_folder() {
+    for blob in [false, true] {
+        let base = PathBuf::from("/census").join(if blob {
+            "unpooled-blob"
+        } else {
+            "unpooled-standard"
+        });
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        let census = Census::new(&base, None, fs.injector());
+        let config = Config::new(
+            &base,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(fs.clone())
+        .table_file_pool(0);
+        let config = if blob {
+            config.with_kv_separation(Some(
+                KvSeparationOptions::default().separation_threshold(64),
+            ))
+        } else {
+            config
+        };
+        let tree = config.open().expect("open");
+        census.take();
+
+        fill(&tree, 1);
+        tree.flush_active_memtable(0).expect("flush");
+        assert!(
+            census
+                .take()
+                .contains(&(Synced::TablesDir, SyncKind::Directory)),
+            "a flush (blob: {blob})"
+        );
+
+        let mut ingestion = tree.ingestion().expect("ingestion");
+        for i in 0..100u32 {
+            ingestion
+                .write(format!("ingested{i:04}"), vec![7u8; 200])
+                .expect("write");
+        }
+        ingestion.finish().expect("finish");
+        assert!(
+            census
+                .take()
+                .contains(&(Synced::TablesDir, SyncKind::Directory)),
+            "an ingestion (blob: {blob})"
+        );
+    }
+}
+
+/// Under barrier syncs a pooled table on another device than the manifest
+/// still has its folder synced in full: that is the sync that makes the
+/// table's data durable on its device before the edit on the other one names
+/// it.
+#[test]
+fn a_pooled_table_on_another_device_flushes_that_device() {
+    use lsm_tree::fs::{Fs, SyncMode};
+    let base = std::path::absolute("/census/barrier/tree").expect("absolute path");
+    let route = std::path::absolute("/elsewhere/hot").expect("absolute path");
+    let tree_fs = Arc::new(FaultFs::new(MemFs::new()));
+    let route_fs = Arc::new(FaultFs::new(MemFs::new()));
+    tree_fs
+        .create_dir_all(base.parent().expect("a parent"))
+        .expect("the tree's parent");
+    route_fs
+        .create_dir_all(route.parent().expect("a parent"))
+        .expect("the route's parent");
+    let tree = Config::new(
+        &base,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(tree_fs.clone())
+    .sync_mode(SyncMode::Barrier)
+    .table_file_refill_inline(true)
+    .level_routes(vec![LevelRoute {
+        levels: 0..7,
+        path: route.clone(),
+        fs: route_fs.clone(),
+    }])
+    .open()
+    .expect("open");
+    fill(&tree, 1);
+    tree.flush_active_memtable(0).expect("flush");
+    let before = route_fs
+        .injector()
+        .directory_sync_modes_for("elsewhere")
+        .len();
+
+    fill(&tree, 2);
+    tree.flush_active_memtable(0).expect("flush");
+    let modes = route_fs.injector().directory_sync_modes_for("elsewhere");
+    assert_eq!(
+        modes.get(before..),
+        Some(&[SyncMode::Full][..]),
+        "the route's tables folder, once, in full"
+    );
 }
 
 /// A flush that rotates the manifest installs its fresh snapshot with two
@@ -261,6 +487,7 @@ fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
     )
     .with_shared_fs(fs.clone())
     .manifest_log_rotate_bytes(0)
+    .table_file_refill_inline(true)
     .open()
     .expect("open");
     census.take();

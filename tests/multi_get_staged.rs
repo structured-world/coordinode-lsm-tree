@@ -554,10 +554,11 @@ fn an_unreadable_older_table_behind_a_ceiling_hit_does_not_fail_the_batch() -> l
         let tree = config(Arc::new(StdFs)).open()?;
         tree.insert("k", "old", 1);
         tree.flush_active_memtable(0)?;
+        // The empty files the folder keeps for tables to come are no tables.
         let older = std::fs::read_dir(dir.path().join("tables"))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .find(|path| path.is_file())
+            .find(|path| path.is_file() && std::fs::metadata(path).is_ok_and(|m| m.len() > 0))
             .expect("the first flush wrote a table");
         // Keys the older table's range does not reach, so the batch is large
         // enough for the batched read.
@@ -619,10 +620,11 @@ fn a_batched_read_failing_after_a_ceiling_hit_was_answered_does_not_fail_the_bat
         let tree = config(Arc::new(StdFs)).open()?;
         tree.insert("k", "old", 1);
         tree.flush_active_memtable(0)?;
+        // The empty files the folder keeps for tables to come are no tables.
         let older = std::fs::read_dir(dir.path().join("tables"))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .find(|path| path.is_file())
+            .find(|path| path.is_file() && std::fs::metadata(path).is_ok_and(|m| m.len() > 0))
             .expect("the first flush wrote a table");
         tree.insert("h", "new", 2);
         tree.insert("j", "new", 3);

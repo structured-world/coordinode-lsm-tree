@@ -35,7 +35,7 @@ mod aligned_buf;
 // (prerequisite); the wider no-std migration epic is #274. This
 // gate is the first concrete step.
 #[cfg(feature = "std")]
-mod direct_io;
+mod open_flags;
 // `std_fs` (std::fs) is genuinely std-bound and gated out of a `no_std` build.
 // `mem_fs` is the no_std-capable reference backend (spin + hashbrown over the
 // `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
@@ -142,16 +142,12 @@ pub struct FsOpenOptions {
     /// are a multiple of that block size.
     ///
     /// `direct_io` is a HINT, not a guarantee. The flag is honoured only
-    /// on Linux and Android, and only on architectures where the
-    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative on
-    /// `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`, and
-    /// `s390x`. On Linux
-    /// architectures with a divergent `O_DIRECT` bit (arm `0o200000`,
-    /// mips `0o100000`, parisc, sparc) the flag is silently dropped to
-    /// avoid passing the wrong bit to `open(2)`. Other platforms - macOS
-    /// (would need `F_NOCACHE` post-open via `fcntl`, not wired here),
-    /// Windows (would need `FILE_FLAG_NO_BUFFERING` at `CreateFile` time,
-    /// not wired here), other Unixes - also silently drop the flag.
+    /// on Linux and Android, with the target architecture's own `O_DIRECT`
+    /// bit, and the raw `io_uring` backend does not wire it. Other
+    /// platforms - macOS (would need `F_NOCACHE` post-open via `fcntl`, not
+    /// wired here), Windows (would need `FILE_FLAG_NO_BUFFERING` at
+    /// `CreateFile` time, not wired here), other Unixes - silently drop the
+    /// flag.
     ///
     /// Callers must therefore treat `direct_io` as best-effort:
     /// correctness must not depend on cache bypass being in effect, and
@@ -161,6 +157,16 @@ pub struct FsOpenOptions {
     /// buffer suitable for `O_DIRECT` reads and writes when the flag is
     /// honoured.
     pub direct_io: bool,
+    /// Do not follow a symbolic link at the path's last component. On Unix
+    /// the open fails (`O_NOFOLLOW`); on Windows the link itself is opened
+    /// (`FILE_FLAG_OPEN_REPARSE_POINT`), which is not a regular file. A
+    /// backend without symbolic links has nothing to follow.
+    pub no_follow: bool,
+    /// Do not wait in the open itself: a named pipe at the path with no
+    /// reader fails the open on Unix rather than block it (`O_NONBLOCK`,
+    /// cleared once the file is open, so its reads and writes block as
+    /// usual). A backend without named pipes has nothing to wait for.
+    pub no_wait: bool,
 }
 
 impl Default for FsOpenOptions {
@@ -181,6 +187,8 @@ impl FsOpenOptions {
             truncate: false,
             append: false,
             direct_io: false,
+            no_follow: false,
+            no_wait: false,
         }
     }
 
@@ -230,6 +238,20 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn direct_io(mut self, direct_io: bool) -> Self {
         self.direct_io = direct_io;
+        self
+    }
+
+    /// Sets the `no_follow` flag.
+    #[must_use]
+    pub const fn no_follow(mut self, no_follow: bool) -> Self {
+        self.no_follow = no_follow;
+        self
+    }
+
+    /// Sets the `no_wait` flag.
+    #[must_use]
+    pub const fn no_wait(mut self, no_wait: bool) -> Self {
+        self.no_wait = no_wait;
         self
     }
 }
@@ -307,6 +329,13 @@ pub struct FsCapabilities {
     /// false the mode is unavailable and the engine falls back to whole-output
     /// compaction.
     pub punch_hole: bool,
+
+    /// Syncing a directory does nothing on this backend (Windows has no
+    /// directory fsync; an entry is as durable as the platform makes it
+    /// without one). Work whose only gain is a directory sync it saves, such
+    /// as the table file pool, is then skipped: it would cost and save
+    /// nothing.
+    pub directory_sync_noop: bool,
 }
 
 /// A directory entry returned by [`Fs::read_dir`].

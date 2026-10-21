@@ -3,6 +3,7 @@ use super::{
     discard_unreferenced, highest_existing_version_id, repair_tmp_path, toc_may_hide_deletions,
     verify_keep_decision,
 };
+use crate::Table;
 use crate::fs::StdFs;
 use test_log::test;
 
@@ -18,6 +19,113 @@ fn remove_manifest(fs: &dyn crate::fs::Fs, root: &std::path::Path) -> crate::Res
             fs.remove_file(&entry.path)?;
         }
     }
+    Ok(())
+}
+
+/// A file one write was still filling when another, numbered above it,
+/// finished its table is no table that lost its bytes: after a power loss
+/// without a manifest the empty file is an output cut short, left out rather
+/// than reported lost (which calls for a replay of the whole retained
+/// history). An empty file below the same table that had its table written by
+/// then is still reported lost.
+#[test]
+fn a_repair_reports_no_loss_for_an_output_cut_short_below_a_newer_table() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(4)
+    };
+    let (emptied, cut_short, finished) = {
+        let AnyTree::Standard(tree) = config().open()? else {
+            panic!("a standard tree");
+        };
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        let Some(emptied) = tree.current_version().iter_tables().map(Table::id).max() else {
+            panic!("the first table");
+        };
+
+        // A write in flight: its file is claimed, and nothing is written into
+        // it before the power goes.
+        let (folder, fs) = tree.config.tables_folder_for_level(0);
+        let in_flight = tree.table_files.claim(&folder, &fs, None, false)?;
+        tree.insert("b", "1", 1);
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let Some(finished) = version.iter_tables().max_by_key(|t| t.id()) else {
+            panic!("the second table");
+        };
+        assert_eq!(
+            finished.metadata.writing_below,
+            vec![in_flight.id],
+            "self-check: the table finished while the file was filling lists it"
+        );
+        (emptied, in_flight.path, finished.id())
+    };
+    let tables = dir.path().join("tables");
+    assert!(emptied < finished, "self-check: {emptied} < {finished}");
+    std::fs::File::create(tables.join(emptied.to_string()))?.set_len(0)?;
+    remove_manifest(&StdFs, dir.path())?;
+
+    let report = config().repair()?;
+    let emptied = tables.join(emptied.to_string());
+    assert!(
+        report.unknowable_losses.contains(&emptied),
+        "the emptied table is a loss: {report:?}"
+    );
+    assert!(
+        !report.unknowable_losses.contains(&cut_short),
+        "the output cut short is no loss: {report:?}"
+    );
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(path, _)| *path == cut_short),
+        "the output cut short is left out: {report:?}"
+    );
+    assert_eq!(report.wal_replay_scope(), WalReplayScope::FullHistory);
+    Ok(())
+}
+
+/// The same tree with nothing emptied: the output cut short alone calls for
+/// no replay past the tail.
+#[test]
+fn a_repair_of_an_output_cut_short_alone_replays_only_the_tail() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(4)
+    };
+    {
+        let AnyTree::Standard(tree) = config().open()? else {
+            panic!("a standard tree");
+        };
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        let (folder, fs) = tree.config.tables_folder_for_level(0);
+        let _in_flight = tree.table_files.claim(&folder, &fs, None, false)?;
+        tree.insert("b", "1", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 2, "{report:?}");
+    assert!(report.unknowable_losses.is_empty(), "{report:?}");
+    assert_eq!(report.wal_replay_scope(), WalReplayScope::TailOnly);
     Ok(())
 }
 
@@ -1877,12 +1985,18 @@ fn a_clean_manifest_restriction_survives_a_lost_sidecar() -> crate::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    // The crash window: the sidecar is gone, an unrelated table vanishes.
+    // The crash window: the sidecar is gone, an unrelated table vanishes (a
+    // table, not one of the empty files the folder keeps for tables to come).
     memfs.remove_file(&crate::restrict_bound::sidecar_path(&sst))?;
     let second = memfs
         .read_dir(&tables)?
         .into_iter()
-        .find(|e| !e.is_dir && e.file_name != "0" && e.file_name.parse::<u64>().is_ok())
+        .find(|e| {
+            !e.is_dir
+                && e.file_name != "0"
+                && e.file_name.parse::<u64>().is_ok()
+                && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0)
+        })
         .map(|e| e.path)
         .ok_or_else(|| crate::Error::Unrecoverable)?;
     memfs.remove_file(&second)?;
@@ -3209,10 +3323,15 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
     // so even that torn state stays collision-free: whatever id the rewrite
     // took, no surviving sidecar may name it — a later repair would restrict
     // that table at a bound belonging to another file.
+    // A published table holds bytes; the empty files the folder keeps for
+    // tables to come hold none.
     let published: Vec<_> = memfs
         .read_dir(&tables)?
         .into_iter()
-        .filter(|e| e.file_name.parse::<crate::TableId>().is_ok())
+        .filter(|e| {
+            e.file_name.parse::<crate::TableId>().is_ok()
+                && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0)
+        })
         .map(|e| e.file_name)
         .collect();
     for e in memfs.read_dir(&tables)? {
@@ -9567,6 +9686,7 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
         // the on-disk shape of a crash between output finalization and the
         // version edit (or of a committed compaction whose input deletion
         // failed).
+        // The empty files the folder keeps for tables to come are no inputs.
         let tables = dir.path().join("tables");
         inputs = std::fs::read_dir(&tables)?
             .map(|e| {
@@ -9574,6 +9694,7 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
                 let bytes = std::fs::read(&path).expect("read input");
                 (path, bytes)
             })
+            .filter(|(_, bytes)| !bytes.is_empty())
             .collect();
         assert_eq!(inputs.len(), 2, "two flushed inputs");
 
@@ -14110,11 +14231,12 @@ fn damage_a_table_and_its_blob(
     }
 
     // Damage the LAST data block of the table, so phase one salvages it into a
-    // replacement holding the earlier blocks.
+    // replacement holding the earlier blocks. The empty files the folder keeps
+    // for tables to come are no tables.
     let table_path = memfs
         .read_dir(&root.join(crate::file::TABLES_FOLDER))?
         .into_iter()
-        .find(|e| !e.is_dir)
+        .find(|e| !e.is_dir && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0))
         .expect("one table")
         .path;
     let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
@@ -15992,10 +16114,11 @@ fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
     let root = std::path::absolute("/db")?;
     standard_tree_without_manifest(&memfs, &root)?;
     // A numeric-named file the scan must treat as a table, with nothing
-    // parseable inside.
+    // parseable inside, under an id no file of the tree holds (the tables
+    // folder keeps empty files under the ids of tables to come).
     {
         let mut file = memfs.open(
-            &root.join("tables").join("7"),
+            &root.join("tables").join("999999"),
             &FsOpenOptions::new().write(true).create_new(true),
         )?;
         file.write_all(b"not a table at all")?;
@@ -17647,11 +17770,13 @@ fn repair_orders_tied_overlapping_tables_by_their_recency_keys() -> crate::Resul
     Ok(())
 }
 
-/// A flush persists its own id as its recency key, as every table carries
-/// one.
+/// A flush persists the recency key it takes from the id counter once its
+/// file is claimed (its file's own id when the file is made for it), as every
+/// table carries one: the manifest records the same key, and a later flush's
+/// is above it whatever ids their pooled files had.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
+fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
     use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
@@ -17664,15 +17789,38 @@ fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
     else {
         panic!("expected a standard tree");
     };
-    tree.insert(b"k", b"v", 1);
-    tree.flush_active_memtable(0)?;
-
-    let version = tree.current_version();
-    let table = version.iter_tables().next().expect("one flushed table");
-    assert_eq!(
-        table.metadata.recency,
-        table.id(),
-        "a flush stamps its own id as its recency",
+    let mut recencies = Vec::new();
+    for (flush, (seqno, key)) in [(0u64, b"a"), (1, b"b")].into_iter().enumerate() {
+        tree.insert(key, b"v", seqno);
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let table = version
+            .iter_tables()
+            .max_by_key(|table| table.l0_recency())
+            .expect("a flushed table");
+        assert_eq!(
+            table.metadata.recency,
+            table.l0_recency(),
+            "the table and the manifest record one recency",
+        );
+        // A file made for its table carries an id taken as the flush starts,
+        // which serves: on Windows, which syncs no folder and so keeps no
+        // pool, and for the first flush of a fresh tree, which finds the pool
+        // dry and leaves the refill to run off its thread. The next flush
+        // waits for that refill and takes a pooled file.
+        if cfg!(windows) || flush == 0 {
+            assert_eq!(table.metadata.recency, table.id(), "the file's own id");
+        } else {
+            assert!(
+                table.metadata.recency > table.id(),
+                "taken after the table's pooled file was claimed",
+            );
+        }
+        recencies.push(table.metadata.recency);
+    }
+    assert!(
+        recencies.is_sorted_by(|a, b| a < b),
+        "{recencies:?} increase"
     );
     Ok(())
 }
@@ -18691,10 +18839,11 @@ fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
         }
         tree.flush_active_memtable(0)?;
     }
+    // The empty files the folder keeps for tables to come are no tables.
     let table_path = memfs
         .read_dir(&root.join(crate::file::TABLES_FOLDER))?
         .into_iter()
-        .find(|e| !e.is_dir)
+        .find(|e| !e.is_dir && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0))
         .expect("one table")
         .path;
     let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
