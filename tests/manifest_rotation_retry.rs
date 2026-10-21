@@ -124,8 +124,15 @@ fn table_names(dir: &std::path::Path) -> std::io::Result<std::collections::BTree
     let mut names = std::collections::BTreeSet::new();
     for entry in std::fs::read_dir(dir.join("tables"))? {
         let entry = entry?;
-        if entry.metadata()?.len() > 0 {
-            names.insert(entry.file_name().to_string_lossy().into_owned());
+        // A retired table the tree unlinks in the background between the
+        // listing and the stat is gone, and not counted.
+        match entry.metadata() {
+            Ok(meta) if meta.len() > 0 => {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(names)

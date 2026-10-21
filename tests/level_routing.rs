@@ -11,13 +11,17 @@ use lsm_tree::{
 use std::sync::Arc;
 
 /// The table files in `folder`. The empty files a tables folder keeps for
-/// tables to come are no tables.
+/// tables to come are no tables, and a retired table the tree unlinks in the
+/// background between the listing and the stat is gone.
 fn table_files(folder: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut tables = Vec::new();
     for entry in std::fs::read_dir(folder)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() && entry.metadata()?.len() > 0 {
-            tables.push(entry.path());
+        match entry.metadata() {
+            Ok(meta) if meta.is_file() && meta.len() > 0 => tables.push(entry.path()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(tables)
