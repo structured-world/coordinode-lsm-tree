@@ -128,19 +128,21 @@ fn bench_flush_series(c: &mut Criterion) {
     group.sample_size(20);
     for pool in [16, 0] {
         let label = format!("pool{pool}");
+        // One tree and one sample set for every call criterion makes, so the
+        // run is one series whose refills fall once per batch.
+        let folder = tempfile::TempDir::new().expect("tempdir");
+        let tree = Config::new(
+            &folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(pool)
+        .open()
+        .expect("open");
+        let mut seqno = 0u64;
+        let mut flushes = 0u64;
+        let mut samples = Vec::new();
         group.bench_function(label.clone(), |b| {
-            let folder = tempfile::TempDir::new().expect("tempdir");
-            let tree = Config::new(
-                &folder,
-                SequenceNumberCounter::default(),
-                SequenceNumberCounter::default(),
-            )
-            .table_file_pool(pool)
-            .open()
-            .expect("open");
-            let mut seqno = 0u64;
-            let mut flushes = 0u64;
-            let mut samples = Vec::new();
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -160,8 +162,8 @@ fn bench_flush_series(c: &mut Criterion) {
                 }
                 total
             });
-            report_percentiles(&format!("flush_series/{label}"), samples);
         });
+        report_percentiles(&format!("flush_series/{label}"), samples);
     }
     group.finish();
 }
