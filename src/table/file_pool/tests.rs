@@ -397,8 +397,13 @@ fn a_dry_pool_makes_the_claim_its_file_and_refills_off_the_thread() -> crate::Re
     assert_eq!(directory_syncs(&fault), 1, "the refill's one folder sync");
     let pooled = empty_files(&fs, &folder)?;
     assert_eq!(pooled.len(), 5, "the claim's file and a batch: {pooled:?}");
+    assert_eq!(
+        pooled.first(),
+        Some(&first.id),
+        "the claim's file, still empty"
+    );
     assert!(
-        pooled.iter().all(|id| *id > first.id),
+        pooled.iter().skip(1).all(|id| *id > first.id),
         "the batch is numbered after the claim's file: {pooled:?}"
     );
 
@@ -428,7 +433,11 @@ fn a_claim_that_leaves_half_a_batch_starts_a_refill() -> crate::Result<()> {
     assert_eq!(directory_syncs(&fault), 1, "two left, a refill ran");
     assert!(first.durable_entry && second.durable_entry);
     let pooled = empty_files(&fs, &folder)?;
-    assert_eq!(pooled.len(), 2 + 2 + 4, "two claimed, two left, a batch");
+    assert_eq!(
+        pooled.len(),
+        1 + 2 + 2 + 4,
+        "the first claim's file, two claimed, two left, a batch"
+    );
     Ok(())
 }
 

@@ -326,22 +326,24 @@ impl TableFilePools {
         let Some(pool) = folders.get_mut(at) else {
             return Err(crate::Error::Unrecoverable);
         };
-        let writing = Arc::clone(&pool.writing);
-        let (claimed, refill) = if pool.unpooled || self.pools.batch == 0 {
-            (Ok(None), None)
+        let (claimed, due) = if pool.unpooled || self.pools.batch == 0 {
+            (Ok(None), false)
         } else {
-            self.pools
-                .claim_pooled(pool, at, folder, fs, above, may_refill)
+            self.pools.claim_pooled(pool, folder, fs, above, may_refill)
         };
+        // No pool, the pool is dry, or the backend cannot tell whether a file
+        // is shared: a file is made for the table. It takes its id, listed,
+        // before a batch reserved now, so every pooled id stays above the
+        // tables written into the folder.
+        let pooled = claimed?.ok_or_else(|| Writing::new(&pool.writing, self.pools.ids.next()));
+        let refill = due.then(|| self.pools.reserve(pool, at, folder, fs));
         drop(folders);
         if let Some(refill) = refill {
             self.start(refill);
         }
-        match claimed? {
-            Some(claimed) => Ok(claimed),
-            // No pool, the pool is dry, or the backend cannot tell whether a
-            // file is shared, so no pooled file will be used.
-            None => self.pools.create(folder, fs, &writing),
+        match pooled {
+            Ok(claimed) => Ok(claimed),
+            Err(made) => Pools::create(folder, fs, made),
         }
     }
 
@@ -406,17 +408,16 @@ impl Pools {
     /// The next file of `pool`, the pool at `at`, to write a table into,
     /// through the route `folder` on `fs`; `None` when it is dry, a fresh
     /// batch held no file that can be used, or the backend cannot count a
-    /// file's links, which gives the pool up. With it, the refill to start
-    /// off this thread, when one is due.
+    /// file's links, which gives the pool up. With it, whether a refill off
+    /// this thread is due.
     fn claim_pooled(
         &self,
         pool: &mut FolderPool,
-        at: usize,
         folder: &Path,
         fs: &Arc<dyn Fs>,
         above: Option<TableId>,
         may_refill: bool,
-    ) -> (crate::Result<Option<ClaimedFile>>, Option<Refill>) {
+    ) -> (crate::Result<Option<ClaimedFile>>, bool) {
         let mut refilled = false;
         let claimed = loop {
             if !pool.synced && !pool.ids.is_empty() {
@@ -475,8 +476,7 @@ impl Pools {
             && !pool.unpooled
             && !pool.refilling
             && pool.ids.len() <= self.batch / 2;
-        let refill = due.then(|| self.reserve(pool, at, folder, fs));
-        (claimed, refill)
+        (claimed, due)
     }
 
     /// Reserves a batch of ids for a refill of `pool`, the pool at `at`, off
@@ -558,7 +558,8 @@ impl Pools {
         }
     }
 
-    /// Gives up a refill of the pool at `at` that never ran.
+    /// Gives up a refill of the pool at `at` that never ran or never finished;
+    /// a file it made stays empty on disk, for the next open to pool.
     fn withdraw(&self, at: usize, ids: &[TableId]) {
         if let Some(pool) = self.folders.lock().get_mut(at) {
             pool.refilling = false;
@@ -570,16 +571,10 @@ impl Pools {
         self.refilled.notify_all();
     }
 
-    /// A file created for the next table, its entry not yet durable, listed
-    /// in `writing` before it exists.
-    fn create(
-        &self,
-        folder: &Path,
-        fs: &Arc<dyn Fs>,
-        writing: &Unwritten,
-    ) -> crate::Result<ClaimedFile> {
-        let id = self.ids.next();
-        let writing = Writing::new(writing, id);
+    /// A file created for the next table under the id `writing` lists, its
+    /// entry not yet durable.
+    fn create(folder: &Path, fs: &Arc<dyn Fs>, writing: Writing) -> crate::Result<ClaimedFile> {
+        let id = writing.id;
         let path = folder.join(id.to_string());
         let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
         Ok(ClaimedFile {
