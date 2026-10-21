@@ -353,8 +353,17 @@ impl TableFilePools {
         let pools = Arc::clone(&self.pools);
         match std::thread::Builder::new()
             .name("lsm-table-files".into())
-            .spawn(move || pools.run(&refill))
-        {
+            .spawn(move || {
+                let ran =
+                    std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| pools.run(&refill)));
+                if let Err(panic) = ran {
+                    // A refill the backend panicked in never pools its batch:
+                    // withdrawn, it leaves no claim waiting on it. The panic
+                    // still reaches whoever joins the thread.
+                    pools.withdraw(refill.at, &refill.ids);
+                    std::panic::resume_unwind(panic);
+                }
+            }) {
             Ok(handle) => {
                 let mut refills = self.refills.lock();
                 refills.retain(|refill| !refill.is_finished());
@@ -465,7 +474,7 @@ impl Pools {
         let due = self.background
             && !pool.unpooled
             && !pool.refilling
-            && pool.ids.len().saturating_mul(2) <= self.batch;
+            && pool.ids.len() <= self.batch / 2;
         let refill = due.then(|| self.reserve(pool, at, folder, fs));
         (claimed, refill)
     }
