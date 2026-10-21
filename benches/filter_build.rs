@@ -236,6 +236,55 @@ fn flushes() {
     }
 }
 
+/// A table's filter built whole at its finish, as levels 0 to 2 build theirs
+/// by default, against one built in partitions as the table is written, as
+/// the deeper levels do: what flushing a large memtable costs with each, and
+/// what a point read through each costs, of a key the tree holds and of one
+/// it does not.
+fn layouts() {
+    const KEYS: u64 = 1_000_000;
+    const READS: u64 = 200_000;
+    for (name, partitioned) in [("full", false), ("partitioned", true)] {
+        let tree = Config::new(
+            "/layouts",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(lsm_tree::fs::MemFs::new())
+        .filter_block_partitioning_policy(PinningPolicy::all(partitioned))
+        .open()
+        .expect("open");
+        let mut seqno = 0;
+        let flushes = (0..3)
+            .map(|round| {
+                for i in 0..KEYS {
+                    tree.insert(format!("k{i:012}"), format!("value-{round}-{i}"), seqno);
+                    seqno += 1;
+                }
+                measure(|| tree.flush_active_memtable(0).expect("flush"))
+            })
+            .collect();
+        report(&format!("layout/{name}/flush/keys={KEYS}"), flushes);
+
+        // Reads spread over the key space by a fixed multiplicative walk.
+        let key_at = |n: u64| n.wrapping_mul(0x9E37_79B9_7F4A_7C15) % KEYS;
+        for (kind, key_of) in [
+            ("present", (|i| format!("k{i:012}")) as fn(u64) -> String),
+            ("absent", |i| format!("k{i:012}~")),
+        ] {
+            let samples = (0..READS)
+                .map(|n| {
+                    let key = key_of(key_at(n));
+                    measure(|| {
+                        std::hint::black_box(tree.get(&key, lsm_tree::SeqNo::MAX).expect("get"));
+                    })
+                })
+                .collect();
+            report(&format!("layout/{name}/get/{kind}"), samples);
+        }
+    }
+}
+
 fn main() {
     // `cargo bench` passes `--bench`; a filter argument selects one part.
     let only: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-'));
@@ -246,5 +295,9 @@ fn main() {
     if only.as_deref().is_none_or(|o| "flushes".contains(o)) {
         eprintln!("[filter_build/flushes]");
         flushes();
+    }
+    if only.as_deref().is_none_or(|o| "layouts".contains(o)) {
+        eprintln!("[filter_build/layouts]");
+        layouts();
     }
 }
