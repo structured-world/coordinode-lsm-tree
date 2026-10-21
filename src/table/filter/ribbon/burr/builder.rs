@@ -176,6 +176,17 @@ impl BurrBuilder {
         hashes: &[u64],
         locators: &[u64],
     ) -> Result<BurrFilter, BurrBuildError> {
+        self.build_from_hashes_with_values_owned(hashes.to_vec(), locators.to_vec())
+    }
+
+    /// Same as [`Self::build_from_hashes_with_values`] but consumes
+    /// caller-owned vectors, which the build works in, instead of copying
+    /// them.
+    pub(crate) fn build_from_hashes_with_values_owned(
+        &self,
+        hashes: Vec<u64>,
+        locators: Vec<u64>,
+    ) -> Result<BurrFilter, BurrBuildError> {
         if hashes.len() != locators.len() {
             return Err(BurrBuildError::InvalidParams(
                 "hashes and locators must have equal length",
@@ -194,7 +205,7 @@ impl BurrBuilder {
                 "locator does not fit in r bits",
             ));
         }
-        self.build_layers(hashes.to_vec(), Some(locators.to_vec()))
+        self.build_layers(hashes, Some(locators))
     }
 
     /// Shared layer-recursion driver for both the membership build

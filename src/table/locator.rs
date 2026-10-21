@@ -197,7 +197,7 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
             return None;
         }
     };
-    let filter = match builder.build_from_hashes_with_values(&hashes, &locators) {
+    let filter = match builder.build_from_hashes_with_values_owned(hashes, locators) {
         Ok(f) => f,
         Err(e) => {
             // A u64 hash collision between two distinct keys yields an
@@ -208,13 +208,12 @@ pub fn build_locator_section(entries: &[(u64, u64, u64)], spec: LocatorSpec) -> 
         }
     };
 
-    let wire = filter.to_wire_bytes();
-    let mut section = Vec::with_capacity(SECTION_HEADER_LEN + wire.len());
+    let mut section = Vec::with_capacity(SECTION_HEADER_LEN + filter.encoded_len());
     section.push(SECTION_VERSION);
     section.push(precision_byte(spec.precision));
     section.push(block_id_bits);
     section.push(slot_bits);
-    section.extend_from_slice(&wire);
+    filter.append_wire_bytes(&mut section);
     Some(section)
 }
 

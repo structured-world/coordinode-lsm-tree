@@ -115,10 +115,17 @@ impl BurrFilter {
     /// boundary.
     #[must_use]
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.layers.is_empty() {
-            return Vec::new();
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        self.append_wire_bytes(&mut bytes);
+        bytes
+    }
+
+    /// Appends [`Self::to_wire_bytes`] to `out`, for a caller that frames the
+    /// filter inside a larger buffer.
+    pub(crate) fn append_wire_bytes(&self, out: &mut Vec<u8>) {
+        if !self.layers.is_empty() {
+            super::wire::encode_into(self, out);
         }
-        super::wire::encode(self)
     }
 
     /// Returns the parameters this filter was built with.
