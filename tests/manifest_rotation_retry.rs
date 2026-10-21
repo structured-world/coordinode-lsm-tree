@@ -48,8 +48,13 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
 
         // The next flush writes its table into a file pooled with the first
         // one's, so its first directory sync is the one that would install
-        // its snapshot and log: it fails.
-        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
+        // its snapshot and log: it fails. Where there is no pool (Windows) its
+        // file is made for it, and its install syncs the tables folder first.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(UNPOOLED_FOLDER_SYNCS)
+                .once(),
+        );
         tree.insert("k1", "v1", 1);
         assert!(
             tree.flush_active_memtable(1).is_err(),
@@ -102,8 +107,13 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
         }
         // The compaction writes its output into a pooled file, so its first
         // directory sync is that of the install that names the output: it
-        // fails.
-        injector.arm(FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other)).once());
+        // fails. Where there is no pool (Windows) the output's file is made
+        // for it, and the install syncs the tables folder first.
+        injector.arm(
+            FaultRule::new(FaultOp::SyncDirectory, Fault::Error(ErrorKind::Other))
+                .skip(UNPOOLED_FOLDER_SYNCS)
+                .once(),
+        );
         assert!(
             tree.major_compact(64 * 1024 * 1024, 0).is_err(),
             "the armed directory sync must fail the compaction's install"

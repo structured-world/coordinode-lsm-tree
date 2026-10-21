@@ -163,6 +163,9 @@ fn a_failed_relocation_reopen_leaves_no_orphan_output() {
         1000,
     );
     tree.flush_active_memtable(0).expect("flush");
+    // The flush found the pool dry and left its refill to run off its thread:
+    // the pooled files are listed once that refill has made them.
+    tree.wait_for_table_file_refills();
 
     // The relocation writes its table into the folder's lowest pooled file
     // above its source, the one table the flush wrote. Positioned reads on
@@ -257,6 +260,8 @@ fn a_failed_relocation_write_removes_its_output_and_keeps_the_rows() {
             1000,
         );
         tree.flush_active_memtable(0).expect("flush");
+        // The pooled files are listed once the flush's refill has made them.
+        tree.wait_for_table_file_refills();
 
         // The output is the lowest pooled file above the flushed table.
         let tables = folder.join("tables");
