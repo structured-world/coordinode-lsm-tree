@@ -84,8 +84,8 @@
 //! equations (smaller storage at the cost of slightly higher false-positive
 //! rate at small `r`).
 //!
-//! See [`Params::new`] for the entry point; ribbons are constructed from
-//! pre-hashed keys via `RibbonBuilder::build_with_seed_verbatim_from_hashes`.
+//! See [`Params::new`] for the entry point; ribbons are constructed from the
+//! equations of pre-hashed keys via `RibbonBuilder::build_from_equations`.
 
 pub mod builder;
 pub mod burr;
