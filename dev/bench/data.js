@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792597952333,
+  "lastUpdate": 1792620942308,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -54068,6 +54068,90 @@ window.BENCHMARK_DATA = {
             "value": 325397.62658518,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 14.3us | P99.9: 98.4us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0a65be42e4a7bcbd8a8cbb69359b57433dc8fcbf",
+          "message": "perf(filter): hash each key once and build filters without per-layer allocations (#969)\n\n## Summary\n- Every key a table writer adds is hashed once for its filter, its\nlocator and its blocks' hash index, and point reads hand that hash down\nto the block instead of hashing the key again.\n- A BuRR build (table filter and locator) allocates a fixed handful of\nbuffers instead of several per layer and one per block, solves from the\nequations it already derived, and writes its wire bytes in place; the\nbytes it writes are unchanged.\n- The reconcile walk's locator and filter gates share one hash per key\nand stop copying keys they have seen.\n\n## Changes\n- `FilterWriter::register_key` takes the key's hash; the table writer\ncomputes it once per new key for the filter, the locator and, when\nblocks carry one, the hash index.\n- The block hash index builder and reader take the key hash;\n`DataBlock::encode_hashed_into` / `point_read_hashed` /\n`point_read_value_hashed` carry it, and the table and batched multi-get\npoint reads use them. A data block appended as it is records its last\nkey's hash too, and `Writer::use_data_block_hash_ratio` is refused once\nwriting has started, like the restart intervals.\n- BuRR build: the split keeps kept keys, values and equations in place\nand moves bumped ones into vectors of exact size; one equation buffer\nand one set of solve rows serve every layer; a block's threshold is read\noff a per-row count instead of sorting its offsets; the solve tells an\noccupied row by its coefficient's bit 0 and keeps no occupancy array;\nthe ribbon solves from the equations the thresholds were computed from.\n- Filter and locator serialization transpose straight into the wire\nbuffer, and the locator frames its section around the filter and hands\nits vectors to the build.\n- The filter build peak estimate counts what the build now holds. Tables\nthat close on their writer's held state hold more keys, so the leveled\ngolden fingerprint is repinned.\n- `benches/filter_build.rs`: allocations, bytes, peak heap and P50 (with\nP99 / P999 where a run has the samples) of filter and locator builds, of\nflushes under several filter setups, and of full against partitioned\nfilters on a large flush and on point reads.\n- `structured-zstd` 0.2.4.\n\n## Measurements\nInterleaved A/B, three runs, before → after:\n- table filter build at 1k / 100k / 1M keys: 20% / 16% / 10% faster,\nallocations 76 / 1862 / 18157 → 20, peak heap −12%;\n- locator build at 1k / 1M keys: 25% / 15% faster, allocations 94 /\n18177 → 25, bytes allocated −46% / −40%;\n- flush of 10k / 100k keys under the default configuration: 9% / 10%\nfaster, peak heap −5% / −14%.\n\nFull against partitioned filters on a flush of 1M keys: the partitioned\nflush is 13% faster at the same peak heap, but point reads through it\nare 60% slower for a present key and five times slower for an absent\none, so the per-level partitioning policy stays.\n\n## Testing\nfmt, clippy (every CI configuration), full nextest, doc tests, doc\nbuild, no-std check, aarch64 build, sst-dump, db_bench and converter\nsuites pass on Linux, with the filter and writer tests on i686; clippy,\nthe full suite, doc tests and sst-dump pass on Windows. The wire bytes\nof filter builds are pinned by digests taken before the change.\n\nCloses #961\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n- **Performance**\n- Improved table reads, filter construction, and data-block encoding\nefficiency.\n- Reduced repeated key hashing and temporary memory allocations during\nwriting, lookups, validation, and serialization.\n- Improved memory usage for filter construction and retrieval\nstructures.\n\n- **Reliability**\n- Added regression coverage for hashed lookups, filter serialization,\nthreshold handling, and wire-format stability.\n- Improved file creation ordering to ensure predictable background table\nreplenishment.\n\n- **Benchmarking**\n- Added benchmarks for filter construction, flushes, table layouts,\nallocations, memory usage, and read latency.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-22T00:58:14+03:00",
+          "tree_id": "acfbf711d003864393094eab78240e5425fc509f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0a65be42e4a7bcbd8a8cbb69359b57433dc8fcbf"
+        },
+        "date": 1792620940123,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 87451.37882491428,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 16.6us | P99.9: 22.6us\nthreads: 1 | elapsed: 6.12s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2602906.0196314296,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 732369.3307189407,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.5us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 497818.5863347036,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.7us | P99.9: 20.2us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2294660.4456127323,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.8us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 239174.2745432275,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 12.5us | P99.9: 20.8us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 130795.823210129,
+            "unit": "ops/sec",
+            "extra": "P50: 6.8us | P99: 17.5us | P99.9: 40.2us\nthreads: 1 | elapsed: 1.53s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 689590.6695293046,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.7us | P99.9: 13.7us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 719772.9470480353,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 2.3us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 273899.6681357668,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 14.4us | P99.9: 174.1us\nthreads: 1 | elapsed: 0.73s | num: 200000 | iterations: 3"
           }
         ]
       }
