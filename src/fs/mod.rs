@@ -142,16 +142,12 @@ pub struct FsOpenOptions {
     /// are a multiple of that block size.
     ///
     /// `direct_io` is a HINT, not a guarantee. The flag is honoured only
-    /// on Linux and Android, and only on architectures where the
-    /// `asm-generic/fcntl.h` value `O_DIRECT = 0o40000` is authoritative on
-    /// `x86`, `x86_64`, `aarch64`, `riscv32`/`riscv64`, `loongarch64`, and
-    /// `s390x`. On Linux
-    /// architectures with a divergent `O_DIRECT` bit (arm `0o200000`,
-    /// mips `0o100000`, parisc, sparc) the flag is silently dropped to
-    /// avoid passing the wrong bit to `open(2)`. Other platforms - macOS
-    /// (would need `F_NOCACHE` post-open via `fcntl`, not wired here),
-    /// Windows (would need `FILE_FLAG_NO_BUFFERING` at `CreateFile` time,
-    /// not wired here), other Unixes - also silently drop the flag.
+    /// on Linux and Android, with the target architecture's own `O_DIRECT`
+    /// bit, and the raw `io_uring` backend does not wire it. Other
+    /// platforms - macOS (would need `F_NOCACHE` post-open via `fcntl`, not
+    /// wired here), Windows (would need `FILE_FLAG_NO_BUFFERING` at
+    /// `CreateFile` time, not wired here), other Unixes - silently drop the
+    /// flag.
     ///
     /// Callers must therefore treat `direct_io` as best-effort:
     /// correctness must not depend on cache bypass being in effect, and

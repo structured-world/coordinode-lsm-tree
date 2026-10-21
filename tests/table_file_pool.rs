@@ -21,7 +21,8 @@ fn config(folder: &Path) -> Config {
 }
 
 /// The ids of the files in `folder` named like tables, split into the empty
-/// ones (pooled) and the ones holding a table.
+/// ones (pooled) and the ones holding a table. A file the tree unlinks in the
+/// background between the listing and its stat is gone, and not counted.
 fn table_files(folder: &Path) -> (Vec<u64>, Vec<u64>) {
     let mut pooled = Vec::new();
     let mut tables = Vec::new();
@@ -30,10 +31,11 @@ fn table_files(folder: &Path) -> (Vec<u64>, Vec<u64>) {
         let Ok(id) = entry.file_name().to_string_lossy().parse::<u64>() else {
             continue;
         };
-        if entry.metadata().expect("metadata").len() == 0 {
-            pooled.push(id);
-        } else {
-            tables.push(id);
+        match entry.metadata() {
+            Ok(meta) if meta.len() == 0 => pooled.push(id),
+            Ok(_) => tables.push(id),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("metadata of {}: {e}", entry.path().display()),
         }
     }
     pooled.sort_unstable();
@@ -420,6 +422,73 @@ fn a_repair_counts_a_table_it_sets_aside_as_the_newest() -> lsm_tree::Result<()>
     );
     assert!(
         named(report.unknowable_losses.iter().collect()).contains(&emptied.to_string()),
+        "the emptied table is a loss: {report:?}"
+    );
+    assert_ne!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::TailOnly
+    );
+    Ok(())
+}
+
+/// A copy of a table in a second folder is a table written into that folder,
+/// even when the repair keeps the first copy and leaves this one out: an empty
+/// file below it in that folder lost its bytes, never a pooled file.
+#[test]
+fn a_repair_counts_a_duplicate_it_leaves_out_as_its_folders_newest() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let hot = folder.path().join("hot");
+    let cold = folder.path().join("cold");
+    let fs: Arc<dyn lsm_tree::fs::Fs> = Arc::new(StdFs);
+    let routed = || {
+        config(folder.path()).table_file_pool(4).level_routes(vec![
+            LevelRoute {
+                levels: 0..1,
+                path: hot.clone(),
+                fs: fs.clone(),
+            },
+            LevelRoute {
+                levels: 1..7,
+                path: cold.clone(),
+                fs: fs.clone(),
+            },
+        ])
+    };
+    {
+        let tree = routed().open()?;
+        for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
+            tree.insert(key, "1", seqno);
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let hot_tables = hot.join("tables");
+    let cold_tables = cold.join("tables");
+    let (_, written) = table_files(&hot_tables);
+    let [_, gone, newest] = written[..] else {
+        panic!("self-check: three flushed tables: {written:?}");
+    };
+    // The cold folder holds a copy of the newest table and an empty file
+    // under an id below it that no other folder holds.
+    std::fs::remove_file(hot_tables.join(gone.to_string()))?;
+    std::fs::create_dir_all(&cold_tables)?;
+    std::fs::copy(
+        hot_tables.join(newest.to_string()),
+        cold_tables.join(newest.to_string()),
+    )?;
+    std::fs::write(cold_tables.join(gone.to_string()), b"")?;
+    remove_manifest(folder.path())?;
+
+    let report = routed().repair()?;
+    let emptied = cold_tables.join(gone.to_string());
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(path, _)| *path == cold_tables.join(newest.to_string())),
+        "self-check: the cold copy is the one left out: {report:?}"
+    );
+    assert!(
+        report.unknowable_losses.contains(&emptied),
         "the emptied table is a loss: {report:?}"
     );
     assert_ne!(

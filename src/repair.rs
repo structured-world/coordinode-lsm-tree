@@ -4661,6 +4661,20 @@ struct TableScan {
     scanned_table_ids: crate::HashSet<TableId>,
 }
 
+/// Records that a file under `table_id` opened as a table in `folder`, so an
+/// empty file below it there is judged a table that lost its bytes.
+#[cfg(feature = "std")]
+fn note_opened(
+    newest_opened: &mut crate::HashMap<PathBuf, TableId>,
+    folder: &std::path::Path,
+    table_id: TableId,
+) {
+    newest_opened
+        .entry(folder.to_path_buf())
+        .and_modify(|newest| *newest = (*newest).max(table_id))
+        .or_insert(table_id);
+}
+
 /// Phase 1 of [`repair_tree`]: classify every entry of every table folder and
 /// recover what can be recovered. See [`TableScan`] for what it hands on.
 ///
@@ -5007,6 +5021,10 @@ fn scan_table_folders(
                         folder_fs.clone(),
                         manifest_position,
                     ))
+                    // It opened as a table, so one was written into this
+                    // folder, whatever the walk below finds and wherever the
+                    // kept copy lives.
+                    .inspect(|_| note_opened(&mut newest_opened, &table_base_folder, table_id))
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
                     // at the trailer, meta and index, leaving every lazily-read
@@ -5122,10 +5140,7 @@ fn scan_table_folders(
             // survive elsewhere and become visible again, which no repair can
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
-                newest_opened
-                    .entry(table_base_folder.clone())
-                    .and_modify(|newest| *newest = (*newest).max(table_id))
-                    .or_insert(table_id);
+                note_opened(&mut newest_opened, &table_base_folder, table_id);
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
                 // the LOST manifest: that open passes offset 0, so
@@ -5726,8 +5741,8 @@ fn scan_table_folders(
     // A pooled file's id is above every table written into its folder: a
     // claim takes the lowest pooled id, and a write numbered above an id
     // passes over the pooled ones below it. So an empty file above its
-    // folder's newest table (one that opened as a table, kept or set aside,
-    // or a salvaged copy) is a pooled file, never a table: it holds no rows
+    // folder's newest table (one that opened as a table, kept, set aside or
+    // left out as a duplicate, or a salvaged copy) is a pooled file, never a table: it holds no rows
     // and is no loss, and like every file the rebuilt manifest does not name
     // it is reported left out and goes once that manifest is durable. One
     // below the newest table is a table that lost its bytes, reported as a

@@ -41,49 +41,28 @@
 
 use super::FsOpenOptions;
 
-/// The `O_DIRECT` bit when `direct_io` is requested AND the running target
-/// supports the authoritative `asm-generic/fcntl.h` value.
+/// The `O_DIRECT` bit when `direct_io` is requested. The bit differs per
+/// architecture (aarch64 and arm `0o200000`, where the asm-generic `0o40000`
+/// is `O_DIRECTORY`), so it comes from the C library of the target.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
-    any(
-        target_arch = "x86",
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv32",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-        target_arch = "s390x",
-    ),
+    not(target_env = "uclibc")
 ))]
 fn direct_io_bits(direct_io: bool) -> i32 {
-    /// `asm-generic/fcntl.h`: `#define O_DIRECT 00040000`. Authoritative
-    /// on every arch listed in the `cfg`. Arches with a divergent bit (arm
-    /// `0o200000`, mips `0o100000`, parisc, sparc) are excluded from the
-    /// `cfg` rather than handled here so we never risk passing the wrong
-    /// bit to `open(2)`.
-    const O_DIRECT: i32 = 0o0_040_000;
-    if direct_io { O_DIRECT } else { 0 }
+    if direct_io { libc::O_DIRECT } else { 0 }
 }
 
-/// No `O_DIRECT` outside Linux/Android on a supported arch. macOS would need
-/// `F_NOCACHE` via `fcntl` post-open, Windows `FILE_FLAG_NO_BUFFERING` at
-/// `CreateFile` time, divergent Linux arches a different `O_DIRECT` bit: all
-/// out of scope per the
+/// No `O_DIRECT` outside Linux/Android, nor where the C library does not
+/// define it (uClibc). macOS would need `F_NOCACHE` via `fcntl` post-open,
+/// Windows `FILE_FLAG_NO_BUFFERING` at `CreateFile` time: both out of scope
+/// per the
 /// [`FsOpenOptions::direct_io`](field@crate::fs::FsOpenOptions::direct_io)
 /// best-effort contract.
 #[cfg(all(
     unix,
     not(all(
         any(target_os = "linux", target_os = "android"),
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv32",
-            target_arch = "riscv64",
-            target_arch = "loongarch64",
-            target_arch = "s390x",
-        ),
+        not(target_env = "uclibc")
     ))
 ))]
 fn direct_io_bits(_direct_io: bool) -> i32 {

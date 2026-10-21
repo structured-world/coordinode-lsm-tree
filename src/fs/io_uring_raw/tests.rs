@@ -1,5 +1,26 @@
 use super::*;
 
+// The open flags this module spells out match the C library's on the target:
+// several differ per architecture (arm, aarch64 and powerpc keep their own
+// `fcntl.h`), and a wrong one opens with another flag's meaning. MIPS and
+// SPARC are left out, their divergent flags not being remapped here.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const _: () = {
+    assert!(O_CREAT == libc::O_CREAT);
+    assert!(O_TRUNC == libc::O_TRUNC);
+    assert!(O_APPEND == libc::O_APPEND);
+    assert!(O_EXCL == libc::O_EXCL);
+    assert!(O_DIRECTORY == libc::O_DIRECTORY);
+    assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
+};
+
 // These tests require a Linux kernel with io_uring; they are compiled only
 // under `cfg(target_os = "linux")` (the module gate) and run on the Linux
 // CI / bench runner, not on the macOS dev host.
@@ -255,6 +276,34 @@ fn raw_file_append_writes_accumulate_at_eof() {
     let n = f.read_at(&mut buf, 0).expect("read_at");
     assert_eq!(n, 6, "both appends must be present");
     assert_eq!(&buf, b"aaabbb", "appends land in order at EOF");
+}
+
+#[test]
+fn raw_fs_no_follow_refuses_a_symlink_and_opens_a_file() {
+    // `no_follow` refuses a symbolic link at the last component (`ELOOP`),
+    // so nothing is written through it into the file it names, and still
+    // opens a regular file.
+    use crate::fs::Fs;
+    use crate::path::Path;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("target");
+    let link = tmp.path().join("link");
+    std::fs::write(&target, b"").expect("target");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let opts = FsOpenOptions::new().write(true).no_follow(true);
+
+    assert!(
+        fs.open(Path::new(link.to_str().expect("utf8")), &opts)
+            .is_err(),
+        "a symlink is refused"
+    );
+    assert!(
+        fs.open(Path::new(target.to_str().expect("utf8")), &opts)
+            .is_ok(),
+        "a regular file opens"
+    );
 }
 
 #[test]

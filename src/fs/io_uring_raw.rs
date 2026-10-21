@@ -700,25 +700,44 @@ pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
 
 // ---- Directory / path syscalls (for the `Fs` backend) ----
 //
-// These use the asm-generic flag values, authoritative on x86/x86_64, ARM,
-// AArch64, RISC-V, PowerPC, etc. (the realistic `io_uring` targets). The handful
-// of flags that diverge on MIPS / SPARC (O_APPEND / O_EXCL / O_DIRECTORY) are not
-// remapped here, matching the `direct_io` policy documented on `FsOpenOptions`.
+// `O_APPEND` and `O_EXCL` take the asm-generic values, which every realistic
+// `io_uring` target shares. The flags MIPS and SPARC move are not remapped
+// here, matching the `direct_io` policy documented on `FsOpenOptions`.
+// `O_DIRECTORY` and `O_NOFOLLOW` differ on arm, aarch64, powerpc and m68k,
+// which keep their own `fcntl.h` (`arch/arm64/include/uapi/asm/fcntl.h`:
+// `O_DIRECTORY 040000`, `O_NOFOLLOW 0100000`, `O_DIRECT 0200000`): the
+// asm-generic `O_DIRECTORY` is `O_DIRECT` there.
 
 /// Append: writes always land at end of file.
 const O_APPEND: i32 = 0o2000;
 /// Fail `open` with `EEXIST` if the path already exists (with `O_CREAT`).
 const O_EXCL: i32 = 0o200;
-/// Require the opened path to be a directory.
-const O_DIRECTORY: i32 = 0o200_000;
-/// Fail `open` with `ELOOP` if the last path component is a symbolic link.
-/// ARM and PowerPC define it in their own `fcntl.h`; MIPS and SPARC share
-/// the asm-generic value below.
+/// Require the opened path to be a directory (arm, aarch64, powerpc, m68k).
 #[cfg(any(
     target_arch = "arm",
     target_arch = "aarch64",
     target_arch = "powerpc",
-    target_arch = "powerpc64"
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+))]
+const O_DIRECTORY: i32 = 0o40_000;
+/// Require the opened path to be a directory.
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
+)))]
+const O_DIRECTORY: i32 = 0o200_000;
+/// Fail `open` with `ELOOP` if the last path component is a symbolic link
+/// (arm, aarch64, powerpc, m68k).
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "m68k"
 ))]
 const O_NOFOLLOW: i32 = 0o100_000;
 /// Fail `open` with `ELOOP` if the last path component is a symbolic link.
@@ -726,7 +745,8 @@ const O_NOFOLLOW: i32 = 0o100_000;
     target_arch = "arm",
     target_arch = "aarch64",
     target_arch = "powerpc",
-    target_arch = "powerpc64"
+    target_arch = "powerpc64",
+    target_arch = "m68k"
 )))]
 const O_NOFOLLOW: i32 = 0o400_000;
 
@@ -1211,8 +1231,8 @@ fn path_to_cstring(path: &Path) -> Result<CString, Error> {
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "path contains an interior NUL"))
 }
 
-/// Maps [`FsOpenOptions`] to `open(2)` flags (asm-generic values; see the
-/// directory-syscall note for the MIPS / SPARC caveat on the divergent flags).
+/// Maps [`FsOpenOptions`] to `open(2)` flags (see the directory-syscall note
+/// for the per-architecture values and the MIPS / SPARC caveat).
 fn open_flags(opts: &FsOpenOptions) -> i32 {
     let mut flags = if opts.read && (opts.write || opts.append) {
         O_RDWR
