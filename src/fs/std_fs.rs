@@ -335,7 +335,7 @@ impl Fs for StdFs {
             .truncate(opts.truncate)
             .append(opts.append);
 
-        // Gate matches the `mod direct_io;` declaration in `fs/mod.rs`
+        // Gate matches the `mod open_flags;` declaration in `fs/mod.rs`
         // - the submodule only exists when `feature = "std"` is on.
         // Without the gate this site would fail to compile under
         // `--no-default-features --features alloc` even before the
@@ -344,7 +344,7 @@ impl Fs for StdFs {
         // resolution-time error on top of the type-checking ones
         // already tracked under the no-std migration epic.
         #[cfg(feature = "std")]
-        super::direct_io::apply_direct_io_flag(&mut builder, opts.direct_io);
+        super::open_flags::apply_open_flags(&mut builder, opts);
 
         let file = builder.open(path)?;
         Ok(Box::new(file))

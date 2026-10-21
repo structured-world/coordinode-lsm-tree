@@ -1866,25 +1866,31 @@ impl AbstractTree for BlobTree {
         log::debug!("=> to table(s) in {}", table_folder.display());
         log::debug!("=> to blob file(s) at {}", self.blobs_folder.display());
 
-        let mut table_writer = MultiWriter::new(
+        let table_writer = MultiWriter::from_pool(
             table_folder.clone(),
-            self.index.table_id_counter.clone(),
+            Arc::clone(&self.index.table_files),
+            None,
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
-        )?
-        .set_comparator(self.index.config.comparator.clone())
-        .use_data_block_restart_interval(data_block_restart_interval)
-        .use_index_block_restart_interval(index_block_restart_interval)
-        .use_data_block_compression(data_block_compression)
-        .use_index_block_compression(index_block_compression)
-        .use_data_block_size(data_block_size)
-        .use_index_partition_size(self.index.config.index_block_partition_size_policy.get(0))
-        .use_filter_partition_size(self.index.config.filter_block_partition_size_policy.get(0))
-        .use_row_group_size(self.index.config.columnar_row_group_size_policy.get(0))
-        .use_columnar_page_size(self.index.config.columnar_page_size_policy.get(0))
-        .use_column_encoding(self.index.config.column_encoding_policy.get(0))
-        .use_data_block_hash_ratio(data_block_hash_ratio);
+        )?;
+        // The flush's L0 recency, taken as the standard tree's flush takes
+        // it: a pooled file's id says nothing about when it was written.
+        let recency = self.index.table_id_counter.next();
+        let mut table_writer = table_writer
+            .set_comparator(self.index.config.comparator.clone())
+            .use_recency(Some(recency))
+            .use_data_block_restart_interval(data_block_restart_interval)
+            .use_index_block_restart_interval(index_block_restart_interval)
+            .use_data_block_compression(data_block_compression)
+            .use_index_block_compression(index_block_compression)
+            .use_data_block_size(data_block_size)
+            .use_index_partition_size(self.index.config.index_block_partition_size_policy.get(0))
+            .use_filter_partition_size(self.index.config.filter_block_partition_size_policy.get(0))
+            .use_row_group_size(self.index.config.columnar_row_group_size_policy.get(0))
+            .use_columnar_page_size(self.index.config.columnar_page_size_policy.get(0))
+            .use_column_encoding(self.index.config.column_encoding_policy.get(0))
+            .use_data_block_hash_ratio(data_block_hash_ratio);
 
         let bloom_policy = {
             use crate::config::FilterPolicyEntry::{Bloom, None};
@@ -2069,7 +2075,8 @@ impl AbstractTree for BlobTree {
 
         let blob_files = blob_writer.finish()?;
 
-        let result = table_writer.finish()?;
+        let written = table_writer.finish()?;
+        let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
 
@@ -2077,7 +2084,8 @@ impl AbstractTree for BlobTree {
         let pin_index = self.index.config.index_block_pinning_policy.get(0);
 
         // Load tables
-        let tables = result
+        let tables = written
+            .tables
             .into_iter()
             .map(|(table_id, checksum)| -> crate::Result<Table> {
                 let mut params = crate::table::RecoverParams::new(
@@ -2106,7 +2114,11 @@ impl AbstractTree for BlobTree {
                 {
                     params.metrics = self.index.metrics.clone();
                 }
-                Table::recover(params)
+                let table = Table::recover(params)?;
+                if entries_durable {
+                    table.mark_entry_durable();
+                }
+                Ok(table)
             })
             .collect::<crate::Result<Vec<_>>>()?;
 

@@ -711,6 +711,24 @@ const O_APPEND: i32 = 0o2000;
 const O_EXCL: i32 = 0o200;
 /// Require the opened path to be a directory.
 const O_DIRECTORY: i32 = 0o200_000;
+/// Fail `open` with `ELOOP` if the last path component is a symbolic link.
+/// ARM and PowerPC define it in their own `fcntl.h`; MIPS and SPARC share
+/// the asm-generic value below.
+#[cfg(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+))]
+const O_NOFOLLOW: i32 = 0o100_000;
+/// Fail `open` with `ELOOP` if the last path component is a symbolic link.
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+)))]
+const O_NOFOLLOW: i32 = 0o400_000;
 
 /// `unlinkat` flag: remove a directory (`rmdir`) instead of a file.
 const AT_REMOVEDIR: i32 = 0x200;
@@ -1214,6 +1232,9 @@ fn open_flags(opts: &FsOpenOptions) -> i32 {
     }
     if opts.append {
         flags |= O_APPEND;
+    }
+    if opts.no_follow {
+        flags |= O_NOFOLLOW;
     }
     flags
 }

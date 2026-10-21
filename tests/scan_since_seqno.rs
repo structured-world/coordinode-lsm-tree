@@ -466,12 +466,13 @@ fn scan_since_seqno_index_corruption_is_caught() -> lsm_tree::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    // Locate the single SST and a sub-index block to corrupt.
+    // Locate the single SST and a sub-index block to corrupt. The empty files
+    // the folder keeps for tables to come are no SSTs.
     let sst = std::fs::read_dir(folder.path().join("tables"))
         .expect("tables dir")
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .find(|p| p.is_file())
+        .find(|p| p.is_file() && std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
         .expect("one SST file");
     let tli = read_top_level_index_entries(&sst).expect("read top-level index");
     assert!(

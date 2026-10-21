@@ -35,7 +35,7 @@ mod aligned_buf;
 // (prerequisite); the wider no-std migration epic is #274. This
 // gate is the first concrete step.
 #[cfg(feature = "std")]
-mod direct_io;
+mod open_flags;
 // `std_fs` (std::fs) is genuinely std-bound and gated out of a `no_std` build.
 // `mem_fs` is the no_std-capable reference backend (spin + hashbrown over the
 // `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
@@ -161,6 +161,11 @@ pub struct FsOpenOptions {
     /// buffer suitable for `O_DIRECT` reads and writes when the flag is
     /// honoured.
     pub direct_io: bool,
+    /// Do not follow a symbolic link at the path's last component. On Unix
+    /// the open fails (`O_NOFOLLOW`); on Windows the link itself is opened
+    /// (`FILE_FLAG_OPEN_REPARSE_POINT`), which is not a regular file. A
+    /// backend without symbolic links has nothing to follow.
+    pub no_follow: bool,
 }
 
 impl Default for FsOpenOptions {
@@ -181,6 +186,7 @@ impl FsOpenOptions {
             truncate: false,
             append: false,
             direct_io: false,
+            no_follow: false,
         }
     }
 
@@ -230,6 +236,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn direct_io(mut self, direct_io: bool) -> Self {
         self.direct_io = direct_io;
+        self
+    }
+
+    /// Sets the `no_follow` flag.
+    #[must_use]
+    pub const fn no_follow(mut self, no_follow: bool) -> Self {
+        self.no_follow = no_follow;
         self
     }
 }

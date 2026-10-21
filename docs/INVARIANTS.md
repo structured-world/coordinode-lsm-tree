@@ -173,6 +173,35 @@ matching entry (and add one for a new subsystem).
   ref-counting in `src/version` and the file GC in `src/compaction` /
   `src/tree`.
 
+- **A table's name is durable before the manifest edit that names it.** A
+  tables folder keeps a pool of empty files under the names of tables to come,
+  made a batch at a time with one folder sync for the batch
+  (`Config::table_file_pool`); a flush, compaction, merge-on-read relocation or
+  ingestion writes into one, so its install syncs the table and the edit and no
+  folder. Only a write's first table refills the pool: a write that runs it dry
+  makes the files of its further tables as they start, those opened when it
+  finishes included, and its install syncs their folder once. A table is never
+  empty, so an empty regular file (not a symlink) under a table name that no
+  version names is a pooled file: an open uses it again after syncing its
+  folder once. A pooled file's id is above every table written into its
+  folder (a claim takes the lowest pooled id, a write numbered above an id
+  passes over the pooled ones below it), so a repair without a manifest
+  removes an empty file above the folder's newest table (one that opened as a
+  table, kept or set aside) as pooled, reporting it left out, and reports one
+  below it as a table that lost its bytes. A folder has one pool however many
+  routes name it (backend handles, path spellings the backend resolves to it),
+  so its files are numbered together; where the backend cannot tell that two
+  routes name one folder, each found file still goes to one pool only. A claim
+  opens its file without following a symbolic link, so no table is written
+  into a file the tree did not make. A pooled file another name links to (a
+  capture of the folder) is unlinked, never written; a backend that cannot
+  count links gets every file made for its table instead. Under
+  `SyncMode::Barrier` a folder on another device than the manifest is still
+  synced in full at the install, as that sync makes the table durable on its
+  device. Enforced in `src/table/file_pool.rs` and
+  `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
+  `tests/sync_census.rs`).
+
 - **A directory has at most one writer process.** Opening a tree acquires an
   exclusive lock on a `LOCK` file; a second open of the same directory fails with
   `Error::Locked` rather than corrupting shared state through two uncoordinated

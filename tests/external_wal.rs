@@ -1256,10 +1256,13 @@ fn reconciled_replay_coalesces_overlapping_loss_ranges() -> lsm_tree::Result<()>
         }
     }
     // Damage BOTH flushed SSTs' leading data blocks: their metadata still
-    // parses, so both overlapping coverages are reported.
+    // parses, so both overlapping coverages are reported. The empty files the
+    // folder keeps for tables to come are no SSTs.
     for entry in std::fs::read_dir(crash_dir.path().join("tables")).expect("read tables dir") {
         let entry = entry.expect("dir entry");
-        if entry.file_name().to_string_lossy().parse::<u64>().is_err() {
+        if entry.file_name().to_string_lossy().parse::<u64>().is_err()
+            || entry.metadata().expect("metadata").len() == 0
+        {
             continue;
         }
         let path = entry.path();
@@ -1855,12 +1858,16 @@ fn reconciled_replay_skips_operands_folded_into_surviving_values() -> lsm_tree::
     }
     // The freshly flushed [a1, z5] SST has the HIGHEST table id (the
     // compaction output was allocated earlier). Corrupt its leading data
-    // block: metadata still parses, so its coverage is reported.
+    // block: metadata still parses, so its coverage is reported. The empty
+    // files the folder keeps for tables to come are no SSTs.
     let tables = crash_dir.path().join("tables");
     let damaged = std::fs::read_dir(&tables)
         .expect("read tables dir")
         .filter_map(|e| {
             let e = e.expect("dir entry");
+            if e.metadata().expect("metadata").len() == 0 {
+                return None;
+            }
             e.file_name()
                 .to_string_lossy()
                 .parse::<u64>()

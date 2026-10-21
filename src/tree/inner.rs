@@ -116,6 +116,10 @@ pub struct TreeInner {
     #[doc(hidden)]
     pub table_id_counter: SequenceNumberCounter,
 
+    /// The empty table files each tables folder keeps ahead of its tables,
+    /// their ids taken from [`Self::table_id_counter`].
+    pub(crate) table_files: Arc<crate::table::file_pool::TableFilePools>,
+
     // This is not really used in the normal tree, but we need it in the blob tree
     /// Hands out a unique (monotonically increasing) blob file ID
     pub(crate) blob_file_id_counter: SequenceNumberCounter,
@@ -341,6 +345,12 @@ impl TreeInner {
 
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
+        let table_id_counter = SequenceNumberCounter::default();
+        let table_files = Arc::new(crate::table::file_pool::TableFilePools::new(
+            table_id_counter.clone(),
+            config.table_file_pool,
+            sync_mode,
+        ));
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
         // A strategy reads the compaction budget from the config: given the
@@ -378,7 +388,8 @@ impl TreeInner {
         Ok(Self {
             id: get_next_tree_id(),
             memtable_id_counter: SequenceNumberCounter::new(1),
-            table_id_counter: SequenceNumberCounter::default(),
+            table_id_counter,
+            table_files,
             blob_file_id_counter: SequenceNumberCounter::default(),
             config: Arc::new(config),
             version_history: Arc::new(RwLock::new(super_versions)),

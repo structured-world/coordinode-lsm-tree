@@ -25,12 +25,15 @@ fn remove_if_present(fs: &dyn Fs, path: &Path) -> crate::Result<()> {
 /// `prior`: a new table's name is durable only once its directory is, and the
 /// manifest edit that names it must not outlive it. The table writers sync
 /// only their files, so a transition writing N tables to one directory syncs
-/// that directory once, not N times.
+/// that directory once, not N times. A directory whose new tables were all
+/// written into files whose entries were durable already (pooled files) is
+/// not synced for them.
 ///
 /// Under [`SyncMode::Barrier`] a folder on another device than the manifest
-/// at `tree_path` is synced in full: it is the last sync of the transition on
-/// that device, and a barrier orders writes on its own device only, so the
-/// manifest edit on the other one could otherwise outlive the tables it names.
+/// at `tree_path` is synced in full, pooled entries or not: it is the last
+/// sync of the transition on that device, and a barrier orders writes on its
+/// own device only, so the manifest edit on the other one could otherwise
+/// outlive the tables it names.
 fn sync_new_table_directories(
     prior: &Version,
     next: &Version,
@@ -39,7 +42,8 @@ fn sync_new_table_directories(
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
     let known: crate::HashSet<crate::TableId> = prior.iter_tables().map(crate::Table::id).collect();
-    let mut synced: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
+    // Each folder holding a new table, with whether it needs a sync.
+    let mut folders: Vec<(&Arc<dyn Fs>, &Path, bool)> = Vec::new();
     for table in next.iter_tables() {
         if known.contains(&table.id()) {
             continue;
@@ -47,21 +51,24 @@ fn sync_new_table_directories(
         let Some(folder) = table.path.parent() else {
             continue;
         };
-        if synced
-            .iter()
-            .any(|&(fs, at)| Arc::ptr_eq(fs, &table.fs) && at == folder)
+        let needs_sync = !table.entry_durable();
+        if let Some(seen) = folders
+            .iter_mut()
+            .find(|(fs, at, _)| Arc::ptr_eq(fs, &table.fs) && *at == folder)
         {
-            continue;
-        }
-        let mode = if sync_mode == SyncMode::Barrier
-            && !same_device(&*table.fs, folder, manifest_fs, tree_path)
-        {
-            SyncMode::Full
+            seen.2 |= needs_sync;
         } else {
-            sync_mode
-        };
-        crate::file::fsync_directory(folder, &*table.fs, mode)?;
-        synced.push((&table.fs, folder));
+            folders.push((&table.fs, folder, needs_sync));
+        }
+    }
+    for (fs, folder, needs_sync) in folders {
+        let flushes_device =
+            sync_mode == SyncMode::Barrier && !same_device(&**fs, folder, manifest_fs, tree_path);
+        if flushes_device {
+            crate::file::fsync_directory(folder, &**fs, SyncMode::Full)?;
+        } else if needs_sync {
+            crate::file::fsync_directory(folder, &**fs, sync_mode)?;
+        }
     }
     Ok(())
 }

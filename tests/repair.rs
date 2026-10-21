@@ -20,10 +20,15 @@ fn key(i: u64) -> String {
     format!("k{i:05}")
 }
 
+/// The SSTs in the tree's tables folder. The empty files the folder keeps for
+/// tables to come are no SSTs.
 fn count_sst_files(dir: &std::path::Path) -> std::io::Result<usize> {
     Ok(std::fs::read_dir(dir.join("tables"))?
         .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok())
+        .filter(|e| {
+            e.file_name().to_string_lossy().parse::<u64>().is_ok()
+                && e.metadata().is_ok_and(|m| m.len() > 0)
+        })
         .count())
 }
 
@@ -304,6 +309,7 @@ fn repair_rejects_corrupted_sst_and_recovers_the_rest() -> lsm_tree::Result<()> 
     let tables = dir.path().join("tables");
     let newest = std::fs::read_dir(&tables)?
         .filter_map(Result::ok)
+        .filter(|e| e.metadata().is_ok_and(|m| m.len() > 0))
         .filter_map(|e| {
             e.file_name()
                 .to_string_lossy()

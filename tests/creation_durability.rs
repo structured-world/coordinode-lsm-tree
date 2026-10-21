@@ -199,9 +199,11 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     let fs = CrashFs::new(mem.clone());
     {
         // The first install appends, the second rotates, the third appends
-        // to the rotated generation's log.
+        // to the rotated generation's log. No pooled table files, so the log
+        // is the only state left.
         let tree = config(&fs, false)
             .manifest_log_rotate_bytes(1)
+            .table_file_pool(0)
             .open()
             .expect("create");
         for i in 0..2u64 {
@@ -496,8 +498,10 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
     let mem = MemFs::new();
     let fs = CrashFs::new(mem.clone());
     {
+        // No pooled table files, so the log is the only state left.
         let tree = config(&fs, false)
             .manifest_log_rotate_bytes(0)
+            .table_file_pool(0)
             .open()
             .expect("create");
         tree.insert("key", "value", 0);

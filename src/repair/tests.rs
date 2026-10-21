@@ -1877,12 +1877,18 @@ fn a_clean_manifest_restriction_survives_a_lost_sidecar() -> crate::Result<()> {
         tree.flush_active_memtable(0)?;
     }
 
-    // The crash window: the sidecar is gone, an unrelated table vanishes.
+    // The crash window: the sidecar is gone, an unrelated table vanishes (a
+    // table, not one of the empty files the folder keeps for tables to come).
     memfs.remove_file(&crate::restrict_bound::sidecar_path(&sst))?;
     let second = memfs
         .read_dir(&tables)?
         .into_iter()
-        .find(|e| !e.is_dir && e.file_name != "0" && e.file_name.parse::<u64>().is_ok())
+        .find(|e| {
+            !e.is_dir
+                && e.file_name != "0"
+                && e.file_name.parse::<u64>().is_ok()
+                && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0)
+        })
         .map(|e| e.path)
         .ok_or_else(|| crate::Error::Unrecoverable)?;
     memfs.remove_file(&second)?;
@@ -3209,10 +3215,15 @@ fn repair_does_not_publish_a_rewrite_under_an_id_a_sidecar_names() -> crate::Res
     // so even that torn state stays collision-free: whatever id the rewrite
     // took, no surviving sidecar may name it — a later repair would restrict
     // that table at a bound belonging to another file.
+    // A published table holds bytes; the empty files the folder keeps for
+    // tables to come hold none.
     let published: Vec<_> = memfs
         .read_dir(&tables)?
         .into_iter()
-        .filter(|e| e.file_name.parse::<crate::TableId>().is_ok())
+        .filter(|e| {
+            e.file_name.parse::<crate::TableId>().is_ok()
+                && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0)
+        })
         .map(|e| e.file_name)
         .collect();
     for e in memfs.read_dir(&tables)? {
@@ -9567,6 +9578,7 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
         // the on-disk shape of a crash between output finalization and the
         // version edit (or of a committed compaction whose input deletion
         // failed).
+        // The empty files the folder keeps for tables to come are no inputs.
         let tables = dir.path().join("tables");
         inputs = std::fs::read_dir(&tables)?
             .map(|e| {
@@ -9574,6 +9586,7 @@ fn repair_excludes_a_compaction_output_whose_inputs_survived() -> crate::Result<
                 let bytes = std::fs::read(&path).expect("read input");
                 (path, bytes)
             })
+            .filter(|(_, bytes)| !bytes.is_empty())
             .collect();
         assert_eq!(inputs.len(), 2, "two flushed inputs");
 
@@ -14110,11 +14123,12 @@ fn damage_a_table_and_its_blob(
     }
 
     // Damage the LAST data block of the table, so phase one salvages it into a
-    // replacement holding the earlier blocks.
+    // replacement holding the earlier blocks. The empty files the folder keeps
+    // for tables to come are no tables.
     let table_path = memfs
         .read_dir(&root.join(crate::file::TABLES_FOLDER))?
         .into_iter()
-        .find(|e| !e.is_dir)
+        .find(|e| !e.is_dir && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0))
         .expect("one table")
         .path;
     let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
@@ -15992,10 +16006,11 @@ fn unparseable_exclusion_forces_full_history_replay() -> crate::Result<()> {
     let root = std::path::absolute("/db")?;
     standard_tree_without_manifest(&memfs, &root)?;
     // A numeric-named file the scan must treat as a table, with nothing
-    // parseable inside.
+    // parseable inside, under an id no file of the tree holds (the tables
+    // folder keeps empty files under the ids of tables to come).
     {
         let mut file = memfs.open(
-            &root.join("tables").join("7"),
+            &root.join("tables").join("999999"),
             &FsOpenOptions::new().write(true).create_new(true),
         )?;
         file.write_all(b"not a table at all")?;
@@ -17647,11 +17662,12 @@ fn repair_orders_tied_overlapping_tables_by_their_recency_keys() -> crate::Resul
     Ok(())
 }
 
-/// A flush persists its own id as its recency key, as every table carries
-/// one.
+/// A flush persists the recency key it takes from the id counter once its
+/// file is claimed, as every table carries one: the manifest records the same
+/// key, and a later flush's is above it whatever ids their pooled files had.
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
-fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
+fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
     use crate::{AbstractTree, Config, SequenceNumberCounter};
 
     let dir = tempfile::tempdir()?;
@@ -17664,15 +17680,29 @@ fn flush_persists_an_own_id_recency_key() -> crate::Result<()> {
     else {
         panic!("expected a standard tree");
     };
-    tree.insert(b"k", b"v", 1);
-    tree.flush_active_memtable(0)?;
-
-    let version = tree.current_version();
-    let table = version.iter_tables().next().expect("one flushed table");
-    assert_eq!(
-        table.metadata.recency,
-        table.id(),
-        "a flush stamps its own id as its recency",
+    let mut recencies = Vec::new();
+    for (seqno, key) in [(0u64, b"a"), (1, b"b")] {
+        tree.insert(key, b"v", seqno);
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let table = version
+            .iter_tables()
+            .max_by_key(|table| table.l0_recency())
+            .expect("a flushed table");
+        assert_eq!(
+            table.metadata.recency,
+            table.l0_recency(),
+            "the table and the manifest record one recency",
+        );
+        assert!(
+            table.metadata.recency > table.id(),
+            "taken after the table's pooled file was claimed",
+        );
+        recencies.push(table.metadata.recency);
+    }
+    assert!(
+        recencies.is_sorted_by(|a, b| a < b),
+        "{recencies:?} increase"
     );
     Ok(())
 }
@@ -18691,10 +18721,11 @@ fn salvage_after_a_lost_first_unit(columnar: bool) -> crate::Result<u32> {
         }
         tree.flush_active_memtable(0)?;
     }
+    // The empty files the folder keeps for tables to come are no tables.
     let table_path = memfs
         .read_dir(&root.join(crate::file::TABLES_FOLDER))?
         .into_iter()
-        .find(|e| !e.is_dir)
+        .find(|e| !e.is_dir && memfs.metadata(&e.path).is_ok_and(|meta| meta.len > 0))
         .expect("one table")
         .path;
     let block_offsets = recover_table(table_path.clone(), &fs_dyn)?
