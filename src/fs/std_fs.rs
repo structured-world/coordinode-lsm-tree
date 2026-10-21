@@ -347,7 +347,8 @@ impl Fs for StdFs {
         super::open_flags::apply_open_flags(&mut builder, opts);
 
         let file = builder.open(path)?;
-        #[cfg(feature = "std")]
+        // No open waits off Unix, so nothing is left to clear there.
+        #[cfg(all(feature = "std", unix))]
         super::open_flags::finish_open(&file, opts)?;
         Ok(Box::new(file))
     }

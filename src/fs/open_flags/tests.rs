@@ -3,7 +3,6 @@ use super::*;
 /// A `no_wait` open leaves the file it opened blocking: `O_NONBLOCK` is the
 /// open's alone, and a file left with it fails `io_uring` writes that would
 /// block.
-#[cfg(unix)]
 #[test]
 fn a_no_wait_open_leaves_its_file_blocking() -> std::io::Result<()> {
     use std::os::fd::AsRawFd;

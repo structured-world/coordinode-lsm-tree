@@ -111,13 +111,7 @@ pub fn finish_open(file: &std::fs::File, opts: &FsOpenOptions) -> std::io::Resul
     Ok(())
 }
 
-/// Nothing to clear where no open waits.
-#[cfg(not(unix))]
-pub fn finish_open(_file: &std::fs::File, _opts: &FsOpenOptions) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 /// Applies the platform flags `opts` asks for to a `std::fs::OpenOptions`
