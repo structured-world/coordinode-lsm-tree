@@ -93,7 +93,7 @@ pub(crate) fn transpose(rows: &[u64], r: u8) -> Vec<u64> {
         .collect()
 }
 
-/// Inverse of [`transpose`]: rebuilds `row_count` row-major values from the
+/// Inverse of [`transpose_into`]: rebuilds `row_count` row-major values from the
 /// bit-sliced words. Used by the round-trip tests and by the diagnostic
 /// tooling that prints a layer's rows.
 #[must_use]

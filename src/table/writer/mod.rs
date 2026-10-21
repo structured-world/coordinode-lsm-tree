@@ -556,6 +556,14 @@ pub struct Writer {
     chunk: Vec<InternalValue>,
     chunk_size: usize,
 
+    /// The user-key hash of each item in `chunk`, kept while the data blocks
+    /// carry a hash index, which buckets the items by it; empty otherwise.
+    chunk_key_hashes: Vec<u64>,
+
+    /// The hash of the current user key, taken when the key is first seen
+    /// and something keys by it: its filter, its locator, the hash index.
+    current_key_hash: u64,
+
     pub(crate) meta: meta::Metadata,
 
     /// Stores the previous block position (used for creating back links)
@@ -1274,6 +1282,8 @@ impl Writer {
             block_buffer: Vec::new(),
             file_writer: writer,
             chunk: Vec::new(),
+            chunk_key_hashes: Vec::new(),
+            current_key_hash: 0,
 
             prev_pos: (BlockOffset(0), BlockOffset(0)),
 
@@ -2832,9 +2842,11 @@ impl Writer {
             // of the same key
 
             let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
-            if filtered || self.locator.is_some() {
-                // The filter and the locator key the same bytes: one hash.
+            if filtered || self.locator.is_some() || self.data_block_hash_ratio > 0.0 {
+                // The filter, the locator and the hash index key the same
+                // bytes: one hash.
                 let key_hash = crate::hash::hash64(user_key);
+                self.current_key_hash = key_hash;
                 if filtered {
                     self.filter_hashes +=
                         self.filter_writer.register_key(user_key, key_hash)? as u64;
@@ -2880,6 +2892,10 @@ impl Writer {
 
         self.chunk_size += self.entry_size(user_key_len, value_len);
         self.chunk.push(item);
+        if self.data_block_hash_ratio > 0.0 {
+            // Every version of a key shares its hash.
+            self.chunk_key_hashes.push(self.current_key_hash);
+        }
         self.previous_type = Some(value_type);
         self.previous_weak_tombstone_key = weak_tombstone_key;
         self.current_key_seqno = Some(seqno);
@@ -2998,6 +3014,7 @@ impl Writer {
             let mut encoded = Vec::new();
             let kv_flags = Self::encode_chunk_into(
                 &self.chunk,
+                Self::key_hashes_of(&self.chunk, &self.chunk_key_hashes),
                 self.data_block_restart_interval,
                 self.data_block_hash_ratio,
                 kv_emit,
@@ -3043,6 +3060,7 @@ impl Writer {
                 par.submit(encoded, kv_flags);
             }
             self.chunk.clear();
+            self.chunk_key_hashes.clear();
             self.chunk_size = 0;
             return Ok(());
         }
@@ -3051,6 +3069,7 @@ impl Writer {
         self.block_buffer.clear();
         let kv_flags = Self::encode_chunk_into(
             &self.chunk,
+            Self::key_hashes_of(&self.chunk, &self.chunk_key_hashes),
             self.data_block_restart_interval,
             self.data_block_hash_ratio,
             kv_emit,
@@ -3106,6 +3125,7 @@ impl Writer {
 
         // IMPORTANT: Clear chunk after everything else
         self.chunk.clear();
+        self.chunk_key_hashes.clear();
         self.chunk_size = 0;
 
         Ok(())
@@ -3143,6 +3163,7 @@ impl Writer {
             None,
         )?;
         self.chunk.clear();
+        self.chunk_key_hashes.clear();
         self.chunk_size = 0;
         Ok(())
     }
@@ -3732,6 +3753,7 @@ impl Writer {
     /// `&mut self.block_buffer`) without aliasing.
     fn encode_chunk_into(
         chunk: &[InternalValue],
+        key_hashes: Option<&[u64]>,
         restart_interval: u8,
         hash_ratio: f32,
         kv_emit: Option<crate::runtime_config::ChecksumAlgorithm>,
@@ -3745,9 +3767,10 @@ impl Writer {
                     .ok_or(crate::Error::FeatureUnsupported("kv-checksum-algorithm"))?;
                 digests.push(d);
             }
-            DataBlock::encode_kv_checked_into(
+            DataBlock::encode_kv_checked_hashed_into(
                 buf,
                 chunk,
+                key_hashes,
                 &digests,
                 algo,
                 restart_interval,
@@ -3755,9 +3778,16 @@ impl Writer {
             )?;
             Ok(crate::table::block::header::block_flags::KV_CHECKSUM_FOOTER)
         } else {
-            DataBlock::encode_into(buf, chunk, restart_interval, hash_ratio)?;
+            DataBlock::encode_hashed_into(buf, chunk, key_hashes, restart_interval, hash_ratio)?;
             Ok(0)
         }
+    }
+
+    /// `key_hashes`, the user-key hash of each item of `chunk`, when the
+    /// block's hash index buckets them by it (and so they were kept).
+    fn key_hashes_of<'a>(chunk: &[InternalValue], key_hashes: &'a [u64]) -> Option<&'a [u64]> {
+        debug_assert!(key_hashes.is_empty() || key_hashes.len() == chunk.len());
+        (!key_hashes.is_empty()).then_some(key_hashes)
     }
 
     /// Records a just-written data block: index entry (with optional seqno

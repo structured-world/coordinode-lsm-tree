@@ -88,7 +88,7 @@ pub(crate) const HEADER_LEN: usize = MAGIC_BYTES.len() + 6 + 8;
 /// Per-layer fixed header length: m + num_blocks + z_byte_len = 12.
 pub(crate) const LAYER_HEADER_LEN: usize = 12;
 
-/// The exact number of bytes [`encode`] will produce for `filter`, without
+/// The exact number of bytes [`encode_into`] will append for `filter`, without
 /// serialising it.
 ///
 /// This is the figure memory accounting and the filter-size budget use. It is

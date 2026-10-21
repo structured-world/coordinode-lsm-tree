@@ -454,9 +454,9 @@ impl<'a> LevelStages<'a> {
             }
             let special = table.is_chunk_special();
             for (handle, positions) in blocks {
-                let task_keys: Vec<usize> = positions
+                let task_keys: Vec<(usize, u64)> = positions
                     .iter()
-                    .map(|&pos| remaining[keys.start + pos].0)
+                    .map(|&pos| remaining[keys.start + pos])
                     .collect();
                 tasks.push(BlockTask {
                     table,

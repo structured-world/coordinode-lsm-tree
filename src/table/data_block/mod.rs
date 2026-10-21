@@ -910,7 +910,20 @@ impl DataBlock {
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
     ) -> crate::Result<Option<InternalValue>> {
-        self.point_read_with(needle, seqno, comparator, None, |item, bytes| {
+        self.point_read_hashed(needle, None, seqno, comparator)
+    }
+
+    /// [`Self::point_read`], given [`crate::hash::hash64`] of `needle` when
+    /// the caller holds it, which a block's hash index then looks up instead
+    /// of hashing the needle again.
+    pub(crate) fn point_read_hashed(
+        &self,
+        needle: &[u8],
+        key_hash: Option<u64>,
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<InternalValue>> {
+        self.point_read_with(needle, key_hash, seqno, comparator, None, |item, bytes| {
             item.materialize(bytes)
         })
     }
@@ -939,6 +952,7 @@ impl DataBlock {
     ) -> crate::Result<Option<InternalValue>> {
         self.point_read_with(
             needle,
+            None,
             seqno,
             comparator,
             Some((slot, is_entry)),
@@ -959,7 +973,19 @@ impl DataBlock {
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
     ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
-        self.point_read_with(needle, seqno, comparator, None, |item, bytes| {
+        self.point_read_value_hashed(needle, None, seqno, comparator)
+    }
+
+    /// [`Self::point_read_value`], given the needle's hash as
+    /// [`Self::point_read_hashed`] takes it.
+    pub(crate) fn point_read_value_hashed(
+        &self,
+        needle: &[u8],
+        key_hash: Option<u64>,
+        seqno: SeqNo,
+        comparator: &crate::comparator::SharedComparator,
+    ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
+        self.point_read_with(needle, key_hash, seqno, comparator, None, |item, bytes| {
             let value = item
                 .value
                 .as_ref()
@@ -985,6 +1011,7 @@ impl DataBlock {
     ) -> crate::Result<Option<(ValueType, SeqNo, Slice)>> {
         self.point_read_with(
             needle,
+            None,
             seqno,
             comparator,
             Some((slot, is_entry)),
@@ -1017,6 +1044,7 @@ impl DataBlock {
     fn point_read_with<R>(
         &self,
         needle: &[u8],
+        key_hash: Option<u64>,
         seqno: SeqNo,
         comparator: &crate::comparator::SharedComparator,
         slot_hint: Option<(u64, bool)>,
@@ -1062,7 +1090,11 @@ impl DataBlock {
                 _ => seek_data_block(&mut decoder, needle, seqno, comparator),
             }
         } else if let Some(hash_index_reader) = decoder.cached_hash_index_reader() {
-            match hash_index_reader.get(needle) {
+            debug_assert!(
+                key_hash.is_none_or(|hash| hash == crate::hash::hash64(needle)),
+                "the hash of the needle"
+            );
+            match hash_index_reader.get(key_hash.unwrap_or_else(|| crate::hash::hash64(needle))) {
                 MARKER_FREE => return Ok(None),
                 // NOTE: Fallback to seqno-aware binary search on a hash conflict.
                 MARKER_CONFLICT => seek_data_block(&mut decoder, needle, seqno, comparator),
@@ -1253,6 +1285,25 @@ impl DataBlock {
         restart_interval: u8,
         hash_index_ratio: f32,
     ) -> crate::Result<()> {
+        Self::encode_hashed_into(writer, items, None, restart_interval, hash_index_ratio)
+    }
+
+    /// [`Self::encode_into`], given [`crate::hash::hash64`] of each item's
+    /// user key, `key_hashes[i]` for `items[i]`, when the caller holds them:
+    /// the hash index buckets the items by them instead of hashing each key
+    /// again.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given item array if empty.
+    pub(crate) fn encode_hashed_into(
+        writer: &mut Vec<u8>,
+        items: &[InternalValue],
+        key_hashes: Option<&[u64]>,
+        restart_interval: u8,
+        hash_index_ratio: f32,
+    ) -> crate::Result<()> {
+        debug_assert!(key_hashes.is_none_or(|hashes| hashes.len() == items.len()));
         #[expect(clippy::expect_used, reason = "the chunk should not be empty")]
         let first_key = &items
             .first()
@@ -1270,8 +1321,9 @@ impl DataBlock {
 
         serializer.state = SeqnoCoding::new(block_uses_deltas(items, restart_interval));
 
-        for item in items {
-            serializer.write(item)?;
+        for (at, item) in items.iter().enumerate() {
+            let key_hash = key_hashes.and_then(|hashes| hashes.get(at).copied());
+            serializer.write_hashed(item, key_hash)?;
         }
 
         serializer.finish()
@@ -1304,6 +1356,7 @@ impl DataBlock {
     /// # Panics
     ///
     /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
+    #[cfg(test)]
     pub(crate) fn encode_kv_checked_into(
         writer: &mut Vec<u8>,
         items: &[InternalValue],
@@ -1312,10 +1365,47 @@ impl DataBlock {
         restart_interval: u8,
         hash_index_ratio: f32,
     ) -> crate::Result<()> {
+        Self::encode_kv_checked_hashed_into(
+            writer,
+            items,
+            None,
+            digests,
+            algo,
+            restart_interval,
+            hash_index_ratio,
+        )
+    }
+
+    /// Builds a per-KV-checked data block as `encode_kv_checked_into` does,
+    /// given each item's key hash as [`Self::encode_hashed_into`] takes them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidTrailer`] if `digests.len()` does not
+    /// equal `items.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` is empty (same contract as [`Self::encode_into`]).
+    pub(crate) fn encode_kv_checked_hashed_into(
+        writer: &mut Vec<u8>,
+        items: &[InternalValue],
+        key_hashes: Option<&[u64]>,
+        digests: &[u64],
+        algo: crate::runtime_config::ChecksumAlgorithm,
+        restart_interval: u8,
+        hash_index_ratio: f32,
+    ) -> crate::Result<()> {
         if items.len() != digests.len() {
             return Err(crate::Error::InvalidTrailer);
         }
-        Self::encode_into(writer, items, restart_interval, hash_index_ratio)?;
+        Self::encode_hashed_into(
+            writer,
+            items,
+            key_hashes,
+            restart_interval,
+            hash_index_ratio,
+        )?;
         super::block::kv_checksum::append_footer(writer, digests, algo);
         Ok(())
     }

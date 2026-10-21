@@ -132,9 +132,9 @@ struct RunResolve {
 /// One data block the chunked `multi_get` resolver will read (see
 /// `resolve_level_chunked`): the block, the SST it lives in, the table-local
 /// read seqno, whether it needs the special load path (Page-ECC / columnar),
-/// and the ORIGINAL key indices that fall in this block. The table's file is
-/// opened when the block's chunk is read, so a level holds open only the
-/// files of the chunk it is reading.
+/// and the ORIGINAL key indices that fall in this block, each with its key's
+/// hash. The table's file is opened when the block's chunk is read, so a
+/// level holds open only the files of the chunk it is reading.
 struct BlockTask<'a> {
     table: &'a crate::Table,
     /// The table's place in the version, by which a job names it.
@@ -142,7 +142,7 @@ struct BlockTask<'a> {
     handle: crate::table::BlockHandle,
     table_seqno: SeqNo,
     special: bool,
-    keys: Vec<usize>,
+    keys: Vec<(usize, u64)>,
 }
 
 /// A level's block tasks, and per table the filter probes planning them took,
@@ -4301,7 +4301,11 @@ impl Tree {
             .iter()
             .enumerate()
             .filter(|(_, task)| task.table.counts_filter_misses())
-            .flat_map(|(at, task)| task.keys.iter().map(move |&key| (task.table.id(), key, at)))
+            .flat_map(|(at, task)| {
+                task.keys
+                    .iter()
+                    .map(move |&(key, _)| (task.table.id(), key, at))
+            })
             .filter(|&(table, key, _)| found.binary_search(&(table, key)).is_err())
             .collect();
         missed.sort_unstable_by_key(|&(table, key, _)| (table, key));
@@ -4344,11 +4348,13 @@ impl Tree {
         keys: &[K],
         hits: &mut Vec<(usize, usize, InternalValue)>,
     ) -> crate::Result<()> {
-        for &kidx in &task.keys {
-            if let Some(item) =
-                task.table
-                    .point_read_translated(block, keys[kidx].as_ref(), task.table_seqno)?
-            {
+        for &(kidx, key_hash) in &task.keys {
+            if let Some(item) = task.table.point_read_translated(
+                block,
+                keys[kidx].as_ref(),
+                key_hash,
+                task.table_seqno,
+            )? {
                 hits.push((index, kidx, item));
             }
         }

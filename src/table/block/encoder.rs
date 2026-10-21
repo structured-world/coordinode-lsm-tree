@@ -131,6 +131,13 @@ impl<'a, Context: Default, Item: Encodable<Context>> Encoder<'a, Context, Item> 
     // }
 
     pub fn write(&mut self, item: &'a Item) -> crate::Result<()> {
+        self.write_hashed(item, None)
+    }
+
+    /// [`Self::write`], given [`crate::hash::hash64`] of the item's key when
+    /// the caller holds it, which the hash index then buckets the item by
+    /// instead of hashing the key again.
+    pub fn write_hashed(&mut self, item: &'a Item, key_hash: Option<u64>) -> crate::Result<()> {
         // NOTE: Check if we are a restart marker
         if self
             .item_count
@@ -160,11 +167,16 @@ impl<'a, Context: Default, Item: Encodable<Context>> Encoder<'a, Context, Item> 
         let restart_idx = self.restart_count - 1;
 
         if self.hash_index_builder.bucket_count() > 0 && restart_idx < MAX_POINTERS_FOR_HASH_INDEX {
+            debug_assert!(
+                key_hash.is_none_or(|hash| hash == crate::hash::hash64(item.key())),
+                "the hash of this item's key"
+            );
+            let key_hash = key_hash.unwrap_or_else(|| crate::hash::hash64(item.key()));
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "max binary index is bound to u8 by MAX_POINTERS_FOR_HASH_INDEX"
             )]
-            self.hash_index_builder.set(item.key(), restart_idx as u8);
+            self.hash_index_builder.set(key_hash, restart_idx as u8);
         }
 
         self.item_count += 1;

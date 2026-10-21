@@ -41,16 +41,17 @@ impl<'a> Reader<'a> {
             .count()
     }
 
-    /// Returns the binary index position if the key is not conflicted.
+    /// Returns the binary index position of the key whose
+    /// [`crate::hash::hash64`] is `key_hash`, if it is not conflicted.
     #[must_use]
-    pub fn get(&self, key: &[u8]) -> u8 {
+    pub fn get(&self, key_hash: u64) -> u8 {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "even with very high hash ratio, there won't be nearly enough items to cause us to create ~4 billion buckets"
         )]
         let bucket_count = self.0.len() as u32;
 
-        let bucket_pos = calculate_bucket_position(key, bucket_count);
+        let bucket_pos = calculate_bucket_position(key_hash, bucket_count);
 
         // SAFETY: We use modulo in `calculate_bucket_position`
         // SAFETY: Also we already did a bounds check in the constructor using indexing slicing

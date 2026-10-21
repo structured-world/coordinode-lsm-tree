@@ -7201,7 +7201,12 @@ impl Table {
                     seqno,
                     &self.comparator,
                 )?,
-                _ => data_block.point_read_value(key, seqno, &self.comparator)?,
+                _ => data_block.point_read_value_hashed(
+                    key,
+                    Some(key_hash),
+                    seqno,
+                    &self.comparator,
+                )?,
             };
             if let Some(found) = found {
                 return Ok(Some(found));
@@ -7228,7 +7233,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(found) = data_block.point_read_value(key, seqno, &self.comparator)? {
+            if let Some(found) =
+                data_block.point_read_value_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            {
                 return Ok(Some(found));
             }
 
@@ -7344,7 +7351,7 @@ impl Table {
                 Some((slot, is_entry)) if !is_columnar => {
                     data_block.point_read_at_slot(slot, is_entry, key, seqno, &self.comparator)?
                 }
-                _ => data_block.point_read(key, seqno, &self.comparator)?,
+                _ => data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?,
             };
             if let Some(item) = found {
                 return Ok(Some((item, data_block)));
@@ -7374,7 +7381,9 @@ impl Table {
                 continue;
             };
 
-            if let Some(item) = data_block.point_read(key, seqno, &self.comparator)? {
+            if let Some(item) =
+                data_block.point_read_hashed(key, Some(key_hash), seqno, &self.comparator)?
+            {
                 return Ok(Some((item, data_block)));
             }
 
@@ -7689,13 +7698,16 @@ impl Table {
             //     and retries the same key.
             while p < passing.len() {
                 let key_idx = passing[p];
-                let key = sorted_keys[key_idx].0;
+                let (key, key_hash) = sorted_keys[key_idx];
                 match self.comparator.compare(key, end_key) {
                     core::cmp::Ordering::Greater => break,
                     core::cmp::Ordering::Less => {
-                        if let Some(mut item) =
-                            data_block.point_read(key, table_seqno, &self.comparator)?
-                        {
+                        if let Some(mut item) = data_block.point_read_hashed(
+                            key,
+                            Some(key_hash),
+                            table_seqno,
+                            &self.comparator,
+                        )? {
                             // Translate table-local seqno back to
                             // the global coordinate so callers can
                             // compare results across tables /
@@ -7707,9 +7719,12 @@ impl Table {
                         p += 1;
                     }
                     core::cmp::Ordering::Equal => {
-                        if let Some(mut item) =
-                            data_block.point_read(key, table_seqno, &self.comparator)?
-                        {
+                        if let Some(mut item) = data_block.point_read_hashed(
+                            key,
+                            Some(key_hash),
+                            table_seqno,
+                            &self.comparator,
+                        )? {
                             item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                             results[key_idx] = Some(item);
                             p += 1;
@@ -8203,11 +8218,12 @@ impl Table {
         &self,
         block: &DataBlock,
         key: &[u8],
+        key_hash: u64,
         table_seqno: SeqNo,
     ) -> crate::Result<Option<InternalValue>> {
         let global_seqno = self.global_seqno();
         Ok(block
-            .point_read(key, table_seqno, &self.comparator)?
+            .point_read_hashed(key, Some(key_hash), table_seqno, &self.comparator)?
             .map(|mut item| {
                 item.key.seqno = apply_global_seqno(item.key.seqno, global_seqno);
                 item
