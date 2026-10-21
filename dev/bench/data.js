@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792620948043,
+  "lastUpdate": 1792620952632,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -57064,6 +57064,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.675135836,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0a65be42e4a7bcbd8a8cbb69359b57433dc8fcbf",
+          "message": "perf(filter): hash each key once and build filters without per-layer allocations (#969)\n\n## Summary\n- Every key a table writer adds is hashed once for its filter, its\nlocator and its blocks' hash index, and point reads hand that hash down\nto the block instead of hashing the key again.\n- A BuRR build (table filter and locator) allocates a fixed handful of\nbuffers instead of several per layer and one per block, solves from the\nequations it already derived, and writes its wire bytes in place; the\nbytes it writes are unchanged.\n- The reconcile walk's locator and filter gates share one hash per key\nand stop copying keys they have seen.\n\n## Changes\n- `FilterWriter::register_key` takes the key's hash; the table writer\ncomputes it once per new key for the filter, the locator and, when\nblocks carry one, the hash index.\n- The block hash index builder and reader take the key hash;\n`DataBlock::encode_hashed_into` / `point_read_hashed` /\n`point_read_value_hashed` carry it, and the table and batched multi-get\npoint reads use them. A data block appended as it is records its last\nkey's hash too, and `Writer::use_data_block_hash_ratio` is refused once\nwriting has started, like the restart intervals.\n- BuRR build: the split keeps kept keys, values and equations in place\nand moves bumped ones into vectors of exact size; one equation buffer\nand one set of solve rows serve every layer; a block's threshold is read\noff a per-row count instead of sorting its offsets; the solve tells an\noccupied row by its coefficient's bit 0 and keeps no occupancy array;\nthe ribbon solves from the equations the thresholds were computed from.\n- Filter and locator serialization transpose straight into the wire\nbuffer, and the locator frames its section around the filter and hands\nits vectors to the build.\n- The filter build peak estimate counts what the build now holds. Tables\nthat close on their writer's held state hold more keys, so the leveled\ngolden fingerprint is repinned.\n- `benches/filter_build.rs`: allocations, bytes, peak heap and P50 (with\nP99 / P999 where a run has the samples) of filter and locator builds, of\nflushes under several filter setups, and of full against partitioned\nfilters on a large flush and on point reads.\n- `structured-zstd` 0.2.4.\n\n## Measurements\nInterleaved A/B, three runs, before → after:\n- table filter build at 1k / 100k / 1M keys: 20% / 16% / 10% faster,\nallocations 76 / 1862 / 18157 → 20, peak heap −12%;\n- locator build at 1k / 1M keys: 25% / 15% faster, allocations 94 /\n18177 → 25, bytes allocated −46% / −40%;\n- flush of 10k / 100k keys under the default configuration: 9% / 10%\nfaster, peak heap −5% / −14%.\n\nFull against partitioned filters on a flush of 1M keys: the partitioned\nflush is 13% faster at the same peak heap, but point reads through it\nare 60% slower for a present key and five times slower for an absent\none, so the per-level partitioning policy stays.\n\n## Testing\nfmt, clippy (every CI configuration), full nextest, doc tests, doc\nbuild, no-std check, aarch64 build, sst-dump, db_bench and converter\nsuites pass on Linux, with the filter and writer tests on i686; clippy,\nthe full suite, doc tests and sst-dump pass on Windows. The wire bytes\nof filter builds are pinned by digests taken before the change.\n\nCloses #961\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n- **Performance**\n- Improved table reads, filter construction, and data-block encoding\nefficiency.\n- Reduced repeated key hashing and temporary memory allocations during\nwriting, lookups, validation, and serialization.\n- Improved memory usage for filter construction and retrieval\nstructures.\n\n- **Reliability**\n- Added regression coverage for hashed lookups, filter serialization,\nthreshold handling, and wire-format stability.\n- Improved file creation ordering to ensure predictable background table\nreplenishment.\n\n- **Benchmarking**\n- Added benchmarks for filter construction, flushes, table layouts,\nallocations, memory usage, and read latency.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-22T00:58:14+03:00",
+          "tree_id": "acfbf711d003864393094eab78240e5425fc509f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0a65be42e4a7bcbd8a8cbb69359b57433dc8fcbf"
+        },
+        "date": 1792620951324,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 513.3610000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.914334ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 125.444,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.823156ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 476.099,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 101.112081ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4035.019,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22464.448,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.607,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 67.764223,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.58459383,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.575,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 72.089599,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.570917466,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
