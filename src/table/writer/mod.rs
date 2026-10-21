@@ -2831,30 +2831,37 @@ impl Writer {
             // because there may be multiple versions
             // of the same key
 
-            if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
-                self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
-            }
+            let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
+            if filtered || self.locator.is_some() {
+                // The filter and the locator key the same bytes: one hash.
+                let key_hash = crate::hash::hash64(user_key);
+                if filtered {
+                    self.filter_hashes +=
+                        self.filter_writer.register_key(user_key, key_hash)? as u64;
+                }
 
-            // Retrieval-ribbon locator: record this key's newest version (its
-            // first occurrence in scan order) at its position in the forming
-            // data block. `chunk.len()` is the item index this key will take
-            // (it is pushed below at the same index); `locator_block_id` is the
-            // current block's ordinal. `slot` is the restart index the encoder
-            // will assign (`item_index / restart_interval`) for `Restart`, or
-            // the exact item index for `Entry`.
-            if let Some(spec) = self.locator {
-                let pos = self.chunk.len() as u64;
-                let slot = match spec.precision {
-                    // Per-block precision drops slot (the section build masks it
-                    // to 0-width); record 0 to keep max_slot minimal.
-                    crate::config::LocatorPrecision::Block => 0,
-                    crate::config::LocatorPrecision::Restart => {
-                        pos / u64::from(self.data_block_restart_interval)
-                    }
-                    crate::config::LocatorPrecision::Entry => pos,
-                };
-                self.locators
-                    .push((crate::hash::hash64(user_key), self.locator_block_id, slot));
+                // Retrieval-ribbon locator: record this key's newest version
+                // (its first occurrence in scan order) at its position in the
+                // forming data block. `chunk.len()` is the item index this key
+                // will take (it is pushed below at the same index);
+                // `locator_block_id` is the current block's ordinal. `slot` is
+                // the restart index the encoder will assign
+                // (`item_index / restart_interval`) for `Restart`, or the exact
+                // item index for `Entry`.
+                if let Some(spec) = self.locator {
+                    let pos = self.chunk.len() as u64;
+                    let slot = match spec.precision {
+                        // Per-block precision drops slot (the section build
+                        // masks it to 0-width); record 0 to keep max_slot
+                        // minimal.
+                        crate::config::LocatorPrecision::Block => 0,
+                        crate::config::LocatorPrecision::Restart => {
+                            pos / u64::from(self.data_block_restart_interval)
+                        }
+                        crate::config::LocatorPrecision::Entry => pos,
+                    };
+                    self.locators.push((key_hash, self.locator_block_id, slot));
+                }
             }
 
             // The per-key state grows between blocks too; see
@@ -3982,25 +3989,27 @@ impl Writer {
             {
                 self.meta.key_count += 1;
                 self.current_key = Some(user_key.clone());
-                if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
-                    self.filter_hashes += self.filter_writer.register_key(user_key)? as u64;
-                }
-                if let Some(spec) = self.locator {
-                    // `row` is this key's item index within the forming block;
-                    // `locator_block_id` is the block's ordinal.
-                    let pos = row as u64;
-                    let slot = match spec.precision {
-                        crate::config::LocatorPrecision::Block => 0,
-                        crate::config::LocatorPrecision::Restart => {
-                            pos / u64::from(self.data_block_restart_interval)
-                        }
-                        crate::config::LocatorPrecision::Entry => pos,
-                    };
-                    self.locators.push((
-                        crate::hash::hash64(user_key),
-                        self.locator_block_id,
-                        slot,
-                    ));
+                let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
+                if filtered || self.locator.is_some() {
+                    // The filter and the locator key the same bytes: one hash.
+                    let key_hash = crate::hash::hash64(user_key);
+                    if filtered {
+                        self.filter_hashes +=
+                            self.filter_writer.register_key(user_key, key_hash)? as u64;
+                    }
+                    if let Some(spec) = self.locator {
+                        // `row` is this key's item index within the forming
+                        // block; `locator_block_id` is the block's ordinal.
+                        let pos = row as u64;
+                        let slot = match spec.precision {
+                            crate::config::LocatorPrecision::Block => 0,
+                            crate::config::LocatorPrecision::Restart => {
+                                pos / u64::from(self.data_block_restart_interval)
+                            }
+                            crate::config::LocatorPrecision::Entry => pos,
+                        };
+                        self.locators.push((key_hash, self.locator_block_id, slot));
+                    }
                 }
             }
             if self.meta.first_key.is_none() {

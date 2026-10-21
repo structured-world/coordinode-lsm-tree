@@ -28,7 +28,8 @@ fn a_filter_with_parity_counts_its_framed_copy() -> crate::Result<()> {
     use super::FilterWriter;
     let fill = |writer: &mut FullFilterWriter| -> crate::Result<u64> {
         for i in 0..1_000 {
-            FilterWriter::<W>::register_key(writer, &format!("{i:04}").into_bytes().into())?;
+            let key: crate::UserKey = format!("{i:04}").into_bytes().into();
+            FilterWriter::<W>::register_key(writer, &key, crate::hash::hash64(&key))?;
         }
         Ok(FilterWriter::<W>::finish_scratch_bytes(writer))
     };
@@ -50,10 +51,8 @@ fn a_prefix_shared_by_adjacent_keys_is_buffered_once() -> crate::Result<()> {
     let mut writer = FullFilterWriter::new(BloomConstructionPolicy::default());
     writer.prefix_extractor = Some(Arc::new(UpToColon));
     for i in 0..1_000 {
-        super::FilterWriter::<W>::register_key(
-            &mut writer,
-            &format!("p:{i:04}").into_bytes().into(),
-        )?;
+        let key: crate::UserKey = format!("p:{i:04}").into_bytes().into();
+        super::FilterWriter::<W>::register_key(&mut writer, &key, crate::hash::hash64(&key))?;
     }
     assert_eq!(writer.bloom_hash_buffer.len(), 1_001);
     Ok(())
@@ -78,7 +77,8 @@ impl PrefixExtractor for AllPrefixes {
 fn the_previous_prefixes_are_held() -> crate::Result<()> {
     let mut writer = FullFilterWriter::new(BloomConstructionPolicy::default());
     writer.prefix_extractor = Some(Arc::new(AllPrefixes));
-    super::FilterWriter::<W>::register_key(&mut writer, &vec![b'k'; 10_000].into())?;
+    let key: crate::UserKey = vec![b'k'; 10_000].into();
+    super::FilterWriter::<W>::register_key(&mut writer, &key, crate::hash::hash64(&key))?;
     let word = core::mem::size_of::<u64>();
     let held = (writer.bloom_hash_buffer.capacity() + writer.previous_prefixes.capacity()) * word;
     assert_eq!(super::FilterWriter::<W>::held_bytes(&writer), held as u64);

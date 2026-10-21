@@ -36,7 +36,10 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     // so we can clone it without heap allocation, if needed
     /// Registers a key in the filter, and returns the hashes it buffered for
     /// it: one, and one a new prefix under a prefix extractor.
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize>;
+    ///
+    /// `key_hash` is [`crate::hash::hash64`] of `key`, which the table writer
+    /// computes once for every structure keyed by it.
+    fn register_key(&mut self, key: &UserKey, key_hash: u64) -> crate::Result<usize>;
 
     /// Heap bytes this writer holds until [`finish`](Self::finish).
     fn held_bytes(&self) -> u64;

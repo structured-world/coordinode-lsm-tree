@@ -714,8 +714,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         self
     }
 
-    fn register_key(&mut self, key: &UserKey) -> crate::Result<usize> {
-        self.bloom_hash_buffer.push(crate::hash::hash64(key));
+    fn register_key(&mut self, key: &UserKey, key_hash: u64) -> crate::Result<usize> {
+        debug_assert_eq!(key_hash, crate::hash::hash64(key), "the hash of this key");
+        self.bloom_hash_buffer.push(key_hash);
 
         // NOTE: Prefix hashes are NOT inserted for partitioned filters.
         // Table::maybe_contains_prefix returns Ok(true) for partitioned/TLI
