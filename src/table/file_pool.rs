@@ -40,6 +40,68 @@ pub struct ClaimedFile {
     /// Whether the directory entry naming the file is durable already, so
     /// the install that names its table need not sync the folder for it.
     pub durable_entry: bool,
+    /// The file's place among those its folder is writing, held until its
+    /// table is written and synced.
+    pub writing: Writing,
+}
+
+/// The most ids a table records of the files its folder was still writing
+/// below it: the lowest ones. One it leaves out reads to a repair as written,
+/// which can only report a loss that is none, and the bound keeps the table's
+/// metadata a size known in advance.
+pub const WRITING_BELOW_CAP: usize = 16;
+
+/// A file its folder is writing a table into: listed among the folder's
+/// files being written until dropped.
+///
+/// A table records the ids below its own still being written in its folder
+/// when it is finished. After a power loss without a manifest, an empty file
+/// under such an id is no table that lost its bytes, as one finished before
+/// that table was, but an output the power loss cut short.
+pub struct Writing {
+    folder: Arc<Mutex<Vec<TableId>>>,
+    id: TableId,
+}
+
+impl Writing {
+    fn new(folder: &Arc<Mutex<Vec<TableId>>>, id: TableId) -> Self {
+        folder.lock().push(id);
+        Self {
+            folder: Arc::clone(folder),
+            id,
+        }
+    }
+
+    /// A file of a folder that writes nothing else: for a claim a test makes
+    /// up.
+    #[cfg(test)]
+    pub fn alone(id: TableId) -> Self {
+        Self::new(&Arc::new(Mutex::new(Vec::new())), id)
+    }
+
+    /// The ids below this file's that its folder is writing, ascending, at
+    /// most [`WRITING_BELOW_CAP`] of the lowest.
+    pub fn below(&self) -> Vec<TableId> {
+        let mut ids: Vec<TableId> = self
+            .folder
+            .lock()
+            .iter()
+            .copied()
+            .filter(|id| *id < self.id)
+            .collect();
+        ids.sort_unstable();
+        ids.truncate(WRITING_BELOW_CAP);
+        ids
+    }
+}
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        let mut ids = self.folder.lock();
+        if let Some(at) = ids.iter().position(|id| *id == self.id) {
+            ids.swap_remove(at);
+        }
+    }
 }
 
 /// The pool of one tables folder.
@@ -61,6 +123,8 @@ struct FolderPool {
     /// Set once the backend reports it cannot count a file's links: no
     /// pooled file can be told unshared, so every file is made for its table.
     unpooled: bool,
+    /// The ids of the files a table is being written into (see [`Writing`]).
+    writing: Arc<Mutex<Vec<TableId>>>,
 }
 
 /// The pools of a tree's tables folders, and the ids their files take.
@@ -128,14 +192,12 @@ impl TableFilePools {
         above: Option<TableId>,
         may_refill: bool,
     ) -> crate::Result<ClaimedFile> {
-        if self.batch == 0 {
-            return self.create(folder, fs);
-        }
         // Held across the refill and the open, so two claims never take one
         // file.
         let mut folders = self.folders.lock();
         let pool = pool_of(&mut folders, folder, fs);
-        let claimed = if pool.unpooled {
+        let writing = Arc::clone(&pool.writing);
+        let claimed = if pool.unpooled || self.batch == 0 {
             Ok(None)
         } else {
             self.claim_pooled(pool, folder, &**fs, above, may_refill)
@@ -143,10 +205,10 @@ impl TableFilePools {
         drop(folders);
         match claimed? {
             Some(claimed) => Ok(claimed),
-            // The pool is dry and is not to be refilled, or the backend
-            // cannot tell whether a file is shared, so no pooled file will be
-            // used.
-            None => self.create(folder, fs),
+            // No pool, the pool is dry and is not to be refilled, or the
+            // backend cannot tell whether a file is shared, so no pooled file
+            // will be used.
+            None => self.create(folder, fs, &writing),
         }
     }
 
@@ -191,6 +253,7 @@ impl TableFilePools {
                         path,
                         file,
                         durable_entry: true,
+                        writing: Writing::new(&pool.writing, id),
                     }));
                 }
                 Opened::Unusable => {}
@@ -207,9 +270,16 @@ impl TableFilePools {
         }
     }
 
-    /// A file created for the next table, its entry not yet durable.
-    fn create(&self, folder: &Path, fs: &Arc<dyn Fs>) -> crate::Result<ClaimedFile> {
+    /// A file created for the next table, its entry not yet durable, listed
+    /// in `writing` before it exists.
+    fn create(
+        &self,
+        folder: &Path,
+        fs: &Arc<dyn Fs>,
+        writing: &Arc<Mutex<Vec<TableId>>>,
+    ) -> crate::Result<ClaimedFile> {
         let id = self.ids.next();
+        let writing = Writing::new(writing, id);
         let path = folder.join(id.to_string());
         let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
         Ok(ClaimedFile {
@@ -217,6 +287,7 @@ impl TableFilePools {
             path,
             file,
             durable_entry: false,
+            writing,
         })
     }
 
@@ -267,6 +338,7 @@ fn pool_of<'a>(
                 ids: VecDeque::new(),
                 synced: true,
                 unpooled: false,
+                writing: Arc::new(Mutex::new(Vec::new())),
             });
             folders.len() - 1
         }
@@ -307,18 +379,28 @@ enum Opened {
 /// file, and only once it is claimed, so it is left to the open that finds it
 /// unnamed. So is a symbolic link put under the name since the tree made the
 /// file: the open does not follow it, as a table's own `create_new` would
-/// not, so no table is written into a file the tree never made. One a capture
+/// not, so no table is written into a file the tree never made. Nor does it
+/// wait on a named pipe put there, which `create_new` would have refused
+/// rather than block the write on a reader that never comes. One a capture
 /// hard-linked is unlinked from the pool: its inode is shared with another
 /// tree, which must never see a write. A link count that cannot be read is
 /// treated as shared.
 fn open_unshared_empty(fs: &dyn Fs, path: &Path) -> crate::Result<Opened> {
-    let file = match fs.open(path, &FsOpenOptions::new().write(true).no_follow(true)) {
+    let opts = FsOpenOptions::new()
+        .write(true)
+        .no_follow(true)
+        .no_wait(true);
+    let file = match fs.open(path, &opts) {
         Ok(file) => file,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(Opened::Unusable),
-        // The open a link refuses fails with no error kind of its own.
+        // The open a link or a pipe with no reader refuses fails with no
+        // error kind of its own: what the name holds tells.
         Err(e) => {
-            return match fs.read_link(path) {
-                Ok(Some(_)) => Ok(Opened::Unusable),
+            if let Ok(Some(_)) = fs.read_link(path) {
+                return Ok(Opened::Unusable);
+            }
+            return match fs.metadata(path) {
+                Ok(meta) if !meta.is_file => Ok(Opened::Unusable),
                 _ => Err(e.into()),
             };
         }

@@ -652,6 +652,26 @@ pub fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result
     Ok(())
 }
 
+/// Clears `O_NONBLOCK` from `fd`'s status flags, which a `no_wait` open set
+/// for the open alone.
+///
+/// # Errors
+/// Returns an [`Error`] if an `fcntl` syscall fails.
+pub fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
+    /// `F_GETFL`, the same on every Linux architecture.
+    const F_GETFL: usize = 3;
+    /// `F_SETFL`, the same on every Linux architecture.
+    const F_SETFL: usize = 4;
+    // SAFETY: `fd` is an owned descriptor; `F_GETFL` takes no argument.
+    let flags = unsafe { syscall3(Sysno::fcntl, fd as usize, F_GETFL, 0) }
+        .map_err(|e| err("fcntl(F_GETFL)", e))?;
+    let cleared = flags & !(O_NONBLOCK.unsigned_abs() as usize);
+    // SAFETY: as above; `F_SETFL` takes the flags as an integer.
+    unsafe { syscall3(Sysno::fcntl, fd as usize, F_SETFL, cleared) }
+        .map_err(|e| err("fcntl(F_SETFL)", e))?;
+    Ok(())
+}
+
 /// `lseek(fd, offset, whence)` — reposition; returns the resulting absolute
 /// offset. Used to resolve the file size (`SEEK_END`) for append / `Seek::End`.
 ///
@@ -710,6 +730,29 @@ pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
 
 /// Append: writes always land at end of file.
 const O_APPEND: i32 = 0o2000;
+/// Do not block in the open on a named pipe with no other end. Asm-generic
+/// (`0o4000`, arm, aarch64 and powerpc alike); MIPS and SPARC override below.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const O_NONBLOCK: i32 = 0o4000;
+/// Do not block in the open on a named pipe with no other end (MIPS: `0x80`).
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+))]
+const O_NONBLOCK: i32 = 0x80;
+/// Do not block in the open on a named pipe with no other end (SPARC:
+/// `0x4000`).
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+const O_NONBLOCK: i32 = 0x4000;
 /// Fail `open` with `EEXIST` if the path already exists (with `O_CREAT`).
 const O_EXCL: i32 = 0o200;
 /// Require the opened path to be a directory (arm, aarch64, powerpc, m68k).
@@ -1256,6 +1299,9 @@ fn open_flags(opts: &FsOpenOptions) -> i32 {
     if opts.no_follow {
         flags |= O_NOFOLLOW;
     }
+    if opts.no_wait {
+        flags |= O_NONBLOCK;
+    }
     flags
 }
 
@@ -1352,11 +1398,12 @@ impl Fs for IoUringRawFs {
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
         let cpath = path_to_cstring(path)?;
         let fd = open_raw(&cpath, open_flags(opts), 0o644)?;
-        Ok(Box::new(IoUringRawFile::new(
-            Arc::clone(&self.ring),
-            fd,
-            opts.append,
-        )))
+        // Owns `fd` from here, so a failure below closes it.
+        let file = IoUringRawFile::new(Arc::clone(&self.ring), fd, opts.append);
+        if opts.no_wait {
+            clear_nonblock_raw(fd)?;
+        }
+        Ok(Box::new(file))
     }
 
     fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {

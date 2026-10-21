@@ -4661,18 +4661,31 @@ struct TableScan {
     scanned_table_ids: crate::HashSet<TableId>,
 }
 
-/// Records that a file under `table_id` opened as a table in `folder`, so an
-/// empty file below it there is judged a table that lost its bytes.
+/// The tables that opened in one folder: each id with the ids below it its
+/// folder was still writing when it was finished.
 #[cfg(feature = "std")]
-fn note_opened(
-    newest_opened: &mut crate::HashMap<PathBuf, TableId>,
-    folder: &std::path::Path,
-    table_id: TableId,
-) {
-    newest_opened
+type OpenedTables = crate::HashMap<PathBuf, Vec<(TableId, Vec<TableId>)>>;
+
+/// Records that `table` opened as a table in `folder`, so an empty file
+/// there below it, written by the time it was finished, is judged a table
+/// that lost its bytes.
+#[cfg(feature = "std")]
+fn note_opened(opened: &mut OpenedTables, folder: &std::path::Path, table: &Table) {
+    opened
         .entry(folder.to_path_buf())
-        .and_modify(|newest| *newest = (*newest).max(table_id))
-        .or_insert(table_id);
+        .or_default()
+        .push((table.id(), table.metadata.writing_below.clone()));
+}
+
+/// Whether one of `tables` (ids with what their folder was still writing
+/// below them) was finished after `id`'s file had its table written: one
+/// above it that does not list it.
+#[cfg(feature = "std")]
+fn written_before_one_of<'a>(
+    id: TableId,
+    mut tables: impl Iterator<Item = (TableId, &'a [TableId])>,
+) -> bool {
+    tables.any(|(table, writing_below)| id < table && !writing_below.contains(&id))
 }
 
 /// Phase 1 of [`repair_tree`]: classify every entry of every table folder and
@@ -4734,10 +4747,11 @@ fn scan_table_folders(
     // `(id, folder, path, fs)`, judged against the tables their folder
     // recovered once the scan is done.
     let mut empty_unnamed: Vec<(TableId, PathBuf, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
-    // The newest id per folder of a file that opened as a table, whether the
-    // rebuild then keeps it or sets it aside: a table written there either
-    // way, so every empty file below it is one too.
-    let mut newest_opened: crate::HashMap<PathBuf, TableId> = crate::HashMap::default();
+    // The files that opened as tables, per folder, whether the rebuild then
+    // keeps them, sets them aside or leaves them out as duplicates: tables
+    // written there either way, each telling which files below it were
+    // still being written when it was finished.
+    let mut opened_tables: OpenedTables = crate::HashMap::default();
 
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
@@ -5024,7 +5038,7 @@ fn scan_table_folders(
                     // It opened as a table, so one was written into this
                     // folder, whatever the walk below finds and wherever the
                     // kept copy lives.
-                    .inspect(|_| note_opened(&mut newest_opened, &table_base_folder, table_id))
+                    .inspect(|table| note_opened(&mut opened_tables, &table_base_folder, table))
                     // The digest was recomputed from THESE bytes, so recovery
                     // can only prove the file is self-consistent — and it stops
                     // at the trailer, meta and index, leaving every lazily-read
@@ -5140,7 +5154,7 @@ fn scan_table_folders(
             // survive elsewhere and become visible again, which no repair can
             // distinguish from "the key was simply never rewritten".
             if let Ok(t) = &recovered {
-                note_opened(&mut newest_opened, &table_base_folder, table_id);
+                note_opened(&mut opened_tables, &table_base_folder, t);
                 let range = t.metadata.key_range.clone();
                 // The bound is UNKNOWN when the table's sequence base lived in
                 // the LOST manifest: that open passes offset 0, so
@@ -5740,41 +5754,53 @@ fn scan_table_folders(
 
     // A pooled file's id is above every table written into its folder: a
     // claim takes the lowest pooled id, and a write numbered above an id
-    // passes over the pooled ones below it. So an empty file above its
-    // folder's newest table (one that opened as a table, kept, set aside or
-    // left out as a duplicate, or a salvaged copy) is a pooled file, never a table: it holds no rows
-    // and is no loss, and like every file the rebuilt manifest does not name
-    // it is reported left out and goes once that manifest is durable. One
-    // below the newest table is a table that lost its bytes, reported as a
-    // loss nothing can scope. A file with bytes that opens as no table is
-    // not counted: nothing says a table was ever written there.
+    // passes over the pooled ones below it. A file being written when the
+    // power went may sit below a table another write finished first; that
+    // table lists it among the files its folder was still writing (see
+    // `file_pool::Writing`). So an empty file is a table that lost its bytes
+    // only when a table of its folder (one that opened as a table, kept, set
+    // aside or left out as a duplicate, or a salvaged copy) is above it and
+    // was finished after it was written: reported as a loss nothing can
+    // scope. Any other is a pooled file or an output the power loss cut
+    // short, never a table: it holds no rows and is no loss, and like every
+    // file the rebuilt manifest does not name it is reported left out and
+    // goes once that manifest is durable. A file with bytes that opens as no
+    // table is not counted: nothing says a table was ever written there.
     //
-    // The newest table of a folder emptied to nothing reads as pooled here:
-    // nothing on disk tells the two apart. A table is synced before any edit
-    // names it, so only damage outside a crash empties one; a durable mark on
-    // every pooled file would cost a data sync per file, the sync the pool
-    // removes, and reporting every empty file as a loss would call for a full
-    // replay on every repair of a pooled tree.
+    // A table emptied to nothing with no table of its folder finished after
+    // it reads as pooled here: nothing on disk tells the two apart. A table
+    // is synced before any edit names it, so only damage outside a crash
+    // empties one; a durable mark on every pooled file would cost a data sync
+    // per file, the sync the pool removes, and reporting every empty file as
+    // a loss would call for a full replay on every repair of a pooled tree.
     for (table_id, folder, table_path, folder_fs) in empty_unnamed {
-        let newest = recovered_by_id
-            .values()
-            .filter(|c| c.path.parent() == Some(folder.as_path()))
-            .map(|c| c.table.id())
-            .chain(newest_opened.get(&folder).copied())
-            .max();
-        if newest.is_none_or(|newest| table_id > newest) {
-            let reason = "an empty pooled table file, no table";
-            excluded_files.push((table_path.clone(), reason.to_string()));
-            discard_after_commit.push((folder_fs, table_path, reason.to_string()));
-        } else {
+        let written = written_before_one_of(
+            table_id,
+            recovered_by_id
+                .values()
+                .filter(|c| c.path.parent() == Some(folder.as_path()))
+                .map(|c| (c.table.id(), c.table.metadata.writing_below.as_slice()))
+                .chain(
+                    opened_tables
+                        .get(&folder)
+                        .into_iter()
+                        .flatten()
+                        .map(|(id, below)| (*id, below.as_slice())),
+                ),
+        );
+        if written {
             scanned_table_ids.insert(table_id);
             set_aside_path(
                 &folder_fs,
                 &table_path,
-                "an empty table file below its folder's newest table: its bytes were lost",
+                "an empty table file below a table finished after it: its bytes were lost",
                 &mut unreadable_files,
                 &mut discard_after_commit,
             );
+        } else {
+            let reason = "an empty table file no table was written into";
+            excluded_files.push((table_path.clone(), reason.to_string()));
+            discard_after_commit.push((folder_fs, table_path, reason.to_string()));
         }
     }
 

@@ -19,6 +19,7 @@ const _: () = {
     assert!(O_EXCL == libc::O_EXCL);
     assert!(O_DIRECTORY == libc::O_DIRECTORY);
     assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
+    assert!(O_NONBLOCK == libc::O_NONBLOCK);
 };
 
 // These tests require a Linux kernel with io_uring; they are compiled only
@@ -276,6 +277,37 @@ fn raw_file_append_writes_accumulate_at_eof() {
     let n = f.read_at(&mut buf, 0).expect("read_at");
     assert_eq!(n, 6, "both appends must be present");
     assert_eq!(&buf, b"aaabbb", "appends land in order at EOF");
+}
+
+#[test]
+fn raw_fs_no_wait_refuses_a_pipe_with_no_reader_and_opens_a_file() {
+    // `no_wait` fails the open of a named pipe nothing reads rather than
+    // block it, and still opens a regular file, which then writes as any.
+    use crate::fs::Fs;
+    use crate::path::Path;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pipe = tmp.path().join("pipe");
+    let file = tmp.path().join("file");
+    let name = std::ffi::CString::new(pipe.to_str().expect("utf8")).expect("no NUL");
+    // SAFETY: `name` is a NUL-terminated path the call only reads.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    std::fs::write(&file, b"").expect("file");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let opts = FsOpenOptions::new().write(true).no_wait(true);
+
+    assert!(
+        fs.open(Path::new(pipe.to_str().expect("utf8")), &opts)
+            .is_err(),
+        "a pipe with no reader is refused"
+    );
+    let mut opened = fs
+        .open(Path::new(file.to_str().expect("utf8")), &opts)
+        .expect("a regular file opens");
+    opened.write_all(b"a table").expect("write");
+    drop(opened);
+    assert_eq!(std::fs::read(&file).expect("read"), b"a table");
 }
 
 #[test]

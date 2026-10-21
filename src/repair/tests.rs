@@ -3,6 +3,7 @@ use super::{
     discard_unreferenced, highest_existing_version_id, repair_tmp_path, toc_may_hide_deletions,
     verify_keep_decision,
 };
+use crate::Table;
 use crate::fs::StdFs;
 use test_log::test;
 
@@ -18,6 +19,113 @@ fn remove_manifest(fs: &dyn crate::fs::Fs, root: &std::path::Path) -> crate::Res
             fs.remove_file(&entry.path)?;
         }
     }
+    Ok(())
+}
+
+/// A file one write was still filling when another, numbered above it,
+/// finished its table is no table that lost its bytes: after a power loss
+/// without a manifest the empty file is an output cut short, left out rather
+/// than reported lost (which calls for a replay of the whole retained
+/// history). An empty file below the same table that had its table written by
+/// then is still reported lost.
+#[test]
+fn a_repair_reports_no_loss_for_an_output_cut_short_below_a_newer_table() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(4)
+    };
+    let (emptied, cut_short, finished) = {
+        let AnyTree::Standard(tree) = config().open()? else {
+            panic!("a standard tree");
+        };
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        let Some(emptied) = tree.current_version().iter_tables().map(Table::id).max() else {
+            panic!("the first table");
+        };
+
+        // A write in flight: its file is claimed, and nothing is written into
+        // it before the power goes.
+        let (folder, fs) = tree.config.tables_folder_for_level(0);
+        let in_flight = tree.table_files.claim(&folder, &fs, None, false)?;
+        tree.insert("b", "1", 1);
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let Some(finished) = version.iter_tables().max_by_key(|t| t.id()) else {
+            panic!("the second table");
+        };
+        assert_eq!(
+            finished.metadata.writing_below,
+            vec![in_flight.id],
+            "self-check: the table finished while the file was filling lists it"
+        );
+        (emptied, in_flight.path, finished.id())
+    };
+    let tables = dir.path().join("tables");
+    assert!(emptied < finished, "self-check: {emptied} < {finished}");
+    std::fs::File::create(tables.join(emptied.to_string()))?.set_len(0)?;
+    remove_manifest(&StdFs, dir.path())?;
+
+    let report = config().repair()?;
+    let emptied = tables.join(emptied.to_string());
+    assert!(
+        report.unknowable_losses.contains(&emptied),
+        "the emptied table is a loss: {report:?}"
+    );
+    assert!(
+        !report.unknowable_losses.contains(&cut_short),
+        "the output cut short is no loss: {report:?}"
+    );
+    assert!(
+        report
+            .excluded_files
+            .iter()
+            .any(|(path, _)| *path == cut_short),
+        "the output cut short is left out: {report:?}"
+    );
+    assert_eq!(report.wal_replay_scope(), WalReplayScope::FullHistory);
+    Ok(())
+}
+
+/// The same tree with nothing emptied: the output cut short alone calls for
+/// no replay past the tail.
+#[test]
+fn a_repair_of_an_output_cut_short_alone_replays_only_the_tail() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter, WalReplayScope};
+
+    let dir = tempfile::tempdir()?;
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .table_file_pool(4)
+    };
+    {
+        let AnyTree::Standard(tree) = config().open()? else {
+            panic!("a standard tree");
+        };
+        tree.insert("a", "1", 0);
+        tree.flush_active_memtable(0)?;
+        let (folder, fs) = tree.config.tables_folder_for_level(0);
+        let _in_flight = tree.table_files.claim(&folder, &fs, None, false)?;
+        tree.insert("b", "1", 1);
+        tree.flush_active_memtable(0)?;
+    }
+    remove_manifest(&StdFs, dir.path())?;
+
+    let report = config().repair()?;
+    assert_eq!(report.recovered, 2, "{report:?}");
+    assert!(report.unknowable_losses.is_empty(), "{report:?}");
+    assert_eq!(report.wal_replay_scope(), WalReplayScope::TailOnly);
     Ok(())
 }
 

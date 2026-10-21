@@ -185,15 +185,21 @@ matching entry (and add one for a new subsystem).
   version names is a pooled file: an open uses it again after syncing its
   folder once. A pooled file's id is above every table written into its
   folder (a claim takes the lowest pooled id, a write numbered above an id
-  passes over the pooled ones below it), so a repair without a manifest
-  removes an empty file above the folder's newest table (one that opened as a
-  table, kept or set aside) as pooled, reporting it left out, and reports one
-  below it as a table that lost its bytes. A folder has one pool however many
+  passes over the pooled ones below it), and a table records the ids below
+  its own whose files its folder was still writing when it was finished, so
+  a file a power loss cut short is told from a table written before it. A
+  repair without a manifest reports an empty file as a table that lost its
+  bytes only when a table of its folder above it (one that opened as a table,
+  kept, set aside or left out as a duplicate) does not list it; any other it
+  removes as a pooled file or an output cut short, reporting it left out. A
+  table emptied with no table of its folder finished after it reads as
+  pooled. A folder has one pool however many
   routes name it (backend handles, path spellings the backend resolves to it),
   so its files are numbered together; where the backend cannot tell that two
   routes name one folder, each found file still goes to one pool only. A claim
-  opens its file without following a symbolic link, so no table is written
-  into a file the tree did not make. A pooled file another name links to (a
+  opens its file without following a symbolic link or waiting on a named
+  pipe, and takes only an empty regular file, so no table is written into a
+  file the tree did not make and no write waits on one. A pooled file another name links to (a
   capture of the folder) is unlinked, never written; a backend that cannot
   count links gets every file made for its table instead. Under
   `SyncMode::Barrier` a folder on another device than the manifest is still

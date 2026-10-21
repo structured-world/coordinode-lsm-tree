@@ -2,8 +2,9 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Platform open flags shared between [`StdFs`] and `IoUringFs`:
-//! `O_DIRECT` for [`FsOpenOptions::direct_io`] and `O_NOFOLLOW` (or the
-//! Windows reparse-point open) for [`FsOpenOptions::no_follow`].
+//! `O_DIRECT` for [`FsOpenOptions::direct_io`], `O_NOFOLLOW` (or the
+//! Windows reparse-point open) for [`FsOpenOptions::no_follow`], and
+//! `O_NONBLOCK` for the open alone for [`FsOpenOptions::no_wait`].
 //!
 //! Lives here (rather than inline in each backend's `open()`) so the
 //! arch-gating list and the bit values are defined in exactly one place.
@@ -38,6 +39,7 @@
 //! [`StdFs`]: super::StdFs
 //! [`FsOpenOptions::direct_io`]: field@super::FsOpenOptions::direct_io
 //! [`FsOpenOptions::no_follow`]: field@super::FsOpenOptions::no_follow
+//! [`FsOpenOptions::no_wait`]: field@super::FsOpenOptions::no_wait
 
 use super::FsOpenOptions;
 
@@ -75,11 +77,48 @@ fn direct_io_bits(_direct_io: bool) -> i32 {
 pub fn apply_open_flags(builder: &mut std::fs::OpenOptions, opts: &FsOpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     let no_follow = if opts.no_follow { libc::O_NOFOLLOW } else { 0 };
-    let flags = direct_io_bits(opts.direct_io) | no_follow;
+    let no_wait = if opts.no_wait { libc::O_NONBLOCK } else { 0 };
+    let flags = direct_io_bits(opts.direct_io) | no_follow | no_wait;
     if flags != 0 {
         builder.custom_flags(flags);
     }
 }
+
+/// Clears what the open alone needed from `file`, opened under `opts`: the
+/// `O_NONBLOCK` of a `no_wait` open, so its I/O blocks as any file's does
+/// (`io_uring`, for one, fails a write that would block on such a file).
+///
+/// # Errors
+///
+/// The `fcntl` that reads or sets the file's status flags failing.
+#[cfg(unix)]
+pub fn finish_open(file: &std::fs::File, opts: &FsOpenOptions) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if !opts.no_wait {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` is the open descriptor `file` owns for this call;
+    // `F_GETFL` reads its status flags and takes no pointer.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above; `F_SETFL` takes the flags as an integer.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Nothing to clear where no open waits.
+#[cfg(not(unix))]
+pub fn finish_open(_file: &std::fs::File, _opts: &FsOpenOptions) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
 
 /// Applies the platform flags `opts` asks for to a `std::fs::OpenOptions`
 /// builder. Direct I/O is not wired here (see

@@ -113,12 +113,16 @@ impl Table {
         let src = timed.into_inner();
         let pace = pace.map(|pace| &**pace);
 
+        // `writing` is held to the end: the copy is among the files its folder
+        // is writing until it is synced.
         let ClaimedFile {
             id: new_table_id,
             path: new_path,
             file: out,
             durable_entry,
+            writing,
         } = output()?;
+        let writing_below = writing.below();
 
         // Once the output file exists, any later failure (meta re-encode,
         // section copy, bitmap write, sync) must not leave a partial,
@@ -129,7 +133,12 @@ impl Table {
             // delete-bitmap descriptors. The block is loaded TAIL (`meta`)
             // since MID and TAIL carry identical content; the same patched
             // payload is written to both sections below.
-            let meta_payload = self.repoint_meta_block(&*src, new_table_id, delete_bitmap, pace)?;
+            let meta_payload = self.repoint_meta_block(
+                &*src,
+                (new_table_id, &writing_below),
+                delete_bitmap,
+                pace,
+            )?;
             let out = BufWriter::with_capacity(u16::MAX.into(), out);
             let out = ChecksummedWriter::new(out);
             let mut writer = crate::sfa::Writer::from_writer(out);
@@ -229,9 +238,10 @@ impl Table {
     }
 
     /// Loads this segment's meta KV block, replaces the `table_id` entry's value
-    /// with `new_table_id` AND the two `descriptor#delete_bitmap_*` entries with
+    /// with `new_table_id`, the two `descriptor#delete_bitmap_*` entries with
     /// values describing `delete_bitmap` (the NEW positional bitmap this
-    /// relocation appends), then re-encodes the payload (uncompressed, ready for a
+    /// relocation appends), and the `writing_below` entry with the copy's own
+    /// `writing_below`, then re-encodes the payload (uncompressed, ready for a
     /// [`BlockType::Meta`] write). Every other meta field is preserved byte-exact.
     ///
     /// Without patching the delete-bitmap descriptors, the copied values would
@@ -241,7 +251,7 @@ impl Table {
     fn repoint_meta_block(
         &self,
         src: &dyn FsFile,
-        new_table_id: TableId,
+        (new_table_id, writing_below): (TableId, &[TableId]),
         delete_bitmap: &DeleteBitmap,
         pace: Option<&dyn super::util::ReadPacer>,
     ) -> crate::Result<Vec<u8>> {
@@ -332,12 +342,30 @@ impl Table {
         // transformed marker: the bitmap masks rows the source still holds
         // as live tombstones, so either dedup direction re-derives the same
         // materialized content.
+        // The source's `writing_below` named the files its folder was writing
+        // below the source; the copy records its own.
         entries.retain(|e| {
             !matches!(
                 e.key.user_key.as_ref(),
-                b"lineage" | b"lineage_prev" | b"lineage_transformed" | b"lineage_last"
+                b"lineage"
+                    | b"lineage_prev"
+                    | b"lineage_transformed"
+                    | b"lineage_last"
+                    | b"writing_below"
             )
         });
+        if !writing_below.is_empty() {
+            let bytes: Vec<u8> = writing_below
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect();
+            entries.push(InternalValue::from_components(
+                b"writing_below".to_vec(),
+                &bytes[..],
+                0,
+                crate::ValueType::Value,
+            ));
+        }
         entries.push(InternalValue::from_components(
             b"lineage".to_vec(),
             &self.metadata.id.to_le_bytes()[..],

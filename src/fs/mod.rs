@@ -162,6 +162,11 @@ pub struct FsOpenOptions {
     /// (`FILE_FLAG_OPEN_REPARSE_POINT`), which is not a regular file. A
     /// backend without symbolic links has nothing to follow.
     pub no_follow: bool,
+    /// Do not wait in the open itself: a named pipe at the path with no
+    /// reader fails the open on Unix rather than block it (`O_NONBLOCK`,
+    /// cleared once the file is open, so its reads and writes block as
+    /// usual). A backend without named pipes has nothing to wait for.
+    pub no_wait: bool,
 }
 
 impl Default for FsOpenOptions {
@@ -183,6 +188,7 @@ impl FsOpenOptions {
             append: false,
             direct_io: false,
             no_follow: false,
+            no_wait: false,
         }
     }
 
@@ -239,6 +245,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn no_follow(mut self, no_follow: bool) -> Self {
         self.no_follow = no_follow;
+        self
+    }
+
+    /// Sets the `no_wait` flag.
+    #[must_use]
+    pub const fn no_wait(mut self, no_wait: bool) -> Self {
+        self.no_wait = no_wait;
         self
     }
 }

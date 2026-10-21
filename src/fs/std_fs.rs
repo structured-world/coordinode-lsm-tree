@@ -347,6 +347,8 @@ impl Fs for StdFs {
         super::open_flags::apply_open_flags(&mut builder, opts);
 
         let file = builder.open(path)?;
+        #[cfg(feature = "std")]
+        super::open_flags::finish_open(&file, opts)?;
         Ok(Box::new(file))
     }
 

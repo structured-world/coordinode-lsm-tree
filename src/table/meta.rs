@@ -372,6 +372,12 @@ pub struct ParsedMeta {
     /// marker). With an unbroken adjacency chain from the run's first output,
     /// it proves the surviving set is the run's COMPLETE output set.
     pub lineage_last: bool,
+
+    /// The ids below this table's of the files its folder was still writing
+    /// when it was finished, ascending, from the optional `writing_below`
+    /// property (empty when none was). Every other id below this table's in
+    /// its folder had its table written by then.
+    pub writing_below: Vec<TableId>,
 }
 
 macro_rules! read_u8 {
@@ -846,6 +852,24 @@ impl ParsedMeta {
         let lineage_last = block
             .point_read(b"lineage_last", SeqNo::MAX, &cmp)?
             .is_some();
+        // Consecutive little-endian ids, as `lineage`; absent when the
+        // folder was writing no file below this one.
+        let writing_below = match block.point_read(b"writing_below", SeqNo::MAX, &cmp)? {
+            Some(item) => {
+                if item.value.len() % 8 != 0 {
+                    return Err(crate::Error::InvalidHeader("TableMeta"));
+                }
+                item.value
+                    .chunks_exact(8)
+                    .map(|chunk| {
+                        <[u8; 8]>::try_from(chunk)
+                            .map(u64::from_le_bytes)
+                            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))
+                    })
+                    .collect::<crate::Result<Vec<u64>>>()?
+            }
+            None => Vec::new(),
+        };
 
         Ok(Self {
             id,
@@ -889,6 +913,7 @@ impl ParsedMeta {
             lineage_prev,
             lineage_transformed,
             lineage_last,
+            writing_below,
         })
     }
 }

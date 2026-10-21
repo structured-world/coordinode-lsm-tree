@@ -20,6 +20,7 @@ fn output_at(path: &Path, id: TableId) -> crate::Result<ClaimedFile> {
         path: path.to_path_buf(),
         file: StdFs.open(path, &FsOpenOptions::new().write(true).create_new(true))?,
         durable_entry: false,
+        writing: crate::table::file_pool::Writing::alone(id),
     })
 }
 
@@ -102,6 +103,53 @@ fn relocate_reuses_blocks_and_masks_deleted_rows() -> crate::Result<()> {
             assert_eq!(&*got.value, b"val", "live value preserved verbatim");
         }
     }
+    Ok(())
+}
+
+/// A relocated copy records the files its own folder was writing below it
+/// when it was finished, not the ones its source recorded: a repair reads
+/// them to tell an output a power loss cut short from a table that lost its
+/// bytes.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_relocated_copy_records_what_its_folder_was_writing_below_it() -> crate::Result<()> {
+    use crate::table::file_pool::TableFilePools;
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let pools = TableFilePools::new(crate::SequenceNumberCounter::default(), 0, SyncMode::Normal);
+    let claim = || pools.claim(dir.path(), &fs, None, true);
+
+    let earlier = claim()?;
+    let source_file = claim()?;
+    let (source_id, source_path) = (source_file.id, source_file.path.clone());
+    let mut writer = Writer::into_claimed(source_file, 0, Arc::clone(&fs))?
+        .use_columnar(true)
+        .use_zone_map(true);
+    for i in 0..96u32 {
+        writer.write(InternalValue::from_components(
+            format!("k{i:04}").into_bytes(),
+            b"val",
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, source_checksum) = writer.finish()?.expect("source table written");
+    let source = recover_at(&source_path, source_checksum, source_id)?;
+    assert_eq!(
+        source.metadata.writing_below,
+        vec![earlier.id],
+        "self-check: the source records the file written below it"
+    );
+    drop(earlier);
+
+    let pending = claim()?;
+    let mut bitmap = DeleteBitmap::new();
+    bitmap.insert(3);
+    let relocated =
+        source.relocate_columnar_with_deletes(claim, &StdFs, &bitmap, SyncMode::Normal, None)?;
+    let copy = recover_at(&relocated.path, relocated.checksum, relocated.id)?;
+    assert_eq!(copy.metadata.writing_below, vec![pending.id]);
     Ok(())
 }
 

@@ -7989,6 +7989,7 @@ fn delete_bitmap_masks_value_subcolumns_in_point_and_projection_reads() -> crate
                     path: out.clone(),
                     file: StdFs.open(&out, &FsOpenOptions::new().write(true).create_new(true))?,
                     durable_entry: false,
+                    writing: crate::table::file_pool::Writing::alone(1),
                 })
             },
             &StdFs,

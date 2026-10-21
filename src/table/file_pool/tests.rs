@@ -266,6 +266,56 @@ fn a_symlink_put_under_a_pooled_name_is_never_written_through() -> crate::Result
     Ok(())
 }
 
+/// A named pipe put under a pooled name does not hold the claim waiting for
+/// a reader: the claim passes it over, as `create_new` would have refused
+/// it, and takes the next file.
+#[cfg(all(unix, feature = "std"))]
+#[test]
+fn a_pipe_put_under_a_pooled_name_does_not_hold_the_claim() -> crate::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = tempfile::tempdir()?;
+    let folder = dir.path().join("t");
+    std::fs::create_dir(&folder)?;
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    let pools = TableFilePools::new(SequenceNumberCounter::default(), 2, SyncMode::Normal);
+    assert_eq!(pools.claim(&folder, &fs, None, true)?.id, 0);
+    let pipe = folder.join("1");
+    std::fs::remove_file(&pipe)?;
+    let name = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes())
+        .map_err(|e| crate::io::Error::new(crate::io::ErrorKind::InvalidInput, e.to_string()))?;
+    // SAFETY: `name` is a NUL-terminated path the call only reads.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    let mut claimed = pools.claim(&folder, &fs, None, true)?;
+    assert_ne!(claimed.id, 1, "the pipe is passed over");
+    claimed.file.write_all(b"a table")?;
+    assert!(
+        std::fs::symlink_metadata(&pipe)?.file_type().is_fifo(),
+        "the pipe is left as found"
+    );
+    Ok(())
+}
+
+/// A table records the files its folder is writing below it, and a file
+/// leaves that list once its claim is dropped.
+#[test]
+fn a_claim_lists_the_files_its_folder_writes_below_it() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = pools(4)?;
+    let first = pools.claim(&folder, &fs, None, true)?;
+    let second = pools.claim(&folder, &fs, None, false)?;
+    let third = pools.claim(&folder, &fs, None, false)?;
+    assert_eq!(third.writing.below(), vec![first.id, second.id]);
+    assert!(first.writing.below().is_empty(), "nothing below the first");
+    drop(second);
+    assert_eq!(
+        third.writing.below(),
+        vec![first.id],
+        "a dropped claim leaves"
+    );
+    Ok(())
+}
+
 /// Two routes on a backend that cannot tell they name one folder keep two
 /// pools of it. An empty file the open found goes to one of them only: the
 /// other would hand out the file the first one is about to write a table

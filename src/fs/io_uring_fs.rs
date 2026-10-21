@@ -278,6 +278,8 @@ impl Fs for IoUringFs {
         super::open_flags::apply_open_flags(&mut builder, opts);
 
         let file = builder.open(path)?;
+        #[cfg(feature = "std")]
+        super::open_flags::finish_open(&file, opts)?;
 
         // When opened in append mode, io_uring writes use an explicit offset
         // so the kernel's O_APPEND semantics don't apply. Initialize the
