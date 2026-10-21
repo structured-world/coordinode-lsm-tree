@@ -95,7 +95,9 @@ pub(crate) fn compute_thresholds(equations: &[StandardEquation], m: usize, b: u8
     for (block, threshold) in thresholds.iter_mut().enumerate() {
         let block_counts = &counts[block * b_usize..(block + 1) * b_usize];
         let mut kept = 0_usize;
-        for (offset, &count) in (0_u8..).zip(block_counts) {
+        // `0..b` ends where the block does, so the offset never steps past
+        // `u8` even for a 255-row block.
+        for (offset, &count) in (0..b).zip(block_counts) {
             kept += count as usize;
             if kept > cap_per_block {
                 // More than `cap` keys start at or below this offset, at most

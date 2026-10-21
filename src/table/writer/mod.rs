@@ -2036,8 +2036,16 @@ impl Writer {
         self
     }
 
+    /// Sets the hash index ratio of the data blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a write has started: the table records one ratio for all
+    /// its blocks, and a block's index buckets the key hashes kept from its
+    /// first item on.
     #[must_use]
     pub fn use_data_block_hash_ratio(mut self, ratio: f32) -> Self {
+        self.assert_not_started("data block hash ratio");
         self.data_block_hash_ratio = ratio;
         self
     }
@@ -4020,9 +4028,12 @@ impl Writer {
                 self.meta.key_count += 1;
                 self.current_key = Some(user_key.clone());
                 let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
-                if filtered || self.locator.is_some() {
+                if filtered || self.locator.is_some() || self.data_block_hash_ratio > 0.0 {
                     // The filter and the locator key the same bytes: one hash.
+                    // It is the current key's for the hash index too, which a
+                    // later row write of another version of this key buckets by.
                     let key_hash = crate::hash::hash64(user_key);
+                    self.current_key_hash = key_hash;
                     if filtered {
                         self.filter_hashes +=
                             self.filter_writer.register_key(user_key, key_hash)? as u64;

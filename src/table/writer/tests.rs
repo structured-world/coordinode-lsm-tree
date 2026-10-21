@@ -430,6 +430,32 @@ fn writer_rejects_data_block_restart_interval_change_after_write() {
     let _writer = writer.use_data_block_restart_interval(2);
 }
 
+/// The table records one hash index ratio for all its blocks, and the hashes
+/// a block's index buckets by are kept from its first item on, so the ratio
+/// is set before the first write, not between them.
+#[test]
+#[should_panic(expected = "data block hash ratio must be configured before writing starts")]
+fn writer_rejects_data_block_hash_ratio_change_after_write() {
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => panic!("tempdir should be created: {e}"),
+    };
+    let path = dir.path().join("1");
+    let mut writer = match Writer::new(path, 1, 0, Arc::new(StdFs)) {
+        Ok(writer) => writer,
+        Err(e) => panic!("writer should be created: {e}"),
+    };
+    if let Err(e) = writer.write(InternalValue::from_components(
+        b"a",
+        b"v",
+        0,
+        ValueType::Value,
+    )) {
+        panic!("write should succeed: {e}");
+    }
+    let _writer = writer.use_data_block_hash_ratio(1.33);
+}
+
 #[test]
 #[should_panic(expected = "index block restart interval must be configured before writing starts")]
 fn writer_rejects_index_block_restart_interval_change_after_write() {
@@ -1650,6 +1676,106 @@ fn a_table_of_tombstones_alone_covers_them_without_a_given_range() -> crate::Res
     assert_eq!(table.metadata.key_range.min().as_ref(), b"a");
     assert_eq!(table.metadata.key_range.max().as_ref(), b"z");
     assert_eq!(table.range_tombstones().len(), 3);
+    Ok(())
+}
+
+/// A key whose versions run from a block appended as it is into rows written
+/// after it keeps its own hash in the hash index of the block those rows form:
+/// every version reads back at its own snapshot.
+#[test]
+fn a_key_running_from_a_verbatim_block_into_written_rows_keeps_its_hash() -> crate::Result<()> {
+    use crate::coding::Decode;
+    use crate::table::block::Header;
+
+    const VERSIONS: u64 = 60;
+    let key = b"the-one-key";
+    let version = |seqno: u64| {
+        InternalValue::from_components(
+            key.to_vec(),
+            format!("value-{seqno:04}").into_bytes(),
+            seqno,
+            ValueType::Value,
+        )
+    };
+    let hashed = |path: crate::path::PathBuf| -> crate::Result<Writer> {
+        Ok(Writer::new(path, 1, 0, Arc::new(StdFs))?
+            .use_data_block_size(256)
+            .use_data_block_hash_ratio(2.0))
+    };
+    let recover = |path: crate::path::PathBuf, id, checksum| {
+        crate::Table::recover(crate::table::RecoverParams::new(
+            path,
+            checksum,
+            id,
+            Arc::new(StdFs),
+            crate::comparator::default_comparator(),
+            Arc::new(crate::Cache::with_capacity_bytes(1 << 20)),
+        ))
+    };
+
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("source");
+    let mut writer = hashed(source.clone())?;
+    for seqno in (1..=VERSIONS).rev() {
+        writer.write(version(seqno))?;
+    }
+    let Some((id, checksum)) = writer.finish()? else {
+        panic!("the source table is written");
+    };
+    let table = recover(source.clone(), id, checksum)?;
+    let Some(first) = table.data_block_handles().find_map(Result::ok) else {
+        panic!("the source table has a data block");
+    };
+    let last_copied = first.seqno();
+    assert!(
+        last_copied > 1,
+        "the key's versions run past the first block"
+    );
+    let offset = *first.as_ref().offset();
+
+    let bytes = std::fs::read(&source)?;
+    let Some(frame) = bytes.get(usize::try_from(offset).unwrap_or(usize::MAX)..) else {
+        panic!("the first block lies within the file");
+    };
+    let header = Header::decode_from(&mut &frame[..])?;
+    let Some(raw) = frame.get(..header.on_disk_size_with(None) as usize) else {
+        panic!("the first block's frame lies within the file");
+    };
+
+    let dest = dir.path().join("dest");
+    let mut writer = hashed(dest.clone())?;
+    let copied: Vec<InternalValue> = (last_copied..=VERSIONS).rev().map(version).collect();
+    writer.append_verbatim_data_block(
+        (
+            raw,
+            VerbatimSource {
+                table_id: id,
+                offset,
+            },
+        ),
+        header,
+        Vec::new(),
+        &copied,
+        None,
+        &crate::comparator::default_comparator(),
+    )?;
+    for seqno in (1..last_copied).rev() {
+        writer.write(version(seqno))?;
+    }
+    let Some((id, checksum)) = writer.finish()? else {
+        panic!("the copy is written");
+    };
+
+    let table = recover(dest, id, checksum)?;
+    let hash = crate::hash::hash64(key);
+    for seqno in 1..=VERSIONS {
+        let got = table.get(key, seqno + 1, hash)?;
+        assert_eq!(
+            got.map(|v| v.key.seqno),
+            Some(seqno),
+            "the version at seqno {seqno} reads back",
+        );
+    }
     Ok(())
 }
 

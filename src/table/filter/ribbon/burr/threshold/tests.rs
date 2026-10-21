@@ -131,6 +131,18 @@ fn is_bumped_predicate_matches_partition() {
     }
 }
 
+/// The widest block, 255 rows, walks every offset `u8` holds: an underloaded
+/// one keeps everything, and an overloaded one gets its `cap`-th offset, with
+/// no offset counter running past 255.
+#[test]
+fn a_block_of_255_rows_walks_every_offset() {
+    let underloaded: Vec<_> = (0..10).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&underloaded, 255, 255), vec![255]);
+    // cap = 229 for 255 rows: one key at each of offsets 0..=254.
+    let overloaded: Vec<_> = (0..255).map(eq_at).collect();
+    assert_eq!(compute_thresholds(&overloaded, 255, 255), vec![229]);
+}
+
 #[test]
 fn keys_outside_block_range_get_bumped() {
     // start values past m get treated as block_idx >= block_count;

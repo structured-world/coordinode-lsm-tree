@@ -1350,13 +1350,19 @@ fn a_lowered_budget_enters_the_over_budget_state_until_rewrites() -> crate::Resu
 
 /// Before any probe is observed the static policy decides: the advisor
 /// writes the same filters as a tree without it.
+///
+/// The compaction writes one table: a writer under the advisor holds more
+/// state than one without it (it bounds its filter by the widest width and
+/// keeps the hashes for a narrower retry), so where a held-state limit cuts
+/// tables differs between the two, and the filters are compared over the
+/// same keys.
 #[test]
 fn before_any_probe_the_filters_match_the_static_policy() -> crate::Result<()> {
     let sizes = |advisor: Option<FilterAdvisor>| -> crate::Result<Vec<u32>> {
         let folder = tempfile::tempdir()?;
         let tree = open(folder.path(), advisor)?;
         fill(&tree, &["hot", "old"], KEYS)?;
-        tree.major_compact(64 * 1_024, 0)?;
+        tree.major_compact(u64::MAX, 0)?;
         let mut sizes: Vec<u32> = tables(&tree).iter().map(Table::filter_size).collect();
         sizes.sort_unstable();
         Ok(sizes)
