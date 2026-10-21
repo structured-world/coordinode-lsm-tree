@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use test_log::test;
 
+/// A tree at `folder` whose pools refill on the writing thread, so what each
+/// write leaves in its folder is the same on every run; the background refill
+/// is tested on its own below.
 fn config(folder: &Path) -> Config {
     Config::new(
         folder,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
+    .table_file_refill_inline(true)
 }
 
 /// The ids of the files in `folder` named like tables, split into the empty
@@ -603,6 +607,8 @@ fn a_checkpoint_carries_no_pooled_file_and_shares_none() -> lsm_tree::Result<()>
 
 const DB: &str = "/db/tree";
 
+/// A tree on `fs` whose pools refill on the writing thread, so the syncs an
+/// operation issues are the same ones on every run.
 fn crash_config(fs: &Arc<FaultFs<CrashFs>>) -> Config {
     Config::new(
         DB,
@@ -611,6 +617,67 @@ fn crash_config(fs: &Arc<FaultFs<CrashFs>>) -> Config {
     )
     .with_shared_fs(fs.clone())
     .table_file_pool(4)
+    .table_file_refill_inline(true)
+}
+
+/// By default a pool refills off the flushing thread: the flushes still take
+/// their files in id order, a flush that comes before the first batch is
+/// ready waits for it rather than number its table above the batch, every
+/// key reads back after a reopen, and once the refills are done the folder
+/// holds pooled files for the flushes to come.
+#[test]
+fn a_pool_refilled_off_the_flushing_thread_hands_out_ids_in_order() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::Fs;
+
+    let fs = MemFs::new();
+    let open = || {
+        Config::new(
+            "/bg/tree",
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_fs(fs.clone())
+        .table_file_pool(4)
+        .open()
+    };
+    let tree = open()?;
+    let mut ids = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for seqno in 0..10u64 {
+        tree.insert(format!("k{seqno}"), "1", seqno);
+        tree.flush_active_memtable(0)?;
+        let version = tree.current_version();
+        let new: Vec<_> = version
+            .iter_tables()
+            .map(|t| t.id())
+            .filter(|id| seen.insert(*id))
+            .collect();
+        assert_eq!(new.len(), 1, "each flush adds one table");
+        ids.extend(new);
+    }
+    assert!(
+        ids.is_sorted_by(|a, b| a < b),
+        "each flush's table is numbered above the last: {ids:?}"
+    );
+
+    tree.wait_for_table_file_refills();
+    let tables = std::path::absolute("/bg/tree")?.join("tables");
+    let pooled = fs
+        .read_dir(&tables)?
+        .into_iter()
+        .filter(|entry| fs.metadata(&entry.path).is_ok_and(|meta| meta.len == 0))
+        .count();
+    assert!(pooled > 0, "pooled files wait for the flushes to come");
+
+    drop(tree);
+    let tree = open()?;
+    for seqno in 0..10u64 {
+        assert!(
+            tree.get(format!("k{seqno}"), u64::MAX)?.is_some(),
+            "k{seqno}"
+        );
+    }
+    Ok(())
 }
 
 /// The rule that fails the sync `at` of `syncs`, the syncs an operation

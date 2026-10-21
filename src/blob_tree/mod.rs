@@ -1391,6 +1391,10 @@ impl AbstractTree for BlobTree {
         self.index.sync_mode()
     }
 
+    fn wait_for_table_file_refills(&self) {
+        self.index.wait_for_table_file_refills();
+    }
+
     fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
         // The prefix filter is built over the index tree's SST keys.
         self.index.prefix_extractor()

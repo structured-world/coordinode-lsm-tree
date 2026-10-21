@@ -34,6 +34,9 @@ fn a_rotation_failed_at_its_install_does_not_block_the_next_install() -> lsm_tre
         // Every install rotates, so each flush writes and installs a fresh
         // snapshot.
         .manifest_log_rotate_bytes(0)
+        // The armed sync counts the folder syncs in order: none may come from
+        // a refill on another thread.
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -86,6 +89,7 @@ fn a_compaction_whose_install_fails_reopens_on_the_previous_generation() -> lsm_
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -205,6 +209,7 @@ fn a_compaction_whose_install_cannot_be_withdrawn_keeps_its_output() -> lsm_tree
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };
@@ -264,6 +269,7 @@ fn a_compaction_whose_withdrawal_is_not_durable_keeps_its_output() -> lsm_tree::
             SequenceNumberCounter::default(),
         )
         .manifest_log_rotate_bytes(0)
+        .table_file_refill_inline(true)
         .with_fs(fs)
         .open()
     };

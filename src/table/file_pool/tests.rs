@@ -340,6 +340,203 @@ fn a_backend_whose_folder_sync_does_nothing_gets_no_pool() -> crate::Result<()> 
     Ok(())
 }
 
+/// Pools refilling off the claiming thread over a fresh tables folder `/t`
+/// on a fault-injecting in-memory backend, making `batch` files at a time.
+#[cfg(feature = "std")]
+fn background_pools(batch: usize) -> crate::Result<Pools> {
+    let (_, fault, fs, folder) = pools(batch)?;
+    Ok((
+        TableFilePools::refilling_in_background(
+            SequenceNumberCounter::default(),
+            batch,
+            SyncMode::Normal,
+        ),
+        fault,
+        fs,
+        folder,
+    ))
+}
+
+/// The ids of the empty files in `folder`.
+#[cfg(feature = "std")]
+fn empty_files(fs: &Arc<dyn Fs>, folder: &Path) -> crate::Result<Vec<TableId>> {
+    let mut ids: Vec<TableId> = fs
+        .read_dir(folder)?
+        .into_iter()
+        .filter(|entry| fs.metadata(&entry.path).is_ok_and(|meta| meta.len == 0))
+        .filter_map(|entry| entry.file_name.parse().ok())
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// The ids the one folder of `pools` lists as holding no table, ascending.
+#[cfg(feature = "std")]
+fn listed(pools: &TableFilePools) -> Vec<TableId> {
+    let mut ids = pools
+        .pools
+        .folders
+        .lock()
+        .first()
+        .map(|pool| pool.writing.lock().clone())
+        .unwrap_or_default();
+    ids.sort_unstable();
+    ids
+}
+
+/// Refilling off the claiming thread, a claim that finds the pool dry makes
+/// its own file, its entry not durable, and starts a refill rather than wait
+/// on one: the batch and its single folder sync come off that thread.
+#[cfg(feature = "std")]
+#[test]
+fn a_dry_pool_makes_the_claim_its_file_and_refills_off_the_thread() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = background_pools(4)?;
+    let first = pools.claim(&folder, &fs, None, true)?;
+    assert!(!first.durable_entry, "made for its table");
+    pools.wait_for_refills();
+    assert_eq!(directory_syncs(&fault), 1, "the refill's one folder sync");
+    let pooled = empty_files(&fs, &folder)?;
+    assert_eq!(pooled.len(), 5, "the claim's file and a batch: {pooled:?}");
+    assert!(
+        pooled.iter().all(|id| *id > first.id),
+        "the batch is numbered after the claim's file: {pooled:?}"
+    );
+
+    let next = pools.claim(&folder, &fs, None, true)?;
+    assert!(next.durable_entry, "a pooled file");
+    assert_eq!(Some(next.id), pooled.get(1).copied());
+    Ok(())
+}
+
+/// A claim that leaves half a batch starts the next refill, so the pool is
+/// topped up before a write finds it dry.
+#[cfg(feature = "std")]
+#[test]
+fn a_claim_that_leaves_half_a_batch_starts_a_refill() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = background_pools(4)?;
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    let _ = directory_syncs(&fault);
+
+    // Four pooled: the first claim leaves three, the second two, half the
+    // batch, which starts the refill.
+    let first = pools.claim(&folder, &fs, None, true)?;
+    pools.wait_for_refills();
+    assert_eq!(directory_syncs(&fault), 0, "three left, no refill yet");
+    let second = pools.claim(&folder, &fs, None, true)?;
+    pools.wait_for_refills();
+    assert_eq!(directory_syncs(&fault), 1, "two left, a refill ran");
+    assert!(first.durable_entry && second.durable_entry);
+    let pooled = empty_files(&fs, &folder)?;
+    assert_eq!(pooled.len(), 2 + 2 + 4, "two claimed, two left, a batch");
+    Ok(())
+}
+
+/// The pooled files and the ones a refill is making hold no table, and are
+/// listed with the files being written: a table finished above one records
+/// it, so a repair never reads an empty pooled file below it as a table that
+/// lost its bytes.
+#[cfg(feature = "std")]
+#[test]
+fn pooled_files_are_listed_as_holding_no_table() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(4)?;
+    let made = pools.claim(&folder, &fs, None, true)?;
+    pools.wait_for_refills();
+    let pooled = empty_files(&fs, &folder)?;
+    assert_eq!(
+        listed(&pools),
+        pooled,
+        "the claimed file and every pooled one"
+    );
+    drop(made);
+
+    let claimed = pools.claim(&folder, &fs, None, true)?;
+    drop(claimed);
+    let now = listed(&pools);
+    let rest: Vec<TableId> = pooled.iter().copied().skip(2).collect();
+    assert!(
+        rest.iter().all(|id| now.contains(id)),
+        "{now:?} still lists the unclaimed {rest:?}"
+    );
+    Ok(())
+}
+
+/// An in-memory backend that panics on every folder sync.
+#[cfg(feature = "std")]
+struct PanicsOnFolderSync(MemFs);
+
+#[cfg(feature = "std")]
+impl Fs for PanicsOnFolderSync {
+    fn capabilities(&self, path: &Path) -> FsCapabilities {
+        self.0.capabilities(path)
+    }
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
+        self.0.open(path, opts)
+    }
+    fn create_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &Path) -> crate::io::Result<Vec<FsDirEntry>> {
+        self.0.read_dir(path)
+    }
+    fn remove_file(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> crate::io::Result<()> {
+        self.0.remove_dir_all(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> crate::io::Result<()> {
+        self.0.rename(from, to)
+    }
+    fn metadata(&self, path: &Path) -> crate::io::Result<FsMetadata> {
+        self.0.metadata(path)
+    }
+    fn sync_directory(&self, path: &Path) -> crate::io::Result<()> {
+        panic!("the backend fails syncing {}", path.display());
+    }
+    fn exists(&self, path: &Path) -> crate::io::Result<bool> {
+        self.0.exists(path)
+    }
+}
+
+/// A refill whose backend panics ends there, and a claim that finds the pool
+/// dry goes on rather than wait for a refill that will never finish: it gets
+/// a file made for its table.
+#[cfg(feature = "std")]
+#[test]
+fn a_refill_that_panics_leaves_no_claim_waiting() -> crate::Result<()> {
+    let fs: Arc<dyn Fs> = Arc::new(PanicsOnFolderSync(MemFs::new()));
+    let folder = PathBuf::from("/t");
+    fs.create_dir_all(&folder)?;
+    let pools = TableFilePools::refilling_in_background(
+        SequenceNumberCounter::default(),
+        4,
+        SyncMode::Normal,
+    );
+
+    let first = pools.claim(&folder, &fs, None, true)?;
+    let second = pools.claim(&folder, &fs, None, true)?;
+    assert!(!second.durable_entry, "made for its table, no batch pooled");
+    assert!(second.id > first.id, "{} above {}", second.id, first.id);
+    Ok(())
+}
+
+/// Pools that go wait for their refills: no file is made in a folder after
+/// its tree is closed.
+#[cfg(feature = "std")]
+#[test]
+fn closing_the_pools_waits_for_their_refills() -> crate::Result<()> {
+    let (pools, _fault, fs, folder) = background_pools(8)?;
+    drop(pools.claim(&folder, &fs, None, true)?);
+    drop(pools);
+    assert_eq!(
+        empty_files(&fs, &folder)?.len(),
+        1 + 8,
+        "the claim's file and the whole batch"
+    );
+    Ok(())
+}
+
 /// A table records the files its folder is writing below it, and a file
 /// leaves that list once its claim is dropped.
 #[test]

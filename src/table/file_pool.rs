@@ -13,6 +13,12 @@
 //! A pool file is empty until it is claimed, and a table never is, so a scan
 //! tells the two apart by length: an empty file under a table name that no
 //! version names is a pool file, adopted again by the next open.
+//!
+//! With `std` a tree's pools refill off the writer's thread: a claim that
+//! leaves half a batch starts a refill, long before the pool runs dry, so a
+//! write waits on a batch only when it comes before the first one is ready.
+//! A claim that finds the pool dry with no refill under way makes its file
+//! and starts one.
 
 use crate::{
     SequenceNumberCounter, TableId,
@@ -40,32 +46,43 @@ pub struct ClaimedFile {
     /// Whether the directory entry naming the file is durable already, so
     /// the install that names its table need not sync the folder for it.
     pub durable_entry: bool,
-    /// The file's place among those its folder is writing, held until its
-    /// table is written and synced.
+    /// The file's place among those of its folder that hold no table yet,
+    /// held until its table is written and synced.
     pub writing: Writing,
 }
 
-/// The most ids a table records of the files its folder was still writing
-/// below it: the lowest ones. One it leaves out reads to a repair as written,
-/// which can only report a loss that is none, and the bound keeps the table's
-/// metadata a size known in advance.
+/// The most ids a table records of the files of its folder below it that
+/// held no table yet: the lowest ones. One it leaves out reads to a repair as
+/// written, which can only report a loss that is none, and the bound keeps
+/// the table's metadata a size known in advance.
 pub const WRITING_BELOW_CAP: usize = 16;
 
-/// A file its folder is writing a table into: listed among the folder's
-/// files being written until dropped.
+/// The ids of a folder's files that hold no table yet: pooled, being made by a
+/// refill, or being written into.
+type Unwritten = Arc<Mutex<Vec<TableId>>>;
+
+/// A file its folder is writing a table into: listed among the folder's files
+/// that hold no table until dropped.
 ///
-/// A table records the ids below its own still being written in its folder
-/// when it is finished. After a power loss without a manifest, an empty file
-/// under such an id is no table that lost its bytes, as one finished before
-/// that table was, but an output the power loss cut short.
+/// A table records the ids below its own of the files of its folder that held
+/// no table when it was finished. After a power loss without a manifest, an
+/// empty file under such an id is no table that lost its bytes, as one
+/// finished before that table was, but a pooled file or an output the power
+/// loss cut short.
 pub struct Writing {
-    folder: Arc<Mutex<Vec<TableId>>>,
+    folder: Unwritten,
     id: TableId,
 }
 
 impl Writing {
-    fn new(folder: &Arc<Mutex<Vec<TableId>>>, id: TableId) -> Self {
+    /// A file made for its table, listed from here.
+    fn new(folder: &Unwritten, id: TableId) -> Self {
         folder.lock().push(id);
+        Self::listed(folder, id)
+    }
+
+    /// A pooled file, listed already.
+    fn listed(folder: &Unwritten, id: TableId) -> Self {
         Self {
             folder: Arc::clone(folder),
             id,
@@ -79,8 +96,8 @@ impl Writing {
         Self::new(&Arc::new(Mutex::new(Vec::new())), id)
     }
 
-    /// The ids below this file's that its folder is writing, ascending, at
-    /// most [`WRITING_BELOW_CAP`] of the lowest.
+    /// The ids below this file's of the files its folder holds no table in,
+    /// ascending, at most [`WRITING_BELOW_CAP`] of the lowest.
     pub fn below(&self) -> Vec<TableId> {
         let mut ids: Vec<TableId> = self
             .folder
@@ -97,10 +114,15 @@ impl Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        let mut ids = self.folder.lock();
-        if let Some(at) = ids.iter().position(|id| *id == self.id) {
-            ids.swap_remove(at);
-        }
+        unlist(&self.folder, self.id);
+    }
+}
+
+/// Takes `id` off the list of a folder's files that hold no table.
+fn unlist(folder: &Unwritten, id: TableId) {
+    let mut ids = folder.lock();
+    if let Some(at) = ids.iter().position(|listed| *listed == id) {
+        ids.swap_remove(at);
     }
 }
 
@@ -108,8 +130,7 @@ impl Drop for Writing {
 ///
 /// One per physical folder, however many routes name it: two pools of one
 /// folder would number its files apart, and a table written from one would
-/// sit below files pooled by the other, which a repair reads as tables that
-/// lost their bytes.
+/// sit above files pooled by the other.
 struct FolderPool {
     /// The routes that name the folder (a backend handle and a spelling of
     /// its path each). A claim works through its own route.
@@ -124,12 +145,16 @@ struct FolderPool {
     /// would save, or once it reports it cannot count a file's links, so no
     /// pooled file can be told unshared: every file is made for its table.
     unpooled: bool,
-    /// The ids of the files a table is being written into (see [`Writing`]).
-    writing: Arc<Mutex<Vec<TableId>>>,
+    /// The ids of the folder's files that hold no table yet (see
+    /// [`Writing`]).
+    writing: Unwritten,
+    /// Whether a refill off the claiming thread is under way.
+    refilling: bool,
 }
 
-/// The pools of a tree's tables folders, and the ids their files take.
-pub struct TableFilePools {
+/// What every pool of a tree shares, with the refills running off the
+/// claiming thread.
+struct Pools {
     /// The tree's table id counter: a refill reserves the ids of its files
     /// from it, so they are never handed to any other table.
     ids: SequenceNumberCounter,
@@ -137,16 +162,92 @@ pub struct TableFilePools {
     /// is written, with no pool.
     batch: usize,
     sync_mode: SyncMode,
+    /// Whether a refill runs off the claiming thread.
+    background: bool,
     folders: Mutex<Vec<FolderPool>>,
+    /// Woken when a refill off the claiming thread ends, for a claim that
+    /// found its pool dry while it ran.
+    #[cfg(feature = "std")]
+    refilled: parking_lot::Condvar,
+}
+
+/// Where a table file pool is refilled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefillOn {
+    /// Off the thread of the write that claims from it: no write waits on a
+    /// batch.
+    #[default]
+    Background,
+    /// On that thread: a write waits on the batch it starts, and every sync
+    /// the pool issues falls inside one write.
+    ClaimingThread,
+}
+
+/// A refill to run off the claiming thread: the pool it fills, the route it
+/// makes its files through and the ids reserved for them.
+struct Refill {
+    at: usize,
+    folder: PathBuf,
+    fs: Arc<dyn Fs>,
+    ids: Vec<TableId>,
+}
+
+/// The pools of a tree's tables folders, and the ids their files take.
+pub struct TableFilePools {
+    pools: Arc<Pools>,
+    /// The refills running off the claiming thread, joined before the pools
+    /// go: none makes a file in a folder after its tree is closed.
+    #[cfg(feature = "std")]
+    refills: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl TableFilePools {
+    /// Pools that refill on the claiming thread.
+    #[cfg(test)]
     pub fn new(ids: SequenceNumberCounter, batch: usize, sync_mode: SyncMode) -> Self {
+        Self::with(ids, batch, sync_mode, false)
+    }
+
+    /// Pools that refill off the claiming thread: no claim waits on a batch.
+    #[cfg(all(test, feature = "std"))]
+    pub fn refilling_in_background(
+        ids: SequenceNumberCounter,
+        batch: usize,
+        sync_mode: SyncMode,
+    ) -> Self {
+        Self::with(ids, batch, sync_mode, true)
+    }
+
+    /// A tree's pools: refilling where `refill` says, and on the claiming
+    /// thread without `std`.
+    pub fn for_tree(
+        ids: SequenceNumberCounter,
+        batch: usize,
+        sync_mode: SyncMode,
+        refill: RefillOn,
+    ) -> Self {
+        let background = cfg!(feature = "std") && refill == RefillOn::Background;
+        Self::with(ids, batch, sync_mode, background)
+    }
+
+    fn with(
+        ids: SequenceNumberCounter,
+        batch: usize,
+        sync_mode: SyncMode,
+        background: bool,
+    ) -> Self {
         Self {
-            ids,
-            batch,
-            sync_mode,
-            folders: Mutex::new(Vec::new()),
+            pools: Arc::new(Pools {
+                ids,
+                batch,
+                sync_mode,
+                background,
+                folders: Mutex::new(Vec::new()),
+                #[cfg(feature = "std")]
+                refilled: parking_lot::Condvar::new(),
+            }),
+            #[cfg(feature = "std")]
+            refills: Mutex::new(Vec::new()),
         }
     }
 
@@ -159,16 +260,19 @@ impl TableFilePools {
     /// pools handing out one file would let one remove or overwrite the table
     /// the other wrote into it.
     pub fn adopt(&self, folder: &Path, fs: &Arc<dyn Fs>, mut ids: Vec<TableId>) {
-        if self.batch == 0 {
+        if self.pools.batch == 0 {
             return;
         }
-        let mut folders = self.folders.lock();
+        let mut folders = self.pools.folders.lock();
         ids.retain(|id| !folders.iter().any(|pool| pool.ids.contains(id)));
         if ids.is_empty() {
             return;
         }
         ids.sort_unstable();
-        let pool = pool_of(&mut folders, folder, fs);
+        let at = pool_of(&mut folders, folder, fs);
+        let Some(pool) = folders.get_mut(at) else {
+            return;
+        };
         // A folder without a pool keeps no empty file: each is an orphan.
         if pool.unpooled {
             for id in ids {
@@ -176,6 +280,7 @@ impl TableFilePools {
             }
             return;
         }
+        pool.writing.lock().extend(ids.iter().copied());
         pool.ids.extend(ids);
         pool.synced = false;
         drop(folders);
@@ -185,10 +290,12 @@ impl TableFilePools {
     /// `above` when given: a compaction output's id is above its inputs', so
     /// an output and the input whose age it takes are told apart by id.
     ///
-    /// The pool is refilled only when `may_refill`: a write's first table. A
-    /// later table of a write that has run the pool dry gets a file made for
-    /// it, since the install that names it syncs the folder once for all of
-    /// them, where refills would sync it once per batch.
+    /// Refilling off the claiming thread, a claim that finds the pool dry
+    /// makes its file and starts a refill, as does one that leaves half a
+    /// batch. Otherwise the pool is refilled only when `may_refill`: a write's
+    /// first table. A later table of a write that has run the pool dry gets a
+    /// file made for it, since the install that names it syncs the folder
+    /// once for all of them, where refills would sync it once per batch.
     ///
     /// # Errors
     ///
@@ -202,80 +309,256 @@ impl TableFilePools {
     ) -> crate::Result<ClaimedFile> {
         // Held across the refill and the open, so two claims never take one
         // file.
-        let mut folders = self.folders.lock();
-        let pool = pool_of(&mut folders, folder, fs);
+        let mut folders = self.pools.folders.lock();
+        let at = pool_of(&mut folders, folder, fs);
+        // A dry pool a refill is filling is waited for rather than passed
+        // over: a file made now would take an id above the batch, and the
+        // ids a folder hands out would depend on how far the refill got.
+        // Only a write that comes before the first batch is ready waits; one
+        // started at half a batch is ready long before the pool runs dry.
+        #[cfg(feature = "std")]
+        while folders
+            .get(at)
+            .is_some_and(|pool| pool.refilling && pool.ids.is_empty())
+        {
+            self.pools.refilled.wait(&mut folders);
+        }
+        let Some(pool) = folders.get_mut(at) else {
+            return Err(crate::Error::Unrecoverable);
+        };
         let writing = Arc::clone(&pool.writing);
-        let claimed = if pool.unpooled || self.batch == 0 {
-            Ok(None)
+        let (claimed, refill) = if pool.unpooled || self.pools.batch == 0 {
+            (Ok(None), None)
         } else {
-            self.claim_pooled(pool, folder, &**fs, above, may_refill)
+            self.pools
+                .claim_pooled(pool, at, folder, fs, above, may_refill)
         };
         drop(folders);
+        if let Some(refill) = refill {
+            self.start(refill);
+        }
         match claimed? {
             Some(claimed) => Ok(claimed),
-            // No pool, the pool is dry and is not to be refilled, or the
-            // backend cannot tell whether a file is shared, so no pooled file
-            // will be used.
-            None => self.create(folder, fs, &writing),
+            // No pool, the pool is dry, or the backend cannot tell whether a
+            // file is shared, so no pooled file will be used.
+            None => self.pools.create(folder, fs, &writing),
         }
     }
 
-    /// The next file of `pool` to write a table into, through the route
-    /// `folder` on `fs`, refilled when it runs out and `may_refill`; `None`
-    /// when it is dry and may not be, a fresh batch held no file that can be
-    /// used, or the backend cannot count a file's links, which gives the pool
-    /// up.
+    /// Runs `refill` off this thread. A thread that cannot be started leaves
+    /// the pool as it was, for the next claim to start again.
+    #[cfg(feature = "std")]
+    fn start(&self, refill: Refill) {
+        let (at, ids) = (refill.at, refill.ids.clone());
+        let pools = Arc::clone(&self.pools);
+        match std::thread::Builder::new()
+            .name("lsm-table-files".into())
+            .spawn(move || pools.run(&refill))
+        {
+            Ok(handle) => {
+                let mut refills = self.refills.lock();
+                refills.retain(|refill| !refill.is_finished());
+                refills.push(handle);
+            }
+            Err(e) => {
+                log::warn!("could not start refilling a table file pool: {e}");
+                self.pools.withdraw(at, &ids);
+            }
+        }
+    }
+
+    /// No refill runs off the claiming thread without `std`.
+    #[cfg(not(feature = "std"))]
+    fn start(&self, refill: Refill) {
+        self.pools.withdraw(refill.at, &refill.ids);
+    }
+
+    /// Waits for the refills running off the claiming thread to finish.
+    pub fn wait_for_refills(&self) {
+        #[cfg(feature = "std")]
+        {
+            let refills = core::mem::take(&mut *self.refills.lock());
+            for refill in refills {
+                if refill.join().is_err() {
+                    log::warn!("a table file pool refill panicked");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TableFilePools {
+    fn drop(&mut self) {
+        self.wait_for_refills();
+    }
+}
+
+impl Pools {
+    /// The next file of `pool`, the pool at `at`, to write a table into,
+    /// through the route `folder` on `fs`; `None` when it is dry, a fresh
+    /// batch held no file that can be used, or the backend cannot count a
+    /// file's links, which gives the pool up. With it, the refill to start
+    /// off this thread, when one is due.
     fn claim_pooled(
         &self,
         pool: &mut FolderPool,
+        at: usize,
         folder: &Path,
-        fs: &dyn Fs,
+        fs: &Arc<dyn Fs>,
         above: Option<TableId>,
         may_refill: bool,
-    ) -> crate::Result<Option<ClaimedFile>> {
+    ) -> (crate::Result<Option<ClaimedFile>>, Option<Refill>) {
         let mut refilled = false;
-        loop {
+        let claimed = loop {
             if !pool.synced && !pool.ids.is_empty() {
-                crate::file::fsync_directory(folder, fs, self.sync_mode)?;
+                if let Err(e) = crate::file::fsync_directory(folder, &**fs, self.sync_mode) {
+                    break Err(e.into());
+                }
                 pool.synced = true;
             }
             let Some(id) = pool.ids.pop_front() else {
-                if refilled || !may_refill {
-                    return Ok(None);
+                if self.background || refilled || !may_refill {
+                    break Ok(None);
                 }
                 // Synced by the refill itself, or left unsynced for the
                 // next claim when its sync fails.
-                self.refill(pool, folder, fs)?;
+                if let Err(e) = self.refill(pool, folder, &**fs) {
+                    break Err(e);
+                }
                 refilled = true;
                 continue;
             };
             let path = folder.join(id.to_string());
             if above.is_some_and(|above| id <= above) {
-                discard(fs, &path);
+                unlist(&pool.writing, id);
+                discard(&**fs, &path);
                 continue;
             }
-            match open_unshared_empty(fs, &path)? {
-                Opened::Unshared(file) => {
-                    return Ok(Some(ClaimedFile {
+            match open_unshared_empty(&**fs, &path) {
+                Ok(Opened::Unshared(file)) => {
+                    break Ok(Some(ClaimedFile {
                         id,
                         path,
                         file,
                         durable_entry: true,
-                        writing: Writing::new(&pool.writing, id),
+                        writing: Writing::listed(&pool.writing, id),
                     }));
                 }
-                Opened::Unusable => {}
-                Opened::LinksUncountable => {
+                Ok(Opened::Unusable) => unlist(&pool.writing, id),
+                Ok(Opened::LinksUncountable) => {
                     // Every other file would be refused alike: removed now,
                     // rather than kept for claims that never come.
+                    unlist(&pool.writing, id);
                     for id in pool.ids.drain(..) {
-                        discard(fs, &folder.join(id.to_string()));
+                        unlist(&pool.writing, id);
+                        discard(&**fs, &folder.join(id.to_string()));
                     }
                     pool.unpooled = true;
-                    return Ok(None);
+                    break Ok(None);
+                }
+                Err(e) => {
+                    unlist(&pool.writing, id);
+                    break Err(e);
+                }
+            }
+        };
+        let due = self.background
+            && !pool.unpooled
+            && !pool.refilling
+            && pool.ids.len().saturating_mul(2) <= self.batch;
+        let refill = due.then(|| self.reserve(pool, at, folder, fs));
+        (claimed, refill)
+    }
+
+    /// Reserves a batch of ids for a refill of `pool`, the pool at `at`, off
+    /// the claiming thread, listing them among the folder's files that hold
+    /// no table from here.
+    fn reserve(&self, pool: &mut FolderPool, at: usize, folder: &Path, fs: &Arc<dyn Fs>) -> Refill {
+        pool.refilling = true;
+        let ids: Vec<TableId> = (0..self.batch).map(|_| self.ids.next()).collect();
+        pool.writing.lock().extend(ids.iter().copied());
+        Refill {
+            at,
+            folder: folder.to_path_buf(),
+            fs: Arc::clone(fs),
+            ids,
+        }
+    }
+
+    /// Makes the files of `refill` and syncs their folder once, then pools
+    /// them. What could not be made is taken off the folder's list; files
+    /// made before a failed sync are pooled unsynced, so the next claim syncs
+    /// the folder before handing one out.
+    #[cfg(feature = "std")]
+    fn run(&self, refill: &Refill) {
+        let mut made = Vec::with_capacity(refill.ids.len());
+        let mut synced = true;
+        for &id in &refill.ids {
+            let path = refill.folder.join(id.to_string());
+            match refill
+                .fs
+                .open(&path, &FsOpenOptions::new().write(true).create_new(true))
+            {
+                Ok(file) => {
+                    drop(file);
+                    made.push(id);
+                }
+                Err(e) => {
+                    log::warn!("could not make pooled table file {}: {e}", path.display());
+                    synced = false;
+                    break;
                 }
             }
         }
+        if !made.is_empty()
+            && let Err(e) =
+                crate::file::fsync_directory(&refill.folder, &*refill.fs, self.sync_mode)
+        {
+            log::warn!(
+                "could not sync {} for its pooled table files: {e}",
+                refill.folder.display()
+            );
+            synced = false;
+        }
+
+        if let Some(pool) = self.folders.lock().get_mut(refill.at) {
+            Self::pool_made(pool, refill, made, synced);
+        }
+        self.refilled.notify_all();
+    }
+
+    /// Pools `made`, the files `refill` made into `pool`, `synced` when their
+    /// folder sync succeeded; takes the ids it could not make off the folder's
+    /// list, and the made ones too where the pool was given up meanwhile.
+    #[cfg(feature = "std")]
+    fn pool_made(pool: &mut FolderPool, refill: &Refill, made: Vec<TableId>, synced: bool) {
+        pool.refilling = false;
+        for id in refill.ids.iter().filter(|id| !made.contains(id)) {
+            unlist(&pool.writing, *id);
+        }
+        if pool.unpooled {
+            for id in made {
+                unlist(&pool.writing, id);
+                discard(&*refill.fs, &refill.folder.join(id.to_string()));
+            }
+            return;
+        }
+        if !made.is_empty() {
+            pool.synced &= synced;
+            pool.ids.extend(made);
+        }
+    }
+
+    /// Gives up a refill of the pool at `at` that never ran.
+    fn withdraw(&self, at: usize, ids: &[TableId]) {
+        if let Some(pool) = self.folders.lock().get_mut(at) {
+            pool.refilling = false;
+            for id in ids {
+                unlist(&pool.writing, *id);
+            }
+        }
+        #[cfg(feature = "std")]
+        self.refilled.notify_all();
     }
 
     /// A file created for the next table, its entry not yet durable, listed
@@ -284,7 +567,7 @@ impl TableFilePools {
         &self,
         folder: &Path,
         fs: &Arc<dyn Fs>,
-        writing: &Arc<Mutex<Vec<TableId>>>,
+        writing: &Unwritten,
     ) -> crate::Result<ClaimedFile> {
         let id = self.ids.next();
         let writing = Writing::new(writing, id);
@@ -309,6 +592,7 @@ impl TableFilePools {
             let id = self.ids.next();
             let path = folder.join(id.to_string());
             drop(fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?);
+            pool.writing.lock().push(id);
             pool.ids.push_back(id);
         }
         crate::file::fsync_directory(folder, fs, self.sync_mode)?;
@@ -317,20 +601,16 @@ impl TableFilePools {
     }
 }
 
-/// The pool of the folder `folder` on `fs` names, made empty when there is
-/// none yet. A route seen for the first time joins the pool of a folder it
-/// is another name for.
-fn pool_of<'a>(
-    folders: &'a mut Vec<FolderPool>,
-    folder: &Path,
-    fs: &Arc<dyn Fs>,
-) -> &'a mut FolderPool {
+/// The position of the pool of the folder `folder` on `fs` names, made empty
+/// when there is none yet. A route seen for the first time joins the pool of
+/// a folder it is another name for.
+fn pool_of(folders: &mut Vec<FolderPool>, folder: &Path, fs: &Arc<dyn Fs>) -> usize {
     let known = folders.iter().position(|pool| {
         pool.routes
             .iter()
             .any(|(route_fs, route)| Arc::ptr_eq(route_fs, fs) && route == folder)
     });
-    let at = known.unwrap_or_else(|| {
+    known.unwrap_or_else(|| {
         let alias = folders.iter().position(|pool| {
             pool.routes
                 .first()
@@ -350,15 +630,11 @@ fn pool_of<'a>(
                 // pays for every file made ahead.
                 unpooled: fs.capabilities(folder).directory_sync_noop,
                 writing: Arc::new(Mutex::new(Vec::new())),
+                refilling: false,
             });
             folders.len() - 1
         }
-    });
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "`at` is a position found in, or just pushed onto, `folders`"
-    )]
-    &mut folders[at]
+    })
 }
 
 /// Whether `folder` on `fs` is the folder `route` on `route_fs` names: one

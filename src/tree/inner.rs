@@ -346,10 +346,11 @@ impl TreeInner {
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
         let table_id_counter = SequenceNumberCounter::default();
-        let table_files = Arc::new(crate::table::file_pool::TableFilePools::new(
+        let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
             table_id_counter.clone(),
             config.table_file_pool,
             sync_mode,
+            config.table_file_refill,
         ));
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();

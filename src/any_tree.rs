@@ -149,6 +149,11 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
+    fn wait_for_table_file_refills(&self) {
+        forward!(self.wait_for_table_file_refills());
+    }
+
+    #[inline]
     fn prefix_extractor(&self) -> Option<Arc<dyn crate::prefix::PrefixExtractor>> {
         forward!(self.prefix_extractor())
     }

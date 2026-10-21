@@ -178,16 +178,21 @@ matching entry (and add one for a new subsystem).
   made a batch at a time with one folder sync for the batch
   (`Config::table_file_pool`); a flush, compaction, merge-on-read relocation or
   ingestion writes into one, so its install syncs the table and the edit and no
-  folder. Only a write's first table refills the pool: a write that runs it dry
-  makes the files of its further tables as they start, those opened when it
-  finishes included, and its install syncs their folder once. A table is never
+  folder. The pool refills off the writing thread: a claim that leaves half a
+  batch or less starts the next batch in the background. A claim on a dry pool
+  waits for a refill already running, so tables still take their ids in order;
+  with none running it makes its own file and starts one. A write that runs
+  the pool dry makes the files of its further tables as they start, those
+  opened when it finishes included, and its install syncs their folder once.
+  A table is never
   empty, so an empty regular file (not a symlink) under a table name that no
   version names is a pooled file: an open uses it again after syncing its
   folder once. A pooled file's id is above every table written into its
   folder (a claim takes the lowest pooled id, a write numbered above an id
   passes over the pooled ones below it), and a table records the ids below
-  its own whose files its folder was still writing when it was finished, so
-  a file a power loss cut short is told from a table written before it. A
+  its own whose files held no table when it was finished (pooled, being made
+  by a refill, or still being written), so a file a power loss cut short is
+  told from a table written before it. A
   repair without a manifest reports an empty file as a table that lost its
   bytes only when a table of its folder above it (one that opened as a table,
   kept, set aside or left out as a duplicate) does not list it; any other it

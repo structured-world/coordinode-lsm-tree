@@ -123,12 +123,15 @@ fn open(base: &Path, fs: &Arc<FaultFs<MemFs>>, blob: bool, route: Option<&Path>)
             fs.create_dir_all(parent).expect("the tree's parent");
         }
     }
+    // Refilled on the writing thread, so each operation's syncs are the same
+    // ones on every run.
     let config = Config::new(
         base,
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .with_shared_fs(fs.clone());
+    .with_shared_fs(fs.clone())
+    .table_file_refill_inline(true);
     let config = match route {
         Some(route) => config.level_routes(vec![LevelRoute {
             levels: 0..7,
@@ -278,10 +281,14 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
     }
 }
 
-/// Over a run of flushes the pool syncs the tables folder once per batch: 33
-/// flushes under the default batch of 16 sync it three times, at the flushes
-/// that make a batch, where 33 flushes without a pool sync it 33 times. Every
-/// flush syncs its table and its edit either way.
+/// Over a run of flushes the default pool, refilled off the flushing thread,
+/// syncs the tables folder once per batch, where 33 flushes without a pool
+/// sync it 33 times. The first flush finds the pool dry: its install syncs
+/// the folder for the file made for it, and the first batch is made and
+/// synced. From there a flush that leaves half a batch starts the next one:
+/// the 9th and the 25th. Every flush syncs its table and its edit either
+/// way. The refills are waited for before each count, so each lands on the
+/// flush that started it.
 #[test]
 fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
     const FLUSHES: u64 = 33;
@@ -310,18 +317,19 @@ fn a_run_of_flushes_syncs_the_tables_folder_once_per_batch() {
         for round in 1..=FLUSHES {
             fill(&tree, round);
             tree.flush_active_memtable(0).expect("flush");
+            tree.wait_for_table_file_refills();
             let syncs = census.take();
             let count = |synced: &Synced| syncs.iter().filter(|(s, _)| s == synced).count();
             assert_eq!(count(&Synced::Table), 1, "flush {round} (pool {pool})");
             assert_eq!(count(&Synced::EditLog), 1, "flush {round} (pool {pool})");
-            if count(&Synced::TablesDir) > 0 {
+            for _ in 0..count(&Synced::TablesDir) {
                 folder_syncs.push(round);
             }
         }
         let expected: Vec<u64> = if pool == 0 {
             (1..=FLUSHES).collect()
         } else {
-            (1..=FLUSHES).step_by(pool).collect()
+            vec![1, 1, 9, 25]
         };
         assert_eq!(folder_syncs, expected, "pool {pool}");
     }
@@ -439,6 +447,7 @@ fn a_pooled_table_on_another_device_flushes_that_device() {
     )
     .with_shared_fs(tree_fs.clone())
     .sync_mode(SyncMode::Barrier)
+    .table_file_refill_inline(true)
     .level_routes(vec![LevelRoute {
         levels: 0..7,
         path: route.clone(),
@@ -478,6 +487,7 @@ fn a_rotating_install_syncs_the_snapshot_and_its_folder_once() {
     )
     .with_shared_fs(fs.clone())
     .manifest_log_rotate_bytes(0)
+    .table_file_refill_inline(true)
     .open()
     .expect("open");
     census.take();

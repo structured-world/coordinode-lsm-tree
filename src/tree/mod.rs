@@ -708,6 +708,10 @@ impl AbstractTree for Tree {
         self.config.sync_mode
     }
 
+    fn wait_for_table_file_refills(&self) {
+        self.table_files.wait_for_refills();
+    }
+
     fn prefix_extractor(&self) -> Option<alloc::sync::Arc<dyn crate::prefix::PrefixExtractor>> {
         self.config.prefix_extractor.clone()
     }
@@ -5637,10 +5641,11 @@ impl Tree {
             .max()
             .unwrap_or_default();
         let table_id_counter = SequenceNumberCounter::new(highest_table_id + 1);
-        let table_files = Arc::new(crate::table::file_pool::TableFilePools::new(
+        let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
             table_id_counter.clone(),
             config.table_file_pool,
             config.sync_mode,
+            config.table_file_refill,
         ));
         for (folder, folder_fs, ids) in pooled {
             table_files.adopt(&folder, &folder_fs, ids);
