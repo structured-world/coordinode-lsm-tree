@@ -290,12 +290,12 @@ impl TableFilePools {
     /// `above` when given: a compaction output's id is above its inputs', so
     /// an output and the input whose age it takes are told apart by id.
     ///
-    /// Refilling off the claiming thread, a claim that finds the pool dry
-    /// makes its file and starts a refill, as does one that leaves half a
-    /// batch. Otherwise the pool is refilled only when `may_refill`: a write's
-    /// first table. A later table of a write that has run the pool dry gets a
-    /// file made for it, since the install that names it syncs the folder
-    /// once for all of them, where refills would sync it once per batch.
+    /// The pool is refilled only when `may_refill`: a write's first table. A
+    /// later table of a write that has run the pool dry gets a file made for
+    /// it, since the install that names it syncs the folder once for all of
+    /// them, where refills would sync it once per batch. Refilling off the
+    /// claiming thread, such a first claim that finds the pool dry makes its
+    /// file and starts a refill, as does one that leaves half a batch.
     ///
     /// # Errors
     ///
@@ -472,7 +472,12 @@ impl Pools {
                 }
             }
         };
+        // Only a write's first table starts a refill, as on the claiming
+        // thread: the install of a write that runs the pool dry syncs the
+        // folder once for all its further files, where refills started by
+        // them would sync it once per batch and keep them waiting on batches.
         let due = self.background
+            && may_refill
             && !pool.unpooled
             && !pool.refilling
             && pool.ids.len() <= self.batch / 2;

@@ -17790,7 +17790,7 @@ fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
         panic!("expected a standard tree");
     };
     let mut recencies = Vec::new();
-    for (seqno, key) in [(0u64, b"a"), (1, b"b")] {
+    for (flush, (seqno, key)) in [(0u64, b"a"), (1, b"b")].into_iter().enumerate() {
         tree.insert(key, b"v", seqno);
         tree.flush_active_memtable(0)?;
         let version = tree.current_version();
@@ -17803,9 +17803,12 @@ fn flush_persists_the_recency_it_takes_when_it_starts() -> crate::Result<()> {
             table.l0_recency(),
             "the table and the manifest record one recency",
         );
-        // Windows syncs no folder, so it keeps no pool: a file made for its
-        // table carries an id taken as the flush starts, which serves.
-        if cfg!(windows) {
+        // A file made for its table carries an id taken as the flush starts,
+        // which serves: on Windows, which syncs no folder and so keeps no
+        // pool, and for the first flush of a fresh tree, which finds the pool
+        // dry and leaves the refill to run off its thread. The next flush
+        // waits for that refill and takes a pooled file.
+        if cfg!(windows) || flush == 0 {
             assert_eq!(table.metadata.recency, table.id(), "the file's own id");
         } else {
             assert!(

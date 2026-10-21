@@ -421,7 +421,7 @@ fn a_claim_that_leaves_half_a_batch_starts_a_refill() -> crate::Result<()> {
     let (pools, fault, fs, folder) = background_pools(4)?;
     drop(pools.claim(&folder, &fs, None, true)?);
     pools.wait_for_refills();
-    let _ = directory_syncs(&fault);
+    directory_syncs(&fault);
 
     // Four pooled: the first claim leaves three, the second two, half the
     // batch, which starts the refill.
@@ -438,6 +438,33 @@ fn a_claim_that_leaves_half_a_batch_starts_a_refill() -> crate::Result<()> {
         1 + 2 + 2 + 4,
         "the first claim's file, two claimed, two left, a batch"
     );
+    Ok(())
+}
+
+/// A write's further tables start no refill off the claiming thread, however
+/// low they leave the pool: its install syncs the folder once for the files
+/// made for them. Its next first table does.
+#[cfg(feature = "std")]
+#[test]
+fn a_writes_further_tables_start_no_refill() -> crate::Result<()> {
+    let (pools, fault, fs, folder) = background_pools(4)?;
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    directory_syncs(&fault);
+
+    for _ in 0..3 {
+        drop(pools.claim(&folder, &fs, None, false)?);
+    }
+    pools.wait_for_refills();
+    assert_eq!(
+        directory_syncs(&fault),
+        0,
+        "one pooled file left, no refill"
+    );
+
+    drop(pools.claim(&folder, &fs, None, true)?);
+    pools.wait_for_refills();
+    assert_eq!(directory_syncs(&fault), 1, "a first table refills");
     Ok(())
 }
 
