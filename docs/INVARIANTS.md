@@ -183,8 +183,12 @@ matching entry (and add one for a new subsystem).
   finishes included, and its install syncs their folder once. A table is never
   empty, so an empty regular file (not a symlink) under a table name that no
   version names is a pooled file: an open uses it again after syncing its
-  folder once, and a repair removes it rather than count it as a lost table.
-  Each such file goes to one pool, however many routes name its folder. A
+  folder once. A pooled file's id is above every table written into its
+  folder (a claim takes the lowest pooled id, a write numbered above an id
+  passes over the pooled ones below it), so a repair without a manifest
+  removes an empty file above the folder's newest table as pooled, reporting
+  it left out, and grades one below it as a table that lost its bytes. Each
+  such file goes to one pool, however many routes name its folder. A
   pooled file another name links to (a capture of the folder) is unlinked,
   never written; a backend that cannot count links gets every file made for
   its table instead. Under

@@ -281,30 +281,41 @@ fn a_pooled_file_linked_elsewhere_is_never_written() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A repair of a tree holding pooled files finds the same tables, and reports
-/// the same losses (none), as one without them: an empty file under a table
-/// name holds no rows. It removes them as it removes every file the rebuilt
-/// manifest does not name, and the tree makes new ones.
-#[test]
-fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tables = folder.path().join("tables");
-    {
-        let tree = config(folder.path()).table_file_pool(4).open()?;
-        for (seqno, key) in [(0, "a"), (1, "b")] {
-            tree.insert(key, "1", seqno);
-            tree.flush_active_memtable(0)?;
-        }
-    }
-    let (pooled, _) = table_files(&tables);
-    assert!(!pooled.is_empty(), "self-check: pooled files are there");
-    for entry in std::fs::read_dir(folder.path())? {
+/// Removes a tree's manifest: its snapshots and edit logs.
+fn remove_manifest(folder: &Path) -> lsm_tree::Result<()> {
+    for entry in std::fs::read_dir(folder)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('v') || name.starts_with("edits-") {
             std::fs::remove_file(entry.path())?;
         }
     }
+    Ok(())
+}
+
+/// A tree of two flushed tables over a pool of four, closed.
+fn two_tables(folder: &Path) -> lsm_tree::Result<()> {
+    let tree = config(folder).table_file_pool(4).open()?;
+    for (seqno, key) in [(0, "a"), (1, "b")] {
+        tree.insert(key, "1", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    Ok(())
+}
+
+/// A repair of a tree holding pooled files finds the same tables, and reports
+/// the same losses (none), as one without them: an empty file under a table
+/// name holds no rows. It removes them as it removes every file the rebuilt
+/// manifest does not name, lists them among the files it left out, and the
+/// tree makes new ones.
+#[test]
+fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    two_tables(folder.path())?;
+    let (pooled, _) = table_files(&tables);
+    assert!(!pooled.is_empty(), "self-check: pooled files are there");
+    remove_manifest(folder.path())?;
 
     let report = config(folder.path()).repair()?;
     assert_eq!(report.recovered, 2);
@@ -315,6 +326,13 @@ fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
         report.wal_replay_scope(),
         lsm_tree::WalReplayScope::TailOnly
     );
+    let mut excluded: Vec<u64> = report
+        .excluded_files
+        .iter()
+        .filter_map(|(path, _)| path.file_name()?.to_str()?.parse().ok())
+        .collect();
+    excluded.sort_unstable();
+    assert_eq!(excluded, pooled, "the pooled files are reported left out");
     let (left, _) = table_files(&tables);
     assert!(left.is_empty(), "pooled files removed: {left:?}");
 
@@ -324,6 +342,35 @@ fn a_repair_takes_no_pooled_file_for_a_lost_table() -> lsm_tree::Result<()> {
     for key in ["a", "b", "c"] {
         assert!(tree.get(key, u64::MAX)?.is_some(), "{key}");
     }
+    Ok(())
+}
+
+/// A pooled file's id is above every table written into its folder, so an
+/// empty file below the folder's newest table is no pooled file: a table
+/// whose bytes were lost. A repair without a manifest reports it as a loss
+/// it cannot scope, rather than remove it as pooled.
+#[test]
+fn a_repair_reports_an_emptied_table_below_the_newest_as_lost() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tables = folder.path().join("tables");
+    two_tables(folder.path())?;
+    let (_, written) = table_files(&tables);
+    let older = *written.first().expect("two tables");
+    std::fs::File::create(tables.join(older.to_string()))?.set_len(0)?;
+    remove_manifest(folder.path())?;
+
+    let report = config(folder.path()).repair()?;
+    assert_eq!(report.recovered, 1);
+    let lost: Vec<String> = report
+        .unknowable_losses
+        .iter()
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(lost, vec![older.to_string()], "{report:?}");
+    assert_ne!(
+        report.wal_replay_scope(),
+        lsm_tree::WalReplayScope::TailOnly
+    );
     Ok(())
 }
 

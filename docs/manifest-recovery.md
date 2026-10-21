@@ -104,7 +104,7 @@ a file would invalidate every reference to it.
 flowchart TD
     START([Rebuild manifest from tables/]) --> LOOP{{For each file}}
     LOOP -->|name is not a table id| QNAME[Set aside: foreign file]
-    LOOP -->|table id, empty,<br/>no committed manifest names it| QPOOL[Remove after the commit:<br/>a pooled file, no table]
+    LOOP -->|table id, empty, above the folder's<br/>newest table, no committed manifest names it| QPOOL[Report left out, remove after<br/>the commit: a pooled file, no table]
     LOOP -->|table id| DUP{Id already recovered?}
     DUP -->|yes| KEEPBEST[Keep the better copy;<br/>drop the redundant one]
     DUP -->|no| OPEN[Open + recover]
