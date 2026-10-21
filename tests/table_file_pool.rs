@@ -679,11 +679,20 @@ fn a_flush_survives_a_power_loss_at_every_sync() {
     }
 }
 
-/// Flushes the tree it is handed while the compaction it filters is writing,
-/// then fails that compaction: a write numbered above the compaction's
-/// output installs first, and the output is left empty.
+/// What a compaction filter needs to cut the compaction it filters short with
+/// a power loss: the tree to flush meanwhile, the store that loses power, and
+/// the injector that fails everything the tree does after it.
+struct Midway {
+    tree: Option<AnyTree>,
+    crash: CrashFs,
+    injector: Arc<lsm_tree::fs::FaultInjector>,
+}
+
+/// Flushes the tree while the compaction it filters is writing, then loses
+/// power before that compaction can clean up: a write numbered above the
+/// compaction's output installs first, and the output is left empty.
 struct FlushMidway {
-    tree: std::panic::AssertUnwindSafe<Arc<std::sync::Mutex<Option<AnyTree>>>>,
+    midway: std::panic::AssertUnwindSafe<Arc<std::sync::Mutex<Midway>>>,
 }
 
 impl lsm_tree::compaction::filter::Factory for FlushMidway {
@@ -696,13 +705,13 @@ impl lsm_tree::compaction::filter::Factory for FlushMidway {
         _ctx: &lsm_tree::compaction::filter::Context,
     ) -> Box<dyn lsm_tree::compaction::filter::CompactionFilter> {
         Box::new(FlushMidwayFilter {
-            tree: Arc::clone(&self.tree),
+            midway: Arc::clone(&self.midway),
         })
     }
 }
 
 struct FlushMidwayFilter {
-    tree: Arc<std::sync::Mutex<Option<AnyTree>>>,
+    midway: Arc<std::sync::Mutex<Midway>>,
 }
 
 impl lsm_tree::compaction::filter::CompactionFilter for FlushMidwayFilter {
@@ -711,14 +720,38 @@ impl lsm_tree::compaction::filter::CompactionFilter for FlushMidwayFilter {
         _item: lsm_tree::compaction::filter::ItemAccessor<'_>,
         _ctx: &lsm_tree::compaction::filter::Context,
     ) -> lsm_tree::Result<lsm_tree::compaction::filter::Verdict> {
-        let tree = self
-            .tree
+        let mut midway = self
+            .midway
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(tree) = tree {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tree) = midway.tree.take() {
             tree.insert("late", "1", 100);
             tree.flush_active_memtable(0)?;
+            midway.crash.crash();
+            // Past the power loss nothing the old tree does reaches the disk.
+            for op in [
+                FaultOp::Open,
+                FaultOp::CreateDirAll,
+                FaultOp::CreateDir,
+                FaultOp::RemoveFile,
+                FaultOp::Rename,
+                FaultOp::SyncDirectory,
+                FaultOp::Write,
+                FaultOp::Flush,
+                FaultOp::SyncAll,
+                FaultOp::SyncData,
+                FaultOp::SetLen,
+                FaultOp::HardLink,
+                FaultOp::Reflink,
+                FaultOp::PunchHole,
+                FaultOp::RemoveDir,
+                FaultOp::RemoveDirAll,
+            ] {
+                midway.injector.arm(FaultRule::new(
+                    op,
+                    Fault::Error(lsm_tree::io::ErrorKind::Other),
+                ));
+            }
         }
         Err(std::io::Error::other("the power goes").into())
     }
@@ -745,10 +778,14 @@ fn an_output_cut_short_below_an_installed_table_is_no_loss() -> lsm_tree::Result
 
     let crash = CrashFs::new(MemFs::new());
     let fs = Arc::new(FaultFs::new(crash.clone()));
-    let handle = Arc::new(std::sync::Mutex::new(None));
+    let midway = Arc::new(std::sync::Mutex::new(Midway {
+        tree: None,
+        crash: crash.clone(),
+        injector: fs.injector(),
+    }));
     let tree = crash_config(&fs)
         .with_compaction_filter_factory(Some(Arc::new(FlushMidway {
-            tree: std::panic::AssertUnwindSafe(Arc::clone(&handle)),
+            midway: std::panic::AssertUnwindSafe(Arc::clone(&midway)),
         })))
         .open()?;
     for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
@@ -760,9 +797,10 @@ fn an_output_cut_short_below_an_installed_table_is_no_loss() -> lsm_tree::Result
         .iter_tables()
         .map(|t| t.id())
         .collect();
-    *handle
+    midway
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tree.clone());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .tree = Some(tree.clone());
     assert!(
         tree.major_compact(u64::MAX, 0).is_err(),
         "self-check: the compaction is cut short"
@@ -783,7 +821,6 @@ fn an_output_cut_short_below_an_installed_table_is_no_loss() -> lsm_tree::Result
     );
     drop(version);
     drop(tree);
-    crash.crash();
 
     let tables = std::path::absolute(DB)?.join("tables");
     let cut_short_path = tables.join(cut_short.to_string());
