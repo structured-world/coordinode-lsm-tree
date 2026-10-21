@@ -186,9 +186,10 @@ matching entry (and add one for a new subsystem).
   folder once. A pooled file's id is above every table written into its
   folder (a claim takes the lowest pooled id, a write numbered above an id
   passes over the pooled ones below it), so a repair without a manifest
-  removes an empty file above the folder's newest table as pooled, reporting
-  it left out, and grades one below it as a table that lost its bytes. Each
-  such file goes to one pool, however many routes name its folder. A
+  removes an empty file above the folder's newest recovered table as pooled,
+  reporting it left out, and reports one below it as a table that lost its
+  bytes. Each such file goes to one pool, however many routes name its
+  folder. A
   pooled file another name links to (a capture of the folder) is unlinked,
   never written; a backend that cannot count links gets every file made for
   its table instead. Under

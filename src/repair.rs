@@ -4716,6 +4716,11 @@ fn scan_table_folders(
     // survived is preserved, an orphan is removed post-commit.
     let mut live_sidecars: Vec<(TableId, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
 
+    // Empty files under table names no committed manifest names:
+    // `(id, folder, path, fs)`, judged against the tables their folder
+    // recovered once the scan is done.
+    let mut empty_unnamed: Vec<(TableId, PathBuf, PathBuf, Arc<dyn crate::fs::Fs>)> = Vec::new();
+
     for (table_base_folder, folder_fs) in config.all_tables_folders() {
         if !folder_fs.exists(&table_base_folder)? {
             continue;
@@ -4758,24 +4763,6 @@ fn scan_table_folders(
                 .cmp(&key(b))
                 .then_with(|| a.file_name.cmp(&b.file_name))
         });
-
-        // The newest table of this folder: the highest id of a table file in
-        // it that holds bytes. A pooled file's id is above every table written
-        // into its folder (a claim takes the lowest pooled id, and a write
-        // numbered above an id passes over the pooled ones below it), so an
-        // empty file under a lower id is a table that lost its bytes.
-        let newest_table = dirents
-            .iter()
-            .filter(|e| !e.is_dir)
-            .filter_map(
-                |e| match crate::file::TableDirEntry::classify(&e.file_name) {
-                    crate::file::TableDirEntry::Table(id) => Some((id, &e.path)),
-                    _ => None,
-                },
-            )
-            .filter(|(_, path)| folder_fs.metadata(path).is_ok_and(|meta| meta.len > 0))
-            .map(|(id, _)| id)
-            .max();
 
         'dirent: for dirent in dirents {
             let crate::fs::FsDirEntry {
@@ -4888,26 +4875,24 @@ fn scan_table_folders(
                 }
                 TableDirEntry::Table(id) => id,
             };
-            // An empty file under a table name above the folder's newest
-            // table is a pooled file a table was to be written into, never a
-            // table, unless a committed manifest names it. It holds no rows,
-            // so it is no loss; like every file the rebuilt manifest does not
-            // name, it is reported left out and goes once that manifest is
-            // durable. An empty file below the newest table is graded as any
-            // table file is, and its lost bytes reported.
+            // An empty file under a table name that no committed manifest
+            // names is judged once every table of its folder is recovered
+            // (see `empty_unnamed`). A file whose length cannot be read is
+            // graded as any table file is.
             let named = manifest_referenced
                 .as_ref()
                 .is_some_and(|m| m.tables.contains_key(&table_id));
-            // A file whose length cannot be read is no pooled file either.
             if !named
-                && newest_table.is_none_or(|newest| table_id > newest)
                 && folder_fs
                     .metadata(&table_path)
                     .is_ok_and(|meta| meta.len == 0)
             {
-                let reason = "an empty pooled table file, no table";
-                excluded_files.push((table_path.clone(), reason.to_string()));
-                discard_after_commit.push((Arc::clone(&folder_fs), table_path, reason.to_string()));
+                empty_unnamed.push((
+                    table_id,
+                    table_base_folder.clone(),
+                    table_path,
+                    Arc::clone(&folder_fs),
+                ));
                 continue;
             }
             scanned_table_ids.insert(table_id);
@@ -5727,6 +5712,36 @@ fn scan_table_folders(
                     );
                 }
             }
+        }
+    }
+
+    // A pooled file's id is above every table written into its folder: a
+    // claim takes the lowest pooled id, and a write numbered above an id
+    // passes over the pooled ones below it. So an empty file above its
+    // folder's newest recovered table is a pooled file, never a table: it
+    // holds no rows and is no loss, and like every file the rebuilt manifest
+    // does not name it is reported left out and goes once that manifest is
+    // durable. One below the newest table is a table that lost its bytes,
+    // reported as a loss nothing can scope.
+    for (table_id, folder, table_path, folder_fs) in empty_unnamed {
+        let newest = recovered_by_id
+            .values()
+            .filter(|c| c.path.parent() == Some(folder.as_path()))
+            .map(|c| c.table.id())
+            .max();
+        if newest.is_none_or(|newest| table_id > newest) {
+            let reason = "an empty pooled table file, no table";
+            excluded_files.push((table_path.clone(), reason.to_string()));
+            discard_after_commit.push((folder_fs, table_path, reason.to_string()));
+        } else {
+            scanned_table_ids.insert(table_id);
+            set_aside_path(
+                &folder_fs,
+                &table_path,
+                "an empty table file below its folder's newest table: its bytes were lost",
+                &mut unreadable_files,
+                &mut discard_after_commit,
+            );
         }
     }
 
