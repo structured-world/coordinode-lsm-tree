@@ -793,6 +793,29 @@ const O_NOFOLLOW: i32 = 0o100_000;
 )))]
 const O_NOFOLLOW: i32 = 0o400_000;
 
+// The open flags this module spells out match the C library's on the target,
+// checked as it builds: several differ per architecture, and a wrong one
+// opens with another flag's meaning. A comparison of constants, so nothing of
+// the C library is linked. MIPS and SPARC are left out, their divergent
+// `O_APPEND` / `O_EXCL` / `O_DIRECTORY` / `O_NOFOLLOW` not being remapped here.
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const _: () = {
+    assert!(O_CREAT == libc::O_CREAT);
+    assert!(O_TRUNC == libc::O_TRUNC);
+    assert!(O_APPEND == libc::O_APPEND);
+    assert!(O_EXCL == libc::O_EXCL);
+    assert!(O_DIRECTORY == libc::O_DIRECTORY);
+    assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
+    assert!(O_NONBLOCK == libc::O_NONBLOCK);
+};
+
 /// `unlinkat` flag: remove a directory (`rmdir`) instead of a file.
 const AT_REMOVEDIR: i32 = 0x200;
 

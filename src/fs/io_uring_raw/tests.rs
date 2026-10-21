@@ -1,27 +1,5 @@
 use super::*;
 
-// The open flags this module spells out match the C library's on the target:
-// several differ per architecture (arm, aarch64 and powerpc keep their own
-// `fcntl.h`), and a wrong one opens with another flag's meaning. MIPS and
-// SPARC are left out, their divergent flags not being remapped here.
-#[cfg(not(any(
-    target_arch = "mips",
-    target_arch = "mips32r6",
-    target_arch = "mips64",
-    target_arch = "mips64r6",
-    target_arch = "sparc",
-    target_arch = "sparc64"
-)))]
-const _: () = {
-    assert!(O_CREAT == libc::O_CREAT);
-    assert!(O_TRUNC == libc::O_TRUNC);
-    assert!(O_APPEND == libc::O_APPEND);
-    assert!(O_EXCL == libc::O_EXCL);
-    assert!(O_DIRECTORY == libc::O_DIRECTORY);
-    assert!(O_NOFOLLOW == libc::O_NOFOLLOW);
-    assert!(O_NONBLOCK == libc::O_NONBLOCK);
-};
-
 // These tests require a Linux kernel with io_uring; they are compiled only
 // under `cfg(target_os = "linux")` (the module gate) and run on the Linux
 // CI / bench runner, not on the macOS dev host.
