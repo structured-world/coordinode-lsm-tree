@@ -1116,8 +1116,11 @@ impl AbstractTree for Tree {
         // The flush's L0 recency, taken once its first file is: flushes are
         // serialized, so it is above every table already flushed and below
         // every one flushed later. A pooled file's id was taken when its batch
-        // was made and says nothing about when the table was written.
-        let recency = self.table_id_counter.next();
+        // was made and says nothing about when the table was written; a file
+        // made now carries an id taken now, which serves.
+        let recency = table_writer
+            .first_made_now()
+            .unwrap_or_else(|| self.table_id_counter.next());
         let mut table_writer = table_writer
             .set_comparator(self.config.comparator.clone())
             .use_recency(Some(recency))

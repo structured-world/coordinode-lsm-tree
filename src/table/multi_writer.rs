@@ -81,6 +81,11 @@ pub struct MultiWriter {
     /// them.
     entries_durable: bool,
 
+    /// The first output's id when its file was made as this writer started,
+    /// the id taken from the counter then; `None` when it came from a pool,
+    /// whose ids were taken when their batch was made.
+    first_made_now: Option<TableId>,
+
     pub writer: Writer,
 
     pub data_block_compression: CompressionType,
@@ -413,6 +418,7 @@ impl MultiWriter {
             results: Vec::new(),
             files,
             entries_durable,
+            first_made_now: (!entries_durable).then_some(current_table_id),
             writer,
 
             data_block_compression: CompressionType::None,
@@ -1192,6 +1198,13 @@ impl MultiWriter {
         // salvage's mirror path yields.
         self.writer = self.writer.use_bulk_ingested(Some(bulk_ingested));
         self
+    }
+
+    /// The first output's id when its file was made as this writer started:
+    /// taken from the tree's counter then, it stands for when the write
+    /// began. `None` for a pooled file.
+    pub(crate) fn first_made_now(&self) -> Option<TableId> {
+        self.first_made_now
     }
 
     /// Stamps a FIXED L0 recency key on this and every rotated successor

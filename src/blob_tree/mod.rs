@@ -1875,8 +1875,11 @@ impl AbstractTree for BlobTree {
             level_fs.clone(),
         )?;
         // The flush's L0 recency, taken as the standard tree's flush takes
-        // it: a pooled file's id says nothing about when it was written.
-        let recency = self.index.table_id_counter.next();
+        // it: a pooled file's id says nothing about when it was written, a
+        // file made now carries an id taken now.
+        let recency = table_writer
+            .first_made_now()
+            .unwrap_or_else(|| self.index.table_id_counter.next());
         let mut table_writer = table_writer
             .set_comparator(self.index.config.comparator.clone())
             .use_recency(Some(recency))
