@@ -8753,37 +8753,35 @@ impl Table {
         Ok((file, blocks))
     }
 
-    /// The versions of `key` in `blocks`, the blocks [`Self::key_blocks`]
-    /// names, newest first, with their global seqnos, of those visible at
-    /// `seqno`; and whether the table holds a version of the key at all,
-    /// whatever its seqno, as the table's reader reports it.
+    /// The versions of `key` in `block`, one of the blocks
+    /// [`Self::key_blocks`] names, newest first, with their global seqnos, of
+    /// those visible at `seqno`; and whether the block holds a version of the
+    /// key at all, whatever its seqno, as the table's reader reports it.
     pub(crate) fn key_versions(
         &self,
-        blocks: &[DataBlock],
+        block: &DataBlock,
         key: &[u8],
         seqno: SeqNo,
     ) -> (Vec<InternalValue>, bool) {
         let global_seqno = self.global_seqno();
         let mut versions = Vec::new();
         let mut found = false;
-        for block in blocks {
-            let data = &block.inner.data;
-            let mut entries = block.iter(self.comparator.clone());
-            if !entries.seek(key, SeqNo::MAX) {
-                continue;
+        let data = &block.inner.data;
+        let mut entries = block.iter(self.comparator.clone());
+        if !entries.seek(key, SeqNo::MAX) {
+            return (versions, found);
+        }
+        for item in entries {
+            let mut version = item.materialize(data);
+            match self.comparator.compare(&version.key.user_key, key) {
+                core::cmp::Ordering::Less => continue,
+                core::cmp::Ordering::Greater => break,
+                core::cmp::Ordering::Equal => {}
             }
-            for item in entries {
-                let mut version = item.materialize(data);
-                match self.comparator.compare(&version.key.user_key, key) {
-                    core::cmp::Ordering::Less => continue,
-                    core::cmp::Ordering::Greater => break,
-                    core::cmp::Ordering::Equal => {}
-                }
-                found = true;
-                version.key.seqno = apply_global_seqno(version.key.seqno, global_seqno);
-                if crate::range::seqno_filter(version.key.seqno, seqno) {
-                    versions.push(version);
-                }
+            found = true;
+            version.key.seqno = apply_global_seqno(version.key.seqno, global_seqno);
+            if crate::range::seqno_filter(version.key.seqno, seqno) {
+                versions.push(version);
             }
         }
         (versions, found)

@@ -334,6 +334,7 @@ fn a_merge_whose_block_fails_to_read_answers_on_its_own_path() -> lsm_tree::Resu
         .and_then(|name| name.to_str())
         .expect("the bases' table")
         .to_owned();
+    let first_block = first_data_block_offset(tables.first().expect("the bases' table"))?;
     let fault = Arc::new(FaultFs::new(StdFs));
     let injector = fault.injector();
     let tree = Config::new(
@@ -345,12 +346,16 @@ fn a_merge_whose_block_fails_to_read_answers_on_its_own_path() -> lsm_tree::Resu
     .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
     .with_merge_operator(Some(Arc::new(Concat)))
     .open()?;
+    // The first data block of the bases' table, which holds the first key's
+    // base: only that merge's block read reaches it, since the levels stop at
+    // the operands and locating a key reads the table's index, not its data.
     injector.arm(
         FaultRule::new(
             FaultOp::ReadAt,
             Fault::Error(lsm_tree::io::ErrorKind::Other),
         )
         .on_path(format!("tables/{base}"))
+        .at_offset(first_block)
         .once(),
     );
     let keys: Vec<String> = (0..N).map(key_for).collect();
@@ -365,6 +370,135 @@ fn a_merge_whose_block_fails_to_read_answers_on_its_own_path() -> lsm_tree::Resu
             "key {i}"
         );
     }
+    Ok(())
+}
+
+/// Where the first data block of the table at `path` starts: at the start of
+/// its `data` section.
+fn first_data_block_offset(path: &std::path::Path) -> lsm_tree::Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let reader = lsm_tree::sfa::Reader::from_reader(&mut file)
+        .map_err(|error| std::io::Error::other(format!("read the table's TOC: {error}")))?;
+    let data = reader
+        .toc()
+        .iter()
+        .find(|entry| entry.name() == b"data")
+        .expect("a table carries a data section");
+    Ok(data.pos())
+}
+
+/// A merge over a key whose retained history spans many blocks of its base's
+/// table reads that table's blocks of the key newest first and stops at the
+/// first base, as a read of the key alone stops there: the history beneath it
+/// is hidden by it and never read.
+#[test]
+fn a_merge_stops_reading_its_base_table_at_the_first_base() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+        .with_merge_operator(Some(Arc::new(Concat)))
+    };
+    let version = |seqno: u64| format!("{seqno:0>100}");
+    {
+        let tree = config().open()?;
+        // A flush at watermark 0 keeps every version: about forty blocks of
+        // history under the newest.
+        for seqno in 1..=200 {
+            tree.insert("key", version(seqno), seqno);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        tree.merge("key", "+", 201);
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    fs.take();
+
+    let values = tree.multi_get(["key"], SeqNo::MAX)?;
+    let calls = fs.take();
+
+    let mut expected = version(200).into_bytes();
+    expected.push(b'+');
+    assert_eq!(
+        values.first().and_then(Option::as_deref),
+        Some(expected.as_slice())
+    );
+    assert!(
+        calls.iter().sum::<usize>() <= 2,
+        "the operand's block and the base's block, none of the history: {calls:?}"
+    );
+    Ok(())
+}
+
+/// The blocks merges read are brought in within half the cache at a time, as
+/// a level's chunks are: a cold multi-get over many merges with a small cache
+/// never holds more of their buffers in flight than that, and still merges
+/// exactly as key-by-key reads do.
+#[test]
+fn merge_block_reads_stay_within_half_the_cache() -> lsm_tree::Result<()> {
+    const CACHE: u64 = 16 * 1_024;
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let config = |cache: u64| {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(1_024))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(cache)))
+        .with_merge_operator(Some(Arc::new(Concat)))
+    };
+    // A kilobyte of noise per base, which no compression shrinks: a block of
+    // a kilobyte each, on disk too.
+    let base = |i: usize| {
+        let mut base = format!("base-{i:04}-").into_bytes();
+        let mut state = i as u64 + 1;
+        while base.len() < 1_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            base.push((state >> 56) as u8);
+        }
+        base
+    };
+    {
+        let tree = config(64 * 1_024 * 1_024).open()?;
+        for i in 0..N {
+            tree.insert(key_for(i), base(i), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        for i in 0..N {
+            tree.merge(key_for(i), format!("+{i}"), (N + i) as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config(CACHE).open()?;
+    let keys: Vec<String> = (0..N).map(key_for).collect();
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+
+    for (i, value) in values.iter().enumerate() {
+        let mut expected = base(i);
+        expected.extend_from_slice(format!("+{i}").as_bytes());
+        assert_eq!(value.as_deref(), Some(expected.as_slice()), "key {i}");
+    }
+    // Half the cache holds at most eight blocks of a kilobyte or more.
+    assert!(
+        calls.iter().all(|&reads| reads <= 8),
+        "no call carries more than half the cache: {calls:?}"
+    );
     Ok(())
 }
 

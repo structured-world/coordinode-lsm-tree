@@ -7537,6 +7537,10 @@ mod chunk_order_tests;
 mod chunk_file_tests;
 
 #[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod merge_read_tests;
+
+#[cfg(all(test, feature = "std"))]
 mod probe_stats_tests;
 
 #[cfg(all(test, feature = "std"))]
