@@ -1593,7 +1593,7 @@ impl<I: Iterator<Item = (Bound<UserKey>, Bound<UserKey>)>> Iterator for BatchRan
 }
 
 mod point_merge;
-pub(crate) use point_merge::resolve_point_merge;
+pub(crate) use point_merge::{MergeTable, MergeWalk, TableFilter, resolve_point_merge};
 
 #[cfg(test)]
 mod tests;

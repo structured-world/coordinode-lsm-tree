@@ -476,7 +476,11 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             JobDone::Loaded { index, block } => {
                 block.and_then(|block| current.read.loaded(chunk, index, block))
             }
-            JobDone::Planned { .. } | JobDone::Serial { .. } | JobDone::Value { .. } => {
+            JobDone::Planned { .. }
+            | JobDone::Serial { .. }
+            | JobDone::Value { .. }
+            | JobDone::MergeLocated { .. }
+            | JobDone::MergeVersions { .. } => {
                 debug_assert!(false, "a job handed back to the data block phase");
                 Ok(())
             }

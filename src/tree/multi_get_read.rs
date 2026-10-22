@@ -4,16 +4,22 @@
 
 //! A multi-get as a machine: the memtables answer what they hold when it
 //! starts, the version's levels are read for the rest, and each key's newest
-//! version is then turned into its value, a merge or a blob read handed out
-//! as a job. It reads the one version its context holds for the whole read
-//! and never opens, reads or waits itself.
+//! version is then turned into its value: a separated value is read through
+//! the read's queue, and a merge walks its sources table by table, each
+//! table's blocks brought in through the queue before its versions are read.
+//! It reads the one version its context holds for the whole read and never
+//! opens, reads or waits itself.
 
 use super::Tree;
-use super::read_job::{BlockRequest, Job, JobDone, ReadCtx, ReadMachine, ReadSink, Values};
+use super::read_job::{
+    BlockRequest, Job, JobDone, MergeLocated, ReadCtx, ReadMachine, ReadSink, TableAt, Values,
+};
 use super::tables_read::TablesRead;
 use crate::blob_tree::{ValuePlan, ValueRead};
 use crate::fs::FsFile;
-use crate::{InternalValue, UserValue};
+use crate::range::{MergeTable, MergeWalk, TableFilter};
+use crate::table::BlockHandle;
+use crate::{InternalValue, Table, UserValue};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -25,6 +31,30 @@ struct BlobRead<'a> {
     read: ValueRead<'a>,
     /// The slot of its blob file in [`MultiGetRead::blob_files`].
     slot: usize,
+}
+
+/// A read out after the levels: a separated value's record, or a data block
+/// a merge brings in before it reads a table's versions.
+enum ValueReadOut<'a> {
+    Blob(BlobRead<'a>),
+    MergeBlock {
+        /// The merge's slot in [`MultiGetRead::merges`].
+        merge: usize,
+        table: &'a Table,
+        handle: BlockHandle,
+    },
+}
+
+/// The merge of one key, walked table by table.
+struct MergeKey<'a> {
+    idx: usize,
+    walk: MergeWalk<'a>,
+    /// The table being read, once handed out.
+    table: Option<MergeTable<'a>>,
+    /// What that table's filters said, once located.
+    filter: Option<TableFilter>,
+    /// Its blocks still being read.
+    waiting: usize,
 }
 
 /// The multi-get of the keys of its context.
@@ -45,14 +75,21 @@ pub(super) struct MultiGetRead<'a, K> {
     /// The failure of the lowest key a value job failed for: the one a
     /// resolve in key order would report.
     failure: Option<(usize, crate::Error)>,
-    /// The value reads out, by tag; `None` once back.
-    blob_reads: Vec<Option<BlobRead<'a>>>,
-    /// The blob files those reads go through, each opened once: `None` while
-    /// its open is out.
+    /// The reads out after the levels, by tag; `None` once back.
+    reads: Vec<Option<ValueReadOut<'a>>>,
+    /// The blob files the value reads go through, each opened once: `None`
+    /// while its open is out.
     blob_files: Vec<(crate::vlog::BlobFileId, Option<Arc<dyn FsFile>>)>,
     /// Values whose read failed or did not check out, to read on their own
     /// path, which reports what is wrong as a single read would.
     alone: Vec<(usize, InternalValue)>,
+    /// The merges walked, by slot; `None` once over.
+    merges: Vec<Option<MergeKey<'a>>>,
+    /// Merges whose blocks are all back, to read the versions of next.
+    merges_ready: Vec<usize>,
+    /// What the merges' blocks may still take of the cache, as a level read
+    /// keeps its blocks within half of it; set by the first block back.
+    merge_room: Option<u64>,
 }
 
 impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
@@ -107,9 +144,12 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             results: alloc::vec![None; n],
             jobs: 0,
             failure: None,
-            blob_reads: Vec::new(),
+            reads: Vec::new(),
             blob_files: Vec::new(),
             alone: Vec::new(),
+            merges: Vec::new(),
+            merges_ready: Vec::new(),
+            merge_room: None,
         }
     }
 
@@ -143,8 +183,15 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 // single-key read returns it. Operands are stored inline in a
                 // blob tree too, so the merge result is a plain value.
                 if ctx.merge_operator.is_some() {
-                    out.job(Job::Merge { idx });
                     self.jobs += 1;
+                    self.merges.push(Some(MergeKey {
+                        idx,
+                        walk: MergeWalk::new(&ctx.super_version, ctx.key(idx), ctx.seqno),
+                        table: None,
+                        filter: None,
+                        waiting: 0,
+                    }));
+                    self.step_merge(self.merges.len() - 1, out);
                 } else {
                     self.results[idx] = Some(entry.value);
                 }
@@ -177,12 +224,12 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                         self.blob_files.push((id, None));
                         self.blob_files.len() - 1
                     });
-                    self.blob_reads.push(Some(BlobRead {
+                    self.reads.push(Some(ValueReadOut::Blob(BlobRead {
                         idx,
                         item: entry,
                         read,
                         slot,
-                    }));
+                    })));
                     self.jobs += 1;
                 }
             }
@@ -205,10 +252,13 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         let version = self.ctx.version();
         match file {
             Ok(file) => {
-                for (tag, pending) in self.blob_reads.iter().enumerate() {
-                    let Some(pending) = pending.as_ref().filter(|p| p.slot == slot) else {
+                for (tag, pending) in self.reads.iter().enumerate() {
+                    let Some(ValueReadOut::Blob(pending)) = pending else {
                         continue;
                     };
+                    if pending.slot != slot {
+                        continue;
+                    }
                     source.count_issued(version, &pending.read);
                     out.read(BlockRequest {
                         tag,
@@ -224,8 +274,10 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 }
             }
             Err(_) => {
-                for pending in &mut self.blob_reads {
-                    if let Some(read) = pending.take_if(|p| p.slot == slot) {
+                for pending in &mut self.reads {
+                    if let Some(ValueReadOut::Blob(read)) = pending.take_if(
+                        |pending| matches!(pending, ValueReadOut::Blob(read) if read.slot == slot),
+                    ) {
                         self.alone.push((read.idx, read.item));
                     }
                 }
@@ -233,13 +285,22 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         }
     }
 
+    /// Takes back a read out after the levels.
+    fn value_read_done(&mut self, done: crate::fs::ReadDone) {
+        match self.reads.get_mut(done.tag).and_then(Option::take) {
+            Some(ValueReadOut::Blob(pending)) => self.blob_read_done(pending, done),
+            Some(ValueReadOut::MergeBlock {
+                merge,
+                table,
+                handle,
+            }) => self.merge_block_done(merge, table, &handle, &done),
+            None => debug_assert!(false, "a read handed back twice or never asked for"),
+        }
+    }
+
     /// Takes back a value read: checked and taken as the key's value, or, when
     /// it failed or does not check out, left to the value's own path.
-    fn blob_read_done(&mut self, done: crate::fs::ReadDone) {
-        let Some(pending) = self.blob_reads.get_mut(done.tag).and_then(Option::take) else {
-            debug_assert!(false, "a value read handed back twice or never asked for");
-            return;
-        };
+    fn blob_read_done(&mut self, pending: BlobRead<'a>, done: crate::fs::ReadDone) {
         let file = self
             .blob_files
             .get(pending.slot)
@@ -257,14 +318,179 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             _ => None,
         };
         match value {
-            Some(value) => {
-                self.jobs -= 1;
-                if let Some(slot) = self.results.get_mut(pending.idx) {
-                    *slot = Some(value);
-                }
-            }
+            Some(value) => self.value_done(pending.idx, Ok(Some(value))),
             None => self.alone.push((pending.idx, pending.item)),
         }
+    }
+
+    /// Takes the final value of the key at `idx`, or the failure of reading
+    /// it: the lowest key's failure is the one a resolve in key order reports.
+    fn value_done(&mut self, idx: usize, value: crate::Result<Option<UserValue>>) {
+        self.jobs -= 1;
+        match value {
+            Ok(value) => {
+                if let Some(slot) = self.results.get_mut(idx) {
+                    *slot = value;
+                }
+            }
+            Err(error) => {
+                if self.failure.as_ref().is_none_or(|(held, _)| idx < *held) {
+                    self.failure = Some((idx, error));
+                }
+            }
+        }
+    }
+
+    /// Moves the merge in `slot` on to its next table, asking `out` to locate
+    /// it, or, with no table left, resolves it.
+    fn step_merge(&mut self, slot: usize, out: &mut impl ReadSink<'a>) {
+        let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        match merge.walk.next_table() {
+            Ok(Some(next)) => {
+                let (level, run, pos) = next.at;
+                out.job(Job::MergeLocate {
+                    tag: slot,
+                    idx: merge.idx,
+                    table: TableAt { level, run, pos },
+                });
+                merge.table = Some(next);
+                merge.filter = None;
+            }
+            Ok(None) => {
+                let Some(merge) = self.merges.get_mut(slot).and_then(Option::take) else {
+                    return;
+                };
+                let value = match &self.ctx.merge_operator {
+                    Some(operator) => merge
+                        .walk
+                        .finish(operator, self.ctx.merge_base.as_ref())
+                        .map(|entry| entry.map(|entry| entry.value)),
+                    None => Ok(None),
+                };
+                self.value_done(merge.idx, value);
+            }
+            Err(_) => self.merge_alone(slot, out),
+        }
+    }
+
+    /// Gives up walking the merge in `slot` and resolves it on its own path,
+    /// which reads every source again and reports what failed as a single
+    /// read would.
+    fn merge_alone(&mut self, slot: usize, out: &mut impl ReadSink<'a>) {
+        if let Some(merge) = self.merges.get_mut(slot).and_then(Option::take) {
+            out.job(Job::Merge { idx: merge.idx });
+        }
+    }
+
+    /// Takes back the table the merge in `slot` located: its blocks the cache
+    /// lacks are read in, and its versions read once they are back.
+    fn merge_located(
+        &mut self,
+        slot: usize,
+        located: crate::Result<MergeLocated>,
+        out: &mut impl ReadSink<'a>,
+    ) {
+        let Ok(MergeLocated { filter, reads }) = located else {
+            self.merge_alone(slot, out);
+            return;
+        };
+        let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        let Some(table) = merge.table.as_ref().map(|next| next.table) else {
+            return;
+        };
+        merge.filter = Some(filter);
+        if let Some((file, handles)) = reads {
+            // These reads bypass the per-block load path that charges every
+            // other read.
+            table.record_batched_read(crate::table::block::BlockType::Data, &handles);
+            merge.waiting += handles.len();
+            for handle in handles {
+                out.read(BlockRequest {
+                    tag: self.reads.len(),
+                    fs: &table.fs,
+                    cache: &table.cache,
+                    file: Arc::clone(&file),
+                    offset: *handle.offset(),
+                    buf: alloc::vec![0u8; handle.size() as usize],
+                });
+                self.reads.push(Some(ValueReadOut::MergeBlock {
+                    merge: slot,
+                    table,
+                    handle,
+                }));
+            }
+        }
+        self.read_merge_versions(slot, out);
+    }
+
+    /// Asks `out` to read the versions of the table the merge in `slot` is
+    /// at, once none of its blocks is still being read.
+    fn read_merge_versions(&self, slot: usize, out: &mut impl ReadSink<'a>) {
+        let Some(merge) = self.merges.get(slot).and_then(Option::as_ref) else {
+            return;
+        };
+        let (Some(next), Some(filter), 0) = (&merge.table, merge.filter, merge.waiting) else {
+            return;
+        };
+        let (level, run, pos) = next.at;
+        out.job(Job::MergeVersions {
+            tag: slot,
+            idx: merge.idx,
+            table: TableAt { level, run, pos },
+            filter,
+        });
+    }
+
+    /// Takes back a block a merge brought in: kept in the cache, where the
+    /// read of the table's versions finds it. A block that fails is left to
+    /// that read, which reads it itself and reports what is wrong.
+    fn merge_block_done(
+        &mut self,
+        slot: usize,
+        table: &'a Table,
+        handle: &BlockHandle,
+        done: &crate::fs::ReadDone,
+    ) {
+        if done.result.is_ok() {
+            let room = self
+                .merge_room
+                .get_or_insert_with(|| table.cache_capacity() / 2);
+            if let Err(error) = table.decode_data_block_keeping(&done.buf, handle, room, None) {
+                log::debug!("a block a merge brought in did not decode, it is read again: {error}");
+            }
+        }
+        if let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) {
+            merge.waiting -= 1;
+            if merge.waiting == 0 {
+                self.merges_ready.push(slot);
+            }
+        }
+    }
+
+    /// Takes back the versions of the table the merge in `slot` read, and
+    /// moves it on.
+    fn merge_versions(
+        &mut self,
+        slot: usize,
+        versions: crate::Result<Vec<InternalValue>>,
+        out: &mut impl ReadSink<'a>,
+    ) {
+        let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
+            return;
+        };
+        merge.table = None;
+        merge.filter = None;
+        let taken =
+            versions.and_then(|versions| merge.walk.take_table(versions.into_iter().map(Ok)));
+        if taken.is_err() {
+            self.merge_alone(slot, out);
+            return;
+        }
+        self.step_merge(slot, out);
     }
 }
 
@@ -289,6 +515,9 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
         for (idx, item) in self.alone.drain(..) {
             out.job(Job::Blob { idx, item });
         }
+        for slot in core::mem::take(&mut self.merges_ready) {
+            self.read_merge_versions(slot, out);
+        }
         if self.jobs > 0 {
             return None;
         }
@@ -300,21 +529,9 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
 
     fn job_done<S: ReadSink<'a>>(&mut self, done: JobDone, out: &mut S) {
         match done {
-            JobDone::Value { idx, value } => {
-                self.jobs -= 1;
-                match value {
-                    Ok(value) => {
-                        if let Some(slot) = self.results.get_mut(idx) {
-                            *slot = value;
-                        }
-                    }
-                    Err(error) => {
-                        if self.failure.as_ref().is_none_or(|(held, _)| idx < *held) {
-                            self.failure = Some((idx, error));
-                        }
-                    }
-                }
-            }
+            JobDone::Value { idx, value } => self.value_done(idx, value),
+            JobDone::MergeLocated { tag, located } => self.merge_located(tag, located, out),
+            JobDone::MergeVersions { tag, versions } => self.merge_versions(tag, versions, out),
             done => {
                 if let Some(tables) = &mut self.tables {
                     tables.job_done(done, out);
@@ -333,7 +550,7 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
         if let Some(tables) = &mut self.tables {
             tables.read_done(done);
         } else {
-            self.blob_read_done(done);
+            self.value_read_done(done);
         }
     }
 }

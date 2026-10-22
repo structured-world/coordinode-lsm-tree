@@ -134,6 +134,29 @@ pub(super) enum Job {
         tag: usize,
         blob_file: crate::vlog::BlobFileId,
     },
+    /// Asks `table`'s filters about the key at `idx` for the merge tagged
+    /// `tag`, and finds the data blocks of the table holding versions of it
+    /// that the cache does not, for the read to bring in.
+    MergeLocate {
+        tag: usize,
+        idx: usize,
+        table: TableAt,
+    },
+    /// Reads `table`'s versions of the key at `idx` for the merge tagged
+    /// `tag`, through the table's reader, after `filter` let the key through.
+    MergeVersions {
+        tag: usize,
+        idx: usize,
+        table: TableAt,
+        filter: crate::range::TableFilter,
+    },
+}
+
+/// What [`Job::MergeLocate`] found: the filter's answer, and the file and the
+/// uncached data blocks to read before the versions are, when there are any.
+pub(super) struct MergeLocated {
+    pub(super) filter: crate::range::TableFilter,
+    pub(super) reads: Option<(Arc<dyn FsFile>, Vec<BlockHandle>)>,
 }
 
 /// A finished [`Job`].
@@ -158,6 +181,17 @@ pub(super) enum JobDone {
     Value {
         idx: usize,
         value: crate::Result<Option<UserValue>>,
+    },
+    /// A table of the merge tagged `tag`, located.
+    MergeLocated {
+        tag: usize,
+        located: crate::Result<MergeLocated>,
+    },
+    /// A table's versions of the key of the merge tagged `tag`, newest first,
+    /// down to its first base.
+    MergeVersions {
+        tag: usize,
+        versions: crate::Result<Vec<InternalValue>>,
     },
 }
 
@@ -239,8 +273,71 @@ impl Job {
                     _ => Err(misplaced()),
                 },
             },
+            Self::MergeLocate { tag, idx, table } => JobDone::MergeLocated {
+                tag,
+                located: table
+                    .table(version)
+                    .ok_or_else(misplaced)
+                    .map(|table| locate(table, ctx.key(idx), ctx.seqno)),
+            },
+            Self::MergeVersions {
+                tag,
+                idx,
+                table,
+                filter,
+            } => JobDone::MergeVersions {
+                tag,
+                versions: table
+                    .table(version)
+                    .ok_or_else(misplaced)
+                    .and_then(|table| {
+                        let mut versions = Vec::new();
+                        for version in filter.versions(table, ctx.key(idx), ctx.seqno) {
+                            let version = version?;
+                            // Older versions are hidden by the first base.
+                            let base = !version.key.value_type.is_merge_operand();
+                            versions.push(version);
+                            if base {
+                                break;
+                            }
+                        }
+                        Ok(versions)
+                    }),
+            },
         }
     }
+}
+
+/// Asks `table`'s filters about `key` and finds the data blocks holding its
+/// versions at `seqno` that the cache does not hold. Bringing them in is an
+/// optimization only: the versions are read through the table's reader after,
+/// which reads any block still missing itself, so a table whose blocks need
+/// their own load path, or whose plan fails, asks for none.
+fn locate(table: &Table, key: &[u8], seqno: SeqNo) -> MergeLocated {
+    let filter = crate::range::TableFilter::of(table, key);
+    if filter.absent() || table.is_chunk_special() || table.is_below_restriction(key) {
+        return MergeLocated {
+            filter,
+            reads: None,
+        };
+    }
+    // The plan probes the filter again into a tally of its own, which is
+    // never counted: the probe above is the one the merge counts.
+    let mut tally = PlanCounts::default();
+    let reads = table
+        .plan_block_tasks(&[(key, crate::hash::hash64(key))], seqno, &mut tally)
+        .ok()
+        .flatten()
+        .map(|(file, _, _, blocks)| {
+            let missing = blocks
+                .into_iter()
+                .map(|(handle, _)| handle)
+                .filter(|handle| !table.cache.has_block(table.global_id(), handle.offset()))
+                .collect::<Vec<_>>();
+            (file, missing)
+        })
+        .filter(|(_, missing)| !missing.is_empty());
+    MergeLocated { filter, reads }
 }
 
 /// Where a read's asks go as it makes them. A driver that submits a block
