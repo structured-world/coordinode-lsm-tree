@@ -336,11 +336,19 @@ pub struct FaultInjector {
     /// hold a read in flight while other readers run.
     #[cfg(test)]
     read_hooks: spin::Mutex<Vec<(String, u64, ReadHook)>>,
+    /// Called on a removal of a path containing the paired text, before the
+    /// removal is done, so a test can see the state the removal happens in.
+    #[cfg(test)]
+    removal_hooks: spin::Mutex<Vec<(String, RemovalHook)>>,
 }
 
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
 pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+
+/// What a test runs before a removal, given the removal's kind and path.
+#[cfg(test)]
+pub type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
 
 std::thread_local! {
     /// The injectors whose batches and queue waits this thread is inside:
@@ -670,6 +678,30 @@ impl FaultInjector {
         self.read_hooks.lock().push((path.into(), offset, hook));
     }
 
+    /// Runs `hook` before every removal (of a file, a folder, or a folder and
+    /// all it holds) of a path containing `path`.
+    #[cfg(test)]
+    pub(crate) fn hook_removal(&self, path: impl Into<String>, hook: RemovalHook) {
+        self.removal_hooks.lock().push((path.into(), hook));
+    }
+
+    /// Runs the hooks armed for a removal of kind `op` of `path`, outside the
+    /// hook list's lock so a hook may use the backend.
+    #[cfg(test)]
+    fn run_removal_hooks(&self, op: FaultOp, path: &Path) {
+        let spelled = path.to_string_lossy();
+        let hooks: Vec<RemovalHook> = self
+            .removal_hooks
+            .lock()
+            .iter()
+            .filter(|(within, _)| spelled.contains(within.as_str()))
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
+            hook(op, path);
+        }
+    }
+
     /// Runs the hooks armed for a read at `offset` of `path`, outside the
     /// hook list's lock so a hook may block.
     #[cfg(test)]
@@ -734,6 +766,8 @@ impl FaultInjector {
         self.writeback_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();
+        #[cfg(test)]
+        self.removal_hooks.lock().clear();
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1066,6 +1100,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveFile, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveFile, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveFile));
         }
@@ -1079,6 +1115,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveDirAll, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDirAll, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveDirAll));
         }
@@ -1086,6 +1124,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveDir, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDir, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveDir));
         }

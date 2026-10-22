@@ -479,7 +479,7 @@ pub fn restore(
 
     let seqno = Arc::clone(&config.seqno);
     let visible_seqno = Arc::clone(&config.visible_seqno);
-    let tree = config.open_with(
+    let (tree, _) = config.open_with(
         crate::config::DirectoryLock::Held(lock),
         crate::tree::NewFolderNames::Synced,
     )?;

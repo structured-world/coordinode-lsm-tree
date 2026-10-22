@@ -349,15 +349,15 @@ impl BlobTree {
     }
 
     /// Opens the tree, coming by the directory lock as `lock` says; see
-    /// [`Tree::open`](crate::Tree::open).
+    /// [`Tree::open`](crate::Tree::open), and whether this open made it.
     pub(crate) fn open(
         config: Config,
         #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
         names: crate::tree::NewFolderNames,
-    ) -> crate::Result<Self> {
+    ) -> crate::Result<(Self, bool)> {
         use crate::file::BLOBS_FOLDER;
 
-        let index = crate::Tree::open(
+        let (index, created) = crate::Tree::open(
             config,
             #[cfg(feature = "std")]
             lock,
@@ -399,10 +399,13 @@ impl BlobTree {
             .blob_file_id_counter
             .set(blob_file_id_to_continue_with);
 
-        Ok(Self {
-            index,
-            blobs_folder: Arc::new(blobs_folder),
-        })
+        Ok((
+            Self {
+                index,
+                blobs_folder: Arc::new(blobs_folder),
+            },
+            created,
+        ))
     }
 
     /// Resolves a single key against a pre-acquired [`SuperVersion`](crate::version::SuperVersion),

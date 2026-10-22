@@ -1438,6 +1438,7 @@ impl Config {
             DirectoryLock::Acquire,
             crate::tree::NewFolderNames::Synced,
         )
+        .map(|(tree, _)| tree)
     }
 
     /// Opens a tree for each config, making each one that does not exist
@@ -1484,12 +1485,12 @@ impl Config {
 
     /// [`Self::open`], coming by the directory lock as `lock` says, and
     /// leaving the new tree folder's name to its caller to sync as `names`
-    /// says.
+    /// says; with the tree, whether this open made it.
     pub(crate) fn open_with(
         self,
         #[cfg(feature = "std")] lock: DirectoryLock,
         names: crate::tree::NewFolderNames,
-    ) -> crate::Result<AnyTree> {
+    ) -> crate::Result<(AnyTree, bool)> {
         // The dictionary registry is loaded and the compression policy validated
         // inside `Tree::open`, under the directory lock — NOT here. Both read the
         // tree's `dicts/` folder, and the load SWEEPS unpublished temps; doing
@@ -1514,19 +1515,21 @@ impl Config {
         }
 
         Ok(if self.kv_separation_opts.is_some() {
-            AnyTree::Blob(BlobTree::open(
+            let (tree, created) = BlobTree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
                 names,
-            )?)
+            )?;
+            (AnyTree::Blob(tree), created)
         } else {
-            AnyTree::Standard(Tree::open(
+            let (tree, created) = Tree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
                 names,
-            )?)
+            )?;
+            (AnyTree::Standard(tree), created)
         })
     }
 

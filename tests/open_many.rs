@@ -179,6 +179,70 @@ fn a_batch_opens_a_tree_that_exists_and_never_takes_it_back() {
     assert_eq!(syncs_of_data(&fault), 1, "one sync for the new trees");
 }
 
+/// Configs that each hold their own handle of one backend, as configs made
+/// with `Config::new` each hold their own `StdFs`, share their folder: it is
+/// synced once for all of them.
+#[test]
+fn a_batch_syncs_its_folder_once_through_separate_handles_of_one_backend() {
+    let memory = MemFs::new();
+    memory.create_dir_all(&data()).expect("the data folder");
+    let injector = Arc::new(lsm_tree::fs::FaultInjector::new());
+    let configs: Vec<Config> = (0..TREES)
+        .map(|i| {
+            let handle = FaultFs::with_injector(memory.clone(), Arc::clone(&injector));
+            Config::new(
+                tree_path(i),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_fs(handle)
+        })
+        .collect();
+    let trees = Config::open_many(configs).expect("the batch");
+    assert_eq!(trees.len(), TREES);
+    let synced = injector
+        .take_syncs()
+        .into_iter()
+        .filter(|(path, _)| *path == data())
+        .count();
+    assert_eq!(synced, 1, "one sync of the data folder");
+}
+
+/// A tree a batch made in a folder that existed already, empty, is taken
+/// back by a batch that fails after it: what the tree put there goes, the
+/// folder stays, and a retry makes the tree anew rather than recovering one
+/// the failed batch left.
+#[test]
+fn a_failed_batch_takes_back_a_tree_it_made_in_a_folder_that_existed() {
+    let (_, fault) = stack();
+    let fs: Arc<dyn Fs> = fault.clone();
+    fault
+        .create_dir_all(&tree_path(0))
+        .expect("an empty tree folder");
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::Rename,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path(tree_path(1).to_string_lossy()),
+    );
+    assert!(Config::open_many(configs(&fs)).is_err(), "the batch fails");
+    assert!(
+        fault.exists(&tree_path(0)).expect("probe"),
+        "the folder that existed stays"
+    );
+    assert_eq!(
+        fault
+            .read_dir(&tree_path(0))
+            .expect("list the folder")
+            .into_iter()
+            .map(|entry| entry.file_name)
+            .collect::<Vec<_>>(),
+        Vec::<String>::new(),
+        "nothing the tree put there is left"
+    );
+}
+
 /// Trees made in folders on two backends have each folder synced once, on
 /// its own backend.
 #[test]
