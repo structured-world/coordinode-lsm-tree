@@ -413,26 +413,38 @@ fn a_merge_stops_reading_its_base_table_at_the_first_base() -> lsm_tree::Result<
         for seqno in 1..=200 {
             tree.insert("key", version(seqno), seqno);
         }
+        // Two more merged keys: a batch of two keys or fewer is read key by
+        // key, not through the batch.
+        tree.insert("a1", "base-a1", 201);
+        tree.insert("a2", "base-a2", 202);
         tree.flush_active_memtable(0)?;
         tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
-        tree.merge("key", "+", 201);
+        for (seqno, key) in (203..).zip(["a1", "a2", "key"]) {
+            tree.merge(key, "+", seqno);
+        }
         tree.flush_active_memtable(0)?;
     }
     let tree = config().open()?;
     fs.take();
 
-    let values = tree.multi_get(["key"], SeqNo::MAX)?;
+    let values = tree.multi_get(["a1", "a2", "key"], SeqNo::MAX)?;
     let calls = fs.take();
 
     let mut expected = version(200).into_bytes();
     expected.push(b'+');
     assert_eq!(
-        values.first().and_then(Option::as_deref),
-        Some(expected.as_slice())
+        values,
+        vec![
+            Some(UserValue::from("base-a1+")),
+            Some(UserValue::from("base-a2+")),
+            Some(UserValue::from(expected)),
+        ]
     );
+    // The operands' block, and at most one block of the bases' table per
+    // key: none of the history.
     assert!(
-        calls.iter().sum::<usize>() <= 2,
-        "the operand's block and the base's block, none of the history: {calls:?}"
+        calls.iter().sum::<usize>() <= 4,
+        "the history beneath the newest base is not read: {calls:?}"
     );
     Ok(())
 }
