@@ -4900,7 +4900,7 @@ impl Tree {
         // After the recover / create above, because registering installs a
         // version edit and there is no history to install into before that.
         #[cfg(zstd_any)]
-        for dict in [
+        let registered = [
             tree.config.zstd_dictionary.clone(),
             tree.config
                 .kv_separation_opts
@@ -4909,8 +4909,18 @@ impl Tree {
         ]
         .into_iter()
         .flatten()
-        {
-            tree.register_zstd_dictionary(dict)?;
+        .try_for_each(|dict| tree.register_zstd_dictionary(dict));
+        // A tree this open made, whose open then fails, is taken back: the
+        // caller is told it was not opened, and a retry makes it anew.
+        #[cfg(zstd_any)]
+        if let Err(e) = registered {
+            if !recovering {
+                take_back_new_tree(tree, &made_by_open);
+                if names == NewFolderNames::Synced {
+                    sync_made_names(&open_holders);
+                }
+            }
+            return Err(e);
         }
 
         Ok((tree, !recovering))
@@ -7005,6 +7015,7 @@ pub fn open_batch(configs: impl IntoIterator<Item = Config>) -> crate::Result<Ve
 }
 
 /// The tree behind `tree`, whose folder holds the manifest and the lock.
+#[cfg(feature = "std")]
 fn batch_tree(tree: &crate::AnyTree) -> &Tree {
     match tree {
         crate::AnyTree::Standard(tree) => tree,
@@ -7066,33 +7077,60 @@ fn undo_batch(trees: Vec<crate::AnyTree>, made: Vec<BatchMade>, failed: Option<&
             .collect();
     // The trees close their files; each made one's lock stays held by `made`.
     drop(trees);
-    for tree in made {
-        // Another opener taking the lock now would have its tree taken back
-        // from under it: what the tree holds goes while the lock is held.
-        empty_tree_folder(&tree.path, &tree.fs);
-        #[cfg(feature = "std")]
-        drop(tree.lock);
-        // Only folders left empty go: one the lock no longer keeps another
-        // opener out of may hold its tree by now.
-        let folders = made_folders(&tree.path, &tree.holders)
-            .into_iter()
-            .map(|folder| (folder, Arc::clone(&tree.fs)))
-            .collect();
-        undo_creation(None, folders, &[]);
+    // Another opener taking a lock now would have its tree taken back from
+    // under it: what each tree holds goes while its lock is held.
+    let mut folders = Vec::new();
+    for tree in &made {
+        empty_tree_folder(&tree.path, &tree.fs, tree.holders.is_empty());
+        folders.extend(
+            made_folders(&tree.path, &tree.holders)
+                .into_iter()
+                .map(|folder| (folder, Arc::clone(&tree.fs))),
+        );
     }
+    // Then the locks go, and only folders left empty with them, deepest
+    // first: one the batch made for several of its trees goes after all of
+    // them, and one a lock no longer keeps another opener out of may hold
+    // that opener's tree by now.
+    #[cfg(feature = "std")]
+    for tree in made {
+        drop(tree.lock);
+    }
+    undo_creation(None, folders, &[]);
     sync_made_names(&holders);
+}
+
+/// Takes back `tree`, which its open made: what it put in its folder goes
+/// while its lock is still held, then the folders the open made
+/// (`made_by_open`), once empty.
+#[cfg(zstd_any)]
+fn take_back_new_tree(tree: Tree, made_by_open: &[crate::path::PathBuf]) {
+    let path = tree.config.path.clone();
+    let fs = Arc::clone(&tree.config.fs);
+    #[cfg(feature = "std")]
+    let lock = tree.0.directory_lock.clone();
+    drop(tree);
+    empty_tree_folder(&path, &fs, made_by_open.is_empty());
+    #[cfg(feature = "std")]
+    drop(lock);
+    let made = made_folders(&path, made_by_open)
+        .into_iter()
+        .map(|folder| (folder, Arc::clone(&fs)))
+        .collect();
+    undo_creation(None, made, &[]);
 }
 
 /// Removes everything in the tree folder `path`, the lock file last: it goes
 /// while the lock is still held, so no opener is left holding the lock of a
 /// file another one can make anew. What cannot be removed stays, and keeps
-/// the folder.
-fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>) {
+/// the folder. A folder that `stays` is synced, so its emptying is durable
+/// and no snapshot of the tree comes back after a power loss.
+fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>, stays: bool) {
     let entries = match fs.read_dir(path) {
         Ok(entries) => entries,
         Err(e) => {
             log::warn!(
-                "Config::open_many: could not list {} to take back its tree ({e})",
+                "could not list {} to take back the tree made there ({e})",
                 path.display()
             );
             return;
@@ -7111,10 +7149,17 @@ fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>) {
             Ok(()) => {}
             Err(gone) if gone.kind() == crate::io::ErrorKind::NotFound => {}
             Err(kept) => log::warn!(
-                "Config::open_many: could not remove {} taking back its tree ({kept})",
+                "could not remove {} taking back the tree made there ({kept})",
                 entry.path.display()
             ),
         }
+    }
+    if stays && let Err(e) = crate::file::fsync_directory(path, &**fs, crate::fs::SyncMode::Full) {
+        log::warn!(
+            "could not sync {} after taking back the tree made there ({e}); a power loss \
+             may bring the tree back",
+            path.display()
+        );
     }
 }
 

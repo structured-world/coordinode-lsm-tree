@@ -45,11 +45,19 @@ fn configs(fs: &Arc<dyn Fs>) -> Vec<Config> {
 /// A crash simulator holding the data folder durably, and a fault layer over
 /// it the batch runs on.
 fn stack() -> (CrashFs, Arc<FaultFs<CrashFs>>) {
+    stack_with(true)
+}
+
+/// [`stack`], with the data folder made beforehand when `warm`, and left for
+/// the batch to make otherwise.
+fn stack_with(warm: bool) -> (CrashFs, Arc<FaultFs<CrashFs>>) {
     let crash = CrashFs::new(MemFs::new()).tracking_folders();
-    crash.create_dir_all(&data()).expect("the data folder");
-    crash
-        .sync_directory(data().parent().expect("a parent"))
-        .expect("its name");
+    if warm {
+        crash.create_dir_all(&data()).expect("the data folder");
+        crash
+            .sync_directory(data().parent().expect("a parent"))
+            .expect("its name");
+    }
     let fault = Arc::new(FaultFs::new(crash.clone()));
     (crash, fault)
 }
@@ -65,74 +73,132 @@ fn named(fs: &CrashFs) -> Vec<usize> {
 /// its trees, before the sync of their folder, or all of them; and the trees
 /// it leaves open again, empty. Every sync before the last one of the batch
 /// is a power loss with no tree named, since that last one is the folder's.
+/// A batch that makes the data folder too syncs that folder's name as well,
+/// and a power loss before both leaves no tree either.
 #[test]
 fn a_power_loss_leaves_all_of_a_batch_or_none() {
-    let (_, clean) = stack();
-    let fs: Arc<dyn Fs> = clean.clone();
-    let _ = clean.injector().take_syncs();
-    drop(Config::open_many(configs(&fs)).expect("the batch"));
-    let syncs = clean.injector().take_syncs();
-    assert!(!syncs.is_empty(), "self-check: the batch syncs");
+    for warm in [true, false] {
+        let (_, clean) = stack_with(warm);
+        let fs: Arc<dyn Fs> = clean.clone();
+        let _ = clean.injector().take_syncs();
+        drop(Config::open_many(configs(&fs)).expect("the batch"));
+        let syncs = clean.injector().take_syncs();
+        assert!(!syncs.is_empty(), "self-check: the batch syncs");
 
-    for kept in 0..=syncs.len() {
-        let (crash, fault) = stack();
-        let fs: Arc<dyn Fs> = fault.clone();
-        if kept < syncs.len() {
-            fault.injector().power_off_after_syncs(kept);
-        }
-        let opened = Config::open_many(configs(&fs));
-        assert_eq!(
-            opened.is_ok(),
-            kept == syncs.len(),
-            "the batch returns only with every sync made, {kept} of {}",
-            syncs.len()
-        );
-        drop(opened);
-        crash.crash();
+        for kept in 0..=syncs.len() {
+            let (crash, fault) = stack_with(warm);
+            let fs: Arc<dyn Fs> = fault.clone();
+            if kept < syncs.len() {
+                fault.injector().power_off_after_syncs(kept);
+            }
+            let opened = Config::open_many(configs(&fs));
+            assert_eq!(
+                opened.is_ok(),
+                kept == syncs.len(),
+                "the batch returns only with every sync made, {kept} of {} (warm: {warm})",
+                syncs.len()
+            );
+            drop(opened);
+            crash.crash();
 
-        let expected: Vec<usize> = if kept == syncs.len() {
-            (0..TREES).collect()
-        } else {
-            Vec::new()
-        };
-        assert_eq!(named(&crash), expected, "power lost after {kept} syncs");
+            let expected: Vec<usize> = if kept == syncs.len() {
+                (0..TREES).collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                named(&crash),
+                expected,
+                "power lost after {kept} syncs (warm: {warm})"
+            );
 
-        let fs: Arc<dyn Fs> = Arc::new(crash.clone());
-        let trees = Config::open_many(configs(&fs)).expect("the batch opens again");
-        for tree in &trees {
-            assert!(tree.is_empty(SeqNo::MAX, None).expect("read"));
+            let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+            let trees = Config::open_many(configs(&fs)).expect("the batch opens again");
+            for tree in &trees {
+                assert!(tree.is_empty(SeqNo::MAX, None).expect("read"));
+            }
         }
     }
 }
 
 /// A batch one of whose trees cannot be made takes back every tree it made,
-/// before that one and after a power loss alike, and closes them: a retry
-/// opens the whole batch.
+/// before that one and after a power loss alike, and the data folder too when
+/// it made that, and closes them: a retry opens the whole batch.
 #[test]
 fn a_failed_batch_takes_back_the_trees_it_made() {
-    let (crash, fault) = stack();
-    let fs: Arc<dyn Fs> = fault.clone();
-    // The third tree's snapshot is never installed.
-    fault.injector().arm(
-        FaultRule::new(
-            FaultOp::Rename,
-            Fault::Error(lsm_tree::io::ErrorKind::Other),
-        )
-        .on_path(tree_path(2).to_string_lossy()),
-    );
-    assert!(Config::open_many(configs(&fs)).is_err(), "the batch fails");
-    for i in 0..TREES {
+    for warm in [true, false] {
+        let (crash, fault) = stack_with(warm);
+        let fs: Arc<dyn Fs> = fault.clone();
+        // The last tree's snapshot is never installed, after every other
+        // tree is made.
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path(tree_path(TREES - 1).to_string_lossy()),
+        );
+        assert!(Config::open_many(configs(&fs)).is_err(), "the batch fails");
+        for i in 0..TREES {
+            assert!(
+                !fault.exists(&tree_path(i)).expect("probe"),
+                "tree {i} is taken back (warm: {warm})"
+            );
+        }
+        assert_eq!(
+            fault.exists(&data()).expect("probe"),
+            warm,
+            "the data folder stays only when it was there (warm: {warm})"
+        );
+        crash.crash();
+        assert_eq!(
+            named(&crash),
+            Vec::<usize>::new(),
+            "after a power loss (warm: {warm})"
+        );
+
+        fault.injector().clear();
+        let trees = Config::open_many(configs(&fs)).expect("the retry");
+        assert_eq!(trees.len(), TREES);
+    }
+}
+
+/// A tree whose open fails after it was made, registering its dictionary,
+/// is taken back, alone as in a batch: no tree is left that the caller was
+/// told was not opened.
+#[cfg(feature = "zstd")]
+#[test]
+fn a_tree_whose_dictionary_cannot_be_registered_is_taken_back() {
+    let dictionary = Arc::new(lsm_tree::ZstdDictionary::new(
+        &b"a dictionary the open registers".repeat(40),
+    ));
+    for batched in [true, false] {
+        let (_, fault) = stack();
+        let fs: Arc<dyn Fs> = fault.clone();
+        // The dictionary file is never published.
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::Rename,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path("dicts"),
+        );
+        let mut configs = configs(&fs);
+        let first = configs
+            .remove(0)
+            .zstd_dictionary(Some(Arc::clone(&dictionary)));
+        configs.insert(0, first);
+        let failed = if batched {
+            Config::open_many(configs).is_err()
+        } else {
+            configs.swap_remove(0).open().is_err()
+        };
+        assert!(failed, "the open fails (batched: {batched})");
         assert!(
-            !fault.exists(&tree_path(i)).expect("probe"),
-            "tree {i} is taken back"
+            !fault.exists(&tree_path(0)).expect("probe"),
+            "the tree is taken back (batched: {batched})"
         );
     }
-    crash.crash();
-    assert_eq!(named(&crash), Vec::<usize>::new(), "after a power loss");
-
-    fault.injector().clear();
-    let trees = Config::open_many(configs(&fs)).expect("the retry");
-    assert_eq!(trees.len(), TREES);
 }
 
 /// A tree of the batch that exists already is opened as it is, keeps its
