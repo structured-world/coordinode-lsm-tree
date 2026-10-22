@@ -107,7 +107,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_request(&self, on_disk: usize) {
+    pub(crate) fn count_request(&self, on_disk: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
@@ -128,7 +128,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_decoded(&self, decoded: usize) {
+    pub(crate) fn count_decoded(&self, decoded: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
@@ -249,7 +249,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_gather(&self, bytes: usize) {
+    pub(crate) fn count_gather(&self, bytes: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             metrics.record_gather(bytes);

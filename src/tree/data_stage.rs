@@ -190,7 +190,8 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             );
             out.read(BlockRequest {
                 tag: index,
-                table: task.table,
+                fs: &task.table.fs,
+                cache: &task.table.cache,
                 file: Arc::clone(file),
                 offset: *task.handle.offset(),
                 buf,

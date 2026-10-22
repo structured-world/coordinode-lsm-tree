@@ -85,7 +85,11 @@ fn misplaced() -> crate::Error {
 /// with `tag`.
 pub(super) struct BlockRequest<'a> {
     pub(super) tag: usize,
-    pub(super) table: &'a Table,
+    /// The backend `file` was opened through, whose queue takes the read.
+    pub(super) fs: &'a Arc<dyn crate::fs::Fs>,
+    /// The cache the block is read for, whose load-time estimate the wait
+    /// for it is timed into.
+    pub(super) cache: &'a crate::cache::Cache,
     pub(super) file: Arc<dyn FsFile>,
     pub(super) offset: u64,
     pub(super) buf: Vec<u8>,
@@ -125,6 +129,11 @@ pub(super) enum Job {
     /// Reads the value the indirection `item`, the newest version of the key
     /// at `idx`, points to in the value log.
     Blob { idx: usize, item: InternalValue },
+    /// Opens the blob file `blob_file` for the value read tagged `tag`.
+    OpenBlob {
+        tag: usize,
+        blob_file: crate::vlog::BlobFileId,
+    },
 }
 
 /// A finished [`Job`].
@@ -221,6 +230,13 @@ impl Job {
                 value: match &ctx.values {
                     Values::Blob(source) => source.value(version, item).map(Some),
                     Values::Inline => Ok(Some(item.value)),
+                },
+            },
+            Self::OpenBlob { tag, blob_file } => JobDone::Opened {
+                tag,
+                file: match (&ctx.values, version.blob_files.get(blob_file)) {
+                    (Values::Blob(source), Some(blob_file)) => source.open_blob_file(blob_file),
+                    _ => Err(misplaced()),
                 },
             },
         }

@@ -144,9 +144,9 @@ impl ResumableMultiGet {
                 .map(|read| {
                     let backend = backends
                         .iter()
-                        .position(|fs| Arc::ptr_eq(fs, &read.table.fs))
+                        .position(|fs| Arc::ptr_eq(fs, read.fs))
                         .unwrap_or_else(|| {
-                            backends.push(Arc::clone(&read.table.fs));
+                            backends.push(Arc::clone(read.fs));
                             backends.len() - 1
                         });
                     BlockRequest {

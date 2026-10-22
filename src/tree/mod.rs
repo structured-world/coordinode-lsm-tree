@@ -253,23 +253,19 @@ impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn read(&mut self, read: read_job::BlockRequest<'a>) {
         if self.cache.is_none() {
-            self.cache = Some(&read.table.cache);
+            self.cache = Some(read.cache);
         }
-        let slot = if let Some(slot) = self
-            .queues
-            .iter()
-            .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
-        {
+        let slot = if let Some(slot) = self.queues.iter().position(|q| Arc::ptr_eq(q.fs, read.fs)) {
             slot
         } else {
             #[cfg_attr(not(feature = "std"), expect(unused_mut))]
-            let mut queue = read.table.fs.read_queue();
+            let mut queue = read.fs.read_queue();
             #[cfg(feature = "std")]
             let wakes = queue.set_wake(Arc::clone(&self.wake) as Arc<dyn crate::fs::ReadWake>);
             #[cfg(not(feature = "std"))]
             let wakes = false;
             self.queues.push(LevelQueue {
-                fs: &read.table.fs,
+                fs: read.fs,
                 queue,
                 wakes,
             });
