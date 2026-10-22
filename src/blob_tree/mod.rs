@@ -353,6 +353,7 @@ impl BlobTree {
     pub(crate) fn open(
         config: Config,
         #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
+        names: crate::tree::NewFolderNames,
     ) -> crate::Result<Self> {
         use crate::file::BLOBS_FOLDER;
 
@@ -360,6 +361,7 @@ impl BlobTree {
             config,
             #[cfg(feature = "std")]
             lock,
+            names,
         )?;
 
         // The folder's name is an entry of the tree folder, and a blob file in

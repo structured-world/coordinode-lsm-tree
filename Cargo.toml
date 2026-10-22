@@ -431,6 +431,12 @@ path = "benches/filter_build.rs"
 required-features = []
 
 [[bench]]
+name = "open_many"
+harness = false
+path = "benches/open_many.rs"
+required-features = []
+
+[[bench]]
 name = "multi_get_metadata_budget"
 harness = false
 path = "benches/multi_get_metadata_budget.rs"
