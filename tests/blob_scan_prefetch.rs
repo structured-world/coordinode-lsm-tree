@@ -8,7 +8,10 @@
 
 use lsm_tree::{
     AbstractTree, Config, Guard as _, KvSeparationOptions, SeqNo, SequenceNumberCounter, UserValue,
+    fs::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, StdFs},
+    io,
 };
+use std::path::Path;
 
 /// Values large enough to be separated out of the index, and distinct enough
 /// that a record parsed from the wrong offset in a coalesced buffer cannot
@@ -93,6 +96,120 @@ fn a_scan_yields_the_same_values_with_and_without_prefetch() -> lsm_tree::Result
         assert_eq!(value.as_ref(), value_for(i).as_slice());
     }
 
+    Ok(())
+}
+
+/// A backend delegating to [`StdFs`] that records, per batched read, how many
+/// requests it carried.
+struct BatchCountFs(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+impl Fs for BatchCountFs {
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(reqs.len());
+        StdFs.read_blocks_batched(reqs)
+    }
+
+    fn open(&self, path: &Path, opts: &FsOpenOptions) -> io::Result<Box<dyn FsFile>> {
+        StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {
+        StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+        StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        StdFs.exists(path)
+    }
+}
+
+/// A window whose records lie in several blob files coalesces into a span per
+/// file, and the spans of one window go to the backend in ONE batched read,
+/// not one read each.
+#[test_log::test]
+fn a_window_reads_its_spans_in_one_batched_call() -> lsm_tree::Result<()> {
+    const N: usize = 256;
+    const WINDOW: u16 = 64;
+    // 8 records per blob file: a 64-record window spans 8 files, so 8 spans.
+    const FLUSH_EVERY: usize = 8;
+
+    let dir = tempfile::tempdir()?;
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seqno = SequenceNumberCounter::default();
+    let config = || {
+        Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+            .with_shared_fs(std::sync::Arc::new(BatchCountFs(std::sync::Arc::clone(
+                &calls,
+            ))))
+            .with_kv_separation(Some(
+                KvSeparationOptions::default()
+                    .separation_threshold(1)
+                    .scan_prefetch(WINDOW),
+            ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..N {
+            tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+            if (i + 1) % FLUSH_EVERY == 0 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // Reopened, so no value is in the cache the writes filled.
+    let tree = config().open()?;
+    calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+
+    let items = collect(&tree)?;
+    assert_eq!(items.len(), N);
+    for (i, (key, value)) in items.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+
+    let calls = calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let windows = N.div_ceil(usize::from(WINDOW));
+    assert!(
+        calls.len() <= windows + 1,
+        "{} batched reads for {windows} windows: {calls:?}",
+        calls.len()
+    );
+    assert!(
+        calls.iter().any(|&reqs| reqs >= 8),
+        "a window's spans travel together: {calls:?}"
+    );
     Ok(())
 }
 
