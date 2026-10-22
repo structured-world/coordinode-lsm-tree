@@ -8711,6 +8711,75 @@ impl Table {
         Ok(out)
     }
 
+    /// The data blocks that can hold a version of `key`, whatever its seqno,
+    /// found through the index alone, with the table's file to read them
+    /// through. A key's versions run from the block its first one is in
+    /// through every block ending on the key.
+    ///
+    /// # Errors
+    ///
+    /// The index or the file fails to read.
+    pub(crate) fn key_blocks(
+        &self,
+        key: &[u8],
+    ) -> crate::Result<(Arc<dyn crate::fs::FsFile>, Vec<BlockHandle>)> {
+        let file = self.open_file()?;
+        let mut blocks = Vec::new();
+        if let Some(mut index) = self.block_index.forward_reader(key, SeqNo::MAX) {
+            let fd = LookupFd::default();
+            while let Some(handle) = index.next_with(&fd) {
+                let handle = handle?;
+                // A block ending before the key holds none of it; one ending
+                // on it may be followed by older versions in the next.
+                match self.comparator.compare(key, handle.end_key()) {
+                    core::cmp::Ordering::Greater => {}
+                    core::cmp::Ordering::Equal => blocks.push(*handle.as_ref()),
+                    core::cmp::Ordering::Less => {
+                        blocks.push(*handle.as_ref());
+                        break;
+                    }
+                }
+            }
+        }
+        Ok((file, blocks))
+    }
+
+    /// The versions of `key` in `blocks`, the blocks [`Self::key_blocks`]
+    /// names, newest first, with their global seqnos, of those visible at
+    /// `seqno`; and whether the table holds a version of the key at all,
+    /// whatever its seqno, as the table's reader reports it.
+    pub(crate) fn key_versions(
+        &self,
+        blocks: &[DataBlock],
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> (Vec<InternalValue>, bool) {
+        let global_seqno = self.global_seqno();
+        let mut versions = Vec::new();
+        let mut found = false;
+        for block in blocks {
+            let data = &block.inner.data;
+            let mut entries = block.iter(self.comparator.clone());
+            if !entries.seek(key, SeqNo::MAX) {
+                continue;
+            }
+            for item in entries {
+                let mut version = item.materialize(data);
+                match self.comparator.compare(&version.key.user_key, key) {
+                    core::cmp::Ordering::Less => continue,
+                    core::cmp::Ordering::Greater => break,
+                    core::cmp::Ordering::Equal => {}
+                }
+                found = true;
+                version.key.seqno = apply_global_seqno(version.key.seqno, global_seqno);
+                if crate::range::seqno_filter(version.key.seqno, seqno) {
+                    versions.push(version);
+                }
+            }
+        }
+        (versions, found)
+    }
+
     /// The entries of the block `handle` names whose local seqno lies in
     /// `window`, with their global seqnos, appended to `out`.
     fn collect_seqno_range(
@@ -10035,6 +10104,12 @@ impl Table {
         self.1
             .as_ref()
             .is_some_and(|bound| self.comparator.compare(key, bound) == core::cmp::Ordering::Less)
+    }
+
+    /// Whether this version sees the table only from a tight-space
+    /// restriction's bound up.
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.1.is_some()
     }
 
     /// Returns a view of this table restricted to keys `>= lower`, for

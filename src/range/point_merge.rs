@@ -318,6 +318,18 @@ impl TableFilter {
         self.0 == FilterAnswer::Absent
     }
 
+    /// Counts the false positive of the probe a filter let through when
+    /// `table`, read for the key, `found` no version of it at all, as the
+    /// table's reader counts it in [`Self::versions`].
+    pub(crate) fn settle(self, table: &Table, found: bool) {
+        if !found && self.0.passed() && table.probe_stats().is_some() {
+            table.count_probes(crate::table::probe_stats::ProbeCounts {
+                probes: 0,
+                negatives: 1,
+            });
+        }
+    }
+
     /// `table`'s versions of `key` at `seqno`, newest first, read through the
     /// table's reader, which counts the filter's false positive when it holds
     /// none. Nothing for a table the filter ruled out.

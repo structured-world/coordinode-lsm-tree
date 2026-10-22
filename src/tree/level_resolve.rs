@@ -479,8 +479,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             JobDone::Planned { .. }
             | JobDone::Serial { .. }
             | JobDone::Value { .. }
-            | JobDone::MergeLocated { .. }
-            | JobDone::MergeVersions { .. } => {
+            | JobDone::MergeLocated { .. } => {
                 debug_assert!(false, "a job handed back to the data block phase");
                 Ok(())
             }

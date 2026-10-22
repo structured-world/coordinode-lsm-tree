@@ -135,28 +135,29 @@ pub(super) enum Job {
         blob_file: crate::vlog::BlobFileId,
     },
     /// Asks `table`'s filters about the key at `idx` for the merge tagged
-    /// `tag`, and finds the data blocks of the table holding versions of it
-    /// that the cache does not, for the read to bring in.
+    /// `tag`, and finds the data blocks of the table that can hold its
+    /// versions, for the read to bring in.
     MergeLocate {
         tag: usize,
         idx: usize,
         table: TableAt,
     },
-    /// Reads `table`'s versions of the key at `idx` for the merge tagged
-    /// `tag`, through the table's reader, after `filter` let the key through.
-    MergeVersions {
-        tag: usize,
-        idx: usize,
-        table: TableAt,
-        filter: crate::range::TableFilter,
-    },
 }
 
-/// What [`Job::MergeLocate`] found: the filter's answer, and the file and the
-/// uncached data blocks to read before the versions are, when there are any.
-pub(super) struct MergeLocated {
-    pub(super) filter: crate::range::TableFilter,
-    pub(super) reads: Option<(Arc<dyn FsFile>, Vec<BlockHandle>)>,
+/// What [`Job::MergeLocate`] found.
+pub(super) enum MergeLocated {
+    /// The table's versions of the key, newest first, read already: the
+    /// filter ruled the table out, or the table is read through its own
+    /// reader (a Page-ECC, columnar or restricted one).
+    Versions(Vec<InternalValue>),
+    /// The data blocks that can hold its versions, and the file they are
+    /// read through; their versions are taken out once they are in hand,
+    /// and `filter`'s false positive settled.
+    Blocks {
+        filter: crate::range::TableFilter,
+        file: Arc<dyn FsFile>,
+        blocks: Vec<BlockHandle>,
+    },
 }
 
 /// A finished [`Job`].
@@ -186,12 +187,6 @@ pub(super) enum JobDone {
     MergeLocated {
         tag: usize,
         located: crate::Result<MergeLocated>,
-    },
-    /// A table's versions of the key of the merge tagged `tag`, newest first,
-    /// down to its first base.
-    MergeVersions {
-        tag: usize,
-        versions: crate::Result<Vec<InternalValue>>,
     },
 }
 
@@ -278,66 +273,43 @@ impl Job {
                 located: table
                     .table(version)
                     .ok_or_else(misplaced)
-                    .map(|table| locate(table, ctx.key(idx), ctx.seqno)),
-            },
-            Self::MergeVersions {
-                tag,
-                idx,
-                table,
-                filter,
-            } => JobDone::MergeVersions {
-                tag,
-                versions: table
-                    .table(version)
-                    .ok_or_else(misplaced)
-                    .and_then(|table| {
-                        let mut versions = Vec::new();
-                        for version in filter.versions(table, ctx.key(idx), ctx.seqno) {
-                            let version = version?;
-                            // Older versions are hidden by the first base.
-                            let base = !version.key.value_type.is_merge_operand();
-                            versions.push(version);
-                            if base {
-                                break;
-                            }
-                        }
-                        Ok(versions)
-                    }),
+                    .and_then(|table| locate(table, ctx.key(idx), ctx.seqno)),
             },
         }
     }
 }
 
-/// Asks `table`'s filters about `key` and finds the data blocks holding its
-/// versions at `seqno` that the cache does not hold. Bringing them in is an
-/// optimization only: the versions are read through the table's reader after,
-/// which reads any block still missing itself, so a table whose blocks need
-/// their own load path, or whose plan fails, asks for none.
-fn locate(table: &Table, key: &[u8], seqno: SeqNo) -> MergeLocated {
+/// Asks `table`'s filters about `key`, counting the probe, and either reads
+/// the table's versions of it at `seqno` here, through the table's reader,
+/// or finds the data blocks that can hold them, for the batch to read: a
+/// table the filter rules out has none, and a Page-ECC or columnar table's
+/// blocks, or a restricted table's, are read through the reader that loads,
+/// rebuilds and bounds them.
+///
+/// # Errors
+///
+/// The versions, the index or the file fail to read.
+fn locate(table: &Table, key: &[u8], seqno: SeqNo) -> crate::Result<MergeLocated> {
     let filter = crate::range::TableFilter::of(table, key);
-    if filter.absent() || table.is_chunk_special() || table.is_below_restriction(key) {
-        return MergeLocated {
-            filter,
-            reads: None,
-        };
+    if filter.absent() || table.is_chunk_special() || table.is_restricted() {
+        let mut versions = Vec::new();
+        for version in filter.versions(table, key, seqno) {
+            let version = version?;
+            // Older versions are hidden by the first base.
+            let base = !version.key.value_type.is_merge_operand();
+            versions.push(version);
+            if base {
+                break;
+            }
+        }
+        return Ok(MergeLocated::Versions(versions));
     }
-    // The plan probes the filter again into a tally of its own, which is
-    // never counted: the probe above is the one the merge counts.
-    let mut tally = PlanCounts::default();
-    let reads = table
-        .plan_block_tasks(&[(key, crate::hash::hash64(key))], seqno, &mut tally)
-        .ok()
-        .flatten()
-        .map(|(file, _, _, blocks)| {
-            let missing = blocks
-                .into_iter()
-                .map(|(handle, _)| handle)
-                .filter(|handle| !table.cache.has_block(table.global_id(), handle.offset()))
-                .collect::<Vec<_>>();
-            (file, missing)
-        })
-        .filter(|(_, missing)| !missing.is_empty());
-    MergeLocated { filter, reads }
+    let (file, blocks) = table.key_blocks(key)?;
+    Ok(MergeLocated::Blocks {
+        filter,
+        file,
+        blocks,
+    })
 }
 
 /// Where a read's asks go as it makes them. A driver that submits a block
