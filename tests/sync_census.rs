@@ -763,6 +763,63 @@ fn a_creation_in_a_folder_that_exists_syncs_nothing_above_it() {
     assert!(above.is_empty(), "synced above the tree: {above:?}");
 }
 
+/// A batch of new trees in one folder syncs that folder once, after every
+/// tree's snapshot, where as many single creations sync it once each; each
+/// tree still syncs its own snapshot and folder.
+#[test]
+fn a_batch_of_trees_syncs_their_folder_once() {
+    use lsm_tree::fs::Fs;
+    const TREES: usize = 5;
+    let data = std::path::absolute("/census/batch").expect("absolute path");
+    for batched in [true, false] {
+        let fs = Arc::new(FaultFs::new(MemFs::new()));
+        fs.create_dir_all(&data).expect("the data folder");
+        let configs = (0..TREES).map(|i| {
+            Config::new(
+                data.join(format!("tree{i}")),
+                SequenceNumberCounter::default(),
+                SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(fs.clone())
+        });
+        let trees = if batched {
+            Config::open_many(configs).expect("open the batch")
+        } else {
+            configs.map(|config| config.open().expect("open")).collect()
+        };
+        assert_eq!(trees.len(), TREES);
+        let syncs = fs.injector().take_syncs();
+        let of = |wanted: &dyn Fn(&Path, SyncKind) -> bool| -> Vec<usize> {
+            syncs
+                .iter()
+                .enumerate()
+                .filter(|(_, (path, kind))| wanted(path, *kind))
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let parent = of(&|path, kind| kind == SyncKind::Directory && path == data);
+        let snapshots = of(&|path, kind| {
+            kind == SyncKind::FileData
+                && path
+                    .parent()
+                    .is_some_and(|folder| folder.parent() == Some(&*data))
+        });
+        let tree_folders =
+            of(&|path, kind| kind == SyncKind::Directory && path.parent() == Some(&*data));
+        assert_eq!(snapshots.len(), TREES, "batched: {batched}: {syncs:?}");
+        assert_eq!(tree_folders.len(), TREES, "batched: {batched}: {syncs:?}");
+        if batched {
+            assert_eq!(parent.len(), 1, "one sync of the data folder: {syncs:?}");
+            assert!(
+                snapshots.iter().all(|at| *at < parent[0]),
+                "after every snapshot: {syncs:?}"
+            );
+        } else {
+            assert_eq!(parent.len(), TREES, "one per creation: {syncs:?}");
+        }
+    }
+}
+
 /// Under barrier syncs a deep route on another device than the tree's
 /// flushes that device once, with the last of its folder syncs; the ones
 /// before it are ordered ahead of it on the same device.

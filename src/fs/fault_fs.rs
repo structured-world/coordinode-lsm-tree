@@ -328,16 +328,27 @@ pub struct FaultInjector {
     /// Whether a removal of a file with an open handle fails, as on a backend
     /// that refuses to unlink an open file.
     refuse_open_removal: core::sync::atomic::AtomicBool,
+    /// How many more syncs pass before the power is off, when set: see
+    /// [`Self::power_off_after_syncs`].
+    power: spin::Mutex<Option<usize>>,
     /// Called on a positional read at the paired offset of a file whose path
     /// contains the paired text, before the read is served, so a test can
     /// hold a read in flight while other readers run.
     #[cfg(test)]
     read_hooks: spin::Mutex<Vec<(String, u64, ReadHook)>>,
+    /// Called on a removal of a path containing the paired text, before the
+    /// removal is done, so a test can see the state the removal happens in.
+    #[cfg(test)]
+    removal_hooks: spin::Mutex<Vec<(String, RemovalHook)>>,
 }
 
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
 pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+
+/// What a test runs before a removal, given the removal's kind and path.
+#[cfg(test)]
+pub type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
 
 std::thread_local! {
     /// The injectors whose batches and queue waits this thread is inside:
@@ -596,6 +607,62 @@ impl FaultInjector {
         }
     }
 
+    /// Lets `syncs` more syncs of files and directories through, then fails
+    /// every later one, and every rename and removal, with
+    /// [`io::ErrorKind::Other`]: what a host whose power went out after the
+    /// last sync let through still makes nothing durable. Over a
+    /// [`CrashFs`](crate::fs::CrashFs), whose crash then keeps what those
+    /// syncs made durable, it is a power loss at that point of a run, however
+    /// the code that sees the failures goes on.
+    ///
+    /// Renames and removals are refused rather than let through because the
+    /// crash simulator does not bring a removed name back. A device sync
+    /// ([`Fs::sync_device`]) is neither counted nor refused.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::{CrashFs, FaultFs, Fs, MemFs};
+    /// use std::path::Path;
+    ///
+    /// let crash = CrashFs::new(MemFs::new()).tracking_folders();
+    /// let fs = FaultFs::new(crash.clone());
+    /// fs.injector().power_off_after_syncs(1);
+    /// fs.create_dir_all(Path::new("/kept"))?;
+    /// fs.sync_directory(Path::new("/"))?;
+    /// fs.create_dir_all(Path::new("/lost"))?;
+    /// assert!(fs.sync_directory(Path::new("/")).is_err());
+    /// crash.crash();
+    /// assert!(crash.exists(Path::new("/kept"))?);
+    /// assert!(!crash.exists(Path::new("/lost"))?);
+    /// # Ok::<(), lsm_tree::io::Error>(())
+    /// ```
+    pub fn power_off_after_syncs(&self, syncs: usize) {
+        *self.power.lock() = Some(syncs);
+    }
+
+    /// Whether the power is off for an operation of `op`, counting it when it
+    /// is a sync that still passes.
+    fn powered_off(&self, op: FaultOp) -> bool {
+        let mut power = self.power.lock();
+        let Some(left) = power.as_mut() else {
+            return false;
+        };
+        match op {
+            FaultOp::SyncDirectory | FaultOp::SyncAll | FaultOp::SyncData => {
+                if *left == 0 {
+                    return true;
+                }
+                *left -= 1;
+                false
+            }
+            FaultOp::Rename | FaultOp::RemoveFile | FaultOp::RemoveDir | FaultOp::RemoveDirAll => {
+                *left == 0
+            }
+            _ => false,
+        }
+    }
+
     /// Arms `rule`. Rules are evaluated in arm order; the first rule that
     /// matches an operation owns that occurrence (whether it is skipping,
     /// firing, or exhausted), so a later rule never fires on an operation an
@@ -609,6 +676,30 @@ impl FaultInjector {
     #[cfg(test)]
     pub(crate) fn hook_read_at(&self, path: impl Into<String>, offset: u64, hook: ReadHook) {
         self.read_hooks.lock().push((path.into(), offset, hook));
+    }
+
+    /// Runs `hook` before every removal (of a file, a folder, or a folder and
+    /// all it holds) of a path containing `path`.
+    #[cfg(test)]
+    pub(crate) fn hook_removal(&self, path: impl Into<String>, hook: RemovalHook) {
+        self.removal_hooks.lock().push((path.into(), hook));
+    }
+
+    /// Runs the hooks armed for a removal of kind `op` of `path`, outside the
+    /// hook list's lock so a hook may use the backend.
+    #[cfg(test)]
+    fn run_removal_hooks(&self, op: FaultOp, path: &Path) {
+        let spelled = path.to_string_lossy();
+        let hooks: Vec<RemovalHook> = self
+            .removal_hooks
+            .lock()
+            .iter()
+            .filter(|(within, _)| spelled.contains(within.as_str()))
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
+            hook(op, path);
+        }
     }
 
     /// Runs the hooks armed for a read at `offset` of `path`, outside the
@@ -656,8 +747,9 @@ impl FaultInjector {
     }
 
     /// Removes all armed rules AND the recorded observations (sync modes, the
-    /// read count and the open count), resetting the injector so a later phase
-    /// cannot see state recorded before the `clear()`.
+    /// read count and the open count), and turns the power back on (see
+    /// [`Self::power_off_after_syncs`]), resetting the injector so a later
+    /// phase cannot see state recorded before the `clear()`.
     pub fn clear(&self) {
         {
             // Under the rules' lock, as a refund and a counted screening are:
@@ -675,6 +767,9 @@ impl FaultInjector {
         self.writeback_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();
+        #[cfg(test)]
+        self.removal_hooks.lock().clear();
+        *self.power.lock() = None;
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
@@ -737,6 +832,9 @@ impl FaultInjector {
     /// matched rule's skip/fire counters. Returns the [`Fault`] to apply, or
     /// `None` to let the operation proceed normally.
     fn check(&self, op: FaultOp, path: Option<&Path>) -> Option<Fault> {
+        if self.powered_off(op) {
+            return Some(Fault::Error(io::ErrorKind::Other));
+        }
         let mut rules = self.rules.lock();
         for rule in rules.iter_mut() {
             if !rule.matches(op, path) {
@@ -1004,6 +1102,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveFile, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveFile, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveFile));
         }
@@ -1017,6 +1117,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveDirAll, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDirAll, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveDirAll));
         }
@@ -1024,6 +1126,8 @@ impl<F: Fs> Fs for FaultFs<F> {
     }
 
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        self.injector.run_removal_hooks(FaultOp::RemoveDir, path);
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::RemoveDir, Some(path)) {
             return Err(fault_error(kind, FaultOp::RemoveDir));
         }

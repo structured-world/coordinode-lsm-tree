@@ -37,11 +37,14 @@
 //! A new directory entry (a created file, the destination of a rename, a hard
 //! link or a reflink) is durable only once its parent directory is synced, as
 //! POSIX promises: `crash()` removes a file whose entry was never made durable,
-//! even when its content was synced. The directory synced is matched by what
+//! even when its content was synced. A new folder is durable from its
+//! creation, unless [`CrashFs::tracking_folders`] makes its entry follow the
+//! same rule: then `crash()` removes a folder whose entry was never made
+//! durable, with everything under it. The directory synced is matched by what
 //! the backend reports as the same directory, so any spelling of it covers
 //! its entries. Removed entries are not brought back, except a durable file
-//! removed behind a [`SyncMode::Barrier`] sync a power loss loses (see
-//! below), and directories themselves are not rolled back. Opens, operations that make or remove
+//! removed behind a [`SyncMode::Barrier`] sync a power loss loses (see below),
+//! and a removed folder is not put back. Opens, operations that make or remove
 //! entries, and directory syncs are linearized: each
 //! happens wholly before or wholly after any other, so an entry is made
 //! either before a sync that then covers it or after one that does not.
@@ -322,6 +325,35 @@ impl CrashState {
         }
     }
 
+    /// Forgets the folder `path` and every name under it, gone from the
+    /// namespace with it.
+    fn forget_under(&mut self, path: &Path) {
+        // A linked name under the directory hands what its file went through
+        // to the names that survive outside it.
+        let linked: Vec<PathBuf> = self
+            .link_group
+            .keys()
+            .filter(|k| k.starts_with(path))
+            .cloned()
+            .collect();
+        for name in &linked {
+            self.forget_name(name);
+        }
+        self.durable.retain(|k, _| !k.starts_with(path));
+        self.touched.retain(|k| !k.starts_with(path));
+        self.links.retain(|k, _| !k.starts_with(path));
+        self.unlinked.retain(|k, _| !k.starts_with(path));
+        self.pending_entries.retain(|k| !k.starts_with(path));
+        self.ordered.retain_mut(|sync| match sync {
+            Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
+            Ordered::Renamed { from, to, .. } => !from.starts_with(path) && !to.starts_with(path),
+            Ordered::Entries(entries) => {
+                entries.retain(|(entry, _)| !entry.starts_with(path));
+                true
+            }
+        });
+    }
+
     /// Records `dst` as a hard link of the file `src` names.
     fn link(&mut self, src: &Path, dst: &Path) {
         let group = if let Some(&group) = self.link_group.get(src) {
@@ -394,6 +426,8 @@ pub struct CrashFs {
     /// other entry change can interleave with. Blocking, not spinning: a
     /// directory sync holds it across a system call.
     namespace: Arc<parking_lot::Mutex<()>>,
+    /// Whether a new folder's entry is durable only once its parent is synced.
+    folders: bool,
 }
 
 impl CrashFs {
@@ -412,7 +446,36 @@ impl CrashFs {
             inner,
             state: Arc::new(spin::Mutex::new(CrashState::default())),
             namespace: Arc::new(parking_lot::Mutex::new(())),
+            folders: false,
         }
+    }
+
+    /// Makes a folder made from here on durable only once the folder above it
+    /// is synced, as a file is: a [`crash`](Self::crash) removes one whose
+    /// entry no sync covered, with everything under it.
+    ///
+    /// Off by default, so that a test may make the folders it works in
+    /// without syncing the ones above them.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::{CrashFs, Fs, MemFs};
+    /// use std::path::Path;
+    ///
+    /// let fs = CrashFs::new(MemFs::new()).tracking_folders();
+    /// fs.create_dir_all(Path::new("/kept"))?;
+    /// fs.sync_directory(Path::new("/"))?;
+    /// fs.create_dir_all(Path::new("/lost"))?;
+    /// fs.crash();
+    /// assert!(fs.exists(Path::new("/kept"))?);
+    /// assert!(!fs.exists(Path::new("/lost"))?);
+    /// # Ok::<(), lsm_tree::io::Error>(())
+    /// ```
+    #[must_use]
+    pub fn tracking_folders(mut self) -> Self {
+        self.folders = true;
+        self
     }
 
     /// Returns a clone of the wrapped backend handle, for reopening the engine
@@ -459,7 +522,31 @@ impl CrashFs {
         // An entry its directory never made durable is lost with whatever
         // content it had.
         let lost: Vec<PathBuf> = state.pending_entries.drain().collect();
+        // A folder whose entry is lost takes everything under it, whatever
+        // its own syncs made durable there. Shallowest first, so a folder
+        // inside another lost one is gone with it.
+        let mut lost_folders: Vec<&PathBuf> = lost
+            .iter()
+            .filter(|path| {
+                !matches!(self.inner.read_link(path), Ok(Some(_)))
+                    && self.inner.metadata(path).is_ok_and(|meta| meta.is_dir)
+            })
+            .collect();
+        lost_folders.sort_by_key(|path| path.components().count());
+        for folder in lost_folders {
+            match self.inner.remove_dir_all(folder) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => panic!(
+                    "crash(): removing the un-synced folder {} failed: {e}",
+                    folder.display()
+                ),
+            }
+            state.forget_under(folder);
+        }
         for path in &lost {
+            // One gone with a lost folder above it is gone already: its
+            // removal below finds nothing.
             state.durable.remove(path);
             state.links.remove(path);
             state.link_group.remove(path);
@@ -524,32 +611,7 @@ impl CrashFs {
     /// whose parent is gone.
     fn forget_folder(&self, path: &Path) {
         let name = self.name_after(path);
-        let path = name.as_path();
-        let mut state = self.state.lock();
-        // A linked name under the directory hands what its file went through
-        // to the names that survive outside it.
-        let linked: Vec<PathBuf> = state
-            .link_group
-            .keys()
-            .filter(|k| k.starts_with(path))
-            .cloned()
-            .collect();
-        for name in &linked {
-            state.forget_name(name);
-        }
-        state.durable.retain(|k, _| !k.starts_with(path));
-        state.touched.retain(|k| !k.starts_with(path));
-        state.links.retain(|k, _| !k.starts_with(path));
-        state.unlinked.retain(|k, _| !k.starts_with(path));
-        state.pending_entries.retain(|k| !k.starts_with(path));
-        state.ordered.retain_mut(|sync| match sync {
-            Ordered::Image(name, _) | Ordered::Removed(name, _) => !name.starts_with(path),
-            Ordered::Renamed { from, to, .. } => !from.starts_with(path) && !to.starts_with(path),
-            Ordered::Entries(entries) => {
-                entries.retain(|(entry, _)| !entry.starts_with(path));
-                true
-            }
-        });
+        self.state.lock().forget_under(&name);
     }
 
     /// Captures what the name `name` holds before a queued step may take it,
@@ -965,11 +1027,41 @@ impl Fs for CrashFs {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        self.inner.create_dir_all(path)
+        if !self.folders {
+            return self.inner.create_dir_all(path);
+        }
+        let _namespace = self.namespace.lock();
+        // Each folder of the chain that did not exist gets an entry in the one
+        // above it, durable only once that one is synced.
+        // A root has no entry anywhere, whatever the backend says of it.
+        let mut made = Vec::new();
+        let mut at = path;
+        while !self.inner.exists(at)? {
+            let Some(parent) = at.parent() else {
+                break;
+            };
+            made.push(at.to_path_buf());
+            // A bare name's entry is in the current directory.
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            at = parent;
+        }
+        self.inner.create_dir_all(path)?;
+        for folder in made {
+            self.new_entry(&self.name_after(&folder));
+        }
+        Ok(())
     }
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {
-        self.inner.create_dir(path)
+        if !self.folders {
+            return self.inner.create_dir(path);
+        }
+        let _namespace = self.namespace.lock();
+        self.inner.create_dir(path)?;
+        self.new_entry(&self.name_after(path));
+        Ok(())
     }
 
     fn read_dir(&self, path: &Path) -> io::Result<Vec<FsDirEntry>> {

@@ -1436,14 +1436,61 @@ impl Config {
         self.open_with(
             #[cfg(feature = "std")]
             DirectoryLock::Acquire,
+            crate::tree::NewFolderNames::Synced,
         )
+        .map(|(tree, _)| tree)
     }
 
-    /// [`Self::open`], coming by the directory lock as `lock` says.
+    /// Opens a tree for each config, making each one that does not exist
+    /// yet, and makes the new trees' folder names durable with one sync of
+    /// each folder that holds them, after all of them are made, rather than
+    /// one sync of it per tree. A consumer that makes many trees in one data
+    /// directory at once pays one device flush for that directory.
+    ///
+    /// The trees come back in the order of `configs`. They are durable once
+    /// this returns: before that a power loss may take back any new tree of
+    /// the batch, with everything in it. A batch that fails takes back every
+    /// tree it made and closes the ones it opened, so a retry finds what was
+    /// there before it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`], for the first config whose tree fails to open, or a
+    /// failed sync of a folder holding a new tree's name.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::MemFs;
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    /// use std::sync::Arc;
+    ///
+    /// let fs = Arc::new(MemFs::new());
+    /// let config = |name: &str| {
+    ///     Config::new(
+    ///         format!("/data/{name}"),
+    ///         SequenceNumberCounter::default(),
+    ///         SequenceNumberCounter::default(),
+    ///     )
+    ///     .with_shared_fs(fs.clone())
+    /// };
+    /// let trees = Config::open_many([config("nodes"), config("edges")])?;
+    /// trees[0].insert("a", "node", 0);
+    /// assert!(trees[1].is_empty(lsm_tree::SeqNo::MAX, None)?);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn open_many(configs: impl IntoIterator<Item = Self>) -> crate::Result<Vec<AnyTree>> {
+        crate::tree::open_batch(configs)
+    }
+
+    /// [`Self::open`], coming by the directory lock as `lock` says, and
+    /// leaving the new tree folder's name to its caller to sync as `names`
+    /// says; with the tree, when this open made it, what takes it back.
     pub(crate) fn open_with(
         self,
         #[cfg(feature = "std")] lock: DirectoryLock,
-    ) -> crate::Result<AnyTree> {
+        names: crate::tree::NewFolderNames,
+    ) -> crate::Result<(AnyTree, Option<crate::tree::Creation>)> {
         // The dictionary registry is loaded and the compression policy validated
         // inside `Tree::open`, under the directory lock — NOT here. Both read the
         // tree's `dicts/` folder, and the load SWEEPS unpublished temps; doing
@@ -1468,17 +1515,21 @@ impl Config {
         }
 
         Ok(if self.kv_separation_opts.is_some() {
-            AnyTree::Blob(BlobTree::open(
+            let (tree, creation) = BlobTree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
-            )?)
+                names,
+            )?;
+            (AnyTree::Blob(tree), creation)
         } else {
-            AnyTree::Standard(Tree::open(
+            let (tree, creation) = Tree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
-            )?)
+                names,
+            )?;
+            (AnyTree::Standard(tree), creation)
         })
     }
 

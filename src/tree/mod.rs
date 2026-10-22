@@ -4603,10 +4603,17 @@ impl Tree {
     /// `lock` says how the open comes by the directory lock: a caller that
     /// wrote the tree's files under it passes it in, so no other opener gets
     /// in between.
+    ///
+    /// `names` says who syncs the folders that gain an entry when the open
+    /// makes the tree's folder.
+    ///
+    /// Returns the tree, and when this open made it rather than recovering
+    /// one, what takes it back.
     pub(crate) fn open(
         config: Config,
         #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
-    ) -> crate::Result<Self> {
+        names: NewFolderNames,
+    ) -> crate::Result<(Self, Option<Creation>)> {
         log::debug!("Opening LSM-tree at {}", config.path.display());
 
         // Resolve the per-tree compaction compression pool once, at open: if the
@@ -4667,6 +4674,14 @@ impl Tree {
             .iter()
             .map(|holder| (holder.clone(), Arc::clone(&config.fs)))
             .collect();
+        // What the tree folder holds before this open, when it exists: a tree
+        // the open makes there and then takes back takes back only what it
+        // added.
+        let found = if made_by_open.is_empty() {
+            Some(folder_entries(&*config.fs, &config.path)?)
+        } else {
+            None
+        };
         #[cfg(feature = "std")]
         let directory_lock = match lock {
             crate::config::DirectoryLock::Held(held) => held,
@@ -4864,6 +4879,14 @@ impl Tree {
             }
         };
 
+        let creation = (!recovering).then(|| Creation {
+            path: config.path.clone(),
+            fs: Arc::clone(&config.fs),
+            holders: made_by_open.clone(),
+            found,
+            names,
+            sync_mode: config.sync_mode,
+        });
         let tree = if recovering {
             Self::recover(
                 config,
@@ -4874,6 +4897,7 @@ impl Tree {
             Self::create_new(
                 config,
                 &made_by_open,
+                names,
                 #[cfg(feature = "std")]
                 directory_lock,
             )
@@ -4892,7 +4916,7 @@ impl Tree {
         // After the recover / create above, because registering installs a
         // version edit and there is no history to install into before that.
         #[cfg(zstd_any)]
-        for dict in [
+        let registered = [
             tree.config.zstd_dictionary.clone(),
             tree.config
                 .kv_separation_opts
@@ -4901,11 +4925,18 @@ impl Tree {
         ]
         .into_iter()
         .flatten()
-        {
-            tree.register_zstd_dictionary(dict)?;
+        .try_for_each(|dict| tree.register_zstd_dictionary(dict));
+        // A tree this open made, whose open then fails, is taken back: the
+        // caller is told it was not opened, and a retry makes it anew.
+        #[cfg(zstd_any)]
+        if let Err(e) = registered {
+            if let Some(creation) = creation {
+                creation.take_back(tree);
+            }
+            return Err(e);
         }
 
-        Ok(tree)
+        Ok((tree, creation))
     }
 
     /// Returns `true` if there are some tables that are being compacted.
@@ -5844,6 +5875,8 @@ impl Tree {
         // The folders that gained an entry when `Tree::open` made the tree
         // folder, to lock it.
         made_by_open: &[crate::path::PathBuf],
+        // Whether this creation syncs those folders, or its caller does.
+        names: NewFolderNames,
         // The cross-process directory lock acquired by `Tree::open`, held for
         // the tree's lifetime.
         #[cfg(feature = "std")] directory_lock: Option<Box<dyn crate::fs::FsFile>>,
@@ -5873,7 +5906,9 @@ impl Tree {
         // tree's own backend is the one exception: the directory sync that
         // makes the snapshot's name durable makes every name made in it
         // durable too. A route on another backend holds its own names, even
-        // one whose path lies inside the tree folder.
+        // one whose path lies inside the tree folder. The folders above the
+        // tree folder are left to the caller under `NewFolderNames::Deferred`,
+        // which syncs them once for a batch of trees after all of them.
         let mut holders: Vec<(PathBuf, Arc<dyn Fs>)> = Vec::new();
         // Every folder a chain made, on its backend: what a failed creation
         // removes, so a retry makes the chain anew and syncs it, rather than
@@ -5884,8 +5919,10 @@ impl Tree {
         for folder in made_folders(&path, made_by_open) {
             once(&mut made, &folder, &config.fs);
         }
-        for holder in made_by_open {
-            once(&mut holders, holder, &config.fs);
+        if names == NewFolderNames::Synced {
+            for holder in made_by_open {
+                once(&mut holders, holder, &config.fs);
+            }
         }
 
         let built = (|| -> crate::Result<()> {
@@ -6904,6 +6941,311 @@ impl Tree {
     }
 }
 
+/// Who syncs the folders that gain an entry when an open makes a tree's
+/// folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewFolderNames {
+    /// The open, before the tree's first snapshot.
+    Synced,
+    /// The open's caller, once for a batch of trees after every one of them
+    /// is made.
+    Deferred,
+}
+
+/// A tree an open made, and what takes it back: its folder on its backend,
+/// the folders that gained an entry making that folder, what the folder held
+/// before the open when it existed, and who syncs those folders.
+pub struct Creation {
+    path: crate::path::PathBuf,
+    fs: Arc<dyn Fs>,
+    /// Nearest first; none when the tree folder existed already.
+    holders: Vec<crate::path::PathBuf>,
+    /// The names in the tree folder before the open; `None` when the open
+    /// made the folder.
+    found: Option<Vec<alloc::string::String>>,
+    names: NewFolderNames,
+    sync_mode: crate::fs::SyncMode,
+}
+
+impl Creation {
+    /// Takes back `tree`, which this open made: what it put in its folder goes
+    /// while its lock is still held, then the folders the open made, once
+    /// empty, and the folders that held their names are synced where the open
+    /// synced them, so the tree does not come back after a power loss.
+    pub fn take_back(self, tree: Tree) {
+        #[cfg(feature = "std")]
+        let lock = tree.0.directory_lock.clone();
+        drop(tree);
+        self.empty();
+        #[cfg(feature = "std")]
+        drop(lock);
+        undo_creation(None, self.made_folders(), &[]);
+        if self.names == NewFolderNames::Synced {
+            sync_made_names(&self.holders_on_backend());
+        }
+    }
+
+    /// Removes what the tree put in its folder.
+    fn empty(&self) {
+        empty_tree_folder(&self.path, &self.fs, self.found.as_deref());
+    }
+
+    /// The folders the open made, on the tree's backend.
+    fn made_folders(&self) -> Vec<(crate::path::PathBuf, Arc<dyn Fs>)> {
+        made_folders(&self.path, &self.holders)
+            .into_iter()
+            .map(|folder| (folder, Arc::clone(&self.fs)))
+            .collect()
+    }
+
+    /// The folders that gained an entry for the tree folder, on its backend.
+    fn holders_on_backend(&self) -> Vec<(crate::path::PathBuf, Arc<dyn Fs>)> {
+        self.holders
+            .iter()
+            .map(|holder| (holder.clone(), Arc::clone(&self.fs)))
+            .collect()
+    }
+}
+
+/// The names in the folder `path`.
+fn folder_entries(fs: &dyn Fs, path: &Path) -> crate::Result<Vec<alloc::string::String>> {
+    Ok(fs
+        .read_dir(path)?
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .collect())
+}
+
+/// A tree a batch made, and while the batch runs, the tree's directory lock.
+struct BatchMade {
+    creation: Creation,
+    #[cfg(feature = "std")]
+    lock: Option<Arc<dyn crate::fs::FsFile>>,
+}
+
+/// Opens a tree for each config, making the missing ones, and syncs each
+/// folder that gained a new tree's name once, after all of them: see
+/// [`Config::open_many`].
+pub fn open_batch(configs: impl IntoIterator<Item = Config>) -> crate::Result<Vec<crate::AnyTree>> {
+    let mut trees = Vec::new();
+    let mut made: Vec<BatchMade> = Vec::new();
+    for config in configs {
+        let fs = Arc::clone(&config.fs);
+        let path = config.path.clone();
+        let sync_mode = config.sync_mode;
+        let holders = match new_entry_holders(&*fs, &path) {
+            Ok(holders) => holders,
+            Err(e) => {
+                undo_batch(trees, made, None);
+                return Err(e);
+            }
+        };
+        match config.open_with(
+            #[cfg(feature = "std")]
+            crate::config::DirectoryLock::Acquire,
+            NewFolderNames::Deferred,
+        ) {
+            Ok((tree, creation)) => {
+                // A tree made in a folder that existed already is the batch's
+                // as much as one whose folder it made: it is taken back too,
+                // though the folder stays.
+                if let Some(creation) = creation {
+                    made.push(BatchMade {
+                        #[cfg(feature = "std")]
+                        lock: batch_tree(&tree).0.directory_lock.clone(),
+                        creation,
+                    });
+                }
+                trees.push(tree);
+            }
+            Err(e) => {
+                // The failed open took back what it made; the folders that
+                // gained an entry for it are synced with the batch's.
+                let failed = Creation {
+                    path,
+                    fs,
+                    holders,
+                    found: None,
+                    names: NewFolderNames::Deferred,
+                    sync_mode,
+                };
+                undo_batch(trees, made, Some(&failed));
+                return Err(e);
+            }
+        }
+    }
+    let holders = batch_holders(made.iter().map(|tree| &tree.creation));
+    for (folder, fs, mode) in holders {
+        if let Err(e) = crate::file::fsync_directory(&folder, &*fs, mode) {
+            undo_batch(trees, made, None);
+            return Err(e.into());
+        }
+    }
+    Ok(trees)
+}
+
+/// The tree behind `tree`, whose folder holds the manifest and the lock.
+#[cfg(feature = "std")]
+fn batch_tree(tree: &crate::AnyTree) -> &Tree {
+    match tree {
+        crate::AnyTree::Standard(tree) => tree,
+        crate::AnyTree::Blob(tree) => &tree.index,
+    }
+}
+
+/// Whether `a` and `b` name one namespace of paths: one handle, or two
+/// handles of one backend, as configs made one by one each hold their own
+/// handle of the real file system.
+fn same_backend(a: &Arc<dyn Fs>, b: &Arc<dyn Fs>) -> bool {
+    Arc::ptr_eq(a, b) || a.backend_id().is_some_and(|id| b.backend_id() == Some(id))
+}
+
+/// The folders that hold the names of the trees `made`, each once, on its
+/// backend, with the sync that makes them durable: each tree's own mode where
+/// they agree and a full sync where they do not, and a full one under barrier
+/// syncs for a folder on another device than a tree it holds, whose own syncs
+/// a barrier there does not order.
+fn batch_holders<'a>(
+    made: impl Iterator<Item = &'a Creation>,
+) -> Vec<(crate::path::PathBuf, Arc<dyn Fs>, crate::fs::SyncMode)> {
+    use crate::fs::SyncMode;
+    let mut holders: Vec<(crate::path::PathBuf, Arc<dyn Fs>, SyncMode)> = Vec::new();
+    for tree in made {
+        let tree_volume = tree.fs.volume_id(&tree.path);
+        for folder in &tree.holders {
+            let volume = tree.fs.volume_id(folder);
+            let mode = if tree.sync_mode == SyncMode::Barrier
+                && (volume.is_none() || volume != tree_volume)
+            {
+                SyncMode::Full
+            } else {
+                tree.sync_mode
+            };
+            match holders
+                .iter_mut()
+                .find(|(at, on, _)| at == folder && same_backend(on, &tree.fs))
+            {
+                Some((_, _, held)) if *held != mode => *held = SyncMode::Full,
+                Some(_) => {}
+                None => holders.push((folder.clone(), Arc::clone(&tree.fs), mode)),
+            }
+        }
+    }
+    holders
+}
+
+/// Takes back a failed batch: closes the trees it opened, removes what each
+/// tree it made put in its folder while still holding that tree's lock, then
+/// the folders it made once they are empty, and makes the removals durable by
+/// syncing every folder that held a name the batch made, `failed`'s included,
+/// so no tree of the batch comes back after a power loss.
+fn undo_batch(trees: Vec<crate::AnyTree>, made: Vec<BatchMade>, failed: Option<&Creation>) {
+    let holders: Vec<(crate::path::PathBuf, Arc<dyn Fs>)> =
+        batch_holders(made.iter().map(|tree| &tree.creation).chain(failed))
+            .into_iter()
+            .map(|(folder, fs, _)| (folder, fs))
+            .collect();
+    // The trees close their files; each made one's lock stays held by `made`.
+    drop(trees);
+    // Another opener taking a lock now would have its tree taken back from
+    // under it: what each tree holds goes while its lock is held.
+    let mut folders = Vec::new();
+    for tree in &made {
+        tree.creation.empty();
+        folders.extend(tree.creation.made_folders());
+    }
+    // Then the locks go, and only folders left empty with them, deepest
+    // first: one the batch made for several of its trees goes after all of
+    // them, and one a lock no longer keeps another opener out of may hold
+    // that opener's tree by now.
+    #[cfg(feature = "std")]
+    for tree in made {
+        drop(tree.lock);
+    }
+    undo_creation(None, folders, &[]);
+    sync_made_names(&holders);
+}
+
+/// Removes what a tree made in the tree folder `path`, the lock file last:
+/// everything in a folder the open made (`found` is `None`), and in one that
+/// existed, holding `found`, only what was not there before. A tables or
+/// blob folder that was there was empty, as a creation requires, so what it
+/// holds now is the tree's. The lock file goes while the lock is still held,
+/// so no opener is left holding the lock of a file another one can make
+/// anew. What cannot be removed stays, and keeps the folder. A folder that
+/// existed is synced, so its emptying is durable and no snapshot of the tree
+/// comes back after a power loss.
+fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>, found: Option<&[alloc::string::String]>) {
+    let entries = match fs.read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!(
+                "could not list {} to take back the tree made there ({e})",
+                path.display()
+            );
+            return;
+        }
+    };
+    let (lock, rest): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| entry.file_name == crate::config::DIRECTORY_LOCK_FILE);
+    let remove = |at: &Path, is_dir: bool| {
+        let removed = if is_dir {
+            fs.remove_dir_all(at)
+        } else {
+            fs.remove_file(at)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(gone) if gone.kind() == crate::io::ErrorKind::NotFound => {}
+            Err(kept) => log::warn!(
+                "could not remove {} taking back the tree made there ({kept})",
+                at.display()
+            ),
+        }
+    };
+    for entry in rest.into_iter().chain(lock) {
+        let was_there = found.is_some_and(|found| found.contains(&entry.file_name));
+        if !was_there {
+            remove(&entry.path, entry.is_dir);
+        } else if entry.is_dir
+            && (entry.file_name == crate::file::TABLES_FOLDER
+                || entry.file_name == crate::file::BLOBS_FOLDER)
+        {
+            match fs.read_dir(&entry.path) {
+                Ok(inner) => {
+                    for inner in inner {
+                        remove(&inner.path, inner.is_dir);
+                    }
+                    // Files a power loss brought back here would read as a
+                    // half-written tree to the next open.
+                    if let Err(e) =
+                        crate::file::fsync_directory(&entry.path, &**fs, crate::fs::SyncMode::Full)
+                    {
+                        log::warn!(
+                            "could not sync {} after taking back the tree made there ({e})",
+                            entry.path.display()
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "could not list {} to take back the tree made there ({e})",
+                    entry.path.display()
+                ),
+            }
+        }
+    }
+    if found.is_some()
+        && let Err(e) = crate::file::fsync_directory(path, &**fs, crate::fs::SyncMode::Full)
+    {
+        log::warn!(
+            "could not sync {} after taking back the tree made there ({e}); a power loss \
+             may bring the tree back",
+            path.display()
+        );
+    }
+}
+
 /// Takes back what a failed creation made: the folders in `made`, so a retry
 /// makes them anew and syncs the folders `holders` that gained their names;
 /// or, where one cannot be removed, those syncs now, since a retry finds it
@@ -7203,6 +7545,9 @@ mod probe_stats_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod filter_advisor_tests;
+
+#[cfg(all(test, feature = "std"))]
+mod open_batch_tests;
 
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]

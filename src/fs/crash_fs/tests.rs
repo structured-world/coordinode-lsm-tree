@@ -100,6 +100,65 @@ fn a_synced_file_in_an_unsynced_directory_is_lost() {
     );
 }
 
+/// Tracking folders, a folder whose entry its parent never had synced is lost
+/// on a crash with everything under it, files whose bytes and entries were
+/// synced and folders inside it included; a folder whose entry was synced
+/// stays. Without tracking, every folder stays.
+#[test]
+fn a_folder_whose_entry_was_never_synced_is_lost_with_what_it_holds() {
+    for tracking in [true, false] {
+        let fs = CrashFs::new(MemFs::new());
+        let fs = if tracking { fs.tracking_folders() } else { fs };
+        fs.create_dir_all(Path::new("/d")).unwrap();
+        fs.sync_directory(Path::new("/")).unwrap();
+        fs.create_dir_all(Path::new("/d/sub/inner")).unwrap();
+        fs.sync_directory(Path::new("/d/sub")).unwrap();
+        let mut file = fs
+            .open(
+                Path::new("/d/sub/a"),
+                &FsOpenOptions::new().write(true).create_new(true),
+            )
+            .unwrap();
+        file.write_all(b"synced").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs.sync_directory(Path::new("/d/sub")).unwrap();
+
+        fs.crash();
+        assert!(fs.exists(Path::new("/d")).unwrap(), "tracking: {tracking}");
+        assert_eq!(
+            fs.exists(Path::new("/d/sub")).unwrap(),
+            !tracking,
+            "tracking: {tracking}"
+        );
+        if !tracking {
+            assert_eq!(read(&fs, "/d/sub/a"), b"synced");
+        }
+    }
+}
+
+/// A folder's entry under a barrier sync is durable once the device is
+/// flushed, and lost with the barrier without it; a folder made by one
+/// `create_dir` is tracked as one made by `create_dir_all`.
+#[test]
+fn a_folder_entry_behind_a_barrier_needs_the_device_flush() {
+    for flushed in [false, true] {
+        let fs = CrashFs::new(MemFs::new()).tracking_folders();
+        fs.create_dir(Path::new("/d")).unwrap();
+        fs.sync_directory_with(Path::new("/"), SyncMode::Barrier)
+            .unwrap();
+        if flushed {
+            fs.sync_device(Path::new("/")).unwrap();
+        }
+        fs.crash();
+        assert_eq!(
+            fs.exists(Path::new("/d")).unwrap(),
+            flushed,
+            "flushed: {flushed}"
+        );
+    }
+}
+
 /// A rename's new name is an entry of its own: without a sync of its
 /// directory it is lost, and the old name was removed.
 #[test]
