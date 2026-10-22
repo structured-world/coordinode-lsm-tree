@@ -252,12 +252,46 @@ impl<'v> MergeWalk<'v> {
         merge_operator: &Arc<dyn MergeOperator>,
         blob_source: Option<&BlobSource>,
     ) -> crate::Result<Option<InternalValue>> {
+        let super_version = self.super_version;
+        self.into_read()
+            .finish(super_version, merge_operator, blob_source)
+    }
+
+    /// What the walk read, holding no borrow, to resolve elsewhere: a base in
+    /// the value log is read as the merge resolves, which may block.
+    pub(crate) fn into_read(self) -> MergeRead {
+        MergeRead {
+            key: self.key,
+            entries: self.entries,
+            tombstones: self.tombstones,
+        }
+    }
+}
+
+/// The versions and tombstones a [`MergeWalk`] read of one key, holding no
+/// borrow of the version it read them from.
+pub struct MergeRead {
+    key: UserKey,
+    entries: Vec<(usize, InternalValue)>,
+    tombstones: Vec<(RangeTombstone, SeqNo)>,
+}
+
+impl MergeRead {
+    /// [`MergeWalk::finish`] over what the walk read in `super_version`.
+    ///
+    /// # Errors
+    ///
+    /// The merge operator fails, or a base in the value log fails to read.
+    pub(crate) fn finish(
+        self,
+        super_version: &SuperVersion,
+        merge_operator: &Arc<dyn MergeOperator>,
+        blob_source: Option<&BlobSource>,
+    ) -> crate::Result<Option<InternalValue>> {
         let Self {
-            super_version,
             key,
             mut entries,
             tombstones,
-            ..
         } = self;
         let comparator = super_version.active_memtable.comparator.as_ref();
         // Newest first; at one seqno the newer source first, as the point read

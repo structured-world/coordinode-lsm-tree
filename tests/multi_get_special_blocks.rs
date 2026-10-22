@@ -86,6 +86,90 @@ fn a_page_ecc_level_reads_its_data_blocks_in_one_batch() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A Page-ECC table's blocks the first multi-get kept in the cache serve the
+/// next one from there: a warm multi-get reads nothing.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn a_warm_page_ecc_level_reads_nothing() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    fill(&ecc_tree(dir.path(), &fs)?)?;
+    let tree = ecc_tree(dir.path(), &fs)?;
+    assert_answers(&tree.multi_get(keys(), SeqNo::MAX)?);
+    fs.take();
+
+    let values = tree.multi_get(keys(), SeqNo::MAX)?;
+    let calls = fs.take();
+
+    assert_answers(&values);
+    assert!(calls.is_empty(), "a warm level reads nothing: {calls:?}");
+    Ok(())
+}
+
+/// A merge over bases in a Page-ECC table reads that table's versions through
+/// its own reader, which recovers and checks its blocks, and answers what a
+/// read of each key alone answers.
+#[cfg(feature = "page_ecc")]
+#[test]
+fn merges_over_a_page_ecc_table_answer_as_single_reads() -> lsm_tree::Result<()> {
+    /// Appends every operand to the base.
+    struct Concat;
+
+    impl lsm_tree::MergeOperator for Concat {
+        fn merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> lsm_tree::Result<lsm_tree::UserValue> {
+            let mut merged = base.unwrap_or_default().to_vec();
+            for operand in operands {
+                merged.extend_from_slice(operand);
+            }
+            Ok(merged.into())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let open = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::new(fs.clone()))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(CACHE)))
+        .page_ecc(true)
+        .ecc_scheme(lsm_tree::runtime_config::EccScheme::Secded)
+        .with_merge_operator(Some(Arc::new(Concat)))
+        .open()
+    };
+    {
+        let tree = open()?;
+        fill(&tree)?;
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        for key in keys() {
+            tree.merge(key, "+", u64::from(ROWS) + 1);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = open()?;
+
+    let values = tree.multi_get(keys(), SeqNo::MAX)?;
+
+    for (key, value) in keys().iter().zip(&values) {
+        let row: u32 = key
+            .get(1..)
+            .and_then(|row| row.parse().ok())
+            .expect("a row");
+        let mut expected = value_for(row);
+        expected.push(b'+');
+        assert_eq!(value.as_deref(), Some(expected.as_slice()), "{key}");
+    }
+    Ok(())
+}
+
 /// A block whose payload Page-ECC has to correct answers what a read of the
 /// key alone answers: the batch hands it to the load path, which recovers it
 /// and schedules its heal.
@@ -159,5 +243,27 @@ fn a_columnar_level_reads_its_row_groups_in_one_batch() -> lsm_tree::Result<()> 
         calls.iter().any(|&reads| reads >= keys().len() / 2),
         "the row groups travel in one batch: {calls:?}"
     );
+    Ok(())
+}
+
+/// A columnar group whose directory the cache holds is loaded through its
+/// own path, which takes its pages from the cache: a warm multi-get answers
+/// what the cold one did.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_warm_columnar_level_answers_from_its_cached_groups() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    fill(&columnar_tree(dir.path(), &fs)?)?;
+    let tree = columnar_tree(dir.path(), &fs)?;
+    let cold = tree.multi_get(keys(), SeqNo::MAX)?;
+    fs.take();
+
+    let warm = tree.multi_get(keys(), SeqNo::MAX)?;
+    let calls = fs.take();
+
+    assert_eq!(warm, cold);
+    assert_answers(&warm);
+    assert!(calls.is_empty(), "a warm level reads nothing: {calls:?}");
     Ok(())
 }

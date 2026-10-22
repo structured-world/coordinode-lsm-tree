@@ -142,6 +142,12 @@ pub(super) enum Job {
         idx: usize,
         table: TableAt,
     },
+    /// Resolves the merge of the key at `idx` from what its walk read: a base
+    /// kept in the value log is read here.
+    MergeFinish {
+        idx: usize,
+        read: crate::range::MergeRead,
+    },
 }
 
 /// What [`Job::MergeLocate`] found.
@@ -274,6 +280,15 @@ impl Job {
                     .table(version)
                     .ok_or_else(misplaced)
                     .and_then(|table| locate(table, ctx.key(idx), ctx.seqno)),
+            },
+            Self::MergeFinish { idx, read } => JobDone::Value {
+                idx,
+                value: match &ctx.merge_operator {
+                    Some(operator) => read
+                        .finish(&ctx.super_version, operator, ctx.merge_base.as_ref())
+                        .map(|entry| entry.map(|entry| entry.value)),
+                    None => Err(misplaced()),
+                },
             },
         }
     }

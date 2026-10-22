@@ -54,6 +54,31 @@ fn a_batch_deeper_than_the_ring_reads_every_block_in_few_enters() {
     );
 }
 
+/// A batched read of a descriptor that is not open completes with `-EBADF`,
+/// which the batch reports as the read's error; a read returning fewer bytes
+/// than its block is a block cut off, not an end of file.
+#[test]
+fn a_batched_read_reports_an_errno_and_a_short_block() {
+    let mut ring = IoUringRaw::new(4).expect("ring setup");
+    let mut buf = [0u8; 8];
+    let reads = [RawRead {
+        fd: 1 << 30,
+        buf: buf.as_mut_ptr(),
+        len: 8,
+        offset: 0,
+    }];
+    let mut results = [0i32];
+    // SAFETY: `buf` outlives the call, which returns once the read completed.
+    unsafe { ring.read_batch(&reads, &mut results) };
+    let [res] = results;
+    let error = read_verdict(res, 8).expect_err("a read of no descriptor fails");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput, "EBADF: {error}");
+
+    let short = read_verdict(4, 8).expect_err("half a block is no block");
+    assert_eq!(short.kind(), ErrorKind::UnexpectedEof);
+    assert!(read_verdict(8, 8).is_ok());
+}
+
 /// `read_many` on one file is one batch too.
 #[cfg(feature = "std")]
 #[test]

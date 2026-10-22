@@ -155,6 +155,52 @@ fn a_window_reads_its_spans_in_one_batched_call() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A read-ahead whose batched read fails leaves its values cold, and each is
+/// read on its own when resolved: the scan still yields every value. The
+/// first read of the value log is the first value's own, which arms the
+/// read-ahead; the fault fires on the next, the read-ahead's.
+#[test_log::test]
+fn a_failed_read_ahead_leaves_the_values_to_their_own_reads() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    const N: usize = 200;
+    let dir = tempfile::tempdir()?;
+    drop(tree_with(dir.path(), 64, N, 0)?);
+    let fault = std::sync::Arc::new(FaultFs::new(StdFs));
+    let injector = fault.injector();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1)
+            .scan_prefetch(64),
+    ))
+    .open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::ReadAt,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("blobs")
+        .skip(1)
+        .once(),
+    );
+
+    let items = collect(&tree)?;
+    injector.clear();
+
+    assert_eq!(items.len(), N);
+    for (i, (key, value)) in items.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+    Ok(())
+}
+
 /// A window wider than the scan has entries left: the refill must stop at the
 /// end of the iterator rather than over-read, and the tail must still resolve.
 #[test_log::test]

@@ -188,6 +188,186 @@ fn a_multi_get_brings_the_blocks_its_merges_read_in_one_batch() -> lsm_tree::Res
     Ok(())
 }
 
+/// Merges whose bases share a block read that block once, however many of
+/// them wait on it: the batch carries no more reads than there are blocks.
+#[test]
+fn merges_sharing_a_base_block_read_it_once() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    {
+        let tree = merge_tree(dir.path(), &fs)?;
+        // Short bases: all of them fit a few blocks.
+        for i in 0..N {
+            tree.insert(key_for(i), format!("base-{i}"), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        for i in 0..N {
+            tree.merge(key_for(i), "+", (N + i) as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = merge_tree(dir.path(), &fs)?;
+    let keys: Vec<String> = (0..N).map(key_for).collect();
+    fs.take();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("base-{i}+").as_bytes()),
+            "key {i}"
+        );
+    }
+    assert!(
+        calls.iter().all(|&reads| reads <= 4),
+        "a shared block is read once, not once per merge: {calls:?}"
+    );
+    Ok(())
+}
+
+/// With values cached as they are read, a second multi-get answers from the
+/// cache what the first read from the value log, and reads none of them again.
+#[test]
+fn a_blob_tree_multi_get_caching_its_values_reads_them_once() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    drop(cold_tree(dir.path(), &fs)?);
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(fs.clone()))
+    .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+    .blob_cache_fill(lsm_tree::config::BlobCacheFill::Always)
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()?;
+    let keys: Vec<String> = (0..N).map(key_for).collect();
+    let first = tree.multi_get(&keys, SeqNo::MAX)?;
+    fs.take();
+
+    let second = tree.multi_get(&keys, SeqNo::MAX)?;
+    let calls = fs.take();
+
+    assert_eq!(second, first);
+    for (i, value) in second.iter().enumerate() {
+        assert_eq!(value.as_deref(), Some(value_for(i).as_slice()), "key {i}");
+    }
+    assert!(
+        calls.is_empty(),
+        "the values come from the cache: {calls:?}"
+    );
+    Ok(())
+}
+
+/// A blob file that will not open fails a multi-get as it fails a read of a
+/// key alone, with the same error.
+#[test]
+fn a_blob_file_that_will_not_open_fails_a_multi_get_as_a_single_read() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    let dir = tempfile::tempdir()?;
+    drop(cold_tree(dir.path(), &BatchCountFs::default())?);
+    let fault = Arc::new(FaultFs::new(StdFs));
+    let injector = fault.injector();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault)
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::Open,
+            Fault::Error(lsm_tree::io::ErrorKind::PermissionDenied),
+        )
+        .on_path("blobs"),
+    );
+    let keys: Vec<String> = (0..N).map(key_for).collect();
+
+    let single = tree
+        .get(key_for(0), SeqNo::MAX)
+        .expect_err("the value's file does not open");
+    let batched = tree
+        .multi_get(&keys, SeqNo::MAX)
+        .expect_err("the values' files do not open");
+    injector.clear();
+
+    assert_eq!(
+        std::mem::discriminant(&batched),
+        std::mem::discriminant(&single),
+        "{batched:?} vs {single:?}"
+    );
+    Ok(())
+}
+
+/// A block a merge reads that fails to read hands the merge to the path that
+/// resolves a key alone, which reads it again: the merge still answers.
+#[test]
+fn a_merge_whose_block_fails_to_read_answers_on_its_own_path() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    {
+        let tree = merge_tree(dir.path(), &fs)?;
+        for i in 0..N {
+            tree.insert(key_for(i), format!("base-{i}"), i as u64);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        for i in 0..N {
+            tree.merge(key_for(i), "+", (N + i) as u64);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    // The bases' table: written first, so it sorts first.
+    let tables = common::sorted_sst_paths(dir.path());
+    let base = tables
+        .first()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .expect("the bases' table")
+        .to_owned();
+    let fault = Arc::new(FaultFs::new(StdFs));
+    let injector = fault.injector();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault)
+    .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::ReadAt,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path(format!("tables/{base}"))
+        .once(),
+    );
+    let keys: Vec<String> = (0..N).map(key_for).collect();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+    injector.clear();
+
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("base-{i}+").as_bytes()),
+            "key {i}"
+        );
+    }
+    Ok(())
+}
+
 /// The tree in `dir` reopened as it is, with nothing cached.
 fn cold_tree_reopened(dir: &std::path::Path, fs: &BatchCountFs) -> lsm_tree::Result<AnyTree> {
     Config::new(

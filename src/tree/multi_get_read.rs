@@ -38,12 +38,12 @@ struct BlobRead<'a> {
 enum ValueReadOut<'a> {
     Blob(BlobRead<'a>),
     MergeBlock {
-        /// The merge's slot in [`MultiGetRead::merges`].
-        merge: usize,
         table: &'a Table,
         handle: BlockHandle,
-        /// Its place among the table's blocks of the key.
-        at: usize,
+        /// The merges waiting on it, each by its slot in
+        /// [`MultiGetRead::merges`] and the block's place among the table's
+        /// blocks of its key.
+        waiters: Vec<(usize, usize)>,
     },
 }
 
@@ -94,6 +94,9 @@ pub(super) struct MultiGetRead<'a, K> {
     merges: Vec<Option<MergeKey<'a>>>,
     /// Merges whose blocks are all back, to take the versions of next.
     merges_ready: Vec<usize>,
+    /// The tag of each merge block being read, by table and offset: a merge
+    /// needing a block another merge is reading waits on that read.
+    merge_blocks_out: crate::HashMap<(crate::GlobalTableId, u64), usize>,
     /// What the merges' blocks may still take of the cache, as a level read
     /// keeps its blocks within half of it; set by the first block back.
     merge_room: Option<u64>,
@@ -156,6 +159,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             alone: Vec::new(),
             merges: Vec::new(),
             merges_ready: Vec::new(),
+            merge_blocks_out: crate::HashMap::default(),
             merge_room: None,
         }
     }
@@ -299,11 +303,10 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         match self.reads.get_mut(done.tag).and_then(Option::take) {
             Some(ValueReadOut::Blob(pending)) => self.blob_read_done(pending, done),
             Some(ValueReadOut::MergeBlock {
-                merge,
                 table,
                 handle,
-                at,
-            }) => self.merge_block_done(merge, table, &handle, at, &done),
+                waiters,
+            }) => self.merge_block_done(table, &handle, &waiters, &done),
             None => debug_assert!(false, "a read handed back twice or never asked for"),
         }
     }
@@ -372,6 +375,16 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 let Some(merge) = self.merges.get_mut(slot).and_then(Option::take) else {
                     return;
                 };
+                // A blob tree's merge may read its base from the value log as
+                // it resolves, which blocks: that goes out as a job. Any other
+                // merge resolves from what it holds.
+                if self.ctx.merge_base.is_some() {
+                    out.job(Job::MergeFinish {
+                        idx: merge.idx,
+                        read: merge.walk.into_read(),
+                    });
+                    return;
+                }
                 let value = match &self.ctx.merge_operator {
                     Some(operator) => merge
                         .walk
@@ -434,26 +447,36 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             if merge.blocks.get(at).is_some_and(Option::is_some) {
                 continue;
             }
+            merge.waiting += 1;
+            // A block another merge is reading is waited on, not read again.
+            let place = (table.global_id(), *handle.offset());
+            if let Some(&tag) = self.merge_blocks_out.get(&place)
+                && let Some(Some(ValueReadOut::MergeBlock { waiters, .. })) =
+                    self.reads.get_mut(tag)
+            {
+                waiters.push((slot, at));
+                continue;
+            }
             // This read bypasses the per-block load path that charges every
             // other read.
             table.record_batched_read(
                 crate::table::block::BlockType::Data,
                 core::slice::from_ref(handle),
             );
-            merge.waiting += 1;
+            let tag = self.reads.len();
             out.read(BlockRequest {
-                tag: self.reads.len(),
+                tag,
                 fs: &table.fs,
                 cache: &table.cache,
                 file: Arc::clone(&file),
                 offset: *handle.offset(),
                 buf: alloc::vec![0u8; handle.size() as usize],
             });
+            self.merge_blocks_out.insert(place, tag);
             self.reads.push(Some(ValueReadOut::MergeBlock {
-                merge: slot,
                 table,
                 handle: *handle,
-                at,
+                waiters: alloc::vec![(slot, at)],
             }));
         }
         if merge.waiting == 0 {
@@ -461,18 +484,19 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         }
     }
 
-    /// Takes back a block of the table the merge in `slot` is reading:
-    /// decoded, kept in the cache while it fits half of it, and held for the
-    /// versions to be taken out of. One that fails sends the merge on its own
-    /// path once the table's other blocks are back.
+    /// Takes back a block of a table merges are reading: decoded once, kept
+    /// in the cache while it fits half of it, and held by every merge waiting
+    /// on it for the versions to be taken out of. One that fails sends those
+    /// merges on their own path once their table's other blocks are back.
     fn merge_block_done(
         &mut self,
-        slot: usize,
         table: &'a Table,
         handle: &BlockHandle,
-        at: usize,
+        waiters: &[(usize, usize)],
         done: &crate::fs::ReadDone,
     ) {
+        self.merge_blocks_out
+            .remove(&(table.global_id(), *handle.offset()));
         let block = match &done.result {
             Ok(()) => {
                 let room = self
@@ -484,16 +508,18 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             }
             Err(_) => None,
         };
-        let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
-            return;
-        };
-        match (block, merge.blocks.get_mut(at)) {
-            (Some(block), Some(held)) => *held = Some(block),
-            _ => merge.failed = true,
-        }
-        merge.waiting -= 1;
-        if merge.waiting == 0 {
-            self.merges_ready.push(slot);
+        for &(slot, at) in waiters {
+            let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
+                continue;
+            };
+            match (&block, merge.blocks.get_mut(at)) {
+                (Some(block), Some(held)) => *held = Some(block.clone()),
+                _ => merge.failed = true,
+            }
+            merge.waiting -= 1;
+            if merge.waiting == 0 {
+                self.merges_ready.push(slot);
+            }
         }
     }
 

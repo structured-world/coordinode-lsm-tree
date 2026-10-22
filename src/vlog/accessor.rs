@@ -394,7 +394,28 @@ impl<'a> Accessor<'a> {
             }
             start = end;
         }
-        self.warm_spans(tree_id, items, &spans, cache, &mut into, half);
+        // The spans go out in batches of at most one coalesced read's worth of
+        // extent, so the buffers held at once are what one read held before
+        // the spans were batched; a window within that (the usual one) is one
+        // batch. A batch is read only while the admission budget lasts.
+        let mut admit_budget = half;
+        let mut start = 0;
+        while start < spans.len() && admit_budget > 0 {
+            let mut end = start;
+            let mut extent = 0u64;
+            while let Some(span) = spans.get(end) {
+                let width = span.end - span.start;
+                if end > start && extent + width > max_read as u64 {
+                    break;
+                }
+                extent += width;
+                end += 1;
+            }
+            if let Some(batch) = spans.get(start..end) {
+                self.warm_spans(tree_id, items, batch, cache, &mut into, &mut admit_budget);
+            }
+            start = end;
+        }
     }
 
     /// Reads every one of `spans` of `items` in one batched call per
@@ -403,8 +424,9 @@ impl<'a> Accessor<'a> {
     /// store, in span order. A span whose file will not open or whose read
     /// fails stays cold, and the read walk fetches its values normally.
     ///
-    /// `admit_budget` is how many bytes this prefetch may hand over, spent by
-    /// what each value actually weighs; the walk stops when it runs out.
+    /// `admit_budget` is how many bytes this prefetch may still hand over,
+    /// spent by what each value actually weighs; the walk stops when it runs
+    /// out.
     fn warm_spans(
         &self,
         tree_id: TreeId,
@@ -412,7 +434,7 @@ impl<'a> Accessor<'a> {
         spans: &[Span],
         cache: &Cache,
         into: &mut PrefetchInto<'_>,
-        mut admit_budget: u64,
+        admit_budget: &mut u64,
     ) {
         /// One span's read: its span, its blob file and the open file, and
         /// the buffer its extent is read into, emptied when the read fails.
@@ -522,7 +544,7 @@ impl<'a> Accessor<'a> {
         }
 
         for read in reads {
-            if admit_budget == 0 {
+            if *admit_budget == 0 {
                 return;
             }
             let (Some(span), false) = (spans.get(read.span), read.buf.is_empty()) else {
@@ -540,7 +562,7 @@ impl<'a> Accessor<'a> {
                 read.file.as_ref(),
                 cache,
                 into,
-                &mut admit_budget,
+                admit_budget,
             );
         }
     }

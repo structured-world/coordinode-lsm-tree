@@ -8145,6 +8145,18 @@ impl Table {
         }
     }
 
+    /// The data block at `handle` of this Page-ECC table, when the cache
+    /// holds it, counted as a cache hit as the load path counts one. Never a
+    /// columnar group's: the cache holds its directory and pages, not the
+    /// group, and the load path assembles it from them.
+    pub(crate) fn cached_special_block(&self, handle: &BlockHandle) -> Option<DataBlock> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return None;
+        }
+        self.cached_data_block(handle)
+    }
+
     /// The role a batched read of a Page-ECC or columnar data block is
     /// charged to: a columnar group is read as its pages are.
     #[cfg_attr(
@@ -8181,10 +8193,7 @@ impl Table {
             let fd = LookupFd::default();
             let blocks = self
                 .group_read(handle, ReadCharge::Foreground, &fd)
-                .load_whole(
-                    &crate::table::row_group::PageWant::ALL,
-                    &crate::Slice::from(bytes),
-                )?;
+                .load_whole(&crate::Slice::from(bytes))?;
             return self.columnar_data_block_from(handle, &blocks, ReadCharge::Foreground);
         }
         let compression = self.metadata.data_block_compression;
