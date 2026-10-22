@@ -1748,6 +1748,22 @@ fn clear_drops_the_syncs_observed_before_it() -> io::Result<()> {
     Ok(())
 }
 
+/// `clear` turns the power back on: a sync, a rename and a removal refused
+/// after the syncs `power_off_after_syncs` let through pass again.
+#[test]
+fn clear_turns_the_power_back_on() -> io::Result<()> {
+    let fs = FaultFs::new(MemFs::new());
+    fs.create_dir_all(Path::new("/d"))?;
+    drop(write_file(&fs, "f")?);
+    fs.injector().power_off_after_syncs(0);
+    assert!(fs.sync_directory(Path::new("/d")).is_err(), "self-check");
+    fs.injector().clear();
+    fs.sync_directory(Path::new("/d"))?;
+    fs.rename(Path::new("/d/f"), Path::new("/d/g"))?;
+    fs.remove_file(Path::new("/d/g"))?;
+    Ok(())
+}
+
 #[test]
 fn identity_probes_forward_to_inner_backend() {
     let mem = MemFs::new();

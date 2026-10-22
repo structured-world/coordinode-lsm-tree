@@ -309,6 +309,47 @@ fn a_failed_batch_takes_back_a_tree_it_made_in_a_folder_that_existed() {
     );
 }
 
+/// Taking back a tree made in a folder that existed already removes only
+/// what the tree writes there: a file of someone else's in that folder
+/// survives the failed batch.
+#[test]
+fn a_failed_batch_leaves_what_it_did_not_write_in_a_folder_that_existed() {
+    use std::io::Write;
+    let (_, fault) = stack();
+    let fs: Arc<dyn Fs> = fault.clone();
+    fault
+        .create_dir_all(&tree_path(0))
+        .expect("a tree folder holding a note");
+    let note = tree_path(0).join("notes.txt");
+    {
+        let mut file = fault
+            .open(
+                &note,
+                &lsm_tree::fs::FsOpenOptions::new().write(true).create(true),
+            )
+            .expect("the note");
+        file.write_all(b"not the tree's").expect("its text");
+    }
+    fault.injector().arm(
+        FaultRule::new(
+            FaultOp::Rename,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path(tree_path(1).to_string_lossy()),
+    );
+    assert!(Config::open_many(configs(&fs)).is_err(), "the batch fails");
+    assert_eq!(
+        fault
+            .read_dir(&tree_path(0))
+            .expect("list the folder")
+            .into_iter()
+            .map(|entry| entry.file_name)
+            .collect::<Vec<_>>(),
+        vec![String::from("notes.txt")],
+        "the note stays, and only the note"
+    );
+}
+
 /// Trees made in folders on two backends have each folder synced once, on
 /// its own backend.
 #[test]

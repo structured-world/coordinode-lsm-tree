@@ -7120,11 +7120,13 @@ fn take_back_new_tree(tree: Tree, made_by_open: &[crate::path::PathBuf]) {
     undo_creation(None, made, &[]);
 }
 
-/// Removes everything in the tree folder `path`, the lock file last: it goes
-/// while the lock is still held, so no opener is left holding the lock of a
-/// file another one can make anew. What cannot be removed stays, and keeps
-/// the folder. A folder that `stays` is synced, so its emptying is durable
-/// and no snapshot of the tree comes back after a power loss.
+/// Removes what a tree made in the tree folder `path`, the lock file last:
+/// everything in a folder the open made, and only what a tree writes in one
+/// that `stays`, having existed before. The lock file goes while the lock is
+/// still held, so no opener is left holding the lock of a file another one
+/// can make anew. What cannot be removed stays, and keeps the folder. A
+/// folder that `stays` is synced, so its emptying is durable and no snapshot
+/// of the tree comes back after a power loss.
 fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>, stays: bool) {
     let entries = match fs.read_dir(path) {
         Ok(entries) => entries,
@@ -7139,7 +7141,22 @@ fn empty_tree_folder(path: &Path, fs: &Arc<dyn Fs>, stays: bool) {
     let (lock, rest): (Vec<_>, Vec<_>) = entries
         .into_iter()
         .partition(|entry| entry.file_name == crate::config::DIRECTORY_LOCK_FILE);
-    for entry in rest.into_iter().chain(lock) {
+    // A folder that existed before the tree may hold what others put there:
+    // only what a tree writes goes from it. A folder the open made holds
+    // nothing but the tree's.
+    let written = |name: &str| {
+        !stays
+            || matches!(
+                name,
+                crate::file::TABLES_FOLDER | crate::file::BLOBS_FOLDER | crate::file::DICTS_FOLDER
+            )
+            || crate::version::recovery::manifest_file_of(name).is_some()
+    };
+    for entry in rest
+        .into_iter()
+        .filter(|entry| written(&entry.file_name))
+        .chain(lock)
+    {
         let removed = if entry.is_dir {
             fs.remove_dir_all(&entry.path)
         } else {

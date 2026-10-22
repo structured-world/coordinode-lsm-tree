@@ -747,8 +747,9 @@ impl FaultInjector {
     }
 
     /// Removes all armed rules AND the recorded observations (sync modes, the
-    /// read count and the open count), resetting the injector so a later phase
-    /// cannot see state recorded before the `clear()`.
+    /// read count and the open count), and turns the power back on (see
+    /// [`Self::power_off_after_syncs`]), resetting the injector so a later
+    /// phase cannot see state recorded before the `clear()`.
     pub fn clear(&self) {
         {
             // Under the rules' lock, as a refund and a counted screening are:
@@ -768,6 +769,7 @@ impl FaultInjector {
         self.read_hooks.lock().clear();
         #[cfg(test)]
         self.removal_hooks.lock().clear();
+        *self.power.lock() = None;
         self.opens.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
