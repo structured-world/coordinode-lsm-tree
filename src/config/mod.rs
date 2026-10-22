@@ -1485,12 +1485,12 @@ impl Config {
 
     /// [`Self::open`], coming by the directory lock as `lock` says, and
     /// leaving the new tree folder's name to its caller to sync as `names`
-    /// says; with the tree, whether this open made it.
+    /// says; with the tree, when this open made it, what takes it back.
     pub(crate) fn open_with(
         self,
         #[cfg(feature = "std")] lock: DirectoryLock,
         names: crate::tree::NewFolderNames,
-    ) -> crate::Result<(AnyTree, bool)> {
+    ) -> crate::Result<(AnyTree, Option<crate::tree::Creation>)> {
         // The dictionary registry is loaded and the compression policy validated
         // inside `Tree::open`, under the directory lock — NOT here. Both read the
         // tree's `dicts/` folder, and the load SWEEPS unpublished temps; doing
@@ -1515,21 +1515,21 @@ impl Config {
         }
 
         Ok(if self.kv_separation_opts.is_some() {
-            let (tree, created) = BlobTree::open(
+            let (tree, creation) = BlobTree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
                 names,
             )?;
-            (AnyTree::Blob(tree), created)
+            (AnyTree::Blob(tree), creation)
         } else {
-            let (tree, created) = Tree::open(
+            let (tree, creation) = Tree::open(
                 self,
                 #[cfg(feature = "std")]
                 lock,
                 names,
             )?;
-            (AnyTree::Standard(tree), created)
+            (AnyTree::Standard(tree), creation)
         })
     }
 

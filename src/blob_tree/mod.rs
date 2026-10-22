@@ -349,15 +349,16 @@ impl BlobTree {
     }
 
     /// Opens the tree, coming by the directory lock as `lock` says; see
-    /// [`Tree::open`](crate::Tree::open), and whether this open made it.
+    /// [`Tree::open`](crate::Tree::open), and when this open made it, what
+    /// takes it back.
     pub(crate) fn open(
         config: Config,
         #[cfg(feature = "std")] lock: crate::config::DirectoryLock,
         names: crate::tree::NewFolderNames,
-    ) -> crate::Result<(Self, bool)> {
+    ) -> crate::Result<(Self, Option<crate::tree::Creation>)> {
         use crate::file::BLOBS_FOLDER;
 
-        let (index, created) = crate::Tree::open(
+        let (index, creation) = crate::Tree::open(
             config,
             #[cfg(feature = "std")]
             lock,
@@ -376,14 +377,25 @@ impl BlobTree {
         // though, may come after the first append: the open itself installs
         // an edit when it registers a dictionary. Its name is synced here.
         let blobs_folder = index.config.path.join(BLOBS_FOLDER);
-        let made = !(*index.config.fs).exists(&blobs_folder)?;
-        (*index.config.fs).create_dir_all(&blobs_folder)?;
-        if made {
-            crate::file::fsync_directory(
-                &index.config.path,
-                &*index.config.fs,
-                index.config.sync_mode,
-            )?;
+        let folder = (|| -> crate::Result<()> {
+            let made = !(*index.config.fs).exists(&blobs_folder)?;
+            (*index.config.fs).create_dir_all(&blobs_folder)?;
+            if made {
+                crate::file::fsync_directory(
+                    &index.config.path,
+                    &*index.config.fs,
+                    index.config.sync_mode,
+                )?;
+            }
+            Ok(())
+        })();
+        // A tree this open made, whose open then fails, is taken back: the
+        // caller is told it was not opened, and a retry makes it anew.
+        if let Err(e) = folder {
+            if let Some(creation) = creation {
+                creation.take_back(index);
+            }
+            return Err(e);
         }
 
         let blob_file_id_to_continue_with = index
@@ -404,7 +416,7 @@ impl BlobTree {
                 index,
                 blobs_folder: Arc::new(blobs_folder),
             },
-            created,
+            creation,
         ))
     }
 

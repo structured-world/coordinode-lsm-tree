@@ -320,6 +320,10 @@ fn a_failed_batch_leaves_what_it_did_not_write_in_a_folder_that_existed() {
     fault
         .create_dir_all(&tree_path(0))
         .expect("a tree folder holding a note");
+    // A name a tree uses too, there before the tree: it is not the tree's.
+    fault
+        .create_dir_all(&tree_path(0).join("dicts"))
+        .expect("a dictionary folder");
     let note = tree_path(0).join("notes.txt");
     {
         let mut file = fault
@@ -338,16 +342,53 @@ fn a_failed_batch_leaves_what_it_did_not_write_in_a_folder_that_existed() {
         .on_path(tree_path(1).to_string_lossy()),
     );
     assert!(Config::open_many(configs(&fs)).is_err(), "the batch fails");
+    let mut left: Vec<String> = fault
+        .read_dir(&tree_path(0))
+        .expect("list the folder")
+        .into_iter()
+        .map(|entry| entry.file_name)
+        .collect();
+    left.sort();
     assert_eq!(
-        fault
-            .read_dir(&tree_path(0))
-            .expect("list the folder")
-            .into_iter()
-            .map(|entry| entry.file_name)
-            .collect::<Vec<_>>(),
-        vec![String::from("notes.txt")],
-        "the note stays, and only the note"
+        left,
+        vec![String::from("dicts"), String::from("notes.txt")],
+        "what was there stays, and only that"
     );
+}
+
+/// A KV-separated tree whose open fails after its index was made, making
+/// its blob folder, is taken back, alone as in a batch.
+#[test]
+fn a_blob_tree_whose_blob_folder_cannot_be_made_is_taken_back() {
+    for batched in [true, false] {
+        let (_, fault) = stack();
+        let fs: Arc<dyn Fs> = fault.clone();
+        // The index makes the blob folder; the blob tree's own pass at it,
+        // after the index is made, fails.
+        fault.injector().arm(
+            FaultRule::new(
+                FaultOp::CreateDirAll,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            )
+            .on_path(tree_path(TREES - 1).join("blobs").to_string_lossy())
+            .skip(1),
+        );
+        let mut configs = configs(&fs);
+        let failed = if batched {
+            Config::open_many(configs).is_err()
+        } else {
+            configs
+                .pop()
+                .expect("the blob tree's config")
+                .open()
+                .is_err()
+        };
+        assert!(failed, "the open fails (batched: {batched})");
+        assert!(
+            !fault.exists(&tree_path(TREES - 1)).expect("probe"),
+            "the tree is taken back (batched: {batched})"
+        );
+    }
 }
 
 /// Trees made in folders on two backends have each folder synced once, on
