@@ -8147,6 +8147,10 @@ impl Table {
 
     /// The role a batched read of a Page-ECC or columnar data block is
     /// charged to: a columnar group is read as its pages are.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(clippy::unused_self, reason = "only a columnar table reads as pages")
+    )]
     pub(crate) fn special_read_role(&self) -> BlockType {
         #[cfg(feature = "columnar")]
         if self.metadata.columnar {
