@@ -4,6 +4,85 @@ use super::*;
 // under `cfg(target_os = "linux")` (the module gate) and run on the Linux
 // CI / bench runner, not on the macOS dev host.
 
+// A ring shallower than most batches below, so they go through it in waves.
+#[cfg(feature = "std")]
+crate::fs::batch_conformance::batched_read_conformance!(Some(
+    super::IoUringRawFs::new(8).expect("ring setup")
+));
+
+/// A batch deeper than the ring goes through it in waves, every read landing
+/// in its own buffer, in far fewer entries into the kernel than reads.
+#[cfg(feature = "std")]
+#[test]
+fn a_batch_deeper_than_the_ring_reads_every_block_in_few_enters() {
+    use crate::fs::{BlockBuf, BlockRead};
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(4).expect("ring setup");
+    let path = Path::new(tmp.path().to_str().expect("utf8 path")).join("deep.bin");
+    let bytes: Vec<u8> = (0..64 * 16)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts).expect("open");
+    file.write_all(&bytes).expect("write");
+
+    let mut buffers = vec![[0u8; 16]; 64];
+    let enters = fs.ring.lock().enters;
+    {
+        // Reversed, so a read landing in another's buffer is caught.
+        let mut reqs: Vec<_> = buffers
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .map(|(i, buf)| BlockRead {
+                file: file.as_ref(),
+                offset: (i * 16) as u64,
+                buf: BlockBuf::new(buf),
+            })
+            .collect();
+        fs.read_blocks_batched(&mut reqs).expect("batched read");
+    }
+    let taken = fs.ring.lock().enters - enters;
+    for (i, buf) in buffers.iter().enumerate() {
+        assert_eq!(&buf[..], bytes.get(i * 16..(i + 1) * 16).expect("in range"));
+    }
+    assert!(
+        taken <= 64 / 4 * 2,
+        "64 reads through a 4-entry ring took {taken} enters"
+    );
+}
+
+/// `read_many` on one file is one batch too.
+#[cfg(feature = "std")]
+#[test]
+fn read_many_is_one_batch_of_the_ring() {
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(32).expect("ring setup");
+    let path = Path::new(tmp.path().to_str().expect("utf8 path")).join("many.bin");
+    let opts = FsOpenOptions::new().write(true).create(true).read(true);
+    let mut file = fs.open(&path, &opts).expect("open");
+    file.write_all(&[7u8; 16 * 16]).expect("write");
+
+    let mut buffers = vec![[0u8; 16]; 16];
+    let enters = fs.ring.lock().enters;
+    let mut regions: Vec<(u64, &mut [u8])> = buffers
+        .iter_mut()
+        .enumerate()
+        .map(|(i, buf)| ((i * 16) as u64, &mut buf[..]))
+        .collect();
+    file.read_many(&mut regions).expect("read_many");
+    drop(regions);
+    assert!(
+        fs.ring.lock().enters - enters <= 2,
+        "16 regions within the ring's depth go in one or two enters"
+    );
+    assert!(buffers.iter().all(|buf| buf == &[7u8; 16]));
+}
+
 #[test]
 fn raw_file_fsfile_round_trips() {
     // Exercises the full IoUringRawFile FsFile surface: sequential write
