@@ -1624,7 +1624,8 @@ impl Block {
     ///
     /// The second half of [`Self::read_verified_payload`], split out so a
     /// caller that read several blocks in one request — a columnar row
-    /// group's pages — verifies each of them through exactly the code a block
+    /// group's pages, a batched multi-get's Page-ECC blocks — verifies each
+    /// of them through exactly the code a block
     /// read on its own goes through: the same size caps, trailer
     /// classification, checksum, ECC recovery and decrypt, and the same
     /// [`EccStatus`] for auto-heal to act on. `frame` must be exactly the
@@ -1634,7 +1635,6 @@ impl Block {
     /// # Errors
     ///
     /// As [`Self::read_verified_payload`], minus the I/O.
-    #[cfg(feature = "columnar")]
     pub(crate) fn verify_frame(
         frame: alloc::vec::Vec<u8>,
         handle: BlockHandle,

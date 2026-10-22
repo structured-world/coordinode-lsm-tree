@@ -119,6 +119,12 @@ pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// Flips a byte a fixed depth into the SST's `data` section, so the SST still
 /// opens but one data block fails its checksum.
 pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    corrupt_data_region_with(path, 0xFF)
+}
+
+/// [`corrupt_data_region`], flipping the bits of `mask` in that byte: one bit
+/// is a fault Page-ECC corrects.
+pub fn corrupt_data_region_with(path: &std::path::Path, mask: u8) -> std::io::Result<()> {
     // Locate the `data` section through the SFA trailer TOC rather than assuming
     // it begins at offset 0: a byte a fixed depth into the section's payload is
     // stable against tail growth (the index / filter / meta / trailer that follow
@@ -144,7 +150,7 @@ pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
     let mut bytes = std::fs::read(path)?;
     *bytes
         .get_mut(pos)
-        .expect("corruption offset within the SST") ^= 0xFF;
+        .expect("corruption offset within the SST") ^= mask;
     std::fs::write(path, &bytes)
 }
 

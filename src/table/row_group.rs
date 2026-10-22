@@ -774,6 +774,89 @@ impl GroupRead<'_> {
         })
     }
 
+    /// Loads the group's directory and the pages `want` selects from `group`,
+    /// the whole group's bytes as one read brought them in: every block is
+    /// verified, admitted and cached as [`Self::load`] does it, the directory
+    /// once the pages it names checked out, and nothing is read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], and [`crate::Error::InvalidHeader`] when `group` is
+    /// not as long as the index entry says the group is.
+    pub(crate) fn load_whole(
+        &self,
+        want: &PageWant<'_>,
+        group: &Slice,
+    ) -> crate::Result<RowGroupBlocks> {
+        if group.len() != self.group.size() as usize {
+            return Err(crate::Error::InvalidHeader(
+                "columnar: a row group read is not as long as its index entry",
+            ));
+        }
+        let directory_len = indexed_directory_len(self.group)?;
+        self.check_block_len(directory_len)?;
+        let directory = self.admit_directory(group, directory_len)?;
+        let directory = if want
+            .zone_column()
+            .is_some_and(|column_id| directory.lacks_head_zones_for(column_id))
+        {
+            self.with_head_zones(&directory, directory_len, group)?
+        } else {
+            directory
+        };
+        let zones = match want.zone_block_column(&directory) {
+            Some(column_id) => {
+                Some(self.zone_block(&directory, directory_len, column_id, group, true)?)
+            }
+            None => None,
+        };
+        let wanted = want.resolve(&directory, zones.as_ref())?;
+        let mut pages = wanted.slots(&directory);
+        // Every page is in `group`: the extent check in `admit_directory`
+        // proved the directory, its zone blocks and its pages fill it. Each is
+        // admitted from its own range, so no run of slots has to be
+        // consecutive in the directory.
+        let pages_at = directory_len as usize + directory.pages_start() as usize;
+        let mut no_leads = Vec::new().into_iter().peekable();
+        for slot in 0..pages.len() {
+            let Some(entry) = pages
+                .get(slot)
+                .and_then(|page| directory.entries().get(page.index))
+            else {
+                continue;
+            };
+            let start = pages_at + entry.offset as usize;
+            let end = start + entry.length as usize;
+            if end > group.len() {
+                return Err(crate::Error::InvalidHeader(
+                    "columnar: page outside its row group",
+                ));
+            }
+            self.admit_pages(
+                &directory,
+                directory_len,
+                slot..slot + 1,
+                start,
+                &group.slice(start..end),
+                &mut pages,
+                &mut no_leads,
+            )?;
+        }
+        if self.charge.touches_cache() {
+            self.cache.insert_directory(
+                self.table_id,
+                self.group.offset(),
+                Arc::clone(&directory),
+                directory_len,
+            );
+        }
+        Ok(RowGroupBlocks {
+            directory,
+            row_pages: wanted.row_pages,
+            pages,
+        })
+    }
+
     /// Verifies and admits the directory of `directory_len` bytes, the length
     /// the index entry records, at the front of `front`, decodes it and proves
     /// it fills the group. The caller caches it once the blocks it names have

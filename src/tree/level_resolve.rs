@@ -502,7 +502,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             Ok(()) => current.read.read(
                 &self.tasks[self.start..current.end],
                 done.tag,
-                &done.buf,
+                done.buf,
                 &mut self.keep_room,
             ),
             Err(error) => {
