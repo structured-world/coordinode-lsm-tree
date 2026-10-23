@@ -462,6 +462,9 @@ impl TreeIter {
             let range = user_to_internal_bounds(&user_range);
 
             let mut iters: Vec<BoxedIterator<'_>> = Vec::with_capacity(5);
+            // Per source: whether it holds at most one version of any key,
+            // which a lone source then needs no version grouping for.
+            let mut one_version: Vec<bool> = Vec::with_capacity(5);
             // Each RT is paired with the per-source visibility cutoff so that
             // ephemeral memtable RTs use their own index_seqno instead of the
             // outer scan seqno (see issue #33).
@@ -620,12 +623,14 @@ impl TreeIter {
                 // nothing; the others' passes are no false positives.
                 let (first, answer) = surviving.remove(0);
                 first.note_scan();
+                one_version.push(holds_one_version_per_key(&first));
                 iters.push(table_reader(answer, first, user_range.clone(), seqno));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
                             table.note_scan();
+                            one_version.push(holds_one_version_per_key(&table));
                             iters.push(table_reader(answer, table, user_range.clone(), seqno));
                         }
                     }
@@ -644,10 +649,14 @@ impl TreeIter {
             }
 
             for run in multi_runs {
+                // The tables of a run hold disjoint keys, so the run holds one
+                // version of a key when each of its tables does.
+                let run_one_version = run.iter().all(holds_one_version_per_key);
                 if let Some(reader) =
                     RunReader::new_cmp(run, user_range.clone(), lock.comparator.as_ref())
                         .map(RunReader::counting_scans)
                 {
+                    one_version.push(run_one_version);
                     iters.push(Box::new(reader.filter(move |item| match item {
                         Ok(item) => seqno_filter(item.key.seqno, seqno),
                         Err(_) => true,
@@ -672,8 +681,14 @@ impl TreeIter {
                         .map(|rt| (rt, seqno)),
                 );
 
+                // A memtable holding no row adds nothing to merge; its range
+                // tombstones were collected above and still apply.
+                if memtable.items.is_empty() {
+                    continue;
+                }
                 let iter = memtable.range_internal(range.clone());
 
+                one_version.push(false);
                 iters.push(Box::new(
                     iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
                         .map(Ok),
@@ -697,12 +712,20 @@ impl TreeIter {
                         .map(|rt| (rt, seqno)),
                 );
 
-                let iter = lock.version.active_memtable.range_internal(range.clone());
+                // Empty when the scan is built, it holds no row the snapshot
+                // can see: a write is published as visible only once it is in
+                // the memtable, so one below the scan's seqno is already there.
+                // A write backdated below the seqno after the scan began is
+                // one the live walk could miss anyway.
+                if !lock.version.active_memtable.items.is_empty() {
+                    let iter = lock.version.active_memtable.range_internal(range.clone());
 
-                iters.push(Box::new(
-                    iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                        .map(Ok),
-                ));
+                    one_version.push(false);
+                    iters.push(Box::new(
+                        iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
+                            .map(Ok),
+                    ));
+                }
             }
 
             if let Some((mt, eph_seqno)) = &lock.ephemeral {
@@ -719,12 +742,15 @@ impl TreeIter {
                         .map(|rt| (rt, *eph_seqno)),
                 );
 
-                let iter = Box::new(
-                    mt.range_internal(range)
-                        .filter(move |item| seqno_filter(item.key.seqno, *eph_seqno))
-                        .map(Ok),
-                );
-                iters.push(iter);
+                if !mt.items.is_empty() {
+                    let iter = Box::new(
+                        mt.range_internal(range)
+                            .filter(move |item| seqno_filter(item.key.seqno, *eph_seqno))
+                            .map(Ok),
+                    );
+                    one_version.push(false);
+                    iters.push(iter);
+                }
             }
 
             // Tie-break order: the merger resolves identical (key, seqno)
@@ -740,22 +766,21 @@ impl TreeIter {
             }
             iters.rotate_left(table_source_count);
 
-            let merged = build_seeking(iters, lock.comparator.clone());
+            // A lone source needs no merge, and a lone source holding one
+            // version of each key needs no version grouping either, unless a
+            // merge operator has operands to resolve.
+            let lone = (iters.len() == 1).then(|| iters.pop()).flatten();
+            let lone_one_version = one_version.len() == 1 && one_version.first() == Some(&true);
+            let groups_versions = !(lone_one_version && lock.merge_operator.is_none());
+
             // Clone needed: MvccStream uses the RT set for merge suppression,
             // while RangeTombstoneFilter below consumes it for post-merge
             // filtering. An Arc<[_]> could avoid the copy if RT sets grow large.
-            let iter = MvccStream::new_with_comparator(
-                merged,
-                lock.merge_operator.clone(),
-                lock.comparator.clone(),
-            )
-            .with_value_log(lock.value_log())
-            .with_range_tombstones(all_range_tombstones.clone());
-
-            let iter = iter.filter(|x| match x {
-                Ok(value) => !value.key.is_tombstone(),
-                Err(_) => true,
-            });
+            let mvcc_tombstones = if lone.is_some() && !groups_versions {
+                Vec::new()
+            } else {
+                all_range_tombstones.clone()
+            };
 
             // Deduplicate: MultiWriter rotation copies the same RTs into each
             // output table, so collected tombstones can contain duplicates.
@@ -775,22 +800,77 @@ impl TreeIter {
                 }
             });
 
-            // Fast path: skip filter wrapping when no tombstone is visible at
-            // its per-source cutoff. Each RT carries the seqno of its originating
-            // source, so the check is per-RT rather than global.
-            if all_range_tombstones
-                .iter()
-                .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
-            {
-                Box::new(iter)
-            } else {
-                Box::new(RangeTombstoneFilter::new_with_comparator(
-                    iter,
+            let comparator = lock.comparator.clone();
+            match lone {
+                Some(source) if !groups_versions => {
+                    finish_scan(source.filter(is_live), all_range_tombstones, comparator)
+                }
+                Some(source) => finish_scan(
+                    MvccStream::new_with_comparator(
+                        source,
+                        lock.merge_operator.clone(),
+                        lock.comparator.clone(),
+                    )
+                    .with_value_log(lock.value_log())
+                    .with_range_tombstones(mvcc_tombstones)
+                    .filter(is_live),
                     all_range_tombstones,
-                    lock.comparator.clone(),
-                ))
+                    comparator,
+                ),
+                None => finish_scan(
+                    MvccStream::new_with_comparator(
+                        build_seeking(iters, lock.comparator.clone()),
+                        lock.merge_operator.clone(),
+                        lock.comparator.clone(),
+                    )
+                    .with_value_log(lock.value_log())
+                    .with_range_tombstones(mvcc_tombstones)
+                    .filter(is_live),
+                    all_range_tombstones,
+                    comparator,
+                ),
             }
         })
+    }
+}
+
+/// Whether a resolved row is handed out: a tombstone ends its key instead.
+fn is_live(item: &crate::Result<InternalValue>) -> bool {
+    match item {
+        Ok(value) => !value.key.is_tombstone(),
+        Err(_) => true,
+    }
+}
+
+/// Whether `table` holds at most one version of any key: the distinct keys
+/// its writer counted are all its rows.
+fn holds_one_version_per_key(table: &crate::table::Table) -> bool {
+    table.metadata.key_count == Some(table.metadata.item_count)
+}
+
+/// The scan's last stage: rows a range tombstone deletes are dropped, a pass
+/// left out when no tombstone is visible at its per-source cutoff.
+fn finish_scan<'a, I>(
+    iter: I,
+    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    comparator: SharedComparator,
+) -> BoxedMerge<'a>
+where
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + Send + 'a,
+{
+    // Each RT carries the seqno of its originating source, so the check is
+    // per-RT rather than global.
+    if range_tombstones
+        .iter()
+        .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
+    {
+        Box::new(iter)
+    } else {
+        Box::new(RangeTombstoneFilter::new_with_comparator(
+            iter,
+            range_tombstones,
+            comparator,
+        ))
     }
 }
 
