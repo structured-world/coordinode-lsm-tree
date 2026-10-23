@@ -225,6 +225,8 @@ mod errno {
     pub(super) const EPERM: i32 = 1;
     pub(super) const ENOENT: i32 = 2;
     pub(super) const EINTR: i32 = 4;
+    /// Read only by the hole probes, which are 64-bit only.
+    #[cfg(target_pointer_width = "64")]
     pub(super) const ENXIO: i32 = 6;
     pub(super) const EBADF: i32 = 9;
     pub(super) const EAGAIN: i32 = 11;
@@ -236,6 +238,18 @@ mod errno {
     pub(super) const EINVAL: i32 = 22;
     pub(super) const ENFILE: i32 = 23;
     pub(super) const EMFILE: i32 = 24;
+    /// Read only by the copy-on-write switch, on the asm-generic ioctl
+    /// architectures.
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    ))]
     pub(super) const ENOTTY: i32 = 25;
     pub(super) const ENOSPC: i32 = 28;
     pub(super) const EROFS: i32 = 30;
@@ -1255,9 +1269,22 @@ const _: () = {
     assert!(FS_IOC_SETFLAGS == libc::FS_IOC_SETFLAGS as u32);
 };
 
-/// A descriptor opened for one probe, closed when the probe is over.
+/// A descriptor opened for one probe, closed when the probe is over. Its users
+/// are the 64-bit range syscalls and the asm-generic ioctls.
+#[cfg(any(
+    target_pointer_width = "64",
+    target_arch = "x86",
+    target_arch = "arm",
+    target_arch = "riscv32"
+))]
 struct ProbeFd(i32);
 
+#[cfg(any(
+    target_pointer_width = "64",
+    target_arch = "x86",
+    target_arch = "arm",
+    target_arch = "riscv32"
+))]
 impl ProbeFd {
     /// `path` opened with `flags`.
     fn open(path: &core::ffi::CStr, flags: i32) -> Result<Self, Error> {
@@ -1265,6 +1292,12 @@ impl ProbeFd {
     }
 }
 
+#[cfg(any(
+    target_pointer_width = "64",
+    target_arch = "x86",
+    target_arch = "arm",
+    target_arch = "riscv32"
+))]
 impl Drop for ProbeFd {
     fn drop(&mut self) {
         // Best-effort: nothing was written through it.

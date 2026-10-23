@@ -1896,6 +1896,7 @@ pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
 /// kernel's file system table: `StdFs` and the `io_uring` backends. Two such
 /// backends can hard-link across instances because both resolve their paths
 /// through the same kernel namespace.
+#[cfg(any(feature = "std", all(target_os = "linux", feature = "io-uring-raw")))]
 pub(crate) const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 
 /// The capabilities of a Linux file system by its `statfs(2)` `f_type` magic,
@@ -2021,3 +2022,16 @@ mod block_buf_tests;
 
 #[cfg(test)]
 mod read_queue_tests;
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(
+        all(feature = "std", target_pointer_width = "64"),
+        all(
+            feature = "io-uring-raw",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
+mod fs_type_tests;

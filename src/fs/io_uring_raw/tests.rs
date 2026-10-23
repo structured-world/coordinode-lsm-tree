@@ -881,3 +881,101 @@ fn raw_files_accept_every_access_hint() {
     assert!(std_pipe.hint(FileHint::Sequential).is_err());
     assert!(raw_pipe.hint(FileHint::Sequential).is_err());
 }
+
+/// A range no file extent can have (past `i64::MAX`, or ending past
+/// `u64::MAX`) is refused before any syscall, and a file that does not exist
+/// is not found, for the punch and both hole probes, as through `StdFs`.
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn raw_range_syscalls_refuse_what_the_std_backend_refuses() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let std_fs = crate::fs::StdFs;
+    let path = tmp.path().join("file");
+    write_raw_file(&fs, &path, 1, 4_096);
+    let missing = tmp.path().join("missing");
+
+    for (what, file, offset, len, kind) in [
+        (
+            "offset past i64",
+            &path,
+            u64::MAX,
+            1,
+            ErrorKind::InvalidInput,
+        ),
+        ("end past u64", &path, 1, u64::MAX, ErrorKind::InvalidInput),
+        ("missing file", &missing, 0, 4_096, ErrorKind::NotFound),
+    ] {
+        let raw = [
+            fs.punch_hole(file, offset, len).map(|()| None),
+            fs.extent_is_hole(file, offset, len),
+            fs.extent_contains_hole(file, offset, len),
+        ];
+        let std = [
+            std_fs.punch_hole(file, offset, len).map(|()| None),
+            std_fs.extent_is_hole(file, offset, len),
+            std_fs.extent_contains_hole(file, offset, len),
+        ];
+        for (raw, std) in raw.iter().zip(&std) {
+            assert_eq!(raw.as_ref().map_err(|e| e.kind()), Err(&kind), "{what}");
+            assert_eq!(std.as_ref().map_err(|e| e.kind()), Err(&kind), "{what}");
+        }
+    }
+}
+
+/// A path the kernel cannot be handed (an interior NUL) reports nothing it
+/// cannot prove: the conservative capabilities and no volume, as through
+/// `StdFs`; the operations on it fail.
+#[cfg(feature = "std")]
+#[test]
+fn a_path_with_a_nul_proves_no_capability_and_no_volume() {
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let path = std::path::Path::new("bad\0path");
+    assert_eq!(fs.capabilities(path), crate::fs::StdFs.capabilities(path));
+    assert_eq!(fs.capabilities(path), crate::fs::FsCapabilities::default());
+    assert_eq!(fs.volume_id(path), None);
+    assert_eq!(crate::fs::StdFs.volume_id(path), None);
+    assert!(fs.allocated_size(path).is_err());
+    assert!(fs.hard_link_count(path).is_err());
+    assert!(fs.hard_link(path, std::path::Path::new("other")).is_err());
+}
+
+/// A clone of a file that does not exist is not found, and turning
+/// copy-on-write off fails for a path no writable file sits at, as through
+/// `StdFs`; neither leaves a target behind.
+#[cfg(all(
+    feature = "std",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    )
+))]
+#[test]
+fn raw_clone_and_copy_on_write_refuse_what_the_std_backend_refuses() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let (missing, clone) = (tmp.path().join("missing"), tmp.path().join("clone"));
+    assert_eq!(
+        fs.reflink_file(&missing, &clone)
+            .expect_err("no source")
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert!(!clone.exists(), "no target is left behind");
+    assert_eq!(
+        crate::fs::StdFs
+            .reflink_file(&missing, &clone)
+            .expect_err("no source")
+            .kind(),
+        ErrorKind::NotFound
+    );
+    // A directory does not open for writing.
+    assert!(fs.try_disable_cow(tmp.path()).is_err());
+    assert!(crate::fs::StdFs.try_disable_cow(tmp.path()).is_err());
+}
