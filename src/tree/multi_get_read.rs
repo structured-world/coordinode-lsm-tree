@@ -34,6 +34,25 @@ struct BlobRead<'a> {
     slot: usize,
 }
 
+/// A blob file the value reads go through: opened once, when the read has
+/// room for another file, and given back once its last read is back.
+struct BlobSlot {
+    id: crate::vlog::BlobFileId,
+    /// The file, while it is open.
+    file: Option<Arc<dyn FsFile>>,
+    /// Its reads not yet back.
+    reads_out: usize,
+}
+
+/// A user of a file, waiting for room under the read's file cap.
+#[derive(Clone, Copy)]
+enum FileWait {
+    /// The blob file of a slot in [`MultiGetRead::blob_files`].
+    Blob(usize),
+    /// The table a merge, by its slot in [`MultiGetRead::merges`], is at.
+    Merge(usize),
+}
+
 /// A read out after the levels: a separated value's record, or a data block
 /// of the table a merge is reading.
 enum ValueReadOut<'a> {
@@ -69,6 +88,9 @@ struct MergeKey<'a> {
     found: bool,
     /// The block being read failed to read or decode.
     failed: bool,
+    /// Whether it holds one of the read's files: from the locate of its table
+    /// until the table is over.
+    holds_file: bool,
 }
 
 /// The multi-get of the keys of its context.
@@ -77,7 +99,8 @@ pub(super) struct MultiGetRead<'a, K> {
     /// Each key's newest version, from the memtables or the levels.
     entries: Vec<Option<InternalValue>>,
     /// `(duplicate index, representative index)` of keys asked more than
-    /// once: the levels are read for the representative only.
+    /// once: the representative alone is read, and its value handed to each
+    /// duplicate once the read is over.
     duplicates: Vec<(usize, usize)>,
     /// The read of the levels, while it goes on.
     tables: Option<TablesRead<'a, K>>,
@@ -91,9 +114,16 @@ pub(super) struct MultiGetRead<'a, K> {
     failure: Option<(usize, crate::Error)>,
     /// The reads out after the levels, by tag; `None` once back.
     reads: Vec<Option<ValueReadOut<'a>>>,
-    /// The blob files the value reads go through, each opened once: `None`
-    /// while its open is out.
-    blob_files: Vec<(crate::vlog::BlobFileId, Option<Arc<dyn FsFile>>)>,
+    /// The blob files the value reads go through, each opened once.
+    blob_files: Vec<BlobSlot>,
+    /// The most files the value reads and the merges hold at once: as many
+    /// as the descriptor cache keeps, as a level's chunk spans, so a cache
+    /// evicting a file can close it; set by the first file asked for.
+    file_cap: Option<usize>,
+    /// The files held: blob files open or opening, tables a merge is at.
+    files_held: usize,
+    /// The users of a file waiting for room under the cap, first come first.
+    file_waits: VecDeque<FileWait>,
     /// Values whose read failed or did not check out, to read on their own
     /// path, which reports what is wrong as a single read would.
     alone: Vec<(usize, InternalValue)>,
@@ -170,6 +200,9 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             failure: None,
             reads: Vec::new(),
             blob_files: Vec::new(),
+            file_cap: None,
+            files_held: 0,
+            file_waits: VecDeque::new(),
             alone: Vec::new(),
             merges: Vec::new(),
             merges_ready: Vec::new(),
@@ -222,6 +255,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                         versions: Vec::new(),
                         found: false,
                         failed: false,
+                        holds_file: false,
                     }));
                     self.step_merge(self.merges.len() - 1, out);
                 } else {
@@ -247,14 +281,23 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 }
                 ValuePlan::Read(read) => {
                     let id = read.vhandle.blob_file_id;
-                    let held = self.blob_files.iter().position(|&(held, _)| held == id);
+                    let held = self.blob_files.iter().position(|slot| slot.id == id);
                     let slot = held.unwrap_or_else(|| {
-                        out.job(Job::OpenBlob {
-                            tag: self.blob_files.len(),
-                            blob_file: id,
+                        Self::note_file_cap(
+                            &mut self.file_cap,
+                            read.blob_file
+                                .file_accessor()
+                                .as_descriptor_table()
+                                .map(crate::descriptor_table::DescriptorTable::capacity),
+                        );
+                        self.blob_files.push(BlobSlot {
+                            id,
+                            file: None,
+                            reads_out: 0,
                         });
-                        self.blob_files.push((id, None));
-                        self.blob_files.len() - 1
+                        let slot = self.blob_files.len() - 1;
+                        self.file_waits.push_back(FileWait::Blob(slot));
+                        slot
                     });
                     self.reads.push(Some(ValueReadOut::Blob(BlobRead {
                         idx,
@@ -282,39 +325,45 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
             return;
         };
         let version = self.ctx.version();
-        match file {
-            Ok(file) => {
-                for (tag, pending) in self.reads.iter().enumerate() {
-                    let Some(ValueReadOut::Blob(pending)) = pending else {
-                        continue;
-                    };
-                    if pending.slot != slot {
-                        continue;
-                    }
-                    source.count_issued(version, &pending.read);
-                    out.read(BlockRequest {
-                        tag,
-                        fs: &pending.read.blob_file.0.fs,
-                        cache: &source.cache,
-                        file: Arc::clone(&file),
-                        offset: pending.read.vhandle.offset,
-                        buf: alloc::vec![0u8; pending.read.len],
-                    });
-                }
-                if let Some((_, held)) = self.blob_files.get_mut(slot) {
-                    *held = Some(file);
+        let Ok(file) = file else {
+            for pending in &mut self.reads {
+                if let Some(ValueReadOut::Blob(read)) = pending.take_if(
+                    |pending| matches!(pending, ValueReadOut::Blob(read) if read.slot == slot),
+                ) {
+                    self.alone.push((read.idx, read.item));
                 }
             }
-            Err(_) => {
-                for pending in &mut self.reads {
-                    if let Some(ValueReadOut::Blob(read)) = pending.take_if(
-                        |pending| matches!(pending, ValueReadOut::Blob(read) if read.slot == slot),
-                    ) {
-                        self.alone.push((read.idx, read.item));
-                    }
-                }
+            self.files_held -= 1;
+            return;
+        };
+        let mut issued = 0usize;
+        for (tag, pending) in self.reads.iter().enumerate() {
+            let Some(ValueReadOut::Blob(pending)) = pending else {
+                continue;
+            };
+            if pending.slot != slot {
+                continue;
+            }
+            source.count_issued(version, &pending.read);
+            out.read(BlockRequest {
+                tag,
+                fs: &pending.read.blob_file.0.fs,
+                cache: &source.cache,
+                file: Arc::clone(&file),
+                offset: pending.read.vhandle.offset,
+                buf: alloc::vec![0u8; pending.read.len],
+            });
+            issued += 1;
+        }
+        // Held until its last read is back.
+        if let Some(held) = self.blob_files.get_mut(slot) {
+            held.reads_out = issued;
+            if issued > 0 {
+                held.file = Some(file);
+                return;
             }
         }
+        self.files_held -= 1;
     }
 
     /// Takes back a read out after the levels.
@@ -336,7 +385,7 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         let file = self
             .blob_files
             .get(pending.slot)
-            .and_then(|(_, file)| file.as_ref());
+            .and_then(|slot| slot.file.as_ref());
         let value = match (&self.ctx.values, file, done.result) {
             (Values::Blob(source), Some(file), Ok(())) => source
                 .finish_value(
@@ -349,6 +398,15 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
                 .ok(),
             _ => None,
         };
+        // Its last read back, the file is given back: the descriptor cache can
+        // close it, and another file can be opened in its place.
+        if let Some(slot) = self.blob_files.get_mut(pending.slot) {
+            slot.reads_out -= 1;
+            if slot.reads_out == 0 {
+                slot.file = None;
+                self.files_held -= 1;
+            }
+        }
         match value {
             Some(value) => self.value_done(pending.idx, Ok(Some(value))),
             None => self.alone.push((pending.idx, pending.item)),
@@ -381,14 +439,11 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         };
         match merge.walk.next_table() {
             Ok(Some(next)) => {
-                let (level, run, pos) = next.at;
-                out.job(Job::MergeLocate {
-                    tag: slot,
-                    idx: merge.idx,
-                    table: TableAt { level, run, pos },
-                });
+                // Located once the read has room for its file.
+                Self::note_file_cap(&mut self.file_cap, next.table.descriptor_capacity());
                 merge.table = Some(next);
                 merge.filter = None;
+                self.file_waits.push_back(FileWait::Merge(slot));
             }
             Ok(None) => {
                 let Some(merge) = self.merges.get_mut(slot).and_then(Option::take) else {
@@ -422,7 +477,58 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
     /// read would.
     fn merge_alone(&mut self, slot: usize, out: &mut impl ReadSink<'a>) {
         if let Some(merge) = self.merges.get_mut(slot).and_then(Option::take) {
+            if merge.holds_file {
+                self.files_held -= 1;
+            }
             out.job(Job::Merge { idx: merge.idx });
+        }
+    }
+
+    /// Sets the read's file cap from the first file asked for: as many files
+    /// as `capacity`, the descriptor cache's, keeps, at least one; no bound
+    /// without a cache, as a level read has none then.
+    fn note_file_cap(cap: &mut Option<usize>, capacity: Option<u64>) {
+        cap.get_or_insert_with(|| {
+            capacity.map_or(usize::MAX, |capacity| {
+                usize::try_from(capacity).unwrap_or(usize::MAX).max(1)
+            })
+        });
+    }
+
+    /// Hands out the opens of blob files and the locates of tables waiting
+    /// for room under the file cap, first come first, while there is room.
+    fn open_files(&mut self, out: &mut impl ReadSink<'a>) {
+        let cap = self.file_cap.unwrap_or(usize::MAX);
+        while self.files_held < cap {
+            let Some(wait) = self.file_waits.pop_front() else {
+                return;
+            };
+            match wait {
+                FileWait::Blob(slot) => {
+                    let Some(blob) = self.blob_files.get(slot) else {
+                        continue;
+                    };
+                    out.job(Job::OpenBlob {
+                        tag: slot,
+                        blob_file: blob.id,
+                    });
+                }
+                FileWait::Merge(slot) => {
+                    let Some(merge) = self.merges.get_mut(slot).and_then(Option::as_mut) else {
+                        continue;
+                    };
+                    let Some((level, run, pos)) = merge.table.as_ref().map(|next| next.at) else {
+                        continue;
+                    };
+                    out.job(Job::MergeLocate {
+                        tag: slot,
+                        idx: merge.idx,
+                        table: TableAt { level, run, pos },
+                    });
+                    merge.holds_file = true;
+                }
+            }
+            self.files_held += 1;
         }
     }
 
@@ -654,6 +760,10 @@ impl<'a, K: AsRef<[u8]>> MultiGetRead<'a, K> {
         };
         merge.table = None;
         merge.filter = None;
+        // The table is over: its file is given back.
+        if core::mem::take(&mut merge.holds_file) {
+            self.files_held -= 1;
+        }
         if merge.walk.take_table(versions.into_iter().map(Ok)).is_err() {
             self.merge_alone(slot, out);
             return;
@@ -673,7 +783,6 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
             if let Err(error) = read {
                 return Some(Err(error));
             }
-            Tree::fan_out_duplicates(&self.duplicates, &mut self.entries);
         }
         if !self.resolved {
             self.resolved = true;
@@ -684,12 +793,15 @@ impl<'a, K: AsRef<[u8]>> ReadMachine<'a> for MultiGetRead<'a, K> {
             out.job(Job::Blob { idx, item });
         }
         self.move_merges(out);
+        self.open_files(out);
         if self.jobs > 0 {
             return None;
         }
         if let Some((_, error)) = self.failure.take() {
             return Some(Err(error));
         }
+        // A key asked again answers its representative's value, read once.
+        Tree::fan_out_duplicates(&self.duplicates, &mut self.results);
         Some(Ok(core::mem::take(&mut self.results)))
     }
 

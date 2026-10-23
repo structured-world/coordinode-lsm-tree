@@ -3843,21 +3843,21 @@ impl Tree {
         (miss_keys, duplicates)
     }
 
-    /// Fans each representative's resolved entry out to its duplicate positions,
-    /// so every input slot carries the same answer the per-key path would have
-    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call after the
-    /// batched resolver fills `internal_entries`.
+    /// Fans each representative's answer out to its duplicate positions, so
+    /// every input slot carries the same answer the per-key path would have
+    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call once the
+    /// representatives' answers are in `answers`.
     #[expect(
         clippy::indexing_slicing,
-        reason = "duplicate/representative indices are batch-local key indices < entries.len()"
+        reason = "duplicate/representative indices are batch-local key indices < answers.len()"
     )]
-    pub(crate) fn fan_out_duplicates(
+    pub(crate) fn fan_out_duplicates<T: Clone>(
         duplicates: &[(usize, usize)],
-        internal_entries: &mut [Option<InternalValue>],
+        answers: &mut [Option<T>],
     ) {
         for &(dup_idx, rep_idx) in duplicates {
-            let resolved = internal_entries[rep_idx].clone();
-            internal_entries[dup_idx] = resolved;
+            let resolved = answers[rep_idx].clone();
+            answers[dup_idx] = resolved;
         }
     }
 

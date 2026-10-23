@@ -4041,6 +4041,53 @@ fn scan_seqno_range_returns_nothing_below_a_bulk_ingest_base() -> crate::Result<
     Ok(())
 }
 
+/// The versions a merge takes out of a block are filtered by visibility before
+/// their seqnos are translated, as a table's reader takes them: under an ingest
+/// base whose sum with a version's local seqno passes `SeqNo::MAX`, that
+/// version is above every snapshot and is left out, not translated (which
+/// panics), while an older version still visible is taken.
+#[test]
+fn key_versions_leaves_out_a_version_whose_translated_seqno_overflows() -> crate::Result<()> {
+    use crate::ValueType::Value;
+    use crate::fs::StdFs;
+
+    const BASE: SeqNo = SeqNo::MAX - 2;
+
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("ingested");
+    let mut writer = crate::table::Writer::new(file.clone(), 0, 0, Arc::new(StdFs))?;
+    // Local 5 overflows under the base; local 0 sits at MAX - 2.
+    writer.write(InternalValue::from_components("abc", "newer", 5, Value))?;
+    writer.write(InternalValue::from_components("abc", "older", 0, Value))?;
+    let _trailer = writer.finish()?;
+
+    let table = {
+        let mut params = test_recover_params(file, crate::Checksum::from_raw(0));
+        params.global_seqno = BASE;
+        params.cache = Arc::new(crate::Cache::with_capacity_bytes(0));
+        crate::Table::recover(params)?
+    };
+
+    let (_, handles) = table.key_blocks(b"abc")?;
+    let mut versions = Vec::new();
+    let mut found = false;
+    for handle in &handles {
+        let block = table
+            .load_data_block(handle, &crate::table::util::LookupFd::default())?
+            .expect("a row table's block");
+        let (taken, in_block) = table.key_versions(&block, b"abc", SeqNo::MAX);
+        versions.extend(taken);
+        found |= in_block;
+    }
+    assert!(found, "the table holds the key");
+    assert_eq!(
+        versions,
+        vec![InternalValue::from_components("abc", "older", BASE, Value)],
+        "only the version a snapshot can see, at its translated seqno"
+    );
+    Ok(())
+}
+
 /// A seqno scan of a restricted view reads none of the punched prefix and
 /// hands out nothing below the restriction, whole or key-bounded.
 #[test]

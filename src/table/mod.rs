@@ -8779,8 +8779,12 @@ impl Table {
                 core::cmp::Ordering::Equal => {}
             }
             found = true;
-            version.key.seqno = apply_global_seqno(version.key.seqno, global_seqno);
-            if crate::range::seqno_filter(version.key.seqno, seqno) {
+            // Filtered before it is translated, as the table's reader takes a
+            // version: a sum past `SeqNo::MAX` is above every snapshot.
+            if let Some(global) = version.key.seqno.checked_add(global_seqno)
+                && crate::range::seqno_filter(global, seqno)
+            {
+                version.key.seqno = global;
                 versions.push(version);
             }
         }

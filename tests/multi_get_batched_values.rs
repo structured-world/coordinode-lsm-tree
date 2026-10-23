@@ -70,6 +70,35 @@ fn a_blob_tree_multi_get_reads_its_values_in_one_batch() -> lsm_tree::Result<()>
     Ok(())
 }
 
+/// A key asked several times in one multi-get reads its separated value once:
+/// the batch carries no more reads than the same keys asked once, and every
+/// occurrence answers the value.
+#[test]
+fn a_key_asked_again_reads_its_separated_value_once() -> lsm_tree::Result<()> {
+    let once: Vec<String> = (0..4).map(key_for).collect();
+    let mut repeated = once.clone();
+    repeated.extend(std::iter::repeat_n(key_for(0), 8));
+    let mut reads = Vec::new();
+    for keys in [&once, &repeated] {
+        let dir = tempfile::tempdir()?;
+        let fs = BatchCountFs::default();
+        let tree = cold_tree(dir.path(), &fs)?;
+        fs.take();
+        let values = tree.multi_get(keys, SeqNo::MAX)?;
+        reads.push(fs.take().iter().sum::<usize>());
+        for (key, value) in keys.iter().zip(&values) {
+            let i: usize = key.trim_start_matches("key").parse().expect("a key index");
+            assert_eq!(value.as_deref(), Some(value_for(i).as_slice()), "{key}");
+        }
+    }
+    assert_eq!(
+        reads.first(),
+        reads.last(),
+        "a repeated key adds no read: {reads:?}"
+    );
+    Ok(())
+}
+
 /// A value whose record fails its checks fails the multi-get as it fails a
 /// read of that key alone, with the same error, and the values beside it
 /// are unaffected when read alone.
