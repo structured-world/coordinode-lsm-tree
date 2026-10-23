@@ -19,12 +19,17 @@
 //! | `tree` | `tree.iter` over one table, every value handed out |
 //! | `table` | the one table's own reader, no merge or version resolution |
 //! | `tree_8_tables` | `tree.iter` over the same rows in 8 overlapping tables |
+//! | `tree_32_tables` | the same in 32 overlapping tables |
 //! | `tree_3_versions` | `tree.iter` over one table holding 3 versions per key |
 //!
 //! Read the arms as differences: `tree` − `table` is the merge, version
 //! resolution and hand-out above a single table; `tree_8_tables` − `tree` is
 //! merging several tables; `tree_3_versions` − `tree` is skipping older
 //! versions (per visible row).
+//!
+//! Built with the `metrics` feature, each arm also reports what one scan asks
+//! of the files: block loads served from the file and from the cache, the
+//! bytes read and decoded, and the table file lookups and opens.
 //!
 //! `SCAN_SPLIT_SIZES` (comma-separated, default `1000,10000,70000`) and
 //! `SCAN_SPLIT_ROUNDS` (default 15) set the run. `SCAN_SPLIT_ARM=<arm>` with
@@ -170,6 +175,7 @@ fn arms(n: u64) -> Vec<Arm> {
         Arm::new("tree", n, 1, 1, false),
         Arm::new("table", n, 1, 1, true),
         Arm::new("tree_8_tables", n, 8, 1, false),
+        Arm::new("tree_32_tables", n, 32, 1, false),
         Arm::new("tree_3_versions", n, 1, 3, false),
     ]
 }
@@ -235,6 +241,34 @@ fn main() {
                 arm.label,
                 median(out)
             );
+            #[cfg(feature = "metrics")]
+            report_file_work(arm, n);
         }
     }
+}
+
+/// What one more scan of `arm` asks of its files, from the tree's counters.
+#[cfg(feature = "metrics")]
+fn report_file_work(arm: &Arm, n: u64) {
+    let m = arm.tree.metrics();
+    let before = (
+        m.block_load_io_count(),
+        m.block_load_cached_count(),
+        m.bytes_read(),
+        m.bytes_decoded(),
+        m.table_file_cached_count(),
+        m.table_file_opened_count(),
+    );
+    arm.scan();
+    println!(
+        "scan_split/{}/{n}: one scan: {} block loads from the file, {} from the cache, \
+         {} bytes read, {} decoded, {} table file lookups, {} opens",
+        arm.label,
+        m.block_load_io_count() - before.0,
+        m.block_load_cached_count() - before.1,
+        m.bytes_read() - before.2,
+        m.bytes_decoded() - before.3,
+        m.table_file_cached_count() - before.4,
+        m.table_file_opened_count() - before.5,
+    );
 }
