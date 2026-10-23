@@ -435,6 +435,55 @@ where
     }
 }
 
+/// A source of a scan, a table's reader built only once the scan knows whether
+/// the table is its only source and can be read without the indirection.
+enum Source<'a> {
+    Table(crate::table::Table, FilterAnswer),
+    Boxed(BoxedIterator<'a>),
+}
+
+impl<'a> Source<'a> {
+    fn into_boxed(self, user_range: &UserBounds, seqno: SeqNo) -> BoxedIterator<'a> {
+        match self {
+            Self::Table(table, answer) => table_reader(answer, table, user_range.clone(), seqno),
+            Self::Boxed(iter) => iter,
+        }
+    }
+}
+
+/// The whole scan over a table that is its only source and holds one version
+/// of each key: the rows its snapshot sees, but tombstones, in one pass over
+/// the reader, then the range tombstones.
+fn lone_table_scan<'a>(
+    answer: FilterAnswer,
+    table: crate::table::Table,
+    user_range: UserBounds,
+    seqno: SeqNo,
+    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    comparator: SharedComparator,
+) -> BoxedMerge<'a> {
+    let reader = table.range(user_range);
+    let counts = answer.passed() && table.probe_stats().is_some();
+    let handed_out = move |item: &crate::Result<InternalValue>| match item {
+        Ok(item) => seqno_filter(item.key.seqno, seqno) && !item.key.is_tombstone(),
+        Err(_) => true,
+    };
+    if counts {
+        finish_scan(
+            FilterPassReader {
+                inner: reader,
+                table,
+                settled: false,
+            }
+            .filter(handed_out),
+            range_tombstones,
+            comparator,
+        )
+    } else {
+        finish_scan(reader.filter(handed_out), range_tombstones, comparator)
+    }
+}
+
 impl TreeIter {
     #[expect(
         clippy::too_many_lines,
@@ -461,7 +510,7 @@ impl TreeIter {
 
             let range = user_to_internal_bounds(&user_range);
 
-            let mut iters: Vec<BoxedIterator<'_>> = Vec::with_capacity(5);
+            let mut iters: Vec<Source<'_>> = Vec::with_capacity(5);
             // Per source: whether it holds at most one version of any key,
             // which a lone source then needs no version grouping for.
             let mut one_version: Vec<bool> = Vec::with_capacity(5);
@@ -624,14 +673,14 @@ impl TreeIter {
                 let (first, answer) = surviving.remove(0);
                 first.note_scan();
                 one_version.push(holds_one_version_per_key(&first));
-                iters.push(table_reader(answer, first, user_range.clone(), seqno));
+                iters.push(Source::Table(first, answer));
                 match surviving.len() {
                     0 => {}
                     1 => {
                         if let Some((table, answer)) = surviving.pop() {
                             table.note_scan();
                             one_version.push(holds_one_version_per_key(&table));
-                            iters.push(table_reader(answer, table, user_range.clone(), seqno));
+                            iters.push(Source::Table(table, answer));
                         }
                     }
                     _ => {
@@ -657,10 +706,12 @@ impl TreeIter {
                         .map(RunReader::counting_scans)
                 {
                     one_version.push(run_one_version);
-                    iters.push(Box::new(reader.filter(move |item| match item {
-                        Ok(item) => seqno_filter(item.key.seqno, seqno),
-                        Err(_) => true,
-                    })));
+                    iters.push(Source::Boxed(Box::new(reader.filter(
+                        move |item| match item {
+                            Ok(item) => seqno_filter(item.key.seqno, seqno),
+                            Err(_) => true,
+                        },
+                    ))));
                 }
             }
 
@@ -689,10 +740,10 @@ impl TreeIter {
                 let iter = memtable.range_internal(range.clone());
 
                 one_version.push(false);
-                iters.push(Box::new(
+                iters.push(Source::Boxed(Box::new(
                     iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
                         .map(Ok),
-                ));
+                )));
             }
 
             // Active memtable
@@ -721,10 +772,10 @@ impl TreeIter {
                     let iter = lock.version.active_memtable.range_internal(range.clone());
 
                     one_version.push(false);
-                    iters.push(Box::new(
+                    iters.push(Source::Boxed(Box::new(
                         iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
                             .map(Ok),
-                    ));
+                    )));
                 }
             }
 
@@ -749,7 +800,7 @@ impl TreeIter {
                             .map(Ok),
                     );
                     one_version.push(false);
-                    iters.push(iter);
+                    iters.push(Source::Boxed(iter));
                 }
             }
 
@@ -802,12 +853,22 @@ impl TreeIter {
 
             let comparator = lock.comparator.clone();
             match lone {
-                Some(source) if !groups_versions => {
-                    finish_scan(source.filter(is_live), all_range_tombstones, comparator)
-                }
+                Some(Source::Table(table, answer)) if !groups_versions => lone_table_scan(
+                    answer,
+                    table,
+                    user_range,
+                    seqno,
+                    all_range_tombstones,
+                    comparator,
+                ),
+                Some(source) if !groups_versions => finish_scan(
+                    source.into_boxed(&user_range, seqno).filter(is_live),
+                    all_range_tombstones,
+                    comparator,
+                ),
                 Some(source) => finish_scan(
                     MvccStream::new_with_comparator(
-                        source,
+                        source.into_boxed(&user_range, seqno),
                         lock.merge_operator.clone(),
                         lock.comparator.clone(),
                     )
@@ -819,7 +880,13 @@ impl TreeIter {
                 ),
                 None => finish_scan(
                     MvccStream::new_with_comparator(
-                        build_seeking(iters, lock.comparator.clone()),
+                        build_seeking(
+                            iters
+                                .into_iter()
+                                .map(|source| source.into_boxed(&user_range, seqno))
+                                .collect(),
+                            lock.comparator.clone(),
+                        ),
                         lock.merge_operator.clone(),
                         lock.comparator.clone(),
                     )
