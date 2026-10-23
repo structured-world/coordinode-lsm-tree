@@ -613,9 +613,6 @@ fn raw_statfs_on_missing_path_errors() {
 // a tree on the raw backend keeps the reclaim, clone and volume decisions the
 // std backend makes.
 
-#[cfg(feature = "std")]
-use crate::fs::{Fs as _, FsFile as _};
-
 /// Writes `len` bytes of `byte` to a new file at `path` through `fs`.
 #[cfg(feature = "std")]
 fn write_raw_file(fs: &IoUringRawFs, path: &std::path::Path, byte: u8, len: usize) {
