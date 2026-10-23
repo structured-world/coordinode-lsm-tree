@@ -296,8 +296,32 @@ impl ByteView {
 
     /// Fuses two byte slices into a single byteview.
     #[must_use]
+    #[inline]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {
         let len = left.len() + right.len();
+        // A key rebuilt from its restart head's prefix and its own suffix is
+        // short as a rule: written straight into the inline form, it skips
+        // the builder and its prefix bookkeeping, which only the heap form has.
+        if len <= INLINE_SIZE {
+            let mut data = [0; INLINE_SIZE];
+            // Both pieces fit: `left.len() + right.len() == len <= INLINE_SIZE`.
+            if let Some((head, rest)) = data.split_at_mut_checked(left.len())
+                && let Some(tail) = rest.get_mut(..right.len())
+            {
+                head.copy_from_slice(left);
+                tail.copy_from_slice(right);
+            }
+            return Self {
+                trailer: Trailer {
+                    short: ManuallyDrop::new(ShortRepr {
+                        // `len` is at most `INLINE_SIZE`, so it fits a u32.
+                        #[expect(clippy::cast_possible_truncation, reason = "len <= INLINE_SIZE")]
+                        len: len as u32,
+                        data,
+                    }),
+                },
+            };
+        }
         let mut builder = unsafe { Self::builder_unzeroed(len) };
         builder[0..left.len()].copy_from_slice(left);
         builder[left.len()..].copy_from_slice(right);

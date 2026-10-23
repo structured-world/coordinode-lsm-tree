@@ -48,6 +48,12 @@ impl Slice {
         Self(self.0.slice(range))
     }
 
+    /// Whether both hold the same bytes.
+    #[inline]
+    pub(crate) fn same_bytes(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {

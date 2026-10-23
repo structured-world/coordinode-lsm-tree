@@ -50,6 +50,14 @@ impl Slice {
         Self(ByteView::fused(left, right))
     }
 
+    /// Whether both hold the same bytes. Unlike a comparison of the byte
+    /// slices, it rules out most different keys on the length and the first
+    /// bytes held inline, without reaching the bytes behind a pointer.
+    #[inline]
+    pub(crate) fn same_bytes(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {

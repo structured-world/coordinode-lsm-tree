@@ -121,6 +121,16 @@ pub fn same_user_key(a: &[u8], b: &[u8]) -> bool {
     a == b
 }
 
+/// [`same_user_key`] of two held keys: the same byte equality, answered from
+/// the keys' own representation, which rules out most different keys on their
+/// length and first bytes without a byte-by-byte compare. For the read path's
+/// per-entry version grouping.
+#[inline]
+#[must_use]
+pub fn same_held_key(a: &crate::UserKey, b: &crate::UserKey) -> bool {
+    a.same_bytes(b)
+}
+
 /// Default comparator using lexicographic byte ordering.
 ///
 /// This is the comparator used when no custom comparator is configured,
