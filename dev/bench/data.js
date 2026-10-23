@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792766646156,
+  "lastUpdate": 1792783030587,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -56858,6 +56858,90 @@ window.BENCHMARK_DATA = {
             "value": 334661.4030875771,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.0us | P99.9: 83.4us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "14c82ede6daccbf951e4444a07dd47a14653e83e",
+          "message": "fix(fs): implement the capability methods of the raw io_uring backend (#980)\n\n## Summary\n\n- The raw-syscall `io_uring` backend (`io-uring-raw`) answers every\ncapability-dependent `Fs` / `FsFile` method as `StdFs` does on the same\nLinux files, through its own syscalls, instead of the trait defaults\nthat silently turned off tight-space reclaim, prefix punches, reflinked\nand hard-linked checkpoints and the space gate's volume split.\n- The raw backend works on 32-bit targets: it maps its ring, sets\nlengths and seeks with the 64-bit syscall forms and opens with\n`O_LARGEFILE` there.\n- `StdFs` takes `FS_IOC_GETFLAGS` / `FS_IOC_SETFLAGS` from libc, which\nencodes the target's `long` width, and turns copy-on-write off on 32-bit\narm too.\n\n## Changes\n\n- `capabilities`: `statfs` `f_type` (x86-64 / aarch64, where the raw\n`statfs` layout is verified), mapped by the `f_type` table `StdFs` now\nshares from the `fs` module.\n- `punch_hole` (`fallocate` `PUNCH_HOLE | KEEP_SIZE`), `extent_is_hole`\n/ `extent_contains_hole` (`lseek` `SEEK_DATA` / `SEEK_HOLE`; `ENXIO`\nread as an answer, `EINVAL` / `EOPNOTSUPP` as \"cannot tell\"),\n`allocated_size` (`statx` `stx_blocks`; a missing file is an error, not\n\"cannot tell\").\n- `reflink_file` (`ioctl(FICLONE)`, falling back to the streamed copy\nwhere the file system cannot clone), `try_disable_cow`\n(`FS_IOC_SETFLAGS` `FS_NOCOW_FL`, a no-op where not applicable).\n- `hard_link` (`linkat`), `hard_link_count` by path (`statx` `nlink`),\n`backend_id` (the kernel namespace `StdFs` reports, now defined in the\n`fs` module for both), `volume_id` (the `statx` device, encoded as `std`\nencodes `st_dev`).\n- `FsFile::hint` (`fadvise64`).\n- The constants the C library also defines are checked against it at\nbuild time; nothing of the C library is linked.\n- `StdFs`'s hand-written `FS_IOC_*FLAGS` values carried a size of 8 on\nthe 32-bit targets too, where the kernel refused them; the libc values\ncarry 4 there.\n- 32-bit raw backend: the ring is mapped through `mmap2` (its `mmap`\ntakes a 32-bit offset, and on x86 reads its arguments through a pointer,\nso the ring never came up), lengths go through `ftruncate64` and seeks\nthrough `_llseek` as register pairs, and files open with `O_LARGEFILE`.\n\n## Testing\n\nFormat, clippy (default and all features), nextest (default and all\nfeatures), doc tests, rustdoc, the no-std and the armv7 / i686 / aarch64\n`io-uring-raw` checks, the tools, the i686 lib tests and the raw\nbackend's tests as a 32-bit x86 binary (also a CI step now) pass on\nLinux. Each raw method is compared with `StdFs` on the same files, and\nskips where the file system lacks the feature.\n\nCloses #924\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added filesystem support for hard links, reflinks, copy-on-write\ncontrols, hole punching, allocation-size reporting, and file-access\nhints where available.\n* Added filesystem capability reporting for common Linux filesystem\ntypes.\n* **Bug Fixes**\n* Improved raw filesystem operations on 32-bit Linux, including support\nfor large files and correct handling of file offsets and lengths.\n* Reflink requests now fall back to copying when the filesystem or file\nlocation does not support reflinks.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-23T21:55:12+03:00",
+          "tree_id": "5c9c3ab64259221f34710e489415d60c5d4f274f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/14c82ede6daccbf951e4444a07dd47a14653e83e"
+        },
+        "date": 1792783029386,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 120701.87678604935,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 21.6us | P99.9: 43.0us\nthreads: 1 | elapsed: 4.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2595429.3969234303,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 576117.8597029088,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 3.7us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 421925.8261739096,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.3us | P99.9: 31.0us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2282154.776307468,
+            "unit": "ops/sec",
+            "extra": "P50: 0.3us | P99: 4.9us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 246285.6885664517,
+            "unit": "ops/sec",
+            "extra": "P50: 3.5us | P99: 8.4us | P99.9: 19.4us\nthreads: 1 | elapsed: 0.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 137376.20297962622,
+            "unit": "ops/sec",
+            "extra": "P50: 6.4us | P99: 17.0us | P99.9: 46.9us\nthreads: 1 | elapsed: 1.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 651047.9779325465,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 17.3us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 722643.0110247827,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 8.8us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 305729.6788411073,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 17.6us | P99.9: 93.3us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
