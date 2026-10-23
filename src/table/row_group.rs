@@ -774,6 +774,50 @@ impl GroupRead<'_> {
         })
     }
 
+    /// Loads the group's directory and every page from `group`, the whole
+    /// group's bytes as one read brought them in: every block is verified,
+    /// admitted and cached as [`Self::load`] does it, the directory once the
+    /// pages it names checked out, and nothing is read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`].
+    pub(crate) fn load_whole(&self, group: &Slice) -> crate::Result<RowGroupBlocks> {
+        let directory_len = indexed_directory_len(self.group)?;
+        self.check_block_len(directory_len)?;
+        let directory = self.admit_directory(group, directory_len)?;
+        // Every page: no zone selects among them.
+        let wanted = PageWant::ALL.resolve(&directory, None)?;
+        let mut pages = wanted.slots(&directory);
+        // The pages lie past the directory and the zone blocks, within the
+        // group, as `admit_directory`'s extent check proved; each is cut out
+        // of the bytes from there and refused should it reach past them.
+        let pages_at = directory_len as usize + directory.pages_start() as usize;
+        let span = group.slice(pages_at.min(group.len())..);
+        self.admit_pages(
+            &directory,
+            directory_len,
+            0..pages.len(),
+            pages_at,
+            &span,
+            &mut pages,
+            &mut Vec::new().into_iter().peekable(),
+        )?;
+        if self.charge.touches_cache() {
+            self.cache.insert_directory(
+                self.table_id,
+                self.group.offset(),
+                Arc::clone(&directory),
+                directory_len,
+            );
+        }
+        Ok(RowGroupBlocks {
+            directory,
+            row_pages: wanted.row_pages,
+            pages,
+        })
+    }
+
     /// Verifies and admits the directory of `directory_len` bytes, the length
     /// the index entry records, at the front of `front`, decodes it and proves
     /// it fills the group. The caller caches it once the blocks it names have

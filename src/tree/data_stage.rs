@@ -9,6 +9,7 @@
 
 use super::read_job::{BlockRequest, Job, ReadSink};
 use super::{BlockTask, TaskBlock, Tree};
+use crate::table::SpecialRead;
 use crate::{InternalValue, TableId, fs::FsFile};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -16,11 +17,12 @@ use alloc::vec::Vec;
 /// A table file a chunk's reads go through, by table.
 pub(super) type ChunkFile = (TableId, Arc<dyn FsFile>);
 
-/// A block to read whole into `buf`, the block of task `index`, from the file
-/// in `slot` of the chunk's files.
+/// A block to read whole into `buf` from `offset`, the block of task `index`,
+/// from the file in `slot` of the chunk's files.
 struct Fill {
     index: usize,
     slot: usize,
+    offset: u64,
     buf: Vec<u8>,
 }
 
@@ -98,9 +100,22 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
                 TaskBlock::Load => {}
             }
         }
+        // A Page-ECC or columnar block is read as bytes with the others where
+        // its table can rebuild it from them, and loaded in a job where not.
+        let special: Vec<Option<(u64, usize)>> = chunk
+            .iter()
+            .zip(cached)
+            .map(|(task, block)| match block {
+                TaskBlock::Load => match task.table.batched_special_read(&task.handle) {
+                    SpecialRead::Bytes { offset, len } => Some((offset, len)),
+                    SpecialRead::Load => None,
+                },
+                TaskBlock::Held(_) | TaskBlock::Read => None,
+            })
+            .collect();
         let mut jobs = 0usize;
-        for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if matches!(block, TaskBlock::Load) {
+        for (index, ((task, block), bytes)) in chunk.iter().zip(cached).zip(&special).enumerate() {
+            if matches!(block, TaskBlock::Load) && bytes.is_none() {
                 out.job(Job::Load {
                     index,
                     table: task.at,
@@ -110,12 +125,14 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             }
         }
         let mut carry = carried.take();
-        for (index, (task, block)) in chunk.iter().zip(cached).enumerate() {
-            if !matches!(block, TaskBlock::Read) {
-                continue;
-            }
-            // Its size is checked above.
-            let buf = alloc::vec![0u8; task.handle.size() as usize];
+        for (index, ((task, block), bytes)) in chunk.iter().zip(cached).zip(&special).enumerate() {
+            let (offset, len) = match (block, bytes) {
+                // Its size is checked above.
+                (TaskBlock::Read, _) => (*task.handle.offset(), task.handle.size() as usize),
+                (TaskBlock::Load, Some(read)) => *read,
+                _ => continue,
+            };
+            let buf = alloc::vec![0u8; len];
             let id = task.table.id();
             if read.files.last().is_none_or(|&(last, _)| last != id) {
                 let file = match carry.take() {
@@ -138,6 +155,7 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             read.fills.push(Fill {
                 index,
                 slot: read.files.len() - 1,
+                offset,
                 buf,
             });
         }
@@ -177,22 +195,32 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
             )));
         }
         let count = self.fills.len();
-        for Fill { index, slot, buf } in core::mem::take(&mut self.fills) {
+        for Fill {
+            index,
+            slot,
+            offset,
+            buf,
+        } in core::mem::take(&mut self.fills)
+        {
             let (Some(task), Some((_, Some(file)))) = (chunk.get(index), self.files.get(slot))
             else {
                 unreachable!("every fill's task and file are checked above");
             };
             // These reads bypass the per-block load path that charges every
             // other read.
-            task.table.record_batched_read(
-                crate::table::block::BlockType::Data,
-                core::slice::from_ref(&task.handle),
-            );
+            let role = if task.special {
+                task.table.special_read_role()
+            } else {
+                crate::table::block::BlockType::Data
+            };
+            task.table
+                .record_batched_read(role, core::slice::from_ref(&task.handle));
             out.read(BlockRequest {
                 tag: index,
-                table: task.table,
+                fs: &task.table.fs,
+                cache: &task.table.cache,
                 file: Arc::clone(file),
-                offset: *task.handle.offset(),
+                offset,
                 buf,
             });
         }
@@ -222,35 +250,49 @@ impl<'k, K: AsRef<[u8]>> ChunkRead<'k, K> {
     }
 
     /// Takes back the read of task `index` of `chunk` as its on-disk `bytes`:
-    /// decoded, kept in the cache while it fits in `keep_room`, and
+    /// decoded (a Page-ECC or columnar block checked and rebuilt by its
+    /// table), kept in the cache while it fits in `keep_room`, and
     /// point-read.
     pub(super) fn read(
         &mut self,
         chunk: &[BlockTask<'_>],
         index: usize,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         keep_room: &mut u64,
     ) {
         let Some(task) = chunk.get(index) else {
             return;
         };
-        let lead = self
-            .leads
-            .iter()
-            .position(|(at, _)| *at == index)
-            .map(|at| self.leads.swap_remove(at).1);
-        if let Err(e) = Tree::resolve_block_task(
-            task,
-            index,
-            bytes,
-            keep_room,
-            lead,
-            self.keys,
-            &mut self.hits,
-        ) && self
-            .decode_failure
-            .as_ref()
-            .is_none_or(|(held, _)| index < *held)
+        let resolved = if task.special {
+            task.table
+                .decode_special_block(&task.handle, bytes, keep_room)
+                .and_then(|block| match block {
+                    Some(block) => {
+                        Tree::read_task_keys(task, index, &block, self.keys, &mut self.hits)
+                    }
+                    None => Ok(()),
+                })
+        } else {
+            let lead = self
+                .leads
+                .iter()
+                .position(|(at, _)| *at == index)
+                .map(|at| self.leads.swap_remove(at).1);
+            Tree::resolve_block_task(
+                task,
+                index,
+                &bytes,
+                keep_room,
+                lead,
+                self.keys,
+                &mut self.hits,
+            )
+        };
+        if let Err(e) = resolved
+            && self
+                .decode_failure
+                .as_ref()
+                .is_none_or(|(held, _)| index < *held)
         {
             self.decode_failure = Some((index, e));
         }

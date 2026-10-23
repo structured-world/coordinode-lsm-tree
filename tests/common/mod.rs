@@ -119,6 +119,12 @@ pub fn sorted_sst_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// Flips a byte a fixed depth into the SST's `data` section, so the SST still
 /// opens but one data block fails its checksum.
 pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
+    corrupt_data_region_with(path, 0xFF)
+}
+
+/// [`corrupt_data_region`], flipping the bits of `mask` in that byte: one bit
+/// is a fault Page-ECC corrects.
+pub fn corrupt_data_region_with(path: &std::path::Path, mask: u8) -> std::io::Result<()> {
     // Locate the `data` section through the SFA trailer TOC rather than assuming
     // it begins at offset 0: a byte a fixed depth into the section's payload is
     // stable against tail growth (the index / filter / meta / trailer that follow
@@ -144,8 +150,81 @@ pub fn corrupt_data_region(path: &std::path::Path) -> std::io::Result<()> {
     let mut bytes = std::fs::read(path)?;
     *bytes
         .get_mut(pos)
-        .expect("corruption offset within the SST") ^= 0xFF;
+        .expect("corruption offset within the SST") ^= mask;
     std::fs::write(path, &bytes)
+}
+
+/// A backend delegating to [`lsm_tree::fs::StdFs`] that records, per batched
+/// read, how many requests it carried.
+#[derive(Clone, Default)]
+pub struct BatchCountFs(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+impl BatchCountFs {
+    /// The request counts recorded since the last take, forgotten.
+    pub fn take(&self) -> Vec<usize> {
+        core::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+impl lsm_tree::fs::Fs for BatchCountFs {
+    fn read_blocks_batched(
+        &self,
+        reqs: &mut [lsm_tree::fs::BlockRead<'_>],
+    ) -> lsm_tree::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(reqs.len());
+        lsm_tree::fs::StdFs.read_blocks_batched(reqs)
+    }
+
+    fn open(
+        &self,
+        path: &std::path::Path,
+        opts: &lsm_tree::fs::FsOpenOptions,
+    ) -> lsm_tree::io::Result<Box<dyn lsm_tree::fs::FsFile>> {
+        lsm_tree::fs::StdFs.open(path, opts)
+    }
+
+    fn create_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.create_dir_all(path)
+    }
+
+    fn read_dir(
+        &self,
+        path: &std::path::Path,
+    ) -> lsm_tree::io::Result<Vec<lsm_tree::fs::FsDirEntry>> {
+        lsm_tree::fs::StdFs.read_dir(path)
+    }
+
+    fn remove_file(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.remove_file(path)
+    }
+
+    fn remove_dir_all(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.remove_dir_all(path)
+    }
+
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.rename(from, to)
+    }
+
+    fn metadata(&self, path: &std::path::Path) -> lsm_tree::io::Result<lsm_tree::fs::FsMetadata> {
+        lsm_tree::fs::StdFs.metadata(path)
+    }
+
+    fn sync_directory(&self, path: &std::path::Path) -> lsm_tree::io::Result<()> {
+        lsm_tree::fs::StdFs.sync_directory(path)
+    }
+
+    fn exists(&self, path: &std::path::Path) -> lsm_tree::io::Result<bool> {
+        lsm_tree::fs::StdFs.exists(path)
+    }
 }
 
 /// Convert an iterator guard into owned `(key, value)` byte vectors.

@@ -9,12 +9,10 @@
 //! the `syscalls` crate's raw `syscall!` and its own `mmap`'d ring management,
 //! so a Linux `no_std + alloc` consumer gets kernel async I/O with no `std`.
 //!
-//! This is the driver CORE: it sets up a ring, submits a single SQE, and reaps
-//! its CQE. The `IORING_OP_NOP` round-trip exercised by the tests proves the
-//! whole submission/completion machinery (ring `mmap`, SQE encode, tail/head
-//! handoff, `io_uring_enter`, CQE decode) end to end. File-operation opcodes
-//! (READ / WRITE / FSYNC) and the [`Fs`](crate::fs::Fs) / [`FsFile`] impls layer
-//! on top of this core in follow-up work.
+//! The core sets up a ring, submits a batch of SQEs (as many in flight as the
+//! rings hold) and reaps their CQEs; one operation is a batch of one. The
+//! [`Fs`](crate::fs::Fs) / [`FsFile`] impls build on it: single reads, writes
+//! and syncs, and batched reads across files.
 //!
 //! Linux-only by construction (`io_uring` is a Linux kernel API); the module is
 //! `cfg(all(target_os = "linux", feature = "io-uring-raw"))` at its declaration.
@@ -47,7 +45,7 @@ use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 use syscalls::{Errno, Sysno, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6};
 
-use crate::fs::{Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use crate::fs::{BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
 use crate::io::{Error, ErrorKind, SeekFrom};
 use crate::path::Path;
 
@@ -229,6 +227,7 @@ mod errno {
     pub(super) const EINTR: i32 = 4;
     pub(super) const EBADF: i32 = 9;
     pub(super) const EAGAIN: i32 = 11;
+    pub(super) const EBUSY: i32 = 16;
     pub(super) const ENOMEM: i32 = 12;
     pub(super) const EACCES: i32 = 13;
     pub(super) const EEXIST: i32 = 17;
@@ -355,16 +354,18 @@ unsafe fn io_uring_setup(entries: u32, params: *mut IoUringParams) -> Result<i32
     Ok(fd as i32)
 }
 
-/// `io_uring_enter(fd, to_submit, min_complete, flags, NULL, 0)`.
+/// `io_uring_enter(fd, to_submit, min_complete, flags, NULL, 0)`, returning
+/// how many SQEs the kernel took, or the raw `errno`, which the caller sorts
+/// into the ones to enter again on and the ones that refuse the SQEs.
 ///
 /// # Safety
 /// `fd` must be a live ring fd from [`io_uring_setup`].
-unsafe fn io_uring_enter(
+unsafe fn io_uring_enter_raw(
     fd: i32,
     to_submit: u32,
     min_complete: u32,
     flags: u32,
-) -> Result<u32, Error> {
+) -> Result<u32, Errno> {
     // SAFETY: `fd` is a live ring fd (caller contract). `sig`/`sigsz` are
     // NULL/0 — we never block on a signal mask.
     let n = unsafe {
@@ -377,9 +378,37 @@ unsafe fn io_uring_enter(
             0,
             0,
         )
-    }
-    .map_err(|e| err("io_uring_enter", e))?;
+    }?;
     Ok(n as u32)
+}
+
+/// Ends the process: the ring failed to report completions it owes, so the
+/// kernel may still write into buffers a return would hand back to their
+/// owners, and nothing can say when it stops.
+// Coverage: needs `io_uring_enter` to fail while waiting, which a healthy
+// kernel never does for these arguments.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn ring_lost(error: Errno) -> ! {
+    log::error!("io_uring_enter failed with reads in flight: {error}; aborting");
+    #[cfg(feature = "std")]
+    std::process::abort();
+    // no-std: no abort in `core`; leaving the process at once is what an
+    // abort does here, with the status a SIGABRT death reports.
+    #[cfg(not(feature = "std"))]
+    loop {
+        // SAFETY: `exit_group` takes a status and never returns.
+        let _ = unsafe { syscall1(Sysno::exit_group, 134) };
+    }
+}
+
+/// One read of a batch handed to [`IoUringRaw::read_batch`]: `len` bytes of
+/// `fd` from `offset` into `buf`.
+#[derive(Clone, Copy)]
+struct RawRead {
+    fd: i32,
+    buf: *mut u8,
+    len: u32,
+    offset: u64,
 }
 
 /// `mmap` wrapper returning the mapped address or a typed error.
@@ -1220,6 +1249,39 @@ impl FsFile for IoUringRawFile {
         Ok(total)
     }
 
+    // Every region goes to the ring in one batch instead of the trait's serial
+    // `read_at` loop, so they overlap in flight.
+    fn read_many(&self, regions: &mut [(u64, &mut [u8])]) -> crate::io::Result<()> {
+        let mut reads = Vec::with_capacity(regions.len());
+        for (offset, buf) in regions.iter_mut() {
+            if buf.is_empty() {
+                continue;
+            }
+            reads.push(RawRead {
+                fd: self.fd,
+                buf: buf.as_mut_ptr(),
+                len: batch_read_len(buf.len())?,
+                offset: *offset,
+            });
+        }
+        let mut results = alloc::vec![0i32; reads.len()];
+        // SAFETY: every pointer is into a region `regions` borrows for this
+        // whole call, and `read_batch` returns only once every read completed.
+        unsafe { self.ring.lock().read_batch(&reads, &mut results) };
+        // Every read has completed, so the first failure in region order
+        // decides, whatever order they finished in.
+        reads
+            .iter()
+            .zip(results)
+            .try_for_each(|(read, res)| read_verdict(res, read.len))
+    }
+
+    // Exposes the descriptor so `IoUringRawFs::read_blocks_batched` can read
+    // several files through one ring batch.
+    fn backing_fd(&self) -> Option<i32> {
+        Some(self.fd)
+    }
+
     fn lock_exclusive(&self) -> crate::io::Result<()> {
         flock_exclusive_raw(self.fd, false)?;
         Ok(())
@@ -1415,9 +1477,187 @@ impl IoUringRawFs {
             ring: Arc::new(Mutex::new(IoUringRaw::new(ring_entries)?)),
         })
     }
+
+    /// Reads `reqs`: every one with a descriptor through the ring in one
+    /// batch, then the others serially through `read_at`, stopping at the
+    /// first of those that fails. Each request filled is handed to `on_read`
+    /// once every read is over, in request order, whatever the call returns.
+    ///
+    /// # Errors
+    ///
+    /// The batch [`Fs::check_descriptor_batch`] refuses, before anything is
+    /// read; else the failure of the lowest-indexed request that failed.
+    fn read_blocks(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        on_read: Option<OnRead<'_>>,
+    ) -> crate::io::Result<()> {
+        self.check_descriptor_batch(reqs)?;
+        let mut reads = Vec::with_capacity(reqs.len());
+        let mut ats = Vec::with_capacity(reqs.len());
+        for (at, req) in reqs.iter_mut().enumerate() {
+            let Some(fd) = req.file.backing_fd() else {
+                continue;
+            };
+            let want = req.buf.capacity() - req.buf.filled();
+            if want == 0 {
+                continue;
+            }
+            // A partly filled destination owns the block's first `filled`
+            // bytes already, so its read covers the suffix from there; the
+            // check above proved the offset and the length fit.
+            let offset = req.offset + req.buf.filled() as u64;
+            reads.push(RawRead {
+                fd,
+                buf: req.buf.unfilled_mut().as_mut_ptr(),
+                len: batch_read_len(want)?,
+                offset,
+            });
+            ats.push(at);
+        }
+        let mut results = alloc::vec![0i32; reads.len()];
+        if !reads.is_empty() {
+            // SAFETY: every pointer is into a destination `reqs` borrows for
+            // this whole call, and `read_batch` returns only once every read
+            // completed; nothing touches a destination until then.
+            unsafe { self.ring.lock().read_batch(&reads, &mut results) };
+        }
+
+        let mut failure: Option<(usize, Error)> = None;
+        for ((&at, read), res) in ats.iter().zip(&reads).zip(results) {
+            match read_verdict(res, read.len) {
+                // The kernel filled exactly the unfilled span the read named.
+                Ok(()) => {
+                    if let Some(req) = reqs.get_mut(at) {
+                        req.buf.advance(read.len as usize);
+                    }
+                }
+                Err(error) => {
+                    if failure.as_ref().is_none_or(|(held, _)| at < *held) {
+                        failure = Some((at, error));
+                    }
+                }
+            }
+        }
+
+        // A file with no descriptor this ring can take is read on its own.
+        for (at, req) in reqs.iter_mut().enumerate() {
+            if req.file.backing_fd().is_some() || req.buf.is_full() {
+                continue;
+            }
+            // A lower request already failed: the call's verdict is decided.
+            if failure.as_ref().is_some_and(|(held, _)| *held < at) {
+                break;
+            }
+            let Some(offset) = req.offset.checked_add(req.buf.filled() as u64) else {
+                failure = Some((
+                    at,
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "read_blocks_batched: request offset overflows",
+                    ),
+                ));
+                break;
+            };
+            let dst = req.buf.unfilled_mut();
+            let want = dst.len();
+            match req.file.read_at(dst, offset) {
+                Ok(n) => {
+                    req.buf.advance(n);
+                    if n != want {
+                        failure = Some((at, short_block_read()));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    failure = Some((at, error));
+                    break;
+                }
+            }
+        }
+
+        if let Some(on_read) = on_read {
+            for (at, req) in reqs.iter().enumerate() {
+                if req.buf.is_full() {
+                    on_read(at, req);
+                }
+            }
+        }
+        failure.map_or(Ok(()), |(_, error)| Err(error))
+    }
+}
+
+/// The callback [`Fs::read_blocks_batched_each`] hands each filled request to.
+type OnRead<'f> = &'f mut dyn for<'a, 'b> FnMut(usize, &'a BlockRead<'b>);
+
+/// The SQE length of a batched read of `len` bytes: its completion reports
+/// the count as an `i32`, so a longer read could not say it finished.
+fn batch_read_len(len: usize) -> Result<u32, Error> {
+    i32::try_from(len)
+        .map(i32::unsigned_abs)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))
+}
+
+/// What a batched read's completion `res` says about its fixed-size block of
+/// `len` bytes: a short count is a block cut off, not an end of file.
+fn read_verdict(res: i32, len: u32) -> Result<(), Error> {
+    if res < 0 {
+        return Err(Error::new(
+            errno_to_kind(-res),
+            format!("io_uring read completed with errno {}", -res),
+        ));
+    }
+    if res.unsigned_abs() != len {
+        return Err(short_block_read());
+    }
+    Ok(())
+}
+
+/// A batched read that returned fewer bytes than its fixed-size block.
+fn short_block_read() -> Error {
+    Error::new(
+        ErrorKind::UnexpectedEof,
+        "io_uring read_blocks_batched: short read on a fixed-size block",
+    )
 }
 
 impl Fs for IoUringRawFs {
+    fn read_blocks_batched(&self, reqs: &mut [BlockRead<'_>]) -> crate::io::Result<()> {
+        self.read_blocks(reqs, None)
+    }
+
+    fn read_blocks_batched_each(
+        &self,
+        reqs: &mut [BlockRead<'_>],
+        on_read: &mut dyn FnMut(usize, &BlockRead<'_>),
+    ) -> crate::io::Result<()> {
+        self.read_blocks(reqs, Some(on_read))
+    }
+
+    // The ring reads every request with a descriptor by that descriptor; one
+    // without is read serially through `read_at`.
+    fn reads_by_descriptor(&self) -> bool {
+        true
+    }
+
+    // What `read_blocks` refuses before it reads any of the batch.
+    fn check_descriptor_batch(&self, reqs: &[BlockRead<'_>]) -> crate::io::Result<()> {
+        for req in reqs {
+            let want = req.buf.capacity() - req.buf.filled();
+            if want == 0 || req.file.backing_fd().is_none() {
+                continue;
+            }
+            batch_read_len(want)?;
+            if req.offset.checked_add(req.buf.filled() as u64).is_none() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "read_blocks_batched: request offset overflows",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn open(&self, path: &Path, opts: &FsOpenOptions) -> crate::io::Result<Box<dyn FsFile>> {
         let cpath = path_to_cstring(path)?;
         let fd = open_raw(&cpath, open_flags(opts), 0o644)?;
@@ -1582,6 +1822,10 @@ pub struct IoUringRaw {
     sqes_len: usize,
 
     sq_entries: u32,
+    cq_entries: u32,
+    /// How many times this ring entered the kernel.
+    #[cfg(test)]
+    enters: usize,
 
     // Cached pointers into the SQ ring (kernel-shared, accessed volatile).
     sq_khead: *const u32,
@@ -1705,6 +1949,9 @@ impl IoUringRaw {
                 sqes,
                 sqes_len,
                 sq_entries,
+                cq_entries: params.cq_entries,
+                #[cfg(test)]
+                enters: 0,
                 sq_khead: sq_ptr.add(params.sq_off.head as usize).cast(),
                 sq_ktail: sq_ptr.add(params.sq_off.tail as usize).cast(),
                 sq_ring_mask: *(sq_ptr.add(params.sq_off.ring_mask as usize).cast::<u32>()),
@@ -1797,88 +2044,45 @@ impl IoUringRaw {
         Ok(())
     }
 
-    /// Submits one SQE and reaps exactly one completion, returning its `res`.
+    /// Reads every one of `reads` through the ring, as many in flight at once
+    /// as the rings hold, and stores each one's completion in `results` at its
+    /// index: the byte count, or `-errno`.
     ///
-    /// This is the shared submit/complete path the opcode helpers build on. It
-    /// follows the full `io_uring` ring protocol: a submit-side overflow guard
-    /// against the kernel-advanced SQ head, an `io_uring_enter` that submits one
-    /// and blocks for one completion, and a reap that consults the
-    /// kernel-advanced CQ tail before reading the CQE.
+    /// Every read has completed when this returns, so the buffers are the
+    /// caller's again; no caller code runs while any is in flight.
+    ///
+    /// # Safety
+    /// Every `buf` is valid for writes of its `len` bytes until this returns.
+    unsafe fn read_batch(&mut self, reads: &[RawRead], results: &mut [i32]) {
+        // SAFETY: the buffers are the caller's contract, forwarded.
+        unsafe {
+            self.submit_all(
+                &mut |at| {
+                    reads.get(at).map(|read| IoUringSqe {
+                        opcode: IORING_OP_READ,
+                        fd: read.fd,
+                        addr: read.buf as u64,
+                        len: read.len,
+                        off: read.offset,
+                        ..IoUringSqe::default()
+                    })
+                },
+                results,
+            );
+        }
+    }
+
+    /// Submits one SQE and reaps its completion, returning its `res`.
     ///
     /// # Errors
-    /// Returns an [`Error`] if the SQ is full, `io_uring_enter` fails, no
-    /// completion is visible after the wait, or the completion's `res` is a
-    /// negative `-errno`.
-    // Coverage: the SQ-full and no-completion guards are defensive and
-    // unreachable through this one-submit-one-reap driver (it never lets the SQ
-    // fill or `io_uring_enter` return without a completion); they would need
-    // kernel fault injection. The submit/enter/reap success path and the
-    // negative-`res` error path ARE covered by tests.
-    #[cfg_attr(coverage_nightly, coverage(off))]
+    /// Returns an [`Error`] if the ring refuses the SQE or the completion's
+    /// `res` is a negative `-errno`.
     fn submit_and_reap_one(&mut self, sqe: &IoUringSqe) -> Result<i32, Error> {
-        // SAFETY: single-threaded driver. Read the kernel-advanced SQ head
-        // (Acquire) to confirm the ring has a free slot, write the SQE into
-        // `tail & mask`, then publish the new tail (Release) so the kernel sees
-        // a fully-written SQE before the index it reads.
-        unsafe {
-            let tail = core::ptr::read_volatile(self.sq_ktail);
-            let head = core::ptr::read_volatile(self.sq_khead);
-            fence(Ordering::Acquire);
-            if tail.wrapping_sub(head) >= self.sq_entries {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "io_uring submission queue is full",
-                ));
-            }
-            let index = tail & self.sq_ring_mask;
-            core::ptr::write(self.sqes.add(index as usize), *sqe);
-            core::ptr::write(self.sq_array.add(index as usize), index);
-            fence(Ordering::Release);
-            core::ptr::write_volatile(self.sq_ktail, tail.wrapping_add(1));
-        }
-
-        // Submit 1, wait for 1 completion. Retry on EINTR: the SQE is already
-        // published to the SQ (the tail was advanced above), so a
-        // signal-interrupted `enter` must be re-entered to reap that in-flight
-        // submission rather than returning and leaking it (the next call would
-        // then reap this completion against the wrong `user_data`). The kernel
-        // submits `min(to_submit, pending)` SQEs, so a retry after the first
-        // `enter` already consumed the entry simply waits for the completion.
-        loop {
-            // SAFETY: `self.ring_fd` is the live ring fd owned by this `IoUringRaw`.
-            match unsafe { io_uring_enter(self.ring_fd, 1, 1, IORING_ENTER_GETEVENTS) } {
-                Ok(_) => break,
-                // EINTR: fall through to re-enter the ring on the next iteration.
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        // SAFETY: read the kernel-advanced CQ tail (Acquire) before touching the
-        // CQE so we never read a slot the kernel has not published. After a
-        // successful `enter` with `min_complete == 1` a completion is present,
-        // but the explicit tail check keeps the reaper correct and ready to
-        // drain multiple completions in later opcode work.
-        let res = unsafe {
-            let head = core::ptr::read_volatile(self.cq_khead);
-            let ktail = core::ptr::read_volatile(self.cq_ktail);
-            fence(Ordering::Acquire);
-            if head == ktail {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "io_uring_enter returned with no completion",
-                ));
-            }
-            let cqe = core::ptr::read(self.cqes.add((head & self.cq_ring_mask) as usize));
-            // Release the CQE read before publishing the advanced head: the
-            // (non-volatile) read above must complete before the kernel can see
-            // the new head and reuse the slot, otherwise the read could be
-            // reordered after the head store and observe a torn / overwritten
-            // entry. Matters once a future reaper drains multiple CQEs.
-            fence(Ordering::Release);
-            core::ptr::write_volatile(self.cq_khead, head.wrapping_add(1));
-            cqe.res
-        };
+        let mut res = [0i32];
+        // SAFETY: the memory `sqe` names is the opcode helper's borrow, which
+        // outlives this call, and the call returns only once it completed.
+        unsafe { self.submit_all(&mut |at| (at == 0).then_some(*sqe), &mut res) };
+        let [res] = res;
         if res < 0 {
             return Err(Error::new(
                 errno_to_kind(-res),
@@ -1886,6 +2090,141 @@ impl IoUringRaw {
             ));
         }
         Ok(res)
+    }
+
+    /// Submits the SQEs `sqe_at` builds for `0..results.len()` and stores the
+    /// `res` of each one's completion in `results` at its index.
+    ///
+    /// At most as many go in flight as the completion ring holds, so no
+    /// completion is ever dropped. An SQE the kernel refuses to take, and every
+    /// one not yet published by then, is completed with the refusal's
+    /// `-errno`; one `sqe_at` cannot build is completed with `-EINVAL`. It
+    /// returns only once every SQE the kernel took has completed: until then
+    /// the kernel may still write into the memory they name.
+    ///
+    /// # Safety
+    /// The memory each SQE names stays valid until this returns.
+    // Coverage: the refusal and lost-ring arms need `io_uring_enter` to fail
+    // for a reason other than a signal or a full ring, which a healthy kernel
+    // never does for these arguments.
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    unsafe fn submit_all(
+        &mut self,
+        sqe_at: &mut dyn FnMut(usize) -> Option<IoUringSqe>,
+        results: &mut [i32],
+    ) {
+        let count = results.len();
+        let room = self.sq_entries.min(self.cq_entries) as usize;
+        // The next SQE to publish.
+        let mut next = 0usize;
+        // Published, and not taken by the kernel yet.
+        let mut untaken = 0u32;
+        // Published, and not completed yet.
+        let mut owed = 0usize;
+        while next < count || owed > 0 {
+            // SAFETY: single-threaded driver (the ring is behind the caller's
+            // lock). Read the kernel-advanced SQ head (Acquire) for the free
+            // slots, write each SQE into `tail & mask`, then publish the new
+            // tail (Release) so the kernel sees fully written SQEs before the
+            // indices it reads.
+            unsafe {
+                let mut tail = core::ptr::read_volatile(self.sq_ktail);
+                let head = core::ptr::read_volatile(self.sq_khead);
+                fence(Ordering::Acquire);
+                while next < count && owed < room && tail.wrapping_sub(head) < self.sq_entries {
+                    let Some(sqe) = sqe_at(next) else {
+                        if let Some(slot) = results.get_mut(next) {
+                            *slot = -errno::EINVAL;
+                        }
+                        next += 1;
+                        continue;
+                    };
+                    let index = tail & self.sq_ring_mask;
+                    core::ptr::write(
+                        self.sqes.add(index as usize),
+                        IoUringSqe {
+                            user_data: next as u64,
+                            ..sqe
+                        },
+                    );
+                    core::ptr::write(self.sq_array.add(index as usize), index);
+                    tail = tail.wrapping_add(1);
+                    next += 1;
+                    owed += 1;
+                    untaken += 1;
+                }
+                fence(Ordering::Release);
+                core::ptr::write_volatile(self.sq_ktail, tail);
+            }
+            if owed == 0 {
+                continue;
+            }
+
+            // With every SQE published, one wait covers the rest; while some
+            // are still to come, a completion frees the room they need.
+            let wait = if next == count {
+                // At most `room`, itself a `u32`.
+                owed as u32
+            } else {
+                1
+            };
+            #[cfg(test)]
+            {
+                self.enters += 1;
+            }
+            // SAFETY: `self.ring_fd` is the live ring fd owned by this `IoUringRaw`.
+            match unsafe { io_uring_enter_raw(self.ring_fd, untaken, wait, IORING_ENTER_GETEVENTS) }
+            {
+                Ok(taken) => untaken -= taken.min(untaken),
+                // A signal, or no room for the kernel's own work yet: enter again.
+                Err(e) if matches!(e.into_raw(), errno::EINTR | errno::EAGAIN | errno::EBUSY) => {}
+                Err(e) if untaken > 0 => {
+                    // An `enter` that fails took none of the SQEs it was offered
+                    // (one that took some reports how many instead), so the
+                    // kernel never reads them: they are taken back off the
+                    // ring, and they and the ones never published fail with
+                    // the refusal.
+                    let refusal = -e.into_raw();
+                    // SAFETY: no SQ polling thread, so the kernel reads the
+                    // tail only inside `enter`, and it took none of these.
+                    unsafe {
+                        let tail = core::ptr::read_volatile(self.sq_ktail);
+                        core::ptr::write_volatile(self.sq_ktail, tail.wrapping_sub(untaken));
+                    }
+                    let first = next - untaken as usize;
+                    for slot in results.get_mut(first..).into_iter().flatten() {
+                        *slot = refusal;
+                    }
+                    owed -= untaken as usize;
+                    untaken = 0;
+                    next = count;
+                }
+                Err(e) => ring_lost(e),
+            }
+
+            // SAFETY: read the kernel-advanced CQ tail (Acquire) before any
+            // CQE, so no slot is read before the kernel published it, and
+            // release the reads (Release) before the advanced head lets the
+            // kernel reuse the slots.
+            unsafe {
+                let mut head = core::ptr::read_volatile(self.cq_khead);
+                let tail = core::ptr::read_volatile(self.cq_ktail);
+                fence(Ordering::Acquire);
+                while head != tail {
+                    let cqe = core::ptr::read(self.cqes.add((head & self.cq_ring_mask) as usize));
+                    head = head.wrapping_add(1);
+                    owed -= 1;
+                    if let Some(slot) = usize::try_from(cqe.user_data)
+                        .ok()
+                        .and_then(|at| results.get_mut(at))
+                    {
+                        *slot = cqe.res;
+                    }
+                }
+                fence(Ordering::Release);
+                core::ptr::write_volatile(self.cq_khead, head);
+            }
+        }
     }
 
     /// The submission-queue depth the kernel allocated.

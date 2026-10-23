@@ -85,7 +85,11 @@ fn misplaced() -> crate::Error {
 /// with `tag`.
 pub(super) struct BlockRequest<'a> {
     pub(super) tag: usize,
-    pub(super) table: &'a Table,
+    /// The backend `file` was opened through, whose queue takes the read.
+    pub(super) fs: &'a Arc<dyn crate::fs::Fs>,
+    /// The cache the block is read for, whose load-time estimate the wait
+    /// for it is timed into.
+    pub(super) cache: &'a crate::cache::Cache,
     pub(super) file: Arc<dyn FsFile>,
     pub(super) offset: u64,
     pub(super) buf: Vec<u8>,
@@ -125,6 +129,41 @@ pub(super) enum Job {
     /// Reads the value the indirection `item`, the newest version of the key
     /// at `idx`, points to in the value log.
     Blob { idx: usize, item: InternalValue },
+    /// Opens the blob file `blob_file` for the value read tagged `tag`.
+    OpenBlob {
+        tag: usize,
+        blob_file: crate::vlog::BlobFileId,
+    },
+    /// Asks `table`'s filters about the key at `idx` for the merge tagged
+    /// `tag`, and finds the data blocks of the table that can hold its
+    /// versions, for the read to bring in.
+    MergeLocate {
+        tag: usize,
+        idx: usize,
+        table: TableAt,
+    },
+    /// Resolves the merge of the key at `idx` from what its walk read: a base
+    /// kept in the value log is read here.
+    MergeFinish {
+        idx: usize,
+        read: crate::range::MergeRead,
+    },
+}
+
+/// What [`Job::MergeLocate`] found.
+pub(super) enum MergeLocated {
+    /// The table's versions of the key, newest first, read already: the
+    /// filter ruled the table out, or the table is read through its own
+    /// reader (a Page-ECC, columnar or restricted one).
+    Versions(Vec<InternalValue>),
+    /// The data blocks that can hold its versions, and the file they are
+    /// read through; their versions are taken out once they are in hand,
+    /// and `filter`'s false positive settled.
+    Blocks {
+        filter: crate::range::TableFilter,
+        file: Arc<dyn FsFile>,
+        blocks: Vec<BlockHandle>,
+    },
 }
 
 /// A finished [`Job`].
@@ -149,6 +188,11 @@ pub(super) enum JobDone {
     Value {
         idx: usize,
         value: crate::Result<Option<UserValue>>,
+    },
+    /// A table of the merge tagged `tag`, located.
+    MergeLocated {
+        tag: usize,
+        located: crate::Result<MergeLocated>,
     },
 }
 
@@ -223,8 +267,64 @@ impl Job {
                     Values::Inline => Ok(Some(item.value)),
                 },
             },
+            Self::OpenBlob { tag, blob_file } => JobDone::Opened {
+                tag,
+                file: match (&ctx.values, version.blob_files.get(blob_file)) {
+                    (Values::Blob(source), Some(blob_file)) => source.open_blob_file(blob_file),
+                    _ => Err(misplaced()),
+                },
+            },
+            Self::MergeLocate { tag, idx, table } => JobDone::MergeLocated {
+                tag,
+                located: table
+                    .table(version)
+                    .ok_or_else(misplaced)
+                    .and_then(|table| locate(table, ctx.key(idx), ctx.seqno)),
+            },
+            Self::MergeFinish { idx, read } => JobDone::Value {
+                idx,
+                value: match &ctx.merge_operator {
+                    Some(operator) => read
+                        .finish(&ctx.super_version, operator, ctx.merge_base.as_ref())
+                        .map(|entry| entry.map(|entry| entry.value)),
+                    None => Err(misplaced()),
+                },
+            },
         }
     }
+}
+
+/// Asks `table`'s filters about `key`, counting the probe, and either reads
+/// the table's versions of it at `seqno` here, through the table's reader,
+/// or finds the data blocks that can hold them, for the batch to read: a
+/// table the filter rules out has none, and a Page-ECC or columnar table's
+/// blocks, or a restricted table's, are read through the reader that loads,
+/// rebuilds and bounds them.
+///
+/// # Errors
+///
+/// The versions, the index or the file fail to read.
+fn locate(table: &Table, key: &[u8], seqno: SeqNo) -> crate::Result<MergeLocated> {
+    let filter = crate::range::TableFilter::of(table, key);
+    if filter.absent() || table.is_chunk_special() || table.is_restricted() {
+        let mut versions = Vec::new();
+        for version in filter.versions(table, key, seqno) {
+            let version = version?;
+            // Older versions are hidden by the first base.
+            let base = !version.key.value_type.is_merge_operand();
+            versions.push(version);
+            if base {
+                break;
+            }
+        }
+        return Ok(MergeLocated::Versions(versions));
+    }
+    let (file, blocks) = table.key_blocks(key)?;
+    Ok(MergeLocated::Blocks {
+        filter,
+        file,
+        blocks,
+    })
 }
 
 /// Where a read's asks go as it makes them. A driver that submits a block

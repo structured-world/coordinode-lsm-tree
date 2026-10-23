@@ -28,3 +28,9 @@ ignore:
   # (ignored-only, no coverage instrumentation), and its assertions run there
   # on every push; unit tests over the harness itself would test the test.
   - "src/fuzz_heal.rs"
+  # The batched-read conformance tests, generated into each io_uring
+  # backend's test module. Test code only: what it leaves unrun is its own
+  # skip arm for a kernel without io_uring, the panic arms of its
+  # expectations, and the trait methods its counting file wrapper must have
+  # and the tests never call.
+  - "src/fs/batch_conformance.rs"

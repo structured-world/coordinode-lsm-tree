@@ -107,7 +107,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_request(&self, on_disk: usize) {
+    pub(crate) fn count_request(&self, on_disk: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
@@ -128,7 +128,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_decoded(&self, decoded: usize) {
+    pub(crate) fn count_decoded(&self, decoded: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             use core::sync::atomic::Ordering::Relaxed;
@@ -249,7 +249,7 @@ impl<'a> Accessor<'a> {
         )
     )]
     #[inline]
-    fn count_gather(&self, bytes: usize) {
+    pub(crate) fn count_gather(&self, bytes: usize) {
         #[cfg(feature = "metrics")]
         if let Some(metrics) = self.metrics {
             metrics.record_gather(bytes);
@@ -363,10 +363,12 @@ impl<'a> Accessor<'a> {
         // file is a different number again. Each bounds the prefetch at half
         // the cache.
         let mut read_budget = half;
-        let mut admit_budget = half;
 
+        // Every span of the window is found first and then read in one batch,
+        // so they overlap in flight instead of going out one after another.
+        let mut spans: Vec<Span> = Vec::new();
         let mut start = 0;
-        while start < items.len() && admit_budget > 0 && read_budget > 0 {
+        while start < items.len() && read_budget > 0 {
             #[expect(clippy::indexing_slicing, reason = "start < items.len() by the loop")]
             let (_, first, _) = items[start];
 
@@ -380,87 +382,211 @@ impl<'a> Accessor<'a> {
                 continue;
             };
 
-            if end - start >= 2
-                && let Some(span) = items.get(start..end)
-            {
+            if end - start >= 2 {
                 // `span_extent` bounds the extent by `reach`, so it fits.
                 debug_assert!(span_end - first.offset <= read_budget);
                 read_budget -= span_end - first.offset;
-                self.warm_span(
-                    tree_id,
-                    span,
-                    first.offset,
-                    span_end,
-                    cache,
-                    &mut into,
-                    &mut admit_budget,
-                );
+                spans.push(Span {
+                    records: start..end,
+                    start: first.offset,
+                    end: span_end,
+                });
+            }
+            start = end;
+        }
+        // The spans go out in batches of at most one coalesced read's worth of
+        // extent, so the buffers held at once are what one read held before
+        // the spans were batched; a window within that (the usual one) is one
+        // batch. A batch is read only while the admission budget lasts.
+        let mut admit_budget = half;
+        let mut start = 0;
+        while start < spans.len() && admit_budget > 0 {
+            let mut end = start;
+            let mut extent = 0u64;
+            while let Some(span) = spans.get(end) {
+                let width = span.end - span.start;
+                if end > start && extent + width > max_read as u64 {
+                    break;
+                }
+                extent += width;
+                end += 1;
+            }
+            if let Some(batch) = spans.get(start..end) {
+                self.warm_spans(tree_id, items, batch, cache, &mut into, &mut admit_budget);
             }
             start = end;
         }
     }
 
-    /// Reads one coalesced span and parses every record it covers into the
-    /// cache, or into the read's own store. Any failure returns early: those
-    /// values stay cold and the read walk fetches them normally.
+    /// Reads every one of `spans` of `items` in one batched call per
+    /// filesystem (a window's blob files are normally all one backend's), then
+    /// parses the records each covers into the cache, or into the read's own
+    /// store, in span order. A span whose file will not open or whose read
+    /// fails stays cold, and the read walk fetches its values normally.
     ///
     /// `admit_budget` is how many bytes this prefetch may still hand over,
-    /// decremented by what each value actually weighs, and stopping the walk
-    /// when it runs out.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one span: its records and extent, and where its values go under which budget"
-    )]
-    fn warm_span(
+    /// spent by what each value actually weighs; the walk stops when it runs
+    /// out.
+    fn warm_spans(
         &self,
         tree_id: TreeId,
-        records: &[(&[u8], ValueHandle, usize)],
-        span_start: u64,
-        span_end: u64,
+        items: &[(&[u8], ValueHandle, usize)],
+        spans: &[Span],
         cache: &Cache,
         into: &mut PrefetchInto<'_>,
         admit_budget: &mut u64,
     ) {
-        let Some((_, first, _)) = records.first() else {
-            return;
-        };
-        let Some(blob_file) = self.blob_files.get(first.blob_file_id) else {
-            return;
-        };
-
-        let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
-        let Ok((file, _)) = blob_file
-            .file_accessor()
-            .get_or_open_blob_file(&bf_id, &blob_file.0.path)
-        else {
-            return;
-        };
-
-        // `span_end` was built as the maximum record end in the span, and every
-        // one of those is at or past `span_start` (the span's own first
-        // offset, in a slice sorted by offset), so the span is never negative.
-        debug_assert!(span_end >= span_start);
-        let Ok(span_len) = usize::try_from(span_end - span_start) else {
-            return;
-        };
-        // The whole extent, gaps included: that is what is asked of the
-        // filesystem, and swallowing a gap to merge two reads is the point of
-        // the coalescing, so charging only the records would hide its cost.
-        // Charged once, before the read is issued, so a read the filesystem
-        // then fails is counted, and whether or not every record it covers is
-        // then parsed.
-        self.count_request(span_len);
-        #[cfg(feature = "metrics")]
-        if let Some(metrics) = self.metrics {
-            metrics
-                .blob_bytes_prefetched
-                .fetch_add(span_len as u64, core::sync::atomic::Ordering::Relaxed);
+        /// One span's read: its span, its blob file and the open file, and
+        /// the buffer its extent is read into, emptied when the read fails.
+        struct SpanRead<'b> {
+            span: usize,
+            blob_file: &'b crate::vlog::BlobFile,
+            file: alloc::sync::Arc<dyn crate::fs::FsFile>,
+            buf: Vec<u8>,
         }
-        let Ok(span) = crate::file::read_exact(file.as_ref(), span_start, span_len) else {
-            return;
-        };
 
-        let reader = Reader::new(blob_file, file.as_ref());
+        let mut reads: Vec<SpanRead<'_>> = Vec::with_capacity(spans.len());
+        for (at, span) in spans.iter().enumerate() {
+            let Some((_, first, _)) = items.get(span.records.start) else {
+                continue;
+            };
+            let Some(blob_file) = self.blob_files.get(first.blob_file_id) else {
+                continue;
+            };
+            let bf_id = GlobalTableId::from((tree_id, blob_file.id()));
+            let Ok((file, _)) = blob_file
+                .file_accessor()
+                .get_or_open_blob_file(&bf_id, &blob_file.0.path)
+            else {
+                continue;
+            };
+            // `end` was built as the maximum record end in the span, and every
+            // one of those is at or past `start` (the span's own first offset,
+            // in a slice sorted by offset), so the extent is never negative.
+            debug_assert!(span.end >= span.start);
+            let Ok(len) = usize::try_from(span.end - span.start) else {
+                continue;
+            };
+            // The whole extent, gaps included: that is what is asked of the
+            // filesystem, and swallowing a gap to merge two reads is the point
+            // of the coalescing, so charging only the records would hide its
+            // cost. Charged before the read is issued, so a read the
+            // filesystem then fails is counted, and whether or not every
+            // record it covers is then parsed.
+            self.count_request(len);
+            #[cfg(feature = "metrics")]
+            if let Some(metrics) = self.metrics {
+                metrics
+                    .blob_bytes_prefetched
+                    .fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
+            }
+            reads.push(SpanRead {
+                span: at,
+                blob_file,
+                file,
+                buf: alloc::vec![0u8; len],
+            });
+        }
+
+        // One batched call per filesystem, taking its spans in window order.
+        let mut issued = alloc::vec![false; reads.len()];
+        while let Some(lead) = issued.iter().position(|issued| !issued) {
+            let Some(fs) = reads
+                .get(lead)
+                .map(|read| alloc::sync::Arc::clone(&read.blob_file.0.fs))
+            else {
+                break;
+            };
+            let on_fs = |read: &SpanRead<'_>| {
+                core::ptr::addr_eq(
+                    alloc::sync::Arc::as_ptr(&read.blob_file.0.fs),
+                    alloc::sync::Arc::as_ptr(&fs),
+                )
+            };
+            // In ascending order, so membership is a binary search.
+            let group: Vec<usize> = reads
+                .iter()
+                .enumerate()
+                .skip(lead)
+                .filter(|(at, read)| issued.get(*at) == Some(&false) && on_fs(read))
+                .map(|(at, _)| at)
+                .collect();
+            for &at in &group {
+                if let Some(slot) = issued.get_mut(at) {
+                    *slot = true;
+                }
+            }
+            let mut got = alloc::vec![false; group.len()];
+            {
+                let mut reqs: Vec<crate::fs::BlockRead<'_>> = reads
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(at, _)| group.binary_search(at).is_ok())
+                    .map(|(_, read)| crate::fs::BlockRead {
+                        file: read.file.as_ref(),
+                        offset: spans.get(read.span).map_or(0, |span| span.start),
+                        buf: crate::fs::BlockBuf::new(&mut read.buf),
+                    })
+                    .collect();
+                // Best effort: a failed call still hands over the spans it
+                // filled, and the others stay cold for the read walk.
+                let _ = fs.read_blocks_batched_each(&mut reqs, &mut |index, _| {
+                    if let Some(slot) = got.get_mut(index) {
+                        *slot = true;
+                    }
+                });
+            }
+            for (&at, got) in group.iter().zip(got) {
+                if !got && let Some(read) = reads.get_mut(at) {
+                    read.buf.clear();
+                }
+            }
+        }
+
+        for read in reads {
+            if *admit_budget == 0 {
+                return;
+            }
+            let (Some(span), false) = (spans.get(read.span), read.buf.is_empty()) else {
+                continue;
+            };
+            let Some(records) = items.get(span.records.clone()) else {
+                continue;
+            };
+            self.admit_span(
+                tree_id,
+                records,
+                span.start,
+                &crate::Slice::from(read.buf),
+                read.blob_file,
+                read.file.as_ref(),
+                cache,
+                into,
+                admit_budget,
+            );
+        }
+    }
+
+    /// Parses every record of `records`, a span read from `span_start` into
+    /// `span`, into the cache or the read's own store, spending
+    /// `admit_budget` by each value's weight and stopping when it runs out.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one span: its records and bytes, its file, and where its values go under which budget"
+    )]
+    fn admit_span(
+        &self,
+        tree_id: TreeId,
+        records: &[(&[u8], ValueHandle, usize)],
+        span_start: u64,
+        span: &crate::Slice,
+        blob_file: &crate::vlog::BlobFile,
+        file: &dyn crate::fs::FsFile,
+        cache: &Cache,
+        into: &mut PrefetchInto<'_>,
+        admit_budget: &mut u64,
+    ) {
+        let reader = Reader::new(blob_file, file);
 
         // An uncompressed value is returned as a VIEW into the buffer it was
         // parsed from, here the whole coalesced read. Handed on as it is, every
@@ -542,6 +668,14 @@ impl<'a> Accessor<'a> {
             }
         }
     }
+}
+
+/// One coalesced read of a window: the records it covers, by their places in
+/// the window, and the extent of the blob file it reads, gaps included.
+struct Span {
+    records: core::ops::Range<usize>,
+    start: u64,
+    end: u64,
 }
 
 /// How far one coalesced span reaches, starting at `items[start]`.

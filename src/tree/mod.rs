@@ -253,23 +253,19 @@ impl<'a> read_job::ReadSink<'a> for DriveSink<'a> {
     #[expect(clippy::indexing_slicing, reason = "a slot is a position in `queues`")]
     fn read(&mut self, read: read_job::BlockRequest<'a>) {
         if self.cache.is_none() {
-            self.cache = Some(&read.table.cache);
+            self.cache = Some(read.cache);
         }
-        let slot = if let Some(slot) = self
-            .queues
-            .iter()
-            .position(|q| Arc::ptr_eq(q.fs, &read.table.fs))
-        {
+        let slot = if let Some(slot) = self.queues.iter().position(|q| Arc::ptr_eq(q.fs, read.fs)) {
             slot
         } else {
             #[cfg_attr(not(feature = "std"), expect(unused_mut))]
-            let mut queue = read.table.fs.read_queue();
+            let mut queue = read.fs.read_queue();
             #[cfg(feature = "std")]
             let wakes = queue.set_wake(Arc::clone(&self.wake) as Arc<dyn crate::fs::ReadWake>);
             #[cfg(not(feature = "std"))]
             let wakes = false;
             self.queues.push(LevelQueue {
-                fs: &read.table.fs,
+                fs: read.fs,
                 queue,
                 wakes,
             });
@@ -3847,21 +3843,21 @@ impl Tree {
         (miss_keys, duplicates)
     }
 
-    /// Fans each representative's resolved entry out to its duplicate positions,
-    /// so every input slot carries the same answer the per-key path would have
-    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call after the
-    /// batched resolver fills `internal_entries`.
+    /// Fans each representative's answer out to its duplicate positions, so
+    /// every input slot carries the same answer the per-key path would have
+    /// produced. Counterpart to [`Self::dedup_sorted_miss_keys`]; call once the
+    /// representatives' answers are in `answers`.
     #[expect(
         clippy::indexing_slicing,
-        reason = "duplicate/representative indices are batch-local key indices < entries.len()"
+        reason = "duplicate/representative indices are batch-local key indices < answers.len()"
     )]
-    pub(crate) fn fan_out_duplicates(
+    pub(crate) fn fan_out_duplicates<T: Clone>(
         duplicates: &[(usize, usize)],
-        internal_entries: &mut [Option<InternalValue>],
+        answers: &mut [Option<T>],
     ) {
         for &(dup_idx, rep_idx) in duplicates {
-            let resolved = internal_entries[rep_idx].clone();
-            internal_entries[dup_idx] = resolved;
+            let resolved = answers[rep_idx].clone();
+            answers[dup_idx] = resolved;
         }
     }
 
@@ -7539,6 +7535,10 @@ mod chunk_order_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod chunk_file_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod merge_read_tests;
 
 #[cfg(all(test, feature = "std"))]
 mod probe_stats_tests;

@@ -270,57 +270,63 @@ fn window_into_a_tiered_level_takes_one_table_of_three() -> crate::Result<()> {
 
 /// A window into a tiered level, set to move the hottest data, takes the
 /// table reads touch, not the first one.
+///
+/// Heat is reads per second since a table was written, so the test holds the
+/// process clock: a test pinning it meanwhile would age the tables by years
+/// and zero every table's heat.
 #[test]
 fn hottest_window_into_a_tiered_level_takes_the_read_table() -> crate::Result<()> {
-    let (_dir, tree) = tree()?;
-    for from in [0, 1_000, 2_000] {
-        write_keys(&tree, from)?;
-        tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
-    }
-    for _ in 0..3 {
-        for i in 2_000..2_100u64 {
-            tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+    crate::time::with_test_clock(|_| {
+        let (_dir, tree) = tree()?;
+        for from in [0, 1_000, 2_000] {
+            write_keys(&tree, from)?;
+            tree.compact(Arc::new(MoveDown(0, 1)), 0)?;
         }
-    }
-    let version = tree.current_version();
-    let hot = version
-        .level(1)
-        .expect("L1")
-        .iter()
-        .flat_map(|run| run.iter())
-        .find(|table| table.key_range().min().as_ref() == b"k2000")
-        .expect("the table of k2000..")
-        .id();
-    let strategy = Strategy::default()
-        .with_level_policy(
-            1,
-            LevelPolicy {
-                trigger: Trigger::Shape {
-                    runs: u8::MAX,
-                    tables: 1,
+        for _ in 0..3 {
+            for i in 2_000..2_100u64 {
+                tree.get(format!("k{i:04}"), SeqNo::MAX)?;
+            }
+        }
+        let version = tree.current_version();
+        let hot = version
+            .level(1)
+            .expect("L1")
+            .iter()
+            .flat_map(|run| run.iter())
+            .find(|table| table.key_range().min().as_ref() == b"k2000")
+            .expect("the table of k2000..")
+            .id();
+        let strategy = Strategy::default()
+            .with_level_policy(
+                1,
+                LevelPolicy {
+                    trigger: Trigger::Shape {
+                        runs: u8::MAX,
+                        tables: 1,
+                    },
+                    layout: Layout::Leveled,
+                    granularity: Granularity::Window,
+                    movement: Movement::Hottest,
                 },
-                layout: Layout::Leveled,
-                granularity: Granularity::Window,
-                movement: Movement::Hottest,
-            },
-        )
-        .with_level_policy(
-            2,
-            LevelPolicy {
-                trigger: Trigger::Never,
-                layout: Layout::Tiered,
-                granularity: Granularity::Level {
-                    through_full_next: false,
+            )
+            .with_level_policy(
+                2,
+                LevelPolicy {
+                    trigger: Trigger::Never,
+                    layout: Layout::Tiered,
+                    granularity: Granularity::Level {
+                        through_full_next: false,
+                    },
+                    movement: Movement::LeastRewrite { slack: None },
                 },
-                movement: Movement::LeastRewrite { slack: None },
-            },
-        );
-    let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
-    let Choice::Move(input) = choice else {
-        panic!("a move of a window: {choice:?}");
-    };
-    assert_eq!(input.table_ids, core::iter::once(hot).collect());
-    Ok(())
+            );
+        let choice = strategy.choose(&version, tree.tree_config(), &CompactionState::default());
+        let Choice::Move(input) = choice else {
+            panic!("a move of a window: {choice:?}");
+        };
+        assert_eq!(input.table_ids, core::iter::once(hot).collect());
+        Ok(())
+    })
 }
 
 /// The hottest window is the one read most often, not the one read most since
@@ -526,19 +532,24 @@ fn a_large_table_before_a_hot_small_one(
 /// A window past the cap leaves the rest of its width to be ranked: the
 /// hottest window over a tiered level whose first table is past the cap is
 /// the small table reads touch, not none.
+///
+/// Holds the process clock, which the tables' heat is measured on (see
+/// [`hottest_window_into_a_tiered_level_takes_the_read_table`]).
 #[test]
 fn hottest_window_past_a_large_first_table_takes_the_read_one() -> crate::Result<()> {
-    let (_dir, tree) = tree()?;
-    let (version, hot, base) = a_large_table_before_a_hot_small_one(&tree)?;
-    let window = window_over(
-        version.level(1).expect("L1"),
-        &HiddenSet::default(),
-        0,
-        Movement::Hottest,
-        base,
-    );
-    assert_eq!(window, Some(core::iter::once(hot).collect()));
-    Ok(())
+    crate::time::with_test_clock(|_| {
+        let (_dir, tree) = tree()?;
+        let (version, hot, base) = a_large_table_before_a_hot_small_one(&tree)?;
+        let window = window_over(
+            version.level(1).expect("L1"),
+            &HiddenSet::default(),
+            0,
+            Movement::Hottest,
+            base,
+        );
+        assert_eq!(window, Some(core::iter::once(hot).collect()));
+        Ok(())
+    })
 }
 
 /// A merge into a leveled level ranks the windows of its width past one over

@@ -297,7 +297,8 @@ impl<'a> LevelStages<'a> {
         for handle in need {
             out.read(BlockRequest {
                 tag: self.asked.len(),
-                table,
+                fs: &table.fs,
+                cache: &table.cache,
                 file: Arc::clone(file),
                 offset: *handle.offset(),
                 buf: alloc::vec![0u8; handle.size() as usize],

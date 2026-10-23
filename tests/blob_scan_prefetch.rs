@@ -6,6 +6,9 @@
 //! the window size, and however the values are spread across blob files, a scan
 //! yields exactly what it yields with read-ahead switched off.
 
+mod common;
+
+use common::BatchCountFs;
 use lsm_tree::{
     AbstractTree, Config, Guard as _, KvSeparationOptions, SeqNo, SequenceNumberCounter, UserValue,
 };
@@ -93,6 +96,108 @@ fn a_scan_yields_the_same_values_with_and_without_prefetch() -> lsm_tree::Result
         assert_eq!(value.as_ref(), value_for(i).as_slice());
     }
 
+    Ok(())
+}
+
+/// A window whose records lie in several blob files coalesces into a span per
+/// file, and the spans of one window go to the backend in ONE batched read,
+/// not one read each.
+#[test_log::test]
+fn a_window_reads_its_spans_in_one_batched_call() -> lsm_tree::Result<()> {
+    const N: usize = 256;
+    const WINDOW: u16 = 64;
+    // 8 records per blob file: a 64-record window spans 8 files, so 8 spans.
+    const FLUSH_EVERY: usize = 8;
+
+    let dir = tempfile::tempdir()?;
+    let fs = BatchCountFs::default();
+    let seqno = SequenceNumberCounter::default();
+    let config = || {
+        Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+            .with_shared_fs(std::sync::Arc::new(fs.clone()))
+            .with_kv_separation(Some(
+                KvSeparationOptions::default()
+                    .separation_threshold(1)
+                    .scan_prefetch(WINDOW),
+            ))
+    };
+    {
+        let tree = config().open()?;
+        for i in 0..N {
+            tree.insert(key_for(i).as_bytes(), value_for(i), seqno.next());
+            if (i + 1) % FLUSH_EVERY == 0 {
+                tree.flush_active_memtable(0)?;
+            }
+        }
+    }
+    // Reopened, so no value is in the cache the writes filled.
+    let tree = config().open()?;
+    fs.take();
+
+    let items = collect(&tree)?;
+    assert_eq!(items.len(), N);
+    for (i, (key, value)) in items.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
+
+    let calls = fs.take();
+    let windows = N.div_ceil(usize::from(WINDOW));
+    assert!(
+        calls.len() <= windows + 1,
+        "{} batched reads for {windows} windows: {calls:?}",
+        calls.len()
+    );
+    assert!(
+        calls.iter().any(|&reqs| reqs >= 8),
+        "a window's spans travel together: {calls:?}"
+    );
+    Ok(())
+}
+
+/// A read-ahead whose batched read fails leaves its values cold, and each is
+/// read on its own when resolved: the scan still yields every value. The
+/// first read of the value log is the first value's own, which arms the
+/// read-ahead; the fault fires on the next, the read-ahead's.
+#[test_log::test]
+fn a_failed_read_ahead_leaves_the_values_to_their_own_reads() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    const N: usize = 200;
+    let dir = tempfile::tempdir()?;
+    drop(tree_with(dir.path(), 64, N, 0)?);
+    let fault = std::sync::Arc::new(FaultFs::new(StdFs));
+    let injector = fault.injector();
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault)
+    .with_kv_separation(Some(
+        KvSeparationOptions::default()
+            .separation_threshold(1)
+            .scan_prefetch(64),
+    ))
+    .open()?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::ReadAt,
+            Fault::Error(lsm_tree::io::ErrorKind::Other),
+        )
+        .on_path("blobs")
+        .skip(1)
+        .once(),
+    );
+
+    let items = collect(&tree)?;
+    injector.clear();
+
+    assert_eq!(items.len(), N);
+    for (i, (key, value)) in items.iter().enumerate() {
+        assert_eq!(key.as_slice(), key_for(i).as_bytes());
+        assert_eq!(value.as_ref(), value_for(i).as_slice());
+    }
     Ok(())
 }
 

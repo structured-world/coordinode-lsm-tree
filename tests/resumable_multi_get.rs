@@ -109,8 +109,8 @@ fn a_resumable_read_answers_what_the_blocking_read_answers() -> lsm_tree::Result
     Ok(())
 }
 
-/// A blob tree's values live in the value log: the resumable read hands out a
-/// job per value and answers what the blocking read answers.
+/// A blob tree's values live in the value log: the resumable read hands out
+/// their records as reads and answers what the blocking read answers.
 #[test]
 fn a_resumable_read_of_a_blob_tree_answers_what_the_blocking_read_answers() -> lsm_tree::Result<()>
 {
@@ -121,6 +121,77 @@ fn a_resumable_read_of_a_blob_tree_answers_what_the_blocking_read_answers() -> l
     let blocking = tree.multi_get(&keys, SeqNo::MAX)?;
     let resumable = drive(tree.start_multi_get(keys.iter().map(String::as_str), SeqNo::MAX)?)?;
     assert_eq!(resumable, blocking);
+    Ok(())
+}
+
+/// A blob tree's merge over a base kept in the value log reads that base in a
+/// job, never while the read is resumed or handed a result: every read of the
+/// value log made outside a job or a handed-out block read fails here, and the
+/// read still answers.
+#[test]
+fn a_resumable_merge_reads_its_separated_base_in_a_job() -> lsm_tree::Result<()> {
+    use lsm_tree::fs::{Fault, FaultFs, FaultOp, FaultRule, StdFs};
+
+    let folder = tempfile::tempdir()?;
+    let fault = Arc::new(FaultFs::new(StdFs));
+    let injector = fault.injector();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fault)
+    .use_cache(Arc::new(Cache::with_capacity_bytes(0)))
+    .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .open()?;
+    for i in 0..8u64 {
+        tree.insert(format!("k{i}"), format!("base-{i}"), i);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+    for i in 0..8u64 {
+        tree.merge(format!("k{i}"), "+", 8 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+
+    // Reads of the value log fail while the read itself runs.
+    let forbid = || {
+        injector.arm(
+            FaultRule::new(FaultOp::ReadAt, Fault::Error(io::ErrorKind::Other)).on_path("blobs"),
+        );
+    };
+    forbid();
+    let mut step = tree.start_multi_get(keys.iter().map(String::as_str), SeqNo::MAX)?;
+    let values = loop {
+        let mut read = match step {
+            Step::Done(values) => break values?,
+            Step::Pending(read) => read,
+        };
+        for job in read.take_jobs() {
+            injector.clear();
+            let outcome = job.run();
+            forbid();
+            read.complete_job(outcome);
+        }
+        for mut block in read.take_reads() {
+            injector.clear();
+            let result = block.file.read_at(&mut block.buf, block.offset).map(|_| ());
+            forbid();
+            read.complete_read(block.tag, result, block.buf);
+        }
+        step = read.resume();
+    };
+    injector.clear();
+
+    for (i, value) in values.iter().enumerate() {
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("base-{i}+").as_bytes()),
+            "k{i}"
+        );
+    }
     Ok(())
 }
 

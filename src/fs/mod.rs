@@ -63,6 +63,15 @@ mod io_uring_fs;
 #[cfg(all(target_os = "linux", feature = "io-uring-raw"))]
 mod io_uring_raw;
 
+// The batched-read tests every backend that reads by descriptor passes.
+#[cfg(all(
+    test,
+    feature = "std",
+    target_os = "linux",
+    any(feature = "io-uring", feature = "io-uring-raw")
+))]
+mod batch_conformance;
+
 #[cfg(feature = "std")]
 pub use crash_fs::CrashFs;
 #[cfg(all(test, feature = "std"))]

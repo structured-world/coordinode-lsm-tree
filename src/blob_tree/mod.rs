@@ -212,6 +212,24 @@ pub(crate) fn resolve_value_handle(
     }
 }
 
+/// How a batched read gets one separated value: see [`BlobSource::plan_value`].
+pub(crate) enum ValuePlan<'v> {
+    /// The value, from the cache.
+    Ready(UserValue),
+    /// One record to read.
+    Read(ValueRead<'v>),
+    /// Read on the value's own path.
+    Alone,
+}
+
+/// One blob record a batched read reads: `len` bytes of `blob_file` at the
+/// handle's offset.
+pub(crate) struct ValueRead<'v> {
+    pub(crate) blob_file: &'v BlobFile,
+    pub(crate) vhandle: crate::vlog::ValueHandle,
+    pub(crate) len: usize,
+}
+
 /// Where a blob tree's values kept in the value log are read from: the tree
 /// they belong to and the cache their blocks go through.
 #[derive(Clone)]
@@ -240,6 +258,103 @@ impl BlobSource {
             item,
         )
         .map(|(_, value)| value)
+    }
+
+    /// How a batched read gets the value the indirection `item` stands for in
+    /// `version`: from the cache, by reading one record of a blob file, or on
+    /// its own path through [`Self::value`] (a cell row, a reference the
+    /// version does not hold, a malformed one), which also reports what is
+    /// wrong with it. Nothing here blocks on I/O.
+    pub(crate) fn plan_value<'v>(
+        &self,
+        version: &'v Version,
+        item: &InternalValue,
+    ) -> ValuePlan<'v> {
+        if !item.key.value_type.is_indirection() {
+            return ValuePlan::Alone;
+        }
+        let mut cursor = crate::io::Cursor::new(&item.value[..]);
+        let Ok(indirection) = BlobIndirection::decode_from(&mut cursor) else {
+            return ValuePlan::Alone;
+        };
+        let vhandle = indirection.vhandle;
+        if let Some(value) = self
+            .cache
+            .get_blob(self.tree_id, &vhandle, &item.key.user_key)
+        {
+            return ValuePlan::Ready(value);
+        }
+        let (Some(blob_file), Ok(len)) = (
+            version.blob_files.get(vhandle.blob_file_id),
+            crate::vlog::blob_file::reader::record_len(item.key.user_key.len(), &vhandle),
+        ) else {
+            return ValuePlan::Alone;
+        };
+        ValuePlan::Read(ValueRead {
+            blob_file,
+            vhandle,
+            len,
+        })
+    }
+
+    /// `blob_file` open, from the descriptor cache or opened now: it may
+    /// block, so a batched read calls it from a job.
+    pub(crate) fn open_blob_file(
+        &self,
+        blob_file: &BlobFile,
+    ) -> crate::Result<Arc<dyn crate::fs::FsFile>> {
+        let id = crate::GlobalTableId::from((self.tree_id, blob_file.id()));
+        Ok(blob_file
+            .file_accessor()
+            .get_or_open_blob_file(&id, &blob_file.0.path)?
+            .0)
+    }
+
+    /// The value `read` planned, from the record's `bytes` as read: checked
+    /// against `key` and the handle as a single read checks it, counted, and
+    /// cached when the read caches what it reads.
+    ///
+    /// # Errors
+    ///
+    /// The record fails its checks; the caller then reads the value on its
+    /// own path, which reports the failure as a single read would.
+    pub(crate) fn finish_value(
+        &self,
+        version: &Version,
+        key: &[u8],
+        read: &ValueRead<'_>,
+        file: &dyn crate::fs::FsFile,
+        bytes: &crate::Slice,
+    ) -> crate::Result<UserValue> {
+        let accessor = Accessor::new(
+            &version.blob_files,
+            self.fill,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        );
+        let reader = crate::vlog::blob_file::reader::Reader::new(read.blob_file, file);
+        let mut decoded = 0;
+        let parsed = reader.parse_record(key, &read.vhandle, bytes, &mut decoded);
+        accessor.count_decoded(decoded);
+        let value = parsed?;
+        if self.fill.fills() {
+            let detached = self
+                .cache
+                .insert_blob(self.tree_id, &read.vhandle, key, value.clone());
+            accessor.count_gather(detached);
+        }
+        Ok(value)
+    }
+
+    /// Counts the read of `read`'s record as issued.
+    pub(crate) fn count_issued(&self, version: &Version, read: &ValueRead<'_>) {
+        Accessor::new(
+            &version.blob_files,
+            self.fill,
+            #[cfg(feature = "metrics")]
+            Some(&self.metrics),
+        )
+        .count_request(read.len);
     }
 
     /// The object `indirection` names under `key`, read from `version`'s blob

@@ -1623,6 +1623,161 @@ fn a_staged_level_read_opens_no_more_files_than_the_descriptor_cache_holds() -> 
     Ok(())
 }
 
+/// The widest batched read `counts` recorded: the most distinct files one
+/// batch read.
+fn widest(counts: &Mutex<Vec<(usize, usize)>>) -> usize {
+    counts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|&(_, files)| files)
+        .max()
+        .unwrap_or_default()
+}
+
+/// The separated values of a multi-get are read from at most as many blob
+/// files at once as the descriptor cache keeps, as a level's data blocks are:
+/// a batch over values spread across many blob files neither opens nor keeps a
+/// file per blob file, and every value is answered.
+#[test]
+fn value_reads_open_no_more_blob_files_than_the_descriptor_cache_holds() -> lsm_tree::Result<()> {
+    const BLOB_FILES: u32 = 16;
+    /// The descriptor cache the tree is opened with.
+    const DESCRIPTORS: usize = 2;
+    let dir = tempfile::tempdir()?;
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let fs: Arc<dyn Fs> = Arc::new(LiveCountFs {
+        live: Arc::default(),
+        counts: Arc::clone(&counts),
+    });
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(DESCRIPTORS))))
+        .with_kv_separation(Some(
+            lsm_tree::KvSeparationOptions::default().separation_threshold(1),
+        ))
+    };
+    {
+        let tree = config().open()?;
+        // One flush per blob file, each holding one value.
+        for file in 0..BLOB_FILES {
+            tree.insert(format!("k{file:03}"), vec![b'v'; 256], u64::from(file));
+            tree.flush_active_memtable(0)?;
+        }
+    }
+    let keys: Vec<String> = (0..BLOB_FILES).map(|file| format!("k{file:03}")).collect();
+    let expected = one_by_one(&config().open()?, &keys)?;
+    // Reopened, so no value is cached.
+    let tree = config().open()?;
+    counts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+
+    assert_eq!(values, expected);
+    assert!(values.iter().all(Option::is_some), "every value is found");
+    let widest = widest(&counts);
+    assert!(
+        widest <= DESCRIPTORS,
+        "a batch read {widest} files, past the {DESCRIPTORS} the cache keeps"
+    );
+    Ok(())
+}
+
+/// Appends every operand to the base.
+struct Concat;
+
+impl lsm_tree::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<lsm_tree::UserValue> {
+        let mut merged = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            merged.extend_from_slice(operand);
+        }
+        Ok(merged.into())
+    }
+}
+
+/// The tables the merges of a multi-get read their bases from are read at most
+/// as many at once as the descriptor cache keeps, as a level's are: merges over
+/// bases spread across many tables neither open nor keep a file per table, and
+/// every merge is answered.
+#[test]
+fn merges_open_no_more_tables_than_the_descriptor_cache_holds() -> lsm_tree::Result<()> {
+    const TABLES: u32 = 16;
+    /// The descriptor cache the tree is opened with.
+    const DESCRIPTORS: usize = 2;
+    let dir = tempfile::tempdir()?;
+    let counts = Arc::new(Mutex::new(Vec::new()));
+    let fs: Arc<dyn Fs> = Arc::new(LiveCountFs {
+        live: Arc::default(),
+        counts: Arc::clone(&counts),
+    });
+    let config = || {
+        Config::new(
+            dir.path(),
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .with_shared_fs(Arc::clone(&fs))
+        .use_cache(Arc::new(Cache::with_capacity_bytes(64 * 1_024 * 1_024)))
+        .use_descriptor_table(Some(Arc::new(lsm_tree::DescriptorTable::new(DESCRIPTORS))))
+        .with_merge_operator(Some(Arc::new(Concat)))
+    };
+    let key = |table: u32| format!("t{table:03}");
+    {
+        let tree = config().open()?;
+        // One table of bases per key, moved a level down; then the operands of
+        // every key in one table above them.
+        let mut seqno = 0;
+        for table in 0..TABLES {
+            tree.insert(key(table), format!("base-{table}"), seqno);
+            seqno += 1;
+            tree.flush_active_memtable(0)?;
+        }
+        tree.compact(Arc::new(lsm_tree::compaction::MoveDown(0, 1)), 0)?;
+        for table in 0..TABLES {
+            tree.merge(key(table), "+", seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    let tree = config().open()?;
+    let keys: Vec<String> = (0..TABLES).map(key).collect();
+    counts
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+
+    let values = tree.multi_get(&keys, SeqNo::MAX)?;
+
+    for (table, value) in (0..TABLES).zip(&values) {
+        assert_eq!(
+            value.as_deref(),
+            Some(format!("base-{table}+").as_bytes()),
+            "key {table}"
+        );
+    }
+    let widest = widest(&counts);
+    assert!(
+        widest <= DESCRIPTORS,
+        "a batch read {widest} files, past the {DESCRIPTORS} the cache keeps"
+    );
+    Ok(())
+}
+
 /// The filter and index blocks a level read stage by stage holds are bounded
 /// by `Config::multi_get_metadata_budget`, not by the block cache: under a
 /// cache far larger than the budget, a batch of keys every filter answers

@@ -331,6 +331,17 @@ pub(crate) enum SeqnoVisibility {
     Partial,
 }
 
+/// How a batched read gets a Page-ECC or columnar table's data block, as
+/// [`Table::batched_special_read`] decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpecialRead {
+    /// `len` bytes of the table's file from `offset`, read with the batch's
+    /// other blocks and handed to [`Table::decode_special_block`].
+    Bytes { offset: u64, len: usize },
+    /// Through the table's own load path, in a job.
+    Load,
+}
+
 /// Which data blocks a key range boundary takes in [`Table::data_span`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpanEdge {
@@ -1668,7 +1679,20 @@ impl Table {
             ..self.group_read(handle, charge, fd)
         }
         .load(&crate::table::row_group::PageWant::ALL)?;
-        let batch = self.row_pages(&blocks, charge)?.batches;
+        self.columnar_data_block_from(handle, &blocks, charge)
+    }
+
+    /// The row-major data block of the row group `handle` names, rebuilt from
+    /// its loaded `blocks` and delete-masked: `None` when the mask removes
+    /// every row.
+    #[cfg(feature = "columnar")]
+    fn columnar_data_block_from(
+        &self,
+        handle: &BlockHandle,
+        blocks: &crate::table::row_group::RowGroupBlocks,
+        charge: ReadCharge,
+    ) -> crate::Result<Option<DataBlock>> {
+        let batch = self.row_pages(blocks, charge)?.batches;
         let restart = self.metadata.data_block_restart_interval;
         // The segment has materialized deletes and this block has a recorded
         // start position: drop the deleted rows during reconstruction. The
@@ -8091,6 +8115,143 @@ impl Table {
         self.data_block_of(block)
     }
 
+    /// How a batched read gets the data block at `handle` of this Page-ECC or
+    /// columnar table: as bytes it reads with its other blocks, then
+    /// [`Self::decode_special_block`], or through the table's own load path in
+    /// a job.
+    ///
+    /// A columnar group goes through the load path when its directory is
+    /// cached (its pages may be too, which that path takes from the cache),
+    /// when it is wider than one request, or when it carries Page-ECC, whose
+    /// recovery re-reads a page to confirm a heal.
+    pub(crate) fn batched_special_read(&self, handle: &BlockHandle) -> SpecialRead {
+        if self.check_block_size(handle).is_err() {
+            return SpecialRead::Load;
+        }
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar
+            && (self.metadata.ecc_params.is_some()
+                || handle.size() > self.read_budget().io_buffer()
+                || self
+                    .cache
+                    .get_directory(self.global_id(), handle.offset(), false)
+                    .is_some())
+        {
+            return SpecialRead::Load;
+        }
+        SpecialRead::Bytes {
+            offset: *handle.offset(),
+            len: handle.size() as usize,
+        }
+    }
+
+    /// The data block at `handle` of this Page-ECC table, when the cache
+    /// holds it, counted as a cache hit as the load path counts one. Never a
+    /// columnar group's: the cache holds its directory and pages, not the
+    /// group, and the load path assembles it from them.
+    pub(crate) fn cached_special_block(&self, handle: &BlockHandle) -> Option<DataBlock> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return None;
+        }
+        self.cached_data_block(handle)
+    }
+
+    /// The role a batched read of a Page-ECC or columnar data block is
+    /// charged to: a columnar group is read as its pages are.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(clippy::unused_self, reason = "only a columnar table reads as pages")
+    )]
+    pub(crate) fn special_read_role(&self) -> BlockType {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            return BlockType::ColumnPage;
+        }
+        BlockType::Data
+    }
+
+    /// The data block at `handle` of this Page-ECC or columnar table, from the
+    /// `bytes` [`Self::batched_special_read`] asked for: checked, recovered
+    /// and reconstructed exactly as the load path does it, cached (a row block
+    /// while it fits in `room`), and `None` when a columnar block's delete
+    /// mask removes every row.
+    ///
+    /// # Errors
+    ///
+    /// A check fails; and a block whose payload Page-ECC had to correct,
+    /// which the load path reads again to schedule its heal, so the caller
+    /// takes that path for it.
+    pub(crate) fn decode_special_block(
+        &self,
+        handle: &BlockHandle,
+        bytes: alloc::vec::Vec<u8>,
+        room: &mut u64,
+    ) -> crate::Result<Option<DataBlock>> {
+        #[cfg(feature = "columnar")]
+        if self.metadata.columnar {
+            let fd = LookupFd::default();
+            let blocks = self
+                .group_read(handle, ReadCharge::Foreground, &fd)
+                .load_whole(&crate::Slice::from(bytes))?;
+            return self.columnar_data_block_from(handle, &blocks, ReadCharge::Foreground);
+        }
+        let compression = self.metadata.data_block_compression;
+        let transform = crate::table::util::build_block_transform(
+            compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+        )?;
+        let identity = crate::table::block::BlockIdentity {
+            table_id: self.global_id().table_id(),
+            block_type: BlockType::Data,
+            dict_id: compression.dict_id(),
+            window_log: 0,
+        };
+        let (header, payload, status, recovery) =
+            Block::verify_frame(bytes, *handle, identity, &transform)?;
+        if matches!(status, crate::table::block::EccStatus::Corrected) {
+            return Err(crate::Error::Io(crate::io::Error::other(
+                "a block Page-ECC corrected is loaded through the path that heals it",
+            )));
+        }
+        let mut produced = 0;
+        let data = Block::decompress_payload(&header, payload, &transform, &mut produced);
+        #[cfg(feature = "metrics")]
+        crate::table::util::record_block_decoded(&self.metrics, ReadCharge::Foreground, produced);
+        let block = crate::table::util::admit_read_block(
+            self.global_id(),
+            &self.path,
+            &self.file_accessor,
+            handle,
+            BlockType::Data,
+            compression,
+            self.encryption.as_deref(),
+            self.metadata.ecc_params,
+            #[cfg(zstd_any)]
+            self.zstd_dictionary.as_deref(),
+            self.heal_hints.get().map(AsRef::as_ref),
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+            ReadCharge::Foreground,
+            Block {
+                header,
+                data: data?,
+            },
+            status,
+            recovery,
+        )?;
+        let weight = crate::cache::block_weight(&block);
+        if weight <= *room {
+            *room -= weight;
+            self.cache
+                .insert_block(self.global_id(), handle.offset(), block.clone());
+        }
+        self.data_block_of(block).map(Some)
+    }
+
     /// `block`, a data block of this table, as the point reads take it.
     pub(crate) fn data_block_of(&self, block: Block) -> crate::Result<DataBlock> {
         DataBlock::from_loaded(block, self.metadata.kv_checksum_algo.is_some())
@@ -8557,6 +8718,77 @@ impl Table {
         }
 
         Ok(out)
+    }
+
+    /// The data blocks that can hold a version of `key`, whatever its seqno,
+    /// found through the index alone, with the table's file to read them
+    /// through. A key's versions run from the block its first one is in
+    /// through every block ending on the key.
+    ///
+    /// # Errors
+    ///
+    /// The index or the file fails to read.
+    pub(crate) fn key_blocks(
+        &self,
+        key: &[u8],
+    ) -> crate::Result<(Arc<dyn crate::fs::FsFile>, Vec<BlockHandle>)> {
+        let file = self.open_file()?;
+        let mut blocks = Vec::new();
+        if let Some(mut index) = self.block_index.forward_reader(key, SeqNo::MAX) {
+            let fd = LookupFd::default();
+            while let Some(handle) = index.next_with(&fd) {
+                let handle = handle?;
+                // A block ending before the key holds none of it; one ending
+                // on it may be followed by older versions in the next.
+                match self.comparator.compare(key, handle.end_key()) {
+                    core::cmp::Ordering::Greater => {}
+                    core::cmp::Ordering::Equal => blocks.push(*handle.as_ref()),
+                    core::cmp::Ordering::Less => {
+                        blocks.push(*handle.as_ref());
+                        break;
+                    }
+                }
+            }
+        }
+        Ok((file, blocks))
+    }
+
+    /// The versions of `key` in `block`, one of the blocks
+    /// [`Self::key_blocks`] names, newest first, with their global seqnos, of
+    /// those visible at `seqno`; and whether the block holds a version of the
+    /// key at all, whatever its seqno, as the table's reader reports it.
+    pub(crate) fn key_versions(
+        &self,
+        block: &DataBlock,
+        key: &[u8],
+        seqno: SeqNo,
+    ) -> (Vec<InternalValue>, bool) {
+        let global_seqno = self.global_seqno();
+        let mut versions = Vec::new();
+        let mut found = false;
+        let data = &block.inner.data;
+        let mut entries = block.iter(self.comparator.clone());
+        if !entries.seek(key, SeqNo::MAX) {
+            return (versions, found);
+        }
+        for item in entries {
+            let mut version = item.materialize(data);
+            match self.comparator.compare(&version.key.user_key, key) {
+                core::cmp::Ordering::Less => continue,
+                core::cmp::Ordering::Greater => break,
+                core::cmp::Ordering::Equal => {}
+            }
+            found = true;
+            // Filtered before it is translated, as the table's reader takes a
+            // version: a sum past `SeqNo::MAX` is above every snapshot.
+            if let Some(global) = version.key.seqno.checked_add(global_seqno)
+                && crate::range::seqno_filter(global, seqno)
+            {
+                version.key.seqno = global;
+                versions.push(version);
+            }
+        }
+        (versions, found)
     }
 
     /// The entries of the block `handle` names whose local seqno lies in
@@ -9883,6 +10115,12 @@ impl Table {
         self.1
             .as_ref()
             .is_some_and(|bound| self.comparator.compare(key, bound) == core::cmp::Ordering::Less)
+    }
+
+    /// Whether this version sees the table only from a tight-space
+    /// restriction's bound up.
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.1.is_some()
     }
 
     /// Returns a view of this table restricted to keys `>= lower`, for

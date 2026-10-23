@@ -320,15 +320,16 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             return None;
         };
         // Each task's block, when the cache holds it; the others are read. A
-        // Page-ECC or columnar table's block is loaded through its own path,
-        // the same load a point read makes: the scratch decode is row-format
-        // only. It is loaded when its chunk is read, so the blocks loaded stay
-        // within the chunk budget too.
+        // Page-ECC or columnar table's block the cache lacks is read and
+        // rebuilt by its table, or loaded through its own path, when its chunk
+        // is read, so the blocks loaded stay within the chunk budget too.
         let cached: Vec<TaskBlock> = tasks
             .iter()
             .map(|task| {
                 if task.special {
-                    TaskBlock::Load
+                    task.table
+                        .cached_special_block(&task.handle)
+                        .map_or(TaskBlock::Load, TaskBlock::Held)
                 } else {
                     task.table
                         .cached_data_block(&task.handle)
@@ -476,7 +477,10 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             JobDone::Loaded { index, block } => {
                 block.and_then(|block| current.read.loaded(chunk, index, block))
             }
-            JobDone::Planned { .. } | JobDone::Serial { .. } | JobDone::Value { .. } => {
+            JobDone::Planned { .. }
+            | JobDone::Serial { .. }
+            | JobDone::Value { .. }
+            | JobDone::MergeLocated { .. } => {
                 debug_assert!(false, "a job handed back to the data block phase");
                 Ok(())
             }
@@ -502,7 +506,7 @@ impl<'a, K: AsRef<[u8]>> Chunks<'a, K> {
             Ok(()) => current.read.read(
                 &self.tasks[self.start..current.end],
                 done.tag,
-                &done.buf,
+                done.buf,
                 &mut self.keep_room,
             ),
             Err(error) => {
