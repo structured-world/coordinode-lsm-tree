@@ -608,3 +608,415 @@ fn raw_statfs_on_missing_path_errors() {
         std::ffi::CString::new("/proc/does-not-exist/iou_raw_statfs").expect("no interior NUL");
     assert!(statfs_available_raw(&cpath).is_err());
 }
+
+// The capability-dependent surface answers as `StdFs` does on the same files:
+// a tree on the raw backend keeps the reclaim, clone and volume decisions the
+// std backend makes.
+
+/// Writes `len` bytes of `byte` to a new file at `path` through `fs`.
+#[cfg(feature = "std")]
+fn write_raw_file(fs: &IoUringRawFs, path: &std::path::Path, byte: u8, len: usize) {
+    use std::io::Write as _;
+    let mut file = fs
+        .open(path, &FsOpenOptions::new().write(true).create(true))
+        .expect("open");
+    file.write_all(&alloc::vec![byte; len]).expect("write");
+    file.sync_all().expect("sync");
+}
+
+/// A directory reports the same capabilities through the raw backend as
+/// through `StdFs`: every path that adapts to the file system (tight-space
+/// reclaim, prefix punches, reflinked checkpoints) asks them first.
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[test]
+fn raw_capabilities_match_the_std_backend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    assert_eq!(
+        fs.capabilities(tmp.path()),
+        crate::fs::StdFs.capabilities(tmp.path())
+    );
+}
+
+/// A hole punched through the raw backend frees the range as `StdFs` sees it:
+/// the range reads as zeros, the length is kept, both hole probes and the
+/// allocated size answer as they do through `StdFs`.
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn a_hole_punched_through_the_raw_backend_lands() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    if !crate::fs::StdFs.capabilities(tmp.path()).punch_hole {
+        eprintln!("skipping: the temporary directory's file system cannot punch holes");
+        return;
+    }
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let std_fs = crate::fs::StdFs;
+    let path = tmp.path().join("punched");
+    write_raw_file(&fs, &path, 0xAB, 1 << 20);
+    fs.punch_hole(&path, 0, 512 * 1024).expect("punch_hole");
+
+    assert_eq!(
+        fs.extent_contains_hole(&path, 0, 512 * 1024)
+            .expect("probe"),
+        Some(true)
+    );
+    for (offset, len) in [(0, 512 * 1024), (512 * 1024, 4_096), (1 << 20, 4_096)] {
+        assert_eq!(
+            fs.extent_is_hole(&path, offset, len).expect("probe"),
+            std_fs.extent_is_hole(&path, offset, len).expect("probe"),
+            "extent_is_hole({offset}, {len})"
+        );
+        assert_eq!(
+            fs.extent_contains_hole(&path, offset, len).expect("probe"),
+            std_fs
+                .extent_contains_hole(&path, offset, len)
+                .expect("probe"),
+            "extent_contains_hole({offset}, {len})"
+        );
+    }
+    assert_eq!(
+        fs.allocated_size(&path).expect("allocated_size"),
+        std_fs.allocated_size(&path).expect("allocated_size")
+    );
+    assert_eq!(fs.metadata(&path).expect("metadata").len, 1 << 20);
+    let file = fs
+        .open(&path, &FsOpenOptions::new().read(true))
+        .expect("open");
+    let mut head = [0xFFu8; 64];
+    assert_eq!(file.read_at(&mut head, 0).expect("read"), 64);
+    assert_eq!(head, [0u8; 64], "the punched range reads as zeros");
+    let mut tail = [0u8; 64];
+    assert_eq!(file.read_at(&mut tail, 512 * 1024).expect("read"), 64);
+    assert_eq!(tail, [0xABu8; 64], "the rest is untouched");
+}
+
+/// A fully written file holds no hole, and a range past its end is a hole that
+/// none of the file's bytes can sit in, as `StdFs` answers; a file that does
+/// not exist is an error for the allocated size, never "cannot tell".
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn the_raw_extent_probes_answer_as_the_std_backend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let std_fs = crate::fs::StdFs;
+    let path = tmp.path().join("dense");
+    write_raw_file(&fs, &path, 1, 64 * 1024);
+
+    for (offset, len) in [(0, 64 * 1024), (4_096, 1), (64 * 1024, 4_096), (0, 0)] {
+        assert_eq!(
+            fs.extent_is_hole(&path, offset, len).expect("probe"),
+            std_fs.extent_is_hole(&path, offset, len).expect("probe"),
+            "extent_is_hole({offset}, {len})"
+        );
+        assert_eq!(
+            fs.extent_contains_hole(&path, offset, len).expect("probe"),
+            std_fs
+                .extent_contains_hole(&path, offset, len)
+                .expect("probe"),
+            "extent_contains_hole({offset}, {len})"
+        );
+    }
+    let allocated = fs.allocated_size(&path).expect("allocated_size");
+    assert!(allocated.is_some(), "a written file reports its allocation");
+    assert_eq!(
+        allocated,
+        std_fs.allocated_size(&path).expect("allocated_size")
+    );
+    let missing = tmp.path().join("missing");
+    assert_eq!(
+        fs.allocated_size(&missing)
+            .expect_err("no such file")
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// A hard link through the raw backend is a second name of the inode, its
+/// link count reads by path, and the refusals are the ones `StdFs` gives: an
+/// existing destination, a missing source.
+#[cfg(feature = "std")]
+#[test]
+fn raw_hard_links_count_and_refuse_as_the_std_backend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let (path, link) = (tmp.path().join("table"), tmp.path().join("link"));
+    write_raw_file(&fs, &path, 1, 4_096);
+    assert_eq!(fs.hard_link_count(&path).expect("count"), 1);
+    fs.hard_link(&path, &link).expect("hard_link");
+    assert_eq!(fs.hard_link_count(&path).expect("count"), 2);
+    assert!(fs.same_file(&path, &link).expect("same_file"));
+
+    assert_eq!(
+        fs.hard_link(&path, &link).expect_err("exists").kind(),
+        ErrorKind::AlreadyExists
+    );
+    let missing = tmp.path().join("missing");
+    assert_eq!(
+        fs.hard_link(&missing, &tmp.path().join("other"))
+            .expect_err("no source")
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        fs.hard_link_count(&missing).expect_err("no file").kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// The raw backend resolves paths through the host kernel as `StdFs` does, so
+/// it names the same namespace and the same volumes: a checkpoint hard-links
+/// across the two and the space gate tells mounts apart.
+#[cfg(feature = "std")]
+#[test]
+fn raw_namespace_and_volume_ids_match_the_std_backend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    assert_eq!(fs.backend_id(), crate::fs::StdFs.backend_id());
+    assert!(fs.backend_id().is_some());
+    let volume = fs.volume_id(tmp.path());
+    assert!(volume.is_some(), "a real mount has an id");
+    assert_eq!(volume, crate::fs::StdFs.volume_id(tmp.path()));
+    assert_eq!(fs.volume_id(&tmp.path().join("missing")), None);
+}
+
+/// A file cloned through the raw backend holds the source's bytes in an inode
+/// of its own, whether the file system shares the blocks or the clone falls
+/// back to a copy; an existing destination is refused.
+#[cfg(feature = "std")]
+#[test]
+fn a_file_cloned_through_the_raw_backend_is_independent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let (source, clone) = (tmp.path().join("source"), tmp.path().join("clone"));
+    write_raw_file(&fs, &source, 7, 64 * 1024);
+    fs.reflink_file(&source, &clone).expect("reflink_file");
+
+    let clone_file = fs
+        .open(&clone, &FsOpenOptions::new().read(true).write(true))
+        .expect("open");
+    let mut bytes = alloc::vec![0u8; 64 * 1024];
+    assert_eq!(
+        clone_file.read_at(&mut bytes, 0).expect("read"),
+        bytes.len()
+    );
+    assert!(bytes.iter().all(|&b| b == 7), "the clone holds the source");
+    assert_eq!(
+        fs.hard_link_count(&clone).expect("count"),
+        1,
+        "an inode of its own"
+    );
+    assert_eq!(
+        fs.reflink_file(&source, &clone).expect_err("exists").kind(),
+        ErrorKind::AlreadyExists
+    );
+}
+
+/// Turning copy-on-write off for a new file succeeds where the file system
+/// has the flag and is a no-op where it has not, as through `StdFs`.
+#[cfg(all(
+    feature = "std",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    )
+))]
+#[test]
+fn raw_disabling_copy_on_write_answers_as_the_std_backend() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let (raw_path, std_path) = (tmp.path().join("raw"), tmp.path().join("std"));
+    write_raw_file(&fs, &raw_path, 0, 0);
+    write_raw_file(&fs, &std_path, 0, 0);
+    assert_eq!(
+        fs.try_disable_cow(&raw_path).map_err(|e| e.kind()),
+        crate::fs::StdFs
+            .try_disable_cow(&std_path)
+            .map_err(|e| e.kind())
+    );
+    assert_eq!(
+        fs.try_disable_cow(&tmp.path().join("missing"))
+            .expect_err("no file")
+            .kind(),
+        ErrorKind::NotFound
+    );
+}
+
+/// Every access hint reaches the kernel through the raw backend's file and is
+/// accepted, as `StdFs` accepts it.
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn raw_files_accept_every_access_hint() {
+    use crate::fs::FileHint;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let path = tmp.path().join("hinted");
+    write_raw_file(&fs, &path, 3, 4_096);
+    let file = fs
+        .open(&path, &FsOpenOptions::new().read(true))
+        .expect("open");
+    for hint in [
+        FileHint::Default,
+        FileHint::Sequential,
+        FileHint::Random,
+        FileHint::WriteOnce,
+    ] {
+        file.hint(hint).expect("hint");
+    }
+
+    // A pipe takes no access advice: the kernel refuses it, and the refusal
+    // reaches the caller as through `StdFs`.
+    let pipe = tmp.path().join("pipe");
+    let name = std::ffi::CString::new(pipe.to_str().expect("utf8")).expect("no NUL");
+    // SAFETY: `name` is a NUL-terminated path the call only reads.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    let opts = FsOpenOptions::new().read(true).no_wait(true);
+    let raw_pipe = fs.open(&pipe, &opts).expect("open the pipe");
+    let std_pipe = crate::fs::StdFs.open(&pipe, &opts).expect("open the pipe");
+    assert!(std_pipe.hint(FileHint::Sequential).is_err());
+    assert!(raw_pipe.hint(FileHint::Sequential).is_err());
+}
+
+/// A range no file extent can have (past `i64::MAX`, or ending past
+/// `u64::MAX`) is refused before any syscall, and a file that does not exist
+/// is not found, for the punch and both hole probes, as through `StdFs`.
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn raw_range_syscalls_refuse_what_the_std_backend_refuses() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let std_fs = crate::fs::StdFs;
+    let path = tmp.path().join("file");
+    write_raw_file(&fs, &path, 1, 4_096);
+    let missing = tmp.path().join("missing");
+
+    for (what, file, offset, len, kind) in [
+        (
+            "offset past i64",
+            &path,
+            u64::MAX,
+            1,
+            ErrorKind::InvalidInput,
+        ),
+        ("end past u64", &path, 1, u64::MAX, ErrorKind::InvalidInput),
+        ("missing file", &missing, 0, 4_096, ErrorKind::NotFound),
+    ] {
+        let raw = [
+            fs.punch_hole(file, offset, len).map(|()| None),
+            fs.extent_is_hole(file, offset, len),
+            fs.extent_contains_hole(file, offset, len),
+        ];
+        let std = [
+            std_fs.punch_hole(file, offset, len).map(|()| None),
+            std_fs.extent_is_hole(file, offset, len),
+            std_fs.extent_contains_hole(file, offset, len),
+        ];
+        for (raw, std) in raw.iter().zip(&std) {
+            assert_eq!(raw.as_ref().err().map(Error::kind), Some(kind), "{what}");
+            assert_eq!(std.as_ref().err().map(Error::kind), Some(kind), "{what}");
+        }
+    }
+}
+
+/// A path the kernel cannot be handed (an interior NUL) reports nothing it
+/// cannot prove: the conservative capabilities and no volume, as through
+/// `StdFs`; the operations on it fail.
+#[cfg(feature = "std")]
+#[test]
+fn a_path_with_a_nul_proves_no_capability_and_no_volume() {
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let path = std::path::Path::new("bad\0path");
+    assert_eq!(fs.capabilities(path), crate::fs::StdFs.capabilities(path));
+    assert_eq!(fs.capabilities(path), crate::fs::FsCapabilities::default());
+    assert_eq!(fs.volume_id(path), None);
+    assert_eq!(crate::fs::StdFs.volume_id(path), None);
+    assert!(fs.allocated_size(path).is_err());
+    assert!(fs.hard_link_count(path).is_err());
+    assert!(fs.hard_link(path, std::path::Path::new("other")).is_err());
+}
+
+/// A clone of a file that does not exist is not found, and turning
+/// copy-on-write off fails for a path no writable file sits at, as through
+/// `StdFs`; neither leaves a target behind.
+#[cfg(all(
+    feature = "std",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    )
+))]
+#[test]
+fn raw_clone_and_copy_on_write_refuse_what_the_std_backend_refuses() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let (missing, clone) = (tmp.path().join("missing"), tmp.path().join("clone"));
+    assert_eq!(
+        fs.reflink_file(&missing, &clone)
+            .expect_err("no source")
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert!(!clone.exists(), "no target is left behind");
+    assert_eq!(
+        crate::fs::StdFs
+            .reflink_file(&missing, &clone)
+            .expect_err("no source")
+            .kind(),
+        ErrorKind::NotFound
+    );
+    // A directory does not open for writing.
+    assert!(fs.try_disable_cow(tmp.path()).is_err());
+    assert!(crate::fs::StdFs.try_disable_cow(tmp.path()).is_err());
+}
+
+/// A file past 4 GiB keeps its length and its bytes through the raw backend:
+/// the size set, the end offset, a write and a read beyond 32 bits, and a
+/// reopen all see the full 64-bit values. A 32-bit target needs the 64-bit
+/// forms of the length and offset syscalls and `O_LARGEFILE` for this, and
+/// `mmap2` to set the ring up at all. The file is sparse.
+#[test]
+fn a_file_past_four_gibibytes_keeps_its_length_and_bytes_through_the_raw_backend() {
+    use crate::fs::Fs;
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    const LEN: u64 = 5 << 30;
+    const AT: u64 = (4 << 30) + 7;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("big.bin");
+    let path = crate::path::Path::new(p.to_str().expect("utf8 temp path"));
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    {
+        let mut f = fs
+            .open(
+                path,
+                &FsOpenOptions::new().read(true).write(true).create(true),
+            )
+            .expect("create");
+        f.set_len(LEN).expect("set_len past 4 GiB");
+        assert_eq!(f.metadata().expect("metadata").len, LEN);
+        assert_eq!(f.seek(SeekFrom::End(0)).expect("seek to the end"), LEN);
+        assert_eq!(f.seek(SeekFrom::Start(AT)).expect("seek past 4 GiB"), AT);
+        f.write_all(b"far").expect("write past 4 GiB");
+        let mut buf = [0u8; 3];
+        assert_eq!(f.read_at(&mut buf, AT).expect("read past 4 GiB"), 3);
+        assert_eq!(&buf, b"far");
+    }
+    let f = fs
+        .open(path, &FsOpenOptions::new().read(true))
+        .expect("reopen a file past 2 GiB");
+    assert_eq!(f.metadata().expect("metadata after reopen").len, LEN);
+    let mut buf = [0u8; 3];
+    assert_eq!(f.read_at(&mut buf, AT).expect("read after reopen"), 3);
+    assert_eq!(&buf, b"far");
+}

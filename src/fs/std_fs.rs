@@ -600,7 +600,7 @@ impl Fs for StdFs {
     }
 
     fn backend_id(&self) -> Option<u64> {
-        Some(KERNEL_BACKEND_ID)
+        Some(super::KERNEL_BACKEND_ID)
     }
 
     #[cfg(unix)]
@@ -730,12 +730,6 @@ impl Fs for StdFs {
         Ok(linux_caps::extent_contains_hole(path, offset, len)?)
     }
 }
-
-/// Shared by every backend that resolves paths against the host kernel's
-/// filesystem table - currently `StdFs` and `IoUringFs`. Two such backends
-/// can hard-link across instances because `std::fs::hard_link(src, dst)`
-/// resolves both paths through the same kernel namespace.
-pub const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 
 /// Detects `EXDEV` (cross-device link) errors across platforms.
 ///
@@ -1294,10 +1288,8 @@ mod linux_caps {
     }
 
     /// Capabilities derived from `statfs(2)`'s `f_type` magic for the mount
-    /// backing `path`. Btrfs / ZFS get the full profile; XFS gets copy-on-write
-    /// plus reflink (reflink is only present on `reflink=1` volumes, which
-    /// `ficlone` handles by falling back). Everything else (ext4, tmpfs,
-    /// network) and any detection failure report the conservative default.
+    /// backing `path` (see [`crate::fs::linux_fs_type_capabilities`]); any
+    /// detection failure reports the conservative default.
     ///
     /// Gated to 64-bit targets: `statfs.f_type` is `__fsword_t` (`c_long`),
     /// and the magic numbers exceed `i32::MAX`, so a clean comparison needs the
@@ -1305,13 +1297,6 @@ mod linux_caps {
     /// it reports the conservative default.
     #[cfg(target_pointer_width = "64")]
     pub(super) fn capabilities(path: &Path) -> FsCapabilities {
-        // statfs f_type magic numbers (stable kernel ABI, arch-independent).
-        const BTRFS: i64 = 0x9123_683E;
-        const ZFS: i64 = 0x2FC1_2FC1;
-        const XFS: i64 = 0x5846_5342;
-        const EXT_FAMILY: i64 = 0x0000_EF53; // ext2/3/4 share this magic
-        const TMPFS: i64 = 0x0102_1994;
-
         let Ok(c) = to_cstring(path) else {
             return FsCapabilities::default();
         };
@@ -1334,33 +1319,7 @@ mod linux_caps {
             reason = "f_type is i64 on glibc (no-op cast) and u64 on musl (cast required)"
         )]
         let f_type = unsafe { buf.assume_init() }.f_type as i64;
-
-        // fallocate(PUNCH_HOLE) is supported by every common local Linux
-        // filesystem (ext4 / xfs / btrfs / zfs / tmpfs); leave it false for
-        // unknown / network mounts so a runtime EOPNOTSUPP never surprises the
-        // tight-space compaction gate.
-        match f_type {
-            BTRFS | ZFS => FsCapabilities {
-                per_block_integrity_on_read: true,
-                background_scrub: true,
-                copy_on_write: true,
-                reflink: true,
-                native_snapshot: true,
-                punch_hole: true,
-                ..FsCapabilities::default()
-            },
-            XFS => FsCapabilities {
-                copy_on_write: true,
-                reflink: true,
-                punch_hole: true,
-                ..FsCapabilities::default()
-            },
-            EXT_FAMILY | TMPFS => FsCapabilities {
-                punch_hole: true,
-                ..FsCapabilities::default()
-            },
-            _ => FsCapabilities::default(),
-        }
+        crate::fs::linux_fs_type_capabilities(f_type)
     }
 
     /// Deallocates `[offset, offset+len)` inside the file at `path` via
@@ -1487,6 +1446,10 @@ mod linux_caps {
     /// 32-bit Linux: `punch_hole` is unsupported there, so no hole can exist to
     /// attribute; "cannot tell" is the truthful answer.
     #[cfg(not(target_pointer_width = "64"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature of the 64-bit probe the same caller uses"
+    )]
     pub(super) fn extent_is_hole(
         _path: &Path,
         _offset: u64,
@@ -1497,6 +1460,10 @@ mod linux_caps {
 
     /// 32-bit Linux: as [`extent_is_hole`] — no punch support, "cannot tell".
     #[cfg(not(target_pointer_width = "64"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature of the 64-bit probe the same caller uses"
+    )]
     pub(super) fn extent_contains_hole(
         _path: &Path,
         _offset: u64,
@@ -1574,6 +1541,7 @@ mod linux_caps {
     #[cfg(any(
         target_arch = "x86",
         target_arch = "x86_64",
+        target_arch = "arm",
         target_arch = "aarch64",
         target_arch = "riscv32",
         target_arch = "riscv64",
@@ -1581,10 +1549,11 @@ mod linux_caps {
         target_arch = "s390x"
     ))]
     pub(super) fn try_disable_cow(path: &Path) -> io::Result<()> {
-        // asm-generic `_IO*` encodings of FS_IOC_{GET,SET}FLAGS (size = 8 =
-        // sizeof(long)); FS_NOCOW_FL is the inode flag bit.
-        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
-        const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+        // FS_IOC_{GET,SET}FLAGS encode sizeof(long) in the request, which is 4
+        // on the 32-bit targets above and 8 on the 64-bit ones: libc's values
+        // carry the target's width. FS_NOCOW_FL is the inode flag bit.
+        const FS_IOC_GETFLAGS: libc::Ioctl = libc::FS_IOC_GETFLAGS;
+        const FS_IOC_SETFLAGS: libc::Ioctl = libc::FS_IOC_SETFLAGS;
         const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
 
         let f = OpenOptions::new().read(true).write(true).open(path)?;
@@ -1623,6 +1592,7 @@ mod linux_caps {
     #[cfg(not(any(
         target_arch = "x86",
         target_arch = "x86_64",
+        target_arch = "arm",
         target_arch = "aarch64",
         target_arch = "riscv32",
         target_arch = "riscv64",
@@ -1641,6 +1611,7 @@ mod linux_caps {
     #[cfg(any(
         target_arch = "x86",
         target_arch = "x86_64",
+        target_arch = "arm",
         target_arch = "aarch64",
         target_arch = "riscv32",
         target_arch = "riscv64",

@@ -375,6 +375,20 @@ jobs:
         run: cargo nextest run --profile ci --all-features
       - name: Run doc tests
         run: cargo test --doc --features lz4
+      - name: Run the raw io_uring backend as a 32-bit x86 binary
+        # The raw backend makes its syscalls itself, and a 32-bit target takes
+        # other forms of several of them (mmap2, 64-bit lengths and offsets in
+        # register pairs, O_LARGEFILE). The cross job's container has no
+        # io_uring, so these tests run here natively, as a 32-bit binary on
+        # the 64-bit kernel.
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        env:
+          CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-multilib
+          rustup target add i686-unknown-linux-gnu
+          cargo nextest run --profile ci --lib --features io-uring-raw --target i686-unknown-linux-gnu -E 'test(/^fs::io_uring_raw::/)'
 
   tools:
     # The standalone crates under tools/, built and tested beside `test` over
