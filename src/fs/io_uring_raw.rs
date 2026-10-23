@@ -442,21 +442,22 @@ unsafe fn mmap(
     fd: i32,
     offset: u64,
 ) -> Result<*mut u8, Error> {
+    // A 32-bit target maps through `mmap2`, whose offset counts 4096-byte
+    // units: its `mmap` takes a 32-bit offset, and on x86 is the old form that
+    // reads its arguments through a pointer. Every `IORING_OFF_*` is a
+    // multiple of 4096.
+    #[cfg(target_pointer_width = "64")]
+    let (nr, off) = (Sysno::mmap, offset as usize);
+    #[cfg(target_pointer_width = "32")]
+    let (nr, off) = {
+        debug_assert!(offset % 4096 == 0, "mmap2 offset is in 4096-byte units");
+        (Sysno::mmap2, (offset / 4096) as usize)
+    };
     // SAFETY: forwarded to the kernel. The raw `mmap` syscall returns `-errno`
     // (in `[-4095, -1]`) on failure, which the `syscalls` Result form maps to
     // `Err` for us; a success is the actual mapping address (page 0 included,
     // though the kernel does not hand it out for a NULL hint).
-    let ret = unsafe {
-        syscall6(
-            Sysno::mmap,
-            0,
-            len,
-            prot,
-            flags,
-            fd as usize,
-            offset as usize,
-        )
-    };
+    let ret = unsafe { syscall6(nr, 0, len, prot, flags, fd as usize, off) };
     match ret {
         Ok(addr) => Ok(addr as *mut u8),
         Err(e) => Err(err("mmap", e)),
@@ -500,7 +501,7 @@ pub fn open_raw(path: &core::ffi::CStr, flags: i32, mode: u32) -> Result<i32, Er
             Sysno::openat,
             AT_FDCWD as usize,
             path.as_ptr() as usize,
-            flags as usize,
+            (flags | O_LARGEFILE) as usize,
             mode as usize,
         )
     }
@@ -638,9 +639,47 @@ pub fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
 /// Returns an [`Error`] if the `ftruncate` syscall fails.
 pub fn ftruncate_raw(fd: i32, length: u64) -> Result<(), Error> {
     // SAFETY: `fd` is an owned writable descriptor; `length` is a plain value.
-    unsafe { syscall2(Sysno::ftruncate, fd as usize, length as usize) }
-        .map_err(|e| err("ftruncate", e))?;
+    #[cfg(target_pointer_width = "64")]
+    let ret = unsafe { syscall2(Sysno::ftruncate, fd as usize, length as usize) };
+    // A 32-bit `ftruncate` takes a 32-bit length; `ftruncate64` takes it in
+    // a register pair, which arm, MIPS and powerpc start at an even register
+    // (glibc `ftruncate64.c`: `__ALIGNMENT_ARG SYSCALL_LL64 (length)`).
+    #[cfg(target_pointer_width = "32")]
+    let ret = {
+        let (a, b) = reg_pair(length);
+        // SAFETY: as above.
+        unsafe {
+            if ALIGNED_REGISTER_PAIRS {
+                syscall4(Sysno::ftruncate64, fd as usize, 0, a, b)
+            } else {
+                syscall3(Sysno::ftruncate64, fd as usize, a, b)
+            }
+        }
+    };
+    ret.map_err(|e| err("ftruncate", e))?;
     Ok(())
+}
+
+/// Whether a 64-bit syscall argument starts at an even register on this
+/// 32-bit target (glibc `__ASSUME_ALIGNED_REGISTER_PAIRS`).
+#[cfg(target_pointer_width = "32")]
+const ALIGNED_REGISTER_PAIRS: bool = cfg!(any(
+    target_arch = "arm",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "powerpc"
+));
+
+/// The two registers a 64-bit syscall argument takes on a 32-bit target, in
+/// the target's byte order (glibc `SYSCALL_LL64`).
+#[cfg(target_pointer_width = "32")]
+fn reg_pair(v: u64) -> (usize, usize) {
+    let (lo, hi) = (v as u32 as usize, (v >> 32) as usize);
+    if cfg!(target_endian = "little") {
+        (lo, hi)
+    } else {
+        (hi, lo)
+    }
 }
 
 /// `sync_file_range(fd, offset, len, SYNC_FILE_RANGE_WRITE)`: starts writing
@@ -728,10 +767,36 @@ pub fn lseek_raw(fd: i32, offset: i64, whence: i32) -> Result<u64, Error> {
 
 /// [`lseek_raw`], handing back the raw `errno` for a caller that tells
 /// failures apart (the hole probes read `ENXIO` as an answer).
+#[cfg(target_pointer_width = "64")]
 fn lseek_errno(fd: i32, offset: i64, whence: i32) -> Result<u64, Errno> {
     // SAFETY: `fd` is an owned descriptor; offset/whence are plain values.
     let pos = unsafe { syscall3(Sysno::lseek, fd as usize, offset as usize, whence as usize) }?;
     Ok(pos as u64)
+}
+
+/// [`lseek_raw`] on a 32-bit target, where `lseek` takes and returns a 32-bit
+/// offset: `_llseek` takes the offset high word first and writes the 64-bit
+/// result through a pointer (glibc `lseek64.c`).
+#[cfg(target_pointer_width = "32")]
+fn lseek_errno(fd: i32, offset: i64, whence: i32) -> Result<u64, Errno> {
+    #[cfg(target_arch = "riscv32")]
+    let nr = Sysno::llseek;
+    #[cfg(not(target_arch = "riscv32"))]
+    let nr = Sysno::_llseek;
+    let mut pos: u64 = 0;
+    // SAFETY: `fd` is an owned descriptor; the offset words and `whence` are
+    // plain values, and `pos` outlives the call, which writes only it.
+    unsafe {
+        syscall5(
+            nr,
+            fd as usize,
+            ((offset as u64) >> 32) as usize,
+            offset as u32 as usize,
+            (&raw mut pos) as usize,
+            whence as usize,
+        )
+    }?;
+    Ok(pos)
 }
 
 /// `flock(fd, LOCK_EX[|LOCK_NB])` — take an advisory exclusive lock. With
@@ -842,6 +907,43 @@ const O_NOFOLLOW: i32 = 0o100_000;
     target_arch = "m68k"
 )))]
 const O_NOFOLLOW: i32 = 0o400_000;
+/// Lets a 32-bit process open and write a file of 2 GiB or more; a 64-bit
+/// kernel sets it on every open itself. Asm-generic value (`0o100000`).
+#[cfg(all(
+    target_pointer_width = "32",
+    not(any(
+        target_arch = "arm",
+        target_arch = "powerpc",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "sparc"
+    ))
+))]
+const O_LARGEFILE: i32 = 0o100_000;
+/// Lets a 32-bit process open and write a file of 2 GiB or more (arm).
+#[cfg(all(target_pointer_width = "32", target_arch = "arm"))]
+const O_LARGEFILE: i32 = 0o400_000;
+/// Lets a 32-bit process open and write a file of 2 GiB or more (powerpc).
+#[cfg(all(target_pointer_width = "32", target_arch = "powerpc"))]
+const O_LARGEFILE: i32 = 0o200_000;
+/// Lets a 32-bit process open and write a file of 2 GiB or more (MIPS).
+#[cfg(all(
+    target_pointer_width = "32",
+    any(target_arch = "mips", target_arch = "mips32r6")
+))]
+const O_LARGEFILE: i32 = 0x2000;
+/// Lets a 32-bit process open and write a file of 2 GiB or more (SPARC).
+#[cfg(all(target_pointer_width = "32", target_arch = "sparc"))]
+const O_LARGEFILE: i32 = 0x4_0000;
+/// Set by a 64-bit kernel on every open, so nothing to add.
+#[cfg(target_pointer_width = "64")]
+const O_LARGEFILE: i32 = 0;
+
+#[cfg(all(
+    target_pointer_width = "32",
+    any(target_arch = "x86", target_arch = "arm")
+))]
+const _: () = assert!(O_LARGEFILE == libc::O_LARGEFILE);
 
 // The open flags this module spells out match the C library's on the target,
 // checked as it builds: several differ per architecture, and a wrong one

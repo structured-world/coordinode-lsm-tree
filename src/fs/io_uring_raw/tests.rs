@@ -979,3 +979,44 @@ fn raw_clone_and_copy_on_write_refuse_what_the_std_backend_refuses() {
     assert!(fs.try_disable_cow(tmp.path()).is_err());
     assert!(crate::fs::StdFs.try_disable_cow(tmp.path()).is_err());
 }
+
+/// A file past 4 GiB keeps its length and its bytes through the raw backend:
+/// the size set, the end offset, a write and a read beyond 32 bits, and a
+/// reopen all see the full 64-bit values. A 32-bit target needs the 64-bit
+/// forms of the length and offset syscalls and `O_LARGEFILE` for this, and
+/// `mmap2` to set the ring up at all. The file is sparse.
+#[test]
+fn a_file_past_four_gibibytes_keeps_its_length_and_bytes_through_the_raw_backend() {
+    use crate::fs::Fs;
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    const LEN: u64 = 5 << 30;
+    const AT: u64 = (4 << 30) + 7;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("big.bin");
+    let path = crate::path::Path::new(p.to_str().expect("utf8 temp path"));
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    {
+        let mut f = fs
+            .open(
+                path,
+                &FsOpenOptions::new().read(true).write(true).create(true),
+            )
+            .expect("create");
+        f.set_len(LEN).expect("set_len past 4 GiB");
+        assert_eq!(f.metadata().expect("metadata").len, LEN);
+        assert_eq!(f.seek(SeekFrom::End(0)).expect("seek to the end"), LEN);
+        assert_eq!(f.seek(SeekFrom::Start(AT)).expect("seek past 4 GiB"), AT);
+        f.write_all(b"far").expect("write past 4 GiB");
+        let mut buf = [0u8; 3];
+        assert_eq!(f.read_at(&mut buf, AT).expect("read past 4 GiB"), 3);
+        assert_eq!(&buf, b"far");
+    }
+    let f = fs
+        .open(path, &FsOpenOptions::new().read(true))
+        .expect("reopen a file past 2 GiB");
+    assert_eq!(f.metadata().expect("metadata after reopen").len, LEN);
+    let mut buf = [0u8; 3];
+    assert_eq!(f.read_at(&mut buf, AT).expect("read after reopen"), 3);
+    assert_eq!(&buf, b"far");
+}
