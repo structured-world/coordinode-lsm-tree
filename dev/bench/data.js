@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792766642068,
+  "lastUpdate": 1792766646156,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -59104,6 +59104,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.588991701,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2a88f9011a4908801b8fd56ef97b931b2c42a216",
+          "message": "perf(multi-get): batch the reads of values, special blocks and merges (#974)\n\n## Summary\n\n- A batched multi-get reads what turning a key's newest version into its\nvalue needs through the read queue its levels use: separated values,\nPage-ECC and columnar data blocks, and the blocks of the tables a merge\nwalks now travel in the batch instead of one synchronous read each.\n- The blob scan read-ahead reads a window's spans in batched calls, one\nfor a usual window.\n- The `io-uring-raw` backend reads batches through its ring, with the\nbatched-read surfaces of `IoUringFs`.\n\n## Changes\n\n- `IoUringRaw` submits a batch of SQEs, as many in flight as its rings\nhold, and reaps them by `user_data`; an `enter` the kernel refuses takes\nits SQEs back, and every taken SQE completes before the call returns.\n`IoUringRawFile` gains `backing_fd` and `read_many`; `IoUringRawFs`\ngains `read_blocks_batched(_each)`, `reads_by_descriptor` and\n`check_descriptor_batch`. The batched-read conformance tests of\n`IoUringFs` run on both backends from one macro.\n- `Accessor::prefetch` finds every span of a window first, then reads\nthem in `read_blocks_batched_each` calls per filesystem, each batch at\nmost one coalesced read's extent so no more is held at once than one\nread held, and none once the admission budget is spent; grouping, gap\nand read limits, cache fill and the per-value fallback are unchanged.\n- A separated value is checked in the cache, its blob file opened once\nin a job, and its record read through the queue and checked against key\nand handle as a single read checks it. A block request names its backend\nand cache instead of a table.\n- A Page-ECC block the cache lacks is verified from its frame and bytes\n(a block its parity corrected goes to the load path, which schedules the\nheal); a columnar row group is read whole in one request and its\ndirectory and pages verified, admitted and rebuilt from those bytes\n(`GroupRead::load_whole`).\n- The walk of a merge over its sources is one `MergeWalk`, which the\npoint read drives on the calling thread and the multi-get drives for all\nits merges at once: each table step asks the filters, finds the key's\nblocks through the index, and takes them one at a time, newest first,\ndown to the first base, as the table's reader does: a block the cache\nlacks is read through the queue with the other merges' next blocks (a\nblock several merges need is read once), its size checked before its\nbuffer is allocated, and the blocks in flight kept within half the\ncache, as a level's chunk is. Page-ECC, columnar and restricted tables\nkeep the table's reader. A blob tree's merge resolves in a job, since\nits base may be read from the value log. Any step that fails hands the\nmerge to the single-key path.\n- The blob files the value reads open and the tables the merges read are\nheld at most as many at once as the descriptor cache keeps, as a level's\nchunk spans; each is given back once its reads, or its merge's table,\nare over. A key asked more than once is read once and its value handed\nto each repetition.\n- The hottest-window tests hold the process clock: a table's heat is\nmeasured on it, and a test pinning it in the same `cargo test` process\nzeroed every heat, which failed the i686 cross job on main.\n- `benches/io_uring_value_multi_get.rs` times cold multi-gets over a\nblob tree, a columnar table and merges over bases on `IoUringFs`.\n\n## Testing\n\nFormat, clippy (default and all features), nextest (default and all\nfeatures), doc tests, rustdoc, the no-std and aarch64 `io-uring-raw`\nchecks, the tools and the i686 lib tests pass on Linux; clippy, nextest,\ndoc tests and the sst-dump tests pass on Windows. On a Linux runner,\ncold multi-gets of 8 and 64 keys on `IoUringFs` against main, p50: blob\ntree 0.74 / 5.38 ms to 0.20 / 0.64 ms, columnar table 1.00 / 8.0 ms to\n0.56 / 3.93 ms, merges over bases 2.96 / 23.6 ms to 1.99 / 14.0 ms; p99\nand p999 drop with them.\n\nCloses #921\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Batched multi-key reads now handle separated values, merge results,\nand supported special table formats more efficiently, with shared reads\nfor data used by multiple keys.\n* Blob-value scans can read groups of values together. If a read-ahead\nfails, values remain available through individual reads.\n  * Linux `io_uring` reads can process multiple requests in batches.\n* **Reliability**\n* Multi-key reads continue to return results or errors consistently when\nencountering damaged data, short reads, or transient read failures.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-23T14:13:49Z",
+          "tree_id": "85e7c7665b9eea6b21b8892a86d19222102cacf9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2a88f9011a4908801b8fd56ef97b931b2c42a216"
+        },
+        "date": 1792766644857,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 504.88300000000004,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.092223ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 152.239,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.093583ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 453.83799999999997,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 105.693166ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5873.475,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9769.643999999998,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.383,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 68.354047,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.564794418,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.647,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 71.630847,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.560381435,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
