@@ -1446,6 +1446,10 @@ mod linux_caps {
     /// 32-bit Linux: `punch_hole` is unsupported there, so no hole can exist to
     /// attribute; "cannot tell" is the truthful answer.
     #[cfg(not(target_pointer_width = "64"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature of the 64-bit probe the same caller uses"
+    )]
     pub(super) fn extent_is_hole(
         _path: &Path,
         _offset: u64,
@@ -1456,6 +1460,10 @@ mod linux_caps {
 
     /// 32-bit Linux: as [`extent_is_hole`] — no punch support, "cannot tell".
     #[cfg(not(target_pointer_width = "64"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature of the 64-bit probe the same caller uses"
+    )]
     pub(super) fn extent_contains_hole(
         _path: &Path,
         _offset: u64,

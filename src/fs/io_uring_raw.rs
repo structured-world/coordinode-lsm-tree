@@ -450,7 +450,10 @@ unsafe fn mmap(
     let (nr, off) = (Sysno::mmap, offset as usize);
     #[cfg(target_pointer_width = "32")]
     let (nr, off) = {
-        debug_assert!(offset % 4096 == 0, "mmap2 offset is in 4096-byte units");
+        debug_assert!(
+            offset.is_multiple_of(4096),
+            "mmap2 offset is in 4096-byte units"
+        );
         (Sysno::mmap2, (offset / 4096) as usize)
     };
     // SAFETY: forwarded to the kernel. The raw `mmap` syscall returns `-errno`
@@ -1365,6 +1368,13 @@ const _: () = {
     target_arch = "loongarch64",
     target_arch = "s390x"
 ))]
+#[cfg_attr(
+    target_pointer_width = "32",
+    expect(
+        clippy::unnecessary_cast,
+        reason = "libc::Ioctl is u32 on a 32-bit target and u64 on a 64-bit one"
+    )
+)]
 const _: () = {
     assert!(FICLONE == libc::FICLONE as u32);
     assert!(FS_IOC_GETFLAGS == libc::FS_IOC_GETFLAGS as u32);
