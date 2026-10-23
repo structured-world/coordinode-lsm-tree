@@ -21,6 +21,7 @@
 //! | `tree_8_tables` | `tree.iter` over the same rows in 8 overlapping tables |
 //! | `tree_32_tables` | the same in 32 overlapping tables |
 //! | `tree_3_versions` | `tree.iter` over one table holding 3 versions per key |
+//! | `short`, `short_8_tables` | 64 scans of 10 rows each from keys spread over one or 8 tables |
 //!
 //! Read the arms as differences: `tree` − `table` is the merge, version
 //! resolution and hand-out above a single table; `tree_8_tables` − `tree` is
@@ -121,39 +122,74 @@ fn build(n: u64, tables: u64, versions: u64) -> (TempDir, AnyTree) {
     (dir, tree)
 }
 
+/// What an arm reads.
+#[derive(Clone, Copy)]
+enum Read {
+    /// `tree.iter`, every value handed out.
+    Tree,
+    /// The first table's own reader.
+    Table,
+    /// [`SHORT_SCANS`] scans of [`SHORT_ROWS`] rows each, from keys spread
+    /// over the tree: what building a scan costs next to reading it.
+    Short,
+}
+
+/// Short scans per [`Read::Short`] pass.
+const SHORT_SCANS: u64 = 64;
+/// Rows each short scan reads.
+const SHORT_ROWS: usize = 10;
+
 /// One scan arm over its own tree.
 struct Arm {
     label: &'static str,
     _dir: TempDir,
     tree: AnyTree,
-    reads_table: bool,
+    read: Read,
+    n: u64,
 }
 
 impl Arm {
-    fn new(label: &'static str, n: u64, tables: u64, versions: u64, reads_table: bool) -> Self {
+    fn new(label: &'static str, n: u64, tables: u64, versions: u64, read: Read) -> Self {
         let (dir, tree) = build(n, tables, versions);
         Self {
             label,
             _dir: dir,
             tree,
-            reads_table,
+            read,
+            n,
         }
     }
 
-    /// One full scan; returns the rows it handed out.
+    /// One pass of the arm's reads; returns the rows it handed out.
     fn scan(&self) -> u64 {
         let mut rows = 0;
-        if self.reads_table {
-            let version = self.tree.current_version();
-            let table = version.iter_tables().next().expect("one table");
-            for item in table.iter() {
-                black_box(item.expect("table row"));
-                rows += 1;
+        match self.read {
+            Read::Table => {
+                let version = self.tree.current_version();
+                let table = version.iter_tables().next().expect("one table");
+                for item in table.iter() {
+                    black_box(item.expect("table row"));
+                    rows += 1;
+                }
             }
-        } else {
-            for guard in self.tree.iter(MAX_SEQNO, None) {
-                black_box(guard.value().expect("scan value"));
-                rows += 1;
+            Read::Tree => {
+                for guard in self.tree.iter(MAX_SEQNO, None) {
+                    black_box(guard.value().expect("scan value"));
+                    rows += 1;
+                }
+            }
+            Read::Short => {
+                for start in 0..SHORT_SCANS {
+                    let from = key_for(start * (self.n / SHORT_SCANS));
+                    for guard in self
+                        .tree
+                        .range(from.as_slice().., MAX_SEQNO, None)
+                        .take(SHORT_ROWS)
+                    {
+                        black_box(guard.value().expect("scan value"));
+                        rows += 1;
+                    }
+                }
             }
         }
         rows
@@ -172,11 +208,13 @@ impl Arm {
 
 fn arms(n: u64) -> Vec<Arm> {
     vec![
-        Arm::new("tree", n, 1, 1, false),
-        Arm::new("table", n, 1, 1, true),
-        Arm::new("tree_8_tables", n, 8, 1, false),
-        Arm::new("tree_32_tables", n, 32, 1, false),
-        Arm::new("tree_3_versions", n, 1, 3, false),
+        Arm::new("tree", n, 1, 1, Read::Tree),
+        Arm::new("table", n, 1, 1, Read::Table),
+        Arm::new("tree_8_tables", n, 8, 1, Read::Tree),
+        Arm::new("tree_32_tables", n, 32, 1, Read::Tree),
+        Arm::new("tree_3_versions", n, 1, 3, Read::Tree),
+        Arm::new("short", n, 1, 1, Read::Short),
+        Arm::new("short_8_tables", n, 8, 1, Read::Short),
     ]
 }
 
