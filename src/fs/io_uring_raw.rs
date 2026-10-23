@@ -225,6 +225,7 @@ mod errno {
     pub(super) const EPERM: i32 = 1;
     pub(super) const ENOENT: i32 = 2;
     pub(super) const EINTR: i32 = 4;
+    pub(super) const ENXIO: i32 = 6;
     pub(super) const EBADF: i32 = 9;
     pub(super) const EAGAIN: i32 = 11;
     pub(super) const EBUSY: i32 = 16;
@@ -235,6 +236,7 @@ mod errno {
     pub(super) const EINVAL: i32 = 22;
     pub(super) const ENFILE: i32 = 23;
     pub(super) const EMFILE: i32 = 24;
+    pub(super) const ENOTTY: i32 = 25;
     pub(super) const ENOSPC: i32 = 28;
     pub(super) const EROFS: i32 = 30;
     pub(super) const EPIPE: i32 = 32;
@@ -707,9 +709,14 @@ pub fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
 /// # Errors
 /// Returns an [`Error`] if the `lseek` syscall fails.
 pub fn lseek_raw(fd: i32, offset: i64, whence: i32) -> Result<u64, Error> {
+    lseek_errno(fd, offset, whence).map_err(|e| err("lseek", e))
+}
+
+/// [`lseek_raw`], handing back the raw `errno` for a caller that tells
+/// failures apart (the hole probes read `ENXIO` as an answer).
+fn lseek_errno(fd: i32, offset: i64, whence: i32) -> Result<u64, Errno> {
     // SAFETY: `fd` is an owned descriptor; offset/whence are plain values.
-    let pos = unsafe { syscall3(Sysno::lseek, fd as usize, offset as usize, whence as usize) }
-        .map_err(|e| err("lseek", e))?;
+    let pos = unsafe { syscall3(Sysno::lseek, fd as usize, offset as usize, whence as usize) }?;
     Ok(pos as u64)
 }
 
@@ -935,6 +942,23 @@ pub fn renameat2_raw(from: &core::ffi::CStr, to: &core::ffi::CStr) -> Result<(),
 /// # Errors
 /// Returns an [`Error`] if `statx` fails for a reason other than `ENOENT`.
 pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Error> {
+    Ok(statx_at(path)?.map(|buf| {
+        let kind = buf.stx_mode & S_IFMT;
+        RawMetadata {
+            size: buf.stx_size,
+            nlink: u64::from(buf.stx_nlink),
+            is_dir: kind == S_IFDIR,
+            is_file: kind == S_IFREG,
+        }
+    }))
+}
+
+/// The whole `statx` of a path (following symlinks), or [`None`] if the path
+/// does not exist (`ENOENT`).
+///
+/// # Errors
+/// Returns an [`Error`] if `statx` fails for a reason other than `ENOENT`.
+fn statx_at(path: &core::ffi::CStr) -> Result<Option<Statx>, Error> {
     let mut buf = Statx::default();
     // SAFETY: `path` is a valid NUL-terminated C string; `buf` is a valid,
     // writable Statx the kernel fills.
@@ -949,17 +973,9 @@ pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Err
         )
     };
     match r {
-        Ok(_) => {
-            let kind = buf.stx_mode & S_IFMT;
-            Ok(Some(RawMetadata {
-                size: buf.stx_size,
-                nlink: u64::from(buf.stx_nlink),
-                is_dir: kind == S_IFDIR,
-                is_file: kind == S_IFREG,
-            }))
-        }
-        // ENOENT (2): the path does not exist — a normal "not found" answer.
-        Err(e) if e.into_raw() == 2 => Ok(None),
+        Ok(_) => Ok(Some(buf)),
+        // The path does not exist: a normal "not found" answer.
+        Err(e) if e.into_raw() == errno::ENOENT => Ok(None),
         Err(e) => Err(err("statx", e)),
     }
 }
@@ -1088,6 +1104,427 @@ pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
     // fundamental block size. Saturate so an implausible value can never wrap.
     let frsize = buf.f_frsize as u64;
     Ok(buf.f_bavail.saturating_mul(frsize))
+}
+
+/// The `f_type` magic of the file system backing `path`, from `statfs(path,
+/// &buf)`. x86-64 / aarch64 only (see [`Statfs`]).
+///
+/// # Errors
+/// Returns an [`Error`] if the `statfs` syscall fails.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn statfs_type_raw(path: &core::ffi::CStr) -> Result<i64, Error> {
+    let mut buf = Statfs::default();
+    // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
+    // `buf` is a valid, writable Statfs the kernel fills on success.
+    unsafe { syscall2(Sysno::statfs, path.as_ptr() as usize, &raw mut buf as usize) }
+        .map_err(|e| err("statfs", e))?;
+    Ok(buf.f_type)
+}
+
+// ---- File system capability syscalls ----
+//
+// The operations `StdFs` reaches through libc on Linux, issued here as plain
+// syscalls with the same semantics: the same flags, the same errno read as an
+// answer or as "cannot tell". The constants are the kernel uapi values; those
+// libc also defines are checked against it as the crate builds.
+
+/// `statx` mask bit: `stx_blocks` was filled.
+const STATX_BLOCKS: u32 = 0x0000_0400;
+/// `fallocate` mode bits: keep the file size, deallocate the range.
+#[cfg(target_pointer_width = "64")]
+const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+#[cfg(target_pointer_width = "64")]
+const FALLOC_FL_PUNCH_HOLE: i32 = 0x02;
+/// `lseek` whences: the next byte backed by data, the next hole.
+#[cfg(target_pointer_width = "64")]
+const SEEK_DATA: i32 = 3;
+#[cfg(target_pointer_width = "64")]
+const SEEK_HOLE: i32 = 4;
+/// `linkat` flags: do not follow a symlink at the source, as `link(2)`.
+const LINKAT_NO_FOLLOW: usize = 0;
+
+/// `posix_fadvise` advice values. `POSIX_FADV_DONTNEED` is 6 on s390x, 4
+/// elsewhere.
+#[cfg(target_pointer_width = "64")]
+const POSIX_FADV_NORMAL: usize = 0;
+#[cfg(target_pointer_width = "64")]
+const POSIX_FADV_RANDOM: usize = 1;
+#[cfg(target_pointer_width = "64")]
+const POSIX_FADV_SEQUENTIAL: usize = 2;
+#[cfg(all(target_pointer_width = "64", not(target_arch = "s390x")))]
+const POSIX_FADV_DONTNEED: usize = 4;
+#[cfg(all(target_pointer_width = "64", target_arch = "s390x"))]
+const POSIX_FADV_DONTNEED: usize = 6;
+
+/// An `ioctl` request in the asm-generic encoding (direction in bits 30-31,
+/// argument size in bits 16-29, type, number), which these architectures use;
+/// powerpc, mips and sparc lay the bits out otherwise and keep the trait
+/// defaults.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const fn ioctl_request(direction: u32, kind: u8, number: u8, size: usize) -> u32 {
+    (direction << 30) | ((size as u32) << 16) | ((kind as u32) << 8) | number as u32
+}
+
+/// `FICLONE` (`_IOW(0x94, 9, int)`): clone the source descriptor's blocks into
+/// the target.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const FICLONE: u32 = ioctl_request(1, 0x94, 9, core::mem::size_of::<i32>());
+/// `FS_IOC_GETFLAGS` / `FS_IOC_SETFLAGS` (`_IOR` / `_IOW('f', 1|2, long)`):
+/// the request carries the target's `long` width, though the kernel moves an
+/// `int`.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const FS_IOC_GETFLAGS: u32 = ioctl_request(2, b'f', 1, core::mem::size_of::<core::ffi::c_long>());
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const FS_IOC_SETFLAGS: u32 = ioctl_request(1, b'f', 2, core::mem::size_of::<core::ffi::c_long>());
+/// The inode flag that turns per-file copy-on-write off.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const FS_NOCOW_FL: i32 = 0x0080_0000;
+
+// The values above that the C library also defines match it on the target,
+// checked as it builds, as the open flags are: a comparison of constants,
+// nothing of the C library is linked.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(FALLOC_FL_KEEP_SIZE == libc::FALLOC_FL_KEEP_SIZE);
+    assert!(FALLOC_FL_PUNCH_HOLE == libc::FALLOC_FL_PUNCH_HOLE);
+    assert!(SEEK_DATA == libc::SEEK_DATA);
+    assert!(SEEK_HOLE == libc::SEEK_HOLE);
+    assert!(POSIX_FADV_NORMAL == libc::POSIX_FADV_NORMAL as usize);
+    assert!(POSIX_FADV_RANDOM == libc::POSIX_FADV_RANDOM as usize);
+    assert!(POSIX_FADV_SEQUENTIAL == libc::POSIX_FADV_SEQUENTIAL as usize);
+    assert!(POSIX_FADV_DONTNEED == libc::POSIX_FADV_DONTNEED as usize);
+};
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+const _: () = {
+    assert!(FICLONE == libc::FICLONE as u32);
+    assert!(FS_IOC_GETFLAGS == libc::FS_IOC_GETFLAGS as u32);
+    assert!(FS_IOC_SETFLAGS == libc::FS_IOC_SETFLAGS as u32);
+};
+
+/// A descriptor opened for one probe, closed when the probe is over.
+struct ProbeFd(i32);
+
+impl ProbeFd {
+    /// `path` opened with `flags`.
+    fn open(path: &core::ffi::CStr, flags: i32) -> Result<Self, Error> {
+        open_raw(path, flags, 0).map(Self)
+    }
+}
+
+impl Drop for ProbeFd {
+    fn drop(&mut self) {
+        // Best-effort: nothing was written through it.
+        let _ = close_raw(self.0);
+    }
+}
+
+/// The `st_dev` the C library builds from a `statx` device pair, as `std`
+/// reports it: two paths on one mount share it.
+fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32)
+        | ((major & 0x0000_0fff) << 8)
+        | ((minor & 0xffff_ff00) << 12)
+        | (minor & 0x0000_00ff)
+}
+
+/// A byte range as the `off_t` pair a syscall takes, and its end.
+///
+/// # Errors
+/// The offset or the length exceeds `i64::MAX`, or the end overflows: no real
+/// file extent.
+#[cfg(target_pointer_width = "64")]
+fn extent(offset: u64, len: u64) -> Result<(i64, i64, u64), Error> {
+    let (Ok(off), Ok(length), Some(end)) = (
+        i64::try_from(offset),
+        i64::try_from(len),
+        offset.checked_add(len),
+    ) else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "extent past the largest file offset",
+        ));
+    };
+    Ok((off, length, end))
+}
+
+/// `fallocate(PUNCH_HOLE | KEEP_SIZE)` over `[offset, offset + len)` of the
+/// file at `path`: the blocks are freed, the length is kept, the range reads
+/// back as zeros. 64-bit targets only, where each argument is one register.
+///
+/// # Errors
+/// Returns an [`Error`] if the file does not open or `fallocate` fails (e.g.
+/// `EOPNOTSUPP` on a file system that cannot punch).
+#[cfg(target_pointer_width = "64")]
+fn punch_hole_raw(path: &core::ffi::CStr, offset: u64, len: u64) -> Result<(), Error> {
+    let (off, length, _) = extent(offset, len)?;
+    let fd = ProbeFd::open(path, O_WRONLY)?;
+    // SAFETY: `fd` is a descriptor this call owns; mode and range are plain
+    // values the kernel checks.
+    unsafe {
+        syscall4(
+            Sysno::fallocate,
+            fd.0 as usize,
+            (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE) as usize,
+            off as usize,
+            length as usize,
+        )
+    }
+    .map_err(|e| err("fallocate", e))?;
+    Ok(())
+}
+
+/// Whether `[offset, offset + len)` of the file at `path` is entirely a hole:
+/// `lseek(SEEK_DATA)` finds the next byte backed by data, and the range is a
+/// hole when that lies at or past its end. `ENXIO` (no data follows) is a hole
+/// to the end of the file; a file system without `SEEK_DATA` cannot answer.
+///
+/// # Errors
+/// Returns an [`Error`] if the file does not open or `lseek` fails otherwise.
+#[cfg(target_pointer_width = "64")]
+fn extent_is_hole_raw(
+    path: &core::ffi::CStr,
+    offset: u64,
+    len: u64,
+) -> Result<Option<bool>, Error> {
+    if len == 0 {
+        return Ok(Some(false));
+    }
+    let (off, _, end) = extent(offset, len)?;
+    let fd = ProbeFd::open(path, O_RDONLY)?;
+    match lseek_errno(fd.0, off, SEEK_DATA) {
+        Ok(next_data) => Ok(Some(next_data >= end)),
+        Err(e) if e.into_raw() == errno::ENXIO => Ok(Some(true)),
+        Err(e) if matches!(e.into_raw(), errno::EINVAL | errno::EOPNOTSUPP) => Ok(None),
+        Err(e) => Err(err("lseek(SEEK_DATA)", e)),
+    }
+}
+
+/// Whether `[offset, offset + len)` of the file at `path` contains a hole:
+/// `lseek(SEEK_HOLE)` finds the next hole, and one before the range end proves
+/// it. The hole every file ends in is excluded by clamping the end to the file
+/// length; `ENXIO` (offset at or past the end) holds no byte of the file.
+///
+/// # Errors
+/// Returns an [`Error`] if the file does not open or a syscall fails otherwise.
+#[cfg(target_pointer_width = "64")]
+fn extent_contains_hole_raw(
+    path: &core::ffi::CStr,
+    offset: u64,
+    len: u64,
+) -> Result<Option<bool>, Error> {
+    if len == 0 {
+        return Ok(Some(false));
+    }
+    let (off, _, end) = extent(offset, len)?;
+    let fd = ProbeFd::open(path, O_RDONLY)?;
+    let file_len = fstat_raw(fd.0)?.size;
+    match lseek_errno(fd.0, off, SEEK_HOLE) {
+        Ok(next_hole) => Ok(Some(next_hole < end.min(file_len))),
+        Err(e) if e.into_raw() == errno::ENXIO => Ok(Some(false)),
+        Err(e) if matches!(e.into_raw(), errno::EINVAL | errno::EOPNOTSUPP) => Ok(None),
+        Err(e) => Err(err("lseek(SEEK_HOLE)", e)),
+    }
+}
+
+/// `linkat(AT_FDCWD, src, AT_FDCWD, dst, 0)`: `dst` becomes a second name of
+/// the inode `src` names. A link across mounts fails with `EXDEV`, reported as
+/// [`ErrorKind::CrossesDevices`].
+///
+/// # Errors
+/// Returns an [`Error`] if `linkat` fails.
+fn linkat_raw(src: &core::ffi::CStr, dst: &core::ffi::CStr) -> Result<(), Error> {
+    // SAFETY: both paths are valid NUL-terminated C strings the kernel reads.
+    unsafe {
+        syscall5(
+            Sysno::linkat,
+            AT_FDCWD as usize,
+            src.as_ptr() as usize,
+            AT_FDCWD as usize,
+            dst.as_ptr() as usize,
+            LINKAT_NO_FOLLOW,
+        )
+    }
+    .map_err(|e| err("linkat", e))?;
+    Ok(())
+}
+
+/// `ioctl(dst, FICLONE, src)` on a `dst` created for it: the clone shares the
+/// source's blocks copy-on-write. Ok(Err(errno)) when the clone is refused,
+/// with the empty `dst` removed, so the caller can tell a file system that
+/// cannot clone (and copy instead) from a genuine failure.
+///
+/// # Errors
+/// Returns an [`Error`] if `src` does not open or `dst` cannot be created.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+fn ficlone_raw(src: &core::ffi::CStr, dst: &core::ffi::CStr) -> Result<Result<(), Errno>, Error> {
+    let source = ProbeFd::open(src, O_RDONLY)?;
+    let target = ProbeFd(open_raw(dst, O_WRONLY | O_CREAT | O_EXCL, 0o644)?);
+    // SAFETY: both descriptors are owned for the call; FICLONE takes the
+    // source descriptor as its argument.
+    let cloned = unsafe {
+        syscall3(
+            Sysno::ioctl,
+            target.0 as usize,
+            FICLONE as usize,
+            source.0 as usize,
+        )
+    };
+    if let Err(e) = cloned {
+        drop(target);
+        // The empty target goes, so a copy in its place can create it again.
+        let _ = unlinkat_raw(dst, false);
+        return Ok(Err(e));
+    }
+    Ok(Ok(()))
+}
+
+/// Turns per-file copy-on-write off for the file at `path` (`FS_NOCOW_FL`
+/// through `FS_IOC_SETFLAGS`). A file system without the inode-flags ioctl, or
+/// without the flag, leaves it as it is: an optimization, never a requirement.
+///
+/// # Errors
+/// Returns an [`Error`] if the file does not open or the ioctl fails for
+/// another reason.
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm",
+    target_arch = "aarch64",
+    target_arch = "riscv32",
+    target_arch = "riscv64",
+    target_arch = "loongarch64",
+    target_arch = "s390x"
+))]
+fn disable_cow_raw(path: &core::ffi::CStr) -> Result<(), Error> {
+    /// A refusal that means "not applicable here".
+    fn not_applicable(e: Errno) -> bool {
+        matches!(
+            e.into_raw(),
+            errno::ENOTTY | errno::EOPNOTSUPP | errno::EINVAL
+        )
+    }
+    let fd = ProbeFd::open(path, O_RDWR)?;
+    let mut flags: i32 = 0;
+    // SAFETY: `fd` is owned for the call; GETFLAGS writes one `int` through
+    // the pointer, which outlives the call.
+    let got = unsafe {
+        syscall3(
+            Sysno::ioctl,
+            fd.0 as usize,
+            FS_IOC_GETFLAGS as usize,
+            (&raw mut flags) as usize,
+        )
+    };
+    match got {
+        Ok(_) => {}
+        Err(e) if not_applicable(e) => return Ok(()),
+        Err(e) => return Err(err("ioctl(FS_IOC_GETFLAGS)", e)),
+    }
+    if flags & FS_NOCOW_FL != 0 {
+        return Ok(());
+    }
+    flags |= FS_NOCOW_FL;
+    // SAFETY: as above; SETFLAGS reads one `int` through the pointer.
+    let set = unsafe {
+        syscall3(
+            Sysno::ioctl,
+            fd.0 as usize,
+            FS_IOC_SETFLAGS as usize,
+            (&raw const flags) as usize,
+        )
+    };
+    match set {
+        Ok(_) => Ok(()),
+        Err(e) if not_applicable(e) => Ok(()),
+        Err(e) => Err(err("ioctl(FS_IOC_SETFLAGS)", e)),
+    }
+}
+
+/// `fadvise64(fd, 0, 0, advice)`: access advice for the whole file. Advice the
+/// kernel does not know (`EINVAL`) is advisory and dropped, as `StdFs` drops
+/// it. 64-bit targets only, where each argument is one register.
+///
+/// # Errors
+/// Returns an [`Error`] if `fadvise64` refuses the descriptor (a pipe).
+#[cfg(target_pointer_width = "64")]
+fn fadvise_raw(fd: i32, hint: super::FileHint) -> Result<(), Error> {
+    let advice = match hint {
+        super::FileHint::Default => POSIX_FADV_NORMAL,
+        super::FileHint::Sequential => POSIX_FADV_SEQUENTIAL,
+        super::FileHint::Random => POSIX_FADV_RANDOM,
+        super::FileHint::WriteOnce => POSIX_FADV_DONTNEED,
+    };
+    // SAFETY: `fd` is a descriptor the caller owns; the range and the advice
+    // are plain values.
+    match unsafe { syscall4(Sysno::fadvise64, fd as usize, 0, 0, advice) } {
+        Ok(_) => Ok(()),
+        Err(e) if e.into_raw() == errno::EINVAL => Ok(()),
+        Err(e) => Err(err("fadvise64", e)),
+    }
 }
 
 // SAFETY: `IoUringRaw`'s raw pointers address `mmap` regions it owns for its
@@ -1300,6 +1737,12 @@ impl FsFile for IoUringRawFile {
 
     fn set_write_lifetime(&self, lifetime: super::WriteLifetime) -> crate::io::Result<()> {
         set_write_lifetime_raw(self.fd, lifetime)
+    }
+
+    // 32-bit targets keep the no-op default, as for `start_writeback`.
+    #[cfg(target_pointer_width = "64")]
+    fn hint(&self, hint: super::FileHint) -> crate::io::Result<()> {
+        fadvise_raw(self.fd, hint)
     }
 }
 
@@ -1799,6 +2242,124 @@ impl Fs for IoUringRawFs {
 
     fn exists(&self, path: &Path) -> crate::io::Result<bool> {
         Ok(statx_path_raw(&path_to_cstring(path)?)?.is_some())
+    }
+
+    // The file system's capabilities, and the operations they gate, answer as
+    // `StdFs` answers them on Linux: the same syscalls, issued directly.
+
+    fn hard_link(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
+        linkat_raw(&path_to_cstring(src)?, &path_to_cstring(dst)?)
+    }
+
+    // Paths resolve through the host kernel, as through `StdFs`, so a
+    // checkpoint links across the two instead of copying.
+    fn backend_id(&self) -> Option<u64> {
+        Some(super::KERNEL_BACKEND_ID)
+    }
+
+    // The mount's device, as `StdFs` reports it; a path that cannot be stat-ed
+    // proves no independence.
+    fn volume_id(&self, path: &Path) -> Option<u64> {
+        let stat = statx_at(&path_to_cstring(path).ok()?).ok()??;
+        Some(makedev(stat.stx_dev_major, stat.stx_dev_minor))
+    }
+
+    // x86-64 / aarch64 only, where the raw `statfs` layout is verified; other
+    // targets keep the conservative default.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn capabilities(&self, path: &Path) -> super::FsCapabilities {
+        path_to_cstring(path)
+            .and_then(|path| statfs_type_raw(&path))
+            .map_or_else(
+                |_| super::FsCapabilities::default(),
+                super::linux_fs_type_capabilities,
+            )
+    }
+
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    ))]
+    fn try_disable_cow(&self, path: &Path) -> crate::io::Result<()> {
+        disable_cow_raw(&path_to_cstring(path)?)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    fn punch_hole(&self, path: &Path, offset: u64, len: u64) -> crate::io::Result<()> {
+        punch_hole_raw(&path_to_cstring(path)?, offset, len)
+    }
+
+    // A file system that cannot clone (no reflink, another mount, a clone it
+    // rejects) gets the streamed copy, as through `StdFs`; any other failure
+    // is reported.
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "s390x"
+    ))]
+    fn reflink_file(&self, src: &Path, dst: &Path) -> crate::io::Result<()> {
+        match ficlone_raw(&path_to_cstring(src)?, &path_to_cstring(dst)?)? {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.into_raw(),
+                    errno::EOPNOTSUPP | errno::EXDEV | errno::EINVAL
+                ) =>
+            {
+                super::copy_file_streamed(self, src, dst)
+            }
+            Err(e) => Err(err("ioctl(FICLONE)", e)),
+        }
+    }
+
+    fn hard_link_count(&self, path: &Path) -> crate::io::Result<u64> {
+        statx_path_raw(&path_to_cstring(path)?)?
+            .map(|stat| stat.nlink)
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "path not found"))
+    }
+
+    // A stat failure is an error, never "cannot tell": repair reads `None` as
+    // an unpunched file.
+    fn allocated_size(&self, path: &Path) -> crate::io::Result<Option<u64>> {
+        let stat = statx_at(&path_to_cstring(path)?)?
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "path not found"))?;
+        if stat.stx_mask & STATX_BLOCKS == 0 {
+            return Ok(None);
+        }
+        // `stx_blocks` counts 512-byte units; a file's blocks stay far below
+        // `u64::MAX / 512`.
+        Ok(Some(stat.stx_blocks * 512))
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    fn extent_is_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        extent_is_hole_raw(&path_to_cstring(path)?, offset, len)
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    fn extent_contains_hole(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> crate::io::Result<Option<bool>> {
+        extent_contains_hole_raw(&path_to_cstring(path)?, offset, len)
     }
 }
 

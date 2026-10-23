@@ -1892,6 +1892,53 @@ pub(crate) fn statvfs_available_space(path: &Path) -> std::io::Result<u64> {
     Ok(bavail.saturating_mul(frsize))
 }
 
+/// The [`Fs::backend_id`] of every backend that resolves paths against the host
+/// kernel's file system table: `StdFs` and the `io_uring` backends. Two such
+/// backends can hard-link across instances because both resolve their paths
+/// through the same kernel namespace.
+pub(crate) const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
+
+/// The capabilities of a Linux file system by its `statfs(2)` `f_type` magic,
+/// shared by every backend that reads it. Btrfs / ZFS get the full profile;
+/// XFS gets copy-on-write plus reflink (reflink is only present on
+/// `reflink=1` volumes, which a clone handles by falling back to a copy).
+/// `fallocate(PUNCH_HOLE)` is supported by every common local file system
+/// (ext4 / xfs / btrfs / zfs / tmpfs); unknown and network mounts get the
+/// conservative default, so a runtime `EOPNOTSUPP` never surprises the
+/// tight-space compaction gate.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_fs_type_capabilities(f_type: i64) -> FsCapabilities {
+    // statfs f_type magic numbers (stable kernel ABI, arch-independent).
+    const BTRFS: i64 = 0x9123_683E;
+    const ZFS: i64 = 0x2FC1_2FC1;
+    const XFS: i64 = 0x5846_5342;
+    const EXT_FAMILY: i64 = 0x0000_EF53; // ext2/3/4 share this magic
+    const TMPFS: i64 = 0x0102_1994;
+
+    match f_type {
+        BTRFS | ZFS => FsCapabilities {
+            per_block_integrity_on_read: true,
+            background_scrub: true,
+            copy_on_write: true,
+            reflink: true,
+            native_snapshot: true,
+            punch_hole: true,
+            ..FsCapabilities::default()
+        },
+        XFS => FsCapabilities {
+            copy_on_write: true,
+            reflink: true,
+            punch_hole: true,
+            ..FsCapabilities::default()
+        },
+        EXT_FAMILY | TMPFS => FsCapabilities {
+            punch_hole: true,
+            ..FsCapabilities::default()
+        },
+        _ => FsCapabilities::default(),
+    }
+}
+
 /// The device id (`st_dev`) of the mount backing `path`, the
 /// [`Fs::volume_id`] basis for the std and `io_uring` (libc) backends. Two
 /// paths on the same mount share `st_dev` (one free-space pool); different
