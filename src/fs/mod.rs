@@ -1907,7 +1907,19 @@ pub(crate) const KERNEL_BACKEND_ID: u64 = 0x4b45_524e_454c_5f46; // "KERNEL_F"
 /// (ext4 / xfs / btrfs / zfs / tmpfs); unknown and network mounts get the
 /// conservative default, so a runtime `EOPNOTSUPP` never surprises the
 /// tight-space compaction gate.
-#[cfg(target_os = "linux")]
+///
+/// Built where a backend reads `f_type`: 64-bit `StdFs`, and the raw backend
+/// on the targets whose `statfs` layout it declares.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        all(feature = "std", target_pointer_width = "64"),
+        all(
+            feature = "io-uring-raw",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
+))]
 pub(crate) fn linux_fs_type_capabilities(f_type: i64) -> FsCapabilities {
     // statfs f_type magic numbers (stable kernel ABI, arch-independent).
     const BTRFS: i64 = 0x9123_683E;

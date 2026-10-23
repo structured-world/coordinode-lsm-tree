@@ -917,8 +917,8 @@ fn raw_range_syscalls_refuse_what_the_std_backend_refuses() {
             std_fs.extent_contains_hole(file, offset, len),
         ];
         for (raw, std) in raw.iter().zip(&std) {
-            assert_eq!(raw.as_ref().map_err(|e| e.kind()), Err(&kind), "{what}");
-            assert_eq!(std.as_ref().map_err(|e| e.kind()), Err(&kind), "{what}");
+            assert_eq!(raw.as_ref().err().map(Error::kind), Some(kind), "{what}");
+            assert_eq!(std.as_ref().err().map(Error::kind), Some(kind), "{what}");
         }
     }
 }
