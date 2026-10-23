@@ -494,6 +494,55 @@ fn cmp_fuzz_3() {
     assert!(a != b);
 }
 
+/// Views order exactly as their bytes do, whatever their lengths: inline ones
+/// of every length up to 5 over bytes that include zero (the byte a shorter
+/// view's prefix pads with), heap ones, sub-views cut out of a heap view, and
+/// keys rebuilt from two pieces.
+#[test]
+fn views_order_as_their_bytes_do() {
+    let mut keys: Vec<Vec<u8>> = vec![Vec::new()];
+    for _ in 0..5 {
+        let longer: Vec<Vec<u8>> = keys
+            .iter()
+            .filter(|k| k.len() == keys.last().map_or(0, Vec::len))
+            .flat_map(|k| {
+                [0u8, 1, 255].into_iter().map(move |b| {
+                    let mut k = k.clone();
+                    k.push(b);
+                    k
+                })
+            })
+            .collect();
+        keys.extend(longer);
+    }
+    for tail in [&[0u8][..], &[1], &[255, 0]] {
+        for head in [&[0u8, 0, 0][..], &[0, 0, 0, 1], &[255; 4], &[1, 2, 3, 4, 5]] {
+            let mut long = vec![9u8; 24];
+            long[..head.len()].copy_from_slice(head);
+            long.extend_from_slice(tail);
+            keys.push(long);
+        }
+    }
+
+    let whole = ByteView::from([7u8; 40].as_slice());
+    let views: Vec<(Vec<u8>, ByteView)> = keys
+        .iter()
+        .map(|k| (k.clone(), ByteView::from(k.as_slice())))
+        .chain(keys.iter().map(|k| {
+            let (left, right) = k.split_at(k.len() / 2);
+            (k.clone(), ByteView::fused(left, right))
+        }))
+        .chain((0..40).map(|end| (vec![7u8; end], whole.slice(..end))))
+        .collect();
+
+    for (a_bytes, a) in &views {
+        for (b_bytes, b) in &views {
+            assert_eq!(a.cmp(b), a_bytes.cmp(b_bytes), "{a_bytes:?} vs {b_bytes:?}");
+            assert_eq!(a == b, a_bytes == b_bytes, "{a_bytes:?} vs {b_bytes:?}");
+        }
+    }
+}
+
 #[test]
 fn cmp_fuzz_4() {
     let a = ByteView::from([

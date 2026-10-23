@@ -76,6 +76,9 @@ struct MergerEntry {
 #[derive(Clone)]
 struct MinCmp<C: UserComparator + Clone> {
     comparator: C,
+    /// The comparator orders keys as their bytes do, so keys are compared
+    /// directly rather than through it.
+    lexicographic: bool,
 }
 
 impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> for MinCmp<C> {
@@ -87,10 +90,12 @@ impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> 
     )]
     #[inline(always)]
     fn compare(&self, a: &MergerEntry, b: &MergerEntry) -> Ordering {
-        a.value
-            .key
-            .compare_with(&b.value.key, &self.comparator)
-            .then_with(|| a.source.cmp(&b.source))
+        let keys = if self.lexicographic {
+            a.value.key.cmp(&b.value.key)
+        } else {
+            a.value.key.compare_with(&b.value.key, &self.comparator)
+        };
+        keys.then_with(|| a.source.cmp(&b.source))
     }
 }
 
@@ -104,6 +109,8 @@ impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> 
 #[derive(Clone)]
 struct MaxCmp<C: UserComparator + Clone> {
     comparator: C,
+    /// As [`MinCmp::lexicographic`].
+    lexicographic: bool,
 }
 
 impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> for MaxCmp<C> {
@@ -113,19 +120,29 @@ impl<C: UserComparator + Clone> crate::loser_tree::EntryComparator<MergerEntry> 
     )]
     #[inline(always)]
     fn compare(&self, a: &MergerEntry, b: &MergerEntry) -> Ordering {
-        b.value
-            .key
-            .compare_with(&a.value.key, &self.comparator)
-            .then_with(|| b.source.cmp(&a.source))
+        let keys = if self.lexicographic {
+            b.value.key.cmp(&a.value.key)
+        } else {
+            b.value.key.compare_with(&a.value.key, &self.comparator)
+        };
+        keys.then_with(|| b.source.cmp(&a.source))
     }
 }
 
 fn build_min_cmp<C: UserComparator + Clone>(comparator: C) -> MinCmp<C> {
-    MinCmp { comparator }
+    let lexicographic = comparator.is_lexicographic();
+    MinCmp {
+        comparator,
+        lexicographic,
+    }
 }
 
 fn build_max_cmp<C: UserComparator + Clone>(comparator: C) -> MaxCmp<C> {
-    MaxCmp { comparator }
+    let lexicographic = comparator.is_lexicographic();
+    MaxCmp {
+        comparator,
+        lexicographic,
+    }
 }
 
 /// The slot whose leaf is parked in `other` and now belongs to `active`, if it
