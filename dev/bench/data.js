@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792783034807,
+  "lastUpdate": 1792783038481,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -60124,6 +60124,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.560381435,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "14c82ede6daccbf951e4444a07dd47a14653e83e",
+          "message": "fix(fs): implement the capability methods of the raw io_uring backend (#980)\n\n## Summary\n\n- The raw-syscall `io_uring` backend (`io-uring-raw`) answers every\ncapability-dependent `Fs` / `FsFile` method as `StdFs` does on the same\nLinux files, through its own syscalls, instead of the trait defaults\nthat silently turned off tight-space reclaim, prefix punches, reflinked\nand hard-linked checkpoints and the space gate's volume split.\n- The raw backend works on 32-bit targets: it maps its ring, sets\nlengths and seeks with the 64-bit syscall forms and opens with\n`O_LARGEFILE` there.\n- `StdFs` takes `FS_IOC_GETFLAGS` / `FS_IOC_SETFLAGS` from libc, which\nencodes the target's `long` width, and turns copy-on-write off on 32-bit\narm too.\n\n## Changes\n\n- `capabilities`: `statfs` `f_type` (x86-64 / aarch64, where the raw\n`statfs` layout is verified), mapped by the `f_type` table `StdFs` now\nshares from the `fs` module.\n- `punch_hole` (`fallocate` `PUNCH_HOLE | KEEP_SIZE`), `extent_is_hole`\n/ `extent_contains_hole` (`lseek` `SEEK_DATA` / `SEEK_HOLE`; `ENXIO`\nread as an answer, `EINVAL` / `EOPNOTSUPP` as \"cannot tell\"),\n`allocated_size` (`statx` `stx_blocks`; a missing file is an error, not\n\"cannot tell\").\n- `reflink_file` (`ioctl(FICLONE)`, falling back to the streamed copy\nwhere the file system cannot clone), `try_disable_cow`\n(`FS_IOC_SETFLAGS` `FS_NOCOW_FL`, a no-op where not applicable).\n- `hard_link` (`linkat`), `hard_link_count` by path (`statx` `nlink`),\n`backend_id` (the kernel namespace `StdFs` reports, now defined in the\n`fs` module for both), `volume_id` (the `statx` device, encoded as `std`\nencodes `st_dev`).\n- `FsFile::hint` (`fadvise64`).\n- The constants the C library also defines are checked against it at\nbuild time; nothing of the C library is linked.\n- `StdFs`'s hand-written `FS_IOC_*FLAGS` values carried a size of 8 on\nthe 32-bit targets too, where the kernel refused them; the libc values\ncarry 4 there.\n- 32-bit raw backend: the ring is mapped through `mmap2` (its `mmap`\ntakes a 32-bit offset, and on x86 reads its arguments through a pointer,\nso the ring never came up), lengths go through `ftruncate64` and seeks\nthrough `_llseek` as register pairs, and files open with `O_LARGEFILE`.\n\n## Testing\n\nFormat, clippy (default and all features), nextest (default and all\nfeatures), doc tests, rustdoc, the no-std and the armv7 / i686 / aarch64\n`io-uring-raw` checks, the tools, the i686 lib tests and the raw\nbackend's tests as a 32-bit x86 binary (also a CI step now) pass on\nLinux. Each raw method is compared with `StdFs` on the same files, and\nskips where the file system lacks the feature.\n\nCloses #924\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added filesystem support for hard links, reflinks, copy-on-write\ncontrols, hole punching, allocation-size reporting, and file-access\nhints where available.\n* Added filesystem capability reporting for common Linux filesystem\ntypes.\n* **Bug Fixes**\n* Improved raw filesystem operations on 32-bit Linux, including support\nfor large files and correct handling of file offsets and lengths.\n* Reflink requests now fall back to copying when the filesystem or file\nlocation does not support reflinks.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-23T21:55:12+03:00",
+          "tree_id": "5c9c3ab64259221f34710e489415d60c5d4f274f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/14c82ede6daccbf951e4444a07dd47a14653e83e"
+        },
+        "date": 1792783037363,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 500.866,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 84.525723ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 181.434,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.97193ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 477.272,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 102.307269ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4594.0019999999995,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 22284.52,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.623,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 80.543743,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.63897095,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 27.583,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 73.859071,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.603950354,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
