@@ -1,6 +1,7 @@
 use lsm_tree::{
-    AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter,
+    AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
     compaction::{CompactionAction, CompactionResult, Fifo, Leveled},
+    fs::{CrashFs, FaultFs, Fs, MemFs},
     get_tmp_folder,
 };
 use std::sync::Arc;
@@ -269,5 +270,227 @@ fn remove_range_reclaim_runs_before_the_strategy_chooses() -> lsm_tree::Result<(
     assert_eq!(0, result.work.measured.read, "a covered table was read");
     assert_eq!(1, tree.table_count(), "only the tombstone stays");
     assert_eq!(None, tree.get("k", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// The folder the crash tests put their tree in, spelled as `Config` spells it.
+fn crash_tree_path() -> std::path::PathBuf {
+    std::path::absolute("/db").expect("absolute path")
+}
+
+/// A tree in [`crash_tree_path`] on `fs`, KV-separated when `blobs`, so its
+/// values sit in a blob file a reclaim drops with their tables.
+fn open_on(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
+    let config = Config::new(
+        crash_tree_path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(fs));
+    if blobs {
+        config
+            .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+            .open()
+    } else {
+        config.open()
+    }
+}
+
+/// A tree on `fs` holding one table per key `a..=e` at seqnos 1 to 5 and the
+/// tombstone `[a, d)` at 6, all flushed and durable: the state a reclaim
+/// starts from.
+fn before_reclaim(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
+    let tree = open_on(fs, blobs)?;
+    for (seqno, key) in (1..).zip('a'..='e') {
+        tree.insert([key as u8], [b'v'; 64], seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    Ok(tree)
+}
+
+/// A crash simulator and a fault layer over it the tree runs on.
+fn crash_stack() -> (CrashFs, Arc<FaultFs<CrashFs>>) {
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    (crash, fault)
+}
+
+/// A power loss after any sync of a reclaim reopens into the version before
+/// it or the one after, never between: the dropped tables are all there or
+/// all gone, the deleted keys stay deleted and the others stay. A reclaim
+/// that returned is durable.
+#[test]
+fn remove_range_reclaim_survives_a_power_loss_at_every_sync() -> lsm_tree::Result<()> {
+    for blobs in [false, true] {
+        let (_, clean) = crash_stack();
+        let fs: Arc<dyn Fs> = clean.clone();
+        let tree = before_reclaim(&fs, blobs)?;
+        let before = tree.table_count();
+        let setup = clean.injector().take_syncs();
+        assert!(!setup.is_empty(), "self-check: the flushes before it sync");
+        reclaim(&tree, 7)?;
+        let after = tree.table_count();
+        let syncs = clean.injector().take_syncs().len();
+        assert!(syncs > 0, "self-check: the reclaim syncs");
+        assert_eq!(
+            before - 3,
+            after,
+            "self-check: the reclaim drops three tables"
+        );
+        drop(tree);
+
+        for kept in 0..=syncs {
+            let (crash, fault) = crash_stack();
+            let fs: Arc<dyn Fs> = fault.clone();
+            let tree = before_reclaim(&fs, blobs)?;
+            if kept < syncs {
+                fault.injector().power_off_after_syncs(kept);
+            }
+            let returned = reclaim(&tree, 7).is_ok();
+            drop(tree);
+            crash.crash();
+
+            let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+            let tree = open_on(&fs, blobs)?;
+            let count = tree.table_count();
+            assert!(
+                count == before || count == after,
+                "a version between: {count} tables after {kept} of {syncs} syncs (blobs: {blobs})"
+            );
+            if returned {
+                assert_eq!(after, count, "a reclaim that returned was lost");
+            }
+            for key in ["a", "b", "c"] {
+                assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+            }
+            for key in ["d", "e"] {
+                assert_eq!(
+                    Some([b'v'; 64].as_slice().into()),
+                    tree.get(key, SeqNo::MAX)?,
+                    "{key} was lost"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A tombstone lost from the memtable by a crash dropped no table: the
+/// tables are whole after the reopen, and replaying the deletion from the
+/// caller's log reaches the state the crash interrupted.
+#[test]
+fn remove_range_lost_before_its_flush_left_every_table() -> lsm_tree::Result<()> {
+    let (crash, fault) = crash_stack();
+    let fs: Arc<dyn Fs> = fault.clone();
+    let tree = open_on(&fs, false)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+    reclaim(&tree, 7)?;
+    drop(tree);
+    crash.crash();
+
+    let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+    let tree = open_on(&fs, false)?;
+    assert_eq!(5, tree.table_count());
+    assert!(
+        tree.contains_key("a", SeqNo::MAX)?,
+        "the tombstone was not durable"
+    );
+
+    // The caller's log replays the deletion at its seqno.
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, 7)?;
+    assert_eq!(3, tree.table_count());
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    assert!(tree.contains_key("d", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// A checkpoint taken before a reclaim links the tables the reclaim drops:
+/// the tree unlinks its own names, the checkpoint opens with the data.
+#[test]
+fn remove_range_reclaim_leaves_an_earlier_checkpoint_whole() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    let checkpoint = folder.path().join("checkpoint");
+    tree.create_checkpoint(&checkpoint)?;
+
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, 7)?;
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    drop(tree);
+
+    let restored = Config::new(
+        &checkpoint,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for key in ["a", "b", "c", "d", "e"] {
+        assert!(
+            restored.contains_key(key, SeqNo::MAX)?,
+            "{key} is missing from the checkpoint"
+        );
+    }
+    Ok(())
+}
+
+/// Appends each operand to the base.
+struct Concat;
+
+impl lsm_tree::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<lsm_tree::UserValue> {
+        let mut out = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            out.extend_from_slice(operand);
+        }
+        Ok(out.into())
+    }
+}
+
+/// Merge operands under a tombstone go with it: after the reclaim a new
+/// operand starts from nothing, neither from the dropped operand nor from
+/// the older one a table reaching past the tombstone keeps.
+#[test]
+fn remove_range_reclaim_keeps_merge_operands_deleted() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .open()?;
+    tree.merge("k", "old", 1);
+    tree.insert("z", "outside", 2);
+    tree.flush_active_memtable(0)?;
+    tree.merge("k", "new", 3);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("a", "m", 4);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 5)?;
+
+    assert_eq!(
+        1, result.tables_in,
+        "only the table of the newer operand goes"
+    );
+    assert_eq!(None, tree.get("k", SeqNo::MAX)?);
+    tree.merge("k", "w", 6);
+    assert_eq!(
+        Some("w".as_bytes().into()),
+        tree.get("k", SeqNo::MAX)?,
+        "a deleted operand became the base"
+    );
     Ok(())
 }

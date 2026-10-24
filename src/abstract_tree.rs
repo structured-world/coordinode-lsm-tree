@@ -2041,6 +2041,12 @@ pub trait AbstractTree: sealed::Sealed {
     /// to `seqno`: snapshots at or below the floor report
     /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention).
     ///
+    /// Nothing is rewritten only where the range ends at table boundaries,
+    /// which holds when keys arrive in the order of the range (a time series
+    /// expiring its oldest days); a range cutting through tables leaves their
+    /// survivors to the merge that rewrites them. The deletion covers this
+    /// tree only: a caller indexing these keys elsewhere removes them there.
+    ///
     /// To empty the whole tree, [`clear`](Self::clear) does it without a
     /// tombstone.
     ///

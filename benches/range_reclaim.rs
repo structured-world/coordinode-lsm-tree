@@ -6,8 +6,10 @@
 //! repeat one state:
 //! - `expire`: deleting the oldest day with a range tombstone, its flush and
 //!   the compaction run that follows, which unlinks the day's table;
-//! - `settle`: the same expiry followed by leveled compactions until they have
-//!   nothing left to do, with the bytes they read and wrote;
+//! - `rolling`: ten cycles of writing the next day and expiring the oldest,
+//!   each followed by leveled or size-tiered compactions until they have
+//!   nothing left to do, with the bytes they read and rewrote and how far the
+//!   disk grew;
 //! - `idle`: a compaction run that finds nothing to do, the cost every run
 //!   pays for the unlink check, on a tree of many tables;
 //! - `point_read`: reads that find their key on that tree, each checked
@@ -20,7 +22,7 @@
 
 use lsm_tree::{
     AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter,
-    compaction::{CompactionAction, Fifo, Leveled},
+    compaction::{CompactionAction, CompactionStrategy, Fifo, Leveled, SizeTiered},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,37 +114,52 @@ fn expire() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-fn settle() -> lsm_tree::Result<()> {
-    let leveled = Arc::new(Leveled::default());
+/// Rolling retention over `DAYS` emulated days: each cycle writes the next
+/// day, expires the oldest with a range tombstone and runs `strategy` until
+/// it has nothing left, so the tree keeps `DAYS` days throughout. Reports
+/// what the compactions read and wrote (the written bytes are the survivors
+/// they rewrote), and how far the disk grew past the settled start, at its
+/// peak and at the end.
+fn rolling(name: &str, strategy: &Arc<dyn CompactionStrategy>) -> lsm_tree::Result<()> {
+    const ROLLING_SAMPLES: usize = 3;
     let mut total = Vec::new();
-    let (mut read, mut written, mut runs, mut freed_bytes) = (0, 0, 0, 0);
-    for _ in 0..SAMPLES {
+    let (mut read, mut written, mut peak, mut end) = (0, 0, 0, 0);
+    for _ in 0..ROLLING_SAMPLES {
         let folder = tempfile::tempdir()?;
-        let (tree, seqno) = fill(&folder)?;
-        // Settle the fill itself first: only what an expiry causes is measured.
-        while tree.compact(leveled.clone(), seqno)?.action != CompactionAction::Nothing {}
-        let before = tree.disk_space();
+        let (tree, mut seqno) = fill(&folder)?;
+        // Settle the fill itself first: only what the expiries cause is measured.
+        while tree.compact(Arc::clone(strategy), seqno)?.action != CompactionAction::Nothing {}
+        let base = tree.disk_space();
+        let (mut sample_read, mut sample_written, mut sample_peak) = (0, 0, base);
         let start = Instant::now();
-        tree.remove_range(day_start(0), day_start(1), seqno);
-        tree.flush_active_memtable(0)?;
-        let (mut sample_read, mut sample_written, mut sample_runs) = (0, 0, 0);
-        loop {
-            let result = tree.compact(leveled.clone(), seqno + 1)?;
-            if result.action == CompactionAction::Nothing {
-                break;
+        for cycle in 0..DAYS {
+            for row in 0..ROWS_PER_DAY {
+                tree.insert(day_key(DAYS + cycle, row), [b'v'; 100], seqno);
+                seqno += 1;
             }
-            sample_read += result.work.measured.read;
-            sample_written += result.work.measured.written;
-            sample_runs += 1;
+            tree.flush_active_memtable(0)?;
+            tree.remove_range(day_start(cycle), day_start(cycle + 1), seqno);
+            seqno += 1;
+            tree.flush_active_memtable(0)?;
+            sample_peak = sample_peak.max(tree.disk_space());
+            loop {
+                let result = tree.compact(Arc::clone(strategy), seqno)?;
+                sample_peak = sample_peak.max(tree.disk_space());
+                if result.action == CompactionAction::Nothing {
+                    break;
+                }
+                sample_read += result.work.measured.read;
+                sample_written += result.work.measured.written;
+            }
         }
         total.push(start.elapsed());
         read = read.max(sample_read);
         written = written.max(sample_written);
-        runs = runs.max(sample_runs);
-        freed_bytes = freed(&tree, before);
+        peak = peak.max(sample_peak - base);
+        end = end.max(i128::from(tree.disk_space()) - i128::from(base));
     }
     println!(
-        "settle total {} runs_max={runs} read_max={read} written_max={written} freed={freed_bytes}",
+        "rolling({name}) total {} read_max={read} written_max={written} peak_growth={peak} end_growth={end}",
         percentiles(total),
     );
     Ok(())
@@ -245,6 +262,9 @@ fn point_reads(label: &str, tree: &AnyTree) -> lsm_tree::Result<()> {
 
 fn main() -> lsm_tree::Result<()> {
     expire()?;
-    settle()?;
+    let leveled: Arc<dyn CompactionStrategy> = Arc::new(Leveled::default());
+    rolling("leveled", &leveled)?;
+    let tiered: Arc<dyn CompactionStrategy> = Arc::new(SizeTiered::default());
+    rolling("size_tiered", &tiered)?;
     idle()
 }
