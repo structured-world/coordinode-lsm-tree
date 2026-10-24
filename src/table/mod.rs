@@ -11189,6 +11189,14 @@ impl Table {
         self.metadata.seqnos.1 + self.global_seqno()
     }
 
+    /// The lowest effective sequence number in the table, over its entries
+    /// and range tombstones, the bulk-ingestion offset added as in
+    /// [`Self::get_highest_seqno`].
+    #[must_use]
+    pub(crate) fn get_lowest_seqno(&self) -> SeqNo {
+        self.metadata.seqnos.0 + self.global_seqno()
+    }
+
     /// The highest LOCAL (on-disk, pre-`global_seqno`) sequence number of any
     /// entry, `0` for an empty table. Unlike [`get_highest_seqno`], it does NOT
     /// add the offset. Manifest repair uses it as the LEGACY bulk-ingest
