@@ -163,7 +163,7 @@ fn scan_shapes() -> Vec<Shape> {
         }),
     ];
     #[cfg(feature = "columnar")]
-    shapes.push(("columnar", |w| w.use_data_block_size(64).use_columnar(true)));
+    shapes.push(("columnar", |w| w.use_columnar(true).use_row_group_size(256)));
     shapes
 }
 
@@ -207,7 +207,12 @@ fn a_scan_takes_the_descriptor_again_once_the_cache_drops_it() -> crate::Result<
         let head = iter.by_ref().take(100).count();
         assert_eq!(descriptor_accesses(&table) - before, 1, "{name}: head");
         table.file_accessor.remove_for_table(&table.global_id());
+        let blocks = table.metrics.block_load_io_count();
         assert_eq!(head + iter.count(), 500, "{name}: rows");
+        assert!(
+            table.metrics.block_load_io_count() > blocks,
+            "{name}: the case under test: the scan reads from the file after the drop"
+        );
         assert_eq!(descriptor_accesses(&table) - before, 2, "{name}: after");
     }
     Ok(())
