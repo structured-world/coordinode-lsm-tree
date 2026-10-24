@@ -6,8 +6,11 @@
 //!
 //! No criterion: its post-sample analysis runs on the same cores and lands in a
 //! profile of the timed loop, and a scan item costs little enough that it
-//! shows. Each round runs every arm once, in turn, so a slow stretch of the
-//! host lands on all of them; the median over the rounds is reported.
+//! shows. Each round runs every arm once, in turn, starting one arm later
+//! than the round before, so a slow stretch of the host, and the place in a
+//! round, land on all of them alike; the median over the rounds is reported.
+//! The short-scan arms also report the p50, p99 and p999 latency of one short
+//! scan, timed in a pass of their own.
 //!
 //! The trees match the `range_scan` head-to-head against RocksDB: 16-byte keys
 //! in mixed order, 256-byte values, no block compression, a single-level index
@@ -179,18 +182,26 @@ impl Arm {
                 }
             }
             Read::Short => {
-                for start in 0..SHORT_SCANS {
-                    let from = key_for(start * (self.n / SHORT_SCANS));
-                    for guard in self
-                        .tree
-                        .range(from.as_slice().., MAX_SEQNO, None)
-                        .take(SHORT_ROWS)
-                    {
-                        black_box(guard.value().expect("scan value"));
-                        rows += 1;
-                    }
+                for scan in 0..SHORT_SCANS {
+                    rows += self.short_scan(scan);
                 }
             }
+        }
+        rows
+    }
+
+    /// The `scan`th of the [`SHORT_SCANS`] short scans; returns the rows it
+    /// handed out.
+    fn short_scan(&self, scan: u64) -> u64 {
+        let from = key_for(scan * (self.n / SHORT_SCANS));
+        let mut rows = 0;
+        for guard in self
+            .tree
+            .range(from.as_slice().., MAX_SEQNO, None)
+            .take(SHORT_ROWS)
+        {
+            black_box(guard.value().expect("scan value"));
+            rows += 1;
         }
         rows
     }
@@ -204,6 +215,33 @@ impl Arm {
         }
         start.elapsed().as_nanos() as f64 / rows as f64
     }
+
+    /// The latency of each short scan of a [`Read::Short`] arm, in
+    /// nanoseconds, over passes adding up to at least `budget`, sorted. Timed
+    /// apart from [`Self::time`], so the clock read around every scan does not
+    /// land in the per-row figures.
+    fn short_latencies(&self, budget: Duration) -> Vec<u128> {
+        let mut out = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            for scan in 0..SHORT_SCANS {
+                let began = Instant::now();
+                self.short_scan(scan);
+                out.push(began.elapsed().as_nanos());
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+/// The `q`-quantile of `sorted`, which is not empty.
+fn quantile(sorted: &[u128], q: f64) -> u128 {
+    let last = sorted.len() - 1;
+    let at = ((last as f64) * q).round() as usize;
+    *sorted
+        .get(at.min(last))
+        .expect("a quantile of at least one sample")
 }
 
 fn arms(n: u64) -> Vec<Arm> {
@@ -225,9 +263,10 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// The median of `v`, which is not empty.
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
+    *v.get(v.len() / 2).expect("a median of at least one sample")
 }
 
 fn main() {
@@ -242,6 +281,7 @@ fn main() {
         })
         .collect();
     let rounds: usize = env_or("SCAN_SPLIT_ROUNDS", 15);
+    assert!(rounds > 0, "SCAN_SPLIT_ROUNDS: at least one round");
 
     if let Ok(only) = std::env::var("SCAN_SPLIT_ARM") {
         let &[n] = sizes.as_slice() else {
@@ -263,9 +303,14 @@ fn main() {
         for arm in &arms {
             arm.scan();
         }
+        // Each round starts one arm later than the one before, so every arm
+        // runs at every place in a round as often as any other: what running
+        // first or right after a heavy arm costs is spread over all of them.
         let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
-        for _ in 0..rounds {
-            for (arm, out) in arms.iter().zip(&mut samples) {
+        for round in 0..rounds {
+            for place in 0..arms.len() {
+                let at = (round + place) % arms.len();
+                let (arm, out) = (&arms[at], &mut samples[at]);
                 out.push(arm.time(Duration::from_millis(200)));
             }
         }
@@ -279,6 +324,18 @@ fn main() {
                 arm.label,
                 median(out)
             );
+            if matches!(arm.read, Read::Short) {
+                let latencies = arm.short_latencies(Duration::from_secs(1));
+                println!(
+                    "scan_split/{}/{n}: per scan of {SHORT_ROWS} rows: p50 {} ns, p99 {} ns, \
+                     p999 {} ns over {} scans",
+                    arm.label,
+                    quantile(&latencies, 0.5),
+                    quantile(&latencies, 0.99),
+                    quantile(&latencies, 0.999),
+                    latencies.len(),
+                );
+            }
             #[cfg(feature = "metrics")]
             report_file_work(arm, n);
         }
