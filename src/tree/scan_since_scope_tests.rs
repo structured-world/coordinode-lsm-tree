@@ -14,7 +14,7 @@ use crate::{
 /// the writer widens only tables without rows. A scope inside that stretch,
 /// which no table's key range reaches, must still get the deletion.
 #[test]
-fn a_scoped_scan_gets_a_tombstone_past_its_tables_key_range() -> crate::Result<()> {
+fn scoped_scan_tombstone_past_table_key_range_returns_range_tombstone() -> crate::Result<()> {
     let folder = tempfile::tempdir()?;
     let AnyTree::Standard(tree) = Config::new(
         folder.path(),

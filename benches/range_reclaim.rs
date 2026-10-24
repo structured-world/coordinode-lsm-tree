@@ -205,20 +205,35 @@ fn tombstoned() -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
 }
 
 /// Point reads that find their key on a tree built like `idle`'s: each hit
-/// is checked against the range tombstones of the tables around it.
+/// is checked against the range tombstones of the tables around it. The
+/// mean over batches of 1,000 gets is the amortized cost; each get timed on
+/// its own gives the tail.
 fn point_reads(label: &str, tree: &AnyTree) -> lsm_tree::Result<()> {
     const BATCH: u32 = 1_000;
     const BATCHES: u32 = 200;
-    let mut samples = Vec::new();
+    let key = |n: u32| day_key(n.wrapping_mul(7_919) % IDLE_TABLES, n % 100);
+    let mut batch_means = Vec::new();
     for batch in 0..BATCHES {
         let start = Instant::now();
         for i in 0..BATCH {
-            let n = batch * BATCH + i;
-            let key = day_key(n.wrapping_mul(7_919) % IDLE_TABLES, n % 100);
-            assert!(tree.get(key, SeqNo::MAX)?.is_some());
+            assert!(tree.get(key(batch * BATCH + i), SeqNo::MAX)?.is_some());
         }
-        samples.push(start.elapsed() / BATCH);
+        batch_means.push(start.elapsed() / BATCH);
     }
+    let mut samples = Vec::new();
+    for n in 0..BATCH * BATCHES {
+        let key = key(n);
+        let start = Instant::now();
+        let found = tree.get(key, SeqNo::MAX)?;
+        samples.push(start.elapsed());
+        assert!(found.is_some());
+    }
+    println!(
+        "{label} tables={} l0_runs={} amortized_per_get {}",
+        tree.table_count(),
+        tree.l0_run_count(),
+        percentiles(batch_means),
+    );
     println!(
         "{label} tables={} l0_runs={} per_get {}",
         tree.table_count(),

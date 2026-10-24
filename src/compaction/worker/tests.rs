@@ -2628,7 +2628,7 @@ fn compaction_drop_tables() -> crate::Result<()> {
 /// strategy consumed the tables of both, and says so: the strategy's action,
 /// with every table the run took in.
 #[test]
-fn compaction_reports_reclaimed_tables_with_the_strategys() -> crate::Result<()> {
+fn compaction_reclaim_then_strategy_drop_reports_both_input_counts() -> crate::Result<()> {
     use crate::version::run::Ranged as _;
 
     struct DropZ;
