@@ -103,8 +103,8 @@ fn model_4() -> Result<()> {
     tree.flush_active_memtable(93)?;
     tree.compact(compaction.clone(), 93)?;
 
-    // Every key starts with a zero byte.
-    tree.remove_range([0u8], [1u8], 193);
+    // Every key starts with a byte below 8.
+    tree.remove_range([0u8], [8u8], 193);
     tree.flush_active_memtable(93)?;
     tree.compact(compaction.clone(), 194)?;
 
