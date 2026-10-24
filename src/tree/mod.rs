@@ -3761,17 +3761,24 @@ impl Tree {
         // so binary search narrows candidates to RTs with start <= key. A
         // table's key range does not bound its tombstones (a compaction cuts
         // them at the next output's first key without widening the range up
-        // to it), so it rejects nothing here; a scan takes them from every
-        // table alike.
+        // to it), so the stretch they cover rejects a table instead: from the
+        // first one's start to the greatest end, two compares.
         for table in super_version
             .version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())
             .filter(|run| run.holds_range_tombstones())
             .flat_map(|run| run.iter())
-            .filter(|t| !t.range_tombstones().is_empty())
         {
             let rts = table.range_tombstones();
+            let (Some(first), Some(end)) = (rts.first(), table.range_tombstones_end()) else {
+                continue;
+            };
+            if comparator.compare(&first.start, key) == core::cmp::Ordering::Greater
+                || comparator.compare(key, end) != core::cmp::Ordering::Less
+            {
+                continue;
+            }
 
             // Binary search: find the first RT whose start is > key (in comparator order).
             // All RTs before that index have start <= key and are candidates.
@@ -3780,11 +3787,11 @@ impl Tree {
             });
 
             for rt in rts.iter().take(candidate_end) {
-                // Check: start <= key < end (in comparator order) AND seqno visibility.
-                if rt.visible_at(read_seqno)
-                    && comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
+                // start <= key holds by the search; the seqno checks are
+                // cheaper than the key compare, so they go first.
+                if key_seqno < rt.seqno
+                    && rt.visible_at(read_seqno)
                     && comparator.compare(key, &rt.end) == core::cmp::Ordering::Less
-                    && key_seqno < rt.seqno
                 {
                     return true;
                 }

@@ -152,6 +152,10 @@ pub struct Inner {
     /// Range tombstones stored in this table. Loaded on open.
     pub(crate) range_tombstones: Vec<RangeTombstone>,
 
+    /// The greatest end of `range_tombstones` in the tree's key order, so a
+    /// point read rules the table out in two compares.
+    pub(crate) range_tombstones_end: Option<crate::UserKey>,
+
     /// Inner zstd-block layout index, loaded on open from the optional
     /// `block_layout` section. Empty (no entries) when the table has no
     /// multi-inner-block data blocks. Lets a range query partial-decode only
