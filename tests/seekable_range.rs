@@ -373,9 +373,9 @@ fn peek_key_matches_next_key() -> lsm_tree::Result<()> {
 fn seekable_with_range_tombstone() -> lsm_tree::Result<()> {
     for kv_sep in [false, true] {
         let (tree, _folder) = build_tree(kv_sep)?;
-        // A dropped sub-range plants a range tombstone, so the merge pipeline
-        // wraps in the RangeTombstoneFilter branch.
-        tree.drop_range(key(50)..key(150))?;
+        // A range tombstone over a sub-range, newer than every row, makes the
+        // merge pipeline wrap in the RangeTombstoneFilter branch.
+        tree.remove_range(key(50), key(150), 10);
 
         let intervals: Vec<Range<Vec<u8>>> = vec![key(30)..key(80), key(120)..key(200)];
         let expected = reference(&tree, &intervals);

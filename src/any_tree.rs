@@ -335,11 +335,6 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
-    fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()> {
-        forward!(self.drop_range(range))
-    }
-
-    #[inline]
     fn clear(&self) -> crate::Result<()> {
         forward!(self.clear())
     }

@@ -2626,6 +2626,18 @@ fn compaction_drop_tables() -> crate::Result<()> {
 
 #[test]
 fn blob_file_picking_simple() -> crate::Result<()> {
+    struct DropStrategy(Vec<TableId>);
+
+    impl CompactionStrategy for DropStrategy {
+        fn get_name(&self) -> &'static str {
+            "DropCompaction"
+        }
+
+        fn choose(&self, _: &Version, _: &Config, _: &CompactionState) -> Choice {
+            Choice::Drop(self.0.iter().copied().collect())
+        }
+    }
+
     struct InPlaceStrategy(Vec<TableId>);
 
     impl CompactionStrategy for InPlaceStrategy {
@@ -2673,7 +2685,8 @@ fn blob_file_picking_simple() -> crate::Result<()> {
     assert_eq!(1, tree.blob_file_count());
     // We now have tables [1, 2, 3] pointing into blob file 0
 
-    tree.drop_range("a"..="a")?;
+    // Table #1 holds `a`.
+    tree.compact(Arc::new(DropStrategy(vec![1])), 1_000)?;
     assert_eq!(2, tree.table_count());
     assert_eq!(1, tree.blob_file_count());
 

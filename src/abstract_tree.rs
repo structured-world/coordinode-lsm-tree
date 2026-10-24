@@ -285,7 +285,7 @@ pub trait AbstractTree: sealed::Sealed {
     /// The strategy is supplied by the caller because the engine does not own a
     /// configured compaction strategy (it is injected per compaction run); a
     /// `&dyn` keeps this object-safe. Returns `0` for strategies without a
-    /// size-target notion of debt (FIFO, drop-range), or when the tree is at or
+    /// size-target notion of debt (FIFO), or when the tree is at or
     /// below its target shape. See
     /// [`CompactionStrategy::pending_compaction_bytes`](crate::compaction::CompactionStrategy::pending_compaction_bytes).
     fn compaction_debt(&self, strategy: &dyn crate::compaction::CompactionStrategy) -> u64 {
@@ -968,17 +968,6 @@ pub trait AbstractTree: sealed::Sealed {
     /// Returns the approximate number of values reclaimable once weak tombstones can be GC'd.
     fn weak_tombstone_reclaimable_count(&self) -> u64;
 
-    /// Drops tables that are fully contained in a given range.
-    ///
-    /// Accepts any `RangeBounds`, including unbounded or exclusive endpoints.
-    /// If the normalized lower bound is greater than the upper bound, the
-    /// method returns without performing any work.
-    ///
-    /// # Errors
-    ///
-    /// Will return `Err` only if an IO error occurs.
-    fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()>;
-
     /// Drops all tables and clears all memtables atomically.
     ///
     /// # Errors
@@ -1190,11 +1179,15 @@ pub trait AbstractTree: sealed::Sealed {
     /// `gc_watermark` has the meaning documented at
     /// [`major_compact`](Self::major_compact): the engine's own GC collects
     /// only versions below it, and a run that collects one raises the
-    /// retention floor. Two things act regardless of it: a compaction filter,
-    /// and a strategy that drops whole tables (FIFO eviction, a drop-range, a
-    /// custom strategy choosing to drop). Either removes data at any
-    /// watermark, `0` included, and raises the floor to the install's own
-    /// seqno, so a low watermark does not protect a snapshot from them.
+    /// retention floor. Before the strategy chooses, the run unlinks every
+    /// table a flushed range tombstone below the watermark spans whole and
+    /// is newer than (see [`remove_range`](Self::remove_range)).
+    ///
+    /// Two things act regardless of the watermark: a compaction filter, and a
+    /// strategy that drops whole tables (FIFO eviction, a custom strategy
+    /// choosing to drop). Either removes data at any watermark, `0` included,
+    /// and raises the floor to the install's own seqno, so a low watermark
+    /// does not protect a snapshot from them.
     ///
     /// # Errors
     ///
@@ -2037,7 +2030,19 @@ pub trait AbstractTree: sealed::Sealed {
     /// Deletes all keys in the range `[start, end)` by inserting a range tombstone.
     ///
     /// This is much more efficient than deleting keys individually when
-    /// removing a contiguous range of keys.
+    /// removing a contiguous range of keys. The deletion is exact at once,
+    /// whatever tables hold the keys; a snapshot below `seqno` still reads them.
+    ///
+    /// Space comes back without rewriting: once the tombstone is flushed, every
+    /// compaction whose `gc_watermark` is above `seqno` first unlinks each
+    /// table the tombstone spans whole and is newer than, before its strategy
+    /// chooses. Tables that reach past `[start, end)` keep their bytes until a
+    /// merge rewrites them. Dropping tables raises the retention floor, at most
+    /// to `seqno`: snapshots at or below the floor report
+    /// [`Error::SnapshotBelowRetention`](crate::Error::SnapshotBelowRetention).
+    ///
+    /// To empty the whole tree, [`clear`](Self::clear) does it without a
+    /// tombstone.
     ///
     /// Returns the approximate size added to the memtable.
     /// Returns 0 if `start >= end` (invalid interval is silently ignored).

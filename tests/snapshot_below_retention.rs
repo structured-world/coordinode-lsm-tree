@@ -2,15 +2,16 @@
 //! `Error::SnapshotBelowRetention`, never panic.
 //!
 //! An install that collects what older snapshots read (a GC compaction below
-//! its watermark, `clear`, `drop_range`, FIFO eviction, a filtering compaction)
+//! its watermark, `clear`, a range tombstone's reclaim, FIFO eviction, a
+//! filtering compaction)
 //! raises the floor, and a read at or below it has nothing left to be answered
 //! from: the engine used to `expect` a version and take the whole tree down.
 //! Every read surface that resolves a snapshot is exercised here, on both the
 //! standard and the KV-separated tree, plus the `clear` path.
 //!
 //! The second half covers the boundary's durability: the install that
-//! discards what older snapshots saw (a GC compaction, `clear`, `drop_range`,
-//! FIFO eviction) persists a retention floor, and a reopen, a checkpoint and
+//! discards what older snapshots saw (a GC compaction, `clear`, a range
+//! tombstone's reclaim, FIFO eviction) persists a retention floor, and a reopen, a checkpoint and
 //! a manifest repair each report the boundary the floor implies; additive
 //! installs (flush, ingest, trivial move) leave it alone.
 
@@ -672,11 +673,22 @@ fn leveled_merge_with_watermark_raises_the_boundary() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// `drop_range` removes whole tables, so every snapshot up to its install is
-/// refused, live and after a reopen, for the surviving keys too (the boundary
-/// is tree-wide, not per key).
+/// A compaction at `watermark` whose strategy drops nothing, so it only drops
+/// the tables flushed range tombstones span.
+fn reclaim(tree: &AnyTree, watermark: SeqNo) -> lsm_tree::Result<()> {
+    tree.compact(
+        Arc::new(lsm_tree::compaction::Fifo::new(u64::MAX, None)),
+        watermark,
+    )?;
+    Ok(())
+}
+
+/// Reclaiming the tables a range tombstone spans removes them for every
+/// snapshot that could have read them: those up to the tombstone are refused,
+/// live and after a reopen, for the surviving keys too (the boundary is
+/// tree-wide, not per key). Snapshots past the tombstone stay served.
 #[test]
-fn drop_range_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
+fn range_tombstone_reclaim_raises_the_boundary_to_the_tombstone() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
     let tree = open_tree(folder.path(), false, &seqno)?;
@@ -689,17 +701,22 @@ fn drop_range_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     let snapshot = seqno.get();
     assert_eq!(tree.get("b", snapshot)?.as_deref(), Some(b"vb".as_slice()));
 
-    // The drop's own install takes the next seqno: that is the boundary, and
-    // it holds at once, with no pre-drop version kept to serve the snapshot.
-    let install = seqno.get();
-    tree.drop_range("a"..="a")?;
-    assert_eq!(tree.oldest_retained_seqno(), install);
-    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, install);
+    let tombstone = seqno.next();
+    tree.remove_range("a", "b", tombstone);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, seqno.get() + 10)?;
+    assert_eq!(tree.oldest_retained_seqno(), tombstone);
+    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, tombstone);
+    assert_eq!(
+        tree.get("b", tombstone + 1)?.as_deref(),
+        Some(b"vb".as_slice()),
+        "a snapshot past the tombstone is served"
+    );
     drop(tree);
 
     let tree = reopen(folder.path(), false, seqno.get())?;
     let oldest = tree.oldest_retained_seqno();
-    assert_eq!(oldest, install, "the drop's boundary survives the reopen");
+    assert_eq!(oldest, tombstone, "the drop's boundary survives the reopen");
     assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, oldest);
     assert!(tree.get("a", SeqNo::MAX)?.is_none());
     assert_eq!(
@@ -709,8 +726,8 @@ fn drop_range_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// FIFO eviction drops the oldest tables through the same table-drop
-/// install as `drop_range`, so it raises the boundary the same way.
+/// FIFO eviction drops the oldest tables whatever snapshots read them, so
+/// every snapshot up to its install is refused.
 #[test]
 fn fifo_eviction_raises_the_boundary_to_its_install() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
@@ -857,11 +874,11 @@ fn compaction_filter_rewrite_raises_the_boundary_to_its_install() -> lsm_tree::R
     Ok(())
 }
 
-/// A `drop_range` that finds no table fully inside its bounds installs
-/// nothing and must not raise the boundary: no data changed, so every
-/// snapshot stays readable after a reopen.
+/// A range tombstone that spans no table whole reclaims nothing and must not
+/// raise the boundary: no table went, so every snapshot stays readable after
+/// a reopen.
 #[test]
-fn drop_range_without_a_contained_table_keeps_the_boundary() -> lsm_tree::Result<()> {
+fn range_tombstone_spanning_no_table_keeps_the_boundary() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let seqno = SequenceNumberCounter::default();
     let tree = open_tree(folder.path(), false, &seqno)?;
@@ -869,12 +886,14 @@ fn drop_range_without_a_contained_table_keeps_the_boundary() -> lsm_tree::Result
     let first = seqno.next();
     tree.insert("a", "va", first);
     tree.insert("z", "vz", seqno.next());
-    // One table spanning a..z: no range short of the whole span contains it.
+    // One table spanning a..z: no tombstone short of the whole span spans it.
     tree.flush_active_memtable(0)?;
     let snapshot = seqno.get();
 
-    tree.drop_range("m"..="n")?;
-    assert_eq!(tree.table_count(), 1, "nothing was dropped");
+    tree.remove_range("m", "n", seqno.next());
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, seqno.get() + 10)?;
+    assert_eq!(tree.table_count(), 2, "nothing was dropped");
     assert_eq!(
         tree.retention_floor(),
         0,
@@ -905,19 +924,21 @@ fn retention_floor_reports_the_persisted_boundary() -> lsm_tree::Result<()> {
     tree.flush_active_memtable(0)?;
     let snapshot = seqno.get();
 
-    let install = seqno.get();
-    tree.drop_range("a"..="a")?;
+    let tombstone = seqno.next();
+    tree.remove_range("a", "b", tombstone);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, seqno.get() + 10)?;
     assert_eq!(
         tree.retention_floor(),
-        install,
-        "persisted: the drop's install"
+        tombstone,
+        "persisted: the tombstone the drop needs"
     );
     assert_eq!(
         tree.oldest_retained_seqno(),
-        install,
+        tombstone,
         "live: the same boundary"
     );
-    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, install);
+    assert_below_retention(tree.get("b", snapshot).unwrap_err(), snapshot, tombstone);
 
     // A later GC compaction below that install does not lower it.
     tree.insert("b", "vb2", seqno.next());

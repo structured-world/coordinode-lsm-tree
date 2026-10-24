@@ -19,7 +19,7 @@ use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
     ValueType,
-    compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
+    compaction::{CompactionStrategy, state::CompactionState},
     config::Config,
     format_version::FormatVersion,
     fs::Fs,
@@ -904,23 +904,6 @@ impl AbstractTree for Tree {
             .iter_tables()
             .map(Table::weak_tombstone_reclaimable)
             .sum()
-    }
-
-    fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()> {
-        let (bounds, is_empty) = Self::range_bounds_to_owned_bounds(&range);
-
-        if is_empty {
-            return Ok(());
-        }
-
-        let strategy = Arc::new(crate::compaction::drop_range::Strategy::new(bounds));
-
-        // IMPORTANT: Write lock so we can be the only compaction going on
-        let _lock = self.0.major_compaction_lock.write();
-
-        log::info!("Starting drop_range compaction");
-        self.inner_compact(strategy, 0)?;
-        Ok(())
     }
 
     fn clear(&self) -> crate::Result<()> {
@@ -4544,43 +4527,6 @@ impl Tree {
                 .get_version_for_snapshot(seqno)
                 .map(crate::version::SnapshotRef::Owned)
         }
-    }
-
-    /// Normalizes a user-provided range into owned `Bound<Slice>` values.
-    ///
-    /// Returns a tuple containing:
-    /// - the `OwnedBounds` that mirror the original bounds semantics (including
-    ///   inclusive/exclusive markers and unbounded endpoints), and
-    /// - a `bool` flag indicating whether the normalized range is logically
-    ///   empty (e.g., when the lower bound is greater than the upper bound).
-    ///
-    /// Callers can use the flag to detect empty ranges and skip further work
-    /// while still having access to the normalized bounds for non-empty cases.
-    fn range_bounds_to_owned_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
-        range: &R,
-    ) -> (OwnedBounds, bool) {
-        use Bound::{Excluded, Included, Unbounded};
-
-        let start = match range.start_bound() {
-            Included(key) => Included(Slice::from(key.as_ref())),
-            Excluded(key) => Excluded(Slice::from(key.as_ref())),
-            Unbounded => Unbounded,
-        };
-
-        let end = match range.end_bound() {
-            Included(key) => Included(Slice::from(key.as_ref())),
-            Excluded(key) => Excluded(Slice::from(key.as_ref())),
-            Unbounded => Unbounded,
-        };
-
-        let is_empty =
-            if let (Included(lo) | Excluded(lo), Included(hi) | Excluded(hi)) = (&start, &end) {
-                lo.as_ref() > hi.as_ref()
-            } else {
-                false
-            };
-
-        (OwnedBounds { start, end }, is_empty)
     }
 
     /// Opens an LSM-tree in the given directory.
