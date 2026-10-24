@@ -1103,8 +1103,8 @@ fn scan_since_scoped_sees_a_tombstone_reaching_past_the_tables_point_keys() -> l
 }
 
 /// A compaction cuts a range tombstone at the next output's first key without
-/// widening the table's key range up to it: here the table of `l` keeps the
-/// piece `[m, q)` while its key range stays `[l, l]`. A scope inside that gap
+/// widening the table's key range up to it: here the table ending at `l`
+/// keeps the piece `[m, q)` while its key range stops at `l`. A scope inside that gap
 /// must still get the deletion.
 #[test]
 fn scan_since_scoped_sees_a_tombstone_a_compaction_cut_past_its_table() -> lsm_tree::Result<()> {
@@ -1118,10 +1118,10 @@ fn scan_since_scoped_sees_a_tombstone_a_compaction_cut_past_its_table() -> lsm_t
     // merges the two instead of moving one table down.
     tree.remove_range(b"m", b"r", 5);
     tree.flush_active_memtable(0)?;
-    // Outputs smaller than one value: one table per key. Watermark 0 keeps
-    // the tombstone.
+    // Outputs far below the data: they rotate at every spilled block, so
+    // `a, l` and `q, z` land apart. Watermark 0 keeps the tombstone.
     tree.major_compact(100, 0)?;
-    assert!(tree.table_count() >= 4, "premise: one output per key");
+    assert!(tree.table_count() >= 2, "premise: the outputs split");
 
     let all: Vec<ScanSinceEvent> = tree.scan_since_seqno(0)?.collect();
     assert!(
@@ -1130,7 +1130,7 @@ fn scan_since_scoped_sees_a_tombstone_a_compaction_cut_past_its_table() -> lsm_t
             ScanSinceEvent::RangeTombstone { start_key, end_key, seqno: 5 }
                 if start_key.as_ref() == b"m" && end_key.as_ref() == b"q"
         )),
-        "premise: the table of l holds the piece [m, q): {all:?}",
+        "premise: the table ending at l holds the piece [m, q): {all:?}",
     );
 
     let got: Vec<ScanSinceEvent> = tree
