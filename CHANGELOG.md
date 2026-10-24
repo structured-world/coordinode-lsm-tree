@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v6.0.0...v6.0.1) - 2026-10-24
+
+### Fixed
+
+- *(drop-range)* never expose an older version of a dropped key ([#982](https://github.com/structured-world/coordinode-lsm-tree/pull/982))
+- *(fs)* implement the capability methods of the raw io_uring backend ([#980](https://github.com/structured-world/coordinode-lsm-tree/pull/980))
+
+### Performance
+
+- *(scan)* close the uncompressed full-scan gap ([#981](https://github.com/structured-world/coordinode-lsm-tree/pull/981))
+- *(multi-get)* batch the reads of values, special blocks and merges ([#974](https://github.com/structured-world/coordinode-lsm-tree/pull/974))
+- *(tree)* open a batch of trees with one sync of their folder ([#970](https://github.com/structured-world/coordinode-lsm-tree/pull/970))
+
 ## [6.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v5.11.1...v6.0.0) - 2026-10-21
 
 ### Added
