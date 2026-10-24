@@ -167,6 +167,23 @@ fn scan_shapes() -> Vec<Shape> {
     shapes
 }
 
+/// [`cold_table`] shaped by `shape`, checked to hold several data blocks (row
+/// groups when columnar): a table of one would read nothing after its first
+/// block, and the scan tests would pass without exercising a later read.
+fn cold_scan_table(
+    dir: &std::path::Path,
+    name: &str,
+    shape: fn(Writer) -> Writer,
+) -> crate::Result<Table> {
+    let table = cold_table(dir, shape)?;
+    assert!(
+        table.metadata.data_block_count >= 8,
+        "{name}: the case under test: {} blocks, not several",
+        table.metadata.data_block_count
+    );
+    Ok(table)
+}
+
 /// A scan reads every block of the table through one descriptor: it takes it
 /// from the descriptor cache at its first block read from the file and reads
 /// the later ones through it, in either direction.
@@ -174,15 +191,10 @@ fn scan_shapes() -> Vec<Shape> {
 fn a_cold_scan_takes_the_descriptor_once() -> crate::Result<()> {
     for (name, shape) in scan_shapes() {
         let dir = tempdir()?;
-        let table = cold_table(dir.path(), shape)?;
+        let table = cold_scan_table(dir.path(), name, shape)?;
 
         let before = descriptor_accesses(&table);
-        let blocks = table.metrics.block_load_io_count();
         assert_eq!(table.iter().count(), 500, "{name}: forward");
-        assert!(
-            table.metrics.block_load_io_count() - blocks > 4,
-            "{name}: the scan did not read several blocks from the file"
-        );
         assert_eq!(descriptor_accesses(&table) - before, 1, "{name}: forward");
 
         let before = descriptor_accesses(&table);
@@ -200,7 +212,7 @@ fn a_cold_scan_takes_the_descriptor_once() -> crate::Result<()> {
 fn a_scan_takes_the_descriptor_again_once_the_cache_drops_it() -> crate::Result<()> {
     for (name, shape) in scan_shapes() {
         let dir = tempdir()?;
-        let table = cold_table(dir.path(), shape)?;
+        let table = cold_scan_table(dir.path(), name, shape)?;
 
         let before = descriptor_accesses(&table);
         let mut iter = table.iter();
@@ -225,7 +237,7 @@ fn a_scan_takes_the_descriptor_again_once_the_cache_drops_it() -> crate::Result<
 fn a_scan_does_not_keep_the_descriptor_open() -> crate::Result<()> {
     for (name, shape) in scan_shapes() {
         let dir = tempdir()?;
-        let table = cold_table(dir.path(), shape)?;
+        let table = cold_scan_table(dir.path(), name, shape)?;
 
         let mut iter = table.iter();
         assert!(iter.next().is_some(), "{name}: first row");
