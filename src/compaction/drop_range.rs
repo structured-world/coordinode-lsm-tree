@@ -7,6 +7,8 @@ use crate::compaction::state::CompactionState;
 use crate::version::Version;
 use crate::{HashSet, Table};
 use crate::{KeyRange, config::Config, slice::Slice, version::run::Ranged};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
 
 #[derive(Clone, Debug)]
