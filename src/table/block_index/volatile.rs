@@ -206,6 +206,17 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
+        self.next_back_with(&LookupFd::default())
+    }
+}
+
+impl Iter {
+    /// [`DoubleEndedIterator::next_back`], the index block read through `fd`,
+    /// which the scan's other block reads share.
+    pub(crate) fn next_back_with(
+        &mut self,
+        fd: &LookupFd,
+    ) -> Option<crate::Result<KeyedBlockHandle>> {
         if self.poisoned {
             return None;
         }
@@ -213,7 +224,7 @@ impl DoubleEndedIterator for Iter {
         if let Some(inner) = &mut self.inner {
             inner.next_back().map(Ok)
         } else {
-            let mut iter = match self.init_inner(&LookupFd::default()) {
+            let mut iter = match self.init_inner(fd) {
                 Ok(Some(it)) => it,
                 Ok(None) => return None,
                 Err(e) => return self.poison(e),

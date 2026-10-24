@@ -181,7 +181,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    crate::comparator::same_user_key(&kv.key.user_key, user_key)
+                    crate::comparator::same_held_key(&kv.key.user_key, user_key)
                 } else {
                     true
                 }
@@ -325,7 +325,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    crate::comparator::same_user_key(&kv.key.user_key, key)
+                    crate::comparator::same_held_key(&kv.key.user_key, key)
                 } else {
                     true
                 }
@@ -348,7 +348,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         loop {
             let next = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    crate::comparator::same_user_key(&kv.key.user_key, &key)
+                    crate::comparator::same_held_key(&kv.key.user_key, &key)
                 } else {
                     true
                 }
@@ -365,7 +365,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         let key = self.skip_back.take()?;
         while let Some(prev) = self.inner.peek_back() {
             if let Ok(prev) = prev
-                && !crate::comparator::same_user_key(&prev.key.user_key, &key)
+                && !crate::comparator::same_held_key(&prev.key.user_key, &key)
             {
                 return None;
             }
@@ -445,7 +445,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
-                    crate::comparator::same_user_key(&kv.key.user_key, key)
+                    crate::comparator::same_held_key(&kv.key.user_key, key)
                 } else {
                     // An error is taken only once the key was met: before
                     // that it belongs to whatever key comes first.
@@ -470,7 +470,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         let mut met = false;
         while let Some(prev) = self.inner.peek_back() {
             match prev {
-                Ok(prev) if !crate::comparator::same_user_key(&prev.key.user_key, key) => {
+                Ok(prev) if !crate::comparator::same_held_key(&prev.key.user_key, key) => {
                     break;
                 }
                 Err(_) if !met => break,
@@ -601,7 +601,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
             // comparator a different key may sort bytewise-higher, and a
             // bytewise `<` here classified it as "same key" and dropped it.
             // Byte equality is also cheaper (length short-circuit, no ordering).
-            if !crate::comparator::same_user_key(&prev.key.user_key, &tail.key.user_key) {
+            if !crate::comparator::same_held_key(&prev.key.user_key, &tail.key.user_key) {
                 // `tail` is the newest entry for this key — boundary reached.
                 // Only merge if the newest entry is a MergeOperand.
                 if has_merge_op

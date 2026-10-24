@@ -310,6 +310,16 @@ impl Metrics {
         }
     }
 
+    /// Times a read took a table file from the descriptor cache.
+    pub fn table_file_cached_count(&self) -> usize {
+        self.table_file_opened_cached.load(Relaxed)
+    }
+
+    /// Times a read had to open a table file, missing the descriptor cache.
+    pub fn table_file_opened_count(&self) -> usize {
+        self.table_file_opened_uncached.load(Relaxed)
+    }
+
     /// Data block bytes requested from the `Fs` trait by reads callers made.
     ///
     /// Charged when each read is issued, so a read that then fails its
@@ -432,12 +442,14 @@ impl Metrics {
     }
 
     /// Records what a projected scan handed out.
+    #[cfg(feature = "columnar")]
     #[inline]
     pub(crate) fn record_materialized(&self, bytes: usize) {
         self.bytes_materialized.fetch_add(bytes as u64, Relaxed);
     }
 
     /// Records the chosen rows' cells taken from payload pages read for them.
+    #[cfg(feature = "columnar")]
     #[inline]
     pub(crate) fn record_payload_useful(&self, bytes: u64) {
         self.payload_bytes_useful.fetch_add(bytes, Relaxed);
@@ -445,6 +457,7 @@ impl Metrics {
 
     /// Records what payload pages read for chosen rows held besides their
     /// cells, once the pages are done with.
+    #[cfg(feature = "columnar")]
     #[inline]
     pub(crate) fn record_payload_incidental(&self, bytes: u64) {
         self.payload_bytes_incidental.fetch_add(bytes, Relaxed);

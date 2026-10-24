@@ -2050,6 +2050,13 @@ impl Writer {
         self
     }
 
+    /// Sets the uncompressed size a row-major table cuts its data blocks at.
+    /// Ignored for a columnar table, which cuts its row groups at
+    /// [`Self::use_row_group_size`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `size` exceeds 4 MiB.
     #[must_use]
     pub fn use_data_block_size(mut self, size: u32) -> Self {
         assert!(

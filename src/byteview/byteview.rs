@@ -142,9 +142,14 @@ impl core::cmp::PartialEq for ByteView {
 }
 
 impl core::cmp::Ord for ByteView {
+    #[inline]
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.prefix()
-            .cmp(other.prefix())
+        // The first bytes, held in place in both forms and zeroed past a
+        // shorter view's end, read as one big-endian word: a shorter view
+        // pads with the lowest byte, so words that differ order the views as
+        // their bytes do, and only equal words need the full comparison.
+        self.prefix_word()
+            .cmp(&other.prefix_word())
             .then_with(|| self.deref().cmp(&**other))
     }
 }
@@ -225,6 +230,15 @@ impl ByteView {
         unsafe { self.trailer.short.data.get_unchecked(..len) }
     }
 
+    /// The prefix bytes as one big-endian word, zero past the view's end.
+    #[inline]
+    fn prefix_word(&self) -> u32 {
+        // SAFETY: both trailer layouts hold the first `PREFIX_SIZE` bytes at
+        // the same place, zeroed past the end of a shorter view.
+        let data = unsafe { &self.trailer.short.data };
+        u32::from_be_bytes([data[0], data[1], data[2], data[3]])
+    }
+
     fn is_inline(&self) -> bool {
         self.len() <= INLINE_SIZE
     }
@@ -296,8 +310,32 @@ impl ByteView {
 
     /// Fuses two byte slices into a single byteview.
     #[must_use]
+    #[inline]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {
         let len = left.len() + right.len();
+        // A key rebuilt from its restart head's prefix and its own suffix is
+        // short as a rule: written straight into the inline form, it skips
+        // the builder and its prefix bookkeeping, which only the heap form has.
+        if len <= INLINE_SIZE {
+            let mut data = [0; INLINE_SIZE];
+            // Both pieces fit: `left.len() + right.len() == len <= INLINE_SIZE`.
+            if let Some((head, rest)) = data.split_at_mut_checked(left.len())
+                && let Some(tail) = rest.get_mut(..right.len())
+            {
+                head.copy_from_slice(left);
+                tail.copy_from_slice(right);
+            }
+            return Self {
+                trailer: Trailer {
+                    short: ManuallyDrop::new(ShortRepr {
+                        // `len` is at most `INLINE_SIZE`, so it fits a u32.
+                        #[expect(clippy::cast_possible_truncation, reason = "len <= INLINE_SIZE")]
+                        len: len as u32,
+                        data,
+                    }),
+                },
+            };
+        }
         let mut builder = unsafe { Self::builder_unzeroed(len) };
         builder[0..left.len()].copy_from_slice(left);
         builder[left.len()..].copy_from_slice(right);

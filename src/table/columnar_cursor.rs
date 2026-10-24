@@ -21,7 +21,7 @@ use crate::table::block_index::{BlockIndex, BlockIndexIter, BlockIndexIterImpl};
 use crate::table::columnar::ColumnBatch;
 use crate::table::columnar_predicate::{ColumnRangePredicate, PredicateSupport};
 use crate::table::row_group::{PageWant, RowGroupBlocks, RowPageSelect, RowPageSet};
-use crate::table::util::{LookupFd, ReadCharge};
+use crate::table::util::{LookupFd, ReadCharge, ScanFd};
 use crate::{SeqNo, Table, UserKey};
 
 /// Where a batch a [`ColumnarCursor`] yielded was read from: its row page,
@@ -82,6 +82,9 @@ pub struct ColumnarCursor {
     group_rows: u64,
     /// Reads that went past the share since last taken.
     oversized: u64,
+    /// The table file the row groups, and the index partitions the scan
+    /// walks, are read through.
+    fd: ScanFd,
 }
 
 impl ColumnarCursor {
@@ -149,6 +152,7 @@ impl ColumnarCursor {
             bytes_per_row,
             group_rows,
             oversized: 0,
+            fd: ScanFd::default(),
         })
     }
 
@@ -211,7 +215,10 @@ impl ColumnarCursor {
     fn step(&mut self) -> crate::Result<()> {
         use core::cmp::Ordering;
 
-        let Some(keyed) = self.index.as_mut().and_then(Iterator::next) else {
+        let read = self.fd.lookup();
+        let keyed = self.index.as_mut().and_then(|index| index.next_with(&read));
+        self.fd.keep(read);
+        let Some(keyed) = keyed else {
             self.index = None;
             return Ok(());
         };
@@ -290,13 +297,15 @@ impl ColumnarCursor {
             // The first run is one row page: what a row of this group
             // decodes to is not known before one is read, and the directory,
             // read with it, is what the later runs are sized over.
+            let read = self.fd.lookup();
             let first = self
                 .table
-                .group_read(&handle, ReadCharge::Foreground, &LookupFd::default())
+                .group_read(&handle, ReadCharge::Foreground, &read)
                 .load(&PageWant::projected(
                     &self.decode_projection,
                     RowPageSelect::Range(0..1),
                 ))?;
+            self.fd.keep(read);
             // Whether the projection takes every column, so a group read
             // whole later is taken in one request: the run holds one page per
             // projected column of the directory's grid.
@@ -344,13 +353,15 @@ impl ColumnarCursor {
             rows = rows_after;
             end += 1;
         }
+        let read = self.fd.lookup();
         let blocks = self
             .table
-            .group_read(&group.handle, ReadCharge::Foreground, &LookupFd::default())
+            .group_read(&group.handle, ReadCharge::Foreground, &read)
             .load_after(
                 &group.directory,
                 &PageWant::projected(&self.decode_projection, RowPageSelect::Range(start..end)),
             )?;
+        self.fd.keep(read);
         let mut group = group;
         self.take_run(&mut group, &blocks, start..end)?;
         self.continue_group(group);
@@ -429,14 +440,16 @@ impl ColumnarCursor {
             },
             None => RowPageSelect::All,
         };
+        let read = self.fd.lookup();
         let blocks = self
             .table
-            .group_read(handle, ReadCharge::Foreground, &LookupFd::default())
+            .group_read(handle, ReadCharge::Foreground, &read)
             .load(&PageWant {
                 columns: Some(&self.decode_projection),
                 row_pages: select(),
                 whole: self.expect_whole,
             })?;
+        self.fd.keep(read);
         // The straddling group's key column, decoded separately (one extra
         // cached read for at most one group per scan) so the main projection
         // stays untouched: it masks the rows below the bound. The same

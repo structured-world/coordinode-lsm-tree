@@ -293,6 +293,12 @@ where
         self.active == 0
     }
 
+    /// The comparator this tournament orders its leaves by.
+    #[inline]
+    pub fn comparator(&self) -> &F {
+        &self.cmp
+    }
+
     /// Number of slots still holding a value.
     #[inline]
     #[cfg_attr(

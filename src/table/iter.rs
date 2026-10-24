@@ -431,6 +431,10 @@ pub struct Iter {
     /// Told about every block this iteration reads from the file, as the
     /// index walk inside it is.
     pace: Option<crate::table::util::Pacer>,
+
+    /// The table file this iteration's blocks, and the index partitions it
+    /// walks, are read through.
+    fd: crate::table::util::ScanFd,
 }
 
 impl Iter {
@@ -499,6 +503,7 @@ impl Iter {
             charge: ReadCharge::Foreground,
             read_budget: crate::config::ReadBudget::default(),
             pace: None,
+            fd: crate::table::util::ScanFd::default(),
         }
     }
 
@@ -555,6 +560,18 @@ impl Iter {
     /// loaded directly. Returns `Ok(None)` when a columnar group is wholly
     /// deleted by the positional mask, so the caller skips it.
     fn load_and_resolve(&self, handle: &BlockHandle) -> crate::Result<Option<BlockSource>> {
+        let read = self.fd.lookup();
+        let block = self.load_and_resolve_through(handle, &read)?;
+        self.fd.keep(read);
+        Ok(block)
+    }
+
+    /// [`Self::load_and_resolve`], the block read from the file through `fd`.
+    fn load_and_resolve_through(
+        &self,
+        handle: &BlockHandle,
+        fd: &crate::table::util::LookupFd,
+    ) -> crate::Result<Option<BlockSource>> {
         if self.columnar {
             #[cfg(feature = "columnar")]
             {
@@ -575,7 +592,7 @@ impl Iter {
                     charge: self.charge,
                     budget: self.read_budget,
                     pace: self.pace.as_deref(),
-                    fd: &crate::table::util::LookupFd::default(),
+                    fd,
                 }
                 .load(&crate::table::row_group::PageWant::ALL)?;
                 // What decoding the pages copied out of them, plus the values
@@ -639,7 +656,7 @@ impl Iter {
             &self.metrics,
             self.charge,
             self.pace.as_deref(),
-            &crate::table::util::LookupFd::default(),
+            fd,
         )?;
         DataBlock::from_loaded(raw, self.has_kv_footer).map(|db| Some(BlockSource::Row(db)))
     }
@@ -837,9 +854,15 @@ impl Iter {
         };
 
         let timer = crate::cache::Cache::time_load();
-        let (fd, _cache_event) = self
-            .file_accessor
-            .get_or_open_table(&self.table_id, &self.path)?;
+        let read = self.fd.lookup();
+        let fd = read.resolve(
+            &self.file_accessor,
+            &self.table_id,
+            &self.path,
+            self.charge,
+            #[cfg(feature = "metrics")]
+            &self.metrics,
+        )?;
         let transform = crate::table::block::BlockTransform::from_parts(
             self.compression,
             None,
@@ -852,7 +875,7 @@ impl Iter {
         };
         let block_handle = BlockHandle::new(handle.offset(), handle.size());
         let (_header, frame, recovery) = crate::table::block::Block::read_data_frame(
-            fd.as_ref(),
+            fd,
             block_handle,
             crate::table::block::BlockIdentity {
                 table_id: self.table_id.table_id(),
@@ -875,6 +898,7 @@ impl Iter {
                 }
             },
         )?;
+        self.fd.keep(read);
         // The partial path bypasses `load_block`, so schedule auto-heal here too:
         // an ECC-corrected frame read flags the SST for a healing rewrite (the
         // partial path is non-encrypted by the guard above). This is a primary
@@ -1035,7 +1059,10 @@ impl Iterator for Iter {
         }
 
         loop {
-            let Some(handle) = self.index_iter.next() else {
+            let read = self.fd.lookup();
+            let handle = self.index_iter.next_with(&read);
+            self.fd.keep(read);
+            let Some(handle) = handle else {
                 // No more block handles coming from the index.  Flush any pending items buffered on
                 // the high side (used by reverse iteration) before signalling completion.
                 if let Some(block) = &mut self.hi_data_block
@@ -1171,7 +1198,10 @@ impl DoubleEndedIterator for Iter {
         }
 
         loop {
-            let Some(handle) = self.index_iter.next_back() else {
+            let read = self.fd.lookup();
+            let handle = self.index_iter.next_back_with(&read);
+            self.fd.keep(read);
+            let Some(handle) = handle else {
                 // Once we exhaust the index in reverse order, flush any items that were buffered on
                 // the low side (set when iterating forward first) before signalling completion.
                 if let Some(block) = &mut self.lo_data_block

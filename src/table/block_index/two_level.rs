@@ -241,6 +241,19 @@ impl Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
+        // The partitions this one step reads, until it finds an entry, share
+        // the file.
+        self.next_back_with(&LookupFd::default())
+    }
+}
+
+impl Iter {
+    /// [`DoubleEndedIterator::next_back`], the index partitions read through
+    /// `fd`, which the scan's other block reads share.
+    pub(crate) fn next_back_with(
+        &mut self,
+        fd: &LookupFd,
+    ) -> Option<crate::Result<KeyedBlockHandle>> {
         if self.poisoned {
             return None;
         }
@@ -259,9 +272,6 @@ impl DoubleEndedIterator for Iter {
             }
         }
 
-        // The partitions this one step reads, until it finds an entry, share
-        // the file.
-        let fd = LookupFd::default();
         if let Some(tli) = &mut self.tli {
             loop {
                 let Some(handle) = tli.next_back() else {
@@ -290,7 +300,7 @@ impl DoubleEndedIterator for Iter {
                     &self.metrics,
                     self.charge,
                     self.pace.as_deref(),
-                    &fd,
+                    fd,
                 ) {
                     Ok(b) => b,
                     Err(e) => return self.poison(e),

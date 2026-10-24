@@ -51,6 +51,15 @@ impl FileAccessor {
         matches!(self, Self::DescriptorTable { .. })
     }
 
+    /// The descriptor cache's table epoch: a descriptor resolved under it
+    /// stays current until it changes. A pinned FD never changes.
+    pub(crate) fn table_epoch(&self) -> u64 {
+        match self {
+            Self::DescriptorTable { table, .. } => table.table_epoch(),
+            Self::File(_) | Self::Closed => 0,
+        }
+    }
+
     /// Returns a table FD, opening via [`Fs`] on descriptor-table cache miss.
     ///
     /// Returns `(fd, None)` for pinned FDs (no cache involved),

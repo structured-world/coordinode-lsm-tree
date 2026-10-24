@@ -499,6 +499,12 @@ path = "benches/partial_decode.rs"
 required-features = ["zstd"]
 
 [[bench]]
+name = "scan_split"
+harness = false
+path = "benches/scan_split.rs"
+required-features = []
+
+[[bench]]
 name = "scan_since"
 harness = false
 path = "benches/scan_since.rs"
