@@ -1113,11 +1113,15 @@ fn scan_since_scoped_sees_a_tombstone_a_compaction_cut_past_its_table() -> lsm_t
     for (seqno, key) in (1..).zip([b"a", b"l", b"q", b"z"]) {
         tree.insert(key, vec![0u8; 4_000], seqno);
     }
+    tree.flush_active_memtable(0)?;
+    // The tombstone in a table of its own over the rows, so the compaction
+    // merges the two instead of moving one table down.
     tree.remove_range(b"m", b"r", 5);
     tree.flush_active_memtable(0)?;
     // Outputs smaller than one value: one table per key. Watermark 0 keeps
     // the tombstone.
     tree.major_compact(100, 0)?;
+    assert!(tree.table_count() >= 4, "premise: one output per key");
 
     let all: Vec<ScanSinceEvent> = tree.scan_since_seqno(0)?.collect();
     assert!(
