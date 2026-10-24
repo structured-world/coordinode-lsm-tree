@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792831467400,
+  "lastUpdate": 1792852574877,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -58718,6 +58718,90 @@ window.BENCHMARK_DATA = {
             "value": 309702.32965231006,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 18.1us | P99.9: 106.4us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ea1cbae20753dabc0503370bf6bb262286286d59",
+          "message": "fix(drop-range): never expose an older version of a dropped key (#982)\n\n## Summary\n- `drop_range` no longer brings back a deleted or overwritten value.\nDropping a table inside the bounds could expose an older version of one\nof its keys held by a table that reaches past the bounds, since the\ndropped table's deletion or newer value was what hid it.\n\n## Changes\n- A table inside the bounds is dropped only when every other table over\nthe keys it holds or its range tombstones cover is either dropped with\nit or provably newer than all of it, by the checked seqno ranges the L0\nmove exemption already compares (`proven_older`). A table whose seqno\nrange does not fit the seqno space has unknown age and stays. A kept\ntable keeps the newer tables over its keys, so the check repeats until\nthe set stops changing.\n- The covered extent includes range tombstones that reach past the\ntable's key range.\n- Regression tests in `tests/tree_drop_range.rs`: a deletion, an\noverwrite and a chain of three versions over an older table reaching\npast the bounds, plus overlapping tables wholly inside the bounds that\nstill drop together. A unit test keeps a table of unknown age over an\nolder one.\n\n## Testing\nThe new tests fail without the fix and pass with it. fmt, clippy in\nevery CI configuration, the full nextest suite, doc tests, doc build and\nthe no-std check pass on Linux.\n\nPart of #977",
+          "timestamp": "2026-10-24T17:19:02+03:00",
+          "tree_id": "1cc03f9254a309aa39cac2c64b7140935288c855",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ea1cbae20753dabc0503370bf6bb262286286d59"
+        },
+        "date": 1792852573585,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 50032.00990019697,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 20.5us | P99.9: 39.6us\nthreads: 1 | elapsed: 10.70s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1860711.2840547145,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 506018.5389607305,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 3.6us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 389338.4205433421,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.3us | P99.9: 27.8us\nthreads: 1 | elapsed: 0.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3139446.802160272,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 284896.3332826251,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.5us | P99.9: 17.3us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 165689.32704569842,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 11.9us | P99.9: 28.4us\nthreads: 1 | elapsed: 1.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 580302.1321579901,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.3us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 620928.696662128,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 277806.75263623503,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 18.7us | P99.9: 101.0us\nthreads: 1 | elapsed: 0.72s | num: 200000 | iterations: 3"
           }
         ]
       }
