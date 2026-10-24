@@ -158,9 +158,23 @@ pub(crate) const PACE_PORTION: usize = usize::MAX;
 /// data blocks pays one descriptor-cache access instead of one per block.
 ///
 /// Scoped to one read of one table under one [`ReadCharge`]: it holds the
-/// descriptor only while the read runs.
+/// descriptor only while the read runs. A read taken from a [`ScanFd`] starts
+/// from the descriptor the scan's earlier reads resolved.
 #[derive(Default)]
-pub(crate) struct LookupFd(core::cell::OnceCell<alloc::sync::Arc<dyn crate::fs::FsFile>>);
+pub(crate) struct LookupFd {
+    /// The descriptor this read resolved, with the descriptor cache's epoch
+    /// read just before it was.
+    fd: core::cell::OnceCell<(alloc::sync::Arc<dyn crate::fs::FsFile>, u64)>,
+    held: Option<HeldFd>,
+}
+
+/// A descriptor an earlier read of the same scan resolved, held weakly so it
+/// stays open only as long as the descriptor cache (or the pinned table)
+/// keeps it, with the descriptor cache's epoch at the time it was resolved.
+struct HeldFd {
+    file: alloc::sync::Weak<dyn crate::fs::FsFile>,
+    epoch: u64,
+}
 
 impl LookupFd {
     /// The table's file, resolved on the first call. An untraced read leaves
@@ -173,8 +187,22 @@ impl LookupFd {
         charge: ReadCharge,
         #[cfg(feature = "metrics")] metrics: &Metrics,
     ) -> crate::io::Result<&dyn crate::fs::FsFile> {
-        if let Some(fd) = self.0.get() {
+        if let Some((fd, _)) = self.fd.get() {
             return Ok(fd.as_ref());
+        }
+        // Read before the descriptor is taken, so a removal that lands while
+        // it is taken leaves the descriptor marked as resolved before it.
+        let epoch = file_accessor.table_epoch();
+        // The scan's descriptor is current while nothing has left the
+        // descriptor cache since it was resolved: an in-place heal that
+        // renames a copy over the path evicts the old inode's descriptor, and
+        // a descriptor the cache evicted for room is closed once no read
+        // holds it, which fails the upgrade.
+        if let Some(held) = &self.held
+            && held.epoch == epoch
+            && let Some(fd) = held.file.upgrade()
+        {
+            return Ok(self.fd.get_or_init(|| (fd, epoch)).0.as_ref());
         }
         let fd = Self::open(
             file_accessor,
@@ -184,7 +212,7 @@ impl LookupFd {
             #[cfg(feature = "metrics")]
             metrics,
         )?;
-        Ok(self.0.get_or_init(|| fd).as_ref())
+        Ok(self.fd.get_or_init(|| (fd, epoch)).0.as_ref())
     }
 
     /// The table's file, owned: the one this read resolved, or else taken now,
@@ -197,8 +225,8 @@ impl LookupFd {
         charge: ReadCharge,
         #[cfg(feature = "metrics")] metrics: &Metrics,
     ) -> crate::io::Result<alloc::sync::Arc<dyn crate::fs::FsFile>> {
-        match self.0.into_inner() {
-            Some(fd) => Ok(fd),
+        match self.fd.into_inner() {
+            Some((fd, _)) => Ok(fd),
             None => Self::open(
                 file_accessor,
                 table_id,
@@ -242,6 +270,47 @@ impl LookupFd {
         let _ = cache_event;
 
         Ok(fd)
+    }
+}
+
+/// The table file one scan of one table reads its blocks through, carried
+/// from each block's [`LookupFd`] to the next: the scan takes the descriptor
+/// from the descriptor cache once, rather than once per block it reads from
+/// the file, and takes it again only when it is no longer current.
+#[derive(Default)]
+pub(crate) struct ScanFd(core::cell::Cell<Option<HeldFd>>);
+
+impl ScanFd {
+    /// The read of the scan's next block (or index partition), starting from
+    /// the descriptor its earlier reads resolved.
+    pub(crate) fn lookup(&self) -> LookupFd {
+        LookupFd {
+            fd: core::cell::OnceCell::new(),
+            held: self.0.take(),
+        }
+    }
+
+    /// Keeps the descriptor `read` resolved for the scan's later reads, or the
+    /// one it started from when it needed none (its block came from the
+    /// cache).
+    pub(crate) fn keep(&self, read: LookupFd) {
+        let LookupFd { fd, held } = read;
+        let kept = match (fd.into_inner(), held) {
+            // The read went through the descriptor it started from: kept as
+            // it is, without touching its reference counts again.
+            (Some((file, epoch)), Some(held))
+                if held.epoch == epoch
+                    && core::ptr::addr_eq(held.file.as_ptr(), alloc::sync::Arc::as_ptr(&file)) =>
+            {
+                Some(held)
+            }
+            (Some((file, epoch)), _) => Some(HeldFd {
+                file: alloc::sync::Arc::downgrade(&file),
+                epoch,
+            }),
+            (None, held) => held,
+        };
+        self.0.set(kept);
     }
 }
 

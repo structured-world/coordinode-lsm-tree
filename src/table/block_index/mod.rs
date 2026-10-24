@@ -70,6 +70,19 @@ impl BlockIndexIterImpl {
             Self::TwoLevel(i) => i.next_with(fd),
         }
     }
+
+    /// [`DoubleEndedIterator::next_back`], an index block read from the file
+    /// taken through `fd`, which the scan's other block reads share.
+    pub(crate) fn next_back_with(
+        &mut self,
+        fd: &crate::table::util::LookupFd,
+    ) -> Option<crate::Result<KeyedBlockHandle>> {
+        match self {
+            Self::Full(i) => i.next_back(),
+            Self::Volatile(i) => i.next_back_with(fd),
+            Self::TwoLevel(i) => i.next_back_with(fd),
+        }
+    }
 }
 
 impl BlockIndexIter for BlockIndexIterImpl {

@@ -23,6 +23,11 @@ const FD_CACHE_SHARDS: usize = 16;
 /// Caches file descriptors to tables and blob files
 pub struct DescriptorTable {
     inner: ShardedCache<CacheKey, Item, UnitWeighter, rustc_hash::FxBuildHasher>,
+    /// Advanced after every table descriptor removed: a scan reading through
+    /// a descriptor it resolved under an earlier epoch takes it afresh, so a
+    /// descriptor removed because its path now names another inode (an
+    /// in-place heal's detached copy) is not read through again.
+    table_epoch: portable_atomic::AtomicU64,
 }
 
 impl DescriptorTable {
@@ -39,7 +44,23 @@ impl DescriptorTable {
             rustc_hash::FxBuildHasher,
         );
 
-        Self { inner }
+        Self {
+            inner,
+            table_epoch: portable_atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The table descriptor epoch, see [`Self::remove_for_table`].
+    pub(crate) fn table_epoch(&self) -> u64 {
+        self.table_epoch.load(portable_atomic::Ordering::Acquire)
+    }
+
+    /// Advances the table descriptor epoch after a removal. Release, so a
+    /// read that sees the new epoch also sees the entry gone and takes the
+    /// descriptor the path names now.
+    fn advance_table_epoch(&self) {
+        self.table_epoch
+            .fetch_add(1, portable_atomic::Ordering::Release);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -55,6 +76,7 @@ impl DescriptorTable {
     /// later, tables and blob files alike.
     pub(crate) fn remove_trees_from(&self, first: crate::tree::inner::TreeId) {
         self.inner.remove_where(|key| key.1 >= first);
+        self.advance_table_epoch();
     }
 
     #[must_use]
@@ -87,9 +109,12 @@ impl DescriptorTable {
         self.inner.insert(key, item);
     }
 
+    /// Closes the table's cached descriptor and advances the table descriptor
+    /// epoch, so no scan reads through that descriptor again.
     pub fn remove_for_table(&self, id: &GlobalTableId) {
         let key = CacheKey(TAG_BLOCK, id.tree_id(), id.table_id());
         self.inner.remove(&key);
+        self.advance_table_epoch();
     }
 
     pub fn remove_for_blob_file(&self, id: &GlobalTableId) {
