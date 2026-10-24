@@ -2647,21 +2647,28 @@ impl Tree {
             sources.push(source);
         }
 
-        // SSTs. A table whose key range cannot intersect the scope is skipped
-        // without a single block read — the point of the scoped variant. The
-        // key range is RANGE-TOMBSTONE-SAFE to prune on: every writer keeps
-        // tombstone coverage inside it (a flush conservatively widens the
-        // range over its tombstone spans — see `write_rts_to_writer` — and a
-        // compaction clips its output's tombstones to the table's
-        // responsibility range), so a tombstone overlapping the scope always
-        // sits in a table this loop visits.
+        // SSTs. A table whose key range cannot intersect the scope is not read
+        // — the point of the scoped variant. Its tombstones still are: the key
+        // range does not bound them, since a compaction cuts its outputs'
+        // tombstones at the next output's first key without widening the
+        // range up to it.
         for table in version.iter_tables() {
-            if let Some(bounds) = &ref_bounds
-                && !table
+            let keys_in_scope = ref_bounds.as_ref().is_none_or(|bounds| {
+                table
                     .metadata
                     .key_range
                     .overlaps_with_bounds_cmp(bounds, cmp.as_ref())
-            {
+            });
+            if !keys_in_scope {
+                let mut source = Vec::new();
+                for rt in table.visible_range_tombstones() {
+                    if rt_in_range(&rt) {
+                        source.extend(range_tombstone_event(&rt));
+                    }
+                }
+                if !source.is_empty() {
+                    sources.push(source);
+                }
                 continue;
             }
             // An RT-only table's synthetic weak-tombstone sentinel (the

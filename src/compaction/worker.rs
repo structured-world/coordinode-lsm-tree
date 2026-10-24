@@ -246,9 +246,14 @@ fn remove_superseded_outputs(opts: &Options) {
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     let compaction_state = opts.compaction_state.lock();
     let reclaimed = drop_covered_tables(&compaction_state, opts)?;
+    // The strategy's action, with every table the run took in.
     run_strategy(compaction_state, opts).map(|result| match reclaimed {
         Some(reclaimed) if result.action == CompactionAction::Nothing => reclaimed,
-        _ => result,
+        Some(reclaimed) => CompactionResult {
+            tables_in: result.tables_in + reclaimed.tables_in,
+            ..result
+        },
+        None => result,
     })
 }
 

@@ -2624,6 +2624,52 @@ fn compaction_drop_tables() -> crate::Result<()> {
     Ok(())
 }
 
+/// A run that unlinks the tables a range tombstone spans and then runs its
+/// strategy consumed the tables of both, and says so: the strategy's action,
+/// with every table the run took in.
+#[test]
+fn compaction_reports_reclaimed_tables_with_the_strategys() -> crate::Result<()> {
+    use crate::version::run::Ranged as _;
+
+    struct DropZ;
+
+    impl CompactionStrategy for DropZ {
+        fn get_name(&self) -> &'static str {
+            "DropZ"
+        }
+
+        fn choose(&self, version: &Version, _: &Config, _: &CompactionState) -> Choice {
+            Choice::Drop(
+                version
+                    .iter_tables()
+                    .filter(|t| t.key_range().min().as_ref() == b"z")
+                    .map(crate::Table::id)
+                    .collect(),
+            )
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let tree = crate::Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.insert("k", "v", 1);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("a", "m", 2);
+    tree.flush_active_memtable(0)?;
+    tree.insert("z", "v", 3);
+    tree.flush_active_memtable(0)?;
+
+    let result = tree.compact(Arc::new(DropZ), 3)?;
+
+    assert_eq!(super::CompactionAction::Dropped, result.action);
+    assert_eq!(2, result.tables_in, "the table of k and the table of z");
+    Ok(())
+}
+
 #[test]
 fn blob_file_picking_simple() -> crate::Result<()> {
     struct DropStrategy(Vec<TableId>);

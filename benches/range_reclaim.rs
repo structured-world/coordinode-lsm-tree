@@ -11,7 +11,9 @@
 //! - `idle`: a compaction run that finds nothing to do, the cost every run
 //!   pays for the unlink check, on a tree of many tables;
 //! - `point_read`: reads that find their key on that tree, each checked
-//!   against the range tombstones of the tables around it.
+//!   against the range tombstones of the tables around it;
+//! - `point_read_tombstoned`: the same reads on the same tree after older
+//!   range tombstones spanning its tables, which delete nothing.
 //!
 //! Prints one line per measurement: median, P99 and P999 of the timings, and
 //! the bytes each sample read, wrote and freed.
@@ -170,12 +172,41 @@ fn idle() -> lsm_tree::Result<()> {
         tree.table_count(),
         percentiles(samples),
     );
-    point_reads(&tree)
+    point_reads("point_read", &tree)?;
+    point_reads("point_read_tombstoned", &tombstoned()?.0)
 }
 
-/// Point reads that find their key, on the tree `idle` built: each hit is
-/// checked against the range tombstones of the tables around it.
-fn point_reads(tree: &AnyTree) -> lsm_tree::Result<()> {
+/// The tree `idle` builds, after 40 range tombstones each spanning the keys
+/// of ten of its tables, flushed into a table of their own. They are older
+/// than every row, so they delete nothing, but every hit is checked against
+/// them.
+fn tombstoned() -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
+    const SPANS: u32 = 40;
+    let folder = tempfile::tempdir()?;
+    let tree = open(&folder)?;
+    let width = IDLE_TABLES / SPANS;
+    for span in 0..SPANS {
+        tree.remove_range(
+            day_start(span * width),
+            day_start((span + 1) * width),
+            u64::from(span),
+        );
+    }
+    tree.flush_active_memtable(0)?;
+    let mut seqno = u64::from(SPANS);
+    for table in 0..IDLE_TABLES {
+        for row in 0..100 {
+            tree.insert(day_key(table, row), [b'v'; 100], seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    Ok((tree, folder))
+}
+
+/// Point reads that find their key on a tree built like `idle`'s: each hit
+/// is checked against the range tombstones of the tables around it.
+fn point_reads(label: &str, tree: &AnyTree) -> lsm_tree::Result<()> {
     const BATCH: u32 = 1_000;
     const BATCHES: u32 = 200;
     let mut samples = Vec::new();
@@ -189,7 +220,7 @@ fn point_reads(tree: &AnyTree) -> lsm_tree::Result<()> {
         samples.push(start.elapsed() / BATCH);
     }
     println!(
-        "point_read tables={} l0_runs={} per_get {}",
+        "{label} tables={} l0_runs={} per_get {}",
         tree.table_count(),
         tree.l0_run_count(),
         percentiles(samples),
