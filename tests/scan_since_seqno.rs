@@ -1102,49 +1102,6 @@ fn scan_since_scoped_sees_a_tombstone_reaching_past_the_tables_point_keys() -> l
     Ok(())
 }
 
-/// A compaction cuts a range tombstone at the next output's first key without
-/// widening the table's key range up to it: here the table ending at `l`
-/// keeps the piece `[m, q)` while its key range stops at `l`. A scope inside that gap
-/// must still get the deletion.
-#[test]
-fn scan_since_scoped_sees_a_tombstone_a_compaction_cut_past_its_table() -> lsm_tree::Result<()> {
-    let folder = get_tmp_folder();
-    let tree = open_tree(folder.path())?;
-    for (seqno, key) in (1..).zip([b"a", b"l", b"q", b"z"]) {
-        tree.insert(key, vec![0u8; 4_000], seqno);
-    }
-    tree.flush_active_memtable(0)?;
-    // The tombstone in a table of its own over the rows, so the compaction
-    // merges the two instead of moving one table down.
-    tree.remove_range(b"m", b"r", 5);
-    tree.flush_active_memtable(0)?;
-    // Outputs far below the data: they rotate at every spilled block, so
-    // `a, l` and `q, z` land apart. Watermark 0 keeps the tombstone.
-    tree.major_compact(100, 0)?;
-    assert!(tree.table_count() >= 2, "premise: the outputs split");
-
-    let all: Vec<ScanSinceEvent> = tree.scan_since_seqno(0)?.collect();
-    assert!(
-        all.iter().any(|e| matches!(
-            e,
-            ScanSinceEvent::RangeTombstone { start_key, end_key, seqno: 5 }
-                if start_key.as_ref() == b"m" && end_key.as_ref() == b"q"
-        )),
-        "premise: the table ending at l holds the piece [m, q): {all:?}",
-    );
-
-    let got: Vec<ScanSinceEvent> = tree
-        .scan_since_seqno_in_range(0, b"n".as_slice()..=b"o".as_slice())?
-        .collect();
-    assert!(
-        got.iter()
-            .any(|e| matches!(e, ScanSinceEvent::RangeTombstone { seqno: 5, .. })),
-        "the deletion over the scope must be delivered although no table's key \
-         range reaches it: {got:?}",
-    );
-    Ok(())
-}
-
 /// Key `i` of the range fixtures, ordered as its index.
 fn range_key(i: u32) -> Vec<u8> {
     format!("k{i:05}").into_bytes()

@@ -7462,6 +7462,10 @@ mod cardinality_tests;
 #[expect(clippy::expect_used, reason = "test code")]
 mod scan_since_freeze_tests;
 
+#[cfg(test)]
+#[expect(clippy::expect_used, clippy::panic, reason = "test code")]
+mod scan_since_scope_tests;
+
 #[cfg(all(test, feature = "metrics"))]
 mod cache_stats_tests;
 
