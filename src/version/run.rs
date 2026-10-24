@@ -11,12 +11,13 @@ use once_cell::race::OnceBool;
 
 pub trait Ranged {
     fn key_range(&self) -> &KeyRange;
+}
 
-    /// Whether the item holds range tombstones; items that cannot answer
-    /// `false`.
-    fn holds_range_tombstones(&self) -> bool {
-        false
-    }
+/// An item that knows whether it holds range tombstones. Kept apart from
+/// [`Ranged`] with no default, so no item answers "none" without being asked:
+/// a read skips a run by this answer.
+pub trait HoldsRangeTombstones {
+    fn holds_range_tombstones(&self) -> bool;
 }
 
 /// Item inside a run
@@ -120,6 +121,17 @@ where
     s.get(start..end).expect("should be in range")
 }
 
+impl<T: Ranged + HoldsRangeTombstones> Run<T> {
+    /// Whether any item holds a range tombstone.
+    pub fn holds_range_tombstones(&self) -> bool {
+        self.range_tombstones.get_or_init(|| {
+            self.items
+                .iter()
+                .any(HoldsRangeTombstones::holds_range_tombstones)
+        })
+    }
+}
+
 impl<T: Ranged> Run<T> {
     pub fn new(items: Vec<T>) -> Option<Self> {
         if items.is_empty() {
@@ -130,12 +142,6 @@ impl<T: Ranged> Run<T> {
                 range_tombstones: OnceBool::new(),
             })
         }
-    }
-
-    /// Whether any item holds a range tombstone.
-    pub fn holds_range_tombstones(&self) -> bool {
-        self.range_tombstones
-            .get_or_init(|| self.items.iter().any(Ranged::holds_range_tombstones))
     }
 
     /// The items to change in place; what they hold is asked anew afterwards.

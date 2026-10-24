@@ -6,7 +6,10 @@
 use crate::compaction::state::hidden_set::HiddenSet;
 use crate::comparator::UserComparator;
 use crate::range_tombstone::RangeTombstone;
-use crate::version::{RetentionEffect, Version, run::Ranged};
+use crate::version::{
+    RetentionEffect, Version,
+    run::{HoldsRangeTombstones, Ranged},
+};
 use crate::{HashMap, SeqNo, Table, TableId};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;

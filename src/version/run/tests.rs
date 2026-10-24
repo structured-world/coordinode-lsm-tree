@@ -3,7 +3,7 @@ use test_log::test;
 
 use crate::comparator::DefaultUserComparator;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FakeTable {
     id: u64,
     key_range: KeyRange,
@@ -14,7 +14,9 @@ impl Ranged for FakeTable {
     fn key_range(&self) -> &KeyRange {
         &self.key_range
     }
+}
 
+impl HoldsRangeTombstones for FakeTable {
     fn holds_range_tombstones(&self) -> bool {
         self.tombstones
     }
@@ -76,6 +78,18 @@ fn run_holds_range_tombstones_follows_its_items() {
         !clone.holds_range_tombstones(),
         "a clone asks its own items"
     );
+}
+
+/// A run prints as its items alone: the cached answer is not part of what
+/// the run is, so a run that was asked and one that was not print the same.
+#[test]
+fn run_debug_shows_its_items_not_the_cache() {
+    let items = vec![s(0, "a", "d"), with_tombstone(1, "e", "j")];
+    let expected = format!("Run({items:?})");
+    let asked = run(items.clone());
+    assert!(asked.holds_range_tombstones());
+    assert_eq!(expected, format!("{asked:?}"));
+    assert_eq!(expected, format!("{:?}", run(items)));
 }
 
 /// Reverse comparator for testing non-lexicographic ordering.

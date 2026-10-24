@@ -2,25 +2,29 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 //! Range expiration cost for a time series kept a fixed number of days, one
-//! flushed table per day. Every sample starts from a fresh tree, so samples
-//! repeat one state:
+//! flushed table per day.
+//!
+//! First a report of what expiring costs in bytes, printed directly: every
+//! sample starts from a fresh tree, so its few samples repeat one state and
+//! their timings come with median and maximum only.
 //! - `expire`: deleting the oldest day with a range tombstone, its flush and
-//!   the compaction run that follows, which unlinks the day's table;
+//!   the compaction run that follows, which unlinks the day's table, with
+//!   the bytes it read, wrote and freed;
 //! - `rolling`: ten cycles of writing the next day and expiring the oldest,
 //!   each followed by leveled or size-tiered compactions until they have
 //!   nothing left to do, with the bytes they read and rewrote and how far the
-//!   disk grew;
-//! - `idle`: a compaction run that finds nothing to do, the cost every run
-//!   pays for the unlink check, on a tree of many tables;
+//!   disk grew.
+//!
+//! Then the timings the unlink check adds, through criterion:
+//! - `idle`: a compaction run that finds nothing to do on a tree of many
+//!   tables;
 //! - `point_read`: reads that find their key on that tree, each checked
-//!   against the range tombstones of the tables around it;
+//!   against the range tombstones of the tables around it, with the
+//!   P50/P99/P999 of every get timed alone on stderr;
 //! - `point_read_tombstoned`: the same reads on the same tree after older
 //!   range tombstones spanning its tables, which delete nothing.
-//!
-//! Prints one line per measurement: median and maximum of the timings, P99
-//! and P999 where the sample count resolves them, and the bytes each sample
-//! read, wrote and freed.
 
+use criterion::Criterion;
 use lsm_tree::{
     AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter,
     compaction::{CompactionAction, CompactionStrategy, Fifo, Leveled, SizeTiered},
@@ -32,7 +36,7 @@ const DAYS: u32 = 10;
 const ROWS_PER_DAY: u32 = 20_000;
 const SAMPLES: usize = 10;
 const IDLE_TABLES: u32 = 400;
-const IDLE_RUNS: usize = 2_000;
+const ROWS_PER_TABLE: u32 = 100;
 
 fn day_key(day: u32, row: u32) -> Vec<u8> {
     format!("ts/{day:04}/{row:08}").into_bytes()
@@ -175,99 +179,103 @@ fn rolling(name: &str, strategy: &Arc<dyn CompactionStrategy>) -> lsm_tree::Resu
     Ok(())
 }
 
-fn idle() -> lsm_tree::Result<()> {
+/// A tree of `IDLE_TABLES` flushed tables of `ROWS_PER_TABLE` rows each, and
+/// the next seqno. With `spans` above zero it first holds that many range
+/// tombstones, each spanning the keys of an equal share of the tables, in a
+/// table of their own: older than every row, they delete nothing, but every
+/// hit is checked against them.
+fn many_tables(spans: u32) -> lsm_tree::Result<(AnyTree, tempfile::TempDir, u64)> {
     let folder = tempfile::tempdir()?;
     let tree = open(&folder)?;
     let mut seqno = 0;
+    if spans > 0 {
+        let width = IDLE_TABLES / spans;
+        for span in 0..spans {
+            tree.remove_range(
+                day_start(span * width),
+                day_start((span + 1) * width),
+                seqno,
+            );
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
     for table in 0..IDLE_TABLES {
-        for row in 0..100 {
+        for row in 0..ROWS_PER_TABLE {
             tree.insert(day_key(table, row), [b'v'; 100], seqno);
             seqno += 1;
         }
         tree.flush_active_memtable(0)?;
     }
-    let strategy = nothing();
-    let mut samples = Vec::with_capacity(IDLE_RUNS);
-    for _ in 0..IDLE_RUNS {
-        let start = Instant::now();
-        let result = tree.compact(strategy.clone(), seqno)?;
-        samples.push(start.elapsed());
-        assert_eq!(CompactionAction::Nothing, result.action);
-    }
-    println!(
-        "idle tables={} runs={IDLE_RUNS} {}",
-        tree.table_count(),
-        percentiles(samples),
-    );
-    point_reads("point_read", &tree)?;
-    point_reads("point_read_tombstoned", &tombstoned()?.0)
+    Ok((tree, folder, seqno))
 }
 
-/// The tree `idle` builds, after 40 range tombstones each spanning the keys
-/// of ten of its tables, flushed into a table of their own. They are older
-/// than every row, so they delete nothing, but every hit is checked against
-/// them.
-fn tombstoned() -> lsm_tree::Result<(AnyTree, tempfile::TempDir)> {
-    const SPANS: u32 = 40;
-    let folder = tempfile::tempdir()?;
-    let tree = open(&folder)?;
-    let width = IDLE_TABLES / SPANS;
-    for span in 0..SPANS {
-        tree.remove_range(
-            day_start(span * width),
-            day_start((span + 1) * width),
-            u64::from(span),
+/// A compaction run that finds nothing to do on a tree of many tables: the
+/// cost every run pays for the unlink check.
+fn idle(c: &mut Criterion) {
+    let (tree, _folder, seqno) = many_tables(0).expect("fixture");
+    let strategy = nothing();
+    c.bench_function(
+        &format!("range_reclaim/idle/{}_tables", tree.table_count()),
+        |b| {
+            b.iter(|| {
+                let result = tree.compact(strategy.clone(), seqno).expect("compact");
+                assert_eq!(CompactionAction::Nothing, result.action);
+            });
+        },
+    );
+}
+
+/// The `n`-th key a point read asks for: a walk over every row of every table
+/// in a scattered order, 7,919 being prime to the row count.
+fn read_key(n: u64) -> Vec<u8> {
+    let rows = u64::from(IDLE_TABLES * ROWS_PER_TABLE);
+    let slot = u32::try_from(n.wrapping_mul(7_919) % rows).expect("below the row count");
+    day_key(slot / ROWS_PER_TABLE, slot % ROWS_PER_TABLE)
+}
+
+/// Point reads that find their key on [`many_tables`] with and without older
+/// range tombstones: each hit is checked against the tombstones of the
+/// tables around it. Criterion's pass gives the mean; a second pass times
+/// every get alone and prints the percentiles of all of them.
+fn point_reads(c: &mut Criterion) {
+    for (label, spans) in [("point_read", 0), ("point_read_tombstoned", 40)] {
+        let (tree, _folder, _) = many_tables(spans).expect("fixture");
+        let name = format!(
+            "range_reclaim/{label}/{}_tables_{}_l0_runs",
+            tree.table_count(),
+            tree.l0_run_count(),
+        );
+        let mut n = 0;
+        c.bench_function(&name, |b| {
+            b.iter(|| {
+                n += 1;
+                assert!(tree.get(read_key(n), SeqNo::MAX).expect("get").is_some());
+            });
+        });
+        let mut samples = Vec::new();
+        c.bench_function(&format!("{name}/per_get"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    n += 1;
+                    let key = read_key(n);
+                    let start = Instant::now();
+                    let found = tree.get(key, SeqNo::MAX).expect("get");
+                    let elapsed = start.elapsed();
+                    assert!(found.is_some());
+                    samples.push(elapsed);
+                    total += elapsed;
+                }
+                total
+            });
+        });
+        eprintln!(
+            "{name} per_get n={} {}",
+            samples.len(),
+            percentiles(samples)
         );
     }
-    tree.flush_active_memtable(0)?;
-    let mut seqno = u64::from(SPANS);
-    for table in 0..IDLE_TABLES {
-        for row in 0..100 {
-            tree.insert(day_key(table, row), [b'v'; 100], seqno);
-            seqno += 1;
-        }
-        tree.flush_active_memtable(0)?;
-    }
-    Ok((tree, folder))
-}
-
-/// Point reads that find their key on a tree built like `idle`'s: each hit
-/// is checked against the range tombstones of the tables around it. The
-/// mean over batches of 1,000 gets is the amortized cost; each get timed on
-/// its own gives the tail.
-fn point_reads(label: &str, tree: &AnyTree) -> lsm_tree::Result<()> {
-    const BATCH: u32 = 1_000;
-    const BATCHES: u32 = 200;
-    let key = |n: u32| day_key(n.wrapping_mul(7_919) % IDLE_TABLES, n % 100);
-    let mut batch_means = Vec::new();
-    for batch in 0..BATCHES {
-        let start = Instant::now();
-        for i in 0..BATCH {
-            assert!(tree.get(key(batch * BATCH + i), SeqNo::MAX)?.is_some());
-        }
-        batch_means.push(start.elapsed() / BATCH);
-    }
-    let mut samples = Vec::new();
-    for n in 0..BATCH * BATCHES {
-        let key = key(n);
-        let start = Instant::now();
-        let found = tree.get(key, SeqNo::MAX)?;
-        samples.push(start.elapsed());
-        assert!(found.is_some());
-    }
-    println!(
-        "{label} tables={} l0_runs={} amortized_per_get {}",
-        tree.table_count(),
-        tree.l0_run_count(),
-        percentiles(batch_means),
-    );
-    println!(
-        "{label} tables={} l0_runs={} per_get {}",
-        tree.table_count(),
-        tree.l0_run_count(),
-        percentiles(samples),
-    );
-    Ok(())
 }
 
 fn main() -> lsm_tree::Result<()> {
@@ -276,5 +284,10 @@ fn main() -> lsm_tree::Result<()> {
     rolling("leveled", &leveled)?;
     let tiered: Arc<dyn CompactionStrategy> = Arc::new(SizeTiered::default());
     rolling("size_tiered", &tiered)?;
-    idle()
+
+    let mut c = Criterion::default().configure_from_args();
+    idle(&mut c);
+    point_reads(&mut c);
+    c.final_summary();
+    Ok(())
 }
