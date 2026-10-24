@@ -308,10 +308,10 @@ fn tree_drop_range_keeps_an_overwrite_whose_older_value_stays() -> lsm_tree::Res
 
     tree.drop_range("a".."m")?;
 
-    assert_ne!(
-        Some("old".as_bytes().into()),
+    assert_eq!(
+        Some("new".as_bytes().into()),
         tree.get("k", SeqNo::MAX)?,
-        "the overwritten value came back"
+        "the overwritten value came back or the overwrite was lost"
     );
     Ok(())
 }

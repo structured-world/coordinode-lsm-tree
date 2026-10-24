@@ -1170,12 +1170,13 @@ fn moved_tables<'a>(version: &'a Version, payload: &CompactionPayload) -> Vec<(u
 }
 
 /// Whether everything in `table` is older than everything in `other`, which is
-/// what lets a table leave L0 under a peer that overlaps it.
+/// what lets a table leave L0 under a peer that overlaps it, or drop from under
+/// a newer one.
 ///
 /// A table whose bounds do not translate into the tree's seqno space proves
 /// nothing, so it answers `false`: the exemption exists to let a PROVABLY safe
 /// move through, and no proof means the move is refused like any other overlap.
-fn proven_older(table: &Table, other: &Table) -> bool {
+pub(super) fn proven_older(table: &Table, other: &Table) -> bool {
     match (table.seqno_range(), other.seqno_range()) {
         (Some((_, newest_moved)), Some((oldest_peer, _))) => newest_moved < oldest_peer,
         _ => false,

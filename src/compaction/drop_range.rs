@@ -4,12 +4,16 @@
 
 use super::{Choice, CompactionStrategy};
 use crate::compaction::state::CompactionState;
+use crate::compaction::worker::proven_older;
 use crate::version::Version;
 use crate::{HashSet, Table};
 use crate::{KeyRange, config::Config, slice::Slice, version::run::Ranged};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Debug)]
 pub struct OwnedBounds {
@@ -139,7 +143,8 @@ impl CompactionStrategy for Strategy {
 /// Sequence numbers order the versions of a key, so a table whose lowest one
 /// is above `table`'s highest holds only newer versions, which the drop does
 /// not uncover. A table a bottommost compaction zeroed reads as oldest, so it
-/// keeps whatever overlaps it.
+/// keeps whatever overlaps it, and so does a table whose seqno range does not
+/// fit the seqno space: its age is unknown.
 fn drops_without_exposing(
     table: &Table,
     version: &Version,
@@ -147,13 +152,12 @@ fn drops_without_exposing(
     cmp: &dyn crate::comparator::UserComparator,
 ) -> bool {
     let extent = covered_keys(table, cmp);
-    let highest = table.get_highest_seqno();
     version.iter_levels().flat_map(|lvl| lvl.iter()).all(|run| {
         run.range_overlap_indexes_cmp(&extent, cmp)
             .and_then(|(lo, hi)| run.get(lo..=hi))
             .unwrap_or_default()
             .iter()
-            .all(|other| dropped.contains(&other.id()) || other.get_lowest_seqno() > highest)
+            .all(|other| dropped.contains(&other.id()) || proven_older(table, other))
     })
 }
 
