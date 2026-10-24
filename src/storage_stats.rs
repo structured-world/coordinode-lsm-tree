@@ -887,7 +887,7 @@ pub trait StorageStatistics {
     /// The strategy is a caller argument because the engine does not own a
     /// configured compaction strategy (it is injected per compaction run); a
     /// `&dyn` keeps this object-safe. Returns `0` for strategies without a
-    /// size-target notion of debt (FIFO, drop-range), or when the tree is at or
+    /// size-target notion of debt (FIFO), or when the tree is at or
     /// below its target shape. See
     /// [`CompactionStrategy::pending_compaction_bytes`](crate::compaction::CompactionStrategy::pending_compaction_bytes).
     fn compaction_debt(&self, strategy: &dyn crate::compaction::CompactionStrategy) -> u64;

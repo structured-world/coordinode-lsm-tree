@@ -7,12 +7,12 @@
 pub(crate) mod capacity;
 #[cfg(feature = "columnar")]
 pub(crate) mod carry;
+pub(crate) mod covered;
 pub(crate) mod fifo;
 pub(crate) mod leveled;
 // pub(crate) mod maintenance;
 #[cfg(feature = "std")]
 pub(crate) mod delete_materialize;
-pub(crate) mod drop_range;
 pub mod filter;
 mod flavour;
 pub(crate) mod heal;
@@ -181,7 +181,7 @@ pub trait CompactionStrategy: Send + Sync {
     /// is at or below its target shape.
     ///
     /// The default is `0` for strategies without a size-target notion of debt
-    /// (FIFO, drop-range, major one-shot); the leveled strategy overrides it with
+    /// (FIFO, major one-shot); the leveled strategy overrides it with
     /// the per-level overflow sum.
     fn pending_compaction_bytes(&self, _version: &Version) -> u64 {
         0

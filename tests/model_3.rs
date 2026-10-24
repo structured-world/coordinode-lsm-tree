@@ -61,9 +61,11 @@ fn model_3() -> Result<()> {
     tree.flush_active_memtable(19)?;
     tree.compact(compaction.clone(), 19)?;
 
-    tree.drop_range::<&[u8], _>(..)?;
+    tree.remove_range("a", "z", 11);
+    tree.flush_active_memtable(19)?;
+    tree.compact(compaction.clone(), 41)?;
 
-    assert_eq!(0, tree.table_count());
+    assert_eq!(1, tree.table_count(), "only the tombstone's table stays");
     assert_eq!(0, tree.blob_file_count());
 
     Ok(())

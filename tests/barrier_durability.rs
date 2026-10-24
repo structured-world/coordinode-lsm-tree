@@ -342,8 +342,11 @@ fn an_edit_dropping_a_blob_file_on_another_volume_is_synced_in_full() -> lsm_tre
     assert_eq!(tree.blob_file_count(), 1);
 
     // The tables dropped with it lie on the manifest's volume; only the blob
-    // file is elsewhere.
-    tree.drop_range::<&[u8], _>(..)?;
+    // file is elsewhere. A flushed tombstone below the watermark drops the
+    // table it spans, and its blob file with it.
+    tree.remove_range("a", "z", 1);
+    tree.flush_active_memtable(0)?;
+    tree.compact(Arc::new(lsm_tree::compaction::Fifo::new(u64::MAX, None)), 2)?;
     assert_eq!(tree.blob_file_count(), 0, "the drop removed the blob file");
     let edit_syncs = injector.sync_modes_for("edits-");
     assert_eq!(
