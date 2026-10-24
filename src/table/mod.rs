@@ -9650,6 +9650,11 @@ impl Table {
         } else {
             Vec::new()
         };
+        let range_tombstones_end = range_tombstones
+            .iter()
+            .map(|rt| &rt.end)
+            .max_by(|a, b| comparator.compare(a, b))
+            .cloned();
 
         // Load the optional inner-block layout section (present only when the
         // table has data blocks that split into >= 2 inner zstd blocks). Mirrors
@@ -10063,6 +10068,7 @@ impl Table {
                 last_access_secs: AtomicU64::new(0),
                 probe_stats: once_cell::race::OnceBox::new(),
                 range_tombstones,
+                range_tombstones_end,
                 block_layout,
                 seqno_bounds,
                 zone_map,
@@ -10941,6 +10947,13 @@ impl Table {
         &self.0.range_tombstones
     }
 
+    /// The greatest end of this table's range tombstones, in the tree's key
+    /// order: with the first one's start, the stretch they can cover, which
+    /// may reach past the table's key range. `None` without tombstones.
+    pub(crate) fn range_tombstones_end(&self) -> Option<&UserKey> {
+        self.0.range_tombstones_end.as_ref()
+    }
+
     /// The range tombstones as visible through THIS view: a tight-space
     /// restriction clamps them to the live suffix (`>= bound`). The punched
     /// prefix's deletions belong to the slice output that superseded it, so
@@ -10949,10 +10962,16 @@ impl Table {
     /// cover keys this view no longer owns. Read-path masking keeps using
     /// the raw list — an over-wide tombstone there only masks keys the
     /// restricted view refuses to serve anyway.
-    pub(crate) fn visible_range_tombstones(&self) -> impl Iterator<Item = RangeTombstone> + '_ {
+    /// Borrowed as stored; only a tombstone the restriction clamps is a new
+    /// one.
+    pub(crate) fn visible_range_tombstones(
+        &self,
+    ) -> impl Iterator<Item = alloc::borrow::Cow<'_, RangeTombstone>> + '_ {
+        use alloc::borrow::Cow;
+
         self.0.range_tombstones.iter().filter_map(move |rt| {
             let Some(bound) = self.1.as_ref() else {
-                return Some(rt.clone());
+                return Some(Cow::Borrowed(rt));
             };
             // Live keys are `>= bound`; a tombstone covers `[start, end)`.
             if self.comparator.compare(&rt.end, bound) != core::cmp::Ordering::Greater {
@@ -10960,9 +10979,13 @@ impl Table {
                 return None;
             }
             if self.comparator.compare(&rt.start, bound) == core::cmp::Ordering::Less {
-                return Some(RangeTombstone::new(bound.clone(), rt.end.clone(), rt.seqno));
+                return Some(Cow::Owned(RangeTombstone::new(
+                    bound.clone(),
+                    rt.end.clone(),
+                    rt.seqno,
+                )));
             }
-            Some(rt.clone())
+            Some(Cow::Borrowed(rt))
         })
     }
 

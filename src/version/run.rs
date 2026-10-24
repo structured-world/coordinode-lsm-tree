@@ -7,9 +7,16 @@ use crate::comparator::UserComparator;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
+use once_cell::race::OnceBool;
 
 pub trait Ranged {
     fn key_range(&self) -> &KeyRange;
+
+    /// Whether the item holds range tombstones; items that cannot answer
+    /// `false`.
+    fn holds_range_tombstones(&self) -> bool {
+        false
+    }
 }
 
 /// Item inside a run
@@ -53,14 +60,44 @@ impl<T: Ranged> core::ops::Deref for Indexed<T> {
 }
 
 /// A disjoint run of tables
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Run<T: Ranged>(Vec<T>);
+pub struct Run<T: Ranged> {
+    items: Vec<T>,
+
+    /// Whether an item holds a range tombstone, worked out on the first ask.
+    /// A run is shared by every version it survives into, so the scan runs
+    /// once per run rather than once per reader; every change of the items
+    /// clears it.
+    range_tombstones: OnceBool,
+}
+
+impl<T: Ranged + Clone> Clone for Run<T> {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.clone(),
+            range_tombstones: OnceBool::new(),
+        }
+    }
+}
+
+impl<T: Ranged + PartialEq> PartialEq for Run<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl<T: Ranged + Eq> Eq for Run<T> {}
+
+impl<T: Ranged + core::fmt::Debug> core::fmt::Debug for Run<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Run").field(&self.items).finish()
+    }
+}
 
 impl<T: Ranged> core::ops::Deref for Run<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.items
     }
 }
 
@@ -88,12 +125,23 @@ impl<T: Ranged> Run<T> {
         if items.is_empty() {
             None
         } else {
-            Some(Self(items))
+            Some(Self {
+                items,
+                range_tombstones: OnceBool::new(),
+            })
         }
     }
 
+    /// Whether any item holds a range tombstone.
+    pub fn holds_range_tombstones(&self) -> bool {
+        self.range_tombstones
+            .get_or_init(|| self.items.iter().any(Ranged::holds_range_tombstones))
+    }
+
+    /// The items to change in place; what they hold is asked anew afterwards.
     pub fn inner_mut(&mut self) -> &mut Vec<T> {
-        &mut self.0
+        self.range_tombstones = OnceBool::new();
+        &mut self.items
     }
 
     /// Pushes a table into the run and re-sorts by min key using lexicographic
@@ -111,7 +159,7 @@ impl<T: Ranged> Run<T> {
     /// behavior). Acceptable for typical run sizes (<100 tables); for bulk
     /// insertion use [`Self::extend`] followed by [`Self::sort_by_cmp`].
     pub fn push_cmp<C: UserComparator + ?Sized>(&mut self, item: T, cmp: &C) {
-        self.0.push(item);
+        self.inner_mut().push(item);
         self.sort_by_cmp(cmp);
     }
 
@@ -119,35 +167,35 @@ impl<T: Ranged> Run<T> {
     /// after the tables with an equal min key: the run a [`Self::push_cmp`]
     /// would leave, without sorting it again.
     pub fn insert_sorted_cmp<C: UserComparator + ?Sized>(&mut self, item: T, cmp: &C) {
-        let at = self.0.partition_point(|x| {
+        let at = self.items.partition_point(|x| {
             cmp.compare(x.key_range().min(), item.key_range().min()) != core::cmp::Ordering::Greater
         });
-        self.0.insert(at, item);
+        self.inner_mut().insert(at, item);
     }
 
     /// Sorts the run by min key using the provided user comparator.
     ///
     /// Use after [`Self::extend`] to re-establish ordering in a single pass.
     pub fn sort_by_cmp<C: UserComparator + ?Sized>(&mut self, cmp: &C) {
-        self.0
+        self.items
             .sort_by(|a, b| cmp.compare(a.key_range().min(), b.key_range().min()));
     }
 
     /// Appends items without re-sorting. Callers must ensure the run remains
     /// sorted (e.g. via [`Self::sort_by_cmp`] after all items are added).
     pub fn extend(&mut self, items: Vec<T>) {
-        self.0.extend(items);
+        self.inner_mut().extend(items);
     }
 
     pub fn retain<F>(&mut self, f: F)
     where
         F: FnMut(&T) -> bool,
     {
-        self.0.retain(f);
+        self.inner_mut().retain(f);
     }
 
     pub fn remove(&mut self, idx: usize) -> T {
-        self.0.remove(idx)
+        self.inner_mut().remove(idx)
     }
 
     /// Returns the table that may possibly contains the given key.
@@ -165,7 +213,7 @@ impl<T: Ranged> Run<T> {
     /// use the same comparator to maintain the invariant.
     pub fn get_for_key_cmp<C: UserComparator + ?Sized>(&self, key: &[u8], cmp: &C) -> Option<&T> {
         self.index_for_key_cmp(key, cmp)
-            .and_then(|idx| self.0.get(idx))
+            .and_then(|idx| self.items.get(idx))
     }
 
     /// The position of the table [`Self::get_for_key_cmp`] returns.
@@ -178,7 +226,7 @@ impl<T: Ranged> Run<T> {
             cmp.compare(x.key_range().max(), key) == core::cmp::Ordering::Less
         });
 
-        self.0
+        self.items
             .get(idx)
             .filter(|x| cmp.compare(x.key_range().min(), key) != core::cmp::Ordering::Greater)
             .map(|_| idx)
@@ -264,7 +312,7 @@ impl<T: Ranged> Run<T> {
     {
         use core::cmp::Ordering;
 
-        let level = &self.0;
+        let level = &self.items;
 
         let lo = match key_range.start_bound() {
             Bound::Unbounded => 0,

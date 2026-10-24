@@ -1802,10 +1802,6 @@ impl AbstractTree for BlobTree {
         self.index.weak_tombstone_reclaimable_count()
     }
 
-    fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()> {
-        self.index.drop_range(range)
-    }
-
     fn clear(&self) -> crate::Result<()> {
         let config = self.tree_config();
         let mut versions = self.get_version_history_lock();

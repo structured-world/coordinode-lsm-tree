@@ -122,6 +122,10 @@ impl Ranged for Table {
     fn key_range(&self) -> &KeyRange {
         &self.metadata.key_range
     }
+
+    fn holds_range_tombstones(&self) -> bool {
+        !self.range_tombstones().is_empty()
+    }
 }
 
 pub struct GenericLevel<T: Ranged> {

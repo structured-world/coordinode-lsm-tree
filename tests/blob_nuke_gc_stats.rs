@@ -2,7 +2,20 @@ use lsm_tree::{
     AbstractTree, KvSeparationOptions, SeqNo, SequenceNumberCounter, blob_tree::FragmentationEntry,
     get_tmp_folder,
 };
+use std::sync::Arc;
 use test_log::test;
+
+/// Deletes every key of these trees with a range tombstone at `seqno`, flushes
+/// it and drops the tables it spans in a compaction just above it.
+fn reclaim_all(tree: &lsm_tree::AnyTree, seqno: SeqNo) -> lsm_tree::Result<()> {
+    tree.remove_range("a", "z", seqno);
+    tree.flush_active_memtable(0)?;
+    tree.compact(
+        Arc::new(lsm_tree::compaction::Fifo::new(u64::MAX, None)),
+        seqno + 1,
+    )?;
+    Ok(())
+}
 
 #[test]
 fn blob_tree_nuke_gc_stats() -> lsm_tree::Result<()> {
@@ -31,12 +44,12 @@ fn blob_tree_nuke_gc_stats() -> lsm_tree::Result<()> {
         assert_eq!(1, tree.table_count());
         assert_eq!(1, tree.blob_file_count());
 
-        tree.drop_range::<&[u8], _>(..)?;
+        reclaim_all(&tree, 1)?;
 
         // NOTE: Because the blob does not have any incoming references anymore
         // it is pruned from the Version
         assert_eq!(0, tree.blob_file_count());
-        assert_eq!(0, tree.table_count());
+        assert_eq!(1, tree.table_count(), "only the tombstone's table stays");
 
         let gc_stats = tree.current_version().gc_stats().clone();
 
@@ -83,12 +96,12 @@ fn blob_tree_nuke_gc_stats_multi() -> lsm_tree::Result<()> {
         assert_eq!(1, tree.table_count());
         assert_eq!(1, tree.blob_file_count());
 
-        tree.drop_range::<&[u8], _>(..)?;
+        reclaim_all(&tree, 2)?;
 
         // NOTE: Because the blob does not have any incoming references anymore
         // it is pruned from the Version
         assert_eq!(0, tree.blob_file_count());
-        assert_eq!(0, tree.table_count());
+        assert_eq!(1, tree.table_count(), "only the tombstone's table stays");
 
         let gc_stats = tree.current_version().gc_stats().clone();
 

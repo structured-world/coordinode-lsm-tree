@@ -188,7 +188,7 @@ fn a_reopened_kv_separated_tree_keeps_its_blobs_through_a_power_loss() {
 }
 
 /// A tree that lived holds its history in its edit log even when no table is
-/// left (a dropped range, the retention floor it raised): a lost snapshot
+/// left (a clear, the retention floor it raised): a lost snapshot
 /// over that log is refused, never taken for a fresh folder and created over.
 /// The tree has rotated, so no log of the creation's generation is left to
 /// stand in the way of a new one.
@@ -210,7 +210,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
             tree.insert(format!("key{i}"), "value", i);
             tree.flush_active_memtable(0).expect("flush");
         }
-        tree.drop_range::<&[u8], _>(..).expect("drop");
+        tree.clear().expect("clear");
     }
     // The tree's path as the tree spells it: absolute (on Windows, with a
     // drive).
@@ -232,7 +232,7 @@ fn an_open_without_a_snapshot_refuses_a_log_holding_edits() {
     }
     assert_eq!(
         logs_with_edits, 1,
-        "self-check: a rotated generation's log holds the drop"
+        "self-check: a rotated generation's log holds the clear"
     );
 
     assert!(
@@ -506,7 +506,7 @@ fn an_open_without_a_snapshot_refuses_a_rotated_generations_empty_log() {
             .expect("create");
         tree.insert("key", "value", 0);
         tree.flush_active_memtable(0).expect("flush");
-        tree.drop_range::<&[u8], _>(..).expect("drop");
+        tree.clear().expect("clear");
     }
     let db = std::path::absolute(DB).expect("absolute path");
     assert!(

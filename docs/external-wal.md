@@ -254,7 +254,8 @@ observe the repaired-but-not-yet-reconciled state.
 **Snapshots below the retention boundary stay refused.** A live tree refuses
 a snapshot read at or below its retention floor
 (`Error::SnapshotBelowRetention`): a compaction's GC watermark, a `clear`, a
-table drop (`drop_range`, FIFO eviction) or a filtering compaction each raise
+table drop (the tables a range tombstone spans, FIFO eviction) or a
+filtering compaction each raise
 that boundary, and the manifest carries it across a normal reopen. A repair
 rebuilds the manifest from the tables, which do not record it, so record
 `retention_floor()` in your own durable state whenever you record the trim

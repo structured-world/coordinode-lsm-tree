@@ -244,8 +244,50 @@ fn remove_superseded_outputs(opts: &Options) {
 }
 
 fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
-    let mut compaction_state = opts.compaction_state.lock();
+    let compaction_state = opts.compaction_state.lock();
+    let reclaimed = drop_covered_tables(&compaction_state, opts)?;
+    // The strategy's action, with every table the run took in.
+    run_strategy(compaction_state, opts).map(|result| match reclaimed {
+        Some(reclaimed) if result.action == CompactionAction::Nothing => reclaimed,
+        Some(reclaimed) => CompactionResult {
+            tables_in: result.tables_in + reclaimed.tables_in,
+            ..result
+        },
+        None => result,
+    })
+}
 
+/// Drops, before the strategy chooses, every table a range tombstone deletes
+/// for every reader at the watermark. Unlinking reads nothing, while a merge
+/// that picked those tables first would read and rewrite them only to discard
+/// every row.
+fn drop_covered_tables(
+    compaction_state: &CompactionGuard<'_>,
+    opts: &Options,
+) -> crate::Result<Option<CompactionResult>> {
+    // A clone of the version, so the scan runs without the history lock.
+    let version = opts
+        .version_history
+        .read()
+        .latest_version_ref()
+        .version
+        .clone();
+    let covered = super::covered::covered_tables(
+        &version,
+        opts.gc_watermark,
+        compaction_state.hidden_set(),
+        opts.config.comparator.as_ref(),
+    );
+    let Some((ids, effect)) = covered else {
+        return Ok(None);
+    };
+    drop_tables(compaction_state, opts, &ids, effect).map(Some)
+}
+
+fn run_strategy(
+    mut compaction_state: CompactionGuard<'_>,
+    opts: &Options,
+) -> crate::Result<CompactionResult> {
     let version_history_lock = opts.version_history.read();
 
     // A strategy that drops tables counts what the drop frees, and a blob file
@@ -345,7 +387,15 @@ fn run_compaction(opts: &Options) -> crate::Result<CompactionResult> {
             drop(version_history_lock);
 
             let ids = payload.into_iter().collect::<Vec<_>>();
-            drop_tables(compaction_state, opts, &ids)
+            // Whole tables go (FIFO / TTL eviction): the rows every older
+            // snapshot saw in them are gone, so no snapshot up to this install
+            // is servable.
+            drop_tables(
+                &compaction_state,
+                opts,
+                &ids,
+                crate::version::RetentionEffect::DropsData,
+            )
         }
         Choice::DoNothing => {
             log::trace!("Compactor chose to do nothing");
@@ -1170,13 +1220,12 @@ fn moved_tables<'a>(version: &'a Version, payload: &CompactionPayload) -> Vec<(u
 }
 
 /// Whether everything in `table` is older than everything in `other`, which is
-/// what lets a table leave L0 under a peer that overlaps it, or drop from under
-/// a newer one.
+/// what lets a table leave L0 under a peer that overlaps it.
 ///
 /// A table whose bounds do not translate into the tree's seqno space proves
 /// nothing, so it answers `false`: the exemption exists to let a PROVABLY safe
 /// move through, and no proof means the move is refused like any other overlap.
-pub(super) fn proven_older(table: &Table, other: &Table) -> bool {
+fn proven_older(table: &Table, other: &Table) -> bool {
     match (table.seqno_range(), other.seqno_range()) {
         (Some((_, newest_moved)), Some((oldest_peer, _))) => newest_moved < oldest_peer,
         _ => false,
@@ -4568,16 +4617,19 @@ impl super::carry::CarrySink for FlavourSink<'_> {
     }
 }
 
+/// Unlinks `ids_to_drop` in one version edit whose `effect` says what the drop
+/// owes older snapshots.
 fn drop_tables(
-    compaction_state: CompactionGuard<'_>,
+    compaction_state: &CompactionGuard<'_>,
     opts: &Options,
     ids_to_drop: &[TableId],
+    effect: crate::version::RetentionEffect,
 ) -> crate::Result<CompactionResult> {
     // Nothing to drop: no version edit either. Installing an empty drop would
     // cost a manifest append AND raise the persisted retention floor to an
     // install that removed nothing, refusing every older snapshot after a
-    // reopen for no reason. A strategy that picks no table (a `drop_range`
-    // with no fully contained SST) is a no-op, not a drop.
+    // reopen for no reason. A strategy that picks no table is a no-op, not a
+    // drop.
     if ids_to_drop.is_empty() {
         return Ok(CompactionResult::nothing());
     }
@@ -4655,10 +4707,7 @@ fn drop_tables(
         &*opts.config.fs,
         opts.runtime_config.load_full(),
         opts.encryption.clone(),
-        // Whole tables go (drop-range, FIFO / TTL eviction): the rows every
-        // older snapshot saw in them are gone, so no snapshot up to this
-        // install is servable.
-        crate::version::RetentionEffect::DropsData,
+        effect,
     )?;
 
     // Still under the write lock that published the drop: a reference read
@@ -4684,8 +4733,6 @@ fn drop_tables(
     }
 
     let tables_dropped = ids_to_drop.len();
-
-    drop(compaction_state);
 
     log::trace!("Dropped {tables_dropped} tables");
 
