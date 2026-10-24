@@ -260,8 +260,15 @@ fn drop_covered_tables(
     compaction_state: &CompactionGuard<'_>,
     opts: &Options,
 ) -> crate::Result<Option<CompactionResult>> {
+    // A clone of the version, so the scan runs without the history lock.
+    let version = opts
+        .version_history
+        .read()
+        .latest_version_ref()
+        .version
+        .clone();
     let covered = super::covered::covered_tables(
-        &opts.version_history.read().latest_version_ref().version,
+        &version,
         opts.gc_watermark,
         compaction_state.hidden_set(),
         opts.config.comparator.as_ref(),

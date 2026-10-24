@@ -3751,21 +3751,18 @@ impl Tree {
         // Check SST table range tombstones.
         //
         // Per-table RT lists are sorted by start key (using comparator) on load,
-        // so binary search narrows candidates to RTs with start <= key.
-        // The key_range early reject uses the comparator so it works with
-        // non-lexicographic orderings.
+        // so binary search narrows candidates to RTs with start <= key. A
+        // table's key range does not bound its tombstones (a compaction cuts
+        // them at the next output's first key without widening the range up
+        // to it), so it rejects nothing here; a scan takes them from every
+        // table alike.
         for table in super_version
             .version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())
+            .filter(|run| run.holds_range_tombstones())
             .flat_map(|run| run.iter())
             .filter(|t| !t.range_tombstones().is_empty())
-            .filter(|t| {
-                // Early reject: skip tables whose key range doesn't contain the key.
-                let kr = &t.metadata.key_range;
-                comparator.compare(kr.min(), key) != core::cmp::Ordering::Greater
-                    && comparator.compare(key, kr.max()) != core::cmp::Ordering::Greater
-            })
         {
             let rts = table.range_tombstones();
 

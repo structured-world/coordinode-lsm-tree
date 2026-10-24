@@ -193,6 +193,48 @@ fn remove_range_reclaim_survives_a_reopen() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// Reverses the byte order of keys.
+struct ReverseComparator;
+
+impl lsm_tree::UserComparator for ReverseComparator {
+    fn name(&self) -> &'static str {
+        "reverse"
+    }
+
+    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        b.cmp(a)
+    }
+}
+
+/// Spans and overlaps follow the tree's comparator: under a reversed order
+/// the tombstone `[d, a)` holds `d`, `c` and `b`, whose tables go, while in
+/// byte order it would be empty.
+#[test]
+fn remove_range_reclaims_in_the_trees_key_order() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .comparator(Arc::new(ReverseComparator))
+    .open()?;
+    populate_tables(&tree)?;
+    tree.remove_range("d", "a", 6);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 7)?;
+
+    assert_eq!(3, result.tables_in, "the tables of d, c and b go");
+    for key in ["b", "c", "d"] {
+        assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+    }
+    for key in ["a", "e"] {
+        assert!(tree.contains_key(key, SeqNo::MAX)?, "{key} was lost");
+    }
+    Ok(())
+}
+
 /// Four overlapping L0 tables of `j` and `k`, written at seqnos 1 to 4.
 fn overlapping_l0(tree: &AnyTree) -> lsm_tree::Result<()> {
     for seqno in 1..=4 {

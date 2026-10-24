@@ -5,8 +5,9 @@
 
 use crate::compaction::state::hidden_set::HiddenSet;
 use crate::comparator::UserComparator;
+use crate::range_tombstone::RangeTombstone;
 use crate::version::{RetentionEffect, Version, run::Ranged};
-use crate::{HashMap, SeqNo, TableId};
+use crate::{HashMap, SeqNo, Table, TableId};
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::ops::Bound;
@@ -18,8 +19,8 @@ use core::ops::Bound;
 /// A table goes when a tombstone `R` held by another table
 /// - is visible at the watermark (`R.seqno < gc_watermark`),
 /// - is newer than every version and tombstone in it (`newest < R.seqno`), and
-/// - spans its whole key range, which the writer widens over the table's own
-///   range tombstones, so dropping it uncovers nothing `R` does not cover too.
+/// - spans its key range and the spans of its own range tombstones, so
+///   dropping it uncovers nothing `R` does not cover too.
 ///
 /// Only tombstones in tables count: one still in a memtable is not durable
 /// until its flush, and a drop that survived a crash the tombstone did not
@@ -40,8 +41,15 @@ pub fn covered_tables(
     let mut covered: HashMap<TableId, SeqNo> = HashMap::default();
 
     for holder in version
-        .iter_tables()
-        .filter(|t| !t.range_tombstones().is_empty())
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .filter(|run| run.holds_range_tombstones())
+        .flat_map(|run| run.iter())
+        .filter(|t| t.holds_range_tombstones())
+        // A tombstone in a table with a base seqno is read as local to it by
+        // a scan and as stored by a point read; with no agreed age it proves
+        // nothing. The engine's own writers give such tables no tombstones.
+        .filter(|t| t.global_seqno() == 0)
     {
         for rt in holder.visible_range_tombstones() {
             if !rt.visible_at(gc_watermark) {
@@ -70,8 +78,7 @@ pub fn covered_tables(
                     if newest >= rt.seqno {
                         continue;
                     }
-                    let range = table.key_range();
-                    if !rt.fully_covers_with(range.min(), range.max(), cmp) {
+                    if !spans_whole(&rt, table, cmp) {
                         continue;
                     }
                     covered
@@ -89,6 +96,22 @@ pub fn covered_tables(
     let mut ids: Vec<TableId> = covered.into_keys().collect();
     ids.sort_unstable();
     Some((ids, RetentionEffect::GcBelow(floor + 1)))
+}
+
+/// Whether `rt` spans every key `table` answers for: its key range, and the
+/// range tombstones it holds, which can reach past that range (a compaction
+/// cuts them at the next output's first key without widening the range up to
+/// it). Dropping the table drops those tombstones, so `rt` must hide all they
+/// hid.
+fn spans_whole(rt: &RangeTombstone, table: &Table, cmp: &dyn UserComparator) -> bool {
+    use core::cmp::Ordering::Greater;
+
+    let range = table.key_range();
+    rt.fully_covers_with(range.min(), range.max(), cmp)
+        && table.range_tombstones().iter().all(|own| {
+            cmp.compare(&rt.start, &own.start) != Greater
+                && cmp.compare(&own.end, &rt.end) != Greater
+        })
 }
 
 #[cfg(test)]

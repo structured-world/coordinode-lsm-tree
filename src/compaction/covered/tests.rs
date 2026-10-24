@@ -178,6 +178,65 @@ fn covered_keeps_a_table_whose_seqno_range_overflows() -> crate::Result<()> {
     Ok(())
 }
 
+/// A table's own tombstones can reach past its key range (a compaction cuts
+/// them at the next output's first key without widening the range up to
+/// it), and dropping the table drops them: a newer tombstone over its keys
+/// but not over those spans would uncover what they hid in older tables.
+#[test]
+fn covered_keeps_a_table_whose_own_tombstone_reaches_past_the_cover() -> crate::Result<()> {
+    let fs = fs()?;
+    let reaching = table(&fs, 1, &["b"], 1, &[("b", "q", 2)], 0)?;
+    assert_eq!(
+        reaching.key_range().max().as_ref(),
+        b"b",
+        "premise: the own tombstone reaches past the key range"
+    );
+    let version = version(vec![
+        table(&fs, 2, &["z"], 6, &[("a", "m", 5)], 0)?,
+        reaching,
+    ]);
+
+    assert_eq!(None, covered(&version, 20));
+    Ok(())
+}
+
+/// A point read consults a table's range tombstones wherever they reach, not
+/// only inside its key range: a compaction can cut a tombstone at the next
+/// output's first key without widening the range up to it, and a scan
+/// already honours such a tombstone, so a point read that skipped it would
+/// return a key the scan reports deleted.
+#[test]
+fn point_read_honours_a_tombstone_past_its_tables_key_range() -> crate::Result<()> {
+    use crate::{memtable::Memtable, version::SuperVersion};
+
+    let fs = fs()?;
+    let reaching = table(&fs, 1, &["b"], 3, &[("b", "q", 5)], 0)?;
+    assert_eq!(
+        reaching.key_range().max().as_ref(),
+        b"b",
+        "premise: the tombstone reaches past the key range"
+    );
+    let comparator = crate::comparator::default_comparator();
+    let super_version = SuperVersion {
+        active_memtable: Arc::new(Memtable::new(0, comparator.clone())),
+        sealed_memtables: Arc::default(),
+        version: version(vec![reaching, table(&fs, 2, &["o"], 1, &[], 0)?]),
+        seqno: 0,
+    };
+
+    assert!(
+        crate::Tree::is_suppressed_by_range_tombstones(
+            &super_version,
+            b"o",
+            1,
+            SeqNo::MAX,
+            comparator.as_ref(),
+        ),
+        "o lies under the tombstone [b, q)@5 and is older than it"
+    );
+    Ok(())
+}
+
 /// A table's own tombstone never drops it: its seqno counts in the table's
 /// bounds, so the table is never older than it.
 #[test]
