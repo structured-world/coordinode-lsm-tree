@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792852580398,
+  "lastUpdate": 1792852584741,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -62164,6 +62164,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.556971952,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ea1cbae20753dabc0503370bf6bb262286286d59",
+          "message": "fix(drop-range): never expose an older version of a dropped key (#982)\n\n## Summary\n- `drop_range` no longer brings back a deleted or overwritten value.\nDropping a table inside the bounds could expose an older version of one\nof its keys held by a table that reaches past the bounds, since the\ndropped table's deletion or newer value was what hid it.\n\n## Changes\n- A table inside the bounds is dropped only when every other table over\nthe keys it holds or its range tombstones cover is either dropped with\nit or provably newer than all of it, by the checked seqno ranges the L0\nmove exemption already compares (`proven_older`). A table whose seqno\nrange does not fit the seqno space has unknown age and stays. A kept\ntable keeps the newer tables over its keys, so the check repeats until\nthe set stops changing.\n- The covered extent includes range tombstones that reach past the\ntable's key range.\n- Regression tests in `tests/tree_drop_range.rs`: a deletion, an\noverwrite and a chain of three versions over an older table reaching\npast the bounds, plus overlapping tables wholly inside the bounds that\nstill drop together. A unit test keeps a table of unknown age over an\nolder one.\n\n## Testing\nThe new tests fail without the fix and pass with it. fmt, clippy in\nevery CI configuration, the full nextest suite, doc tests, doc build and\nthe no-std check pass on Linux.\n\nPart of #977",
+          "timestamp": "2026-10-24T17:19:02+03:00",
+          "tree_id": "1cc03f9254a309aa39cac2c64b7140935288c855",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ea1cbae20753dabc0503370bf6bb262286286d59"
+        },
+        "date": 1792852583368,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 534.1700000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 83.622242ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 166.408,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 62.783056ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 464.526,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 104.746332ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4595.25,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 12920.736,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.895,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 86.704127,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.600688843,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.111,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 72.286207,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.581215403,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
