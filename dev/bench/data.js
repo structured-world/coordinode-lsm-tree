@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792831463327,
+  "lastUpdate": 1792831467400,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -61144,6 +61144,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.603950354,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "37deb1b5c4b7ed854ef470c77600468e6e9cee46",
+          "message": "perf(scan): close the uncompressed full-scan gap (#981)\n\n## Summary\n\n- A full forward scan of an uncompressed tree drops most of its per-row\ncost above the table reader: a scan with one source reads it without the\nmerger, and a table holding one version of each key without version\ngrouping either.\n- Merging several sources costs less per row: no copy of the comparator\nper step, and key comparisons decided by the leading bytes a key holds\nin place.\n- A table scan takes the table's descriptor once instead of once per\nblock it reads from the file.\n- `benches/scan_split.rs` attributes a scan's cost to its parts, without\ncriterion, and reports the file work of each scan.\n\n## Changes\n\n- `SeekingMerger`: the parked-head check orders by the tournament's own\ncomparator instead of a comparator copied on every step; under a\nbytewise comparator the tournament compares keys directly rather than\nthrough the shared comparator's dynamic call.\n- `ByteView::cmp` first compares the leading bytes held in place as one\nbig-endian word, and the full bytes only when those agree;\n`ByteView::fused` writes a short key straight into the inline form.\n- Version grouping compares two held keys on their own representation\n(`comparator::same_held_key`) instead of a byte-slice `memcmp` per row.\n- `TreeIter::create_range`: a memtable holding no row is no source (its\nrange tombstones still apply); a lone source is read without the merger;\na lone table or run whose writer counted as many distinct keys as rows,\nwith no merge operator set, is read without version grouping, a lone\ntable as its own reader type with one predicate for the snapshot and\ntombstones.\n- A table scan takes the table's file from the descriptor cache at its\nfirst block read from the file and reads its later blocks and index\npartitions through it, row and columnar alike. It holds the descriptor\nweakly, so it stays open only while the cache keeps it, and only while\nthe cache's table epoch is unchanged: every removal from the cache\nadvances it, so after an in-place heal renames a copy over the table's\npath the scan takes the file afresh.\n- `Metrics` gains public counts of descriptor-cache lookups and of table\nfile opens; the columnar-only recorders are built with `columnar` only.\n\n## Measurements\n\n`scan_split` (ns per row, 1k / 10k / 70k rows, 16 MiB cache, 70k\noverflows it):\n\n| | before | after |\n|---|---|---|\n| Linux, `tree` | 193 / 195 / 301 | 103 / 103 / 211 |\n| Linux, 8 tables | 232 / 227 / 351 | 187 / 182 / 310 |\n| Linux, 3 versions per key | 470 / 523 / 1002 | 343 / 375 / 856 |\n| Windows, `tree` | 158 / 155 / 297 | 92 / 92 / 225 |\n| Linux, 10-row scans, one table | 385 / 397 / 411 | 239 / 254 / 268 |\n| Linux, 10-row scans, 8 tables | 1314 / 1425 / 1529 | 1253 / 1379 /\n1462 |\n\nRocksDB head-to-head (`tools/compare-rocksdb`, `rocksdb-parity`, Linux),\nours / RocksDB for `range_scan`: 1.19 / 1.23 / 0.83 before, 0.50 / 0.54\n/ 0.52 after; `range_scan_zstd22` 0.64 to 0.49. `seek_random`,\n`major_compact_zstd3` and `multi_get` also get faster; `point_read` is\nunchanged in an interleaved run.\n\nAt 70k rows one scan loads each block from the file once and takes the\ntable's descriptor from the cache once, with no file opens. The\nshort-scan arms also report p50 / p99 / p999 per scan. A read-ahead\nwindow that copies each frame out of a larger read was measured at 64\nKiB to 2 MiB and left out: it was 2-4% slower on the single-version\nscan.\n\n## Testing\n\nFormat, clippy (default and all features), nextest (default and all\nfeatures), doc tests, rustdoc, the no-std and aarch64 checks, the tools\nand the i686 lib tests pass on Linux. New tests cover a lone table of\none version per key against its snapshot and tombstones in both\ndirections, a lone table of several versions, merge operands in a lone\ntable, a range deletion in a memtable with no rows, a read error inside\na run of several tables, the order of views against the order of their\nbytes, and a scan's descriptor: taken once per scan in both directions,\ntaken again after the cache drops it, never kept open by the scan.\n\nCloses #942\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved scan behavior for single-table and single-version data,\nreducing unnecessary work while preserving snapshot visibility,\ntombstones, and forward and reverse iteration.\n  * Improved key comparison and table-file access during scans.\n* **New Features**\n* Added a benchmark for comparing scan patterns, including short scans\nand multi-version data.\n  * Added metrics for cached and uncached table-file opens.\n* **Documentation**\n* Clarified data-block sizing limits and how row-major and columnar\ntables configure block sizes.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-24T11:28:56+03:00",
+          "tree_id": "21cdeed2d6aa7877039ff7fb94087dd2a503991b",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/37deb1b5c4b7ed854ef470c77600468e6e9cee46"
+        },
+        "date": 1792831466138,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 507.134,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 80.327622ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 167.044,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.811247ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 449.654,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.076584ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3901.5679999999998,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 10809.062,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.775,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 66.256895,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.548898153,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.711,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 69.861375,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.556971952,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
