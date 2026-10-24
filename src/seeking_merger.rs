@@ -77,7 +77,11 @@ struct MergerEntry {
 struct MinCmp<C: UserComparator + Clone> {
     comparator: C,
     /// The comparator orders keys as their bytes do, so keys are compared
-    /// directly rather than through it.
+    /// directly rather than through it. Taken from
+    /// [`UserComparator::is_lexicographic`], whose contract is that the
+    /// comparator equals a byte comparison; `InternalKey`'s own order and
+    /// `compare_with` then agree, both ordering by user key and then by
+    /// descending seqno.
     lexicographic: bool,
 }
 

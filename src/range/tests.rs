@@ -491,6 +491,50 @@ fn a_lone_table_of_one_version_per_key_still_resolves_merge_operands() -> crate:
     Ok(())
 }
 
+/// A run of several tables read as one source still hands out a read error of
+/// one of its tables, rather than dropping it as a row its snapshot does not
+/// see.
+#[expect(clippy::expect_used, reason = "test code")]
+#[test]
+fn a_read_error_in_a_run_of_several_tables_reaches_the_scan() -> crate::Result<()> {
+    use crate::{AbstractTree, Cache, Config, Guard, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    // Nothing cached, so the scan reads every block from the file.
+    .use_cache(alloc::sync::Arc::new(Cache::with_capacity_bytes(0)))
+    .open()?;
+    for from in [0u64, 1_000, 2_000] {
+        for i in from..from + 100 {
+            tree.insert(format!("k{i:04}"), "v", i + 1);
+        }
+        tree.flush_active_memtable(0)?;
+        tree.compact(alloc::sync::Arc::new(crate::compaction::MoveDown(0, 1)), 0)?;
+    }
+    let version = tree.current_version();
+    let level = version.level(1).expect("L1");
+    assert_eq!(level.iter().count(), 1, "the case under test: one run");
+    let run = level.iter().next().expect("the run");
+    assert_eq!(run.len(), 3, "the case under test: of three tables");
+    assert_eq!(tree.iter(crate::SeqNo::MAX, None).count(), 300);
+
+    let middle = run.get(1).expect("a middle table");
+    let mut bytes = std::fs::read(&*middle.path)?;
+    // The data blocks come first; a byte a little way in lands in one of them.
+    *bytes.get_mut(64).expect("a byte of the first data block") ^= 0xFF;
+    std::fs::write(&*middle.path, &bytes)?;
+
+    let failed = tree
+        .iter(crate::SeqNo::MAX, None)
+        .any(|guard| guard.key().is_err());
+    assert!(failed, "the corrupt block's error must reach the scan");
+    Ok(())
+}
+
 /// A range deletion held by a memtable with no row in it still deletes the
 /// rows a table holds under it, though the memtable is no source of the scan.
 #[test]

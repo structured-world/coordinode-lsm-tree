@@ -524,7 +524,15 @@ fn views_order_as_their_bytes_do() {
         }
     }
 
-    let whole = ByteView::from([7u8; 40].as_slice());
+    // Distinct bytes, so a sub-view whose prefix came from the wrong place in
+    // the buffer orders differently; cut at every start, so prefixes are taken
+    // from inside the buffer, and on both sides of the inline length.
+    let whole_bytes: Vec<u8> = (0..40u8).map(|b| b.wrapping_mul(37)).collect();
+    let whole = ByteView::from(whole_bytes.as_slice());
+    let sub_views = (0..40usize).flat_map(|begin| {
+        let (whole, whole_bytes) = (&whole, &whole_bytes);
+        (begin..=40).map(move |end| (whole_bytes[begin..end].to_vec(), whole.slice(begin..end)))
+    });
     let views: Vec<(Vec<u8>, ByteView)> = keys
         .iter()
         .map(|k| (k.clone(), ByteView::from(k.as_slice())))
@@ -532,7 +540,7 @@ fn views_order_as_their_bytes_do() {
             let (left, right) = k.split_at(k.len() / 2);
             (k.clone(), ByteView::fused(left, right))
         }))
-        .chain((0..40).map(|end| (vec![7u8; end], whole.slice(..end))))
+        .chain(sub_views)
         .collect();
 
     for (a_bytes, a) in &views {
