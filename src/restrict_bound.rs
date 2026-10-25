@@ -168,36 +168,148 @@ pub(crate) fn publish_raw(
     content: &[u8],
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
-    // Write to a sidecar-specific `.restrict-bound.tmp` and atomically rename it
-    // onto the live path. A dedicated temp suffix (not a generic `.tmp_*`) lets
-    // tree recovery recognize and sweep an abandoned temp in the tables folder by
+    publish_many(&[(fs, table_path, content)], sync_mode)
+        .pop()
+        .unwrap_or(Ok(()))
+}
+
+/// One sidecar [`write_many`] publishes: the table's file, its encryption,
+/// its id and its bound.
+pub(crate) struct SidecarWrite<'a> {
+    pub fs: &'a dyn Fs,
+    pub table_path: &'a Path,
+    pub encryption: Option<&'a dyn EncryptionProvider>,
+    pub table_id: u64,
+    pub bound: &'a [u8],
+}
+
+/// [`write()`] for several tables at once, as one tight-space slice restricts
+/// them: each sidecar is written and synced, then renamed, and each folder
+/// they share synced once. A sidecar is durable once its folder's sync
+/// returns, so each write's result is its own; no punch may rely on one that
+/// failed.
+pub(crate) fn write_many(
+    writes: &[SidecarWrite<'_>],
+    sync_mode: SyncMode,
+) -> Vec<crate::Result<()>> {
+    let encoded: Vec<crate::Result<Vec<u8>>> = writes
+        .iter()
+        .map(|w| {
+            if w.bound.len() > u16::MAX as usize {
+                return Err(crate::Error::InvalidHeader(
+                    "restriction bound exceeds the maximum key length",
+                ));
+            }
+            let plain = serialize(w.table_id, w.bound);
+            match w.encryption {
+                Some(enc) => Ok(enc.encrypt(&plain)?),
+                None => Ok(plain),
+            }
+        })
+        .collect();
+    // One publish per encoded sidecar, in order.
+    let published = {
+        let items: Vec<(&dyn Fs, &Path, &[u8])> = writes
+            .iter()
+            .zip(&encoded)
+            .filter_map(|(w, content)| {
+                content
+                    .as_ref()
+                    .ok()
+                    .map(|content| (w.fs, w.table_path, content.as_slice()))
+            })
+            .collect();
+        publish_many(&items, sync_mode)
+    };
+    let mut published = published.into_iter();
+    encoded
+        .into_iter()
+        .map(|content| match content {
+            Err(e) => Err(e),
+            Ok(_) => published.next().unwrap_or(Ok(())),
+        })
+        .collect()
+}
+
+/// A folder [`publish_many`] synced, and the failure its sync ended in.
+struct FolderSync<'a> {
+    fs: &'a dyn Fs,
+    folder: &'a Path,
+    failure: Option<(crate::io::ErrorKind, alloc::string::String)>,
+}
+
+/// Publishes each `(fs, table_path, content)` through the synced
+/// `temp + rename` protocol: every temp written and synced, then every one
+/// renamed, then each folder the renames share synced once. The result of
+/// each is its own: a failure at any step fails that sidecar, and a failed
+/// folder sync fails every sidecar renamed into that folder. A failed publish
+/// leaves no partial sidecar (the temp is removed best-effort).
+fn publish_many(items: &[(&dyn Fs, &Path, &[u8])], sync_mode: SyncMode) -> Vec<crate::Result<()>> {
+    // A sidecar-specific `.restrict-bound.tmp`, atomically renamed onto the
+    // live path. A dedicated temp suffix (not a generic `.tmp_*`) lets tree
+    // recovery recognize and sweep an abandoned temp in the tables folder by
     // name, instead of failing to parse it as a table id.
-    let path = sidecar_path(table_path);
-    let tmp = sidecar_tmp_path(table_path);
-    let publish = (|| -> crate::Result<()> {
-        let mut file = fs.open(
-            &tmp,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
-        )?;
-        file.write_all(content)?;
-        file.flush()?;
-        crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
-        drop(file);
-        // `std::fs::rename` REPLACES an existing destination FILE on every
-        // supported platform (on Windows via MOVEFILE_REPLACE_EXISTING /
-        // POSIX-semantics rename; only a destination DIRECTORY fails there),
-        // so re-publishing over an earlier slice's sidecar is atomic
-        // everywhere — no remove-then-rename window.
-        fs.rename(&tmp, &path)?;
-        if let Some(parent) = path.parent() {
-            fs.sync_directory_with(parent, sync_mode)?;
+    let mut results: Vec<crate::Result<()>> = items
+        .iter()
+        .map(|&(fs, table_path, content)| {
+            let mut file = fs.open(
+                &sidecar_tmp_path(table_path),
+                &FsOpenOptions::new().write(true).create(true).truncate(true),
+            )?;
+            file.write_all(content)?;
+            file.flush()?;
+            crate::fs::FsFile::sync_all_with(&*file, sync_mode)?;
+            Ok(())
+        })
+        .collect();
+    for (result, &(fs, table_path, _)) in results.iter_mut().zip(items) {
+        if result.is_ok() {
+            // `std::fs::rename` REPLACES an existing destination FILE on every
+            // supported platform (on Windows via MOVEFILE_REPLACE_EXISTING /
+            // POSIX-semantics rename; only a destination DIRECTORY fails
+            // there), so re-publishing over an earlier slice's sidecar is
+            // atomic everywhere, with no remove-then-rename window.
+            *result = fs
+                .rename(&sidecar_tmp_path(table_path), &sidecar_path(table_path))
+                .map_err(crate::Error::from);
         }
-        Ok(())
-    })();
-    if publish.is_err() {
-        let _ = fs.remove_file(&tmp);
     }
-    publish
+    // Each folder once, on the backend that holds it, with how its sync ended.
+    let mut synced: Vec<FolderSync<'_>> = Vec::new();
+    for (result, &(fs, table_path, _)) in results.iter_mut().zip(items) {
+        let Some(parent) = table_path.parent() else {
+            continue;
+        };
+        if result.is_err() {
+            continue;
+        }
+        let failure = if let Some(seen) = synced
+            .iter()
+            .find(|seen| core::ptr::addr_eq(seen.fs, fs) && seen.folder == parent)
+        {
+            seen.failure.clone()
+        } else {
+            let failure = fs
+                .sync_directory_with(parent, sync_mode)
+                .err()
+                .map(|e| (e.kind(), alloc::format!("{e}")));
+            synced.push(FolderSync {
+                fs,
+                folder: parent,
+                failure: failure.clone(),
+            });
+            failure
+        };
+        if let Some((kind, message)) = failure {
+            *result = Err(crate::Error::from(crate::io::Error::new(kind, message)));
+        }
+    }
+    for (result, &(fs, table_path, _)) in results.iter().zip(items) {
+        if result.is_err() {
+            let _ = fs.remove_file(&sidecar_tmp_path(table_path));
+        }
+    }
+    results
 }
 
 /// The largest on-disk size a VALID sidecar can have: header + bound + checksum

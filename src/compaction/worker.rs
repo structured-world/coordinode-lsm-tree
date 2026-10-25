@@ -2503,6 +2503,12 @@ fn run_tight_space_compaction(
             // deliberately never deduplicated across sources, so an operand in the
             // consumed prefix WOULD be applied twice. Hence the republish on open —
             // never punch without the sidecar, and never leave it missing for good.
+            //
+            // The slice's sidecars are published together: each written and
+            // synced, then renamed, then their folder synced once rather than
+            // once per input. Each is durable when that sync returns, and each
+            // input's punch waits for its own.
+            let mut restricted: Vec<(&Table, &UserKey)> = Vec::new();
             for view in &current_views {
                 if removed_ids.contains(&view.id()) {
                     view.mark_as_deleted();
@@ -2521,45 +2527,54 @@ fn run_tight_space_compaction(
                         .find(|(id, _)| *id == view.id())
                         .and_then(|(_, restricted)| restricted.restrict_lower_bound())
                         .unwrap_or(boundary);
-                    match view.write_restrict_sidecar(bound, opts.config.sync_mode) {
-                        Ok(()) => match view.punch_offset_for(bound) {
-                            Ok(off) => view.mark_punch_on_drop(off),
-                            // Post-commit, so a punch-offset lookup failure is non-fatal,
-                            // exactly like the sidecar-write failure below: the restriction
-                            // is already durable (manifest + sidecar), so leave the input
-                            // unpunched and let a later compaction reclaim it. Propagating
-                            // `?` here would abort an already-committed slice.
-                            Err(e) => log::error!(
-                                "tight-space could not resolve the punch offset for table \
+                    restricted.push((view, bound));
+                }
+            }
+            let writes: Vec<_> = restricted
+                .iter()
+                .map(|(view, bound)| view.restrict_sidecar_write(bound))
+                .collect();
+            let published = crate::restrict_bound::write_many(&writes, opts.config.sync_mode);
+            drop(writes);
+            for ((view, bound), result) in restricted.into_iter().zip(published) {
+                match result {
+                    Ok(()) => match view.punch_offset_for(bound) {
+                        Ok(off) => view.mark_punch_on_drop(off),
+                        // Post-commit, so a punch-offset lookup failure is non-fatal,
+                        // exactly like the sidecar-write failure below: the restriction
+                        // is already durable (manifest + sidecar), so leave the input
+                        // unpunched and let a later compaction reclaim it. Propagating
+                        // `?` here would abort an already-committed slice.
+                        Err(e) => log::error!(
+                            "tight-space could not resolve the punch offset for table \
                                  {} after committing its restriction: {e}; leaving the input \
                                  unpunched, a later compaction reclaims it",
-                                view.id(),
-                            ),
-                        },
-                        // On a LATER slice of the same input, this failure leaves
-                        // the PREVIOUS slice's sidecar in place — valid but
-                        // stale (a lower bound). Deliberately left there: a
-                        // manifest-loss repair before the next open then
-                        // restricts to that lower bound and republishes only the
-                        // newly consumed interval beside the slice output — the
-                        // same already-tolerated duplication class as a FIRST
-                        // slice's failure (whole unpunched input republished),
-                        // and strictly less of it. REMOVING the stale sidecar
-                        // gains nothing and can lose data: the punch geometry
-                        // re-derives the SAME lower bound (the holes end where
-                        // that slice punched), while a backend that cannot
-                        // prove holes then classifies the zeroed prefix as
-                        // damage and salvage drops live rows the slice output
-                        // does not carry. With the manifest alive, the next
-                        // open replaces a DISAGREEING sidecar from the
-                        // manifest's bound, which closes this window.
-                        Err(e) => log::error!(
-                            "tight-space could not write the restrict-bound sidecar for \
-                             table {} after committing its restriction: {e}; leaving the \
-                             input unpunched, a later compaction rewrites it",
                             view.id(),
                         ),
-                    }
+                    },
+                    // On a LATER slice of the same input, this failure leaves
+                    // the PREVIOUS slice's sidecar in place — valid but
+                    // stale (a lower bound). Deliberately left there: a
+                    // manifest-loss repair before the next open then
+                    // restricts to that lower bound and republishes only the
+                    // newly consumed interval beside the slice output — the
+                    // same already-tolerated duplication class as a FIRST
+                    // slice's failure (whole unpunched input republished),
+                    // and strictly less of it. REMOVING the stale sidecar
+                    // gains nothing and can lose data: the punch geometry
+                    // re-derives the SAME lower bound (the holes end where
+                    // that slice punched), while a backend that cannot
+                    // prove holes then classifies the zeroed prefix as
+                    // damage and salvage drops live rows the slice output
+                    // does not carry. With the manifest alive, the next
+                    // open replaces a DISAGREEING sidecar from the
+                    // manifest's bound, which closes this window.
+                    Err(e) => log::error!(
+                        "tight-space could not write the restrict-bound sidecar for \
+                             table {} after committing its restriction: {e}; leaving the \
+                             input unpunched, a later compaction rewrites it",
+                        view.id(),
+                    ),
                 }
             }
             // Arm each re-opened stale blob file's prior view to punch its

@@ -1647,6 +1647,72 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     Ok(())
 }
 
+/// The views a tight-space pass restricts a file to one after another punch
+/// only above what the view before finished, from the aligned edge under it,
+/// instead of the whole prefix on every slice; together they still cover it.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn successive_views_punch_only_above_what_the_last_one_finished() -> crate::Result<()> {
+    use super::inner::PUNCH_ALIGN;
+    use crate::fs::Fs;
+
+    let fault = crate::fs::FaultFs::new(crate::fs::MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(4_096);
+    for i in 0..20_000u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 100],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let first = {
+        let mut params = test_recover_params(path, checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
+
+    // Slice 1 restricts the file at k005000, slice 2 at k010000.
+    let second = first.reopen_restricted(b"k005000".to_vec().into())?;
+    let off1 = first.punch_offset_for(b"k005000")?;
+    first.mark_punch_on_drop(off1);
+    drop(first);
+    let third = second.reopen_restricted(b"k010000".to_vec().into())?;
+    let off2 = second.punch_offset_for(b"k010000")?;
+    second.mark_punch_on_drop(off2);
+    drop(second);
+    drop(third);
+
+    let punches = injector.punches_for("db/0");
+    let floor = off1 - off1 % PUNCH_ALIGN;
+    let (second_view, first_view): (Vec<_>, Vec<_>) =
+        punches.iter().copied().partition(|(o, len)| o + len > off1);
+    assert!(
+        second_view.iter().all(|(o, _)| *o >= floor),
+        "the second view punches only from {floor} up: {punches:?}",
+    );
+    let covered = |extents: &[(u64, u64)]| extents.iter().map(|(_, len)| len).sum::<u64>();
+    assert_eq!(
+        off1,
+        covered(&first_view),
+        "the first view punched its prefix"
+    );
+    assert_eq!(
+        off2 - floor,
+        covered(&second_view),
+        "the second view punched the rest, from the aligned edge",
+    );
+    Ok(())
+}
+
 /// The prefix punch calls cover exactly the given spans, highest first, and
 /// cut them only at multiples of the chunk, so no call ends mid-page except at
 /// a span's own ends; the gap between two spans is never punched.

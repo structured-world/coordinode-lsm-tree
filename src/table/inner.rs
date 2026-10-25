@@ -98,6 +98,14 @@ pub struct Inner {
     /// old view is unreachable. Cumulative across slices and idempotent.
     pub(crate) punch_on_drop: AtomicU64,
 
+    /// How far this file's data region is known punched, shared by the views
+    /// of the file a tight-space pass restricts it to one after another: each
+    /// view punches only above what an earlier one finished, rather than the
+    /// whole prefix again on every slice. Raised only by a punch that
+    /// completed; one deferred or stopped by a failure leaves it, so the next
+    /// view punches that range too.
+    pub(crate) punched_through: once_cell::race::OnceBox<Arc<AtomicU64>>,
+
     pub(super) checksum: Checksum,
 
     pub(super) global_seqno: SeqNo,
@@ -514,6 +522,17 @@ impl Drop for Inner {
                     }
                 }
             }
+            // An earlier view of this file punched everything below the floor;
+            // from the 64 KiB edge under it, so the page its punch ended in is
+            // freed now that the rest of it is consumed too.
+            let floor = self.punched_through.get().map_or(0, |punched| {
+                punched.load(core::sync::atomic::Ordering::Acquire)
+            });
+            let floor = floor - floor % PUNCH_ALIGN;
+            spans.retain_mut(|span| {
+                span.0 = span.0.max(floor);
+                span.0 < span.1
+            });
             let reclaimable = punch_extents_top_down(&spans);
 
             // An IN-PROGRESS checkpoint's window covers the link step, so a
@@ -588,8 +607,10 @@ impl Drop for Inner {
                 }
             }
 
+            let mut completed = true;
             for (at, &(extent_off, len)) in reclaimable.iter().enumerate() {
                 if let Err(e) = self.fs.punch_hole(&self.path, extent_off, len) {
+                    completed = false;
                     log::warn!(
                         "Failed to punch tight-space extent at {extent_off} of table {global_id:?} at {:?}; \
                          stopping the reclaim to keep the hole pattern classifiable: {e:?}",
@@ -609,9 +630,17 @@ impl Drop for Inner {
                     break;
                 }
             }
+            if completed && let Some(punched) = self.punched_through.get() {
+                punched.fetch_max(off, core::sync::atomic::Ordering::Release);
+            }
         }
     }
 }
+
+/// The edge a punch above an earlier one starts from: a multiple of every
+/// page size a filesystem uses, so the page the earlier punch ended in is
+/// covered whole.
+pub const PUNCH_ALIGN: u64 = 64 * 1_024;
 
 /// The extent of one prefix punch call: chunk edges fall on its multiples, so
 /// every page between two of them is freed whatever the page size.

@@ -5428,6 +5428,23 @@ impl Table {
         Ok(())
     }
 
+    /// The sidecar write [`Self::write_restrict_sidecar`] makes, for
+    /// [`crate::restrict_bound::write_many`] to publish with the other tables a
+    /// slice restricts, under the same ordering.
+    #[cfg(feature = "std")]
+    pub(crate) fn restrict_sidecar_write<'a>(
+        &'a self,
+        bound: &'a [u8],
+    ) -> crate::restrict_bound::SidecarWrite<'a> {
+        crate::restrict_bound::SidecarWrite {
+            fs: &*self.fs,
+            table_path: &self.path,
+            encryption: self.encryption.as_deref(),
+            table_id: self.metadata.id,
+            bound,
+        }
+    }
+
     /// Publishes this table's tight-space restriction lower bound to its
     /// `.restrict-bound` sidecar, so manifest repair recovers the exact bound
     /// WITHOUT the SST itself being mutated (which would invalidate the whole-file
@@ -10063,6 +10080,7 @@ impl Table {
                 is_deleted: AtomicBool::default(),
                 entry_durable: AtomicBool::default(),
                 punch_on_drop: AtomicU64::new(u64::MAX),
+                punched_through: once_cell::race::OnceBox::new(),
 
                 checksum,
                 global_seqno,
@@ -10256,6 +10274,15 @@ impl Table {
         if let Some(pause) = self.0.deletion_pause.get() {
             reopened.install_deletion_pause(Arc::clone(pause));
         }
+        // How far the file is punched is the file's, not a view's.
+        let punched = self
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::new(AtomicU64::new(0))));
+        reopened
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::clone(punched)));
         #[cfg(all(feature = "std", feature = "page_ecc"))]
         reopened.install_heal_lock(self.heal_lock_arc());
         // The heal-hint sink too: a correctable read from the restricted view
