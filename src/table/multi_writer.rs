@@ -2502,7 +2502,12 @@ impl MultiWriter {
                     .last_key
                     .as_ref()
                     .and_then(|last| crate::range_tombstone::upper_bound_exclusive(last));
-                // Nothing lies above a last key with no successor.
+                // Under a comparator other than byte order the successor may
+                // sort before the last key: no key between the two exists, so
+                // the pieces still cover everything past the last key, and the
+                // output holding them shares that key with the last output and
+                // joins another run when the version lays them out. Nothing
+                // lies above a last key with no successor.
                 let Some(past_last) = past_last.as_ref() else {
                     return Vec::new();
                 };

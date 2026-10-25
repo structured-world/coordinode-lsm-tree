@@ -82,6 +82,10 @@ use run::Ranged;
 /// in the first run it follows without overlap. A compaction's outputs of
 /// range tombstones alone may lie past its last output of rows, or end on the
 /// key its first one starts with: a key range's largest key is inclusive.
+/// Under a comparator other than byte order one may also start at the byte
+/// successor of the last output's last key, which can sort before that key:
+/// no key strictly past another can be named for an arbitrary order, so the
+/// two share that key and go to two runs here.
 fn runs_of_new_tables(tables: &[Table], cmp: &dyn UserComparator) -> Vec<Run<Table>> {
     let follows = |before: &Table, after: &Table| {
         cmp.compare(before.key_range().max(), after.key_range().min()) == core::cmp::Ordering::Less
