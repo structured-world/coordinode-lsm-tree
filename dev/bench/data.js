@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792922817807,
+  "lastUpdate": 1792952530250,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64120,6 +64120,90 @@ window.BENCHMARK_DATA = {
             "value": 210445.66348579063,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 14.4us | P99.9: 474.6us\nthreads: 1 | elapsed: 0.95s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a4fc08135b94930d41386fafaf70e08e9b41ec10",
+          "message": "feat(layout): caller-defined key domains no table or blob file spans (#987)\n\n## Summary\n- `Config::key_domains` takes a caller-defined `KeyDomains` policy,\nintervals of the key space such as retention epochs of time-bucketed\nkeys. Flush, ingest and compaction never put rows of two domains in one\ntable, and a key-value separated tree never puts values of two in one\nblob file, so a range tombstone over an expired domain removes its files\nwhole instead of rewriting the survivors that would share them.\n- A compaction no longer drops range tombstone pieces that a table\noutside it still needs. Each output was cut to its own keys, so under\nparallel sub-compactions a tombstone could reach no output at a\nsub-range's edge, and the rows it deleted in a deeper level read back.\nThis happened with or without key domains.\n\n## Changes\n- `KeyDomains::domain_end(key)`: the first key past `key`'s domain in\nthe tree's comparator order. Nothing is written to disk; a table holds\none domain when its key range does, so tables from before the policy, or\nunder another one, are judged the same way, and the policy may change on\nreopen.\n- `MultiWriter` ends an output at a domain's end whatever its size, in\nrow writes, columnar group carries and columnar ingest batches (one\nblock per domain). An output's share of the range tombstones stops at\nits domain's end; the pieces beyond go to tables of tombstones alone,\nwhich may span domains holding no row.\n- The blob `MultiWriter` closes every open file, those a lifetime class\nswitch keeps open included, before a value of the next domain.\n- Compaction passes each writer the tombstones a table outside the\ncompaction overlaps, with the keys that writer answers for; the writer\nkeeps their pieces below its first key and past its last one, within\nthose keys, in tables of tombstones alone. A tombstone nothing outside\noverlaps is clipped as before. The tables outside are merged into\ndisjoint key spans once per compaction, so each tombstone is a binary\nsearch.\n- Such a table may lie past the rows' table or end on its first key, so\na version change lays its new tables out in sorted, disjoint runs\nwhatever order they arrive in. The run's lineage chain still follows key\norder (the pieces below the first output go ahead of it), which manifest\nrepair relies on when it unions a surviving chain's ranges.\n- `benches/key_domains_retention.rs`: rolling retention in one tree, in\none tree with domains, and in a tree per epoch, with expiry; it checks\nevery retained row reads back and no expired one does. Benches that use\n`tempfile` require the `std` feature.\n- `docs/key-domains.md`, the README and `docs/INVARIANTS.md`.\n\n## Measurements\n`key_domains_retention`, median of three rounds on ext4 (bytes, space\nand table counts identical in every round). 102.5 MiB of payload, 4 MiB\nmemtables, 1% of each epoch arriving during the next.\n\n| shape | layout | written MiB | write amp. | epoch peak / end MiB |\ndescriptors | reopen ms |\n|---|---|---|---|---|---|---|\n| 48 epochs, 12 retained | one tree | 516.2 | 5.03 | 41.3 / 36.9 | 1 |\n9.3 |\n| | one tree, domains | 314.9 | 3.07 | 28.6 / 28.4 | 1 | 6.5 |\n| | tree per epoch | 106.1 | 1.03 | 28.6 / 28.6 | 13 | 58.3 |\n| 8 epochs, 2 retained | one tree | 464.8 | 4.53 | 52.2 / 52.2 | 1 | 8.1\n|\n| | one tree, domains | 404.7 | 3.95 | 39.1 / 39.1 | 1 | 9.7 |\n| | tree per epoch | 364.4 | 3.55 | 39.4 / 39.4 | 3 | 39.6 |\n\nDomains give one tree the space of a tree per epoch (23% and 25% less at\nthe end than without them, 31% and 25% at the epoch peak) and 39% and\n13% fewer written bytes. A tree per epoch writes less where an epoch is\nsmaller than a memtable, since it flushes the epoch once, and pays a\ndescriptor and a manifest per epoch and a 4 to 9 times slower reopen. On\nbtrfs the space and the ranking are the same.\n\nBefore the compaction fix the one-tree layout failed the bench's own\ncheck: four expired epochs read back in full.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, aarch64,\nthe tool crates, the benches and the i686 builds pass on Linux. The\nrolling-expiry regression test and the domain tests for flushed and\ncompacted range tombstones fail on the code before the change.\n\nCloses #976",
+          "timestamp": "2026-10-25T18:07:38Z",
+          "tree_id": "127fcde58df84eb9f55d94d6a1f3c345419a9264",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/a4fc08135b94930d41386fafaf70e08e9b41ec10"
+        },
+        "date": 1792952529049,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 87668.43321071075,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.0us | P99.9: 24.3us\nthreads: 1 | elapsed: 6.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1829210.7283136048,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.9us\nthreads: 1 | elapsed: 0.11s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 613617.1864257865,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 12.7us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 440670.89437949983,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.1us | P99.9: 33.1us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3051730.3387313862,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 7.0us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 303138.08193813567,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.7us | P99.9: 15.8us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189435.52659127608,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.7us | P99.9: 19.8us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 660603.5896683792,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.1us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 752691.8282638001,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 8.5us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 297468.62101309747,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.0us | P99.9: 89.0us\nthreads: 1 | elapsed: 0.67s | num: 200000 | iterations: 3"
           }
         ]
       }
