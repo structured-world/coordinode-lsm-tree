@@ -16,9 +16,11 @@
 //!
 //! Per layout it prints the bytes the process wrote (`/proc/self/io`, the
 //! filesystem's view, not the device's), the allocated bytes at their peak
-//! and at the end, the tables and open descriptors at the end, the time to
-//! reopen, and the wall time. It checks that every retained
-//! row reads back and no expired one does.
+//! among the epoch ends and at the end, the tables and open descriptors at the
+//! end, the time to reopen, and the wall time. The peak is sampled once each
+//! epoch settles, so a compaction holding its inputs and outputs at once may
+//! briefly take more. It checks that every retained row reads back and no
+//! expired one does.
 //!
 //! Linux only: the counters come from `/proc`.
 
@@ -136,17 +138,18 @@ mod cases {
         out
     }
 
-    /// A `/proc/self/<file>` field, by its label.
+    /// A `/proc/self/<file>` field, by its label. A missing one stops the
+    /// bench: a zero would read as a measurement.
     fn proc_field(file: &str, label: &str) -> u64 {
-        std::fs::read_to_string(format!("/proc/self/{file}"))
-            .ok()
-            .and_then(|text| {
-                text.lines().find_map(|line| {
-                    let rest = line.strip_prefix(label)?;
-                    rest.split_whitespace().next()?.parse().ok()
-                })
+        let path = format!("/proc/self/{file}");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path} unreadable (task I/O accounting off?): {e}"));
+        text.lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix(label)?;
+                rest.split_whitespace().next()?.parse().ok()
             })
-            .unwrap_or(0)
+            .unwrap_or_else(|| panic!("{path} has no `{label}` field"))
     }
 
     fn written_bytes() -> u64 {
@@ -420,11 +423,11 @@ mod cases {
                 mib(payload),
             );
             println!(
-                "{:<18} {:>11} {:>8} {:>10} {:>9} {:>7} {:>5} {:>10} {:>7}",
+                "{:<18} {:>11} {:>8} {:>14} {:>9} {:>7} {:>5} {:>10} {:>7}",
                 "layout",
                 "written MiB",
                 "WA",
-                "peak MiB",
+                "epoch peak MiB",
                 "end MiB",
                 "tables",
                 "fds",
@@ -441,7 +444,7 @@ mod cases {
                 }
                 let o = run_case(case, layout)?;
                 println!(
-                    "{:<18} {:>11.1} {:>8.2} {:>10.1} {:>9.1} {:>7} {:>5} {:>10.1} {:>7.2}",
+                    "{:<18} {:>11.1} {:>8.2} {:>14.1} {:>9.1} {:>7} {:>5} {:>10.1} {:>7.2}",
                     layout.name(),
                     mib(o.written),
                     o.written as f64 / payload as f64,

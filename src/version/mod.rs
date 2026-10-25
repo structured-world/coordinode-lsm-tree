@@ -77,6 +77,38 @@ fn place_runs(
 }
 use run::Ranged;
 
+/// The runs a change's new tables join a level as: one when they come sorted
+/// and disjoint, as rows written in key order do; otherwise sorted, each table
+/// in the first run it follows without overlap. A compaction's outputs of
+/// range tombstones alone may lie past its last output of rows, or end on the
+/// key its first one starts with: a key range's largest key is inclusive.
+fn runs_of_new_tables(tables: &[Table], cmp: &dyn UserComparator) -> Vec<Run<Table>> {
+    let follows = |before: &Table, after: &Table| {
+        cmp.compare(before.key_range().max(), after.key_range().min()) == core::cmp::Ordering::Less
+    };
+    if tables
+        .iter()
+        .zip(tables.iter().skip(1))
+        .all(|(before, after)| follows(before, after))
+    {
+        return Run::new(tables.to_vec()).into_iter().collect();
+    }
+
+    let mut sorted = tables.to_vec();
+    sorted.sort_by(|a, b| cmp.compare(a.key_range().min(), b.key_range().min()));
+    let mut runs: Vec<Vec<Table>> = Vec::new();
+    for table in sorted {
+        match runs
+            .iter_mut()
+            .find(|run| run.last().is_some_and(|last| follows(last, &table)))
+        {
+            Some(run) => run.push(table),
+            None => runs.push(vec![table]),
+        }
+    }
+    runs.into_iter().filter_map(Run::new).collect()
+}
+
 /// Whether `level` holds a table `named` picks: a level that holds none is
 /// left as it stands by a change, its layout neither rebuilt nor copied.
 fn level_holds_any(level: &Level, named: impl Fn(TableId) -> bool) -> bool {
@@ -1086,16 +1118,15 @@ impl Version {
                 .filter(|x| !x.is_empty())
                 .collect::<Vec<_>>();
 
-            if level_idx == dest_level
-                && let Some(run) = Run::new(new_tables.to_vec())
-            {
+            if level_idx == dest_level {
+                let new_runs = runs_of_new_tables(new_tables, comparator);
                 if dest_level == 0 {
                     // Intra-L0 compaction (flushes use with_new_l0_run). Where
                     // the output goes is decided by its tables' ages below, so
                     // a run flushed while it ran stays in front of it.
-                    runs.push(run);
+                    runs.extend(new_runs);
                 } else {
-                    runs.insert(0, run);
+                    runs.splice(0..0, new_runs);
                 }
             }
 
@@ -1383,13 +1414,12 @@ impl Version {
                 .filter(|run| !run.is_empty())
                 .collect::<Vec<_>>();
 
-            if level_idx == dest_level
-                && let Some(run) = Run::new(outputs.to_vec())
-            {
+            if level_idx == dest_level {
+                let new_runs = runs_of_new_tables(outputs, comparator);
                 if dest_level == 0 {
-                    runs.push(run);
+                    runs.extend(new_runs);
                 } else {
-                    runs.insert(0, run);
+                    runs.splice(0..0, new_runs);
                 }
             }
 

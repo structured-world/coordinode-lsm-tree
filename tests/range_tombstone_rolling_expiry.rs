@@ -1,7 +1,7 @@
 //! Rolling expiry of key ranges with range tombstones under leveled
 //! compaction: an expired range stays expired.
 
-use lsm_tree::compaction::{CompactionAction, Leveled};
+use lsm_tree::compaction::{CompactionAction, Leveled, PullDown};
 use lsm_tree::{AbstractTree, AnyTree, Config, Guard as _, SeqNo, SequenceNumberCounter};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -107,10 +107,10 @@ fn a_tombstone_merged_away_from_the_rows_it_deletes_keeps_them_deleted() -> lsm_
     );
     tree.flush_active_memtable(0)?;
 
-    // L0 into L1 only: a watermark of 0 keeps every version, so nothing is
-    // garbage-collected and the tombstone must be carried.
-    let strategy = Arc::new(Leveled::default().with_l0_threshold(2));
-    tree.compact(strategy, 0)?;
+    // L0 into the empty L1 only: a watermark of 0 keeps every version, so
+    // nothing is garbage-collected and the tombstone must be carried.
+    tree.compact(Arc::new(PullDown(0, 1)), 0)?;
+    assert_eq!(tree.level_table_count(6), Some(1), "deleted rows untouched");
 
     assert_eq!(
         epochs_visible(&tree)?,
@@ -118,6 +118,110 @@ fn a_tombstone_merged_away_from_the_rows_it_deletes_keeps_them_deleted() -> lsm_
         "epoch 7 stays deleted",
     );
     assert!(tree.get(key(7, 0), SeqNo::MAX)?.is_none(), "point read too");
+    Ok(())
+}
+
+/// Rows deep in the tree, newer rows below them in the key space and a
+/// tombstone over the deep rows in L0, merged into an empty L1: the
+/// tombstone's table lies past the rows' table, and both stay findable.
+#[test]
+fn a_tombstone_kept_past_the_rows_leaves_the_rows_readable() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(
+        folder.path(),
+        seqno.clone(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..100 {
+        tree.insert(key(30, i), b"old", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    for flush in 0..3 {
+        for i in 0..100 {
+            tree.insert(key(7, flush * 100 + i), b"new", seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.remove_range(
+        30u32.to_be_bytes().to_vec(),
+        31u32.to_be_bytes().to_vec(),
+        seqno.next(),
+    );
+    tree.flush_active_memtable(0)?;
+
+    // L0 into the empty L1; the deleted rows stay in the last level.
+    tree.compact(Arc::new(PullDown(0, 1)), 0)?;
+    assert_eq!(tree.level_table_count(6), Some(1), "deleted rows untouched");
+
+    assert_eq!(
+        epochs_visible(&tree)?,
+        BTreeSet::from([7]),
+        "epoch 30 stays deleted"
+    );
+    for i in [0, 150, 299] {
+        assert_eq!(
+            tree.get(key(7, i), SeqNo::MAX)?.as_deref(),
+            Some(&b"new"[..]),
+            "point read of row {i}"
+        );
+    }
+    assert!(tree.get(key(30, 0), SeqNo::MAX)?.is_none());
+    Ok(())
+}
+
+/// A tombstone reaching from deep rows up to newer rows above them, merged
+/// into an empty L1: the piece below the rows ends at their first key, which
+/// both tables then record, and that key still reads its row.
+#[test]
+fn a_tombstone_piece_ending_at_the_first_row_leaves_that_row_readable() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(
+        folder.path(),
+        seqno.clone(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for i in 0..100 {
+        tree.insert(key(7, i), b"old", seqno.next());
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    tree.remove_range(
+        7u32.to_be_bytes().to_vec(),
+        31u32.to_be_bytes().to_vec(),
+        seqno.next(),
+    );
+    tree.flush_active_memtable(0)?;
+    for flush in 0..3 {
+        for i in 0..100 {
+            tree.insert(key(30, flush * 100 + i), b"new", seqno.next());
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    // L0 into the empty L1; the deleted rows stay in the last level.
+    tree.compact(Arc::new(PullDown(0, 1)), 0)?;
+    assert_eq!(tree.level_table_count(6), Some(1), "deleted rows untouched");
+
+    assert_eq!(
+        epochs_visible(&tree)?,
+        BTreeSet::from([30]),
+        "epoch 7 stays deleted"
+    );
+    for i in [0, 150, 299] {
+        assert_eq!(
+            tree.get(key(30, i), SeqNo::MAX)?.as_deref(),
+            Some(&b"new"[..]),
+            "point read of row {i}"
+        );
+    }
+    assert!(tree.get(key(7, 0), SeqNo::MAX)?.is_none());
     Ok(())
 }
 

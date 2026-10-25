@@ -332,8 +332,12 @@ matching entry (and add one for a new subsystem).
   compaction overlaps them they are all that keeps its keys deleted: each writer
   writes them, within the keys it answers for, to outputs of tombstones alone.
   With parallel sub-compactions this is every sub-range's edge, not only the
-  compaction's. Enforced in `src/compaction/worker.rs` (`tombstones_outside`)
-  and `src/table/multi_writer.rs` (`tombstones_past_the_outputs`); tested by
+  compaction's. Such an output may lie past an output of rows written after it,
+  or end on the key one starts with, so a version change lays its new tables
+  out in sorted, disjoint runs whatever order they come in. Enforced in
+  `src/compaction/worker.rs` (`tombstones_outside`),
+  `src/table/multi_writer.rs` (`tombstones_past_the_outputs`) and
+  `src/version/mod.rs` (`runs_of_new_tables`); tested by
   `tests/range_tombstone_rolling_expiry.rs`.
 
 ## Key domains

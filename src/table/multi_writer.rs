@@ -126,6 +126,9 @@ pub struct MultiWriter {
     /// The first key of the run's first output, once it closes.
     first_output_key: Option<UserKey>,
 
+    /// The tombstones the gaps between key domains meet, from the last gap on.
+    gap_cursor: tombstone_share::GapCursor,
+
     /// The current output's first key, the lower bound of its share of the
     /// range tombstones; `None` for the first output.
     output_lower: Option<UserKey>,
@@ -469,6 +472,7 @@ impl MultiWriter {
             clip_range_tombstones: false,
             outside: None,
             first_output_key: None,
+            gap_cursor: tombstone_share::GapCursor::default(),
             output_lower: None,
             tombstone_share: tombstone_share::TombstoneShare::new(),
             output_base: None,
@@ -1437,8 +1441,9 @@ impl MultiWriter {
     /// The pieces of the range tombstones from `start` to the next output's
     /// first key, the key last written, in order by start: under clipping only
     /// those a table outside the compaction needs, since the outputs hold no
-    /// key there.
-    fn tombstones_up_to_the_next_output(&self, start: &UserKey) -> Vec<RangeTombstone> {
+    /// key there. The gaps come in key order, so only the tombstones a gap
+    /// meets are visited.
+    fn tombstones_up_to_the_next_output(&mut self, start: &UserKey) -> Vec<RangeTombstone> {
         let Some(next) = self.current_key.as_ref() else {
             return Vec::new();
         };
@@ -1449,11 +1454,12 @@ impl MultiWriter {
         } else {
             self.range_tombstones.as_slice()
         };
+        let cmp = self.comparator.as_ref();
         Self::pieces_within(
-            tombstones,
+            self.gap_cursor.overlapping(tombstones, (start, next), cmp),
             Some(start),
             Some(next),
-            self.comparator.as_ref(),
+            cmp,
         )
     }
 
@@ -1488,8 +1494,8 @@ impl MultiWriter {
 
     /// The pieces of `tombstones`, in order by start, within `[lower, upper)`,
     /// `None` for an end of the key space.
-    fn pieces_within(
-        tombstones: &[RangeTombstone],
+    fn pieces_within<'t>(
+        tombstones: impl IntoIterator<Item = &'t RangeTombstone>,
         lower: Option<&UserKey>,
         upper: Option<&UserKey>,
         cmp: &dyn crate::comparator::UserComparator,
@@ -1497,7 +1503,7 @@ impl MultiWriter {
         use core::cmp::Ordering::Less;
 
         tombstones
-            .iter()
+            .into_iter()
             .filter_map(|rt| {
                 let start = match lower {
                     Some(lower) if cmp.compare(&rt.start, lower) == Less => lower,

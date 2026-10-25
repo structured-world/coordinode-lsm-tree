@@ -75,9 +75,11 @@ Every epoch writes its rows in time order across 64 series; 1% of them arrive
 during the next epoch; an epoch older than the retention expires through a
 range tombstone (one tree) or by removing its tree. Both shapes write 102.5 MiB
 of payload with 4 MiB memtables. Median of three rounds on ext4; bytes, space
-and table counts are the same in every round.
+and table counts are the same in every round. The peak is the largest space
+taken once an epoch settles; a compaction running in between may hold more
+for a moment.
 
-| shape | layout | written MiB | write amp. | peak / end MiB | tables | descriptors | reopen ms |
+| shape | layout | written MiB | write amp. | epoch peak / end MiB | tables | descriptors | reopen ms |
 |---|---|---|---|---|---|---|---|
 | 48 epochs, 12 retained | one tree | 516.2 | 5.03 | 41.3 / 36.9 | 3 | 1 | 9.3 |
 | | one tree, domains | 314.9 | 3.07 | 28.6 / 28.4 | 20 | 1 | 6.5 |
