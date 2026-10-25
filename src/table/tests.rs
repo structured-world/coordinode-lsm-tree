@@ -1744,6 +1744,34 @@ fn punch_on_drop_frees_the_prefix_pages_on_a_real_filesystem() -> crate::Result<
         freed + 4_096 >= punch,
         "the reclaim freed {freed} of the {punch}-byte prefix ({before} -> {after} allocated)",
     );
+
+    // A repair that lost the sidecar sees the punch through this filesystem's
+    // own hole probe, and the bound it derives from the geometry serves no
+    // consumed key.
+    let reopened = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path, checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let geometry = reopened.punch_geometry()?;
+    assert!(
+        matches!(geometry.verdict, crate::table::PunchProbe::Punched),
+        "the filesystem's hole probe proves the punch",
+    );
+    match Table::conservative_restriction(&geometry) {
+        crate::table::DerivedRestriction::Bound(bound) => assert!(
+            bound.as_ref() >= b"k001024".as_slice(),
+            "a derived bound below the committed one would serve consumed keys",
+        ),
+        _ => panic!("a clean punched prefix derives a bound"),
+    }
     Ok(())
 }
 

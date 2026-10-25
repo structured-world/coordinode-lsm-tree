@@ -39,7 +39,11 @@ fn open_on(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
     if blobs {
         config
             .with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(64),
+                KvSeparationOptions::default()
+                    .separation_threshold(64)
+                    .age_cutoff(1.0)
+                    .staleness_threshold(0.1)
+                    .file_target_size(48 * 1_024),
             ))
             .open()
     } else {
@@ -47,34 +51,56 @@ fn open_on(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
     }
 }
 
-/// A tree on `fs` holding two flushed, overlapping generations of every key,
-/// with a quota that leaves room for a slice of their merge but not for all of
-/// it, and tight-space compaction enabled.
+/// The generation key `i` reads after the second one: every key of a
+/// standard tree, the even keys of a KV-separated one, which the second
+/// generation overwrites to leave the first one's blob files half dead.
+fn latest(i: u32, blobs: bool) -> u8 {
+    if blobs && i % 2 == 1 { 1 } else { 2 }
+}
+
+/// The gc watermark of the passes: above every write, so a merge may drop
+/// what the second generation shadows and relocate the live blobs.
+const WATERMARK: SeqNo = 4 * KEYS as SeqNo;
+
+fn update(
+    tree: &AnyTree,
+    f: impl Fn(&mut lsm_tree::runtime_config::RuntimeConfig),
+) -> lsm_tree::Result<()> {
+    match tree {
+        AnyTree::Standard(t) => t.update_runtime_config(f),
+        AnyTree::Blob(t) => t.update_runtime_config(f),
+    }
+}
+
+/// A tree on `fs` holding two flushed, overlapping generations, with a quota
+/// that leaves room for a slice of their merge but not for all of it, and
+/// tight-space compaction enabled. A KV-separated tree's merge relocates the
+/// live blobs of the half-dead first generation: a merge with room to spare
+/// learns how much of each blob file is dead first.
 fn before_pass(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
     let tree = open_on(fs, blobs)?;
     let mut seqno = 0;
     for generation in [1u8, 2] {
-        for i in 0..KEYS {
+        for i in (0..KEYS).filter(|i| generation == 1 || latest(*i, blobs) == 2) {
             tree.insert(key(i), value(i, generation, blobs), seqno);
             seqno += 1;
         }
         tree.flush_active_memtable(0)?;
     }
+    if blobs {
+        tree.major_compact(64 * 1024 * 1024, WATERMARK)?;
+    }
     let used = tree.storage_stats()?.used_bytes;
-    let tight = |c: &mut lsm_tree::runtime_config::RuntimeConfig| {
+    update(&tree, |c| {
         c.storage_admission_check = true;
         c.storage_limit_bytes = Some(used + used / 4);
         c.tight_space_compaction = true;
-    };
-    match &tree {
-        AnyTree::Standard(t) => t.update_runtime_config(tight)?,
-        AnyTree::Blob(t) => t.update_runtime_config(tight)?,
-    }
+    })?;
     Ok(tree)
 }
 
 fn pass(tree: &AnyTree) -> lsm_tree::Result<lsm_tree::compaction::CompactionResult> {
-    tree.major_compact(64 * 1024 * 1024, 0)
+    tree.major_compact(64 * 1024 * 1024, WATERMARK)
 }
 
 /// A crash simulator and a fault layer over it the tree runs on.
@@ -85,7 +111,7 @@ fn crash_stack() -> (CrashFs, Arc<FaultFs<CrashFs>>) {
 }
 
 /// A power loss after any sync of a tight-space pass reopens into a tree
-/// whose every key reads the second generation: the slices installed before
+/// whose every key reads its latest value: the slices installed before
 /// the loss serve their keys, the inputs serve the rest, and no read reaches
 /// a prefix a slice punched.
 #[test]
@@ -134,7 +160,7 @@ fn tight_space_pass_survives_a_power_loss_at_every_sync() -> lsm_tree::Result<()
             for i in 0..KEYS {
                 assert_eq!(
                     tree.get(key(i), SeqNo::MAX)?.as_deref(),
-                    Some(value(i, 2, blobs).as_slice()),
+                    Some(value(i, latest(i, blobs), blobs).as_slice()),
                     "key {i} after a power loss at sync {kept} of {syncs} (blobs: {blobs})",
                 );
             }
