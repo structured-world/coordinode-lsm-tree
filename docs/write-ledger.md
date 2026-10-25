@@ -37,6 +37,7 @@ counters of that origin take:
 | `writes`, `short_writes`, `write_errors` | Write calls that accepted bytes, those that accepted fewer than they were handed, and those that failed. |
 | `opened`, `created` | Files opened for writing, and those opens allowed to create the file. |
 | `syncs`, `sync_errors` | File syncs, data-only ones included, and those that failed. |
+| `writebacks` | Ranges whose writeback a file started ahead of its sync without waiting (`sync_file_range` on Linux with the standard backend): no durability point, and no byte beyond `bytes`. |
 | `truncated` | Lengths set on the files. |
 | `installed` | Bytes of the tables and blob files an install put in the version. |
 
@@ -107,8 +108,9 @@ payload.
   that was never installed.
 - With the standard backend, the ledger's `bytes` and `writes` are what the
   process hands to `write` syscalls: on Linux, `wchar` and `syscw` of
-  `/proc/self/io` move by exactly them when the tree is the only writer. An
-  `io_uring` backend's writes do not pass those syscalls.
+  `/proc/self/io` move by exactly them when the tree is the only writer, and
+  `strace` counts the same write, sync and writeback calls. An `io_uring`
+  backend's writes do not pass those syscalls.
 
 ## A low-rate device workload
 
@@ -148,3 +150,14 @@ Against `/proc/self/io` on Linux, with the standard backend:
 sent to the block layer, adds the filesystem's own writes: little on ext4, more
 on copy-on-write btrfs, most where the writes are smallest. What the device
 then writes to its medium is beyond both.
+
+Syscalls counted by `strace -f -c` over the same runs on btrfs, the bench's own
+output to stdout and stderr taken out of `write`:
+
+| Order | `write` | ledger `writes` | `fdatasync` + `fsync` | ledger file + directory syncs | `sync_file_range` | ledger `writebacks` |
+|---|---|---|---|---|---|---|
+| time | 1 353 | 1 353 | 113 + 5 | 113 + 5 | 36 | 36 |
+| sensor | 5 254 | 5 254 | 148 + 8 | 148 + 8 | 237 | 237 |
+
+Every write and sync call the process made is one the ledger counted, under
+one origin each, and a directory sync is an `fsync` on the directory.
