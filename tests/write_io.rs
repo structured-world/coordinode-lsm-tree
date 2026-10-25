@@ -146,8 +146,18 @@ fn a_flush_charges_separated_values_to_its_blob_files() -> lsm_tree::Result<()> 
         lsm_tree::KvSeparationOptions::default().separation_threshold(16),
     ))
     .open()?;
+    // Bytes no codec shrinks, so every value's bytes reach the blob file.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
     for i in 0..100u32 {
-        tree.insert(format!("key{i:05}"), vec![b'v'; 1_000], u64::from(i));
+        let value: Vec<u8> = (0..1_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        tree.insert(format!("key{i:05}"), value, u64::from(i));
     }
     tree.flush_active_memtable(0)?;
 
@@ -160,8 +170,46 @@ fn a_flush_charges_separated_values_to_its_blob_files() -> lsm_tree::Result<()> 
     Ok(())
 }
 
-/// A manifest whose edit log rotates writes a snapshot per rotation, each a
-/// new file renamed into place, all charged to the manifest.
+/// Blob garbage collection: a compaction that relocates the live values of a
+/// blob file writes them to blob files of its own origin and installs every
+/// byte of them, at least the relocated values.
+#[test]
+fn relocated_values_are_charged_to_compaction_blob_files() -> lsm_tree::Result<()> {
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(MemFs::new())
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default().age_cutoff(1.0),
+    ))
+    .blob_compression(lsm_tree::CompressionType::None)
+    .open()?;
+    let value = b"neptune!".repeat(16_000);
+    tree.insert("big", &value, 0);
+    tree.insert("big2", &value, 0);
+    tree.flush_active_memtable(0)?;
+    tree.insert("big", b"winter!".repeat(16_000), 1);
+    tree.flush_active_memtable(0)?;
+    let before = tree.write_io();
+
+    tree.major_compact(64_000_000, 1_000)?;
+    tree.major_compact(64_000_000, 1_000)?;
+
+    let compacted = tree.write_io().since(&before).expect("one lifetime");
+    let blobs = compacted.origin(WriteOrigin::CompactionBlob);
+    let relocated = tree.metrics().blob_bytes_relocated();
+    assert!(relocated > 0, "a value was relocated");
+    assert!(blobs.bytes >= relocated);
+    assert_eq!(blobs.bytes, blobs.installed);
+    assert_eq!(compacted.unattributed, FileWrites::default());
+    Ok(())
+}
+
+/// A manifest whose edit log rotates writes a snapshot per rotation: two files
+/// made, the snapshot and its empty log, and the snapshot renamed into place,
+/// all charged to the manifest.
 #[test]
 fn manifest_rotation_writes_snapshots_charged_to_the_manifest() -> lsm_tree::Result<()> {
     let tree = Config::new(
@@ -173,15 +221,20 @@ fn manifest_rotation_writes_snapshots_charged_to_the_manifest() -> lsm_tree::Res
     .manifest_log_rotate_bytes(1)
     .open()?;
     let before = tree.write_io();
-    for flush in 0..4u32 {
+    for flush in 0..8u32 {
         tree.insert(format!("key{flush}"), "value", u64::from(flush));
         tree.flush_active_memtable(0)?;
     }
 
     let rotated = tree.write_io().since(&before).expect("one lifetime");
     let manifest = rotated.origin(WriteOrigin::Manifest);
-    assert!(manifest.created >= 4, "a snapshot per flush: {manifest:?}");
-    assert!(rotated.directory.renamed >= 4, "each renamed into place");
+    let rotations = rotated.directory.renamed;
+    assert!(rotations >= 2, "the log rotated: {rotated:?}");
+    assert_eq!(
+        manifest.created,
+        2 * rotations,
+        "a snapshot and its log each"
+    );
     Ok(())
 }
 
