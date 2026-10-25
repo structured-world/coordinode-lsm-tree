@@ -323,6 +323,23 @@ type Output = (
 /// outputs for tables outside the compaction; returns each output's key
 /// range and tombstones.
 fn clipped_outputs(keys: &[&[u8]], outside: Option<Answered<'_>>) -> crate::Result<Vec<Output>> {
+    Ok(clipped_tables(keys, outside)?
+        .iter()
+        .map(|table| {
+            let range = &table.metadata.key_range;
+            (
+                (range.min().to_vec(), range.max().to_vec()),
+                table.range_tombstones().to_vec(),
+            )
+        })
+        .collect())
+}
+
+/// The tables [`clipped_outputs`] describes.
+fn clipped_tables(
+    keys: &[&[u8]],
+    outside: Option<Answered<'_>>,
+) -> crate::Result<Vec<crate::Table>> {
     use crate::range_tombstone::RangeTombstone;
     use crate::{InternalValue, UserKey, fs::StdFs};
     use std::sync::Arc;
@@ -338,7 +355,10 @@ fn clipped_outputs(keys: &[&[u8]], outside: Option<Answered<'_>>) -> crate::Resu
         1,
         fs,
     )?
-    .use_clip_range_tombstones();
+    .use_clip_range_tombstones()
+    // A compaction's outputs record their inputs and the output before them.
+    .use_lineage(Some(vec![1_000]))
+    .use_lineage_whole_run(true);
     let rt = RangeTombstone::new(
         UserKey::from(b"b".as_slice()),
         UserKey::from(b"k".as_slice()),
@@ -367,21 +387,49 @@ fn clipped_outputs(keys: &[&[u8]], outside: Option<Answered<'_>>) -> crate::Resu
         .tables
         .iter()
         .map(|(table_id, checksum)| {
-            let table = crate::Table::recover(crate::table::RecoverParams::new(
+            crate::Table::recover(crate::table::RecoverParams::new(
                 base_path.join(table_id.to_string()),
                 *checksum,
                 *table_id,
                 Arc::new(StdFs),
                 comparator.clone(),
                 cache.clone(),
-            ))?;
-            let range = &table.metadata.key_range;
-            Ok((
-                (range.min().to_vec(), range.max().to_vec()),
-                table.range_tombstones().to_vec(),
             ))
         })
         .collect()
+}
+
+/// The outputs' lineage chain follows key order with pieces kept both below
+/// and past the rows: manifest repair reads an unbroken chain's ranges from
+/// its head's least key to its tail's greatest, so a table below the rows
+/// chained after them would let a chain missing the rows' table claim its
+/// keys.
+#[test]
+fn the_lineage_chain_follows_key_order_around_kept_pieces() -> crate::Result<()> {
+    let tables = clipped_tables(&[b"e", b"f"], Some((None, None)))?;
+    assert_eq!(tables.len(), 3, "below, rows, past");
+    let ids: Vec<_> = tables.iter().map(crate::Table::id).collect();
+    let Some(head) = tables.iter().find(|t| {
+        !t.metadata
+            .lineage_prev
+            .is_some_and(|prev| ids.contains(&prev))
+    }) else {
+        panic!("the chain has a head");
+    };
+    let mut chain = vec![head];
+    while let Some(next) = tables
+        .iter()
+        .find(|t| t.metadata.lineage_prev == chain.last().map(|t| t.id()))
+    {
+        chain.push(next);
+    }
+    let mins: Vec<_> = chain
+        .iter()
+        .map(|t| t.metadata.key_range.min().to_vec())
+        .collect();
+    assert_eq!(chain.len(), tables.len(), "one unbroken chain: {mins:?}");
+    assert!(mins.is_sorted(), "chained in key order: {mins:?}");
+    Ok(())
 }
 
 /// Whether some output both answers for `key` by its key range and holds a

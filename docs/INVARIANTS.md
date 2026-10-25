@@ -334,9 +334,13 @@ matching entry (and add one for a new subsystem).
   With parallel sub-compactions this is every sub-range's edge, not only the
   compaction's. Such an output may lie past an output of rows written after it,
   or end on the key one starts with, so a version change lays its new tables
-  out in sorted, disjoint runs whatever order they come in. Enforced in
+  out in sorted, disjoint runs whatever order they come in. The run's lineage
+  chain still follows key order, since manifest repair unions an unbroken
+  chain's ranges from its head's least key to its tail's greatest: the pieces
+  below the first output go ahead of it. Enforced in
   `src/compaction/worker.rs` (`tombstones_outside`),
-  `src/table/multi_writer.rs` (`tombstones_past_the_outputs`) and
+  `src/table/multi_writer.rs` (`tombstones_beside_the_outputs`,
+  `write_pieces_below_the_first_output`) and
   `src/version/mod.rs` (`runs_of_new_tables`); tested by
   `tests/range_tombstone_rolling_expiry.rs`.
 

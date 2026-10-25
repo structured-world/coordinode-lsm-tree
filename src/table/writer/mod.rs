@@ -2579,6 +2579,13 @@ impl Writer {
         self
     }
 
+    /// Replaces the previous-output link mid-write, returning the old one: an
+    /// output written after this one but lying below it in key order goes
+    /// ahead of it in the run's chain.
+    pub(crate) fn relink_lineage_prev(&mut self, prev: Option<TableId>) -> Option<TableId> {
+        core::mem::replace(&mut self.lineage_prev, prev)
+    }
+
     /// Marks the pending lineage TRANSFORMED (callable mid-write, unlike the
     /// builder): a compaction FILTER transformed at least one record of THIS
     /// output, so it is no longer derivable from its inputs and must never be
