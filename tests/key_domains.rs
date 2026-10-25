@@ -324,19 +324,24 @@ fn a_flushed_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tree:
 }
 
 /// The same through compaction, with the tombstone kept (a watermark of 0)
-/// and a later epoch's rows in the merge: every compacted table holding rows
-/// stays within their epoch, and the deleted rows stay deleted.
+/// and ending past epoch 1 but before epoch 2's first row: a compaction
+/// widens an output's key range up to the next output's first key to cover a
+/// tombstone reaching into that gap, which would take epoch 1's table into
+/// epoch 2. Every compacted table holding rows stays within their epoch, and
+/// the deleted rows stay deleted.
 #[test]
 fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tree::Result<()> {
+    // Epoch 2's rows start at index 5.
+    let first = |epoch: u32| if epoch == 2 { 5 } else { 0 };
     let folder = tempfile::tempdir()?;
     let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
     for epoch in 0..5 {
-        for i in 0..50 {
+        for i in first(epoch)..50 {
             tree.insert(key(epoch, i), b"old", u64::from(epoch * 100 + i));
         }
     }
     tree.flush_active_memtable(0)?;
-    tree.remove_range(key(1, 10), key(3, 10), 1_000);
+    tree.remove_range(key(1, 10), key(2, 3), 1_000);
     tree.flush_active_memtable(0)?;
     for i in 0..50 {
         tree.insert(key(5, i), b"new", 2_000 + u64::from(i));
@@ -346,10 +351,10 @@ fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tre
 
     let past = tables_past_their_epoch(&tree)?;
     assert!(past.is_empty(), "{past:#?}");
-    let deleted = |e: u32, i: u32| (e, i) >= (1, 10) && (e, i) < (3, 10);
+    let deleted = |e: u32, i: u32| (e, i) >= (1, 10) && (e, i) < (2, 3);
     let rows = latest(&tree)?;
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
-        .flat_map(|e| (0..50).map(move |i| (e, i)))
+        .flat_map(|e| (first(e)..50).map(move |i| (e, i)))
         .filter(|&(e, i)| !deleted(e, i))
         .map(|(e, i)| {
             (
@@ -366,6 +371,13 @@ fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tre
         rows, expected,
         "every row outside the tombstone and none in it"
     );
-    assert!(tree.get(key(2, 0), SeqNo::MAX)?.is_none(), "point read too");
+    assert!(
+        tree.get(key(1, 20), SeqNo::MAX)?.is_none(),
+        "point read too"
+    );
+    assert!(
+        tree.get(key(2, 5), SeqNo::MAX)?.is_some(),
+        "past the tombstone"
+    );
     Ok(())
 }
