@@ -353,6 +353,12 @@ path = "benches/tight_space.rs"
 required-features = []
 
 [[bench]]
+name = "tight_space_disk"
+harness = false
+path = "benches/tight_space_disk.rs"
+required-features = []
+
+[[bench]]
 name = "blob_scan_prefetch"
 harness = false
 path = "benches/blob_scan_prefetch.rs"
