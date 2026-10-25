@@ -8,7 +8,7 @@ use crate::coding::{Decode, Encode};
 use crate::compaction::Input as CompactionPayload;
 use crate::compaction::worker::Options;
 use crate::range_tombstone::RangeTombstone;
-use crate::table::multi_writer::MultiWriter;
+use crate::table::multi_writer::{MultiWriter, TombstonesOutside};
 use crate::time::Instant;
 use crate::version::{SuperVersions, Version};
 use crate::vlog::blob_file::scanner::ScanEntry;
@@ -785,8 +785,9 @@ pub(super) trait CompactionFlavour {
     #[cfg(feature = "columnar")]
     fn carrying(&mut self) -> Option<&mut StandardCompaction>;
 
-    /// Writes range tombstones to the current output table.
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
+    /// Writes range tombstones to the output tables, keeping the pieces of
+    /// `outside`'s that fall past them (see [`TombstonesOutside`]).
+    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone], outside: TombstonesOutside);
 
     /// Finalizes this (sub-)compaction's output files (flushing the table
     /// writer, finishing blob writers) WITHOUT installing a version edit. The
@@ -1462,8 +1463,12 @@ impl RelocatingCompaction {
 }
 
 impl CompactionFlavour for RelocatingCompaction {
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
-        self.inner.write_range_tombstones(tombstones);
+    fn write_range_tombstones(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        outside: TombstonesOutside,
+    ) {
+        self.inner.write_range_tombstones(tombstones, outside);
     }
 
     /// A relocating compaction moves the blob values its rows point at, so it
@@ -1904,8 +1909,13 @@ impl StandardCompaction {
 }
 
 impl CompactionFlavour for StandardCompaction {
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
+    fn write_range_tombstones(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        outside: TombstonesOutside,
+    ) {
         self.table_writer.set_range_tombstones(tombstones.to_vec());
+        self.table_writer.keep_tombstones_outside(outside);
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {

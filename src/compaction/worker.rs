@@ -1310,23 +1310,77 @@ fn range_tombstones_after_gc(
             // needed by the oldest live snapshot (which reads at the watermark
             // and does not see `RT@watermark`), so keep it. Only strictly-below
             // tombstones are candidates for GC.
-            if !rt.visible_at(watermark) {
-                return true;
-            }
-            version
-                .iter_levels()
-                .flat_map(|level| level.iter())
-                .flat_map(|run| run.iter())
-                .filter(|t| !input_ids.contains(&t.id()))
-                .any(|t| {
-                    let kr = &t.metadata.key_range;
-                    // [rt.start, rt.end) overlaps [kr.min, kr.max].
-                    cmp.compare(&rt.start, kr.max()) != core::cmp::Ordering::Greater
-                        && cmp.compare(kr.min(), &rt.end) == core::cmp::Ordering::Less
-                })
+            !rt.visible_at(watermark) || overlaps_a_table_outside(rt, version, input_ids, cmp)
         })
         .cloned()
         .collect()
+}
+
+/// Whether a table outside the compaction holds keys in `rt`'s span, which
+/// only `rt` keeps deleted once the compaction's inputs are gone.
+#[cfg(feature = "std")]
+fn overlaps_a_table_outside(
+    rt: &crate::range_tombstone::RangeTombstone,
+    version: &Version,
+    input_ids: &HashSet<TableId>,
+    cmp: &dyn crate::comparator::UserComparator,
+) -> bool {
+    version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .flat_map(|run| run.iter())
+        .filter(|t| !input_ids.contains(&t.id()))
+        .any(|t| {
+            let kr = &t.metadata.key_range;
+            // [rt.start, rt.end) overlaps [kr.min, kr.max].
+            cmp.compare(&rt.start, kr.max()) != core::cmp::Ordering::Greater
+                && cmp.compare(kr.min(), &rt.end) == core::cmp::Ordering::Less
+        })
+}
+
+/// The keys a writer answering for `bounds` covers, as `[lower, upper)` with
+/// `None` for an end of the key space.
+#[cfg(feature = "std")]
+fn answered_span(
+    bounds: &(core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
+) -> (Option<UserKey>, Option<UserKey>) {
+    use core::ops::Bound;
+
+    (
+        // An excluded lower bound is the previous range's included upper one:
+        // a piece starting there is written by both, which deletes no more.
+        match &bounds.0 {
+            Bound::Included(key) | Bound::Excluded(key) => Some(key.clone()),
+            Bound::Unbounded => None,
+        },
+        match &bounds.1 {
+            Bound::Excluded(key) => Some(key.clone()),
+            Bound::Included(key) => crate::range_tombstone::upper_bound_exclusive(key),
+            Bound::Unbounded => None,
+        },
+    )
+}
+
+/// The tombstones of `rts` a writer answering for `[lower, upper)` keeps
+/// past its outputs' keys: those a table outside the compaction overlaps.
+#[cfg(feature = "std")]
+fn tombstones_outside(
+    rts: &[crate::range_tombstone::RangeTombstone],
+    version: &Version,
+    input_ids: &HashSet<TableId>,
+    (lower, upper): (Option<UserKey>, Option<UserKey>),
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::table::multi_writer::TombstonesOutside {
+    let cmp = comparator.as_ref();
+    crate::table::multi_writer::TombstonesOutside {
+        tombstones: rts
+            .iter()
+            .filter(|rt| overlaps_a_table_outside(rt, version, input_ids, cmp))
+            .cloned()
+            .collect(),
+        lower,
+        upper,
+    }
 }
 
 #[cfg_attr(
@@ -2792,6 +2846,8 @@ fn run_subcompaction(
         (Some(_), core::ops::Bound::Excluded(upper)) => Some(upper.clone()),
         _ => None,
     };
+    // The keys this range's writer answers for, past its outputs included.
+    let answered = answered_span(&bounds);
     // This range's writer does not wait for a boundary past its upper bound,
     // which another range's writer reaches.
     let range_upper = match &bounds.1 {
@@ -3041,7 +3097,14 @@ fn run_subcompaction(
         &opts.config.comparator,
     );
     if !output_rts.is_empty() {
-        compactor.write_range_tombstones(&output_rts);
+        let outside = tombstones_outside(
+            &output_rts,
+            version,
+            &payload.table_ids,
+            answered,
+            &opts.config.comparator,
+        );
+        compactor.write_range_tombstones(&output_rts, outside);
     }
 
     #[cfg(feature = "columnar")]
@@ -4358,7 +4421,14 @@ fn merge_tables(
             "Propagating {} range tombstones to compaction output",
             input_range_tombstones.len(),
         );
-        compactor.write_range_tombstones(&input_range_tombstones);
+        let outside = tombstones_outside(
+            &input_range_tombstones,
+            &current_super_version.version,
+            &payload.table_ids,
+            (None, None),
+            &opts.config.comparator,
+        );
+        compactor.write_range_tombstones(&input_range_tombstones, outside);
     }
 
     // Every row the merge emits goes to the output through here: written, or,

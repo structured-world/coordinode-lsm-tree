@@ -308,6 +308,153 @@ fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
     Ok(())
 }
 
+/// The keys a writer answers for, `[lower, upper)`, `None` for an end of
+/// the key space.
+type Answered<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// An output's key range and the range tombstones it holds.
+type Output = (
+    (Vec<u8>, Vec<u8>),
+    Vec<crate::range_tombstone::RangeTombstone>,
+);
+
+/// Writes `keys` through a clipping writer holding the range tombstone
+/// `[b, k)@20` and, when `outside` is given, keeping its pieces past the
+/// outputs for tables outside the compaction; returns each output's key
+/// range and tombstones.
+fn clipped_outputs(keys: &[&[u8]], outside: Option<Answered<'_>>) -> crate::Result<Vec<Output>> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().join("tables");
+    std::fs::create_dir_all(&base_path)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        64 * 1_024 * 1_024,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones();
+    let rt = RangeTombstone::new(
+        UserKey::from(b"b".as_slice()),
+        UserKey::from(b"k".as_slice()),
+        20,
+    );
+    mw.set_range_tombstones(vec![rt.clone()]);
+    if let Some((lower, upper)) = outside {
+        mw.keep_tombstones_outside(super::TombstonesOutside {
+            tombstones: vec![rt],
+            lower: lower.map(UserKey::from),
+            upper: upper.map(UserKey::from),
+        });
+    }
+    for (seqno, key) in (1..).zip(keys) {
+        mw.write(InternalValue::from_components(
+            UserKey::from(*key),
+            b"v".as_slice(),
+            seqno,
+            crate::ValueType::Value,
+        ))?;
+    }
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+    mw.finish()?
+        .tables
+        .iter()
+        .map(|(table_id, checksum)| {
+            let table = crate::Table::recover(crate::table::RecoverParams::new(
+                base_path.join(table_id.to_string()),
+                *checksum,
+                *table_id,
+                Arc::new(StdFs),
+                comparator.clone(),
+                cache.clone(),
+            ))?;
+            let range = &table.metadata.key_range;
+            Ok((
+                (range.min().to_vec(), range.max().to_vec()),
+                table.range_tombstones().to_vec(),
+            ))
+        })
+        .collect()
+}
+
+/// Whether some output both answers for `key` by its key range and holds a
+/// tombstone covering it: what a point read of `key` needs to see it deleted.
+fn deletes(outputs: &[Output], key: &[u8]) -> bool {
+    outputs.iter().any(|((min, max), rts)| {
+        min.as_slice() <= key
+            && key <= max.as_slice()
+            && rts
+                .iter()
+                .any(|rt| rt.start.as_ref() <= key && key < rt.end.as_ref())
+    })
+}
+
+/// A tombstone reaching past the outputs' last key keeps its piece there for
+/// a table outside the compaction: without it, a key of that table in the
+/// piece's span reads back once the inputs are gone. A last output's clip
+/// ends just past its last key, which alone would leave `[c\0, k)` to no one.
+#[test]
+fn a_tombstone_past_the_last_key_keeps_its_piece_for_tables_outside() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], Some((None, None)))?;
+    assert!(
+        deletes(&outputs, b"bb"),
+        "the piece among the keys: {outputs:?}"
+    );
+    assert!(
+        deletes(&outputs, b"j"),
+        "the piece past the last key: {outputs:?}"
+    );
+    assert_eq!(
+        outputs.len(),
+        2,
+        "the piece past the keys is an output of its own"
+    );
+    Ok(())
+}
+
+/// The same below the first key: a writer whose keys start past a
+/// tombstone's start keeps the piece before them.
+#[test]
+fn a_tombstone_before_the_first_key_keeps_its_piece_for_tables_outside() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"e", b"f"], Some((None, None)))?;
+    assert!(
+        deletes(&outputs, b"bb"),
+        "the piece before the first key: {outputs:?}"
+    );
+    assert!(
+        deletes(&outputs, b"j"),
+        "the piece past the last key: {outputs:?}"
+    );
+    Ok(())
+}
+
+/// A writer keeps pieces only within the keys it answers for: past its upper
+/// bound another range's writer does.
+#[test]
+fn a_kept_piece_stops_at_the_keys_the_writer_answers_for() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], Some((None, Some(b"f"))))?;
+    assert!(deletes(&outputs, b"e"), "below the bound: {outputs:?}");
+    assert!(!deletes(&outputs, b"g"), "past the bound: {outputs:?}");
+    Ok(())
+}
+
+/// A tombstone no table outside the compaction overlaps is clipped to the
+/// outputs as before: no output of its own.
+#[test]
+fn without_tables_outside_a_tombstone_stays_clipped_to_the_outputs() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], None)?;
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    assert!(!deletes(&outputs, b"j"), "{outputs:?}");
+    Ok(())
+}
+
 // Edge case (#32): RT spans past the next table's first key, so
 // clipped.end == clip_upper.  Widening last_key to clip_upper would
 // make adjacent tables' key_ranges overlap and break Run::get_for_key_cmp.
