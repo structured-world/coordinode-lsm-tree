@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792952540047,
+  "lastUpdate": 1792967844000,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64204,6 +64204,90 @@ window.BENCHMARK_DATA = {
             "value": 297468.62101309747,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.0us | P99.9: 89.0us\nthreads: 1 | elapsed: 0.67s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "34ee18edd346bbc98e48e9f7642f91b5e271b61f",
+          "message": "fix(compaction): keep relocated and last-output tombstones in bounds (#990)\n\n## Summary\n- Under a key-domain policy, a merge-on-read relocation no longer keeps\na source whose own range tombstone reaches out of its rows' domain: the\nrelocated table would carry that tombstone's end, and its key range,\ninto the next domain. The copy-on-write merge splits such a source per\ndomain.\n- A compaction's last output keeps its last key under the tombstone over\nit whatever the comparator: it cut its tombstones at the last key's byte\nsuccessor, which sorts before that key under a non-byte comparator.\n\n## Changes\n- `plan_merge_on_read` refuses a source when any of its range tombstones\nstarts in another domain than its first row or ends past that domain, as\nwell as when its rows span two domains.\n- `MultiWriter::write_rts_to_writer` derives the last output's exclusive\nupper bound from the byte successor only under byte order; under another\ncomparator it clips on the lower bound alone, as it already did for a\nlast key with no successor.\n- The README states when expiring a domain removes its tables.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, aarch64,\nthe tool crates, the benches and the i686 builds pass on Linux. Both\nregression tests fail on the code before the change.\n\nCloses #989\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved compaction handling of range tombstones at key-domain\nboundaries, keeping table ranges consistent with their rows.\n* Prevented relocation when tombstones cross key-domain boundaries,\nwhile preserving relocation for tables whose rows and tombstones remain\nwithin one domain.\n* Fixed tombstone clipping during compaction with reversed key ordering.\n* **Documentation**\n* Clarified that expired key-domain tables are removed during compaction\nonly after the range tombstone is flushed and falls below the compaction\nwatermark.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-25T22:13:33Z",
+          "tree_id": "0e65e4746b35f73e2462037147d8d21ae810c0b5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/34ee18edd346bbc98e48e9f7642f91b5e271b61f"
+        },
+        "date": 1792967842530,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 66893.94141971246,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.7us | P99.9: 50.8us\nthreads: 1 | elapsed: 8.00s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2534129.3371465225,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 730213.7867714623,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 510715.1485492894,
+            "unit": "ops/sec",
+            "extra": "P50: 1.8us | P99: 6.6us | P99.9: 19.7us\nthreads: 1 | elapsed: 0.39s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3238021.9416138018,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 313684.04994979966,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.9us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189207.46898300204,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 9.8us | P99.9: 19.7us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 703992.2439203309,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.8us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 749612.5327779325,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 310747.4982126775,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 16.9us | P99.9: 92.0us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
