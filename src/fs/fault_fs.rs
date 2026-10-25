@@ -310,6 +310,10 @@ pub struct FaultInjector {
     /// Observed `(path, offset, len)` of every `start_writeback`, in call
     /// order: a writeback changes no byte, so only this shows it was asked.
     writeback_log: spin::Mutex<Vec<(PathBuf, u64, u64)>>,
+    /// Observed `(path, offset, len)` of every `punch_hole` that reached the
+    /// inner backend, in call order: how many calls a reclaim takes and what
+    /// each covers decide what it frees.
+    punch_log: spin::Mutex<Vec<(PathBuf, u64, u64)>>,
     /// Positional reads served, counted whether or not a rule matched — the
     /// pass-through delegation is otherwise invisible, so a test that cares
     /// about how MUCH a path reads (a verification walking each block once
@@ -765,6 +769,7 @@ impl FaultInjector {
         self.directory_sync_log.lock().clear();
         self.syncs.lock().clear();
         self.writeback_log.lock().clear();
+        self.punch_log.lock().clear();
         #[cfg(test)]
         self.read_hooks.lock().clear();
         #[cfg(test)]
@@ -821,6 +826,18 @@ impl FaultInjector {
     #[must_use]
     pub fn writebacks_for(&self, substr: &str) -> Vec<(u64, u64)> {
         self.writeback_log
+            .lock()
+            .iter()
+            .filter(|(p, ..)| p.to_string_lossy().contains(substr))
+            .map(|&(_, offset, len)| (offset, len))
+            .collect()
+    }
+
+    /// The `(offset, len)` of every punch that reached the inner backend on
+    /// files whose path contains `substr`, in call order.
+    #[must_use]
+    pub fn punches_for(&self, substr: &str) -> Vec<(u64, u64)> {
+        self.punch_log
             .lock()
             .iter()
             .filter(|(p, ..)| p.to_string_lossy().contains(substr))
@@ -1243,6 +1260,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::PunchHole, Some(path)) {
             return Err(fault_error(kind, FaultOp::PunchHole));
         }
+        self.injector
+            .punch_log
+            .lock()
+            .push((path.to_path_buf(), offset, len));
         self.inner.punch_hole(path, offset, len)
     }
 

@@ -2051,11 +2051,11 @@ fn excised_extents(
     // guard must fail closed rather than read "unproven" as "unpunched".
     //
     // Probed as CONTAINS-a-hole over the run rather than whole-span-is-a-hole
-    // or a single midpoint byte: the reclaim punches per block with unaligned
-    // extents, so the filesystem deallocates only the wholly-contained pages
-    // and leaves zero-filled boundary pages allocated — the whole span is
-    // never a hole, and a midpoint byte can land on one of those allocated
-    // boundary pages. Any hole inside the zeroed run is attributable to it.
+    // or a single midpoint byte: the reclaim punches at unaligned extents (an
+    // older reclaim did so per block), so the filesystem deallocates only the
+    // wholly-contained pages and leaves zero-filled boundary pages allocated:
+    // the whole span is never a hole, and a midpoint byte can land on one of
+    // those allocated boundary pages. Any hole inside the zeroed run is attributable to it.
     // Only the presence of the hole matters here — the single caller asks
     // whether the extent was reclaimed at all, not exactly where.
     let mut proven = Vec::with_capacity(merged.len());

@@ -1647,6 +1647,211 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     Ok(())
 }
 
+/// The views a tight-space pass restricts a file to one after another punch
+/// only above what the view before finished, from the aligned edge under it,
+/// instead of the whole prefix on every slice; together they still cover it.
+#[cfg(feature = "std")]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn successive_views_punch_only_above_what_the_last_one_finished() -> crate::Result<()> {
+    use super::inner::PUNCH_ALIGN;
+    use crate::fs::Fs;
+
+    let fault = crate::fs::FaultFs::new(crate::fs::MemFs::new());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let root = std::path::absolute("/db")?;
+    fs.create_dir_all(&root)?;
+    let path = root.join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(4_096);
+    for i in 0..20_000u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 100],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    let first = {
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        Table::recover(params)?
+    };
+
+    // Slice 1 restricts the file at k005000, slice 2 at k010000.
+    let second = first.reopen_restricted(b"k005000".to_vec().into())?;
+    let off1 = first.punch_offset_for(b"k005000")?;
+    first.mark_punch_on_drop(off1);
+    drop(first);
+    let third = second.reopen_restricted(b"k010000".to_vec().into())?;
+    let off2 = second.punch_offset_for(b"k010000")?;
+    second.mark_punch_on_drop(off2);
+    drop(second);
+    drop(third);
+
+    let punches = injector.punches_for(&path.to_string_lossy());
+    let floor = off1 - off1 % PUNCH_ALIGN;
+    let (second_view, first_view): (Vec<_>, Vec<_>) =
+        punches.iter().copied().partition(|(o, len)| o + len > off1);
+    assert!(
+        second_view.iter().all(|(o, _)| *o >= floor),
+        "the second view punches only from {floor} up: {punches:?}",
+    );
+    let covered = |extents: &[(u64, u64)]| extents.iter().map(|(_, len)| len).sum::<u64>();
+    assert_eq!(
+        off1,
+        covered(&first_view),
+        "the first view punched its prefix"
+    );
+    assert_eq!(
+        off2 - floor,
+        covered(&second_view),
+        "the second view punched the rest, from the aligned edge",
+    );
+    Ok(())
+}
+
+/// The prefix punch calls cover exactly the given blocks, highest first, and
+/// are cut only at block edges, so every call zeroes whole blocks: a punch
+/// stopped after any call leaves a zeroed block above the intact ones. Each
+/// call stays within the chunk unless one block alone is larger, and the gap
+/// between two runs of blocks is never punched.
+#[test]
+fn punch_extents_cut_at_block_edges_highest_first() {
+    use super::inner::{PUNCH_CHUNK, punch_extents_top_down};
+
+    assert!(punch_extents_top_down(&[]).is_empty(), "no block, no call");
+    assert_eq!(
+        punch_extents_top_down(&[(100, 5_000)]),
+        vec![(100, 4_900)],
+        "one block is one call",
+    );
+    let c = PUNCH_CHUNK;
+    let third = c / 3;
+    let blocks: Vec<(u64, u64)> = (0..7).map(|i| (i * third, (i + 1) * third)).collect();
+    assert_eq!(
+        punch_extents_top_down(&blocks),
+        vec![(4 * third, 3 * third), (third, 3 * third), (0, third)],
+        "adjacent blocks are taken whole, as many as fit in the chunk, top-down",
+    );
+    assert_eq!(
+        punch_extents_top_down(&[(0, 10), (10, 2 * c + 10)]),
+        vec![(10, 2 * c), (0, 10)],
+        "a block larger than the chunk is one call of its own",
+    );
+    assert_eq!(
+        punch_extents_top_down(&[(0, 100), (200, 300)]),
+        vec![(200, 100), (0, 100)],
+        "blocks apart stay apart, the higher one first",
+    );
+}
+
+/// The tight-space prefix reclaim must give back the prefix's pages on a real
+/// filesystem, not only on `MemFs`, which frees punched bytes exactly. A
+/// filesystem deallocates only the pages wholly inside one `punch_hole` call
+/// and zero-fills the rest, so data blocks of about a page, punched one call
+/// each at unaligned offsets, keep nearly every page of the prefix allocated:
+/// the pass that was cut to the room the reclaim frees would find none of it.
+// 32-bit Linux punches no holes (`off_t` is too narrow there).
+#[cfg(all(feature = "std", target_os = "linux", target_pointer_width = "64"))]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_frees_the_prefix_pages_on_a_real_filesystem() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    // A volume without the capability (overlayfs in a cross container) never
+    // takes the tight-space path, so it has nothing to prove here.
+    if !fs.capabilities(dir.path()).punch_hole {
+        eprintln!("skipping: the temporary directory's file system cannot punch holes");
+        return Ok(());
+    }
+    let path = dir.path().join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(4_096);
+    for i in 0..8_192u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 100],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    // What the writer leaves in the page cache counts once it is on disk.
+    std::fs::File::open(&path)?.sync_all()?;
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let punch = table.punch_offset_for(b"k004096")?;
+    // One allocation unit is at most `PUNCH_ALIGN`, whatever this
+    // filesystem's block size.
+    let unit = super::inner::PUNCH_ALIGN;
+    assert!(
+        punch > 4 * unit,
+        "the fixture has a prefix of many allocation units"
+    );
+    let before = fs
+        .allocated_size(&path)?
+        .expect("a unix file reports st_blocks");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    let after = fs
+        .allocated_size(&path)?
+        .expect("a unix file reports st_blocks");
+
+    // At most the allocation unit the prefix ends in stays allocated, shared
+    // with the first live block.
+    let freed = before
+        .checked_sub(after)
+        .expect("a punch allocates nothing");
+    assert!(
+        freed + unit >= punch,
+        "the reclaim freed {freed} of the {punch}-byte prefix ({before} -> {after} allocated)",
+    );
+
+    // A repair that lost the sidecar sees the punch through this filesystem's
+    // own hole probe, and the bound it derives from the geometry serves no
+    // consumed key.
+    let reopened = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path, checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let geometry = reopened.punch_geometry()?;
+    assert!(
+        matches!(geometry.verdict, crate::table::PunchProbe::Punched),
+        "the filesystem's hole probe proves the punch",
+    );
+    match Table::conservative_restriction(&geometry) {
+        crate::table::DerivedRestriction::Bound(bound) => assert!(
+            bound.as_ref() >= b"k004096".as_slice(),
+            "a derived bound below the committed one would serve consumed keys",
+        ),
+        _ => panic!("a clean punched prefix derives a bound"),
+    }
+    Ok(())
+}
+
 /// A reclaim blocked by a COMPLETED checkpoint's surviving hard link must be
 /// RETAINED, not discarded. The pause is no longer active (so the deferred
 /// queue is not an option), yet the dropping view holds the only record of the
@@ -7780,6 +7985,42 @@ fn unshare_for_heal_preserves_unpunched_blocks_of_a_restricted_table() -> crate:
     assert!(
         all_zero(&restricted.path, p0_off, p0_len)?,
         "a genuinely punched extent stays a hole in the heal copy"
+    );
+
+    // HOLES APART: an intact block between two punched ones. Adjacent holes are
+    // merged into one extent; the block between two that are not must still be
+    // copied, not swallowed into a merged hole.
+    let table = build("2")?;
+    let handles: Vec<_> = table
+        .block_index
+        .iter()
+        .collect::<crate::Result<Vec<_>>>()?;
+    assert!(handles.len() >= 5, "need blocks on both sides of the gap");
+    let bound = handles.get(3).expect("fourth block").end_key().clone();
+    let extent = |i: usize| {
+        let h = handles.get(i).expect("block");
+        (h.offset().0, h.size() as usize)
+    };
+    let (hole_a, kept, hole_b) = (extent(0), extent(1), extent(2));
+    for (off, len) in [hole_a, hole_b] {
+        memfs.punch_hole(&table.path, off, len as u64)?;
+    }
+    let restricted = table.with_restriction(bound);
+    let source = fs.open(
+        &restricted.path,
+        &crate::fs::FsOpenOptions::new().read(true),
+    )?;
+    restricted
+        .unshare_for_heal(&*source, crate::fs::SyncMode::Normal)
+        .expect("unshare succeeds");
+    assert!(
+        all_zero(&restricted.path, hole_a.0, hole_a.1)?
+            && all_zero(&restricted.path, hole_b.0, hole_b.1)?,
+        "both punched extents stay holes in the heal copy"
+    );
+    assert!(
+        !all_zero(&restricted.path, kept.0, kept.1)?,
+        "the intact block between two holes is copied, not merged into a hole"
     );
     Ok(())
 }

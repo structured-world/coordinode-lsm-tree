@@ -98,6 +98,14 @@ pub struct Inner {
     /// old view is unreachable. Cumulative across slices and idempotent.
     pub(crate) punch_on_drop: AtomicU64,
 
+    /// How far this file's data region is known punched, shared by the views
+    /// of the file a tight-space pass restricts it to one after another: each
+    /// view punches only above what an earlier one finished, rather than the
+    /// whole prefix again on every slice. Raised only by a punch that
+    /// completed; one deferred or stopped by a failure leaves it, so the next
+    /// view punches that range too.
+    pub(crate) punched_through: once_cell::race::OnceBox<Arc<AtomicU64>>,
+
     pub(super) checksum: Checksum,
 
     pub(super) global_seqno: SeqNo,
@@ -456,34 +464,41 @@ impl Drop for Inner {
             // still serves the suffix. `punch_hole` opens the path itself, so it
             // is fine that this view's own handles drop right after this body.
             //
-            // Punch each data block below the boundary INDIVIDUALLY rather than
-            // the whole `[0, offset)` span. The boundary lies inside the `data`
-            // section, whose blocks the writer lays out contiguously from
-            // offset 0 (index / filter / meta sections all sit PAST the data
-            // region), so a span punch would zero the same bytes — the
-            // per-block form is kept for the classifiable hole pattern below,
-            // not for section safety. The block index yields only data-block
-            // handles, so iterating it punches exactly the reclaimable data.
+            // Punch the data blocks below the boundary in calls of many adjacent
+            // blocks, not one call per block: a filesystem deallocates only the
+            // pages wholly inside one call and zero-fills the edges, so blocks
+            // of about a page punched one by one at unaligned offsets would keep
+            // nearly every page allocated. A call takes whole blocks up to about
+            // [`PUNCH_CHUNK`], so each edge between two calls keeps at most one
+            // page allocated. The writer lays the data blocks out contiguously
+            // from offset 0 and the block index yields only data-block handles,
+            // so the calls cover exactly the reclaimable data (the index, filter
+            // and meta sections all sit past the data region).
             //
-            // Punch TOP-DOWN (highest reclaimable block first) and STOP at the
-            // first failure. This keeps the resulting hole pattern CLASSIFIABLE
-            // for a sidecar-less manifest repair: any failure (or crash) leaves
-            // intact blocks strictly BELOW the zeroed ones — the irregular
-            // signature repair fails closed on — while a fully successful pass
-            // leaves the clean zeroed prefix the classical geometry bound is
-            // sound for. Bottom-up with continue-past-failures could instead
-            // leave intact-but-consumed blocks ABOVE a clean zeroed prefix,
-            // indistinguishable from a live suffix, and a sidecar-less repair
-            // would then restrict to a bound that resurrects their superseded
-            // rows. Stopping reclaims less space on a failure, but reclaim is
-            // best-effort; classification soundness is not.
+            // Punch TOP-DOWN (highest call first) and STOP at the first failure.
+            // This keeps the resulting hole pattern CLASSIFIABLE for a
+            // sidecar-less manifest repair: every call that lands zeroes at
+            // least one whole block, so any failure (or crash) leaves intact
+            // blocks strictly BELOW zeroed ones (the irregular signature repair
+            // fails closed on), while a fully successful pass leaves the clean
+            // zeroed prefix the classical geometry bound is sound for. A call
+            // that ended inside a block would zero only its tail, and if no call
+            // below it landed, the file would show no zeroed block at all: it
+            // would read as unpunched, with consumed rows intact. Bottom-up with
+            // continue-past-failures could instead leave intact-but-consumed
+            // blocks ABOVE a clean zeroed prefix, indistinguishable from a live
+            // suffix, and a sidecar-less repair would then restrict to a bound
+            // that resurrects their superseded rows. Stopping reclaims less
+            // space on a failure, but reclaim is best-effort; classification
+            // soundness is not.
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
             if off == u64::MAX {
                 return;
             }
-            let mut reclaimable: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            // `[start, end)` of each data block below `off`, in file order.
+            let mut blocks: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             // The table is being dropped: caching its index would only evict
             // blocks someone still reads.
             for handle in self.untraced_index_walk() {
@@ -501,10 +516,23 @@ impl Drop for Inner {
                 };
                 let block_off = handle.offset().0;
                 if block_off < off {
-                    reclaimable.push((block_off, u64::from(handle.size())));
+                    // Bounded by the file's length.
+                    blocks.push((block_off, block_off + u64::from(handle.size())));
                 }
             }
-            reclaimable.reverse();
+            // An earlier view of this file punched everything below the floor;
+            // from the 64 KiB edge under it, so the page its punch ended in is
+            // freed now that the rest of it is consumed too. The block cut at
+            // the floor lies wholly below that punch's end, already zeroed.
+            let floor = self.punched_through.get().map_or(0, |punched| {
+                punched.load(core::sync::atomic::Ordering::Acquire)
+            });
+            let floor = floor - floor % PUNCH_ALIGN;
+            blocks.retain_mut(|block| {
+                block.0 = block.0.max(floor);
+                block.0 < block.1
+            });
+            let reclaimable = punch_extents_top_down(&blocks);
 
             // An IN-PROGRESS checkpoint's window covers the link step, so a
             // punch cannot race a link that is about to appear — but the intent
@@ -578,10 +606,12 @@ impl Drop for Inner {
                 }
             }
 
-            for (at, &(block_off, size)) in reclaimable.iter().enumerate() {
-                if let Err(e) = self.fs.punch_hole(&self.path, block_off, size) {
+            let mut completed = true;
+            for (at, &(extent_off, len)) in reclaimable.iter().enumerate() {
+                if let Err(e) = self.fs.punch_hole(&self.path, extent_off, len) {
+                    completed = false;
                     log::warn!(
-                        "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
+                        "Failed to punch tight-space extent at {extent_off} of table {global_id:?} at {:?}; \
                          stopping the reclaim to keep the hole pattern classifiable: {e:?}",
                         self.path,
                     );
@@ -599,6 +629,41 @@ impl Drop for Inner {
                     break;
                 }
             }
+            if completed && let Some(punched) = self.punched_through.get() {
+                punched.fetch_max(off, core::sync::atomic::Ordering::Release);
+            }
         }
     }
+}
+
+/// The edge a punch above an earlier one starts from: a multiple of every
+/// page size a filesystem uses, so the page the earlier punch ended in is
+/// covered whole.
+pub const PUNCH_ALIGN: u64 = 64 * 1_024;
+
+/// The most one prefix punch call covers, unless a single block is larger: a
+/// call is cut only at block edges, so each one that lands zeroes whole blocks.
+pub const PUNCH_CHUNK: u64 = 4 * 1_024 * 1_024;
+
+/// The punch calls for `blocks` (ascending, disjoint `[start, end)`), highest
+/// first: runs of adjacent blocks, each call as many whole blocks as fit in
+/// [`PUNCH_CHUNK`] and at least one.
+pub fn punch_extents_top_down(blocks: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
+    let mut extents = alloc::vec::Vec::new();
+    // `[lo, hi)` of the call being built.
+    let mut call: Option<(u64, u64)> = None;
+    for &(start, end) in blocks.iter().rev() {
+        call = match call {
+            Some((lo, hi)) if lo == end && hi - start <= PUNCH_CHUNK => Some((start, hi)),
+            Some((lo, hi)) => {
+                extents.push((lo, hi - lo));
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    if let Some((lo, hi)) = call {
+        extents.push((lo, hi - lo));
+    }
+    extents
 }

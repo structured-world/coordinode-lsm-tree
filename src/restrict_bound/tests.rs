@@ -187,3 +187,128 @@ fn encrypted_sidecar_roundtrips_and_rejects_a_wrong_key() {
         SidecarRead::Corrupt,
     ));
 }
+
+/// The sidecars a slice publishes over two folders on a `FaultFs`, with the
+/// tables `1..=3` in `/db/a` and `4` in `/db/b`.
+fn batch_fixture() -> (crate::fs::FaultFs<crate::fs::MemFs>, Vec<PathBuf>) {
+    let fs = crate::fs::FaultFs::new(crate::fs::MemFs::new());
+    fs.create_dir_all(Path::new("/db/a")).unwrap();
+    fs.create_dir_all(Path::new("/db/b")).unwrap();
+    let paths = ["/db/a/1", "/db/a/2", "/db/a/3", "/db/b/4"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    (fs, paths)
+}
+
+fn batch<'a>(fs: &'a dyn Fs, paths: &'a [PathBuf], bounds: &'a [Vec<u8>]) -> Vec<SidecarWrite<'a>> {
+    paths
+        .iter()
+        .zip(bounds)
+        .zip(1u64..)
+        .map(|((table_path, bound), table_id)| SidecarWrite {
+            fs,
+            table_path,
+            encryption: None,
+            table_id,
+            bound,
+        })
+        .collect()
+}
+
+/// A slice's sidecars publish together: each reads back its own bound, and
+/// each folder they share is synced once, not once per sidecar.
+#[test]
+fn write_many_syncs_each_folder_once() {
+    let (fs, paths) = batch_fixture();
+    let bounds: Vec<Vec<u8>> = (1..=4).map(|i| format!("k{i}").into_bytes()).collect();
+    drop(fs.injector().take_syncs());
+
+    let results = write_many(&batch(&fs, &paths, &bounds), SyncMode::Normal);
+    assert!(results.iter().all(Result::is_ok), "every sidecar published");
+
+    for ((path, bound), id) in paths.iter().zip(&bounds).zip(1u64..) {
+        match read(&fs, path, None).unwrap() {
+            SidecarRead::Present(read_id, read_bound) => {
+                assert_eq!((id, bound), (read_id, &read_bound), "{}", path.display());
+            }
+            _ => panic!("{} has no sidecar", path.display()),
+        }
+    }
+    let folders: Vec<PathBuf> = fs
+        .injector()
+        .take_syncs()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, crate::fs::SyncKind::Directory))
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        vec![PathBuf::from("/db/a"), PathBuf::from("/db/b")],
+        folders,
+        "one sync per folder",
+    );
+}
+
+/// A folder whose sync fails leaves none of its sidecars known durable, so
+/// every write into it fails and no punch relies on it; a sidecar in another
+/// folder still publishes, and no temp file is left.
+#[test]
+fn write_many_fails_every_sidecar_of_a_folder_whose_sync_fails() {
+    use crate::fs::{Fault, FaultOp, FaultRule};
+    let (fs, paths) = batch_fixture();
+    let bounds: Vec<Vec<u8>> = (1..=4).map(|i| format!("k{i}").into_bytes()).collect();
+    fs.injector().arm(
+        FaultRule::new(
+            FaultOp::SyncDirectory,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .on_path("/db/a")
+        .once(),
+    );
+
+    let results = write_many(&batch(&fs, &paths, &bounds), SyncMode::Normal);
+    let ok: Vec<bool> = results.iter().map(Result::is_ok).collect();
+    assert_eq!(
+        vec![false, false, false, true],
+        ok,
+        "the failed folder's three fail"
+    );
+    for path in &paths {
+        assert!(
+            !fs.exists(&sidecar_tmp_path(path)).unwrap(),
+            "no temp left beside {}",
+            path.display(),
+        );
+    }
+}
+
+/// A sidecar that cannot be written fails alone: its neighbours publish, and
+/// an over-long bound is refused before anything is written for it.
+#[test]
+fn write_many_fails_only_the_sidecar_that_cannot_be_written() {
+    use crate::fs::{Fault, FaultOp, FaultRule};
+    let (fs, paths) = batch_fixture();
+    let mut bounds: Vec<Vec<u8>> = (1..=4).map(|i| format!("k{i}").into_bytes()).collect();
+    bounds[3] = vec![b'x'; usize::from(u16::MAX) + 1];
+    fs.injector().arm(
+        FaultRule::new(FaultOp::Open, Fault::Error(crate::io::ErrorKind::Other))
+            .on_path("2.restrict-bound.tmp")
+            .once(),
+    );
+
+    let results = write_many(&batch(&fs, &paths, &bounds), SyncMode::Normal);
+    let ok: Vec<bool> = results.iter().map(Result::is_ok).collect();
+    assert_eq!(vec![true, false, true, false], ok);
+    assert!(matches!(
+        read(&fs, &paths[1], None).unwrap(),
+        SidecarRead::Missing
+    ));
+    assert!(matches!(
+        read(&fs, &paths[3], None).unwrap(),
+        SidecarRead::Missing
+    ));
+    assert!(matches!(
+        read(&fs, &paths[2], None).unwrap(),
+        SidecarRead::Present(3, _)
+    ));
+}

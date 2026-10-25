@@ -23,6 +23,10 @@ pub(crate) mod group_carry;
 mod id;
 mod index_block;
 mod inner;
+#[cfg(feature = "std")]
+pub(crate) use inner::PUNCH_ALIGN;
+#[cfg(test)]
+pub(crate) use inner::PUNCH_CHUNK;
 pub(crate) mod iter;
 #[cfg(feature = "zstd")]
 pub(crate) mod lazy_block;
@@ -2936,6 +2940,14 @@ impl Table {
                     }
                 }
                 holes.sort_unstable();
+                // Adjacent holes are one extent: one punch call each below.
+                holes.dedup_by(|next, run| {
+                    let adjacent = run.0 + run.1 == next.0;
+                    if adjacent {
+                        run.1 += next.1;
+                    }
+                    adjacent
+                });
                 // Establish the full size so the un-written data-block extents stay
                 // sparse holes.
                 tmp.set_len(len)
@@ -5418,6 +5430,23 @@ impl Table {
         Ok(())
     }
 
+    /// The sidecar write [`Self::write_restrict_sidecar`] makes, for
+    /// [`crate::restrict_bound::write_many`] to publish with the other tables a
+    /// slice restricts, under the same ordering.
+    #[cfg(feature = "std")]
+    pub(crate) fn restrict_sidecar_write<'a>(
+        &'a self,
+        bound: &'a [u8],
+    ) -> crate::restrict_bound::SidecarWrite<'a> {
+        crate::restrict_bound::SidecarWrite {
+            fs: &*self.fs,
+            table_path: &self.path,
+            encryption: self.encryption.as_deref(),
+            table_id: self.metadata.id,
+            bound,
+        }
+    }
+
     /// Publishes this table's tight-space restriction lower bound to its
     /// `.restrict-bound` sidecar, so manifest repair recovers the exact bound
     /// WITHOUT the SST itself being mutated (which would invalidate the whole-file
@@ -5508,10 +5537,11 @@ impl Table {
     /// transparent compression an ordinary, fully-written file already reports
     /// fewer physical bytes than its length), and the run is asked whether it
     /// CONTAINS a hole rather than whether it wholly IS one: the reclaim
-    /// punches per block with arbitrary, unaligned extents, and the filesystem
-    /// deallocates only the wholly-contained pages while zero-filling the
-    /// edges — so every block-boundary page stays allocated and a whole-extent
-    /// probe would reject genuine punches.
+    /// punches at unaligned extents (the prefix ends mid-page, and a block
+    /// edge between two calls need not fall on a page of this filesystem), and the
+    /// filesystem deallocates only the wholly-contained pages while
+    /// zero-filling the edges, so a whole-extent probe would reject genuine
+    /// punches.
     ///
     /// A backend that cannot answer the hole probe (`None`) leaves the punch
     /// UNPROVEN, which is a distinct verdict from "unpunched": on a mount
@@ -10052,6 +10082,7 @@ impl Table {
                 is_deleted: AtomicBool::default(),
                 entry_durable: AtomicBool::default(),
                 punch_on_drop: AtomicU64::new(u64::MAX),
+                punched_through: once_cell::race::OnceBox::new(),
 
                 checksum,
                 global_seqno,
@@ -10245,6 +10276,15 @@ impl Table {
         if let Some(pause) = self.0.deletion_pause.get() {
             reopened.install_deletion_pause(Arc::clone(pause));
         }
+        // How far the file is punched is the file's, not a view's.
+        let punched = self
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::new(AtomicU64::new(0))));
+        reopened
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::clone(punched)));
         #[cfg(all(feature = "std", feature = "page_ecc"))]
         reopened.install_heal_lock(self.heal_lock_arc());
         // The heal-hint sink too: a correctable read from the restricted view

@@ -478,6 +478,7 @@ impl MultiWriter {
                 path,
                 is_deleted: AtomicBool::new(false),
                 punch_on_drop: portable_atomic::AtomicU64::new(u64::MAX),
+                punched_through: once_cell::race::OnceBox::new(),
                 // A freshly written file is whole: nothing has been reclaimed.
                 live_data_start: 0,
                 id: blob_file_id,
