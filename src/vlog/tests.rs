@@ -110,6 +110,77 @@ fn recover_blob_file_on_non_blob_file_errors() {
     assert!(result.is_err(), "recovering a non-blob file must fail");
 }
 
+/// The views a tight-space relocation restricts a blob file to one after
+/// another punch only above what the view before finished, from the aligned
+/// edge under it, instead of the whole relocated prefix on every slice.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn successive_blob_views_punch_only_above_what_the_last_one_finished() -> crate::Result<()> {
+    use crate::fs::{FaultFs, Fs, MemFs};
+
+    let memfs = MemFs::new();
+    let root = std::path::absolute("/blobs")?;
+    memfs.create_dir_all(&root)?;
+    let path = root.join("0");
+    {
+        let fs_dyn: Arc<dyn Fs> = Arc::new(memfs.clone());
+        let mut w = super::blob_file::writer::Writer::new(path.clone(), 0, 0, &*fs_dyn)?;
+        for i in 0..3_000u32 {
+            w.write(
+                format!("k{i:06}").as_bytes(),
+                u64::from(i) + 1,
+                &[b'x'; 200],
+            )?;
+        }
+        w.finish()?;
+    }
+    // Two slices' frontiers: the ends of the 1000th and the 2000th frame.
+    let frame_end = |n: usize| -> crate::Result<u64> {
+        Ok(super::BlobFileScanner::new(&path, &memfs, 0)?
+            .nth(n)
+            .expect("frame")?
+            .frame_end)
+    };
+    let (f1, f2) = (frame_end(999)?, frame_end(1_999)?);
+
+    let fault = FaultFs::new(memfs.clone());
+    let injector = fault.injector();
+    let fs: Arc<dyn Fs> = Arc::new(fault);
+    let first = recover_blob_file(
+        &path,
+        0,
+        Checksum::from_raw(0),
+        0,
+        &fs,
+        #[cfg(zstd_any)]
+        &no_dicts(),
+    )?;
+    let second = first.reopen_restricted(f1)?;
+    first.mark_punch_on_drop(f1);
+    drop(first);
+    let third = second.reopen_restricted(f2)?;
+    second.mark_punch_on_drop(f2);
+    drop(second);
+    drop(third);
+
+    let punches = injector.punches_for("blobs/0");
+    let floor = f1 - f1 % crate::table::PUNCH_ALIGN;
+    let [(first_start, first_len), (second_start, second_len)] = punches[..] else {
+        panic!("one punch per view: {punches:?}");
+    };
+    assert_eq!(
+        f1,
+        first_start + first_len,
+        "the first view punched up to its frontier"
+    );
+    assert_eq!(
+        (first_start.max(floor), f2),
+        (second_start, second_start + second_len),
+        "the second view punched from the aligned edge under the first one's frontier",
+    );
+    Ok(())
+}
+
 /// The blob twin of the table-prefix rule: a reclaim whose link probe cannot
 /// answer (or that reports a COMPLETED checkpoint's surviving link) while the
 /// deletion pause is inactive must be RETAINED for `retry_pending_reclaims`,

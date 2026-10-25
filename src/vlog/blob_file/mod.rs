@@ -61,6 +61,19 @@ pub struct Inner {
     )]
     pub(crate) punch_on_drop: portable_atomic::AtomicU64,
 
+    /// How far this file's data section is known punched, shared by the views
+    /// of the file a tight-space relocation restricts it to one after another:
+    /// each view punches only above what an earlier one finished. Raised only
+    /// by a punch that completed. Mirrors `table::Inner::punched_through`.
+    #[cfg_attr(
+        not(feature = "std"),
+        allow(
+            dead_code,
+            reason = "tight-space punch frontier; the punch consumer is std-gated, so unread under no_std"
+        )
+    )]
+    pub(crate) punched_through: once_cell::race::OnceBox<Arc<portable_atomic::AtomicU64>>,
+
     pub checksum: Checksum,
 
     /// First LIVE byte of this view, or `0` for a whole file. Set on the
@@ -294,6 +307,16 @@ impl Drop for Inner {
                             None
                         }
                     };
+                    // An earlier view of this file punched everything below the
+                    // floor; from the aligned edge under it, as a table's views do.
+                    let floor = self.punched_through.get().map_or(0, |punched| {
+                        punched.load(core::sync::atomic::Ordering::Acquire)
+                    });
+                    let floor = floor - floor % crate::table::PUNCH_ALIGN;
+                    let extent = extent.and_then(|(data_start, _)| {
+                        let start = data_start.max(floor);
+                        (start < off).then(|| (start, off - start))
+                    });
                     if let Some((data_start, len)) = extent {
                         let deferred = self.deletion_pause.get().is_some_and(|pause| {
                             pause.is_active()
@@ -486,7 +509,7 @@ impl BlobFile {
             .map_or_else(crate::compression::ZstdDictionaries::new, |d| {
                 crate::compression::ZstdDictionaries::new().with(d)
             });
-        super::recover_blob_file_from(
+        let reopened = super::recover_blob_file_from(
             &self.0.path,
             self.0.id,
             checksum,
@@ -495,7 +518,17 @@ impl BlobFile {
             frontier,
             #[cfg(zstd_any)]
             &dicts,
-        )
+        )?;
+        // How far the file is punched is the file's, not a view's.
+        let punched = self
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::new(portable_atomic::AtomicU64::new(0))));
+        reopened
+            .0
+            .punched_through
+            .get_or_init(|| Box::new(Arc::clone(punched)));
+        Ok(reopened)
     }
 
     /// Installs the tree-wide deletion pause used by checkpoints.

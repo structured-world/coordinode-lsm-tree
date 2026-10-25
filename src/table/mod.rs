@@ -23,6 +23,8 @@ pub(crate) mod group_carry;
 mod id;
 mod index_block;
 mod inner;
+#[cfg(feature = "std")]
+pub(crate) use inner::PUNCH_ALIGN;
 #[cfg(test)]
 pub(crate) use inner::PUNCH_CHUNK;
 pub(crate) mod iter;
