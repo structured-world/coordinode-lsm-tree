@@ -3790,16 +3790,32 @@ fn plan_merge_on_read(
             Ok((entry.key.user_key, entry.key.seqno))
         })
         .collect::<crate::Result<Vec<_>>>()?;
-    // The relocation keeps the source's key range. A source written before the
-    // key-domain policy, or under another one, may hold rows of two domains: it
-    // is rewritten instead, so no output spans one.
+    // The relocation keeps the source's key range and its range tombstones as
+    // they are. A source written before the key-domain policy, or under another
+    // one, may hold rows of two domains, or a tombstone reaching out of its
+    // rows' domain: it is rewritten instead, so no output spans one.
     if let (Some(domains), Some((first, _)), Some((last, _))) =
         (opts.config.key_domains.as_ref(), keys.first(), keys.last())
-        && domains.domain_end(first).is_some_and(|end| {
-            opts.config.comparator.compare(last, &end) != core::cmp::Ordering::Less
-        })
     {
-        return Ok(None);
+        use core::cmp::Ordering::{Greater, Less};
+
+        let cmp = opts.config.comparator.as_ref();
+        let end = domains.domain_end(first);
+        let rows_leave = end
+            .as_ref()
+            .is_some_and(|end| cmp.compare(last, end) != Less);
+        // A domain's end names it: a tombstone starting in another domain
+        // answers another end.
+        if rows_leave
+            || input_range_tombstones.iter().any(|rt| {
+                domains.domain_end(&rt.start) != end
+                    || end
+                        .as_ref()
+                        .is_some_and(|end| cmp.compare(&rt.end, end) == Greater)
+            })
+        {
+            return Ok(None);
+        }
     }
     let bitmap = super::delete_materialize::build_position_bitmap(
         keys.iter()
