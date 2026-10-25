@@ -2056,6 +2056,7 @@ impl AbstractTree for BlobTree {
 
         table_writer =
             table_writer.use_prefix_extractor(self.index.config.prefix_extractor.clone());
+        table_writer = table_writer.use_key_domains(self.index.config.key_domains.clone());
         table_writer = table_writer.use_encryption(self.index.config.encryption.clone());
         table_writer = table_writer.use_clock(self.index.config.clock.clone());
         // Runtime-driven SST options, mirroring the standard tree's flush so a

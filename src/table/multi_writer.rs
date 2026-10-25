@@ -135,6 +135,9 @@ pub struct MultiWriter {
 
     prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
+    /// The key domains no output spans, and the current output's.
+    domain: Option<crate::key_domain::DomainCursor>,
+
     encryption: Option<Arc<dyn EncryptionProvider>>,
 
     /// The tree's clock, handed to every successor [`Writer`].
@@ -442,6 +445,7 @@ impl MultiWriter {
             output_base: None,
 
             prefix_extractor: None,
+            domain: None,
 
             encryption: None,
             clock: None,
@@ -548,6 +552,20 @@ impl MultiWriter {
                     !alignment.ahead(crossing, comparator) && full(100)
                 });
         (cut && self.rotation_sheds(key, (0, 0)), Some(crossing))
+    }
+
+    /// Whether `key`, the next new key, lies past the current output's domain.
+    fn crosses_domain(&self, key: &[u8]) -> bool {
+        self.domain
+            .as_ref()
+            .is_some_and(|domain| domain.crosses(key, self.comparator.as_ref()))
+    }
+
+    /// Takes `key` into the current output's domain, a new one when `crossed`.
+    fn enter_domain(&mut self, key: &[u8], crossed: bool) {
+        if let Some(domain) = &mut self.domain {
+            domain.enter(key, crossed);
+        }
     }
 
     /// Takes the key `crossing` was decided at into the output: a new one when
@@ -1045,6 +1063,14 @@ impl MultiWriter {
     /// hold until the outputs are installed.
     pub(crate) fn filter_sizing(&self) -> Option<crate::filter_budget::FilterPlan> {
         self.filter_sizing.clone()
+    }
+
+    /// Ends an output before the first key of the next of `domains`, whatever
+    /// its size (see [`crate::KeyDomains`]).
+    #[must_use]
+    pub(crate) fn use_key_domains(mut self, domains: Option<Arc<dyn crate::KeyDomains>>) -> Self {
+        self.domain = domains.map(crate::key_domain::DomainCursor::new);
+        self
     }
 
     #[must_use]
@@ -1676,11 +1702,13 @@ impl MultiWriter {
             // batch starts the next table.
             let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
             let (cut, crossing) = self.decide_cut(&item.key.user_key);
-            if layout_changes || cut {
+            let crossed = self.crosses_domain(&item.key.user_key);
+            if layout_changes || cut || crossed {
                 self.rotate()?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
-            self.commit_cut(crossing, layout_changes || cut);
+            self.commit_cut(crossing, layout_changes || cut || crossed);
+            self.enter_domain(&item.key.user_key, crossed);
         }
 
         self.writer.write(item)?;
@@ -1891,12 +1919,25 @@ impl MultiWriter {
                 self.tombstone_share.open_output(&first.key.user_key);
             }
         }
+        // A group running into the next key domain is written row by row,
+        // which ends the output where the domain does.
+        if self.domain.as_ref().is_some_and(|domain| {
+            !domain.holds(
+                &first.key.user_key,
+                &last.key.user_key,
+                self.comparator.as_ref(),
+            )
+        }) {
+            self.current_key = previous_key;
+            return Ok(false);
+        }
         // A table records one value layout: a group stored the other way
         // starts the next table, a run of groups stored one way shares it.
         let layout_changes = self.value_layout.is_some_and(|current| current != layout);
         // The output is weighed once for the cut and for the copy's checks.
         let load = self.output_load();
         let (cut, crossing) = self.decide_cut_at(&first.key.user_key, load);
+        let cut = cut || self.crosses_domain(&first.key.user_key);
         if self.writes_group_by_rows(load, layout_changes || cut, crossing, last, bytes) {
             self.current_key = previous_key;
             return Ok(false);
@@ -1908,6 +1949,7 @@ impl MultiWriter {
         // Taken now: rows written one by one after a refused copy reach the
         // same key in the same output, which has passed these boundaries.
         self.commit_cut(crossing, layout_changes || cut);
+        self.enter_domain(&first.key.user_key, cut);
 
         let comparator = self.comparator.clone();
         if !write(&mut self.writer, &comparator)? {

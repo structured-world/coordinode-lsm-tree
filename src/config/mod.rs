@@ -866,6 +866,9 @@ pub struct Config {
     /// matching prefixes.
     pub prefix_extractor: Option<Arc<dyn PrefixExtractor>>,
 
+    /// Key domains no table spans (see [`Config::key_domains`]).
+    pub key_domains: Option<Arc<dyn crate::KeyDomains>>,
+
     /// Merge operator for commutative operations
     ///
     /// When set, enables `merge()` operations that store partial updates
@@ -1218,6 +1221,7 @@ impl Default for Config {
             merge_operator: None,
 
             prefix_extractor: None,
+            key_domains: None,
 
             expect_point_read_hits: false,
 
@@ -2553,6 +2557,18 @@ impl Config {
     #[must_use]
     pub fn prefix_extractor(mut self, extractor: Arc<dyn PrefixExtractor>) -> Self {
         self.prefix_extractor = Some(extractor);
+        self
+    }
+
+    /// Ends every table that flush, ingest and compaction write before the
+    /// first key of the next of `domains`, even below the target size, so no
+    /// new table holds keys of two domains.
+    ///
+    /// The policy may be added or replaced on reopen: tables written before it
+    /// keep their keys until compaction rewrites them.
+    #[must_use]
+    pub fn key_domains(mut self, domains: Arc<dyn crate::KeyDomains>) -> Self {
+        self.key_domains = Some(domains);
         self
     }
 

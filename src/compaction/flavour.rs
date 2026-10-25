@@ -497,6 +497,7 @@ pub(super) fn prepare_table_writer(
         // filter writer (preserving the extractor). Only use_partitioned_filter
         // replaces the writer entirely (handled above, lines 85-90).
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
+        .use_key_domains(opts.config.key_domains.clone())
         .use_encryption(opts.config.encryption.clone())
         .use_clock(opts.config.clock.clone())
         // Read the ECC scheme from the same live snapshot as the other

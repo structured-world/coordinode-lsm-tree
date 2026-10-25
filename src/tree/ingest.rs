@@ -206,6 +206,7 @@ impl<'a> Ingestion<'a> {
         }
 
         writer = writer.use_prefix_extractor(tree.config.prefix_extractor.clone());
+        writer = writer.use_key_domains(tree.config.key_domains.clone());
         writer = writer.use_encryption(tree.config.encryption.clone());
         writer = writer.use_clock(tree.config.clock.clone());
         // ECC scheme from the same live snapshot as `seqno_in_index` /
