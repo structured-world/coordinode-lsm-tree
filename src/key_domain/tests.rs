@@ -1,6 +1,6 @@
 use super::{DomainCursor, KeyDomains};
 use crate::UserKey;
-use crate::comparator::{UserComparator, default_comparator};
+use crate::comparator::default_comparator;
 use alloc::sync::Arc;
 
 /// One domain per first byte; `0xFF` runs to the end of the key space.
@@ -66,10 +66,11 @@ fn the_last_domain_is_never_left() {
 
 /// A run of keys from `first` to `last` stays in one domain exactly when
 /// `last` is below `first`'s domain end.
+#[cfg(feature = "columnar")]
 #[test]
 fn holds_a_run_within_one_domain_only() {
     let shared = default_comparator();
-    let cmp: &dyn UserComparator = shared.as_ref();
+    let cmp: &dyn crate::comparator::UserComparator = shared.as_ref();
     let cursor = cursor();
     assert!(cursor.holds(b"a0", b"a9", cmp));
     assert!(
