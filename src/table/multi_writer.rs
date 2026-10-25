@@ -1393,16 +1393,14 @@ impl MultiWriter {
         self
     }
 
-    /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table
-    fn rotate(&mut self) -> crate::Result<()> {
-        self.rotate_at(None)
-    }
-
-    /// [`Self::rotate`], ending the closing output at `domain_end`, the end of
-    /// its key domain, when the next key lies past it: its share of the range
-    /// tombstones stops there, and the pieces between that end and the next
-    /// output's first key go to an output of tombstones alone, so no output
-    /// holding keys reaches into another domain.
+    /// Flushes the current writer, stores its metadata, and sets up a new
+    /// writer for the next table.
+    ///
+    /// `domain_end`, when given, is the end of the closing output's key
+    /// domain, which the next key lies past: its share of the range tombstones
+    /// stops there, and the pieces between that end and the next output's
+    /// first key go to an output of tombstones alone, so no output holding
+    /// keys reaches into another domain.
     fn rotate_at(&mut self, domain_end: Option<&UserKey>) -> crate::Result<()> {
         log::debug!("Rotating table writer");
         self.output_base = None;
@@ -2198,14 +2196,68 @@ impl MultiWriter {
     /// to a fresh table first if the current one has reached the target size (a
     /// batch is a block boundary, mirroring the new-key rotation in
     /// [`Self::write`]). Forwards to the inner writer's columnar-ingest path.
+    ///
+    /// Under a key-domain policy a batch whose keys reach past a domain's end
+    /// is written as one block per domain, each in a table of that domain.
     #[cfg(feature = "columnar")]
     pub(crate) fn write_columnar_batch(
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
     ) -> crate::Result<Option<crate::UserKey>> {
+        let Some(domain) = self.domain.as_ref() else {
+            return self.write_columnar_part(batch);
+        };
+        let keys = batch.user_keys()?;
+        let cmp = self.comparator.clone();
+        // Rows `[start, end)` of each domain, keys ascending.
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < batch.row_count {
+            let end = match domain.domain_end(keys.get(start)?) {
+                None => batch.row_count,
+                Some(domain_end) => {
+                    // The first row at or past the domain's end.
+                    let (mut lo, mut hi) = (start + 1, batch.row_count);
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if cmp.compare(keys.get(mid)?, &domain_end) == core::cmp::Ordering::Less {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    lo
+                }
+            };
+            parts.push((start, end));
+            start = end;
+        }
+        if let [(0, end)] = parts.as_slice()
+            && *end == batch.row_count
+        {
+            return self.write_columnar_part(batch);
+        }
+        let mut last = None;
+        for (start, end) in parts {
+            last = self.write_columnar_part(&batch.rows(start, end)?)?;
+        }
+        Ok(last)
+    }
+
+    /// [`Self::write_columnar_batch`] for a batch within one key domain.
+    #[cfg(feature = "columnar")]
+    fn write_columnar_part(
+        &mut self,
+        batch: &crate::table::columnar::ColumnBatch,
+    ) -> crate::Result<Option<crate::UserKey>> {
+        let crossed = match batch.first_user_key()? {
+            Some(first) => self.crossed_domain_end(first),
+            None => None,
+        };
         // A table records one value layout, so a batch after rows starts the
         // next table.
         if self.table_full()
+            || crossed.is_some()
             || matches!(
                 self.value_layout,
                 Some(
@@ -2213,7 +2265,10 @@ impl MultiWriter {
                 )
             )
         {
-            self.rotate()?;
+            self.rotate_at(crossed.as_ref())?;
+        }
+        if let Some(first) = batch.first_user_key()? {
+            self.enter_domain(first, crossed.is_some());
         }
         // A batch lands whole, so the output's base is what it held before
         // it: closing after the batch sheds all of the batch's state.

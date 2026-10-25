@@ -104,6 +104,13 @@ impl DomainCursor {
             .is_none_or(|end| comparator.compare(last, &end) == core::cmp::Ordering::Less)
     }
 
+    /// The first key past the domain that holds `key` (see
+    /// [`KeyDomains::domain_end`]).
+    #[cfg(feature = "columnar")]
+    pub fn domain_end(&self, key: &[u8]) -> Option<UserKey> {
+        self.domains.domain_end(key)
+    }
+
     /// The first key past the current output's domain, `None` while the
     /// output has no key or when its domain runs to the end of the key space.
     pub fn end(&self) -> Option<&UserKey> {

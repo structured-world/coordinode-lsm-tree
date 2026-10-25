@@ -381,3 +381,54 @@ fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tre
     );
     Ok(())
 }
+
+/// Rows ingested across three epochs land in a table per epoch.
+#[test]
+fn ingest_ends_a_table_at_each_domain_end() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
+    let mut ingest = tree.ingestion()?;
+    for epoch in 0..3 {
+        for i in 0..20 {
+            ingest.write(key(epoch, i), b"v")?;
+        }
+    }
+    ingest.finish()?;
+
+    let mut epochs = table_epochs(&tree);
+    epochs.sort_unstable();
+    assert_eq!(epochs, vec![(0, 0), (1, 1), (2, 2)], "a table per epoch");
+    assert_eq!(latest(&tree)?.len(), 60, "every key reads back");
+    Ok(())
+}
+
+/// One columnar batch whose keys reach across three epochs is written as a
+/// block per epoch, each in a table of that epoch.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_columnar_batch_across_domains_lands_in_a_table_per_domain() -> lsm_tree::Result<()> {
+    use lsm_tree::table::columnar::entries_to_column_batch;
+    use lsm_tree::{InternalValue, ValueType};
+
+    let folder = tempfile::tempdir()?;
+    let any = open(folder.path(), Some(Arc::new(Epochs)))?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| cfg.columnar = true)?;
+    let rows: Vec<InternalValue> = (0..3)
+        .flat_map(|epoch| (0..20).map(move |i| key(epoch, i)))
+        .map(|k| InternalValue::from_components(k, b"v", 0, ValueType::Value))
+        .collect();
+    let batch = entries_to_column_batch(&rows)?;
+
+    let mut ingest = any.ingestion()?;
+    ingest.write_columnar_batch(&batch)?;
+    ingest.finish()?;
+
+    let mut epochs = table_epochs(&any);
+    epochs.sort_unstable();
+    assert_eq!(epochs, vec![(0, 0), (1, 1), (2, 2)], "a table per epoch");
+    assert_eq!(latest(&any)?.len(), 60, "every key reads back");
+    Ok(())
+}
