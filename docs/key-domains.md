@@ -10,7 +10,9 @@ rewriting the survivors that would otherwise share them.
 use lsm_tree::{Config, KeyDomains, SequenceNumberCounter, UserKey};
 use std::sync::Arc;
 
-/// One domain per epoch: the key's first four bytes, big-endian.
+/// One domain per epoch: the key's first four bytes, big-endian. Every key of
+/// this tree starts with its epoch; a shorter one would get `None`, a domain
+/// running to the end of the key space.
 struct Epochs;
 
 impl KeyDomains for Epochs {
@@ -88,8 +90,9 @@ for a moment.
 | | one tree, domains | 404.7 | 3.95 | 39.1 / 39.1 | 10 | 1 | 9.7 |
 | | tree per epoch | 364.4 | 3.55 | 39.4 / 39.4 | 12 | 3 | 39.6 |
 
-- Domains bring one tree to the space a tree per epoch takes: 23% and 25% less
-  than one tree without them, since an expired epoch's tables go whole.
+- Domains bring one tree to the space a tree per epoch takes, since an expired
+  epoch's tables go whole: 23% and 25% less space at the end than one tree
+  without them, 31% and 25% less at the epoch peak.
 - They write 39% and 13% less than one tree without them.
 - A tree per epoch writes less still where an epoch is smaller than a memtable:
   its epoch flushes once, while one shared memtable flushes the epoch in pieces

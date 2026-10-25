@@ -334,7 +334,10 @@ matching entry (and add one for a new subsystem).
   With parallel sub-compactions this is every sub-range's edge, not only the
   compaction's. Such an output may lie past an output of rows written after it,
   or end on the key one starts with, so a version change lays its new tables
-  out in sorted, disjoint runs whatever order they come in. The run's lineage
+  out in sorted runs whose recorded key ranges are disjoint, each table's
+  largest key, inclusive, below the next one's least, whatever order they come
+  in; two tables recording the same boundary key go to separate runs. The run's
+  lineage
   chain still follows key order, since manifest repair unions an unbroken
   chain's ranges from its head's least key to its tail's greatest: the pieces
   below the first output go ahead of it. Enforced in
