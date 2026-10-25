@@ -325,6 +325,29 @@ matching entry (and add one for a new subsystem).
   seqno is newer than the point's; ordering vs point writes is by seqno, same as
   point deletes. Enforced in `src/range_tombstone.rs` /
   `src/range_tombstone_filter.rs` and the range-delete tests.
+- **A compaction drops a piece of a range tombstone only where no table outside
+  it holds a key.** Each output takes the pieces of the tombstones within its
+  share of the key space, so the pieces below the first output's first key and
+  past the last one's last key belong to no output. Where a table outside the
+  compaction overlaps them they are all that keeps its keys deleted: each writer
+  writes them, within the keys it answers for, to outputs of tombstones alone.
+  With parallel sub-compactions this is every sub-range's edge, not only the
+  compaction's. Enforced in `src/compaction/worker.rs` (`tombstones_outside`)
+  and `src/table/multi_writer.rs` (`tombstones_past_the_outputs`); tested by
+  `tests/range_tombstone_rolling_expiry.rs`.
+
+## Key domains
+
+- **No table holding rows reaches past its rows' key domain**, under a
+  `Config::key_domains` policy: flush, ingest and compaction end an output
+  before the next domain's first key, a columnar batch is written as one block
+  per domain, and an output's share of the range tombstones stops at its
+  domain's end (the pieces beyond go to tables of tombstones alone, which may
+  span domains holding no row). A blob file likewise holds values of one domain.
+  The one exception is the inclusive end of a key range: a table whose
+  tombstone reaches its domain's end records that end, the next domain's first
+  key, as its largest key. Enforced in `src/table/multi_writer.rs` and
+  `src/vlog/blob_file/multi_writer.rs`; tested by `tests/key_domains.rs`.
 
 ## Merge operators
 
