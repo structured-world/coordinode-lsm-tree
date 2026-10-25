@@ -1684,7 +1684,8 @@ fn punch_extents_cut_spans_at_chunk_edges_highest_first() {
 /// and zero-fills the rest, so data blocks of about a page, punched one call
 /// each at unaligned offsets, keep nearly every page of the prefix allocated:
 /// the pass that was cut to the room the reclaim frees would find none of it.
-#[cfg(all(feature = "std", target_os = "linux"))]
+// 32-bit Linux punches no holes (`off_t` is too narrow there).
+#[cfg(all(feature = "std", target_os = "linux", target_pointer_width = "64"))]
 #[test]
 #[expect(clippy::expect_used, reason = "test code")]
 fn punch_on_drop_frees_the_prefix_pages_on_a_real_filesystem() -> crate::Result<()> {
