@@ -469,3 +469,52 @@ fn a_columnar_batch_across_domains_lands_in_a_table_per_domain() -> lsm_tree::Re
     assert_eq!(latest(&any)?.len(), 60, "every key reads back");
     Ok(())
 }
+
+/// A lone columnar table whose own range tombstone deletes some of its rows
+/// is relocated with a delete bitmap, its blocks and key range kept as they
+/// were. A table written before the policy may hold two domains: compacting
+/// it under the policy rewrites it into a table per domain instead.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_table_spanning_domains_is_rewritten_not_relocated() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{DeleteStrategy, DeleteStrategyPolicy};
+
+    let merge_on_read = |any: &AnyTree| -> lsm_tree::Result<()> {
+        let AnyTree::Standard(tree) = any else {
+            panic!("expected a standard tree");
+        };
+        tree.update_runtime_config(|cfg| {
+            cfg.columnar = true;
+            cfg.zone_map = true;
+            cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+        })
+    };
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = open(folder.path(), None)?;
+        merge_on_read(&tree)?;
+        for epoch in 0..2 {
+            for i in 0..100 {
+                tree.insert(key(epoch, i), b"v", u64::from(epoch * 100 + i));
+            }
+        }
+        // The table's own tombstone, deleting a few rows of epoch 0.
+        tree.remove_range(key(0, 0), key(0, 10), 1_000);
+        tree.flush_active_memtable(0)?;
+        assert_eq!(
+            table_epochs(&tree),
+            vec![(0, 1)],
+            "self-check: one table over both epochs"
+        );
+    }
+
+    let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
+    merge_on_read(&tree)?;
+    tree.major_compact(u64::MAX, 5_000)?;
+
+    let mut epochs = table_epochs(&tree);
+    epochs.sort_unstable();
+    assert_eq!(epochs, vec![(0, 0), (1, 1)], "a table per epoch");
+    assert_eq!(latest(&tree)?.len(), 190, "the deleted rows read as absent");
+    Ok(())
+}

@@ -2442,8 +2442,14 @@ impl MultiWriter {
             {
                 self.current_key = Some(point.clone());
                 // Past the output's key domain, its share stops at the
-                // domain's end.
-                let domain_end = self.crossed_domain_end(&point);
+                // domain's end. An output of tombstones alone holds no key and
+                // so no domain: the domain the cursor still names is the last
+                // row's, which the first output past it already closed at.
+                let domain_end = if self.writer.meta.key_count > 0 {
+                    self.crossed_domain_end(&point)
+                } else {
+                    None
+                };
                 self.rotate_at(domain_end.as_ref())?;
                 self.tombstone_share.open_output(&point);
             }

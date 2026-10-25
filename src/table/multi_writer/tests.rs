@@ -1053,6 +1053,85 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
     Ok(())
 }
 
+/// Under a key-domain policy, the first output past the last key ends at its
+/// domain's end and the pieces from there go to an output of tombstones alone;
+/// every output of tombstones alone after it holds no key and so no domain.
+/// Each tombstone past the last key is still written once, whatever number of
+/// outputs it spreads over: closing a later one at the rows' domain end again
+/// rewrote everything from that end on, once per output.
+#[test]
+fn a_flush_under_key_domains_writes_each_tombstone_past_the_last_key_once() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    /// One domain per first byte.
+    struct FirstByte;
+    impl crate::KeyDomains for FirstByte {
+        fn domain_end(&self, key: &[u8]) -> Option<UserKey> {
+            match key.first() {
+                Some(&b) if b < u8::MAX => Some(UserKey::from([b + 1].as_slice())),
+                _ => None,
+            }
+        }
+    }
+
+    const TARGET: u64 = 12 * 1_024;
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_key_domains(Some(Arc::new(FirstByte)));
+    let tombstones: Vec<_> = (0..2_000usize)
+        .map(|i| {
+            let prefix = format!("z{i:08}").into_bytes();
+            let mut start = prefix.clone();
+            start.push(0);
+            let mut end = prefix;
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(random_bound_of(2 * i, start, 64)),
+                UserKey::from(random_bound_of(2 * i + 1, end, 64)),
+                5,
+            )
+        })
+        .collect();
+    mw.set_range_tombstones(tombstones.clone());
+    // Every row in the domain `[a, b)`, every tombstone past it.
+    for key in [b"a1" as &[u8], b"a2", b"a3"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
+    assert!(
+        tables.len() > 2,
+        "self-check: the tombstones spread over several outputs of their own"
+    );
+
+    let mut written: Vec<_> = tables
+        .iter()
+        .flat_map(|table| table.range_tombstones().iter())
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    written.sort();
+    let expected: Vec<_> = tombstones
+        .iter()
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    assert_eq!(written.len(), expected.len(), "each tombstone written once");
+    assert_eq!(written, expected, "each tombstone written once, whole");
+    Ok(())
+}
+
 /// The outputs `finish` opens for tombstones past the last key count toward
 /// whether the writer's directory entries are durable: one made as its table
 /// is written, past a pool that ran dry, leaves the install to sync the
