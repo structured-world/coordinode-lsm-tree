@@ -91,13 +91,20 @@ mod cases {
         .with_fs(fs);
         if case.blobs {
             config = config.with_kv_separation(Some(
-                KvSeparationOptions::default().separation_threshold(64),
+                KvSeparationOptions::default()
+                    .separation_threshold(64)
+                    .age_cutoff(1.0)
+                    .staleness_threshold(0.1)
+                    .file_target_size(4 * 1024 * 1024),
             ));
         }
         let tree = config.open()?;
         let mut seqno = 0;
         for input in 0..case.inputs {
-            for i in 0..ROWS {
+            // A KV-separated tree's later inputs overwrite only the even
+            // keys, so its first blob files end half dead and the pass
+            // relocates their live half.
+            for i in (0..ROWS).filter(|i| !case.blobs || input == 0 || i % 2 == 0) {
                 tree.insert(
                     format!("key{i:08}").into_bytes(),
                     value(i, input, case.blobs),
@@ -106,6 +113,11 @@ mod cases {
                 seqno += 1;
             }
             tree.flush_active_memtable(0)?;
+        }
+        if case.blobs {
+            // A merge with room to spare learns how much of each blob file
+            // is dead, which is what makes the timed one relocate.
+            tree.major_compact(64 * 1024 * 1024, seqno)?;
         }
         let used = tree.storage_stats()?.used_bytes;
         let limit = used + used * case.headroom_pct / 100;
@@ -160,12 +172,18 @@ mod cases {
         let blob_punches = injector.punches_for("blobs");
         let covered = |punches: &[(u64, u64)]| punches.iter().map(|&(_, len)| len).sum::<u64>();
 
-        // The pass rewrote, it did not lose: the last input's value reads back.
+        // The pass rewrote, it did not lose: the last value each key took
+        // reads back.
         for i in (0..ROWS).step_by(997) {
+            let last = if case.blobs && i % 2 == 1 {
+                0
+            } else {
+                case.inputs - 1
+            };
             let got = tree.get(format!("key{i:08}").as_bytes(), lsm_tree::SeqNo::MAX)?;
             assert_eq!(
                 got.as_deref(),
-                Some(value(i, case.inputs - 1, case.blobs).as_slice()),
+                Some(value(i, last, case.blobs).as_slice()),
                 "key {i} after the pass",
             );
         }
