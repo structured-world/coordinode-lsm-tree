@@ -48,10 +48,17 @@ slice `[lower, boundary)`:
    sidecar is the only record of the exact bound that survives a lost manifest,
    so a later rebuild from `tables/` can reconstruct the restricted view. Writing
    it after the commit makes its existence prove the restriction is committed
-   (see *Crash safety*).
+   (see *Crash safety*). The sidecars of one slice are written and synced, then
+   renamed, then the folder they share is synced once; an input's punch waits
+   for its own sidecar to be durable.
 4. **Punch** the consumed data blocks of each restricted input (the bytes below
    the boundary), reclaiming their space while leaving the file in place for the
-   restricted view that still serves the suffix.
+   restricted view that still serves the suffix. The blocks are punched as
+   contiguous spans cut at 4 MiB edges, highest first, not one call per block:
+   a filesystem frees only the pages wholly inside one call, so blocks of about
+   a page punched one by one would keep nearly every page allocated. Each slice
+   punches only above what the previous slice's punch finished, from the 64 KiB
+   edge below it, rather than the whole prefix again.
 
 A restricted view is a distinct handle over the same physical SST: reads of keys
 below the boundary are served by the freshly installed output, reads at or above
