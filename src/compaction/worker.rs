@@ -3052,7 +3052,11 @@ fn run_subcompaction(
             .use_sync_mode(opts.config.sync_mode)
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
-            .use_clock(opts.config.clock.clone());
+            .use_clock(opts.config.clock.clone())
+            .use_key_domains(
+                opts.config.key_domains.clone(),
+                opts.config.comparator.clone(),
+            );
             // The policy here is only the OPENING value. Relocation copies
             // frames verbatim out of files that may predate a policy change, so
             // `RelocatingCompaction` records each output file's codec from the
@@ -4359,7 +4363,11 @@ fn merge_tables(
                 .use_sync_mode(opts.config.sync_mode)
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
-                .use_clock(opts.config.clock.clone());
+                .use_clock(opts.config.clock.clone())
+                .use_key_domains(
+                    opts.config.key_domains.clone(),
+                    opts.config.comparator.clone(),
+                );
                 // Same as the tight-space relocation above, through the same
                 // `RelocatingCompaction`: the policy is only the opening value,
                 // each output file records the codec of the source its frames

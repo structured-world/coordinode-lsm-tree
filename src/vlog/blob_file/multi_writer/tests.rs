@@ -1,3 +1,64 @@
+/// Values of two key domains, in two lifetime classes, land in blob files of
+/// one domain each: the file a class switch parks is closed at the domain's
+/// end with the active one, so expiring a domain leaves its files wholly dead.
+#[test_log::test]
+#[expect(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test code: every key is non-empty"
+)]
+fn blob_files_never_hold_values_of_two_key_domains() -> crate::Result<()> {
+    use super::*;
+    use crate::fs::StdFs;
+
+    /// One domain per first byte.
+    struct FirstByte;
+    impl crate::KeyDomains for FirstByte {
+        fn domain_end(&self, key: &[u8]) -> Option<crate::UserKey> {
+            match key.first() {
+                Some(&b) if b < u8::MAX => Some(crate::UserKey::from([b + 1].as_slice())),
+                _ => None,
+            }
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(StdFs);
+    let mut writer =
+        MultiWriter::new(SequenceNumberCounter::default(), folder.path(), 7, None, fs)?
+            .use_target_size(u64::MAX)
+            .use_lifetime_groups(crate::config::LifetimeGroups::new(2).expect("two groups"))
+            .use_key_domains(
+                Some(Arc::new(FirstByte)),
+                crate::comparator::default_comparator(),
+            );
+    for (seqno, (key, class)) in [(b"a1", 0), (b"a2", 1), (b"a3", 0), (b"b1", 1), (b"b2", 0)]
+        .into_iter()
+        .enumerate()
+    {
+        writer.write_fresh(key, seqno as u64, b"value", CompressionType::None, class)?;
+    }
+    let files = writer.finish()?;
+
+    let ranges: Vec<(u8, u8)> = files
+        .iter()
+        .map(|file| {
+            let range = &file.0.meta.key_range;
+            (range.min()[0], range.max()[0])
+        })
+        .collect();
+    assert!(
+        ranges.iter().all(|(lo, hi)| lo == hi),
+        "a blob file holds values of two domains: {ranges:?}",
+    );
+    assert_eq!(
+        files.iter().map(|file| file.0.meta.item_count).sum::<u64>(),
+        5,
+        "every value is written once",
+    );
+    Ok(())
+}
+
 /// A finished blob file whose recorded dictionary cannot be resolved must leave
 /// nothing behind.
 ///

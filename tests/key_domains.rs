@@ -382,6 +382,43 @@ fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tre
     Ok(())
 }
 
+/// A key-value separated tree flushing three epochs writes their separated
+/// values to a blob file per epoch, as it writes their keys to a table per
+/// epoch, and every value reads back.
+#[test]
+fn separated_values_land_in_a_blob_file_per_domain() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_kv_separation(Some(
+        lsm_tree::KvSeparationOptions::default().separation_threshold(16),
+    ))
+    .key_domains(Arc::new(Epochs))
+    .open()?;
+    for epoch in 0..3 {
+        for i in 0..20 {
+            tree.insert(key(epoch, i), [b'v'; 64], u64::from(epoch * 20 + i));
+        }
+    }
+    tree.flush_active_memtable(0)?;
+
+    let mut epochs = table_epochs(&tree);
+    epochs.sort_unstable();
+    assert_eq!(epochs, vec![(0, 0), (1, 1), (2, 2)], "a table per epoch");
+    assert_eq!(
+        tree.current_version().blob_files.len(),
+        3,
+        "a blob file per epoch",
+    );
+    let rows = latest(&tree)?;
+    assert_eq!(rows.len(), 60);
+    assert!(rows.iter().all(|(_, v)| v.as_slice() == [b'v'; 64]));
+    Ok(())
+}
+
 /// Rows ingested across three epochs land in a table per epoch.
 #[test]
 fn ingest_ends_a_table_at_each_domain_end() -> lsm_tree::Result<()> {

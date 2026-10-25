@@ -95,6 +95,10 @@ pub struct MultiWriter {
 
     /// How many of `results`, the first ones, have landed in `outputs`.
     landed: usize,
+
+    /// The key domains no blob file spans, the current one's, and the
+    /// comparator they are intervals of.
+    domain: Option<(crate::key_domain::DomainCursor, crate::SharedComparator)>,
 }
 
 impl MultiWriter {
@@ -146,7 +150,41 @@ impl MultiWriter {
             fs,
             outputs: None,
             landed: 0,
+            domain: None,
         })
+    }
+
+    /// Closes every file this writer holds open before a value whose key lies
+    /// past the key domain of the values written so far, so no blob file holds
+    /// values of two of `domains`, intervals of `comparator`'s order: expiring
+    /// a domain leaves its blob files wholly dead (see [`crate::KeyDomains`]).
+    #[must_use]
+    pub(crate) fn use_key_domains(
+        mut self,
+        domains: Option<Arc<dyn crate::KeyDomains>>,
+        comparator: crate::SharedComparator,
+    ) -> Self {
+        self.domain = domains.map(|d| (crate::key_domain::DomainCursor::new(d), comparator));
+        self
+    }
+
+    /// Takes `key`, the key of the value about to be written, into the
+    /// current domain, closing every open file first when it lies past it.
+    fn enter_key(&mut self, key: &[u8]) -> crate::Result<()> {
+        let Some((domain, comparator)) = &mut self.domain else {
+            return Ok(());
+        };
+        let crossed = domain.crosses(key, comparator.as_ref()).is_some();
+        domain.enter(key, crossed);
+        if crossed {
+            for (codec, _, writer) in core::mem::take(&mut self.parked) {
+                self.land(writer, codec)?;
+            }
+            if self.active_writer.item_count > 0 {
+                self.rotate()?;
+            }
+        }
+        Ok(())
     }
 
     /// Records the blob file already open and every one this writer creates
@@ -377,9 +415,14 @@ impl MultiWriter {
         let new_writer = self.fresh_writer(self.passthrough_compression, self.active_class)?;
 
         let old_writer = core::mem::replace(&mut self.active_writer, new_writer);
+        self.land(old_writer, self.passthrough_compression)
+    }
+
+    /// Finishes `writer`, whose file records `passthrough`, into the results.
+    fn land(&mut self, writer: Writer, passthrough: CompressionType) -> crate::Result<()> {
         let blob_file = Self::consume_writer(
-            old_writer,
-            self.passthrough_compression,
+            writer,
+            passthrough,
             self.descriptor_table.clone(),
             &self.fs,
             #[cfg(zstd_any)]
@@ -530,6 +573,7 @@ impl MultiWriter {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<ValueHandle> {
+        self.enter_key(key)?;
         let target_size = self.target_size;
 
         // Write actual value into blob file
@@ -559,6 +603,7 @@ impl MultiWriter {
         value: &[u8],
         uncompressed_len: u32,
     ) -> crate::Result<ValueHandle> {
+        self.enter_key(key)?;
         let target_size = self.target_size;
 
         // Write actual value into blob file
@@ -607,6 +652,7 @@ impl MultiWriter {
             self.zstd_two_pass_seed,
             value,
         )?;
+        self.enter_key(key)?;
         self.select_output(compression, class)?;
 
         let writer = &mut self.active_writer;
