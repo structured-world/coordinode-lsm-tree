@@ -225,8 +225,10 @@ fn a_reopen_from_a_cloned_config_keeps_counting_once() -> lsm_tree::Result<()> {
     let delta = after
         .since(&before)
         .expect("one counter set across the reopen");
+    // The table may be a file the pool made before the reopen, so it is
+    // opened, not created.
     let flushed = delta.origin(WriteOrigin::FlushTable);
-    assert_eq!(flushed.created, 1);
+    assert_eq!(flushed.opened, 1);
     assert_eq!(
         flushed.bytes, flushed.installed,
         "each byte counted once, not once per wrapper"
