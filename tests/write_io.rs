@@ -344,3 +344,145 @@ fn a_reopen_starts_the_counters_over() -> lsm_tree::Result<()> {
     assert!(reopened.since(&before).is_none());
     Ok(())
 }
+
+/// A reopened tree that has since written more than before still refuses a
+/// difference across the reopen, as do two counters that never shared a
+/// lifetime but counted the same operations: no counter went down, yet the
+/// readings come from different counters.
+#[test]
+fn readings_of_different_counters_have_no_difference() -> lsm_tree::Result<()> {
+    let fs: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let tree = open(fs.clone())?;
+    tree.insert("key", "value", 0);
+    tree.flush_active_memtable(0)?;
+    let before = tree.write_io();
+    drop(tree);
+
+    let reopened = open(fs)?;
+    for i in 0..10u64 {
+        reopened.insert(format!("key{i}"), "a longer value than before", 1 + i);
+        reopened.flush_active_memtable(0)?;
+    }
+    let after = reopened.write_io();
+    assert!(
+        after.origin(WriteOrigin::FlushTable).bytes > before.origin(WriteOrigin::FlushTable).bytes,
+        "self-check: every counter grew past the earlier reading"
+    );
+    assert!(
+        after.since(&before).is_none(),
+        "two lifetimes of the counters"
+    );
+
+    let first = CountingFs::new(Arc::new(MemFs::new()));
+    let second = CountingFs::new(Arc::new(MemFs::new()));
+    for fs in [&first, &second] {
+        fs.create_dir_all(std::path::Path::new("/d"))?;
+    }
+    assert!(
+        second
+            .stats()
+            .snapshot()
+            .since(&first.stats().snapshot())
+            .is_none(),
+        "two counter sets"
+    );
+    Ok(())
+}
+
+/// A row of cells is charged its key and its fields' bytes, as an ingested
+/// row is, not the row as the tree encodes it with its field descriptors.
+#[test]
+fn a_row_of_cells_is_charged_its_key_and_field_bytes() -> lsm_tree::Result<()> {
+    use lsm_tree::KvSeparationOptions;
+    use lsm_tree::blob_tree::field_row::Field;
+
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(MemFs::new()))
+    .with_kv_separation(Some(KvSeparationOptions::default()))
+    .open()?;
+    let AnyTree::Blob(blob) = &tree else {
+        panic!("expected a key-value separated tree");
+    };
+    blob.insert_cells(
+        "doc",
+        &[Field::bytes(4, b"body"), Field::bytes(3, b"draft")],
+        0,
+    )?;
+
+    let accepted = tree.write_io().accepted;
+    assert_eq!(accepted.values, 1);
+    assert_eq!(accepted.payload_bytes, (3 + 4 + 5) as u64);
+    Ok(())
+}
+
+/// An ingestion charges each record it takes in: a value its key and value,
+/// a tombstone or weak tombstone its key.
+#[test]
+fn an_ingestion_charges_each_record_it_takes_in() -> lsm_tree::Result<()> {
+    let tree = open(Arc::new(MemFs::new()))?;
+    let mut ingestion = tree.ingestion()?;
+    ingestion.write("a", "abc")?;
+    ingestion.write_tombstone("bb")?;
+    ingestion.write_weak_tombstone("ccc")?;
+    ingestion.finish()?;
+
+    let accepted = tree.write_io().accepted;
+    assert_eq!(accepted.ingested, 3);
+    assert_eq!(accepted.payload_bytes, (1 + 3) + 2 + 3);
+    Ok(())
+}
+
+/// A config cloned from an open tree and given other backends opens on those
+/// backends, the primary one and every route's: the counting wrappers of the
+/// first tree are taken off only where they are still in place.
+#[test]
+fn a_cloned_config_opens_on_the_backends_it_was_given() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+
+    let route = |fs: Arc<dyn Fs>| LevelRoute {
+        levels: 1..7,
+        path: "/cold".into(),
+        fs,
+    };
+    let first: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(first.clone())
+    .level_routes(vec![route(Arc::new(MemFs::new()))])
+    .open()?;
+    let config = tree.tree_config().clone();
+    drop(tree);
+
+    let primary = Arc::new(CountingFs::new(Arc::new(MemFs::new())));
+    let cold = Arc::new(CountingFs::new(Arc::new(MemFs::new())));
+    let tree = config
+        .with_shared_fs(primary.clone())
+        .level_routes(vec![route(cold.clone())])
+        .open()?;
+    for i in 0..100u32 {
+        tree.insert(format!("key{i:03}"), "value", u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    assert!(
+        primary.stats().snapshot().files().bytes > 0,
+        "the primary backend given"
+    );
+    assert!(
+        cold.stats()
+            .snapshot()
+            .origin(WriteOrigin::CompactionTable)
+            .bytes
+            > 0,
+        "the route's backend given"
+    );
+    Ok(())
+}

@@ -199,3 +199,102 @@ fn readings_from_two_lifetimes_have_no_difference() -> crate::io::Result<()> {
     assert!(reopened.host_write_amplification().is_none(), "no payload");
     Ok(())
 }
+
+/// Each origin has its own name, the one a machine-readable export uses.
+#[test]
+fn every_origin_has_its_own_name() {
+    let names: Vec<&str> = WriteOrigin::ALL.iter().map(|o| o.name()).collect();
+    assert_eq!(
+        names,
+        [
+            "flush_table",
+            "flush_blob",
+            "ingest_table",
+            "ingest_blob",
+            "compaction_table",
+            "compaction_blob",
+            "manifest",
+            "metadata",
+            "repair",
+            "checkpoint",
+        ]
+    );
+}
+
+/// What the wrapper only hands on reaches the backend and returns its answer
+/// unchanged: batched and descriptor reads, links, clones, hole probes and the
+/// file calls besides writes. A vectored write is counted as a write.
+#[test]
+fn what_the_wrapper_hands_on_answers_as_the_backend_does() -> crate::io::Result<()> {
+    use crate::fs::{BlockBuf, BlockRead};
+    use std::io::{IoSlice, Seek as _, SeekFrom};
+
+    let backend: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let fs = CountingFs::new(Arc::clone(&backend));
+    fs.create_dir_all(Path::new("/db"))?;
+    let mut file = fs.open(
+        Path::new("/db/1"),
+        &writable(Some(WriteOrigin::Repair)).read(true),
+    )?;
+    let written = file.write_vectored(&[IoSlice::new(b"ab"), IoSlice::new(b"cd")])?;
+    file.write_all(b"abcd".get(written..).unwrap_or_default())?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut read = [0; 4];
+    file.read_exact(&mut read)?;
+    assert_eq!(&read, b"abcd");
+
+    let (mut a, mut b) = ([0; 2], [0; 2]);
+    file.read_many(&mut [(0, &mut a[..]), (2, &mut b[..])])?;
+    assert_eq!((&a, &b), (b"ab", b"cd"));
+    let inner = backend.open(Path::new("/db/1"), &FsOpenOptions::new().read(true))?;
+    assert_eq!(file.backing_fd(), inner.backing_fd());
+    file.lock_exclusive()?;
+
+    let mut buf = [0; 4];
+    let mut reqs = [BlockRead {
+        file: &*inner,
+        offset: 0,
+        buf: BlockBuf::new(&mut buf),
+    }];
+    fs.read_blocks_batched(&mut reqs)?;
+    assert_eq!(&buf, b"abcd");
+    assert_eq!(fs.reads_by_descriptor(), backend.reads_by_descriptor());
+    let check = |fs: &dyn Fs| {
+        let mut buf = [0; 4];
+        let reqs = [BlockRead {
+            file: &*inner,
+            offset: 0,
+            buf: BlockBuf::new(&mut buf),
+        }];
+        fs.check_descriptor_batch(&reqs).is_ok()
+    };
+    assert_eq!(check(&fs), check(&*backend));
+
+    let link = (
+        fs.symlink(Path::new("/db/1"), Path::new("/db/l"), false)
+            .is_ok(),
+        fs.symlink_to_dir(Path::new("/db/l")).ok(),
+    );
+    let clone = fs
+        .reflink_file(Path::new("/db/1"), Path::new("/db/c"))
+        .is_ok();
+    let holes = (
+        fs.extent_is_hole(Path::new("/db/1"), 0, 4).ok(),
+        fs.extent_contains_hole(Path::new("/db/1"), 0, 4).ok(),
+    );
+    let reading = fs.stats().snapshot();
+    assert_eq!(reading.directory.symlinked, u64::from(link.0));
+    assert_eq!(reading.directory.cloned, u64::from(clone));
+    assert_eq!(
+        holes,
+        (
+            backend.extent_is_hole(Path::new("/db/1"), 0, 4).ok(),
+            backend.extent_contains_hole(Path::new("/db/1"), 0, 4).ok(),
+        )
+    );
+
+    let repair = reading.origin(WriteOrigin::Repair);
+    assert_eq!(repair.bytes, 4);
+    assert_eq!(repair.writes, 1 + u64::from(written < 4));
+    Ok(())
+}

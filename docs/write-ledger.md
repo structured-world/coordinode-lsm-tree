@@ -89,9 +89,11 @@ records it.
 ## Scope and resets
 
 The counters live as long as the tree: they begin at the open, with the open's
-own writes, and a reopen starts them from zero. `since` of a reading taken
-before a reopen is `None`, since a counter went down, so a reading from one
-lifetime is never subtracted from another's. Nothing is persisted.
+own writes, and a reopen starts them from zero. Each set of counters is
+numbered when it is made and its readings carry the number: `since` of a
+reading taken before a reopen, or of another backend's, is `None` whatever the
+values, so a reading from one lifetime is never subtracted from another's.
+Nothing is persisted.
 
 The payload is a tree's own, so `host_write_amplification` is meaningful for a
 tree's reading and `None` for a backend counted on its own, which takes in no

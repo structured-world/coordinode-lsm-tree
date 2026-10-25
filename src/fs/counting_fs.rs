@@ -276,6 +276,8 @@ pub struct WriteIoSnapshot {
     pub directory: DirectoryWrites,
     /// What the tree took in: zero for a backend counted on its own.
     pub accepted: AcceptedWrites,
+    /// The counter set the reading came from (see [`WriteIoStats`]).
+    lifetime: u64,
 }
 
 impl WriteIoSnapshot {
@@ -340,11 +342,13 @@ impl WriteIoSnapshot {
 
     /// What happened between `earlier` and this reading of the same counters.
     ///
-    /// `None` when a counter went down: the readings come from two lifetimes
-    /// of the counters, a reopen in between, and no difference of them means
-    /// anything.
+    /// `None` when the readings come from two counter sets, as across a
+    /// reopen, whatever their values: no difference of them means anything.
     #[must_use]
     pub fn since(&self, earlier: &Self) -> Option<Self> {
+        if self.lifetime != earlier.lifetime {
+            return None;
+        }
         let mut by_origin = [FileWrites::default(); WriteOrigin::ALL.len()];
         for ((delta, now), then) in by_origin
             .iter_mut()
@@ -358,6 +362,7 @@ impl WriteIoSnapshot {
             unattributed: self.unattributed.checked_sub(&earlier.unattributed)?,
             directory: self.directory.checked_sub(&earlier.directory)?,
             accepted: self.accepted.checked_sub(&earlier.accepted)?,
+            lifetime: self.lifetime,
         })
     }
 }
@@ -467,12 +472,29 @@ struct AcceptedCounters {
 ///
 /// Every counter only grows; [`Self::snapshot`] reads them all, and the
 /// difference of two readings ([`WriteIoSnapshot::since`]) is what happened
-/// in between.
-#[derive(Debug, Default)]
+/// in between. Each set is numbered when it is made, and its readings carry
+/// the number, so readings of two sets are never set against each other.
+#[derive(Debug)]
 pub struct WriteIoStats {
     files: [FileCounters; WriteOrigin::ALL.len() + 1],
     directory: DirectoryCounters,
     accepted: AcceptedCounters,
+    lifetime: u64,
+}
+
+/// The number the next counter set takes: distinct for every set this process
+/// makes, which is as far as a reading can travel.
+static NEXT_LIFETIME: AtomicU64 = AtomicU64::new(1);
+
+impl Default for WriteIoStats {
+    fn default() -> Self {
+        Self {
+            files: Default::default(),
+            directory: DirectoryCounters::default(),
+            accepted: AcceptedCounters::default(),
+            lifetime: NEXT_LIFETIME.fetch_add(1, Relaxed),
+        }
+    }
 }
 
 impl WriteIoStats {
@@ -498,6 +520,7 @@ impl WriteIoStats {
                 ingested: self.accepted.ingested.load(Relaxed),
                 payload_bytes: self.accepted.payload_bytes.load(Relaxed),
             },
+            lifetime: self.lifetime,
         }
     }
 

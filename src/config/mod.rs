@@ -196,8 +196,27 @@ pub struct LevelRoute {
 #[derive(Clone)]
 pub(crate) struct WriteCount {
     pub(crate) stats: Arc<crate::fs::WriteIoStats>,
-    fs: Arc<dyn Fs>,
-    routes: Vec<Arc<dyn Fs>>,
+    fs: Wrapped,
+    routes: Vec<Wrapped>,
+}
+
+/// A backend a tree was given and the counting wrapper it put in its place.
+#[cfg(feature = "metrics")]
+#[derive(Clone)]
+struct Wrapped {
+    given: Arc<dyn Fs>,
+    counted: Arc<dyn Fs>,
+}
+
+#[cfg(feature = "metrics")]
+impl Wrapped {
+    /// The backend `slot` holds with this wrapper taken off: the one it was
+    /// given while the wrapper is still there, what a caller put since if not.
+    fn unwrap(&self, slot: &mut Arc<dyn Fs>) {
+        if Arc::ptr_eq(slot, &self.counted) {
+            *slot = Arc::clone(&self.given);
+        }
+    }
 }
 
 impl core::fmt::Debug for LevelRoute {
@@ -1765,17 +1784,14 @@ impl Config {
     /// A route on the primary backend's handle keeps sharing it, which keeps
     /// every comparison of the two handles as it was. A config a counted tree
     /// was opened from carries that tree's wrappers: the backends under them
-    /// are wrapped anew, never the wrappers, so a tree counts only its own.
+    /// are wrapped anew, never the wrappers, so a tree counts only its own. A
+    /// backend a caller put in place of a wrapper since is wrapped as given.
     #[cfg(feature = "metrics")]
     pub(crate) fn count_writes(&mut self) {
         if let Some(earlier) = self.write_count.take() {
-            self.fs = earlier.fs;
-            if let Some(routes) = &mut self.level_routes
-                && routes.len() == earlier.routes.len()
-            {
-                for (route, fs) in routes.iter_mut().zip(earlier.routes) {
-                    route.fs = fs;
-                }
+            earlier.fs.unwrap(&mut self.fs);
+            for (route, wrapped) in self.level_routes.iter_mut().flatten().zip(&earlier.routes) {
+                wrapped.unwrap(&mut route.fs);
             }
         }
         let stats = Arc::<crate::fs::WriteIoStats>::default();
@@ -1794,11 +1810,14 @@ impl Config {
                     Arc::clone(&stats),
                 ));
             }
-            routes.push(route_fs);
+            routes.push(Wrapped {
+                given: route_fs,
+                counted: Arc::clone(&route.fs),
+            });
         }
         self.write_count = Some(WriteCount {
             stats,
-            fs: given,
+            fs: Wrapped { given, counted },
             routes,
         });
     }

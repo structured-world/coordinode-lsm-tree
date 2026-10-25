@@ -5455,8 +5455,6 @@ impl Tree {
         value: InternalValue,
         refs: &[(crate::blob_tree::handle::BlobIndirection, u64)],
     ) -> crate::Result<(u64, u64)> {
-        #[cfg(feature = "metrics")]
-        self.accept(&value);
         let kv_digest = self.insert_digest(&value);
         let history = self.version_history.read();
         let latest = history.latest_version_ref();
