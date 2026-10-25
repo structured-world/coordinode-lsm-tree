@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792887690709,
+  "lastUpdate": 1792921384177,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -63952,6 +63952,90 @@ window.BENCHMARK_DATA = {
             "value": 327252.69732513383,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 12.3us | P99.9: 91.6us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b47dae3e4c66f63812b973cb5f1dba54797bebd4",
+          "message": "perf(compaction): free what a tight-space pass punches on a real filesystem (#986)\n\n## Summary\n- A tight-space pass now gives back the space it is cut to on a real\nfilesystem. A table's consumed prefix was punched one data block per\ncall, and a filesystem frees only the pages wholly inside one call: on\next4, XFS, btrfs and tmpfs a 58 MB prefix of 4 KiB blocks freed 0.57 MB.\nThe pass then wrote slice after slice into room that never came back,\nran past its quota, and spent up to 106 s per pass on XFS in 80,000\npunch calls.\n- Each slice punches only above what the previous slice's punch\nfinished, for tables and for relocated blob files, instead of the whole\nprefix again.\n- The restriction sidecars of a slice are published with one folder sync\ninstead of one per surviving input.\n\n## Changes\n- A table's prefix is punched in calls of adjacent whole data blocks, up\nto 4 MiB each unless one block is larger, highest first. A call never\nends inside a block, so a failure, which still stops the pass, leaves a\nwhole zeroed block above the intact ones: the pattern a sidecar-less\nrepair classifies. Each edge between two calls keeps at most one page\nallocated.\n- The views of one file share how far it is known punched, raised only\nby a punch that completed. A deferred or failed punch leaves the mark,\nso the next view covers its range. Each view starts from the 64 KiB edge\nbelow the mark, so the page the previous punch ended in is freed too.\nBlob files share the same mark across the views a relocation restricts\nthem to.\n- `restrict_bound::write_many` writes and syncs each sidecar, renames\nthem, then syncs each folder they share once. Each input's punch waits\nfor its own sidecar to be durable; a failed folder sync fails every\nsidecar renamed into that folder.\n- The heal copy of a restricted table punches adjacent holes as one\nextent.\n- `FaultInjector` records the punches that reach its inner backend;\n`benches/tight_space_disk.rs` runs a quota-engaged tight-space pass on\nthe filesystem under `TMPDIR` and prints its time, syncs, sidecar syncs,\npunches and allocated bytes at start, peak and end.\n- `docs/tight-space-compaction.md` describes the batched sidecars and\nthe block-edge punch calls.\n- Benches that use `tempfile` require the `std` feature that provides\nit.\n\nAlready in place and unchanged: slices stay cut to the room the pass\nfinds rather than to a fixed granularity, which near ENOSPC could leave\nno slice that fits; slice caps and reservations are taken per volume\nwhen tables and blob files are routed apart\n(`tight_space_budgets_blob_relocation_on_the_blob_volume`,\n`tight_space_declines_when_punching_inputs_frees_the_wrong_volume`,\n`tight_space_engages_when_the_local_share_covers_the_output`).\n\n## Measurements\n`benches/tight_space_disk.rs` on a Linux runner, median of three\nalternating rounds against main. Inputs are overlapping flushed tables\nof 8 MB each; the quota leaves the stated room past their footprint.\nSlices, file syncs and sidecar syncs are the same in both.\n\n| filesystem, inputs x room | main: time / peak allocated | this PR:\ntime / peak allocated | bytes punched | directory syncs |\n|---|---|---|---|---|\n| XFS, 4 x 5% | 106.0 s / 40.4 MB | 0.63 s / 32.7 MB | 332.8 MB -> 34.0\nMB | 90 -> 27 |\n| btrfs, 4 x 5% | 55.0 s / 40.1 MB | 0.75 s / 32.6 MB | 332.8 MB -> 34.0\nMB | 90 -> 27 |\n| ext4, 4 x 5% | 1.68 s / 40.1 MB | 0.45 s / 32.6 MB | 332.8 MB -> 34.0\nMB | 90 -> 27 |\n| tmpfs, 4 x 5% | 1.21 s / 40.1 MB | 0.38 s / 32.6 MB | 332.8 MB -> 34.0\nMB | 90 -> 27 |\n| XFS, 1 x 5% | 26.6 s / 16.4 MB | 0.28 s / 9.0 MB | 82.2 MB -> 8.2 MB |\n23 -> 23 |\n| XFS, 4 x 15% | 38.0 s / 40.8 MB | 0.30 s / 34.3 MB | 122.4 MB -> 31.2\nMB | 33 -> 12 |\n| XFS, 2 x 5%, blob relocation | 1.79 s / 44.2 MB | 0.43 s / 44.2 MB |\nblobs 105.6 MB -> 26.6 MB | 17 -> 17 |\n\nOn main the 4-input pass peaked at 40 MB under a quota of 33.8 MB; this\nPR stays under it. Punching the prefix one block per call on its own (a\n58 MB prefix of 4 KiB blocks): 14,062 calls freeing 0.57 MB, 12.6 s on\nbtrfs and 19.6 s on XFS, against 14 calls freeing 58.1 MB in 9-25 ms.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, aarch64,\nthe tool crates, the benches and the i686 builds pass on Linux. The\nreal-filesystem tests ran on ext4, XFS, btrfs and tmpfs (and skip a\nvolume that cannot punch): the prefix pages are freed and the repair\nhole probe proves the punch. A punch stopped after its first call, with\nthe prefix ending in a block that straddles a chunk edge, is set aside\nby a sidecar-less repair. A tight-space pass on `CrashFs` survives a\npower loss at each of its syncs, with and without blob relocation, every\nkey reading its latest value after the reopen.\n\nCloses #962\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Improvements**\n* Tight-space compaction now reclaims disk space in carefully bounded\nincrements, helping avoid repeated or overlapping reclamation.\n* Compaction is more resilient to interruptions and filesystem errors;\ncompleted data remains recoverable after a power loss.\n* Blob-backed and standard tables now preserve reclamation progress\nacross successive restricted views.\n* **Documentation**\n* Clarified how compaction writes durable metadata and reclaims disk\nspace in aligned chunks.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-25T09:20:42Z",
+          "tree_id": "99e578e76b9e062b766ddfa1bae33788af89da45",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b47dae3e4c66f63812b973cb5f1dba54797bebd4"
+        },
+        "date": 1792921382440,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 46947.58990214646,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 20.3us | P99.9: 39.2us\nthreads: 1 | elapsed: 11.40s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1370282.8458373973,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 589350.2025634954,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.0us | P99.9: 14.4us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 421415.7091589032,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 21.6us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3200601.9692183705,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 312438.7986093943,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.5us | P99.9: 15.4us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 183766.3169443579,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 11.0us | P99.9: 27.7us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 684817.5339804833,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.9us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 493767.8449550796,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 9.1us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 328055.76357480395,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 12.3us | P99.9: 96.3us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
