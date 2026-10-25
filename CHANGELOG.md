@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v6.0.1...v7.0.0) - 2026-10-25
+
+### Added
+
+- *(compaction)* [**breaking**] reclaim tables a range tombstone deletes ([#984](https://github.com/structured-world/coordinode-lsm-tree/pull/984))
+
+### Performance
+
+- *(compaction)* free what a tight-space pass punches on a real filesystem ([#986](https://github.com/structured-world/coordinode-lsm-tree/pull/986))
+
 ## [6.0.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v6.0.0...v6.0.1) - 2026-10-24
 
 ### Fixed
