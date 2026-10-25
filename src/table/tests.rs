@@ -1647,6 +1647,105 @@ fn punched_run_with_allocated_edges_still_proves_the_punch() -> crate::Result<()
     Ok(())
 }
 
+/// The prefix punch calls cover exactly the given spans, highest first, and
+/// cut them only at multiples of the chunk, so no call ends mid-page except at
+/// a span's own ends; the gap between two spans is never punched.
+#[test]
+fn punch_extents_cut_spans_at_chunk_edges_highest_first() {
+    use super::inner::{PUNCH_CHUNK, punch_extents_top_down};
+
+    assert!(punch_extents_top_down(&[]).is_empty(), "no span, no call");
+    assert_eq!(
+        punch_extents_top_down(&[(100, 5_000)]),
+        vec![(100, 4_900)],
+        "a span inside one chunk is one call",
+    );
+    let c = PUNCH_CHUNK;
+    assert_eq!(
+        punch_extents_top_down(&[(10, 2 * c + 7)]),
+        vec![(2 * c, 7), (c, c), (10, c - 10)],
+        "a span over chunk edges is cut at each edge, top-down",
+    );
+    assert_eq!(
+        punch_extents_top_down(&[(0, c)]),
+        vec![(0, c)],
+        "a span ending on an edge takes no empty call",
+    );
+    assert_eq!(
+        punch_extents_top_down(&[(0, 100), (200, c + 50)]),
+        vec![(c, 50), (200, c - 200), (0, 100)],
+        "disjoint spans stay apart, the higher one first",
+    );
+}
+
+/// The tight-space prefix reclaim must give back the prefix's pages on a real
+/// filesystem, not only on `MemFs`, which frees punched bytes exactly. A
+/// filesystem deallocates only the pages wholly inside one `punch_hole` call
+/// and zero-fills the rest, so data blocks of about a page, punched one call
+/// each at unaligned offsets, keep nearly every page of the prefix allocated:
+/// the pass that was cut to the room the reclaim frees would find none of it.
+#[cfg(all(feature = "std", target_os = "linux"))]
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn punch_on_drop_frees_the_prefix_pages_on_a_real_filesystem() -> crate::Result<()> {
+    use crate::fs::Fs;
+
+    let dir = tempfile::tempdir()?;
+    let fs: Arc<dyn Fs> = Arc::new(crate::fs::StdFs);
+    assert!(
+        fs.capabilities(dir.path()).punch_hole,
+        "precondition: the test directory's filesystem punches holes",
+    );
+    let path = dir.path().join("0");
+    let mut writer = Writer::new(path.clone(), 0, 0, Arc::clone(&fs))?.use_data_block_size(4_096);
+    for i in 0..2_048u32 {
+        writer.write(crate::InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 100],
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let (_, checksum) = writer.finish()?.expect("table written");
+    // What the writer leaves in the page cache counts once it is on disk.
+    std::fs::File::open(&path)?.sync_all()?;
+
+    let table = {
+        #[cfg(feature = "metrics")]
+        let metrics = Arc::new(Metrics::default());
+        let mut params = test_recover_params(path.clone(), checksum);
+        params.descriptor_table = None;
+        params.fs = Arc::clone(&fs);
+        #[cfg(feature = "metrics")]
+        {
+            params.metrics = metrics;
+        }
+        Table::recover(params)?
+    };
+    let punch = table.punch_offset_for(b"k001024")?;
+    assert!(
+        punch > 64 * 1_024,
+        "the fixture has a prefix of many blocks"
+    );
+    let before = fs
+        .allocated_size(&path)?
+        .expect("a unix file reports st_blocks");
+    table.mark_punch_on_drop(punch);
+    drop(table);
+    let after = fs
+        .allocated_size(&path)?
+        .expect("a unix file reports st_blocks");
+
+    // At most the page the prefix ends in stays allocated, shared with the
+    // first live block.
+    let freed = before.saturating_sub(after);
+    assert!(
+        freed + 4_096 >= punch,
+        "the reclaim freed {freed} of the {punch}-byte prefix ({before} -> {after} allocated)",
+    );
+    Ok(())
+}
+
 /// A reclaim blocked by a COMPLETED checkpoint's surviving hard link must be
 /// RETAINED, not discarded. The pause is no longer active (so the deferred
 /// queue is not an option), yet the dropping view holds the only record of the

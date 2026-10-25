@@ -456,22 +456,26 @@ impl Drop for Inner {
             // still serves the suffix. `punch_hole` opens the path itself, so it
             // is fine that this view's own handles drop right after this body.
             //
-            // Punch each data block below the boundary INDIVIDUALLY rather than
-            // the whole `[0, offset)` span. The boundary lies inside the `data`
-            // section, whose blocks the writer lays out contiguously from
-            // offset 0 (index / filter / meta sections all sit PAST the data
-            // region), so a span punch would zero the same bytes — the
-            // per-block form is kept for the classifiable hole pattern below,
-            // not for section safety. The block index yields only data-block
-            // handles, so iterating it punches exactly the reclaimable data.
+            // Punch the data blocks below the boundary as contiguous spans cut
+            // into chunks, not one call per block: a filesystem deallocates only
+            // the pages wholly inside one call and zero-fills the edges, so
+            // blocks of about a page punched one by one at unaligned offsets
+            // would keep nearly every page allocated. Chunk edges fall on
+            // multiples of [`PUNCH_CHUNK`], so every page but the one the prefix
+            // ends in is freed. The writer lays the data blocks out contiguously
+            // from offset 0 and the block index yields only data-block handles,
+            // so the spans hold exactly the reclaimable data (the index, filter
+            // and meta sections all sit past the data region).
             //
-            // Punch TOP-DOWN (highest reclaimable block first) and STOP at the
-            // first failure. This keeps the resulting hole pattern CLASSIFIABLE
-            // for a sidecar-less manifest repair: any failure (or crash) leaves
-            // intact blocks strictly BELOW the zeroed ones — the irregular
-            // signature repair fails closed on — while a fully successful pass
-            // leaves the clean zeroed prefix the classical geometry bound is
-            // sound for. Bottom-up with continue-past-failures could instead
+            // Punch TOP-DOWN (highest extent first) and STOP at the first
+            // failure. This keeps the resulting hole pattern CLASSIFIABLE for a
+            // sidecar-less manifest repair: any failure (or crash) leaves intact
+            // blocks strictly BELOW the zeroed ones (the irregular signature
+            // repair fails closed on), while a fully successful pass leaves the
+            // clean zeroed prefix the classical geometry bound is sound for. A
+            // chunk edge inside a block leaves that block's head intact under a
+            // zeroed tail: it reads as intact, below zeroed blocks, which is the
+            // same irregular signature. Bottom-up with continue-past-failures could instead
             // leave intact-but-consumed blocks ABOVE a clean zeroed prefix,
             // indistinguishable from a live suffix, and a sidecar-less repair
             // would then restrict to a bound that resurrects their superseded
@@ -483,7 +487,8 @@ impl Drop for Inner {
             if off == u64::MAX {
                 return;
             }
-            let mut reclaimable: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            // `[start, end)` of each run of adjacent data blocks below `off`.
+            let mut spans: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             // The table is being dropped: caching its index would only evict
             // blocks someone still reads.
             for handle in self.untraced_index_walk() {
@@ -501,10 +506,15 @@ impl Drop for Inner {
                 };
                 let block_off = handle.offset().0;
                 if block_off < off {
-                    reclaimable.push((block_off, u64::from(handle.size())));
+                    // Bounded by the file's length.
+                    let end = block_off + u64::from(handle.size());
+                    match spans.last_mut() {
+                        Some(span) if span.1 == block_off => span.1 = end,
+                        _ => spans.push((block_off, end)),
+                    }
                 }
             }
-            reclaimable.reverse();
+            let reclaimable = punch_extents_top_down(&spans);
 
             // An IN-PROGRESS checkpoint's window covers the link step, so a
             // punch cannot race a link that is about to appear — but the intent
@@ -578,10 +588,10 @@ impl Drop for Inner {
                 }
             }
 
-            for (at, &(block_off, size)) in reclaimable.iter().enumerate() {
-                if let Err(e) = self.fs.punch_hole(&self.path, block_off, size) {
+            for (at, &(extent_off, len)) in reclaimable.iter().enumerate() {
+                if let Err(e) = self.fs.punch_hole(&self.path, extent_off, len) {
                     log::warn!(
-                        "Failed to punch tight-space data block at {block_off} of table {global_id:?} at {:?}; \
+                        "Failed to punch tight-space extent at {extent_off} of table {global_id:?} at {:?}; \
                          stopping the reclaim to keep the hole pattern classifiable: {e:?}",
                         self.path,
                     );
@@ -601,4 +611,24 @@ impl Drop for Inner {
             }
         }
     }
+}
+
+/// The extent of one prefix punch call: chunk edges fall on its multiples, so
+/// every page between two of them is freed whatever the page size.
+pub const PUNCH_CHUNK: u64 = 4 * 1_024 * 1_024;
+
+/// The punch calls for `spans` (ascending, disjoint `[start, end)`), highest
+/// first: each span cut at the multiples of [`PUNCH_CHUNK`] inside it.
+pub fn punch_extents_top_down(spans: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
+    let mut extents = alloc::vec::Vec::new();
+    for &(start, end) in spans.iter().rev() {
+        let mut hi = end;
+        while hi > start {
+            // The chunk edge below `hi`, or the span's start.
+            let lo = ((hi - 1) / PUNCH_CHUNK * PUNCH_CHUNK).max(start);
+            extents.push((lo, hi - lo));
+            hi = lo;
+        }
+    }
+    extents
 }
