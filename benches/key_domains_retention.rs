@@ -36,7 +36,8 @@ fn main() {
 mod cases {
     use lsm_tree::compaction::{CompactionAction, Leveled};
     use lsm_tree::{
-        AbstractTree, AnyTree, Config, KeyDomains, SeqNo, SequenceNumberCounter, UserKey,
+        AbstractTree, AnyTree, Config, Guard as _, KeyDomains, SeqNo, SequenceNumberCounter,
+        UserKey,
     };
     use std::collections::BTreeMap;
     use std::os::unix::fs::MetadataExt;
@@ -285,11 +286,17 @@ mod cases {
             self.trees.values().map(AbstractTree::table_count).sum()
         }
 
-        fn rows(&self) -> u64 {
-            self.trees
-                .values()
-                .map(|tree| tree.iter(SeqNo::MAX, None).count() as u64)
-                .sum()
+        /// The rows that read back, by epoch.
+        fn rows(&self) -> lsm_tree::Result<BTreeMap<u32, u64>> {
+            let mut rows = BTreeMap::new();
+            for tree in self.trees.values() {
+                for item in tree.iter(SeqNo::MAX, None) {
+                    let key = item.key()?;
+                    let epoch = u32::from_be_bytes(key[..4].try_into().expect("epoch"));
+                    *rows.entry(epoch).or_insert(0) += 1;
+                }
+            }
+            Ok(rows)
         }
 
         fn reads(&mut self, epoch: u32, series: u32, seq: u32) -> lsm_tree::Result<bool> {
@@ -354,13 +361,14 @@ mod cases {
 
         // Every retained row, and none of an expired epoch.
         let first_kept = case.epochs.saturating_sub(case.retention + 1);
-        let kept = u64::from(case.epochs - first_kept);
-        let expected = kept * u64::from(case.rows_per_epoch);
-        let rows = store.rows();
+        let expected: BTreeMap<u32, u64> = (first_kept..case.epochs)
+            .map(|epoch| (epoch, u64::from(case.rows_per_epoch)))
+            .collect();
+        let rows = store.rows()?;
         assert_eq!(
             rows,
             expected,
-            "{} {}: retained rows",
+            "{} {}: retained rows by epoch",
             case.name,
             layout.name(),
         );
@@ -431,7 +439,14 @@ mod cases {
                 "reopen ms",
                 "wall s",
             );
+            let only_layout = std::env::var("KD_LAYOUT").ok();
             for layout in Layout::ALL {
+                if only_layout
+                    .as_deref()
+                    .is_some_and(|name| name != layout.name())
+                {
+                    continue;
+                }
                 let o = run_case(case, layout)?;
                 println!(
                     "{:<18} {:>11.1} {:>8.2} {:>10.1} {:>9.1} {:>7} {:>5} {:>8.1} {:>10.1} {:>7.2}",
