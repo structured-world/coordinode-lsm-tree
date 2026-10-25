@@ -23,6 +23,8 @@ pub(crate) mod group_carry;
 mod id;
 mod index_block;
 mod inner;
+#[cfg(test)]
+pub(crate) use inner::PUNCH_CHUNK;
 pub(crate) mod iter;
 #[cfg(feature = "zstd")]
 pub(crate) mod lazy_block;
@@ -2936,6 +2938,14 @@ impl Table {
                     }
                 }
                 holes.sort_unstable();
+                // Adjacent holes are one extent: one punch call each below.
+                holes.dedup_by(|next, run| {
+                    let adjacent = run.0 + run.1 == next.0;
+                    if adjacent {
+                        run.1 += next.1;
+                    }
+                    adjacent
+                });
                 // Establish the full size so the un-written data-block extents stay
                 // sparse holes.
                 tmp.set_len(len)
@@ -5508,10 +5518,11 @@ impl Table {
     /// transparent compression an ordinary, fully-written file already reports
     /// fewer physical bytes than its length), and the run is asked whether it
     /// CONTAINS a hole rather than whether it wholly IS one: the reclaim
-    /// punches per block with arbitrary, unaligned extents, and the filesystem
-    /// deallocates only the wholly-contained pages while zero-filling the
-    /// edges — so every block-boundary page stays allocated and a whole-extent
-    /// probe would reject genuine punches.
+    /// punches at unaligned extents (the prefix ends mid-page, and a chunk or a
+    /// block edge need not fall on a page of this filesystem), and the
+    /// filesystem deallocates only the wholly-contained pages while
+    /// zero-filling the edges, so a whole-extent probe would reject genuine
+    /// punches.
     ///
     /// A backend that cannot answer the hole probe (`None`) leaves the punch
     /// UNPROVEN, which is a distinct verdict from "unpunched": on a mount

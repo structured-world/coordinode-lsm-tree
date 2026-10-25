@@ -2503,19 +2503,19 @@ fn a_recovery_failure_salvage_fails_closed_on_unattributable_zeros() -> crate::R
     Ok(())
 }
 
-/// The punch-on-drop reclaim must leave a CLASSIFIABLE hole pattern when
-/// individual `punch_hole` calls fail: punching top-down and STOPPING at the
-/// first failure guarantees any failure (or crash) leaves intact blocks BELOW
-/// the zeroed ones — the irregular signature default repair sets aside. The
-/// old bottom-up continue-past-failures order left trailing intact-but-consumed
-/// blocks ABOVE a clean zeroed prefix, indistinguishable from a live suffix, so
-/// a sidecar-less repair restricted to a bound that resurrected their
+/// The punch-on-drop reclaim must leave a CLASSIFIABLE hole pattern when a
+/// `punch_hole` call fails: punching top-down and STOPPING at the first
+/// failure guarantees any failure (or crash) leaves intact blocks BELOW the
+/// zeroed ones, the irregular signature default repair sets aside. A
+/// bottom-up continue-past-failures order would leave intact-but-consumed
+/// blocks ABOVE a clean zeroed prefix, indistinguishable from a live suffix,
+/// so a sidecar-less repair would restrict to a bound that resurrects their
 /// superseded rows.
 #[test]
 fn punch_failures_leave_a_classifiable_pattern() -> crate::Result<()> {
     use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
     use crate::io::ErrorKind;
-    use crate::{Config, SequenceNumberCounter};
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
     use std::sync::Arc;
 
     let memfs = Arc::new(MemFs::new());
@@ -2526,18 +2526,32 @@ fn punch_failures_leave_a_classifiable_pattern() -> crate::Result<()> {
     let tables = root.join("tables");
     fs.create_dir_all(&tables)?;
     let sst = tables.join("0");
-    write_multiblock_sst(&sst, &fs)?;
+    // A prefix of three punch calls: one call covers a whole chunk of blocks.
+    let mut w = crate::table::Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..100_000u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 120],
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(w.finish()?.is_some(), "the SST is non-empty");
 
-    // Arm a PERSISTENT punch fault that lets the first two attempts through:
-    // top-down with stop-on-first-failure this zeroes only the top two consumed
-    // blocks and leaves everything below intact (an irregular, classifiable
-    // pattern). Bottom-up with continue-past-failures it would zero the two
-    // LOWEST blocks and leave trailing consumed blocks that read as a clean
-    // zeroed prefix plus a plausible live suffix.
+    // Arm a PERSISTENT punch fault that lets the first attempt through:
+    // top-down with stop-on-first-failure this zeroes only the top chunk of
+    // the consumed prefix and leaves everything below intact (an irregular,
+    // classifiable pattern). Bottom-up with continue-past-failures it would
+    // zero the LOWEST chunk and leave trailing consumed blocks that read as a
+    // clean zeroed prefix plus a plausible live suffix.
     let table = recover_sst(sst, &fs)?;
-    let committed = table.punch_offset_for(b"k00130")?;
+    let committed = table.punch_offset_for(b"k075000")?;
+    assert!(
+        committed > 2 * crate::table::PUNCH_CHUNK,
+        "precondition: the prefix takes three punch calls ({committed} bytes)",
+    );
     table.mark_punch_on_drop(committed);
-    injector.arm(FaultRule::new(FaultOp::PunchHole, Fault::Error(ErrorKind::Other)).skip(2));
+    injector.arm(FaultRule::new(FaultOp::PunchHole, Fault::Error(ErrorKind::Other)).skip(1));
     drop(table);
     injector.clear();
 
