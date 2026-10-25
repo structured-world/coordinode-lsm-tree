@@ -250,3 +250,112 @@ fn a_domain_larger_than_the_target_splits_by_size_within_it() -> lsm_tree::Resul
     }
     Ok(())
 }
+
+/// The epochs of the rows each table holds, for the tables holding rows: a
+/// table of range tombstones alone may span epochs with no row in it.
+fn row_epochs(tree: &AnyTree) -> lsm_tree::Result<Vec<Vec<u32>>> {
+    let mut tables = Vec::new();
+    for table in tree.current_version().iter_tables() {
+        let mut epochs = Vec::new();
+        for item in table.iter() {
+            let item = item?;
+            if item.key.value_type == lsm_tree::ValueType::Value {
+                epochs.push(epoch_of(&item.key.user_key));
+            }
+        }
+        epochs.dedup();
+        if !epochs.is_empty() {
+            tables.push(epochs);
+        }
+    }
+    Ok(tables)
+}
+
+/// A range tombstone across several epochs, flushed with rows of some of
+/// them, keeps each table's rows in one epoch: its pieces past an epoch go
+/// to tables of tombstones alone. Rows older than it stay deleted, newer
+/// ones read back.
+#[test]
+fn a_flushed_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
+    for epoch in [1, 3] {
+        for i in 0..50 {
+            tree.insert(key(epoch, i), b"old", u64::from(epoch * 100 + i));
+        }
+    }
+    // From the middle of epoch 0 to the middle of epoch 4, over every row.
+    tree.remove_range(key(0, 25), key(4, 25), 1_000);
+    for epoch in [1, 3] {
+        tree.insert(key(epoch, 7), b"new", 2_000 + u64::from(epoch));
+    }
+    tree.flush_active_memtable(0)?;
+
+    let tables = row_epochs(&tree)?;
+    assert!(
+        tables.iter().all(|epochs| epochs.len() == 1),
+        "a table's rows span epochs: {tables:?}",
+    );
+    let rows = latest(&tree)?;
+    assert_eq!(
+        rows,
+        vec![(key(1, 7), b"new".to_vec()), (key(3, 7), b"new".to_vec()),],
+        "only the rows newer than the tombstone read back",
+    );
+    assert!(tree.get(key(1, 8), SeqNo::MAX)?.is_none(), "point read too");
+    assert!(
+        tree.get(key(3, 49), SeqNo::MAX)?.is_none(),
+        "point read too"
+    );
+    Ok(())
+}
+
+/// The same through compaction, with the tombstone kept (a watermark of 0)
+/// and a later epoch's rows in the merge: every compacted table holds rows
+/// of one epoch, and the deleted rows stay deleted.
+#[test]
+fn a_compacted_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()> {
+    let folder = tempfile::tempdir()?;
+    let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
+    for epoch in 0..5 {
+        for i in 0..50 {
+            tree.insert(key(epoch, i), b"old", u64::from(epoch * 100 + i));
+        }
+    }
+    tree.flush_active_memtable(0)?;
+    tree.remove_range(key(1, 10), key(3, 10), 1_000);
+    tree.flush_active_memtable(0)?;
+    for i in 0..50 {
+        tree.insert(key(5, i), b"new", 2_000 + u64::from(i));
+    }
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(u64::MAX, 0)?;
+
+    let tables = row_epochs(&tree)?;
+    assert!(
+        tables.iter().all(|epochs| epochs.len() == 1),
+        "a table's rows span epochs: {tables:?}",
+    );
+    let deleted = |e: u32, i: u32| (e, i) >= (1, 10) && (e, i) < (3, 10);
+    let rows = latest(&tree)?;
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
+        .flat_map(|e| (0..50).map(move |i| (e, i)))
+        .filter(|&(e, i)| !deleted(e, i))
+        .map(|(e, i)| {
+            (
+                key(e, i),
+                if e == 5 {
+                    b"new".to_vec()
+                } else {
+                    b"old".to_vec()
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows, expected,
+        "every row outside the tombstone and none in it"
+    );
+    assert!(tree.get(key(2, 0), SeqNo::MAX)?.is_none(), "point read too");
+    Ok(())
+}

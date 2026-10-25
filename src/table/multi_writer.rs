@@ -583,11 +583,13 @@ impl MultiWriter {
         (cut && self.rotation_sheds(key, (0, 0)), Some(crossing))
     }
 
-    /// Whether `key`, the next new key, lies past the current output's domain.
-    fn crosses_domain(&self, key: &[u8]) -> bool {
+    /// The end of the current output's domain when `key`, the next new key,
+    /// lies at or past it: the output ends there.
+    fn crossed_domain_end(&self, key: &[u8]) -> Option<UserKey> {
         self.domain
             .as_ref()
-            .is_some_and(|domain| domain.crosses(key, self.comparator.as_ref()))
+            .and_then(|domain| domain.crosses(key, self.comparator.as_ref()))
+            .cloned()
     }
 
     /// Takes `key` into the current output's domain, a new one when `crossed`.
@@ -1393,16 +1395,157 @@ impl MultiWriter {
 
     /// Flushes the current writer, stores its metadata, and sets up a new writer for the next table
     fn rotate(&mut self) -> crate::Result<()> {
+        self.rotate_at(None)
+    }
+
+    /// [`Self::rotate`], ending the closing output at `domain_end`, the end of
+    /// its key domain, when the next key lies past it: its share of the range
+    /// tombstones stops there, and the pieces between that end and the next
+    /// output's first key go to an output of tombstones alone, so no output
+    /// holding keys reaches into another domain.
+    fn rotate_at(&mut self, domain_end: Option<&UserKey>) -> crate::Result<()> {
         log::debug!("Rotating table writer");
         self.output_base = None;
         self.value_layout = None;
 
+        let (below, _) = self.flush_pieces_outside_the_domain(false);
+        let below_first = !below.is_empty();
+        let gap = domain_end
+            .map(|end| self.tombstones_up_to_the_next_output(end))
+            .unwrap_or_default();
+        let mut alone = Vec::new();
+        for pieces in [below, gap] {
+            if !pieces.is_empty() {
+                alone.push((self.successor()?, pieces));
+            }
+        }
         let new_writer = self.successor()?;
         let old_writer = core::mem::replace(&mut self.writer, new_writer);
         if self.first_output_key.is_none() {
             self.first_output_key.clone_from(&old_writer.meta.first_key);
         }
-        self.close_output(old_writer)
+        // The first output's share starts at its first key when the pieces
+        // below it went to an output of their own.
+        if below_first {
+            self.output_lower.clone_from(&old_writer.meta.first_key);
+        }
+        self.close_output(old_writer, domain_end)?;
+        for (writer, pieces) in alone {
+            self.write_tombstones_alone(writer, pieces, false)?;
+        }
+        Ok(())
+    }
+
+    /// The pieces of the range tombstones from `start` to the next output's
+    /// first key, the key last written, in order by start: under clipping only
+    /// those a table outside the compaction needs, since the outputs hold no
+    /// key there.
+    fn tombstones_up_to_the_next_output(&self, start: &UserKey) -> Vec<RangeTombstone> {
+        let Some(next) = self.current_key.as_ref() else {
+            return Vec::new();
+        };
+        let tombstones = if self.clip_range_tombstones {
+            self.outside
+                .as_ref()
+                .map_or(&[][..], |outside| outside.tombstones.as_slice())
+        } else {
+            self.range_tombstones.as_slice()
+        };
+        Self::pieces_within(
+            tombstones,
+            Some(start),
+            Some(next),
+            self.comparator.as_ref(),
+        )
+    }
+
+    /// Under a key-domain policy, the pieces of a flush's range tombstones
+    /// the current output would take outside its domain: below its first key
+    /// when it is the run's first output, and past its domain's end when it
+    /// is the `last`. A flush widens an output's key range to the pieces it
+    /// holds, so they go to outputs of tombstones alone instead. An output
+    /// with no key holds tombstones alone and takes them all.
+    fn flush_pieces_outside_the_domain(
+        &self,
+        last: bool,
+    ) -> (Vec<RangeTombstone>, Vec<RangeTombstone>) {
+        let Some(domain) = self.domain.as_ref().filter(|_| !self.clip_range_tombstones) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(first) = self.writer.meta.first_key.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let cmp = self.comparator.as_ref();
+        let below = if self.output_lower.is_none() {
+            Self::pieces_within(&self.range_tombstones, None, Some(first), cmp)
+        } else {
+            Vec::new()
+        };
+        let above = match domain.end() {
+            Some(end) if last => Self::pieces_within(&self.range_tombstones, Some(end), None, cmp),
+            _ => Vec::new(),
+        };
+        (below, above)
+    }
+
+    /// The pieces of `tombstones`, in order by start, within `[lower, upper)`,
+    /// `None` for an end of the key space.
+    fn pieces_within(
+        tombstones: &[RangeTombstone],
+        lower: Option<&UserKey>,
+        upper: Option<&UserKey>,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) -> Vec<RangeTombstone> {
+        use core::cmp::Ordering::Less;
+
+        tombstones
+            .iter()
+            .filter_map(|rt| {
+                let start = match lower {
+                    Some(lower) if cmp.compare(&rt.start, lower) == Less => lower,
+                    _ => &rt.start,
+                };
+                let end = match upper {
+                    Some(upper) if cmp.compare(upper, &rt.end) == Less => upper,
+                    _ => &rt.end,
+                };
+                (cmp.compare(start, end) == Less)
+                    .then(|| RangeTombstone::new(start.clone(), end.clone(), rt.seqno))
+            })
+            .collect()
+    }
+
+    /// Writes `pieces`, in order by start, as the only content of `writer`'s
+    /// output, its key range their span; `closes_run` when it is the run's
+    /// last output.
+    fn write_tombstones_alone(
+        &mut self,
+        mut writer: Writer,
+        pieces: Vec<RangeTombstone>,
+        closes_run: bool,
+    ) -> crate::Result<()> {
+        let cmp = self.comparator.as_ref();
+        let mut span: Option<(UserKey, UserKey)> = None;
+        for piece in pieces {
+            Self::widen_coverage(&mut span, &piece.start, &piece.end, cmp);
+            writer.write_range_tombstone(piece);
+        }
+        if let Some((start, end)) = span {
+            writer.cover_range_tombstones(start, end);
+        }
+        if closes_run && self.owns_whole_run {
+            writer.mark_lineage_last();
+        }
+        let path = writer.path.clone();
+        if let Some((table_id, checksum)) =
+            writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
+        {
+            self.results.push((table_id, checksum));
+            if let Some(outputs) = &self.outputs {
+                outputs.landed(&*self.fs, &path)?;
+            }
+        }
+        Ok(())
     }
 
     /// A writer for the output after the current one, configured as this
@@ -1482,8 +1625,14 @@ impl MultiWriter {
         Ok(new_writer)
     }
 
-    /// Writes out `old_writer`, the output a rotation just closed.
-    fn close_output(&mut self, mut old_writer: Writer) -> crate::Result<()> {
+    /// Writes out `old_writer`, the output a rotation just closed, its share
+    /// of the range tombstones ending at `upper` when given, else at the next
+    /// output's first key.
+    fn close_output(
+        &mut self,
+        mut old_writer: Writer,
+        upper: Option<&UserKey>,
+    ) -> crate::Result<()> {
         // The finishing output's meta is about to be written: if a compaction
         // filter transformed a record within ITS window, the output is not
         // derivable from its inputs — mark the lineage transformed before it
@@ -1508,7 +1657,7 @@ impl MultiWriter {
                 self.clip_range_tombstones,
                 &mut old_writer,
                 self.output_lower.as_ref(),
-                self.current_key.as_ref(),
+                upper.or(self.current_key.as_ref()),
                 self.comparator.as_ref(),
             );
         }
@@ -1756,13 +1905,14 @@ impl MultiWriter {
             // batch starts the next table.
             let layout_changes = self.value_layout == Some(crate::table::meta::ValueLayout::Split);
             let (cut, crossing) = self.decide_cut(&item.key.user_key);
-            let crossed = self.crosses_domain(&item.key.user_key);
-            if layout_changes || cut || crossed {
-                self.rotate()?;
+            let crossed = self.crossed_domain_end(&item.key.user_key);
+            let rotates = layout_changes || cut || crossed.is_some();
+            if rotates {
+                self.rotate_at(crossed.as_ref())?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
-            self.commit_cut(crossing, layout_changes || cut || crossed);
-            self.enter_domain(&item.key.user_key, crossed);
+            self.commit_cut(crossing, rotates);
+            self.enter_domain(&item.key.user_key, crossed.is_some());
         }
 
         self.writer.write(item)?;
@@ -1991,19 +2141,20 @@ impl MultiWriter {
         // The output is weighed once for the cut and for the copy's checks.
         let load = self.output_load();
         let (cut, crossing) = self.decide_cut_at(&first.key.user_key, load);
-        let cut = cut || self.crosses_domain(&first.key.user_key);
+        let crossed = self.crossed_domain_end(&first.key.user_key);
+        let cut = cut || crossed.is_some();
         if self.writes_group_by_rows(load, layout_changes || cut, crossing, last, bytes) {
             self.current_key = previous_key;
             return Ok(false);
         }
         if layout_changes || cut {
-            self.rotate()?;
+            self.rotate_at(crossed.as_ref())?;
             self.tombstone_share.open_output(&first.key.user_key);
         }
         // Taken now: rows written one by one after a refused copy reach the
         // same key in the same output, which has passed these boundaries.
         self.commit_cut(crossing, layout_changes || cut);
-        self.enter_domain(&first.key.user_key, cut);
+        self.enter_domain(&first.key.user_key, crossed.is_some());
 
         let comparator = self.comparator.clone();
         if !write(&mut self.writer, &comparator)? {
@@ -2187,7 +2338,10 @@ impl MultiWriter {
                 && self.rotation_sheds(&point, alone_overhead)
             {
                 self.current_key = Some(point.clone());
-                self.rotate()?;
+                // Past the output's key domain, its share stops at the
+                // domain's end.
+                let domain_end = self.crossed_domain_end(&point);
+                self.rotate_at(domain_end.as_ref())?;
                 self.tombstone_share.open_output(&point);
             }
             self.tombstone_share
@@ -2196,20 +2350,15 @@ impl MultiWriter {
         Ok(())
     }
 
-    /// Finishes the last table, making sure all data is written durably
-    ///
-    /// Returns the created tables and whether their directory entries are
-    /// durable: the outputs opened here, for tombstones past the last key,
-    /// count as much as those opened before.
     /// The pieces of the tombstones kept for tables outside the compaction
     /// that fall past the outputs' keys, within the keys this writer answers
-    /// for, in runs of overlapping pieces with each run's span.
+    /// for, in runs of overlapping pieces.
     ///
     /// The outputs together cover from the first one's first key up to just
     /// past the last one's last key, and clipping cuts every tombstone to
     /// that; what lies below or above is a piece nothing else writes. A writer
     /// with no key writes its tombstones whole and has none.
-    fn tombstones_past_the_outputs(&self) -> Vec<(Vec<RangeTombstone>, (UserKey, UserKey))> {
+    fn tombstones_past_the_outputs(&self) -> Vec<Vec<RangeTombstone>> {
         use core::cmp::Ordering::Less;
 
         let Some(outside) = self.outside.as_ref().filter(|_| self.clip_range_tombstones) else {
@@ -2236,27 +2385,16 @@ impl MultiWriter {
             (outside.lower.as_ref(), Some(first)),
             (past_last.as_ref(), outside.upper.as_ref()),
         ];
-        let mut groups: Vec<(Vec<RangeTombstone>, (UserKey, UserKey))> = Vec::new();
+        // Each group with the end of its span.
+        let mut groups: Vec<(Vec<RangeTombstone>, UserKey)> = Vec::new();
         for (index, (lower, upper)) in regions.into_iter().enumerate() {
             // Nothing lies above a last key with no successor.
             if index == 1 && past_last.is_none() {
                 continue;
             }
-            for rt in &outside.tombstones {
-                let start = match lower {
-                    Some(lower) if cmp.compare(&rt.start, lower) == Less => lower.clone(),
-                    _ => rt.start.clone(),
-                };
-                let end = match upper {
-                    Some(upper) if cmp.compare(upper, &rt.end) == Less => upper.clone(),
-                    _ => rt.end.clone(),
-                };
-                if cmp.compare(&start, &end) != Less {
-                    continue;
-                }
-                let piece = RangeTombstone::new(start, end, rt.seqno);
+            for piece in Self::pieces_within(&outside.tombstones, lower, upper, cmp) {
                 match groups.last_mut() {
-                    Some((pieces, (_, span_end)))
+                    Some((pieces, span_end))
                         if cmp.compare(&piece.start, span_end) != core::cmp::Ordering::Greater =>
                     {
                         if cmp.compare(span_end, &piece.end) == Less {
@@ -2265,15 +2403,20 @@ impl MultiWriter {
                         pieces.push(piece);
                     }
                     _ => {
-                        let span = (piece.start.clone(), piece.end.clone());
-                        groups.push((vec![piece], span));
+                        let end = piece.end.clone();
+                        groups.push((vec![piece], end));
                     }
                 }
             }
         }
-        groups
+        groups.into_iter().map(|(pieces, _)| pieces).collect()
     }
 
+    /// Finishes the last table, making sure all data is written durably
+    ///
+    /// Returns the created tables and whether their directory entries are
+    /// durable: the outputs opened here, for tombstones past the last key,
+    /// count as much as those opened before.
     pub fn finish(mut self) -> crate::Result<Written> {
         self.split_tombstones_past_the_last_key()?;
 
@@ -2296,23 +2439,45 @@ impl MultiWriter {
         // non-empty output (or the run produced nothing at all and no meta
         // is written).
         self.writer.spill_block()?;
-        // Read once the last block is spilled, which sets the last output's
-        // key bounds.
-        let outside = self.tombstones_past_the_outputs();
-        if self.owns_whole_run && outside.is_empty() {
+
+        // Outputs of tombstones alone, read once the last block is spilled,
+        // which sets the last output's key bounds: a flush's pieces outside
+        // the last output's key domain, and the pieces past a compaction's
+        // outputs that a table outside it needs, each run of overlapping
+        // pieces an output of its own, since one spanning keys between two
+        // runs could cover a table that lies there.
+        let (below, above) = self.flush_pieces_outside_the_domain(true);
+        let upper = if above.is_empty() {
+            None
+        } else {
+            self.domain
+                .as_ref()
+                .and_then(|domain| domain.end())
+                .cloned()
+        };
+        if !below.is_empty() {
+            self.output_lower.clone_from(&self.writer.meta.first_key);
+        }
+        let mut alone: Vec<Vec<RangeTombstone>> = [below, above]
+            .into_iter()
+            .filter(|pieces| !pieces.is_empty())
+            .collect();
+        alone.extend(self.tombstones_past_the_outputs());
+        if self.owns_whole_run && alone.is_empty() {
             self.writer.mark_lineage_last();
         }
 
         // Write range tombstones to the last writer. No next table exists,
         // so clip_upper=None falls back to upper_bound_exclusive(last_key)
-        // under clipping, and leaves the flush zone open above.
+        // under clipping, and leaves the flush zone open above, up to the
+        // output's domain's end under a key-domain policy.
         if !self.range_tombstones.is_empty() {
             Self::write_rts_to_writer(
                 self.tombstone_share.zone(&self.range_tombstones, true),
                 self.clip_range_tombstones,
                 &mut self.writer,
                 self.output_lower.as_ref(),
-                None,
+                upper.as_ref(),
                 self.comparator.as_ref(),
             );
         }
@@ -2323,13 +2488,12 @@ impl MultiWriter {
         self.writer
             .own_blob_objects(core::mem::take(&mut self.owned_objects));
 
-        // Each run of overlapping pieces past the outputs is an output of its
-        // own, after the last: one spanning keys between two runs could cover
-        // a table that lies there. Opened now, as rotations open theirs, so
-        // they follow the last output in the run's lineage.
-        let mut pieces_outputs = Vec::with_capacity(outside.len());
-        for _ in &outside {
-            pieces_outputs.push(self.successor()?);
+        // They follow the last output in the run's lineage, the final one
+        // closing it, and are written before it.
+        let count = alone.len();
+        for (index, pieces) in alone.into_iter().enumerate() {
+            let writer = self.successor()?;
+            self.write_tombstones_alone(writer, pieces, index + 1 == count)?;
         }
 
         let path = self.writer.path.clone();
@@ -2340,28 +2504,6 @@ impl MultiWriter {
             self.results.push((table_id, checksum));
             if let Some(outputs) = &self.outputs {
                 outputs.landed(&*self.fs, &path)?;
-            }
-        }
-
-        let groups = outside.len();
-        for (index, ((pieces, (start, end)), mut writer)) in
-            outside.into_iter().zip(pieces_outputs).enumerate()
-        {
-            for piece in pieces {
-                writer.write_range_tombstone(piece);
-            }
-            writer.cover_range_tombstones(start, end);
-            if index + 1 == groups && self.owns_whole_run {
-                writer.mark_lineage_last();
-            }
-            let path = writer.path.clone();
-            if let Some((table_id, checksum)) =
-                writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
-            {
-                self.results.push((table_id, checksum));
-                if let Some(outputs) = &self.outputs {
-                    outputs.landed(&*self.fs, &path)?;
-                }
             }
         }
 

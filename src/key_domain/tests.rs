@@ -23,22 +23,27 @@ fn cursor() -> DomainCursor {
 #[test]
 fn a_fresh_cursor_crosses_nothing() {
     let cmp = default_comparator();
-    assert!(!cursor().crosses(b"z", cmp.as_ref()));
+    assert_eq!(cursor().crosses(b"z", cmp.as_ref()), None);
 }
 
 /// A key of the output's domain stays; the next domain's first key and any
-/// key past it cross; a key below the end does not.
+/// key past it cross, at the domain's end; a key below the end does not.
 #[test]
 fn crosses_at_and_past_the_domain_end_only() {
     let cmp = default_comparator();
     let mut cursor = cursor();
     cursor.enter(b"a1", false);
-    assert!(!cursor.crosses(b"a9", cmp.as_ref()), "same domain");
-    assert!(
-        cursor.crosses(b"b", cmp.as_ref()),
-        "the end itself is the next domain"
+    assert_eq!(cursor.crosses(b"a9", cmp.as_ref()), None, "same domain");
+    assert_eq!(
+        cursor.crosses(b"b", cmp.as_ref()).map(|end| end.to_vec()),
+        Some(b"b".to_vec()),
+        "the end itself is the next domain",
     );
-    assert!(cursor.crosses(b"c0", cmp.as_ref()), "past the end");
+    assert_eq!(
+        cursor.crosses(b"c0", cmp.as_ref()).map(|end| end.to_vec()),
+        Some(b"b".to_vec()),
+        "past the end, which is still the end crossed",
+    );
 }
 
 /// Entering without a crossing keeps the output's domain; a crossing takes
@@ -49,10 +54,13 @@ fn enter_moves_the_domain_only_on_a_crossing() {
     let mut cursor = cursor();
     cursor.enter(b"a1", false);
     cursor.enter(b"a5", false);
-    assert!(cursor.crosses(b"b0", cmp.as_ref()), "still a's domain");
+    assert!(
+        cursor.crosses(b"b0", cmp.as_ref()).is_some(),
+        "still a's domain"
+    );
     cursor.enter(b"b0", true);
-    assert!(!cursor.crosses(b"b9", cmp.as_ref()), "now b's domain");
-    assert!(cursor.crosses(b"c", cmp.as_ref()));
+    assert_eq!(cursor.crosses(b"b9", cmp.as_ref()), None, "now b's domain");
+    assert!(cursor.crosses(b"c", cmp.as_ref()).is_some());
 }
 
 /// The last domain runs to the end of the key space: nothing crosses it.
@@ -61,7 +69,7 @@ fn the_last_domain_is_never_left() {
     let cmp = default_comparator();
     let mut cursor = cursor();
     cursor.enter(b"\xff\x01", false);
-    assert!(!cursor.crosses(b"\xff\xff\xff", cmp.as_ref()));
+    assert_eq!(cursor.crosses(b"\xff\xff\xff", cmp.as_ref()), None);
 }
 
 /// A run of keys from `first` to `last` stays in one domain exactly when

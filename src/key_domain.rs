@@ -75,11 +75,19 @@ impl DomainCursor {
         }
     }
 
-    /// Whether `key`, the next new key, lies past the current output's
-    /// domain, without moving into it.
-    pub fn crosses(&self, key: &[u8], comparator: &dyn crate::comparator::UserComparator) -> bool {
-        matches!(&self.end, DomainEnd::At(end)
-            if comparator.compare(key, end) != core::cmp::Ordering::Less)
+    /// The end of the current output's domain when `key`, the next new key,
+    /// lies at or past it, without moving into `key`'s domain.
+    pub fn crosses(
+        &self,
+        key: &[u8],
+        comparator: &dyn crate::comparator::UserComparator,
+    ) -> Option<&UserKey> {
+        match &self.end {
+            DomainEnd::At(end) if comparator.compare(key, end) != core::cmp::Ordering::Less => {
+                Some(end)
+            }
+            _ => None,
+        }
     }
 
     /// Whether `last`, a key past `first` taken in the same output, still lies
@@ -94,6 +102,15 @@ impl DomainCursor {
         self.domains
             .domain_end(first)
             .is_none_or(|end| comparator.compare(last, &end) == core::cmp::Ordering::Less)
+    }
+
+    /// The first key past the current output's domain, `None` while the
+    /// output has no key or when its domain runs to the end of the key space.
+    pub fn end(&self) -> Option<&UserKey> {
+        match &self.end {
+            DomainEnd::At(end) => Some(end),
+            DomainEnd::Unknown | DomainEnd::Open => None,
+        }
     }
 
     /// Takes `key` into the current output: its domain becomes the output's
