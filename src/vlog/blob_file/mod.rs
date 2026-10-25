@@ -379,6 +379,12 @@ impl Drop for Inner {
                                     true
                                 }
                             };
+                        if exclusively_owned
+                            && !punch_failed
+                            && let Some(punched) = self.punched_through.get()
+                        {
+                            punched.fetch_max(off, core::sync::atomic::Ordering::Release);
+                        }
                         if (!exclusively_owned || punch_failed)
                             && let Some(pause) = self.deletion_pause.get()
                         {
