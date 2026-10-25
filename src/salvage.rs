@@ -776,7 +776,10 @@ fn publish_from_temp(
             // still holds the content for a re-derive.
             match fs.open(
                 dest,
-                &crate::fs::FsOpenOptions::new().write(true).create_new(true),
+                &crate::fs::FsOpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .write_origin(crate::fs::WriteOrigin::Repair),
             ) {
                 Ok(claim) => {
                     drop(claim);
@@ -1153,11 +1156,12 @@ fn salvage_attempt(
     // exactly from the indirections of its recovered rows: a dropped block's
     // indirections do not exist in the copy, so no source-only id can ever be
     // needed by it.
-    let writer = crate::table::Writer::new(
+    let writer = crate::table::Writer::new_for(
         dest.clone(),
         options.output_id.unwrap_or(table.metadata.id),
         0,
         Arc::clone(fs),
+        crate::fs::WriteOrigin::Repair,
     )
     .map_err(output_failure)?
     .mirror_from(
@@ -3327,11 +3331,17 @@ pub(crate) fn salvage_blob_file_on(
     // synced below, so the recovered file survives a power loss the moment the
     // report claims success.
     let sync_mode = crate::fs::SyncMode::Full;
-    let mut writer = BlobWriter::new(&dest, blob_file_id, 0, &**fs)
-        .map_err(output_failure)?
-        .use_sync_mode(sync_mode)
-        .use_compression(compression)
-        .use_clock(clock.cloned());
+    let mut writer = BlobWriter::open(
+        &dest,
+        blob_file_id,
+        0,
+        &**fs,
+        Some(crate::fs::WriteOrigin::Repair),
+    )
+    .map_err(output_failure)?
+    .use_sync_mode(sync_mode)
+    .use_compression(compression)
+    .use_clock(clock.cloned());
     // No device hint: salvage does not know the tree's groups, and the hint
     // only steers where the device places the bytes.
     writer.set_lifetime_class(lifetime_class, None);

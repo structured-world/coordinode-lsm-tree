@@ -442,7 +442,13 @@ pub fn restore(
             }
             // Write access for the flush alone: Windows refuses to flush a
             // read-only handle. Nothing is written through it.
-            let file = fs.open(&entry.path, &FsOpenOptions::new().read(true).write(true))?;
+            let file = fs.open(
+                &entry.path,
+                &FsOpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .write_origin(crate::fs::WriteOrigin::Metadata),
+            )?;
             FsFile::sync_all_with(&*file, sync_mode)?;
         }
         fsync_directory(&folder, &*fs, sync_mode)?;
@@ -451,7 +457,13 @@ pub fn restore(
     // Durable before the manifest is: a crash from here until the restored
     // memtable contents are flushed leaves a folder an ordinary open refuses.
     if !resuming {
-        let file = fs.open(&marker, &FsOpenOptions::new().write(true).create_new(true))?;
+        let file = fs.open(
+            &marker,
+            &FsOpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .write_origin(crate::fs::WriteOrigin::Metadata),
+        )?;
         FsFile::sync_all_with(&*file, sync_mode)?;
         drop(file);
         fsync_directory(&root, &*fs, sync_mode)?;
@@ -467,7 +479,10 @@ pub fn restore(
     ));
     let mut file = fs.open(
         &temporary,
-        &FsOpenOptions::new().write(true).create_new(true),
+        &FsOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .write_origin(crate::fs::WriteOrigin::Manifest),
     )?;
     file.write_all(manifest)?;
     file.flush()?;

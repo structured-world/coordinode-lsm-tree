@@ -12,7 +12,7 @@ use crate::{
     Checksum, CompressionType, TableId, UserKey,
     blob_tree::handle::BlobIndirection,
     encryption::EncryptionProvider,
-    fs::{Fs, SyncMode},
+    fs::{Fs, SyncMode, WriteOrigin},
     prefix::PrefixExtractor,
     range_tombstone::RangeTombstone,
     table::writer::{LinkedBlobFiles, LinkedFile},
@@ -370,8 +370,10 @@ struct TableFiles {
     pools: Arc<super::file_pool::TableFilePools>,
     above: Option<TableId>,
     /// Whether an output was opened already: only the first refills the
-    /// pool (see [`super::file_pool::TableFilePools::claim`]).
+    /// pool (see [`super::file_pool::TableFilePools::claim_as`]).
     opened: bool,
+    /// What the outputs are written for.
+    origin: WriteOrigin,
 }
 
 impl TableFiles {
@@ -385,7 +387,9 @@ impl TableFiles {
     ) -> crate::Result<(Writer, bool)> {
         let may_refill = !self.opened;
         self.opened = true;
-        let claimed = self.pools.claim(folder, fs, self.above, may_refill)?;
+        let claimed = self
+            .pools
+            .claim_as(folder, fs, self.above, may_refill, self.origin)?;
         let durable = claimed.durable_entry;
         Ok((Writer::into_claimed(claimed, level, fs.clone())?, durable))
     }
@@ -410,12 +414,13 @@ impl MultiWriter {
             target_size,
             initial_level,
             fs,
+            WriteOrigin::FlushTable,
         )
     }
 
     /// Sets up a `MultiWriter` at the given tables folder, its outputs written
-    /// into files claimed from `pools`, each output's id above `above` when
-    /// given.
+    /// into files claimed from `pools` as `origin`'s, each output's id above
+    /// `above` when given.
     pub(crate) fn from_pool(
         base_path: PathBuf,
         pools: Arc<super::file_pool::TableFilePools>,
@@ -423,11 +428,13 @@ impl MultiWriter {
         target_size: u64,
         initial_level: u8,
         fs: Arc<dyn Fs>,
+        origin: WriteOrigin,
     ) -> crate::Result<Self> {
         let mut files = TableFiles {
             pools,
             above,
             opened: false,
+            origin,
         };
         // Own-id recency until `use_recency` overrides it (see the `recency`
         // field).

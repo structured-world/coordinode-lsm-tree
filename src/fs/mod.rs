@@ -24,6 +24,7 @@
 //!   do not help for storage I/O patterns); [`StdFs`](crate::fs::StdFs) is the correct choice
 
 mod aligned_buf;
+mod counting_fs;
 // `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
 // gated behind the `std` feature so a `no_std + alloc` build of
 // this crate does not even attempt to compile it. The wider
@@ -55,6 +56,10 @@ mod crash_fs;
 mod std_fs;
 
 pub use aligned_buf::AlignedBuf;
+pub use counting_fs::{
+    AcceptedWrites, CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats,
+    WriteOrigin,
+};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod io_uring_fs;
@@ -176,6 +181,10 @@ pub struct FsOpenOptions {
     /// cleared once the file is open, so its reads and writes block as
     /// usual). A backend without named pipes has nothing to wait for.
     pub no_wait: bool,
+    /// What the file is written for, so a counting backend such as
+    /// [`CountingFs`] charges its writes to that origin. Advisory: it never
+    /// changes what the open or the file does.
+    pub write_origin: Option<WriteOrigin>,
 }
 
 impl Default for FsOpenOptions {
@@ -198,6 +207,7 @@ impl FsOpenOptions {
             direct_io: false,
             no_follow: false,
             no_wait: false,
+            write_origin: None,
         }
     }
 
@@ -261,6 +271,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
+        self
+    }
+
+    /// Sets what the file is written for (see [`Self::write_origin`]).
+    #[must_use]
+    pub const fn write_origin(mut self, origin: WriteOrigin) -> Self {
+        self.write_origin = Some(origin);
         self
     }
 }

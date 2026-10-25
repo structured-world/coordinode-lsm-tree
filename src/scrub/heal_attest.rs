@@ -118,7 +118,11 @@ fn write_sidecar(
     let publish = (|| -> crate::Result<()> {
         let mut file = fs.open(
             &tmp,
-            &FsOpenOptions::new().write(true).create(true).truncate(true),
+            &FsOpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .write_origin(crate::fs::WriteOrigin::Repair),
         )?;
         file.write_all(&content)?;
         file.flush()?;

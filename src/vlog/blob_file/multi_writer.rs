@@ -8,7 +8,7 @@ use crate::path::{Path, PathBuf};
 use crate::{
     BlobFile, CompressionType, DescriptorTable, SeqNo, SequenceNumberCounter, TreeId,
     file_accessor::FileAccessor,
-    fs::{Fs, SyncMode},
+    fs::{Fs, SyncMode, WriteOrigin},
     vlog::{
         ValueHandle,
         blob_file::{Inner as BlobFileInner, Metadata},
@@ -99,21 +99,59 @@ pub struct MultiWriter {
     /// The key domains no blob file spans, the current one's, and the
     /// comparator they are intervals of.
     domain: Option<(crate::key_domain::DomainCursor, crate::SharedComparator)>,
+
+    /// What the blob files are written for.
+    origin: Option<WriteOrigin>,
 }
 
 impl MultiWriter {
-    /// Initializes a new blob file writer.
+    /// A blob file writer whose files carry no origin.
     ///
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
-    #[doc(hidden)]
+    #[cfg(test)]
     pub fn new<P: AsRef<Path>>(
         id_generator: SequenceNumberCounter,
         folder: P,
         tree_id: TreeId,
         descriptor_table: Option<Arc<DescriptorTable>>,
         fs: Arc<dyn Fs>,
+    ) -> crate::Result<Self> {
+        Self::open(id_generator, folder, tree_id, descriptor_table, fs, None)
+    }
+
+    /// Initializes a new blob file writer, its blob files written as
+    /// `origin`'s.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub(crate) fn new_for<P: AsRef<Path>>(
+        id_generator: SequenceNumberCounter,
+        folder: P,
+        tree_id: TreeId,
+        descriptor_table: Option<Arc<DescriptorTable>>,
+        fs: Arc<dyn Fs>,
+        origin: WriteOrigin,
+    ) -> crate::Result<Self> {
+        Self::open(
+            id_generator,
+            folder,
+            tree_id,
+            descriptor_table,
+            fs,
+            Some(origin),
+        )
+    }
+
+    fn open<P: AsRef<Path>>(
+        id_generator: SequenceNumberCounter,
+        folder: P,
+        tree_id: TreeId,
+        descriptor_table: Option<Arc<DescriptorTable>>,
+        fs: Arc<dyn Fs>,
+        origin: Option<WriteOrigin>,
     ) -> crate::Result<Self> {
         let folder = folder.as_ref();
 
@@ -125,7 +163,8 @@ impl MultiWriter {
             folder: folder.into(),
             target_size: 64 * 1_024 * 1_024,
 
-            active_writer: Writer::new(blob_file_path, blob_file_id, tree_id, &*fs)?,
+            active_writer: Writer::open(blob_file_path, blob_file_id, tree_id, &*fs, origin)?,
+            origin,
             active_class: 0,
             parked: Vec::new(),
             lifetime_groups: crate::config::LifetimeGroups::ONE,
@@ -335,7 +374,7 @@ impl MultiWriter {
     fn fresh_writer(&self, passthrough: CompressionType, class: u8) -> crate::Result<Writer> {
         let id = self.id_generator.next();
         let path = self.folder.join(id.to_string());
-        let w = Writer::new(path, id, self.tree_id, &*self.fs)?;
+        let w = Writer::open(path, id, self.tree_id, &*self.fs, self.origin)?;
         // Recorded once it exists: a failed constructor created nothing ours.
         if let Some(outputs) = &self.outputs {
             outputs.record_blob_file(id, w.path.clone(), self.fs.clone());

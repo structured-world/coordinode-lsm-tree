@@ -995,7 +995,10 @@ fn refresh_healed_checksum(
         // written through it.
         let file = table.fs.open(
             &table.path,
-            &crate::fs::FsOpenOptions::new().read(true).write(true),
+            &crate::fs::FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .write_origin(crate::fs::WriteOrigin::Repair),
         )?;
         crate::fs::FsFile::sync_data_with(&*file, crate::fs::SyncMode::Full)?;
         Ok(())

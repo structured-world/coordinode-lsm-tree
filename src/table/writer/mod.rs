@@ -1160,13 +1160,36 @@ impl Writer {
         initial_level: u8,
         fs: Arc<dyn Fs>,
     ) -> crate::Result<Self> {
+        Self::open(path, table_id, initial_level, fs, None)
+    }
+
+    /// [`Self::new`], the file written as `origin`'s.
+    pub(crate) fn new_for(
+        path: PathBuf,
+        table_id: TableId,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+        origin: crate::fs::WriteOrigin,
+    ) -> crate::Result<Self> {
+        Self::open(path, table_id, initial_level, fs, Some(origin))
+    }
+
+    fn open(
+        path: PathBuf,
+        table_id: TableId,
+        initial_level: u8,
+        fs: Arc<dyn Fs>,
+        origin: Option<crate::fs::WriteOrigin>,
+    ) -> crate::Result<Self> {
         // Normalize path once so open(), remove_file(), and fsync_directory()
         // all see the same absolute path.
         // no-std: caller must pass an already-absolute path (no cwd concept)
         #[cfg(feature = "std")]
         let path = std::path::absolute(path)?;
 
-        let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
+        let mut opts = FsOpenOptions::new().write(true).create_new(true);
+        opts.write_origin = origin;
+        let file = fs.open(&path, &opts)?;
         // From here the file exists and is OURS (`create_new` proved it), so
         // this constructor owns cleanup: an init failure below must not leak a
         // partial file, and a CALLER must never remove `path` on a constructor

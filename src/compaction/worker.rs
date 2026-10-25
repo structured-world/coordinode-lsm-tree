@@ -2360,6 +2360,11 @@ fn run_tight_space_compaction(
             let relocated_bytes = produced.relocated_bytes();
             let carried = produced.carried();
             let installed_work = produced.installed_work()?;
+            #[cfg(feature = "metrics")]
+            let installed_files = {
+                let tables: u64 = outputs.iter().map(Table::file_len).sum();
+                (tables, installed_work.written - tables)
+            };
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -2587,7 +2592,14 @@ fn run_tight_space_compaction(
             opts.outputs.installed();
             opts.work.installed(installed_work);
             #[cfg(feature = "metrics")]
-            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
+            {
+                super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
+                opts.config.charge_installed(
+                    installed_files,
+                    crate::fs::WriteOrigin::CompactionTable,
+                    crate::fs::WriteOrigin::CompactionBlob,
+                );
+            }
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the
@@ -3099,12 +3111,13 @@ fn run_subcompaction(
                 opts.config.comparator.clone(),
             );
 
-            let writer = BlobFileWriter::new(
+            let writer = BlobFileWriter::new_for(
                 opts.blob_file_id_generator.clone(),
                 blobs_folder,
                 opts.tree_id,
                 opts.config.descriptor_table.clone(),
                 opts.config.fs.clone(),
+                crate::fs::WriteOrigin::CompactionBlob,
             )?
             .use_output_ledger(opts.outputs.clone())
             .use_target_size(blob_opts.file_target_size)
@@ -3856,8 +3869,13 @@ fn run_merge_on_read_relocation(
         copied,
     } = source.relocate_columnar_with_deletes(
         || {
-            opts.table_files
-                .claim(&folder, &level_fs, Some(source.id()), true)
+            opts.table_files.claim_as(
+                &folder,
+                &level_fs,
+                Some(source.id()),
+                true,
+                crate::fs::WriteOrigin::CompactionTable,
+            )
         },
         &*level_fs,
         bitmap,
@@ -4442,12 +4460,13 @@ fn merge_tables(
                     opts.config.comparator.clone(),
                 );
 
-                let writer = BlobFileWriter::new(
+                let writer = BlobFileWriter::new_for(
                     opts.blob_file_id_generator.clone(),
                     &blobs_folder,
                     opts.tree_id,
                     opts.config.descriptor_table.clone(),
                     opts.config.fs.clone(),
+                    crate::fs::WriteOrigin::CompactionBlob,
                 )?
                 .use_output_ledger(opts.outputs.clone())
                 .use_target_size(blob_opts.file_target_size)

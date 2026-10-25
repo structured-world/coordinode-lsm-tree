@@ -189,6 +189,17 @@ pub struct LevelRoute {
     pub fs: Arc<dyn Fs>,
 }
 
+/// The counters a tree counts its writes into, and the backends it was given,
+/// each now wrapped in a [`CountingFs`](crate::fs::CountingFs) counting into
+/// them.
+#[cfg(feature = "metrics")]
+#[derive(Clone)]
+pub(crate) struct WriteCount {
+    pub(crate) stats: Arc<crate::fs::WriteIoStats>,
+    fs: Arc<dyn Fs>,
+    routes: Vec<Arc<dyn Fs>>,
+}
+
 impl core::fmt::Debug for LevelRoute {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LevelRoute")
@@ -727,6 +738,11 @@ pub struct Config {
     #[doc(hidden)]
     pub level_routes: Option<Vec<LevelRoute>>,
 
+    /// What the tree writes, counted by origin, and the backends counted: set
+    /// when the tree opens (see [`Config::count_writes`]).
+    #[cfg(feature = "metrics")]
+    pub(crate) write_count: Option<WriteCount>,
+
     /// Block cache to use
     #[doc(hidden)]
     pub cache: Arc<Cache>,
@@ -1156,6 +1172,8 @@ impl Default for Config {
             path: absolute_path(Path::new(DEFAULT_FILE_FOLDER)),
             fs: Arc::new(StdFs),
             level_routes: None,
+            #[cfg(feature = "metrics")]
+            write_count: None,
             descriptor_table: Some(Arc::new(DescriptorTable::new(256))),
             seqno: SharedSequenceNumberGenerator::from(SequenceNumberCounter::default()),
             visible_seqno: SharedSequenceNumberGenerator::from(SequenceNumberCounter::default()),
@@ -1361,7 +1379,8 @@ pub(crate) fn acquire_directory_lock(
         &crate::fs::FsOpenOptions::new()
             .read(true)
             .write(true)
-            .create(true),
+            .create(true)
+            .write_origin(crate::fs::WriteOrigin::Metadata),
     )?;
     if file.try_lock_exclusive()? {
         Ok(Some(file))
@@ -1738,6 +1757,72 @@ impl Config {
             }
         }
         free
+    }
+
+    /// Wraps the backends in a [`CountingFs`](crate::fs::CountingFs) counting
+    /// into fresh counters, so everything the tree writes is counted once.
+    ///
+    /// A route on the primary backend's handle keeps sharing it, which keeps
+    /// every comparison of the two handles as it was. A config a counted tree
+    /// was opened from carries that tree's wrappers: the backends under them
+    /// are wrapped anew, never the wrappers, so a tree counts only its own.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn count_writes(&mut self) {
+        if let Some(earlier) = self.write_count.take() {
+            self.fs = earlier.fs;
+            if let Some(routes) = &mut self.level_routes
+                && routes.len() == earlier.routes.len()
+            {
+                for (route, fs) in routes.iter_mut().zip(earlier.routes) {
+                    route.fs = fs;
+                }
+            }
+        }
+        let stats = Arc::<crate::fs::WriteIoStats>::default();
+        let given = Arc::clone(&self.fs);
+        let counted: Arc<dyn Fs> = Arc::new(crate::fs::CountingFs::with_stats(
+            Arc::clone(&given),
+            Arc::clone(&stats),
+        ));
+        self.fs = Arc::clone(&counted);
+        let mut routes = Vec::new();
+        for route in self.level_routes.iter_mut().flatten() {
+            let route_fs = core::mem::replace(&mut route.fs, Arc::clone(&counted));
+            if !Arc::ptr_eq(&route_fs, &given) {
+                route.fs = Arc::new(crate::fs::CountingFs::with_stats(
+                    Arc::clone(&route_fs),
+                    Arc::clone(&stats),
+                ));
+            }
+            routes.push(route_fs);
+        }
+        self.write_count = Some(WriteCount {
+            stats,
+            fs: given,
+            routes,
+        });
+    }
+
+    /// The counters this tree counts its writes into, once it is open.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn write_io(&self) -> Option<&Arc<crate::fs::WriteIoStats>> {
+        self.write_count.as_ref().map(|count| &count.stats)
+    }
+
+    /// Charges an install's `(tables, blob files)` bytes, read by
+    /// [`installed_bytes`](crate::tree::installed_bytes) before it published
+    /// them, to the origins that wrote them.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn charge_installed(
+        &self,
+        (tables, blob_files): (u64, u64),
+        table_origin: crate::fs::WriteOrigin,
+        blob_origin: crate::fs::WriteOrigin,
+    ) {
+        if let Some(stats) = self.write_io() {
+            stats.installed(table_origin, tables);
+            stats.installed(blob_origin, blob_files);
+        }
     }
 
     /// Returns all unique tables folders that need to be scanned during

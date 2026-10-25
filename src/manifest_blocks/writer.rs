@@ -120,7 +120,11 @@ impl ManifestArchiveWriter {
     ) -> crate::Result<Self> {
         let mut file = fs.open(
             path,
-            &FsOpenOptions::new().read(true).write(true).create_new(true),
+            &FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .write_origin(crate::fs::WriteOrigin::Manifest),
         )?;
         // Reserve HEAD_FOOTER_RESERVED_SIZE bytes with zeros. The
         // head mirror lands here on finish() — writing the zeros up

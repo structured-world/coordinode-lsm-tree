@@ -535,7 +535,10 @@ pub fn rewrite_atomic(
         let candidate = folder.join(format!(".tmp_{pid}_{seq}"));
         match fs.open(
             &candidate,
-            &FsOpenOptions::new().write(true).create_new(true),
+            &FsOpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .write_origin(crate::fs::WriteOrigin::Metadata),
         ) {
             Ok(mut file) => {
                 let write_result = file

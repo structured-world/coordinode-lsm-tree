@@ -299,29 +299,35 @@ impl TableImport {
         comparator: SharedComparator,
         settings: TableSettings,
     ) -> crate::Result<Self> {
-        let writer = Writer::new(path, table_id, level, fs)?
-            // A row table's blocks end where its source's did
-            // ([`Self::append_block`] cuts each), so a carried locator, which
-            // names blocks by ordinal, still points at the right ones; the
-            // size never cuts one first.
-            .use_data_block_size(crate::config::MAX_BLOCK_SIZE)
-            .use_data_block_compression(settings.data_compression)
-            .use_index_block_compression(settings.index_compression)
-            .use_data_block_restart_interval(settings.data_restart_interval)
-            .use_index_block_restart_interval(settings.index_restart_interval)
-            .use_encryption(settings.encryption)
-            .use_recency(settings.recency)
-            .use_created_at(settings.created_at)
-            // A build without parity writes none: a scheme recorded here would
-            // size every block handle for a trailer that is never written.
-            .use_ecc(settings.ecc.filter(|_| cfg!(feature = "page_ecc")))
-            .use_seqno_in_index(settings.seqno_bounds)
-            .use_zone_map(settings.zone_map)
-            .use_bulk_ingested(settings.bulk_ingested)
-            .use_lineage(settings.lineage.inputs)
-            .use_lineage_prev(settings.lineage.prev)
-            .use_lineage_transformed(settings.lineage.transformed)
-            .use_lineage_last(settings.lineage.last);
+        let writer = Writer::new_for(
+            path,
+            table_id,
+            level,
+            fs,
+            crate::fs::WriteOrigin::IngestTable,
+        )?
+        // A row table's blocks end where its source's did
+        // ([`Self::append_block`] cuts each), so a carried locator, which
+        // names blocks by ordinal, still points at the right ones; the
+        // size never cuts one first.
+        .use_data_block_size(crate::config::MAX_BLOCK_SIZE)
+        .use_data_block_compression(settings.data_compression)
+        .use_index_block_compression(settings.index_compression)
+        .use_data_block_restart_interval(settings.data_restart_interval)
+        .use_index_block_restart_interval(settings.index_restart_interval)
+        .use_encryption(settings.encryption)
+        .use_recency(settings.recency)
+        .use_created_at(settings.created_at)
+        // A build without parity writes none: a scheme recorded here would
+        // size every block handle for a trailer that is never written.
+        .use_ecc(settings.ecc.filter(|_| cfg!(feature = "page_ecc")))
+        .use_seqno_in_index(settings.seqno_bounds)
+        .use_zone_map(settings.zone_map)
+        .use_bulk_ingested(settings.bulk_ingested)
+        .use_lineage(settings.lineage.inputs)
+        .use_lineage_prev(settings.lineage.prev)
+        .use_lineage_transformed(settings.lineage.transformed)
+        .use_lineage_last(settings.lineage.last);
         let writer = if settings.partitioned_index {
             writer.use_partitioned_index()
         } else {
@@ -649,7 +655,13 @@ impl BlobFileImport {
         created_at: u128,
         restriction: Option<BlobFileRestriction>,
     ) -> crate::Result<Self> {
-        let mut writer = crate::vlog::blob_file::writer::Writer::new(path, id, 0, &*fs)?;
+        let mut writer = crate::vlog::blob_file::writer::Writer::open(
+            path,
+            id,
+            0,
+            &*fs,
+            Some(crate::fs::WriteOrigin::IngestBlob),
+        )?;
         // The values arrive compressed: the writer stores them as they are and
         // records their codec.
         writer.metadata_compression_override = Some(compression);

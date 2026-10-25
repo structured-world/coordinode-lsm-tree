@@ -195,7 +195,13 @@ pub fn link_or_copy_cross_fs(
         // snapshot that verifies as corrupt on the next open. Write access is
         // required for the flush alone (Windows refuses to flush a read-only
         // handle with ERROR_ACCESS_DENIED); nothing is written through it.
-        let dst_file = dst_fs.open(dst, &FsOpenOptions::new().read(true).write(true))?;
+        let dst_file = dst_fs.open(
+            dst,
+            &FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .write_origin(crate::fs::WriteOrigin::Checkpoint),
+        )?;
         FsFile::sync_all_with(&*dst_file, sync_mode)?;
         drop(dst_file);
         return Ok(dst_fs.metadata(dst)?.len);
@@ -269,7 +275,13 @@ pub fn link_or_copy_cross_fs(
     // checkpoint is a cold-path operation so the extra allocation is
     // negligible.
     let mut src_file = src_fs.open(src, &FsOpenOptions::new().read(true))?;
-    let mut dst_file = dst_fs.open(dst, &FsOpenOptions::new().write(true).create_new(true))?;
+    let mut dst_file = dst_fs.open(
+        dst,
+        &FsOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .write_origin(crate::fs::WriteOrigin::Checkpoint),
+    )?;
 
     // Run the copy in an inner closure so any failure (read, write,
     // flush, fsync) leaves us with the original error AND lets us
@@ -507,7 +519,13 @@ fn copy_metadata_file_optional(
         Err(e) => return Err(e.into()),
     };
     let dst = target_root.join(file_name);
-    let mut dst_file = target_fs.open(&dst, &FsOpenOptions::new().write(true).create_new(true))?;
+    let mut dst_file = target_fs.open(
+        &dst,
+        &FsOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .write_origin(crate::fs::WriteOrigin::Checkpoint),
+    )?;
 
     std::io::copy(&mut src_file, &mut dst_file)?;
     dst_file.flush()?;

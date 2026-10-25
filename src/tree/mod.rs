@@ -447,6 +447,30 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
     IterGuardImpl::Standard(Guard(Err(e)))
 }
 
+/// The bytes `tables` and `blob_files` hold on disk, read before an install
+/// publishes them: charged to the origins that wrote them once it has
+/// ([`Config::charge_installed`]).
+///
+/// # Errors
+///
+/// A blob file whose length cannot be read.
+#[cfg(feature = "metrics")]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "reached from blob_tree and compaction as crate::tree::installed_bytes"
+)]
+pub(crate) fn installed_bytes(
+    tables: &[Table],
+    blob_files: &[crate::BlobFile],
+) -> crate::Result<(u64, u64)> {
+    let tables = tables.iter().map(Table::file_len).sum();
+    let mut blobs = 0;
+    for blob_file in blob_files {
+        blobs += blob_file.physical_size()?;
+    }
+    Ok((tables, blobs))
+}
+
 /// Extract owned user-key bounds from any range.
 #[expect(
     clippy::redundant_pub_crate,
@@ -1095,6 +1119,7 @@ impl AbstractTree for Tree {
             self.config.table_target_size,
             0,
             level_fs.clone(),
+            crate::fs::WriteOrigin::FlushTable,
         )?;
         // The flush's L0 recency, taken once its first file is: flushes are
         // serialized, so it is above every table already flushed and below
@@ -1303,6 +1328,9 @@ impl AbstractTree for Tree {
             bf.bind_to_tree(&sinks);
         }
 
+        #[cfg(feature = "metrics")]
+        let installed = installed_bytes(tables, blob_files.unwrap_or(&[]))?;
+
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
@@ -1364,6 +1392,12 @@ impl AbstractTree for Tree {
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
         )?;
+        #[cfg(feature = "metrics")]
+        self.config.charge_installed(
+            installed,
+            crate::fs::WriteOrigin::FlushTable,
+            crate::fs::WriteOrigin::FlushBlob,
+        );
 
         Ok(())
     }
@@ -2050,6 +2084,11 @@ impl AbstractTree for Tree {
     }
 
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
+        let (start, end) = (start.into(), end.into());
+        #[cfg(feature = "metrics")]
+        if let Some(stats) = self.config.write_io() {
+            stats.accepted_range_deletion(start.len() + end.len());
+        }
         // The read guard is held through the insert, like `append_entry`: the
         // CDC scan's capture (write side of this lock) must exclude every
         // in-flight memtable write, or a backdated range deletion could land
@@ -2064,7 +2103,7 @@ impl AbstractTree for Tree {
         history
             .latest_version_ref()
             .active_memtable
-            .insert_range_tombstone(start.into(), end.into(), seqno)
+            .insert_range_tombstone(start, end, seqno)
     }
 }
 
@@ -4581,10 +4620,18 @@ impl Tree {
         // arrived with, which is what keeps two trees opened from clones of one
         // config from sharing a set.
         #[cfg_attr(
-            not(any(feature = "parallel", zstd_any)),
-            expect(unused_mut, reason = "assigned only by the parallel / zstd builds")
+            not(any(feature = "parallel", zstd_any, feature = "metrics")),
+            expect(
+                unused_mut,
+                reason = "assigned only by the parallel / zstd / metrics builds"
+            )
         )]
         let mut config = config;
+
+        // Everything the tree writes from here on is counted, its own open
+        // included.
+        #[cfg(feature = "metrics")]
+        config.count_writes();
 
         #[cfg(feature = "parallel")]
         if config.compaction_pool.is_none() && config.compaction_threads > 1 {
@@ -5372,6 +5419,8 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
+        #[cfg(feature = "metrics")]
+        self.accept(&value);
         let kv_digest = self.insert_digest(&value);
 
         // The `.read()` guard is a temporary that lives until the end of this
@@ -5406,6 +5455,8 @@ impl Tree {
         value: InternalValue,
         refs: &[(crate::blob_tree::handle::BlobIndirection, u64)],
     ) -> crate::Result<(u64, u64)> {
+        #[cfg(feature = "metrics")]
+        self.accept(&value);
         let kv_digest = self.insert_digest(&value);
         let history = self.version_history.read();
         let latest = history.latest_version_ref();
@@ -5438,6 +5489,21 @@ impl Tree {
         // version it read staying the latest until the row is in.
         drop(history);
         Ok(inserted)
+    }
+
+    /// Charges `value`, taken in from the caller, to the payload the tree's
+    /// writes are measured against: a deletion its key, anything else its key
+    /// and value.
+    #[cfg(feature = "metrics")]
+    fn accept(&self, value: &InternalValue) {
+        if let Some(stats) = self.config.write_io() {
+            let key = value.key.user_key.len();
+            if value.key.value_type.is_tombstone() {
+                stats.accepted_deletion(key);
+            } else {
+                stats.accepted_value(key + value.value.len());
+            }
+        }
     }
 
     /// The insert-time per-KV digest of `value`, when the runtime config asks
@@ -5489,6 +5555,10 @@ impl Tree {
                 .kv_digest_at_insert
                 .load(core::sync::atomic::Ordering::Relaxed),
         );
+        #[cfg(feature = "metrics")]
+        for item in &items {
+            self.accept(item);
+        }
 
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if
