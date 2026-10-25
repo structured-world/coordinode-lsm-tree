@@ -19,7 +19,7 @@ use crate::path::Path;
 use crate::{
     AbstractTree, Checksum, KvPair, SeqNo, SequenceNumberCounter, TableId, UserKey, UserValue,
     ValueType,
-    compaction::{CompactionStrategy, drop_range::OwnedBounds, state::CompactionState},
+    compaction::{CompactionStrategy, state::CompactionState},
     config::Config,
     format_version::FormatVersion,
     fs::Fs,
@@ -904,23 +904,6 @@ impl AbstractTree for Tree {
             .iter_tables()
             .map(Table::weak_tombstone_reclaimable)
             .sum()
-    }
-
-    fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()> {
-        let (bounds, is_empty) = Self::range_bounds_to_owned_bounds(&range);
-
-        if is_empty {
-            return Ok(());
-        }
-
-        let strategy = Arc::new(crate::compaction::drop_range::Strategy::new(bounds));
-
-        // IMPORTANT: Write lock so we can be the only compaction going on
-        let _lock = self.0.major_compaction_lock.write();
-
-        log::info!("Starting drop_range compaction");
-        self.inner_compact(strategy, 0)?;
-        Ok(())
     }
 
     fn clear(&self) -> crate::Result<()> {
@@ -2664,21 +2647,28 @@ impl Tree {
             sources.push(source);
         }
 
-        // SSTs. A table whose key range cannot intersect the scope is skipped
-        // without a single block read — the point of the scoped variant. The
-        // key range is RANGE-TOMBSTONE-SAFE to prune on: every writer keeps
-        // tombstone coverage inside it (a flush conservatively widens the
-        // range over its tombstone spans — see `write_rts_to_writer` — and a
-        // compaction clips its output's tombstones to the table's
-        // responsibility range), so a tombstone overlapping the scope always
-        // sits in a table this loop visits.
+        // SSTs. A table whose key range cannot intersect the scope is not read
+        // — the point of the scoped variant. Its tombstones still are: the key
+        // range does not bound them, since a compaction cuts its outputs'
+        // tombstones at the next output's first key without widening the
+        // range up to it.
         for table in version.iter_tables() {
-            if let Some(bounds) = &ref_bounds
-                && !table
+            let keys_in_scope = ref_bounds.as_ref().is_none_or(|bounds| {
+                table
                     .metadata
                     .key_range
                     .overlaps_with_bounds_cmp(bounds, cmp.as_ref())
-            {
+            });
+            if !keys_in_scope {
+                let mut source = Vec::new();
+                for rt in table.visible_range_tombstones() {
+                    if rt_in_range(&rt) {
+                        source.extend(range_tombstone_event(&rt));
+                    }
+                }
+                if !source.is_empty() {
+                    sources.push(source);
+                }
                 continue;
             }
             // An RT-only table's synthetic weak-tombstone sentinel (the
@@ -3768,23 +3758,27 @@ impl Tree {
         // Check SST table range tombstones.
         //
         // Per-table RT lists are sorted by start key (using comparator) on load,
-        // so binary search narrows candidates to RTs with start <= key.
-        // The key_range early reject uses the comparator so it works with
-        // non-lexicographic orderings.
+        // so binary search narrows candidates to RTs with start <= key. A
+        // table's key range does not bound its tombstones (a compaction cuts
+        // them at the next output's first key without widening the range up
+        // to it), so the stretch they cover rejects a table instead: from the
+        // first one's start to the greatest end, two compares.
         for table in super_version
             .version
             .iter_levels()
             .flat_map(|lvl| lvl.iter())
+            .filter(|run| run.holds_range_tombstones())
             .flat_map(|run| run.iter())
-            .filter(|t| !t.range_tombstones().is_empty())
-            .filter(|t| {
-                // Early reject: skip tables whose key range doesn't contain the key.
-                let kr = &t.metadata.key_range;
-                comparator.compare(kr.min(), key) != core::cmp::Ordering::Greater
-                    && comparator.compare(key, kr.max()) != core::cmp::Ordering::Greater
-            })
         {
             let rts = table.range_tombstones();
+            let (Some(first), Some(end)) = (rts.first(), table.range_tombstones_end()) else {
+                continue;
+            };
+            if comparator.compare(&first.start, key) == core::cmp::Ordering::Greater
+                || comparator.compare(key, end) != core::cmp::Ordering::Less
+            {
+                continue;
+            }
 
             // Binary search: find the first RT whose start is > key (in comparator order).
             // All RTs before that index have start <= key and are candidates.
@@ -3793,11 +3787,11 @@ impl Tree {
             });
 
             for rt in rts.iter().take(candidate_end) {
-                // Check: start <= key < end (in comparator order) AND seqno visibility.
-                if rt.visible_at(read_seqno)
-                    && comparator.compare(&rt.start, key) != core::cmp::Ordering::Greater
+                // start <= key holds by the search; the seqno checks are
+                // cheaper than the key compare, so they go first.
+                if key_seqno < rt.seqno
+                    && rt.visible_at(read_seqno)
                     && comparator.compare(key, &rt.end) == core::cmp::Ordering::Less
-                    && key_seqno < rt.seqno
                 {
                     return true;
                 }
@@ -4544,43 +4538,6 @@ impl Tree {
                 .get_version_for_snapshot(seqno)
                 .map(crate::version::SnapshotRef::Owned)
         }
-    }
-
-    /// Normalizes a user-provided range into owned `Bound<Slice>` values.
-    ///
-    /// Returns a tuple containing:
-    /// - the `OwnedBounds` that mirror the original bounds semantics (including
-    ///   inclusive/exclusive markers and unbounded endpoints), and
-    /// - a `bool` flag indicating whether the normalized range is logically
-    ///   empty (e.g., when the lower bound is greater than the upper bound).
-    ///
-    /// Callers can use the flag to detect empty ranges and skip further work
-    /// while still having access to the normalized bounds for non-empty cases.
-    fn range_bounds_to_owned_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
-        range: &R,
-    ) -> (OwnedBounds, bool) {
-        use Bound::{Excluded, Included, Unbounded};
-
-        let start = match range.start_bound() {
-            Included(key) => Included(Slice::from(key.as_ref())),
-            Excluded(key) => Excluded(Slice::from(key.as_ref())),
-            Unbounded => Unbounded,
-        };
-
-        let end = match range.end_bound() {
-            Included(key) => Included(Slice::from(key.as_ref())),
-            Excluded(key) => Excluded(Slice::from(key.as_ref())),
-            Unbounded => Unbounded,
-        };
-
-        let is_empty =
-            if let (Included(lo) | Excluded(lo), Included(hi) | Excluded(hi)) = (&start, &end) {
-                lo.as_ref() > hi.as_ref()
-            } else {
-                false
-            };
-
-        (OwnedBounds { start, end }, is_empty)
     }
 
     /// Opens an LSM-tree in the given directory.
@@ -7511,6 +7468,10 @@ mod cardinality_tests;
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "test code")]
 mod scan_since_freeze_tests;
+
+#[cfg(test)]
+#[expect(clippy::expect_used, clippy::panic, reason = "test code")]
+mod scan_since_scope_tests;
 
 #[cfg(all(test, feature = "metrics"))]
 mod cache_stats_tests;

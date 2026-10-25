@@ -3,10 +3,11 @@ use test_log::test;
 
 use crate::comparator::DefaultUserComparator;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FakeTable {
     id: u64,
     key_range: KeyRange,
+    tombstones: bool,
 }
 
 impl Ranged for FakeTable {
@@ -15,11 +16,80 @@ impl Ranged for FakeTable {
     }
 }
 
+impl HoldsRangeTombstones for FakeTable {
+    fn holds_range_tombstones(&self) -> bool {
+        self.tombstones
+    }
+}
+
 fn s(id: u64, min: &str, max: &str) -> FakeTable {
     FakeTable {
         id,
         key_range: KeyRange::new((min.as_bytes().into(), max.as_bytes().into())),
+        tombstones: false,
     }
+}
+
+/// A table like [`s`] that holds a range tombstone.
+fn with_tombstone(id: u64, min: &str, max: &str) -> FakeTable {
+    FakeTable {
+        tombstones: true,
+        ..s(id, min, max)
+    }
+}
+
+/// A run of `items` as given, empty or not.
+fn run(items: Vec<FakeTable>) -> Run<FakeTable> {
+    Run {
+        items,
+        range_tombstones: OnceBool::new(),
+    }
+}
+
+/// The run answers whether an item holds a range tombstone, and every change
+/// of its items asks again rather than serving the cached answer.
+#[test]
+fn run_holds_range_tombstones_follows_its_items() {
+    let mut run = run(vec![s(0, "a", "d"), s(1, "e", "j")]);
+    assert!(!run.holds_range_tombstones());
+
+    run.push_lexicographic(with_tombstone(2, "k", "o"));
+    assert!(run.holds_range_tombstones(), "after a push");
+
+    run.retain(|t| t.id != 2);
+    assert!(!run.holds_range_tombstones(), "after a retain");
+
+    run.extend(vec![with_tombstone(3, "p", "z")]);
+    assert!(run.holds_range_tombstones(), "after an extend");
+
+    run.remove(2);
+    assert!(!run.holds_range_tombstones(), "after a remove");
+
+    run.insert_sorted_cmp(with_tombstone(4, "p", "z"), &DefaultUserComparator);
+    assert!(run.holds_range_tombstones(), "after an insert");
+
+    for table in run.inner_mut() {
+        table.tombstones = false;
+    }
+    assert!(!run.holds_range_tombstones(), "after a change in place");
+
+    let clone = run.clone();
+    assert!(
+        !clone.holds_range_tombstones(),
+        "a clone asks its own items"
+    );
+}
+
+/// A run prints as its items alone: the cached answer is not part of what
+/// the run is, so a run that was asked and one that was not print the same.
+#[test]
+fn run_debug_shows_its_items_not_the_cache() {
+    let items = vec![s(0, "a", "d"), with_tombstone(1, "e", "j")];
+    let expected = format!("Run({items:?})");
+    let asked = run(items.clone());
+    assert!(asked.holds_range_tombstones());
+    assert_eq!(expected, format!("{asked:?}"));
+    assert_eq!(expected, format!("{:?}", run(items)));
 }
 
 /// Reverse comparator for testing non-lexicographic ordering.
@@ -43,7 +113,7 @@ fn run_aggregate_key_range() {
         s(2, "k", "o"),
         s(3, "p", "z"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     assert_eq!(
         KeyRange::new((b"a".into(), b"z".into())),
@@ -59,7 +129,7 @@ fn run_point_lookup() {
         s(2, "k", "o"),
         s(3, "p", "z"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     assert_eq!(0, run.get_for_key(b"a").unwrap().id);
     assert_eq!(0, run.get_for_key(b"aaa").unwrap().id);
@@ -83,7 +153,7 @@ fn run_range_culling() {
         s(2, "k", "o"),
         s(3, "p", "z"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     assert_eq!(Some((0, 3)), run.range_overlap_indexes::<&[u8], _>(&..));
     assert_eq!(
@@ -139,7 +209,7 @@ fn run_range_contained() {
         s(2, "k", "o"),
         s(3, "p", "z"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     assert_eq!(
         &[] as &[TableId],
@@ -220,7 +290,7 @@ fn run_range_contained_cmp_reverse() {
         s(2, "j", "e"),
         s(3, "d", "a"),
     ];
-    let run = Run(items);
+    let run = run(items);
     let cmp = ReverseCmp;
 
     // Full range contains all
@@ -272,7 +342,7 @@ fn run_range_overlaps() {
         s(2, "k", "o"),
         s(3, "p", "z"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     assert_eq!(
         &[0],
@@ -367,7 +437,7 @@ fn get_overlapping_cmp_reverse() {
         s(1, "j", "e"),
         s(0, "d", "a"),
     ];
-    let run = Run(items);
+    let run = run(items);
 
     let result = run
         .get_overlapping_cmp(&KeyRange::new((b"j".into(), b"j".into())), &ReverseCmp)
@@ -392,7 +462,7 @@ fn range_overlap_indexes_cmp_reverse() {
         s(1, "j", "e"),
         s(0, "d", "a"),
     ];
-    let run = Run(items);
+    let run = run(items);
     let cmp = ReverseCmp;
 
     assert_eq!(
@@ -449,7 +519,7 @@ fn get_for_key_cmp_reverse() {
         s(1, "j", "e"),
         s(0, "d", "a"),
     ];
-    let run = Run(items);
+    let run = run(items);
     let cmp = ReverseCmp;
 
     assert_eq!(3, run.get_for_key_cmp(b"z", &cmp).unwrap().id);

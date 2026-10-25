@@ -184,9 +184,10 @@ impl Segment {
     /// The source's range tombstones, in its local seqno space.
     fn range_tombstones(&self) -> Vec<crate::range_tombstone::RangeTombstone> {
         match &self.source {
-            Source::Columnar(table) | Source::RowTable(table) => {
-                table.visible_range_tombstones().collect()
-            }
+            Source::Columnar(table) | Source::RowTable(table) => table
+                .visible_range_tombstones()
+                .map(alloc::borrow::Cow::into_owned)
+                .collect(),
             Source::Memtable(memtable) => memtable.range_tombstones_sorted(),
         }
     }

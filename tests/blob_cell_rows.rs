@@ -57,6 +57,16 @@ fn bytes<'a>(values: &[&'a [u8]]) -> Vec<Field<'a>> {
         .collect()
 }
 
+/// A compaction at `watermark` whose strategy drops nothing, so it only drops
+/// the tables flushed range tombstones span.
+fn reclaim(tree: &BlobTree, watermark: SeqNo) -> lsm_tree::Result<()> {
+    tree.compact(
+        Arc::new(lsm_tree::compaction::Fifo::new(u64::MAX, None)),
+        watermark,
+    )?;
+    Ok(())
+}
+
 /// The latest version of `key`, read as cells.
 fn row_of(tree: &BlobTree, key: &str) -> lsm_tree::Result<RowCells> {
     Ok(tree.get_cells(key, SeqNo::MAX)?.expect("row exists"))
@@ -536,20 +546,23 @@ fn a_dropped_owner_keeps_the_file_a_kept_table_borrows_from() -> lsm_tree::Resul
     tree.insert_cells("doc", &bytes(&[b"draft", &body]), 0)?;
     tree.flush_active_memtable(0)?;
     let row = row_of(&tree, "doc")?;
+    // A tombstone over the owner's version, below the borrower's.
+    tree.remove_range("doc", "doc\0", 1);
+    tree.flush_active_memtable(0)?;
     tree.insert_cells(
         "doc",
         &[Field::bytes(STATUS, b"final"), reference(&row, BODY)?],
-        1,
+        2,
     )?;
     drop(row);
-    // A second key keeps the borrower's table out of the dropped range.
-    tree.insert("zzz", "other", 1);
+    // A second key keeps the borrower's table out of the tombstone's span.
+    tree.insert("zzz", "other", 2);
     tree.flush_active_memtable(0)?;
-    assert_eq!(tree.table_count(), 2);
+    assert_eq!(tree.table_count(), 3);
 
-    // Only the owner's table lies wholly inside the range.
-    tree.drop_range("doc"..="doc")?;
-    assert_eq!(tree.table_count(), 1, "the owner's table is dropped");
+    // Only the owner's table is older than the tombstone and inside it.
+    reclaim(&tree, 3)?;
+    assert_eq!(tree.table_count(), 2, "the owner's table is dropped");
     assert_eq!(tree.blob_file_count(), 1, "the borrowed body's file stays");
     assert_eq!(
         tree.get("doc", SeqNo::MAX)?.as_deref(),
@@ -591,8 +604,14 @@ fn a_table_drop_releases_only_the_objects_the_table_owned() -> lsm_tree::Result<
 
     let a = row_of(&tree, "a")?;
     let z = row_of(&tree, "z")?;
-    tree.drop_range("a"..="a")?;
-    assert_eq!(tree.table_count(), 1, "the table of a is dropped");
+    tree.remove_range("a", "b", 2);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, 3)?;
+    assert_eq!(
+        tree.table_count(),
+        2,
+        "the table of a is dropped, z and the tombstone stay"
+    );
 
     tree.insert_cells(
         "z",
@@ -607,7 +626,7 @@ fn a_table_drop_releases_only_the_objects_the_table_owned() -> lsm_tree::Result<
     let refused = tree.insert_cells(
         "a",
         &[Field::bytes(STATUS, b"final"), reference(&a, BODY)?],
-        3,
+        4,
     );
     assert!(
         matches!(refused, Err(lsm_tree::Error::BlobRef(_))),
@@ -831,7 +850,7 @@ fn references_from_two_trees_are_not_equal() -> lsm_tree::Result<()> {
 /// Dropping the table that owns an object keeps the file while a memtable row
 /// borrows the object.
 #[test]
-fn drop_range_keeps_a_file_a_memtable_row_borrows_from() -> lsm_tree::Result<()> {
+fn a_dropped_owner_keeps_the_file_a_memtable_row_borrows_from() -> lsm_tree::Result<()> {
     let folder = get_tmp_folder();
     let tree = open(folder.path(), KvSeparationOptions::default())?;
     let body = vec![b'b'; 4_096];
@@ -839,14 +858,20 @@ fn drop_range_keeps_a_file_a_memtable_row_borrows_from() -> lsm_tree::Result<()>
     tree.flush_active_memtable(0)?;
 
     let row = row_of(&tree, "doc")?;
+    tree.remove_range("doc", "doc\0", 1);
+    tree.flush_active_memtable(0)?;
     tree.insert_cells(
         "doc",
         &[Field::bytes(STATUS, b"final"), reference(&row, BODY)?],
-        1,
+        2,
     )?;
     drop(row);
-    tree.drop_range::<&str, _>(..)?;
-    assert_eq!(tree.table_count(), 0, "the owner's table is gone");
+    reclaim(&tree, 3)?;
+    assert_eq!(
+        tree.table_count(),
+        1,
+        "the owner's table is gone, the tombstone's stays"
+    );
     assert_eq!(
         tree.blob_file_count(),
         1,

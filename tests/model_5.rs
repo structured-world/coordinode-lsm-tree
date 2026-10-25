@@ -78,9 +78,12 @@ fn model_5() -> Result<()> {
     tree.flush_active_memtable(902)?;
     tree.compact(compaction.clone(), 902)?;
 
-    tree.drop_range::<&[u8], _>(..)?;
+    // Every key starts with a zero byte.
+    tree.remove_range([0u8], [1u8], 1002);
+    tree.flush_active_memtable(902)?;
+    tree.compact(compaction.clone(), 1003)?;
 
-    assert_eq!(0, tree.table_count());
+    assert_eq!(1, tree.table_count(), "only the tombstone's table stays");
     assert_eq!(0, tree.blob_file_count());
 
     Ok(())

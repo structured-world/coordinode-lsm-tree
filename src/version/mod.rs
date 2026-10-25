@@ -124,6 +124,12 @@ impl Ranged for Table {
     }
 }
 
+impl run::HoldsRangeTombstones for Table {
+    fn holds_range_tombstones(&self) -> bool {
+        !self.range_tombstones().is_empty()
+    }
+}
+
 pub struct GenericLevel<T: Ranged> {
     runs: Vec<Arc<Run<T>>>,
 }

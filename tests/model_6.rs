@@ -1284,9 +1284,12 @@ tree.compact(compaction.clone(), 172901)?;
 
 tree.compact(compaction.clone(), 173101)?;
 
-    tree.drop_range::<&[u8], _>(..)?;
+    // Every key starts with a zero byte, and every seqno is below a million.
+    tree.remove_range([0u8], [1u8], 1_000_000);
+    tree.flush_active_memtable(173101)?;
+    tree.compact(compaction.clone(), 1_000_001)?;
 
-    assert_eq!(0, tree.table_count());
+    assert_eq!(1, tree.table_count(), "only the tombstone's table stays");
     assert_eq!(0, tree.blob_file_count());
 
     Ok(())

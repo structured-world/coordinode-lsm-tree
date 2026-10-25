@@ -881,7 +881,10 @@ fn restricted_view_clamps_visible_range_tombstones() -> crate::Result<()> {
             );
 
             let restricted = table.reopen_restricted(crate::UserKey::from(&b"g"[..]))?;
-            let visible: Vec<_> = restricted.visible_range_tombstones().collect();
+            let visible: Vec<_> = restricted
+                .visible_range_tombstones()
+                .map(alloc::borrow::Cow::into_owned)
+                .collect();
             assert_eq!(
                 visible,
                 vec![rt(b"g", b"m", 5), rt(b"p", b"r", 6)],

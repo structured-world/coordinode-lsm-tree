@@ -239,11 +239,19 @@ fn each_tree_operation_syncs_only_what_it_makes_durable() {
             "a compaction into one pooled file (blob: {blob})"
         );
 
-        tree.drop_range::<&[u8], _>(..).expect("drop");
+        // A tombstone over every key, newer than all of them.
+        tree.remove_range("key", "kez", 50_000);
+        tree.flush_active_memtable(0).expect("flush");
+        census.take();
+        tree.compact(
+            Arc::new(lsm_tree::compaction::Fifo::new(u64::MAX, None)),
+            50_001,
+        )
+        .expect("reclaim");
         assert_eq!(
             census.take(),
             vec![(Synced::EditLog, SyncKind::FileData)],
-            "dropping every key (blob: {blob})"
+            "dropping the tables a tombstone spans (blob: {blob})"
         );
 
         // A reopen installs what it recovered as a fresh snapshot, so what it

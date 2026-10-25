@@ -1,0 +1,496 @@
+use lsm_tree::{
+    AbstractTree, AnyTree, Config, KvSeparationOptions, SeqNo, SequenceNumberCounter,
+    compaction::{CompactionAction, CompactionResult, Fifo, Leveled},
+    fs::{CrashFs, FaultFs, Fs, MemFs},
+    get_tmp_folder,
+};
+use std::sync::Arc;
+
+fn open(folder: &tempfile::TempDir) -> lsm_tree::Result<AnyTree> {
+    Config::new(
+        folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+}
+
+/// One table per key `a..=e`, written at seqnos 1 to 5.
+fn populate_tables(tree: &AnyTree) -> lsm_tree::Result<()> {
+    for (seqno, key) in (1..).zip('a'..='e') {
+        tree.insert([key as u8], "", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    Ok(())
+}
+
+/// A compaction at `watermark` whose strategy drops nothing, so the only work
+/// it can do is reclaiming the tables range tombstones delete.
+fn reclaim(tree: &AnyTree, watermark: SeqNo) -> lsm_tree::Result<CompactionResult> {
+    tree.compact(Arc::new(Fifo::new(u64::MAX, None)), watermark)
+}
+
+/// The tables a flushed tombstone spans whole go without being read, and the
+/// keys it deletes stay deleted while the keys past it stay.
+#[test]
+fn remove_range_reclaims_the_tables_it_spans_whole() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(6, tree.table_count());
+
+    let result = reclaim(&tree, 7)?;
+
+    assert_eq!(CompactionAction::Dropped, result.action);
+    assert_eq!(3, result.tables_in, "the tables of a, b and c go");
+    assert_eq!(0, result.work.measured.read, "a reclaim reads nothing");
+    assert_eq!(3, tree.table_count(), "d, e and the tombstone stay");
+    for key in ["a", "b", "c"] {
+        assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+    }
+    for key in ["d", "e"] {
+        assert!(tree.contains_key(key, SeqNo::MAX)?, "{key} was lost");
+    }
+    Ok(())
+}
+
+/// A tombstone inside one table deletes exactly its keys at once; the table
+/// holds others, so it stays for a merge to rewrite.
+#[test]
+fn remove_range_deletes_inside_a_table_it_does_not_span() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    for key in ["a", "b", "c", "d", "e"] {
+        tree.insert(key, "", 1);
+    }
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("b", "d", 2);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 3)?;
+
+    assert_eq!(CompactionAction::Nothing, result.action);
+    assert_eq!(2, tree.table_count());
+    for key in ["b", "c"] {
+        assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+    }
+    for key in ["a", "d", "e"] {
+        assert!(tree.contains_key(key, SeqNo::MAX)?, "{key} was lost");
+    }
+    Ok(())
+}
+
+/// A tombstone still in the memtable is not durable: a drop it justified
+/// could outlive it through a crash. It deletes at once but reclaims nothing.
+#[test]
+fn remove_range_reclaims_nothing_before_the_tombstone_is_flushed() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+
+    let result = reclaim(&tree, 7)?;
+
+    assert_eq!(CompactionAction::Nothing, result.action);
+    assert_eq!(5, tree.table_count());
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// The oldest snapshot still served reads at the watermark; while the
+/// tombstone is not below it, that snapshot reads the tables, so they stay.
+#[test]
+fn remove_range_reclaims_nothing_while_the_watermark_is_not_above_it() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 6)?;
+
+    assert_eq!(CompactionAction::Nothing, result.action);
+    assert_eq!(6, tree.table_count());
+    assert!(tree.contains_key("a", 6)?, "a snapshot below the tombstone");
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// Reclaiming a newer table under the tombstone must not uncover the older
+/// version a table reaching past the tombstone keeps: the tombstone stays
+/// while that table overlaps it, and a later bottom merge applies it.
+#[test]
+fn remove_range_keeps_older_versions_deleted_after_reclaim() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    tree.insert("k", "old", 1);
+    tree.insert("z", "outside", 2);
+    tree.flush_active_memtable(0)?;
+    tree.insert("k", "new", 3);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("a", "m", 4);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 5)?;
+
+    assert_eq!(1, result.tables_in, "only the table of k = new goes");
+    assert_eq!(2, tree.table_count());
+    assert_eq!(None, tree.get("k", SeqNo::MAX)?, "an older k came back");
+    assert_eq!(
+        Some("outside".as_bytes().into()),
+        tree.get("z", SeqNo::MAX)?
+    );
+
+    tree.major_compact(u64::MAX, 5)?;
+
+    assert_eq!(None, tree.get("k", SeqNo::MAX)?, "an older k came back");
+    assert_eq!(
+        Some("outside".as_bytes().into()),
+        tree.get("z", SeqNo::MAX)?
+    );
+    Ok(())
+}
+
+/// A reclaim refuses exactly the snapshots that could still have read a
+/// dropped table: those up to the tombstone.
+#[test]
+fn remove_range_reclaim_refuses_snapshots_up_to_the_tombstone() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+
+    reclaim(&tree, 10)?;
+
+    assert_eq!(6, tree.retention_floor());
+    assert!(matches!(
+        tree.get("d", 6),
+        Err(lsm_tree::Error::SnapshotBelowRetention { .. })
+    ));
+    assert!(tree.contains_key("d", 7)?);
+    Ok(())
+}
+
+/// The drop is one manifest edit: a reopen sees it whole.
+#[test]
+fn remove_range_reclaim_survives_a_reopen() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    {
+        let tree = open(&folder)?;
+        populate_tables(&tree)?;
+        tree.remove_range("a", "d", 6);
+        tree.flush_active_memtable(0)?;
+        reclaim(&tree, 7)?;
+    }
+
+    let tree = open(&folder)?;
+
+    assert_eq!(3, tree.table_count());
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    assert!(tree.contains_key("d", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// Reverses the byte order of keys.
+struct ReverseComparator;
+
+impl lsm_tree::UserComparator for ReverseComparator {
+    fn name(&self) -> &'static str {
+        "reverse"
+    }
+
+    fn compare(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        b.cmp(a)
+    }
+}
+
+/// Spans and overlaps follow the tree's comparator: under a reversed order
+/// the tombstone `[d, a)` holds `d`, `c` and `b`, whose tables go, while in
+/// byte order it would be empty.
+#[test]
+fn remove_range_reclaims_in_the_trees_key_order() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .comparator(Arc::new(ReverseComparator))
+    .open()?;
+    populate_tables(&tree)?;
+    tree.remove_range("d", "a", 6);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 7)?;
+
+    assert_eq!(3, result.tables_in, "the tables of d, c and b go");
+    for key in ["b", "c", "d"] {
+        assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+    }
+    for key in ["a", "e"] {
+        assert!(tree.contains_key(key, SeqNo::MAX)?, "{key} was lost");
+    }
+    Ok(())
+}
+
+/// Four overlapping L0 tables of `j` and `k`, written at seqnos 1 to 4.
+fn overlapping_l0(tree: &AnyTree) -> lsm_tree::Result<()> {
+    for seqno in 1..=4 {
+        tree.insert("j", "v", seqno);
+        tree.insert("k", "v", seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    Ok(())
+}
+
+/// The reclaim runs before the strategy chooses: a leveled compaction that
+/// would merge the covered L0 tables reads none of them.
+#[test]
+fn remove_range_reclaim_runs_before_the_strategy_chooses() -> lsm_tree::Result<()> {
+    let premise_folder = get_tmp_folder();
+    let premise = open(&premise_folder)?;
+    overlapping_l0(&premise)?;
+    let merged = premise.compact(Arc::new(Leveled::default()), 6)?;
+    assert!(
+        merged.work.measured.read > 0,
+        "premise: leveled merges these tables, reading them"
+    );
+
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    overlapping_l0(&tree)?;
+    tree.remove_range("a", "m", 5);
+    tree.flush_active_memtable(0)?;
+
+    let result = tree.compact(Arc::new(Leveled::default()), 6)?;
+
+    assert_eq!(0, result.work.measured.read, "a covered table was read");
+    assert_eq!(1, tree.table_count(), "only the tombstone stays");
+    assert_eq!(None, tree.get("k", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// The folder the crash tests put their tree in, spelled as `Config` spells it.
+fn crash_tree_path() -> std::path::PathBuf {
+    std::path::absolute("/db").expect("absolute path")
+}
+
+/// A tree in [`crash_tree_path`] on `fs`, KV-separated when `blobs`, so its
+/// values sit in a blob file a reclaim drops with their tables.
+fn open_on(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
+    let config = Config::new(
+        crash_tree_path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::clone(fs));
+    if blobs {
+        config
+            .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+            .open()
+    } else {
+        config.open()
+    }
+}
+
+/// A tree on `fs` holding one table per key `a..=e` at seqnos 1 to 5 and the
+/// tombstone `[a, d)` at 6, all flushed and durable: the state a reclaim
+/// starts from.
+fn before_reclaim(fs: &Arc<dyn Fs>, blobs: bool) -> lsm_tree::Result<AnyTree> {
+    let tree = open_on(fs, blobs)?;
+    for (seqno, key) in (1..).zip('a'..='e') {
+        tree.insert([key as u8], [b'v'; 64], seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    Ok(tree)
+}
+
+/// A crash simulator and a fault layer over it the tree runs on.
+fn crash_stack() -> (CrashFs, Arc<FaultFs<CrashFs>>) {
+    let crash = CrashFs::new(MemFs::new());
+    let fault = Arc::new(FaultFs::new(crash.clone()));
+    (crash, fault)
+}
+
+/// A power loss after any sync of a reclaim reopens into the version before
+/// it or the one after, never between: the dropped tables are all there or
+/// all gone, the deleted keys stay deleted and the others stay. A reclaim
+/// that returned is durable.
+#[test]
+fn remove_range_reclaim_survives_a_power_loss_at_every_sync() -> lsm_tree::Result<()> {
+    for blobs in [false, true] {
+        let (_, clean) = crash_stack();
+        let fs: Arc<dyn Fs> = clean.clone();
+        let tree = before_reclaim(&fs, blobs)?;
+        let before = tree.table_count();
+        let setup = clean.injector().take_syncs();
+        assert!(!setup.is_empty(), "self-check: the flushes before it sync");
+        reclaim(&tree, 7)?;
+        let after = tree.table_count();
+        let syncs = clean.injector().take_syncs().len();
+        assert!(syncs > 0, "self-check: the reclaim syncs");
+        assert_eq!(
+            before - 3,
+            after,
+            "self-check: the reclaim drops three tables"
+        );
+        drop(tree);
+
+        for kept in 0..=syncs {
+            let (crash, fault) = crash_stack();
+            let fs: Arc<dyn Fs> = fault.clone();
+            let tree = before_reclaim(&fs, blobs)?;
+            if kept < syncs {
+                fault.injector().power_off_after_syncs(kept);
+            }
+            let returned = reclaim(&tree, 7).is_ok();
+            drop(tree);
+            crash.crash();
+
+            let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+            let tree = open_on(&fs, blobs)?;
+            let count = tree.table_count();
+            assert!(
+                count == before || count == after,
+                "a version between: {count} tables after {kept} of {syncs} syncs (blobs: {blobs})"
+            );
+            if returned {
+                assert_eq!(after, count, "a reclaim that returned was lost");
+            }
+            for key in ["a", "b", "c"] {
+                assert!(!tree.contains_key(key, SeqNo::MAX)?, "{key} came back");
+            }
+            for key in ["d", "e"] {
+                assert_eq!(
+                    Some([b'v'; 64].as_slice().into()),
+                    tree.get(key, SeqNo::MAX)?,
+                    "{key} was lost"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A tombstone lost from the memtable by a crash dropped no table: the
+/// tables are whole after the reopen, and replaying the deletion from the
+/// caller's log reaches the state the crash interrupted.
+#[test]
+fn remove_range_lost_before_its_flush_left_every_table() -> lsm_tree::Result<()> {
+    let (crash, fault) = crash_stack();
+    let fs: Arc<dyn Fs> = fault.clone();
+    let tree = open_on(&fs, false)?;
+    populate_tables(&tree)?;
+    tree.remove_range("a", "d", 6);
+    reclaim(&tree, 7)?;
+    drop(tree);
+    crash.crash();
+
+    let fs: Arc<dyn Fs> = Arc::new(crash.clone());
+    let tree = open_on(&fs, false)?;
+    assert_eq!(5, tree.table_count());
+    assert!(
+        tree.contains_key("a", SeqNo::MAX)?,
+        "the tombstone was not durable"
+    );
+
+    // The caller's log replays the deletion at its seqno.
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, 7)?;
+    assert_eq!(3, tree.table_count());
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    assert!(tree.contains_key("d", SeqNo::MAX)?);
+    Ok(())
+}
+
+/// A checkpoint taken before a reclaim links the tables the reclaim drops:
+/// the tree unlinks its own names, the checkpoint opens with the data.
+#[test]
+fn remove_range_reclaim_leaves_an_earlier_checkpoint_whole() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(&folder)?;
+    populate_tables(&tree)?;
+    let checkpoint = folder.path().join("checkpoint");
+    tree.create_checkpoint(&checkpoint)?;
+
+    tree.remove_range("a", "d", 6);
+    tree.flush_active_memtable(0)?;
+    reclaim(&tree, 7)?;
+    assert!(!tree.contains_key("a", SeqNo::MAX)?);
+    drop(tree);
+
+    let restored = Config::new(
+        &checkpoint,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    for key in ["a", "b", "c", "d", "e"] {
+        assert!(
+            restored.contains_key(key, SeqNo::MAX)?,
+            "{key} is missing from the checkpoint"
+        );
+    }
+    Ok(())
+}
+
+/// Appends each operand to the base.
+struct Concat;
+
+impl lsm_tree::MergeOperator for Concat {
+    fn merge(
+        &self,
+        _key: &[u8],
+        base: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> lsm_tree::Result<lsm_tree::UserValue> {
+        let mut out = base.unwrap_or_default().to_vec();
+        for operand in operands {
+            out.extend_from_slice(operand);
+        }
+        Ok(out.into())
+    }
+}
+
+/// Merge operands under a tombstone go with it: after the reclaim a new
+/// operand starts from nothing, neither from the dropped operand nor from
+/// the older one a table reaching past the tombstone keeps.
+#[test]
+fn remove_range_reclaim_keeps_merge_operands_deleted() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_merge_operator(Some(Arc::new(Concat)))
+    .open()?;
+    tree.merge("k", "old", 1);
+    tree.insert("z", "outside", 2);
+    tree.flush_active_memtable(0)?;
+    tree.merge("k", "new", 3);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("a", "m", 4);
+    tree.flush_active_memtable(0)?;
+
+    let result = reclaim(&tree, 5)?;
+
+    assert_eq!(
+        1, result.tables_in,
+        "only the table of the newer operand goes"
+    );
+    assert_eq!(None, tree.get("k", SeqNo::MAX)?);
+    tree.merge("k", "w", 6);
+    assert_eq!(
+        Some("w".as_bytes().into()),
+        tree.get("k", SeqNo::MAX)?,
+        "a deleted operand became the base"
+    );
+    Ok(())
+}
