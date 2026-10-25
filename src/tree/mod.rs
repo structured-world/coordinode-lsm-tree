@@ -447,28 +447,69 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
     IterGuardImpl::Standard(Guard(Err(e)))
 }
 
-/// The bytes `tables` and `blob_files` hold on disk, read before an install
-/// publishes them: charged to the origins that wrote them once it has
-/// ([`Config::charge_installed`]).
+/// The bytes an install keeps, for each counter set they go to: the set of
+/// the backend each file was written through (see
+/// [`Fs::write_io_stats`](crate::fs::Fs::write_io_stats)), so a route on
+/// another medium is charged to that medium's set. Files on a backend that
+/// counts nothing are not looked at.
 ///
-/// # Errors
-///
-/// A blob file whose length cannot be read.
-#[cfg(feature = "metrics")]
+/// Read before the install publishes the files, recorded once it has
+/// ([`Self::charge`]): an install that fails keeps nothing.
+#[derive(Default)]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "reached from blob_tree and compaction as crate::tree::installed_bytes"
+    reason = "reached from blob_tree and compaction as crate::tree::InstalledCharge"
 )]
-pub(crate) fn installed_bytes(
-    tables: &[Table],
-    blob_files: &[crate::BlobFile],
-) -> crate::Result<(u64, u64)> {
-    let tables = tables.iter().map(Table::file_len).sum();
-    let mut blobs = 0;
-    for blob_file in blob_files {
-        blobs += blob_file.physical_size()?;
+pub(crate) struct InstalledCharge(Vec<(Arc<crate::fs::WriteIoStats>, crate::fs::WriteOrigin, u64)>);
+
+impl InstalledCharge {
+    /// Adds the files of `tables`, written for `table_origin`, and of
+    /// `blob_files`, written for `blob_origin`.
+    ///
+    /// # Errors
+    ///
+    /// A counted blob file whose length cannot be read.
+    pub(crate) fn add(
+        &mut self,
+        tables: &[Table],
+        blob_files: &[crate::BlobFile],
+        table_origin: crate::fs::WriteOrigin,
+        blob_origin: crate::fs::WriteOrigin,
+    ) -> crate::Result<()> {
+        for table in tables {
+            if let Some(stats) = table.fs.write_io_stats() {
+                self.push(stats, table_origin, table.file_len());
+            }
+        }
+        for blob_file in blob_files {
+            if let Some(stats) = blob_file.0.fs.write_io_stats() {
+                self.push(stats, blob_origin, blob_file.physical_size()?);
+            }
+        }
+        Ok(())
     }
-    Ok((tables, blobs))
+
+    fn push(
+        &mut self,
+        stats: &Arc<crate::fs::WriteIoStats>,
+        origin: crate::fs::WriteOrigin,
+        bytes: u64,
+    ) {
+        for (set, slot, sum) in &mut self.0 {
+            if *slot == origin && Arc::ptr_eq(set, stats) {
+                *sum += bytes;
+                return;
+            }
+        }
+        self.0.push((Arc::clone(stats), origin, bytes));
+    }
+
+    /// Records the bytes, once the install that keeps them is published.
+    pub(crate) fn charge(self) {
+        for (stats, origin, bytes) in self.0 {
+            stats.installed(origin, bytes);
+        }
+    }
 }
 
 /// Extract owned user-key bounds from any range.
@@ -1328,8 +1369,13 @@ impl AbstractTree for Tree {
             bf.bind_to_tree(&sinks);
         }
 
-        #[cfg(feature = "metrics")]
-        let installed = installed_bytes(tables, blob_files.unwrap_or(&[]))?;
+        let mut installed = InstalledCharge::default();
+        installed.add(
+            tables,
+            blob_files.unwrap_or(&[]),
+            crate::fs::WriteOrigin::FlushTable,
+            crate::fs::WriteOrigin::FlushBlob,
+        )?;
 
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
@@ -1392,12 +1438,7 @@ impl AbstractTree for Tree {
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
         )?;
-        #[cfg(feature = "metrics")]
-        self.config.charge_installed(
-            installed,
-            crate::fs::WriteOrigin::FlushTable,
-            crate::fs::WriteOrigin::FlushBlob,
-        );
+        installed.charge();
 
         Ok(())
     }
@@ -2086,9 +2127,9 @@ impl AbstractTree for Tree {
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
         let (start, end) = (start.into(), end.into());
         #[cfg(feature = "metrics")]
-        if let Some(stats) = self.config.write_io() {
-            stats.accepted_range_deletion(start.len() + end.len());
-        }
+        self.0
+            .metrics
+            .accepted_range_deletion(start.len() + end.len());
         // The read guard is held through the insert, like `append_entry`: the
         // CDC scan's capture (write side of this lock) must exclude every
         // in-flight memtable write, or a backdated range deletion could land
@@ -4620,18 +4661,10 @@ impl Tree {
         // arrived with, which is what keeps two trees opened from clones of one
         // config from sharing a set.
         #[cfg_attr(
-            not(any(feature = "parallel", zstd_any, feature = "metrics")),
-            expect(
-                unused_mut,
-                reason = "assigned only by the parallel / zstd / metrics builds"
-            )
+            not(any(feature = "parallel", zstd_any)),
+            expect(unused_mut, reason = "assigned only by the parallel / zstd builds")
         )]
         let mut config = config;
-
-        // Everything the tree writes from here on is counted, its own open
-        // included.
-        #[cfg(feature = "metrics")]
-        config.count_writes();
 
         #[cfg(feature = "parallel")]
         if config.compaction_pool.is_none() && config.compaction_threads > 1 {
@@ -5494,13 +5527,11 @@ impl Tree {
     /// and value.
     #[cfg(feature = "metrics")]
     fn accept(&self, value: &InternalValue) {
-        if let Some(stats) = self.config.write_io() {
-            let key = value.key.user_key.len();
-            if value.key.value_type.is_tombstone() {
-                stats.accepted_deletion(key);
-            } else {
-                stats.accepted_value(key + value.value.len());
-            }
+        let key = value.key.user_key.len();
+        if value.key.value_type.is_tombstone() {
+            self.0.metrics.accepted_deletion(key);
+        } else {
+            self.0.metrics.accepted_value(key + value.value.len());
         }
     }
 

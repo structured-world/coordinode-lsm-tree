@@ -214,10 +214,11 @@ matching entry (and add one for a new subsystem).
   `tests/sync_census.rs`).
 
 - **Every file the engine opens for writing names what it is written for.**
-  The open options carry a `WriteOrigin`, so with the `metrics` feature the
-  counting backend a tree wraps around its own charges each byte, write call
-  and sync to one origin and none to `unattributed`; the counters together
-  hold everything the tree wrote, each byte once. A file pool's file is opened
+  The open options carry a `WriteOrigin`, so a counting backend the caller
+  gives the tree charges each byte, write call and sync to one origin and none
+  to `unattributed`; the counters together hold everything the tree wrote,
+  each byte once, and an install records the bytes it kept into the counters
+  of the backend each file was written through. A file pool's file is opened
   for its writer's origin when it is claimed, and the empty files a refill
   makes are metadata. Enforced in `src/fs/counting_fs.rs` and every write-side
   open (tests `tests/write_io.rs`); see [write-ledger.md](write-ledger.md).

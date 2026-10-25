@@ -1247,6 +1247,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.backend_id()
     }
 
+    fn write_io_stats(&self) -> Option<&alloc::sync::Arc<super::WriteIoStats>> {
+        self.inner.write_io_stats()
+    }
+
     fn volume_id(&self, path: &Path) -> Option<u64> {
         if self.injector.check(FaultOp::VolumeId, Some(path)).is_some() {
             return None;

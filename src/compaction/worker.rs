@@ -2360,11 +2360,13 @@ fn run_tight_space_compaction(
             let relocated_bytes = produced.relocated_bytes();
             let carried = produced.carried();
             let installed_work = produced.installed_work()?;
-            #[cfg(feature = "metrics")]
-            let installed_files = {
-                let tables: u64 = outputs.iter().map(Table::file_len).sum();
-                (tables, installed_work.written - tables)
-            };
+            let mut installed_files = crate::tree::InstalledCharge::default();
+            installed_files.add(
+                &outputs,
+                produced.created_blob_files(),
+                crate::fs::WriteOrigin::CompactionTable,
+                crate::fs::WriteOrigin::CompactionBlob,
+            )?;
             drop(produced);
 
             // Serialize each surviving input's suffix-digest capture (inside
@@ -2591,15 +2593,9 @@ fn run_tight_space_compaction(
             // must not remove them.
             opts.outputs.installed();
             opts.work.installed(installed_work);
+            installed_files.charge();
             #[cfg(feature = "metrics")]
-            {
-                super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
-                opts.config.charge_installed(
-                    installed_files,
-                    crate::fs::WriteOrigin::CompactionTable,
-                    crate::fs::WriteOrigin::CompactionBlob,
-                );
-            }
+            super::flavour::charge_installed(&opts.metrics, relocated_bytes, carried);
             #[cfg(not(feature = "metrics"))]
             let _ = (relocated_bytes, carried);
             // The published version counts the outputs' filters now, and the

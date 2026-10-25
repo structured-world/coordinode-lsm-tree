@@ -829,9 +829,7 @@ impl BlobTree {
         // Charged once the row is in: a row refused for a stale reference is
         // written again, and counted, by the retry.
         #[cfg(feature = "metrics")]
-        if let Some(stats) = self.index.config.write_io() {
-            stats.accepted_value(payload);
-        }
+        self.index.0.metrics.accepted_value(payload);
         Ok(written)
     }
 

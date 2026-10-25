@@ -362,7 +362,7 @@ required-features = ["std"]
 name = "write_ledger"
 harness = false
 path = "benches/write_ledger.rs"
-required-features = ["std", "metrics"]
+required-features = ["std"]
 
 [[bench]]
 name = "tight_space_disk"

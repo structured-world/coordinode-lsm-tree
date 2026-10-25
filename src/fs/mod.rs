@@ -57,8 +57,7 @@ mod std_fs;
 
 pub use aligned_buf::AlignedBuf;
 pub use counting_fs::{
-    AcceptedWrites, CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats,
-    WriteOrigin,
+    CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats, WriteOrigin,
 };
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -1730,6 +1729,30 @@ pub trait Fs: Send + Sync + 'static {
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
         self.open(path, &FsOpenOptions::new().write(true))?
             .set_len(0)
+    }
+
+    /// The counters what is written through this backend is counted into,
+    /// when it counts (see [`CountingFs`]): a tree records there the bytes of
+    /// the files it installs on this backend.
+    ///
+    /// # Default implementation
+    ///
+    /// `None`: a backend that counts nothing. A backend wrapping another
+    /// returns the inner one's, so a counting backend under it is still
+    /// found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::{CountingFs, Fs, MemFs};
+    /// use std::sync::Arc;
+    ///
+    /// assert!(MemFs::new().write_io_stats().is_none());
+    /// let counted = CountingFs::new(Arc::new(MemFs::new()));
+    /// assert!(counted.write_io_stats().is_some());
+    /// ```
+    fn write_io_stats(&self) -> Option<&alloc::sync::Arc<WriteIoStats>> {
+        None
     }
 
     /// Number of hard links to the file at `path` (the inode's link count).

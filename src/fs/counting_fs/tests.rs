@@ -207,7 +207,6 @@ fn readings_from_two_lifetimes_have_no_difference() -> crate::io::Result<()> {
 
     let reopened = CountingFs::new(backend).stats().snapshot();
     assert!(reopened.since(&late).is_none(), "the counters started over");
-    assert!(reopened.host_write_amplification().is_none(), "no payload");
     Ok(())
 }
 
@@ -296,6 +295,11 @@ fn what_the_wrapper_hands_on_answers_as_the_backend_does() -> crate::io::Result<
     let reading = fs.stats().snapshot();
     assert_eq!(reading.directory.symlinked, u64::from(link.0));
     assert_eq!(reading.directory.cloned, u64::from(clone));
+    assert_eq!(
+        reading.directory.cloned_bytes,
+        if clone { 4 } else { 0 },
+        "a clone counts the length of what it made, copied or shared"
+    );
     assert_eq!(
         holes,
         (

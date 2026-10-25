@@ -18,8 +18,13 @@
 //! figures are host writes, never NAND writes. A write-ahead log the caller
 //! keeps outside the tree is not written through it and is not counted.
 //!
-//! The counters live as long as the [`WriteIoStats`] they are kept in: a tree
-//! starts its own at open, so a restart starts again from zero.
+//! Counting is the caller's choice, made by giving a tree a `CountingFs` as its
+//! backend and as the backend of its level routes: one set of [`WriteIoStats`]
+//! per physical medium, shared by every tree and route on that medium, a
+//! different set for another medium. A tree given a plain backend counts
+//! nothing and pays nothing for it. The counters live as long as their set,
+//! across the trees that open and close on it; they are kept in memory only,
+//! so a new process starts a new set from zero.
 
 use super::{
     BlockRead, FileHint, Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions,
@@ -204,9 +209,13 @@ pub struct DirectoryWrites {
     pub linked: u64,
     /// Symbolic links made.
     pub symlinked: u64,
-    /// Files cloned. A backend that cannot clone copies inside the call, and
-    /// those bytes are not seen here.
+    /// Files cloned.
     pub cloned: u64,
+    /// The bytes of the files cloned. A backend shares their blocks where it
+    /// can and copies them inside the call where it cannot, which this
+    /// wrapper cannot tell apart: they are outside the files' `bytes`, and
+    /// bound from above what the clones wrote.
+    pub cloned_bytes: u64,
     /// Holes punched into files.
     pub holes_punched: u64,
     /// Files truncated to empty by path.
@@ -229,37 +238,9 @@ impl DirectoryWrites {
             linked: self.linked.checked_sub(earlier.linked)?,
             symlinked: self.symlinked.checked_sub(earlier.symlinked)?,
             cloned: self.cloned.checked_sub(earlier.cloned)?,
+            cloned_bytes: self.cloned_bytes.checked_sub(earlier.cloned_bytes)?,
             holes_punched: self.holes_punched.checked_sub(earlier.holes_punched)?,
             truncated: self.truncated.checked_sub(earlier.truncated)?,
-        })
-    }
-}
-
-/// What a tree took in from its caller, before any encoding: the payload its
-/// writes are measured against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct AcceptedWrites {
-    /// Values written, merge operands included.
-    pub values: u64,
-    /// Point deletions.
-    pub deletions: u64,
-    /// Range deletions.
-    pub range_deletions: u64,
-    /// Records an ingestion took in.
-    pub ingested: u64,
-    /// The bytes of their keys, values, operands and range bounds.
-    pub payload_bytes: u64,
-}
-
-impl AcceptedWrites {
-    fn checked_sub(&self, earlier: &Self) -> Option<Self> {
-        Some(Self {
-            values: self.values.checked_sub(earlier.values)?,
-            deletions: self.deletions.checked_sub(earlier.deletions)?,
-            range_deletions: self.range_deletions.checked_sub(earlier.range_deletions)?,
-            ingested: self.ingested.checked_sub(earlier.ingested)?,
-            payload_bytes: self.payload_bytes.checked_sub(earlier.payload_bytes)?,
         })
     }
 }
@@ -274,8 +255,6 @@ pub struct WriteIoSnapshot {
     pub unattributed: FileWrites,
     /// Directory and device operations.
     pub directory: DirectoryWrites,
-    /// What the tree took in: zero for a backend counted on its own.
-    pub accepted: AcceptedWrites,
     /// The counter set the reading came from (see [`WriteIoStats`]).
     lifetime: u64,
 }
@@ -324,26 +303,12 @@ impl WriteIoSnapshot {
         self.files().syncs + self.directory.syncs + self.directory.device_syncs
     }
 
-    /// The bytes written for each byte of payload taken in: the host write
-    /// amplification of what this reading covers.
-    ///
-    /// `None` when no payload was taken in, as for a backend counted on its
-    /// own, whose writes come from no single tree's payload. It counts the
-    /// bytes handed to the backend, not what a device writes.
-    #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a ratio of byte counts; precision loss past 2^53 bytes is immaterial"
-    )]
-    pub fn host_write_amplification(&self) -> Option<f64> {
-        let payload = self.accepted.payload_bytes;
-        (payload > 0).then(|| self.files().bytes as f64 / payload as f64)
-    }
-
     /// What happened between `earlier` and this reading of the same counters.
     ///
     /// `None` when the readings come from two counter sets, as across a
-    /// reopen, whatever their values: no difference of them means anything.
+    /// restart, whatever their values: no difference of them means anything.
+    /// A difference is an observation of what was written, not a reservation
+    /// of what may be.
     #[must_use]
     pub fn since(&self, earlier: &Self) -> Option<Self> {
         if self.lifetime != earlier.lifetime {
@@ -361,7 +326,6 @@ impl WriteIoSnapshot {
             by_origin,
             unattributed: self.unattributed.checked_sub(&earlier.unattributed)?,
             directory: self.directory.checked_sub(&earlier.directory)?,
-            accepted: self.accepted.checked_sub(&earlier.accepted)?,
             lifetime: self.lifetime,
         })
     }
@@ -435,6 +399,7 @@ struct DirectoryCounters {
     linked: AtomicU64,
     symlinked: AtomicU64,
     cloned: AtomicU64,
+    cloned_bytes: AtomicU64,
     holes_punched: AtomicU64,
     truncated: AtomicU64,
 }
@@ -453,19 +418,11 @@ impl DirectoryCounters {
             linked: self.linked.load(Relaxed),
             symlinked: self.symlinked.load(Relaxed),
             cloned: self.cloned.load(Relaxed),
+            cloned_bytes: self.cloned_bytes.load(Relaxed),
             holes_punched: self.holes_punched.load(Relaxed),
             truncated: self.truncated.load(Relaxed),
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct AcceptedCounters {
-    values: AtomicU64,
-    deletions: AtomicU64,
-    range_deletions: AtomicU64,
-    ingested: AtomicU64,
-    payload_bytes: AtomicU64,
 }
 
 /// The counters a [`CountingFs`] keeps, shared by the files it opens.
@@ -473,12 +430,13 @@ struct AcceptedCounters {
 /// Every counter only grows; [`Self::snapshot`] reads them all, and the
 /// difference of two readings ([`WriteIoSnapshot::since`]) is what happened
 /// in between. Each set is numbered when it is made, and its readings carry
-/// the number, so readings of two sets are never set against each other.
+/// the number, so readings of two sets are never set against each other. The
+/// number tells sets of one process apart only: it names no medium, and a
+/// restart starts the numbering, and every count, again.
 #[derive(Debug)]
 pub struct WriteIoStats {
     files: [FileCounters; WriteOrigin::ALL.len() + 1],
     directory: DirectoryCounters,
-    accepted: AcceptedCounters,
     lifetime: u64,
 }
 
@@ -491,7 +449,6 @@ impl Default for WriteIoStats {
         Self {
             files: Default::default(),
             directory: DirectoryCounters::default(),
-            accepted: AcceptedCounters::default(),
             lifetime: NEXT_LIFETIME.fetch_add(1, Relaxed),
         }
     }
@@ -513,13 +470,6 @@ impl WriteIoStats {
                 .map(FileCounters::read)
                 .unwrap_or_default(),
             directory: self.directory.read(),
-            accepted: AcceptedWrites {
-                values: self.accepted.values.load(Relaxed),
-                deletions: self.accepted.deletions.load(Relaxed),
-                range_deletions: self.accepted.range_deletions.load(Relaxed),
-                ingested: self.accepted.ingested.load(Relaxed),
-                payload_bytes: self.accepted.payload_bytes.load(Relaxed),
-            },
             lifetime: self.lifetime,
         }
     }
@@ -528,44 +478,12 @@ impl WriteIoStats {
         self.files
             .get(origin.map_or(UNATTRIBUTED, WriteOrigin::slot))
     }
-}
 
-/// What a tree charges to its own counters besides what passes its backend.
-#[cfg(feature = "metrics")]
-impl WriteIoStats {
     /// Records `bytes` of `origin`'s files installed.
     pub(crate) fn installed(&self, origin: WriteOrigin, bytes: u64) {
         if let Some(counters) = self.slot(Some(origin)) {
             counters.installed.fetch_add(bytes, Relaxed);
         }
-    }
-
-    /// Records a value of `payload` bytes, key included, taken in.
-    pub(crate) fn accepted_value(&self, payload: usize) {
-        self.accepted.values.fetch_add(1, Relaxed);
-        self.accepted
-            .payload_bytes
-            .fetch_add(payload as u64, Relaxed);
-    }
-
-    /// Records a point deletion of a `key` bytes long key taken in.
-    pub(crate) fn accepted_deletion(&self, key: usize) {
-        self.accepted.deletions.fetch_add(1, Relaxed);
-        self.accepted.payload_bytes.fetch_add(key as u64, Relaxed);
-    }
-
-    /// Records a range deletion of `bounds` bytes of bounds taken in.
-    pub(crate) fn accepted_range_deletion(&self, bounds: usize) {
-        self.accepted.range_deletions.fetch_add(1, Relaxed);
-        self.accepted
-            .payload_bytes
-            .fetch_add(bounds as u64, Relaxed);
-    }
-
-    /// Records `records` ingested records of `payload` bytes taken in.
-    pub(crate) fn accepted_ingestion(&self, records: u64, payload: u64) {
-        self.accepted.ingested.fetch_add(records, Relaxed);
-        self.accepted.payload_bytes.fetch_add(payload, Relaxed);
     }
 }
 
@@ -573,8 +491,11 @@ impl WriteIoStats {
 ///
 /// Every operation is passed to the backend it wraps unchanged; a file opened
 /// only for reading is the backend's own handle, so reads cost nothing more.
-/// One wrapped around a backend several trees share counts them all; a tree
-/// counts its own writes the same way with the `metrics` feature.
+/// Give one to every tree and level route on a physical medium, all counting
+/// into the same set (see [`Self::with_stats`]), and another to those on
+/// another medium: a tree records what its installs keep into the set of the
+/// backend each file was written through. Wrap a backend once: a `CountingFs`
+/// around another counts every write into both.
 ///
 /// # Examples
 ///
@@ -798,10 +719,18 @@ impl Fs for CountingFs {
     }
 
     fn reflink_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        Self::count(
-            &self.stats.directory.cloned,
-            self.inner.reflink_file(src, dst),
-        )
+        self.inner.reflink_file(src, dst)?;
+        self.stats.directory.cloned.fetch_add(1, Relaxed);
+        // What the clone may have copied: the backend does not say whether it
+        // shared the blocks. A clone whose length cannot be read is counted
+        // without it, the call itself having succeeded.
+        if let Ok(metadata) = self.inner.metadata(dst) {
+            self.stats
+                .directory
+                .cloned_bytes
+                .fetch_add(metadata.len, Relaxed);
+        }
+        Ok(())
     }
 
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
@@ -809,6 +738,10 @@ impl Fs for CountingFs {
             &self.stats.directory.truncated,
             self.inner.truncate_file(path),
         )
+    }
+
+    fn write_io_stats(&self) -> Option<&Arc<WriteIoStats>> {
+        Some(&self.stats)
     }
 
     fn hard_link_count(&self, path: &Path) -> io::Result<u64> {

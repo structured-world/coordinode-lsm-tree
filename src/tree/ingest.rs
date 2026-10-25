@@ -356,9 +356,7 @@ impl<'a> Ingestion<'a> {
     /// tree's writes are measured against.
     #[cfg(feature = "metrics")]
     pub(crate) fn accept(&self, records: u64, payload: u64) {
-        if let Some(stats) = self.tree.config.write_io() {
-            stats.accepted_ingestion(records, payload);
-        }
+        self.tree.0.metrics.accepted_ingestion(records, payload);
     }
 
     /// Writes a tombstone for a key.
@@ -689,8 +687,13 @@ impl<'a> Ingestion<'a> {
         // We use upgrade_version_with_seqno (instead of upgrade_version) because
         // we need precise control over the seqno: it must match the seqno we
         // already assigned to the recovered tables.
-        #[cfg(feature = "metrics")]
-        let installed = crate::tree::installed_bytes(&created_tables, &[])?;
+        let mut installed = crate::tree::InstalledCharge::default();
+        installed.add(
+            &created_tables,
+            &[],
+            crate::fs::WriteOrigin::IngestTable,
+            crate::fs::WriteOrigin::IngestBlob,
+        )?;
         version_lock.upgrade_version_with_seqno(
             &self.tree.config.path,
             |current| {
@@ -710,12 +713,7 @@ impl<'a> Ingestion<'a> {
             // Ingestion only adds tables: older snapshots keep everything.
             crate::version::RetentionEffect::Keep,
         )?;
-        #[cfg(feature = "metrics")]
-        self.tree.config.charge_installed(
-            installed,
-            crate::fs::WriteOrigin::IngestTable,
-            crate::fs::WriteOrigin::IngestBlob,
-        );
+        installed.charge();
         // The installed tables name their dictionary from here on.
         drop(write_pin);
 

@@ -1093,45 +1093,6 @@ pub trait AbstractTree: sealed::Sealed {
     #[cfg(feature = "metrics")]
     fn cache_stats(&self) -> crate::CacheStats;
 
-    /// What the tree has written to its backends since it was opened, by what
-    /// each file was written for, with the payload it took in from its caller:
-    /// the host-write ledger a write budget or a wear estimate is kept from.
-    ///
-    /// Counts begin at the open, so a reopen starts them again from zero;
-    /// [`WriteIoSnapshot::since`](crate::fs::WriteIoSnapshot::since) of a
-    /// reading taken before it is `None`. A write-ahead log the caller keeps
-    /// outside the tree is not in it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use lsm_tree::fs::{MemFs, WriteOrigin};
-    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
-    ///
-    /// let tree = Config::new(
-    ///     "/db",
-    ///     SequenceNumberCounter::default(),
-    ///     SequenceNumberCounter::default(),
-    /// )
-    /// .with_fs(MemFs::new())
-    /// .open()?;
-    /// tree.insert("key", "value", 0);
-    /// tree.flush_active_memtable(0)?;
-    ///
-    /// let written = tree.write_io();
-    /// assert_eq!(written.accepted.payload_bytes, 8);
-    /// assert!(written.origin(WriteOrigin::FlushTable).bytes > 0);
-    /// assert_eq!(written.unattributed.bytes, 0);
-    /// # Ok::<(), lsm_tree::Error>(())
-    /// ```
-    #[cfg(feature = "metrics")]
-    fn write_io(&self) -> crate::fs::WriteIoSnapshot {
-        self.tree_config()
-            .write_io()
-            .map(|stats| stats.snapshot())
-            .unwrap_or_default()
-    }
-
     /// Acquires the flush lock which is required to call [`Tree::flush`](crate::Tree::flush).
     fn get_flush_lock(&self) -> FlushGuard<'_>;
 

@@ -868,17 +868,15 @@ pub(super) fn install_merge(
     let mut released_objects = Vec::new();
     let mut carried = (0u64, 0u64, 0u64);
     let mut work = super::work::Installed::default();
-    // The installed bytes of the tables and of the blob files, apart.
-    #[cfg(feature = "metrics")]
-    let mut installed_files = (0u64, 0u64);
+    let mut installed_files = crate::tree::InstalledCharge::default();
     for out in outputs {
         let installed = out.installed_work()?;
-        #[cfg(feature = "metrics")]
-        {
-            let tables: u64 = out.created_tables.iter().map(Table::file_len).sum();
-            installed_files.0 += tables;
-            installed_files.1 += installed.written - tables;
-        }
+        installed_files.add(
+            &out.created_tables,
+            &out.created_blob_files,
+            crate::fs::WriteOrigin::CompactionTable,
+            crate::fs::WriteOrigin::CompactionBlob,
+        )?;
         work.written += installed.written;
         work.carried += installed.carried;
         work.read += installed.read;
@@ -1062,15 +1060,9 @@ pub(super) fn install_merge(
             .released()
             .record(published, released_objects, []);
     }
+    installed_files.charge();
     #[cfg(feature = "metrics")]
-    {
-        charge_installed(&opts.metrics, relocated_bytes, carried);
-        opts.config.charge_installed(
-            installed_files,
-            crate::fs::WriteOrigin::CompactionTable,
-            crate::fs::WriteOrigin::CompactionBlob,
-        );
-    }
+    charge_installed(&opts.metrics, relocated_bytes, carried);
     #[cfg(not(feature = "metrics"))]
     let _ = (relocated_bytes, carried);
 

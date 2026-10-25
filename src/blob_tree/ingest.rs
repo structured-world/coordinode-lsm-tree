@@ -427,8 +427,13 @@ impl<'a> BlobIngestion<'a> {
         // We use upgrade_version_with_seqno (instead of upgrade_version) because
         // we need precise control over the seqno: it must match the seqno we
         // already assigned to the recovered tables.
-        #[cfg(feature = "metrics")]
-        let installed = crate::tree::installed_bytes(&created_tables, &blob_files)?;
+        let mut installed = crate::tree::InstalledCharge::default();
+        installed.add(
+            &created_tables,
+            &blob_files,
+            crate::fs::WriteOrigin::IngestTable,
+            crate::fs::WriteOrigin::IngestBlob,
+        )?;
         version_lock.upgrade_version_with_seqno(
             &index.config.path,
             |current| {
@@ -448,12 +453,7 @@ impl<'a> BlobIngestion<'a> {
             // everything.
             crate::version::RetentionEffect::Keep,
         )?;
-        #[cfg(feature = "metrics")]
-        index.config.charge_installed(
-            installed,
-            crate::fs::WriteOrigin::IngestTable,
-            crate::fs::WriteOrigin::IngestBlob,
-        );
+        installed.charge();
         // The installed files name their dictionaries from here on.
         drop(write_pin);
 

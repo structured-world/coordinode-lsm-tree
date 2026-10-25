@@ -15,8 +15,9 @@
 //!   before it and compaction merges them, and an hour goes under one range
 //!   tombstone per sensor.
 //!
-//! Per order it prints the tree's [`write_io`](lsm_tree::AbstractTree::write_io)
-//! by origin, with the payload and the host write amplification, and one
+//! The tree writes through a [`CountingFs`] over the real filesystem. Per
+//! order it prints that backend's counters by origin, with the payload the
+//! run inserted and the host write amplification, and one
 //! `ledger,<order>,<origin>,<field>,<value>` line per counter for a replay
 //! harness to read. On Linux it also reads `/proc/self/io` around the run:
 //! `wchar` and `syscw`, the bytes and calls the process handed to `write`
@@ -25,9 +26,29 @@
 //! runs one order only.
 
 use lsm_tree::compaction::{CompactionAction, Leveled};
-use lsm_tree::fs::{WriteIoSnapshot, WriteOrigin};
+use lsm_tree::fs::{CountingFs, StdFs, WriteIoSnapshot, WriteOrigin};
 use lsm_tree::{AbstractTree, AnyTree, Config, SeqNo, SequenceNumberCounter};
 use std::sync::Arc;
+
+/// What the run inserted: the denominator of host write amplification.
+#[derive(Default)]
+struct Payload {
+    values: u64,
+    range_deletions: u64,
+    bytes: u64,
+}
+
+impl Payload {
+    fn value(&mut self, key: &[u8], value: &[u8]) {
+        self.values += 1;
+        self.bytes += (key.len() + value.len()) as u64;
+    }
+
+    fn range_deletion(&mut self, start: &[u8], end: &[u8]) {
+        self.range_deletions += 1;
+        self.bytes += (start.len() + end.len()) as u64;
+    }
+}
 
 const SENSORS: u32 = 64;
 const HOURS: u64 = 6;
@@ -58,24 +79,30 @@ impl Order {
     }
 
     /// Deletes the readings of `hour` with range tombstones.
-    fn expire(self, tree: &AnyTree, hour: u64, seqno: &SequenceNumberCounter) {
+    fn expire(
+        self,
+        tree: &AnyTree,
+        hour: u64,
+        seqno: &SequenceNumberCounter,
+        payload: &mut Payload,
+    ) {
         let (start, end) = (
             (hour * 3_600).to_be_bytes(),
             ((hour + 1) * 3_600).to_be_bytes(),
         );
         match self {
             Self::Time => {
+                payload.range_deletion(&start, &end);
                 tree.remove_range(start.to_vec(), end.to_vec(), seqno.next());
             }
             Self::Sensor => {
                 let seqno = seqno.next();
                 for sensor in 0..SENSORS {
                     let sensor = sensor.to_be_bytes();
-                    tree.remove_range(
-                        [&sensor[..], &start[..]].concat(),
-                        [&sensor[..], &end[..]].concat(),
-                        seqno,
-                    );
+                    let start = [&sensor[..], &start[..]].concat();
+                    let end = [&sensor[..], &end[..]].concat();
+                    payload.range_deletion(&start, &end);
+                    tree.remove_range(start, end, seqno);
                 }
             }
         }
@@ -109,7 +136,7 @@ fn proc_io() -> std::collections::BTreeMap<String, u64> {
         .collect()
 }
 
-fn print(order: Order, reading: &WriteIoSnapshot) {
+fn print(order: Order, reading: &WriteIoSnapshot, payload: &Payload) {
     let mib = |b: u64| b as f64 / (1_024.0 * 1_024.0);
     println!(
         "{:<18} {:>11} {:>9} {:>8} {:>8} {:>13}",
@@ -150,14 +177,14 @@ fn print(order: Order, reading: &WriteIoSnapshot) {
     println!(
         "\npayload {:.2} MiB in {} values and {} range deletions; written {:.2} MiB in {} calls, \
          {} syncs, {} writebacks started; host write amplification {:.2}",
-        mib(reading.accepted.payload_bytes),
-        reading.accepted.values,
-        reading.accepted.range_deletions,
+        mib(payload.bytes),
+        payload.values,
+        payload.range_deletions,
         mib(files.bytes),
         files.writes,
         reading.syncs(),
         files.writebacks,
-        reading.host_write_amplification().unwrap_or(f64::NAN),
+        files.bytes as f64 / payload.bytes as f64,
     );
 
     let order = order.name();
@@ -188,14 +215,12 @@ fn print(order: Order, reading: &WriteIoSnapshot) {
         ("removed", directory.removed),
         ("linked", directory.linked),
         ("cloned", directory.cloned),
+        ("cloned_bytes", directory.cloned_bytes),
         ("holes_punched", directory.holes_punched),
     ] {
         println!("ledger,{order},directory,{field},{value}");
     }
-    println!(
-        "ledger,{order},accepted,payload_bytes,{}",
-        reading.accepted.payload_bytes
-    );
+    println!("ledger,{order},accepted,payload_bytes,{}", payload.bytes);
 }
 
 fn run(order: Order) -> lsm_tree::Result<()> {
@@ -204,7 +229,12 @@ fn run(order: Order) -> lsm_tree::Result<()> {
     #[cfg(target_os = "linux")]
     let before = proc_io();
 
-    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default()).open()?;
+    let fs = CountingFs::new(Arc::new(StdFs));
+    let stats = Arc::clone(fs.stats());
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default())
+        .with_shared_fs(Arc::new(fs))
+        .open()?;
+    let mut payload = Payload::default();
     let strategy = Arc::new(Leveled::default());
     let settle = |tree: &AnyTree| -> lsm_tree::Result<()> {
         tree.flush_active_memtable(seqno.get())?;
@@ -213,11 +243,9 @@ fn run(order: Order) -> lsm_tree::Result<()> {
     };
     for second in 0..HOURS * 3_600 {
         for sensor in 0..SENSORS {
-            tree.insert(
-                order.key(second, sensor),
-                reading(second, sensor),
-                seqno.next(),
-            );
+            let (key, value) = (order.key(second, sensor), reading(second, sensor));
+            payload.value(&key, &value);
+            tree.insert(key, value, seqno.next());
         }
         if (second + 1) % FLUSH_EVERY_SECONDS == 0 {
             settle(&tree)?;
@@ -227,11 +255,11 @@ fn run(order: Order) -> lsm_tree::Result<()> {
         if (second + 1) % 3_600 == 0
             && let Some(expired) = ((second + 1) / 3_600).checked_sub(RETENTION_HOURS + 1)
         {
-            order.expire(&tree, expired, &seqno);
+            order.expire(&tree, expired, &seqno, &mut payload);
             settle(&tree)?;
         }
     }
-    let reading = tree.write_io();
+    let reading = stats.snapshot();
     // Read before anything is printed: the process's own output is a write
     // too.
     #[cfg(target_os = "linux")]
@@ -244,7 +272,7 @@ fn run(order: Order) -> lsm_tree::Result<()> {
          {RETENTION_HOURS} h retained ({rows} rows left)\n",
         order.name(),
     );
-    print(order, &reading);
+    print(order, &reading, &payload);
 
     #[cfg(target_os = "linux")]
     {
