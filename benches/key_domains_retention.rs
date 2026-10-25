@@ -16,8 +16,8 @@
 //!
 //! Per layout it prints the bytes the process wrote (`/proc/self/io`, the
 //! filesystem's view, not the device's), the allocated bytes at their peak
-//! and at the end, the tables, open descriptors and resident memory at the
-//! end, the time to reopen, and the wall time. It checks that every retained
+//! and at the end, the tables and open descriptors at the end, the time to
+//! reopen, and the wall time. It checks that every retained
 //! row reads back and no expired one does.
 //!
 //! Linux only: the counters come from `/proc`.
@@ -151,10 +151,6 @@ mod cases {
 
     fn written_bytes() -> u64 {
         proc_field("io", "write_bytes:")
-    }
-
-    fn rss_kib() -> u64 {
-        proc_field("status", "VmRSS:")
     }
 
     fn open_fds() -> usize {
@@ -311,7 +307,6 @@ mod cases {
         end: u64,
         tables: usize,
         fds: usize,
-        rss_kib: u64,
         reopen_ms: f64,
         wall_s: f64,
     }
@@ -357,7 +352,6 @@ mod cases {
         let end = allocated(dir.path());
         let tables = store.tables();
         let fds = open_fds() - fds_before;
-        let rss_kib = rss_kib();
 
         // Every retained row, and none of an expired epoch.
         let first_kept = case.epochs.saturating_sub(case.retention + 1);
@@ -403,7 +397,6 @@ mod cases {
             end,
             tables,
             fds,
-            rss_kib,
             reopen_ms,
             wall_s,
         })
@@ -427,7 +420,7 @@ mod cases {
                 mib(payload),
             );
             println!(
-                "{:<18} {:>11} {:>8} {:>10} {:>9} {:>7} {:>5} {:>8} {:>10} {:>7}",
+                "{:<18} {:>11} {:>8} {:>10} {:>9} {:>7} {:>5} {:>10} {:>7}",
                 "layout",
                 "written MiB",
                 "WA",
@@ -435,7 +428,6 @@ mod cases {
                 "end MiB",
                 "tables",
                 "fds",
-                "rss MiB",
                 "reopen ms",
                 "wall s",
             );
@@ -449,7 +441,7 @@ mod cases {
                 }
                 let o = run_case(case, layout)?;
                 println!(
-                    "{:<18} {:>11.1} {:>8.2} {:>10.1} {:>9.1} {:>7} {:>5} {:>8.1} {:>10.1} {:>7.2}",
+                    "{:<18} {:>11.1} {:>8.2} {:>10.1} {:>9.1} {:>7} {:>5} {:>10.1} {:>7.2}",
                     layout.name(),
                     mib(o.written),
                     o.written as f64 / payload as f64,
@@ -457,7 +449,6 @@ mod cases {
                     mib(o.end),
                     o.tables,
                     o.fds,
-                    o.rss_kib as f64 / 1_024.0,
                     o.reopen_ms,
                     o.wall_s,
                 );
