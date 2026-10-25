@@ -251,10 +251,13 @@ fn a_domain_larger_than_the_target_splits_by_size_within_it() -> lsm_tree::Resul
     Ok(())
 }
 
-/// The epochs of the rows each table holds, for the tables holding rows: a
-/// table of range tombstones alone may span epochs with no row in it.
-fn row_epochs(tree: &AnyTree) -> lsm_tree::Result<Vec<Vec<u32>>> {
-    let mut tables = Vec::new();
+/// The tables holding rows that reach past their rows' epoch: rows of two
+/// epochs, or a key range, widened to the range tombstones a table holds,
+/// that starts in another epoch or ends past the next one's first key. Such a
+/// table is not removed whole when its epoch expires. A table of range
+/// tombstones alone may span epochs with no row in it.
+fn tables_past_their_epoch(tree: &AnyTree) -> lsm_tree::Result<Vec<String>> {
+    let mut found = Vec::new();
     for table in tree.current_version().iter_tables() {
         let mut epochs = Vec::new();
         for item in table.iter() {
@@ -264,19 +267,32 @@ fn row_epochs(tree: &AnyTree) -> lsm_tree::Result<Vec<Vec<u32>>> {
             }
         }
         epochs.dedup();
-        if !epochs.is_empty() {
-            tables.push(epochs);
+        let range = &table.metadata.key_range;
+        let (min, max) = (range.min().to_vec(), range.max().to_vec());
+        let within = match epochs.as_slice() {
+            [] => true,
+            [epoch] => {
+                epoch_of(&min) == *epoch
+                    && (epoch_of(&max) == *epoch || max == (epoch + 1).to_be_bytes())
+            }
+            _ => false,
+        };
+        if !within {
+            found.push(format!(
+                "rows of epochs {epochs:?} in key range {min:?}..={max:?}"
+            ));
         }
     }
-    Ok(tables)
+    Ok(found)
 }
 
 /// A range tombstone across several epochs, flushed with rows of some of
-/// them, keeps each table's rows in one epoch: its pieces past an epoch go
-/// to tables of tombstones alone. Rows older than it stay deleted, newer
-/// ones read back.
+/// them, leaves every table holding rows within its rows' epoch: a flush
+/// widens a table's key range to the pieces it holds, so the pieces past an
+/// epoch go to tables of tombstones alone. Rows older than it stay deleted,
+/// newer ones read back.
 #[test]
-fn a_flushed_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()> {
+fn a_flushed_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
     for epoch in [1, 3] {
@@ -291,11 +307,8 @@ fn a_flushed_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()>
     }
     tree.flush_active_memtable(0)?;
 
-    let tables = row_epochs(&tree)?;
-    assert!(
-        tables.iter().all(|epochs| epochs.len() == 1),
-        "a table's rows span epochs: {tables:?}",
-    );
+    let past = tables_past_their_epoch(&tree)?;
+    assert!(past.is_empty(), "{past:#?}");
     let rows = latest(&tree)?;
     assert_eq!(
         rows,
@@ -311,10 +324,10 @@ fn a_flushed_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()>
 }
 
 /// The same through compaction, with the tombstone kept (a watermark of 0)
-/// and a later epoch's rows in the merge: every compacted table holds rows
-/// of one epoch, and the deleted rows stay deleted.
+/// and a later epoch's rows in the merge: every compacted table holding rows
+/// stays within their epoch, and the deleted rows stay deleted.
 #[test]
-fn a_compacted_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<()> {
+fn a_compacted_tombstone_across_domains_keeps_tables_in_their_epoch() -> lsm_tree::Result<()> {
     let folder = tempfile::tempdir()?;
     let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
     for epoch in 0..5 {
@@ -331,11 +344,8 @@ fn a_compacted_tombstone_across_domains_keeps_rows_apart() -> lsm_tree::Result<(
     tree.flush_active_memtable(0)?;
     tree.major_compact(u64::MAX, 0)?;
 
-    let tables = row_epochs(&tree)?;
-    assert!(
-        tables.iter().all(|epochs| epochs.len() == 1),
-        "a table's rows span epochs: {tables:?}",
-    );
+    let past = tables_past_their_epoch(&tree)?;
+    assert!(past.is_empty(), "{past:#?}");
     let deleted = |e: u32, i: u32| (e, i) >= (1, 10) && (e, i) < (3, 10);
     let rows = latest(&tree)?;
     let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..6)
