@@ -2582,6 +2582,85 @@ fn punch_failures_leave_a_classifiable_pattern() -> crate::Result<()> {
     Ok(())
 }
 
+/// A prefix that ends in the block straddling a chunk edge must still leave a
+/// classifiable pattern when only its first punch call lands: that call must
+/// zero whole blocks, so the intact consumed blocks below it read as the
+/// irregular signature. A call cut at the chunk edge would zero only that
+/// block's tail, leave no zeroed block at all, and the table would read as
+/// unpunched with one damaged block: salvage would republish every consumed
+/// row the failed calls left intact.
+#[test]
+#[expect(clippy::expect_used, reason = "test code")]
+fn a_punch_stopped_after_a_block_tail_stays_classifiable() -> crate::Result<()> {
+    use crate::fs::{Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
+    use crate::io::ErrorKind;
+    use crate::{Config, InternalValue, SequenceNumberCounter, ValueType};
+    use std::sync::Arc;
+
+    let memfs = Arc::new(MemFs::new());
+    let faultfs = FaultFs::new(memfs.as_ref().clone());
+    let injector = faultfs.injector();
+    let fs: Arc<dyn Fs> = Arc::new(faultfs);
+    let root = std::path::absolute("/db")?;
+    let tables = root.join("tables");
+    fs.create_dir_all(&tables)?;
+    let sst = tables.join("0");
+    let mut w = crate::table::Writer::new(sst.clone(), 0, 0, Arc::clone(&fs))?;
+    for i in 0..100_000u32 {
+        w.write(InternalValue::from_components(
+            format!("k{i:06}").into_bytes(),
+            [b'v'; 120],
+            u64::from(i) + 1,
+            ValueType::Value,
+        ))?;
+    }
+    assert!(w.finish()?.is_some(), "the SST is non-empty");
+
+    let table = recover_sst(sst, &fs)?;
+    // The prefix ends with the block that straddles the first chunk edge
+    // strictly inside a block, so the top chunk holds only that block's tail.
+    let chunk = crate::table::PUNCH_CHUNK;
+    let mut committed = None;
+    for handle in table.maintenance_index_walk() {
+        let handle = handle?;
+        let (start, end) = (
+            handle.offset().0,
+            handle.offset().0 + u64::from(handle.size()),
+        );
+        if (start / chunk + 1) * chunk < end {
+            committed = Some(end);
+            break;
+        }
+    }
+    let committed = committed.expect("precondition: a block straddles a chunk edge");
+    table.mark_punch_on_drop(committed);
+    // Only the first call lands; every one below it fails.
+    injector.arm(FaultRule::new(FaultOp::PunchHole, Fault::Error(ErrorKind::Other)).skip(1));
+    drop(table);
+    injector.clear();
+
+    let report = Config::new(
+        &root,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_fs(memfs.as_ref().clone())
+    .repair_with_salvage(true)?;
+    assert_eq!(
+        report.recovered, 0,
+        "a stopped punch must be set aside, not salvaged unrestricted: {report:?}",
+    );
+    assert!(
+        report
+            .unreadable_files
+            .first()
+            .is_some_and(|(_, reason)| reason.contains("punch failures")),
+        "{:?}",
+        report.unreadable_files,
+    );
+    Ok(())
+}
+
 /// The resurrection flag is an INPUT to the run that reads the damaged file, not
 /// a state machine spread across runs. On the same inputs, a resurrection repair
 /// keeps an irregularly punched SST's readable region; the default repair, which

@@ -2537,22 +2537,13 @@ fn run_tight_space_compaction(
             let published = crate::restrict_bound::write_many(&writes, opts.config.sync_mode);
             drop(writes);
             for ((view, bound), result) in restricted.into_iter().zip(published) {
-                match result {
-                    Ok(()) => match view.punch_offset_for(bound) {
-                        Ok(off) => view.mark_punch_on_drop(off),
-                        // Post-commit, so a punch-offset lookup failure is non-fatal,
-                        // exactly like the sidecar-write failure below: the restriction
-                        // is already durable (manifest + sidecar), so leave the input
-                        // unpunched and let a later compaction reclaim it. Propagating
-                        // `?` here would abort an already-committed slice.
-                        Err(e) => log::error!(
-                            "tight-space could not resolve the punch offset for table \
-                                 {} after committing its restriction: {e}; leaving the input \
-                                 unpunched, a later compaction reclaims it",
-                            view.id(),
-                        ),
-                    },
-                    // On a LATER slice of the same input, this failure leaves
+                // A failed sidecar write and a failed punch-offset lookup end the
+                // same way. Both are post-commit, so neither is fatal: propagating
+                // `?` here would abort an already-committed slice. The input is
+                // left unpunched and a later compaction reclaims it.
+                match result.and_then(|()| view.punch_offset_for(bound)) {
+                    Ok(off) => view.mark_punch_on_drop(off),
+                    // On a LATER slice of the same input, a sidecar failure leaves
                     // the PREVIOUS slice's sidecar in place — valid but
                     // stale (a lower bound). Deliberately left there: a
                     // manifest-loss repair before the next open then
@@ -2570,9 +2561,9 @@ fn run_tight_space_compaction(
                     // open replaces a DISAGREEING sidecar from the
                     // manifest's bound, which closes this window.
                     Err(e) => log::error!(
-                        "tight-space could not write the restrict-bound sidecar for \
-                             table {} after committing its restriction: {e}; leaving the \
-                             input unpunched, a later compaction rewrites it",
+                        "tight-space could not arm the prefix punch of table {} after \
+                         committing its restriction: {e}; leaving the input unpunched, \
+                         a later compaction rewrites it",
                         view.id(),
                     ),
                 }

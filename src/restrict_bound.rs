@@ -136,6 +136,16 @@ pub fn write(
     bound: &[u8],
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
+    let content = encode(encryption, table_id, bound)?;
+    publish_raw(fs, table_path, &content, sync_mode)
+}
+
+/// The on-disk bytes of the sidecar for `table_id` restricted at `bound`.
+fn encode(
+    encryption: Option<&dyn EncryptionProvider>,
+    table_id: u64,
+    bound: &[u8],
+) -> crate::Result<Vec<u8>> {
     // A bound is a user key, at most `u16::MAX` bytes. `read` rejects a sidecar
     // whose payload exceeds that limit as corrupt, so reject an oversized bound
     // HERE rather than publishing a sidecar a later repair would read as corrupt,
@@ -146,11 +156,10 @@ pub fn write(
         ));
     }
     let plain = serialize(table_id, bound);
-    let content = match encryption {
-        Some(enc) => enc.encrypt(&plain)?,
-        None => plain,
-    };
-    publish_raw(fs, table_path, &content, sync_mode)
+    match encryption {
+        Some(enc) => Ok(enc.encrypt(&plain)?),
+        None => Ok(plain),
+    }
 }
 
 /// Atomically publishes already-encoded sidecar `content` beside `table_path`
@@ -194,18 +203,7 @@ pub(crate) fn write_many(
 ) -> Vec<crate::Result<()>> {
     let encoded: Vec<crate::Result<Vec<u8>>> = writes
         .iter()
-        .map(|w| {
-            if w.bound.len() > u16::MAX as usize {
-                return Err(crate::Error::InvalidHeader(
-                    "restriction bound exceeds the maximum key length",
-                ));
-            }
-            let plain = serialize(w.table_id, w.bound);
-            match w.encryption {
-                Some(enc) => Ok(enc.encrypt(&plain)?),
-                None => Ok(plain),
-            }
-        })
+        .map(|w| encode(w.encryption, w.table_id, w.bound))
         .collect();
     // One publish per encoded sidecar, in order.
     let published = {
@@ -277,12 +275,9 @@ fn publish_many(items: &[(&dyn Fs, &Path, &[u8])], sync_mode: SyncMode) -> Vec<c
     // Each folder once, on the backend that holds it, with how its sync ended.
     let mut synced: Vec<FolderSync<'_>> = Vec::new();
     for (result, &(fs, table_path, _)) in results.iter_mut().zip(items) {
-        let Some(parent) = table_path.parent() else {
+        let Some(parent) = table_path.parent().filter(|_| result.is_ok()) else {
             continue;
         };
-        if result.is_err() {
-            continue;
-        }
         let failure = if let Some(seen) = synced
             .iter()
             .find(|seen| core::ptr::addr_eq(seen.fs, fs) && seen.folder == parent)

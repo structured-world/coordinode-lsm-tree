@@ -5537,8 +5537,8 @@ impl Table {
     /// transparent compression an ordinary, fully-written file already reports
     /// fewer physical bytes than its length), and the run is asked whether it
     /// CONTAINS a hole rather than whether it wholly IS one: the reclaim
-    /// punches at unaligned extents (the prefix ends mid-page, and a chunk or a
-    /// block edge need not fall on a page of this filesystem), and the
+    /// punches at unaligned extents (the prefix ends mid-page, and a block
+    /// edge between two calls need not fall on a page of this filesystem), and the
     /// filesystem deallocates only the wholly-contained pages while
     /// zero-filling the edges, so a whole-extent probe would reject genuine
     /// punches.

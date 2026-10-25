@@ -163,7 +163,7 @@ fn successive_blob_views_punch_only_above_what_the_last_one_finished() -> crate:
     drop(second);
     drop(third);
 
-    let punches = injector.punches_for("blobs/0");
+    let punches = injector.punches_for(&path.to_string_lossy());
     let floor = f1 - f1 % crate::table::PUNCH_ALIGN;
     let [(first_start, first_len), (second_start, second_len)] = punches[..] else {
         panic!("one punch per view: {punches:?}");

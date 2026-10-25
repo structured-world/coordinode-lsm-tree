@@ -350,31 +350,31 @@ required-features = []
 name = "tight_space"
 harness = false
 path = "benches/tight_space.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "tight_space_disk"
 harness = false
 path = "benches/tight_space_disk.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "blob_scan_prefetch"
 harness = false
 path = "benches/blob_scan_prefetch.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "blob_locality"
 harness = false
 path = "benches/blob_locality.rs"
-required-features = ["metrics"]
+required-features = ["std", "metrics"]
 
 [[bench]]
 name = "filter_advisor"
 harness = false
 path = "benches/filter_advisor.rs"
-required-features = ["metrics"]
+required-features = ["std", "metrics"]
 
 [[bench]]
 name = "dict_ratio"
@@ -398,19 +398,19 @@ required-features = []
 name = "index_block"
 harness = false
 path = "benches/index_block.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "block_cache"
 harness = false
 path = "benches/block_cache.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "batch_ops"
 harness = false
 path = "benches/batch_ops.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "io_uring_multi_get"
@@ -446,13 +446,13 @@ required-features = []
 name = "open_many"
 harness = false
 path = "benches/open_many.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "multi_get_metadata_budget"
 harness = false
 path = "benches/multi_get_metadata_budget.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "zstd_dict"
@@ -508,31 +508,31 @@ required-features = ["zstd"]
 name = "scan_split"
 harness = false
 path = "benches/scan_split.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "scan_since"
 harness = false
 path = "benches/scan_since.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "columnar"
 harness = false
 path = "benches/columnar.rs"
-required-features = ["columnar"]
+required-features = ["std", "columnar"]
 
 [[bench]]
 name = "at_insert"
 harness = false
 path = "benches/at_insert.rs"
-required-features = []
+required-features = ["std"]
 
 [[bench]]
 name = "range_reclaim"
 harness = false
 path = "benches/range_reclaim.rs"
-required-features = []
+required-features = ["std"]
 
 # Deterministic code layout for anything measured: with the default 16
 # codegen units and no LTO, ANY code change reshuffles function placement and

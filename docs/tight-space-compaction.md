@@ -53,10 +53,12 @@ slice `[lower, boundary)`:
    for its own sidecar to be durable.
 4. **Punch** the consumed data blocks of each restricted input (the bytes below
    the boundary), reclaiming their space while leaving the file in place for the
-   restricted view that still serves the suffix. The blocks are punched as
-   contiguous spans cut at 4 MiB edges, highest first, not one call per block:
-   a filesystem frees only the pages wholly inside one call, so blocks of about
-   a page punched one by one would keep nearly every page allocated. Each slice
+   restricted view that still serves the suffix. The blocks are punched in
+   calls of adjacent whole blocks up to about 4 MiB each, highest first, not
+   one call per block: a filesystem frees only the pages wholly inside one
+   call, so blocks of about a page punched one by one would keep nearly every
+   page allocated. A call never ends inside a block, so a punch that stops
+   after any call leaves a whole zeroed block above the intact ones. Each slice
    punches only above what the previous slice's punch finished, from the 64 KiB
    edge below it, rather than the whole prefix again.
 

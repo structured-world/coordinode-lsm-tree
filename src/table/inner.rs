@@ -464,39 +464,41 @@ impl Drop for Inner {
             // still serves the suffix. `punch_hole` opens the path itself, so it
             // is fine that this view's own handles drop right after this body.
             //
-            // Punch the data blocks below the boundary as contiguous spans cut
-            // into chunks, not one call per block: a filesystem deallocates only
-            // the pages wholly inside one call and zero-fills the edges, so
-            // blocks of about a page punched one by one at unaligned offsets
-            // would keep nearly every page allocated. Chunk edges fall on
-            // multiples of [`PUNCH_CHUNK`], so every page but the one the prefix
-            // ends in is freed. The writer lays the data blocks out contiguously
+            // Punch the data blocks below the boundary in calls of many adjacent
+            // blocks, not one call per block: a filesystem deallocates only the
+            // pages wholly inside one call and zero-fills the edges, so blocks
+            // of about a page punched one by one at unaligned offsets would keep
+            // nearly every page allocated. A call takes whole blocks up to about
+            // [`PUNCH_CHUNK`], so each edge between two calls keeps at most one
+            // page allocated. The writer lays the data blocks out contiguously
             // from offset 0 and the block index yields only data-block handles,
-            // so the spans hold exactly the reclaimable data (the index, filter
+            // so the calls cover exactly the reclaimable data (the index, filter
             // and meta sections all sit past the data region).
             //
-            // Punch TOP-DOWN (highest extent first) and STOP at the first
-            // failure. This keeps the resulting hole pattern CLASSIFIABLE for a
-            // sidecar-less manifest repair: any failure (or crash) leaves intact
-            // blocks strictly BELOW the zeroed ones (the irregular signature
-            // repair fails closed on), while a fully successful pass leaves the
-            // clean zeroed prefix the classical geometry bound is sound for. A
-            // chunk edge inside a block leaves that block's head intact under a
-            // zeroed tail: it reads as intact, below zeroed blocks, which is the
-            // same irregular signature. Bottom-up with continue-past-failures could instead
-            // leave intact-but-consumed blocks ABOVE a clean zeroed prefix,
-            // indistinguishable from a live suffix, and a sidecar-less repair
-            // would then restrict to a bound that resurrects their superseded
-            // rows. Stopping reclaims less space on a failure, but reclaim is
-            // best-effort; classification soundness is not.
+            // Punch TOP-DOWN (highest call first) and STOP at the first failure.
+            // This keeps the resulting hole pattern CLASSIFIABLE for a
+            // sidecar-less manifest repair: every call that lands zeroes at
+            // least one whole block, so any failure (or crash) leaves intact
+            // blocks strictly BELOW zeroed ones (the irregular signature repair
+            // fails closed on), while a fully successful pass leaves the clean
+            // zeroed prefix the classical geometry bound is sound for. A call
+            // that ended inside a block would zero only its tail, and if no call
+            // below it landed, the file would show no zeroed block at all: it
+            // would read as unpunched, with consumed rows intact. Bottom-up with
+            // continue-past-failures could instead leave intact-but-consumed
+            // blocks ABOVE a clean zeroed prefix, indistinguishable from a live
+            // suffix, and a sidecar-less repair would then restrict to a bound
+            // that resurrects their superseded rows. Stopping reclaims less
+            // space on a failure, but reclaim is best-effort; classification
+            // soundness is not.
             let off = self
                 .punch_on_drop
                 .load(core::sync::atomic::Ordering::Acquire);
             if off == u64::MAX {
                 return;
             }
-            // `[start, end)` of each run of adjacent data blocks below `off`.
-            let mut spans: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+            // `[start, end)` of each data block below `off`, in file order.
+            let mut blocks: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
             // The table is being dropped: caching its index would only evict
             // blocks someone still reads.
             for handle in self.untraced_index_walk() {
@@ -515,25 +517,22 @@ impl Drop for Inner {
                 let block_off = handle.offset().0;
                 if block_off < off {
                     // Bounded by the file's length.
-                    let end = block_off + u64::from(handle.size());
-                    match spans.last_mut() {
-                        Some(span) if span.1 == block_off => span.1 = end,
-                        _ => spans.push((block_off, end)),
-                    }
+                    blocks.push((block_off, block_off + u64::from(handle.size())));
                 }
             }
             // An earlier view of this file punched everything below the floor;
             // from the 64 KiB edge under it, so the page its punch ended in is
-            // freed now that the rest of it is consumed too.
+            // freed now that the rest of it is consumed too. The block cut at
+            // the floor lies wholly below that punch's end, already zeroed.
             let floor = self.punched_through.get().map_or(0, |punched| {
                 punched.load(core::sync::atomic::Ordering::Acquire)
             });
             let floor = floor - floor % PUNCH_ALIGN;
-            spans.retain_mut(|span| {
-                span.0 = span.0.max(floor);
-                span.0 < span.1
+            blocks.retain_mut(|block| {
+                block.0 = block.0.max(floor);
+                block.0 < block.1
             });
-            let reclaimable = punch_extents_top_down(&spans);
+            let reclaimable = punch_extents_top_down(&blocks);
 
             // An IN-PROGRESS checkpoint's window covers the link step, so a
             // punch cannot race a link that is about to appear — but the intent
@@ -642,22 +641,29 @@ impl Drop for Inner {
 /// covered whole.
 pub const PUNCH_ALIGN: u64 = 64 * 1_024;
 
-/// The extent of one prefix punch call: chunk edges fall on its multiples, so
-/// every page between two of them is freed whatever the page size.
+/// The most one prefix punch call covers, unless a single block is larger: a
+/// call is cut only at block edges, so each one that lands zeroes whole blocks.
 pub const PUNCH_CHUNK: u64 = 4 * 1_024 * 1_024;
 
-/// The punch calls for `spans` (ascending, disjoint `[start, end)`), highest
-/// first: each span cut at the multiples of [`PUNCH_CHUNK`] inside it.
-pub fn punch_extents_top_down(spans: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
+/// The punch calls for `blocks` (ascending, disjoint `[start, end)`), highest
+/// first: runs of adjacent blocks, each call as many whole blocks as fit in
+/// [`PUNCH_CHUNK`] and at least one.
+pub fn punch_extents_top_down(blocks: &[(u64, u64)]) -> alloc::vec::Vec<(u64, u64)> {
     let mut extents = alloc::vec::Vec::new();
-    for &(start, end) in spans.iter().rev() {
-        let mut hi = end;
-        while hi > start {
-            // The chunk edge below `hi`, or the span's start.
-            let lo = ((hi - 1) / PUNCH_CHUNK * PUNCH_CHUNK).max(start);
-            extents.push((lo, hi - lo));
-            hi = lo;
-        }
+    // `[lo, hi)` of the call being built.
+    let mut call: Option<(u64, u64)> = None;
+    for &(start, end) in blocks.iter().rev() {
+        call = match call {
+            Some((lo, hi)) if lo == end && hi - start <= PUNCH_CHUNK => Some((start, hi)),
+            Some((lo, hi)) => {
+                extents.push((lo, hi - lo));
+                Some((start, end))
+            }
+            None => Some((start, end)),
+        };
+    }
+    if let Some((lo, hi)) = call {
+        extents.push((lo, hi - lo));
     }
     extents
 }
