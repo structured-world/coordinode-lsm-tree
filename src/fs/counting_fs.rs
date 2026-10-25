@@ -60,7 +60,8 @@ pub enum WriteOrigin {
     Metadata,
     /// Repair, salvage, and healing of damaged files in place.
     Repair,
-    /// The copies a checkpoint makes of a tree's files.
+    /// The copies a checkpoint makes of a tree's files where it cannot link
+    /// them. The manifest it writes is [`Self::Manifest`]'s.
     Checkpoint,
 }
 

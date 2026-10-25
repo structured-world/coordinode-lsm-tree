@@ -213,6 +213,15 @@ matching entry (and add one for a new subsystem).
   `src/version/super_version.rs` (tests `tests/table_file_pool.rs`,
   `tests/sync_census.rs`).
 
+- **Every file the engine opens for writing names what it is written for.**
+  The open options carry a `WriteOrigin`, so with the `metrics` feature the
+  counting backend a tree wraps around its own charges each byte, write call
+  and sync to one origin and none to `unattributed`; the counters together
+  hold everything the tree wrote, each byte once. A file pool's file is opened
+  for its writer's origin when it is claimed, and the empty files a refill
+  makes are metadata. Enforced in `src/fs/counting_fs.rs` and every write-side
+  open (tests `tests/write_io.rs`); see [write-ledger.md](write-ledger.md).
+
 - **A directory has at most one writer process.** Opening a tree acquires an
   exclusive lock on a `LOCK` file; a second open of the same directory fails with
   `Error::Locked` rather than corrupting shared state through two uncoordinated
