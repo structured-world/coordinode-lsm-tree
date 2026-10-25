@@ -114,6 +114,28 @@ fn failed_writes_and_syncs_are_counted_as_failures() -> crate::io::Result<()> {
     Ok(())
 }
 
+/// A writeback started ahead of a sync is counted apart from the syncs: it is
+/// no durability point and writes no byte the writes did not.
+#[test]
+fn a_started_writeback_is_counted_apart_from_syncs() -> crate::io::Result<()> {
+    let fs = CountingFs::new(Arc::new(MemFs::new()));
+    fs.create_dir_all(Path::new("/db"))?;
+    let mut file = fs.open(
+        Path::new("/db/1"),
+        &writable(Some(WriteOrigin::CompactionTable)),
+    )?;
+    file.write_all(&[1; 64])?;
+
+    file.start_writeback(0, 64)?;
+    file.sync_data()?;
+
+    let compaction = fs.stats().snapshot().origin(WriteOrigin::CompactionTable);
+    assert_eq!(compaction.writebacks, 1);
+    assert_eq!(compaction.syncs, 1);
+    assert_eq!(compaction.bytes, 64);
+    Ok(())
+}
+
 /// Directory operations are counted once each when they succeed, a directory
 /// sync also when it fails; a hard link copies no byte.
 #[test]

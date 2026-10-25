@@ -135,6 +135,10 @@ pub struct FileWrites {
     pub syncs: u64,
     /// File syncs that failed.
     pub sync_errors: u64,
+    /// Ranges whose writeback the files started ahead of a sync, without
+    /// waiting for it: no durability point, and no bytes beyond `bytes`. The
+    /// standard backend issues `sync_file_range` for each on Linux.
+    pub writebacks: u64,
     /// Lengths set on the files.
     pub truncated: u64,
     /// Bytes of the files a store installed: in a version for tables and blob
@@ -154,6 +158,7 @@ impl FileWrites {
             created: self.created.checked_sub(earlier.created)?,
             syncs: self.syncs.checked_sub(earlier.syncs)?,
             sync_errors: self.sync_errors.checked_sub(earlier.sync_errors)?,
+            writebacks: self.writebacks.checked_sub(earlier.writebacks)?,
             truncated: self.truncated.checked_sub(earlier.truncated)?,
             installed: self.installed.checked_sub(earlier.installed)?,
         })
@@ -168,6 +173,7 @@ impl FileWrites {
         self.created += other.created;
         self.syncs += other.syncs;
         self.sync_errors += other.sync_errors;
+        self.writebacks += other.writebacks;
         self.truncated += other.truncated;
         self.installed += other.installed;
     }
@@ -367,6 +373,7 @@ struct FileCounters {
     created: AtomicU64,
     syncs: AtomicU64,
     sync_errors: AtomicU64,
+    writebacks: AtomicU64,
     truncated: AtomicU64,
     installed: AtomicU64,
 }
@@ -382,6 +389,7 @@ impl FileCounters {
             created: self.created.load(Relaxed),
             syncs: self.syncs.load(Relaxed),
             sync_errors: self.sync_errors.load(Relaxed),
+            writebacks: self.writebacks.load(Relaxed),
             truncated: self.truncated.load(Relaxed),
             installed: self.installed.load(Relaxed),
         }
@@ -954,7 +962,13 @@ impl FsFile for CountingFile {
     }
 
     fn start_writeback(&self, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.start_writeback(offset, len)
+        let result = self.inner.start_writeback(offset, len);
+        if result.is_ok()
+            && let Some(counters) = self.counters()
+        {
+            counters.writebacks.fetch_add(1, Relaxed);
+        }
+        result
     }
 
     fn set_write_lifetime(&self, lifetime: WriteLifetime) -> io::Result<()> {

@@ -149,13 +149,14 @@ fn print(order: Order, reading: &WriteIoSnapshot) {
     let files = reading.files();
     println!(
         "\npayload {:.2} MiB in {} values and {} range deletions; written {:.2} MiB in {} calls, \
-         {} syncs; host write amplification {:.2}",
+         {} syncs, {} writebacks started; host write amplification {:.2}",
         mib(reading.accepted.payload_bytes),
         reading.accepted.values,
         reading.accepted.range_deletions,
         mib(files.bytes),
         files.writes,
         reading.syncs(),
+        files.writebacks,
         reading.host_write_amplification().unwrap_or(f64::NAN),
     );
 
@@ -171,6 +172,7 @@ fn print(order: Order, reading: &WriteIoSnapshot) {
             ("created", files.created),
             ("syncs", files.syncs),
             ("sync_errors", files.sync_errors),
+            ("writebacks", files.writebacks),
             ("truncated", files.truncated),
             ("installed", files.installed),
         ] {
