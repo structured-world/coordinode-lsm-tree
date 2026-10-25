@@ -353,6 +353,12 @@ path = "benches/tight_space.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "key_domains_retention"
+harness = false
+path = "benches/key_domains_retention.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "tight_space_disk"
 harness = false
 path = "benches/tight_space_disk.rs"

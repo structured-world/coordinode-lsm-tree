@@ -2056,6 +2056,7 @@ impl AbstractTree for BlobTree {
 
         table_writer =
             table_writer.use_prefix_extractor(self.index.config.prefix_extractor.clone());
+        table_writer = table_writer.use_key_domains(self.index.config.key_domains.clone());
         table_writer = table_writer.use_encryption(self.index.config.encryption.clone());
         table_writer = table_writer.use_clock(self.index.config.clock.clone());
         // Runtime-driven SST options, mirroring the standard tree's flush so a
@@ -2126,7 +2127,11 @@ impl AbstractTree for BlobTree {
             .use_sync_mode(self.index.config.sync_mode)
             .use_writeback_bytes(self.index.config.writeback_bytes)
             .use_lifetime_groups(kv_opts.lifetime_groups)
-            .use_clock(self.index.config.clock.clone());
+            .use_clock(self.index.config.clock.clone())
+            .use_key_domains(
+                self.index.config.key_domains.clone(),
+                self.index.config.comparator.clone(),
+            );
             #[cfg(zstd_any)]
             let w = w
                 .use_zstd_dictionary(dicts.for_compression(rc.blob_compression)?)

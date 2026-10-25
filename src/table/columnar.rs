@@ -100,6 +100,23 @@ pub struct Column {
     pub data: crate::Slice,
 }
 
+/// A batch's user-key column whose framing is checked, read row by row.
+pub(crate) struct UserKeys<'a> {
+    data: &'a [u8],
+    row_count: u32,
+}
+
+impl<'a> UserKeys<'a> {
+    /// The user key of `row`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `row` is past the batch.
+    pub(crate) fn get(&self, row: u32) -> Result<&'a [u8]> {
+        bytes_column_row(self.data, self.row_count, row)
+    }
+}
+
 /// A decoded columnar row-group: the read unit obtained by decoding a row
 /// group's [`BlockType::ColumnPage`](crate::table::block::BlockType::ColumnPage)s.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -908,12 +925,33 @@ impl ColumnBatch {
         if self.row_count == 0 {
             return Ok(None);
         }
+        self.user_key(0).map(Some)
+    }
+
+    /// The user key of `row`, which must be below the batch's row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the first column is not the non-null user-key column,
+    /// its row framing is malformed, or `row` is past the batch.
+    pub(crate) fn user_key(&self, row: u32) -> Result<&[u8]> {
+        self.user_keys()?.get(row)
+    }
+
+    /// The batch's user-key column, its shape checked once, for reading many
+    /// rows' keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the first column is not the non-null user-key
+    /// column or its row framing is malformed.
+    pub(crate) fn user_keys(&self) -> Result<UserKeys<'_>> {
         let Some(key_col) = self.columns.first().filter(|c| c.column_id == COL_USER_KEY) else {
             return Err(Error::InvalidHeader(
                 "columnar: first column is not the user-key column",
             ));
         };
-        // This runs before the full `column_batch_to_entries` validation, so
+        // This can run before the full `column_batch_to_entries` validation, so
         // confirm the intrinsic key column's shape (non-null `Bytes`, correctly
         // framed for `row_count`) before the low-level offset read.
         if key_col.type_tag != TypeTag::Bytes || key_col.validity.is_some() {
@@ -922,7 +960,10 @@ impl ColumnBatch {
             ));
         }
         key_col.validate(self.row_count)?;
-        bytes_column_row(&key_col.data, self.row_count, 0).map(Some)
+        Ok(UserKeys {
+            data: &key_col.data[..],
+            row_count: self.row_count,
+        })
     }
 
     /// Returns the last row's user key, or `None` for an empty batch. Like
@@ -937,18 +978,7 @@ impl ColumnBatch {
         let Some(last) = self.row_count.checked_sub(1) else {
             return Ok(None);
         };
-        let Some(key_col) = self.columns.first().filter(|c| c.column_id == COL_USER_KEY) else {
-            return Err(Error::InvalidHeader(
-                "columnar: first column is not the user-key column",
-            ));
-        };
-        if key_col.type_tag != TypeTag::Bytes || key_col.validity.is_some() {
-            return Err(Error::InvalidHeader(
-                "columnar: first column is not the non-null user-key column",
-            ));
-        }
-        key_col.validate(self.row_count)?;
-        bytes_column_row(&key_col.data, self.row_count, last).map(Some)
+        self.user_key(last).map(Some)
     }
 
     /// Whether `other` has the same column layout (each column's id and type, in

@@ -57,6 +57,7 @@ tree.flush_active_memtable(0)?;
 - `WriteBatch` with seqno-grouped batch writes: caller-controlled atomic visibility.
 - Single deletion tombstones (`remove_weak`).
 - Range tombstones (`delete_range` / `delete_prefix`).
+- Optional caller-defined **key domains** (`Config::key_domains`), such as retention epochs of time-bucketed keys: flush, ingest and compaction never put rows of two domains in one table or values of two in one blob file, so expiring a domain with a range tombstone removes its files whole instead of rewriting the survivors that would share them; see [docs/key-domains.md](docs/key-domains.md).
 - Merge operators for commutative LSM operations.
 - Optional key-value separation (BlobTree) for large-value workloads with automatic garbage collection. Scans read their separated values ahead: where the upcoming values are neighbours in the blob file, which is the usual shape after a flush, their reads merge into one instead of one small read per value. Storage statistics report how many blob files each table, level and the tree reference, and how deeply their key spans interleave; an opt-in compaction trigger rewrites deeply interleaved files in key order within a bounded I/O budget. Values read from blob files stay out of the shared cache by default, so large values read mostly once do not evict the index, filter and data blocks of every tree sharing it; a scan reads them ahead into its own buffer instead. `Config::blob_cache_fill` caches them, and changes on a live tree.
 

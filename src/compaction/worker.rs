@@ -1293,8 +1293,7 @@ fn holds_every_surviving_version(
 #[cfg(feature = "std")]
 fn range_tombstones_after_gc(
     input_rts: &[crate::range_tombstone::RangeTombstone],
-    version: &Version,
-    input_ids: &HashSet<TableId>,
+    outside: &OutsideSpans,
     watermark: SeqNo,
     is_last_level: bool,
     comparator: &crate::comparator::SharedComparator,
@@ -1310,23 +1309,133 @@ fn range_tombstones_after_gc(
             // needed by the oldest live snapshot (which reads at the watermark
             // and does not see `RT@watermark`), so keep it. Only strictly-below
             // tombstones are candidates for GC.
-            if !rt.visible_at(watermark) {
-                return true;
-            }
+            !rt.visible_at(watermark) || outside.overlaps(rt, cmp)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The keys the tables outside a compaction hold, as disjoint inclusive spans
+/// in key order: whether a table outside overlaps a range tombstone is then a
+/// binary search, not a walk of the whole version per tombstone.
+pub struct OutsideSpans(Vec<(UserKey, UserKey)>);
+
+impl OutsideSpans {
+    /// The spans of `version`'s tables other than `input_ids`.
+    pub fn new(
+        version: &Version,
+        input_ids: &HashSet<TableId>,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) -> Self {
+        Self::from_ranges(
             version
                 .iter_levels()
                 .flat_map(|level| level.iter())
                 .flat_map(|run| run.iter())
                 .filter(|t| !input_ids.contains(&t.id()))
-                .any(|t| {
+                .map(|t| {
                     let kr = &t.metadata.key_range;
-                    // [rt.start, rt.end) overlaps [kr.min, kr.max].
-                    cmp.compare(&rt.start, kr.max()) != core::cmp::Ordering::Greater
-                        && cmp.compare(kr.min(), &rt.end) == core::cmp::Ordering::Less
+                    (kr.min().clone(), kr.max().clone())
                 })
-        })
-        .cloned()
-        .collect()
+                .collect(),
+            cmp,
+        )
+    }
+
+    /// Merges inclusive `[min, max]` ranges, in any order, into spans.
+    fn from_ranges(
+        mut ranges: Vec<(UserKey, UserKey)>,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) -> Self {
+        use core::cmp::Ordering::{Greater, Less};
+
+        ranges.sort_by(|a, b| cmp.compare(&a.0, &b.0));
+        let mut spans: Vec<(UserKey, UserKey)> = Vec::with_capacity(ranges.len());
+        for (min, max) in ranges {
+            match spans.last_mut() {
+                Some((_, end)) if cmp.compare(&min, end) != Greater => {
+                    if cmp.compare(end, &max) == Less {
+                        *end = max;
+                    }
+                }
+                _ => spans.push((min, max)),
+            }
+        }
+        Self(spans)
+    }
+
+    /// Whether a table outside the compaction holds keys in `rt`'s span, which
+    /// only `rt` keeps deleted once the compaction's inputs are gone.
+    fn overlaps(
+        &self,
+        rt: &crate::range_tombstone::RangeTombstone,
+        cmp: &dyn crate::comparator::UserComparator,
+    ) -> bool {
+        use core::cmp::Ordering::Less;
+
+        // [rt.start, rt.end) overlaps [min, max]: the first span ending at or
+        // past the start has the least min of those that can.
+        let first = self
+            .0
+            .partition_point(|(_, max)| cmp.compare(max, &rt.start) == Less);
+        self.0
+            .get(first)
+            .is_some_and(|(min, _)| cmp.compare(min, &rt.end) == Less)
+    }
+}
+
+/// The keys a writer answering for `bounds` covers, as `[lower, upper)` with
+/// `None` for an end of the key space.
+#[cfg(feature = "std")]
+fn answered_span(
+    bounds: &(core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
+) -> (Option<UserKey>, Option<UserKey>) {
+    use core::ops::Bound;
+
+    (
+        // An excluded lower bound is the previous range's included upper one:
+        // a piece starting there is written by both, which deletes no more.
+        match &bounds.0 {
+            Bound::Included(key) | Bound::Excluded(key) => Some(key.clone()),
+            Bound::Unbounded => None,
+        },
+        match &bounds.1 {
+            Bound::Excluded(key) => Some(key.clone()),
+            Bound::Included(key) => crate::range_tombstone::upper_bound_exclusive(key),
+            Bound::Unbounded => None,
+        },
+    )
+}
+
+/// The tombstones of `rts` a writer answering for `[lower, upper)` keeps
+/// past its outputs' keys: those reaching into that span that a table outside
+/// the compaction overlaps.
+fn tombstones_outside(
+    rts: &[crate::range_tombstone::RangeTombstone],
+    outside: &OutsideSpans,
+    (lower, upper): (Option<UserKey>, Option<UserKey>),
+    comparator: &crate::comparator::SharedComparator,
+) -> crate::table::multi_writer::TombstonesOutside {
+    use core::cmp::Ordering::Less;
+
+    let cmp = comparator.as_ref();
+    crate::table::multi_writer::TombstonesOutside {
+        tombstones: rts
+            .iter()
+            .filter(|rt| {
+                lower
+                    .as_ref()
+                    .is_none_or(|lower| cmp.compare(lower, &rt.end) == Less)
+                    && upper
+                        .as_ref()
+                        .is_none_or(|upper| cmp.compare(&rt.start, upper) == Less)
+                    && outside.overlaps(rt, cmp)
+            })
+            .cloned()
+            .collect(),
+        lower,
+        upper,
+    }
 }
 
 #[cfg_attr(
@@ -2195,6 +2304,7 @@ fn run_tight_space_compaction(
                 &version.version,
                 Vec::new(),
                 &rts,
+                None,
                 span,
                 dst_lvl,
                 bottommost_gc,
@@ -2646,6 +2756,7 @@ fn run_tight_space_compaction(
             &version.version,
             current_views.clone(),
             &rts,
+            None,
             (lower.clone(), Bound::Unbounded),
             dst_lvl,
             bottommost_gc,
@@ -2727,6 +2838,9 @@ fn run_subcompaction(
     version: &Version,
     tables_for_deletion: Vec<Table>,
     input_range_tombstones: &[crate::range_tombstone::RangeTombstone],
+    // The keys the tables outside the compaction hold, when the caller built
+    // them once for sub-ranges sharing `version`; `None` builds them here.
+    outside_spans: Option<&OutsideSpans>,
     bounds: (core::ops::Bound<UserKey>, core::ops::Bound<UserKey>),
     dst_lvl: usize,
     is_last_level: bool,
@@ -2792,6 +2906,8 @@ fn run_subcompaction(
         (Some(_), core::ops::Bound::Excluded(upper)) => Some(upper.clone()),
         _ => None,
     };
+    // The keys this range's writer answers for, past its outputs included.
+    let answered = answered_span(&bounds);
     // This range's writer does not wait for a boundary past its upper bound,
     // which another range's writer reaches.
     let range_upper = match &bounds.1 {
@@ -2996,7 +3112,11 @@ fn run_subcompaction(
             .use_sync_mode(opts.config.sync_mode)
             .use_writeback_bytes(opts.config.writeback_bytes)
             .use_lifetime_groups(blob_opts.lifetime_groups)
-            .use_clock(opts.config.clock.clone());
+            .use_clock(opts.config.clock.clone())
+            .use_key_domains(
+                opts.config.key_domains.clone(),
+                opts.config.comparator.clone(),
+            );
             // The policy here is only the OPENING value. Relocation copies
             // frames verbatim out of files that may predate a policy change, so
             // `RelocatingCompaction` records each output file's codec from the
@@ -3032,16 +3152,32 @@ fn run_subcompaction(
     // Propagate range tombstones to this sub-range's output (GC'd at the last
     // level when fully applied); the writer clips them to each output table's
     // key range (a boundary-spanning RT is written clipped on both sides).
-    let output_rts = range_tombstones_after_gc(
-        input_range_tombstones,
-        version,
-        &payload.table_ids,
-        opts.gc_watermark,
-        is_last_level,
-        &opts.config.comparator,
-    );
-    if !output_rts.is_empty() {
-        compactor.write_range_tombstones(&output_rts);
+    if !input_range_tombstones.is_empty() {
+        // The sub-ranges of one compaction share its spans; a slice reads a
+        // version of its own and builds them here.
+        let built;
+        let outside_spans = if let Some(spans) = outside_spans {
+            spans
+        } else {
+            built = OutsideSpans::new(version, &payload.table_ids, opts.config.comparator.as_ref());
+            &built
+        };
+        let output_rts = range_tombstones_after_gc(
+            input_range_tombstones,
+            outside_spans,
+            opts.gc_watermark,
+            is_last_level,
+            &opts.config.comparator,
+        );
+        if !output_rts.is_empty() {
+            let outside = tombstones_outside(
+                &output_rts,
+                outside_spans,
+                answered,
+                &opts.config.comparator,
+            );
+            compactor.write_range_tombstones(&output_rts, outside);
+        }
     }
 
     #[cfg(feature = "columnar")]
@@ -3654,6 +3790,17 @@ fn plan_merge_on_read(
             Ok((entry.key.user_key, entry.key.seqno))
         })
         .collect::<crate::Result<Vec<_>>>()?;
+    // The relocation keeps the source's key range. A source written before the
+    // key-domain policy, or under another one, may hold rows of two domains: it
+    // is rewritten instead, so no output spans one.
+    if let (Some(domains), Some((first, _)), Some((last, _))) =
+        (opts.config.key_domains.as_ref(), keys.first(), keys.last())
+        && domains.domain_end(first).is_some_and(|end| {
+            opts.config.comparator.compare(last, &end) != core::cmp::Ordering::Less
+        })
+    {
+        return Ok(None);
+    }
     let bitmap = super::delete_materialize::build_position_bitmap(
         keys.iter()
             .map(|(user_key, seqno)| (user_key.as_ref(), *seqno)),
@@ -3955,6 +4102,15 @@ fn merge_tables(
                 None,
                 &rc,
             );
+            // The ranges read one version: the keys the tables outside the
+            // compaction hold are found once for all of them.
+            let outside_spans = (!input_range_tombstones.is_empty()).then(|| {
+                Arc::new(OutsideSpans::new(
+                    &current_super_version.version,
+                    &payload.table_ids,
+                    opts.config.comparator.as_ref(),
+                ))
+            });
 
             let outputs: Vec<crate::Result<super::flavour::ProducedOutput>> =
                 if let Some(spawner) = opts.config.compaction_pool.clone() {
@@ -3971,6 +4127,7 @@ fn merge_tables(
                         let payload = Arc::clone(&payload);
                         let version = Arc::clone(&version);
                         let rts = Arc::clone(&rts);
+                        let outside_spans = outside_spans.clone();
                         let blobs = Arc::clone(&blobs);
                         let rc = Arc::clone(&rc);
                         let filter_sizing = filter_sizing.clone();
@@ -3982,6 +4139,7 @@ fn merge_tables(
                                 &version.version,
                                 tables_for_deletion,
                                 &rts,
+                                outside_spans.as_deref(),
                                 range,
                                 dst_lvl,
                                 is_last_level,
@@ -4031,6 +4189,7 @@ fn merge_tables(
                                 &current_super_version.version,
                                 only_first_owns_inputs(idx),
                                 &input_range_tombstones,
+                                outside_spans.as_deref(),
                                 range,
                                 dst_lvl,
                                 is_last_level,
@@ -4296,7 +4455,11 @@ fn merge_tables(
                 .use_sync_mode(opts.config.sync_mode)
                 .use_writeback_bytes(opts.config.writeback_bytes)
                 .use_lifetime_groups(blob_opts.lifetime_groups)
-                .use_clock(opts.config.clock.clone());
+                .use_clock(opts.config.clock.clone())
+                .use_key_domains(
+                    opts.config.key_domains.clone(),
+                    opts.config.comparator.clone(),
+                );
                 // Same as the tight-space relocation above, through the same
                 // `RelocatingCompaction`: the policy is only the opening value,
                 // each output file records the codec of the source its frames
@@ -4358,7 +4521,17 @@ fn merge_tables(
             "Propagating {} range tombstones to compaction output",
             input_range_tombstones.len(),
         );
-        compactor.write_range_tombstones(&input_range_tombstones);
+        let outside = tombstones_outside(
+            &input_range_tombstones,
+            &OutsideSpans::new(
+                &current_super_version.version,
+                &payload.table_ids,
+                opts.config.comparator.as_ref(),
+            ),
+            (None, None),
+            &opts.config.comparator,
+        );
+        compactor.write_range_tombstones(&input_range_tombstones, outside);
     }
 
     // Every row the merge emits goes to the output through here: written, or,

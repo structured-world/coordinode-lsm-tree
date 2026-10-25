@@ -8,6 +8,45 @@ use crate::{
 use std::sync::Arc;
 use test_log::test;
 
+mod outside_spans {
+    use super::super::OutsideSpans;
+    use crate::{UserKey, range_tombstone::RangeTombstone};
+    use test_log::test;
+
+    fn key(i: u8) -> UserKey {
+        UserKey::from([i].as_slice())
+    }
+
+    /// Merged spans answer as a scan of every table range does: tables given
+    /// out of order, overlapping, nested, touching at an inclusive end, and
+    /// apart; tombstones before, between, across and past them, and ending on
+    /// a table's first key, which they do not reach.
+    #[test]
+    fn merged_spans_find_the_tables_a_scan_finds() {
+        let comparator = crate::comparator::default_comparator();
+        let cmp = comparator.as_ref();
+        let ranges = vec![
+            (key(40), key(45)),
+            (key(10), key(20)),
+            (key(15), key(18)),
+            (key(20), key(25)),
+            (key(60), key(60)),
+            (key(18), key(30)),
+        ];
+        let spans = OutsideSpans::from_ranges(ranges.clone(), cmp);
+        assert_eq!(spans.0.len(), 3, "10..30, 40..45, 60");
+        for start in 0..70 {
+            for end in start + 1..=70 {
+                let rt = RangeTombstone::new(key(start), key(end), 1);
+                let scanned = ranges.iter().any(|(min, max)| {
+                    cmp.compare(&rt.start, max).is_le() && cmp.compare(min, &rt.end).is_lt()
+                });
+                assert_eq!(spans.overlaps(&rt, cmp), scanned, "[{start}, {end})");
+            }
+        }
+    }
+}
+
 mod chain_completeness {
     use super::may_break_chain;
     use crate::{KeyRange, UserKey};

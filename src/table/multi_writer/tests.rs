@@ -214,7 +214,7 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
         mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
     }
     mw.current_key = Some(UserKey::from(b"b" as &[u8]));
-    mw.rotate()?;
+    mw.rotate_at(None)?;
     assert_eq!(mw.linked_blobs.capacity(), 0);
     Ok(())
 }
@@ -305,6 +305,201 @@ fn clip_preserves_rt_covering_gap_between_output_tables() -> crate::Result<()> {
          no output table preserved it (gap between tables)",
     );
 
+    Ok(())
+}
+
+/// The keys a writer answers for, `[lower, upper)`, `None` for an end of
+/// the key space.
+type Answered<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// An output's key range and the range tombstones it holds.
+type Output = (
+    (Vec<u8>, Vec<u8>),
+    Vec<crate::range_tombstone::RangeTombstone>,
+);
+
+/// Writes `keys` through a clipping writer holding the range tombstone
+/// `[b, k)@20` and, when `outside` is given, keeping its pieces past the
+/// outputs for tables outside the compaction; returns each output's key
+/// range and tombstones.
+fn clipped_outputs(keys: &[&[u8]], outside: Option<Answered<'_>>) -> crate::Result<Vec<Output>> {
+    Ok(clipped_tables(keys, outside)?
+        .iter()
+        .map(|table| {
+            let range = &table.metadata.key_range;
+            (
+                (range.min().to_vec(), range.max().to_vec()),
+                table.range_tombstones().to_vec(),
+            )
+        })
+        .collect())
+}
+
+/// The tables [`clipped_outputs`] describes.
+fn clipped_tables(
+    keys: &[&[u8]],
+    outside: Option<Answered<'_>>,
+) -> crate::Result<Vec<crate::Table>> {
+    use crate::range_tombstone::RangeTombstone;
+    use crate::{InternalValue, UserKey, fs::StdFs};
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().join("tables");
+    std::fs::create_dir_all(&base_path)?;
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        64 * 1_024 * 1_024,
+        1,
+        fs,
+    )?
+    .use_clip_range_tombstones()
+    // A compaction's outputs record their inputs and the output before them.
+    .use_lineage(Some(vec![1_000]))
+    .use_lineage_whole_run(true);
+    let rt = RangeTombstone::new(
+        UserKey::from(b"b".as_slice()),
+        UserKey::from(b"k".as_slice()),
+        20,
+    );
+    mw.set_range_tombstones(vec![rt.clone()]);
+    if let Some((lower, upper)) = outside {
+        mw.keep_tombstones_outside(super::TombstonesOutside {
+            tombstones: vec![rt],
+            lower: lower.map(UserKey::from),
+            upper: upper.map(UserKey::from),
+        });
+    }
+    for (seqno, key) in (1..).zip(keys) {
+        mw.write(InternalValue::from_components(
+            UserKey::from(*key),
+            b"v".as_slice(),
+            seqno,
+            crate::ValueType::Value,
+        ))?;
+    }
+
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let comparator: crate::SharedComparator = Arc::new(crate::DefaultUserComparator);
+    mw.finish()?
+        .tables
+        .iter()
+        .map(|(table_id, checksum)| {
+            crate::Table::recover(crate::table::RecoverParams::new(
+                base_path.join(table_id.to_string()),
+                *checksum,
+                *table_id,
+                Arc::new(StdFs),
+                comparator.clone(),
+                cache.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// The outputs' lineage chain follows key order with pieces kept both below
+/// and past the rows: manifest repair reads an unbroken chain's ranges from
+/// its head's least key to its tail's greatest, so a table below the rows
+/// chained after them would let a chain missing the rows' table claim its
+/// keys.
+#[test]
+fn the_lineage_chain_follows_key_order_around_kept_pieces() -> crate::Result<()> {
+    let tables = clipped_tables(&[b"e", b"f"], Some((None, None)))?;
+    assert_eq!(tables.len(), 3, "below, rows, past");
+    let ids: Vec<_> = tables.iter().map(crate::Table::id).collect();
+    let Some(head) = tables.iter().find(|t| {
+        !t.metadata
+            .lineage_prev
+            .is_some_and(|prev| ids.contains(&prev))
+    }) else {
+        panic!("the chain has a head");
+    };
+    let mut chain = vec![head];
+    while let Some(next) = tables
+        .iter()
+        .find(|t| t.metadata.lineage_prev == chain.last().map(|t| t.id()))
+    {
+        chain.push(next);
+    }
+    let mins: Vec<_> = chain
+        .iter()
+        .map(|t| t.metadata.key_range.min().to_vec())
+        .collect();
+    assert_eq!(chain.len(), tables.len(), "one unbroken chain: {mins:?}");
+    assert!(mins.is_sorted(), "chained in key order: {mins:?}");
+    Ok(())
+}
+
+/// Whether some output both answers for `key` by its key range and holds a
+/// tombstone covering it: what a point read of `key` needs to see it deleted.
+fn deletes(outputs: &[Output], key: &[u8]) -> bool {
+    outputs.iter().any(|((min, max), rts)| {
+        min.as_slice() <= key
+            && key <= max.as_slice()
+            && rts
+                .iter()
+                .any(|rt| rt.start.as_ref() <= key && key < rt.end.as_ref())
+    })
+}
+
+/// A tombstone reaching past the outputs' last key keeps its piece there for
+/// a table outside the compaction: without it, a key of that table in the
+/// piece's span reads back once the inputs are gone. A last output's clip
+/// ends just past its last key, which alone would leave `[c\0, k)` to no one.
+#[test]
+fn a_tombstone_past_the_last_key_keeps_its_piece_for_tables_outside() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], Some((None, None)))?;
+    assert!(
+        deletes(&outputs, b"bb"),
+        "the piece among the keys: {outputs:?}"
+    );
+    assert!(
+        deletes(&outputs, b"j"),
+        "the piece past the last key: {outputs:?}"
+    );
+    assert_eq!(
+        outputs.len(),
+        2,
+        "the piece past the keys is an output of its own"
+    );
+    Ok(())
+}
+
+/// The same below the first key: a writer whose keys start past a
+/// tombstone's start keeps the piece before them.
+#[test]
+fn a_tombstone_before_the_first_key_keeps_its_piece_for_tables_outside() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"e", b"f"], Some((None, None)))?;
+    assert!(
+        deletes(&outputs, b"bb"),
+        "the piece before the first key: {outputs:?}"
+    );
+    assert!(
+        deletes(&outputs, b"j"),
+        "the piece past the last key: {outputs:?}"
+    );
+    Ok(())
+}
+
+/// A writer keeps pieces only within the keys it answers for: past its upper
+/// bound another range's writer does.
+#[test]
+fn a_kept_piece_stops_at_the_keys_the_writer_answers_for() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], Some((None, Some(b"f"))))?;
+    assert!(deletes(&outputs, b"e"), "below the bound: {outputs:?}");
+    assert!(!deletes(&outputs, b"g"), "past the bound: {outputs:?}");
+    Ok(())
+}
+
+/// A tombstone no table outside the compaction overlaps is clipped to the
+/// outputs as before: no output of its own.
+#[test]
+fn without_tables_outside_a_tombstone_stays_clipped_to_the_outputs() -> crate::Result<()> {
+    let outputs = clipped_outputs(&[b"a", b"c"], None)?;
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    assert!(!deletes(&outputs, b"j"), "{outputs:?}");
     Ok(())
 }
 
@@ -855,6 +1050,85 @@ fn a_flush_splits_its_tombstones_past_the_last_key() -> crate::Result<()> {
             table.range_tombstones().len(),
         );
     }
+    Ok(())
+}
+
+/// Under a key-domain policy, the first output past the last key ends at its
+/// domain's end and the pieces from there go to an output of tombstones alone;
+/// every output of tombstones alone after it holds no key and so no domain.
+/// Each tombstone past the last key is still written once, whatever number of
+/// outputs it spreads over: closing a later one at the rows' domain end again
+/// rewrote everything from that end on, once per output.
+#[test]
+fn a_flush_under_key_domains_writes_each_tombstone_past_the_last_key_once() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    /// One domain per first byte.
+    struct FirstByte;
+    impl crate::KeyDomains for FirstByte {
+        fn domain_end(&self, key: &[u8]) -> Option<UserKey> {
+            match key.first() {
+                Some(&b) if b < u8::MAX => Some(UserKey::from([b + 1].as_slice())),
+                _ => None,
+            }
+        }
+    }
+
+    const TARGET: u64 = 12 * 1_024;
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        TARGET,
+        1,
+        fs,
+    )?
+    .use_key_domains(Some(Arc::new(FirstByte)));
+    let tombstones: Vec<_> = (0..2_000usize)
+        .map(|i| {
+            let prefix = format!("z{i:08}").into_bytes();
+            let mut start = prefix.clone();
+            start.push(0);
+            let mut end = prefix;
+            end.push(1);
+            RangeTombstone::new(
+                UserKey::from(random_bound_of(2 * i, start, 64)),
+                UserKey::from(random_bound_of(2 * i + 1, end, 64)),
+                5,
+            )
+        })
+        .collect();
+    mw.set_range_tombstones(tombstones.clone());
+    // Every row in the domain `[a, b)`, every tombstone past it.
+    for key in [b"a1" as &[u8], b"a2", b"a3"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let tables = recover_outputs(&base_path, &mw.finish()?.tables)?;
+    assert!(
+        tables.len() > 2,
+        "self-check: the tombstones spread over several outputs of their own"
+    );
+
+    let mut written: Vec<_> = tables
+        .iter()
+        .flat_map(|table| table.range_tombstones().iter())
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    written.sort();
+    let expected: Vec<_> = tombstones
+        .iter()
+        .map(|rt| (rt.start.to_vec(), rt.end.to_vec()))
+        .collect();
+    assert_eq!(written.len(), expected.len(), "each tombstone written once");
+    assert_eq!(written, expected, "each tombstone written once, whole");
     Ok(())
 }
 

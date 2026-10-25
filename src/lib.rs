@@ -372,6 +372,7 @@ pub(crate) mod metrics;
 #[doc(hidden)]
 pub mod mvcc_stream;
 
+mod key_domain;
 mod path;
 mod pinnable_slice;
 mod prefix;
@@ -553,6 +554,7 @@ pub use {
     error::{Error, FormatPart, Result},
     format_version::FormatVersion,
     iter_guard::IterGuard as Guard,
+    key_domain::KeyDomains,
     memtable::{Memtable, MemtableId},
     merge_operator::MergeOperator,
     prefix::PrefixExtractor,

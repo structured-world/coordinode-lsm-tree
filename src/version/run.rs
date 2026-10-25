@@ -213,10 +213,11 @@ impl<T: Ranged> Run<T> {
     ///
     /// # Precondition (guaranteed by construction)
     ///
-    /// Tables within a run are sorted by `key_range` in comparator order.
-    /// This holds because tables are flushed from comparator-sorted memtables
-    /// and compaction preserves the ordering. The binary search here must
-    /// use the same comparator to maintain the invariant.
+    /// Tables within a run are sorted by `key_range` in comparator order and
+    /// disjoint. This holds because a version change lays the new tables out
+    /// in sorted, disjoint runs as they join a level, whatever order its
+    /// writer produced them in. The binary search here must use the same
+    /// comparator to maintain the invariant.
     pub fn get_for_key_cmp<C: UserComparator + ?Sized>(&self, key: &[u8], cmp: &C) -> Option<&T> {
         self.index_for_key_cmp(key, cmp)
             .and_then(|idx| self.items.get(idx))

@@ -70,7 +70,11 @@ impl<'a> BlobIngestion<'a> {
         .use_sync_mode(tree.index.config.sync_mode)
         .use_writeback_bytes(tree.index.config.writeback_bytes)
         .use_lifetime_groups(kv.lifetime_groups)
-        .use_clock(tree.index.config.clock.clone());
+        .use_clock(tree.index.config.clock.clone())
+        .use_key_domains(
+            tree.index.config.key_domains.clone(),
+            tree.index.config.comparator.clone(),
+        );
 
         // Ingestion writes blob files under the tree's own blob policy, so it
         // needs the dictionary to compress with and the set to pin on what it

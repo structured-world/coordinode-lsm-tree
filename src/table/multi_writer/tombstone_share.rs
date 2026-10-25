@@ -235,6 +235,42 @@ impl TombstoneShare {
     }
 }
 
+/// The tombstones, ordered by start, that the gaps between a writer's outputs
+/// meet, the gaps taken in key order: each tombstone is taken up when a gap
+/// first reaches its start and let go once a gap begins at or past its end, so
+/// a gap costs the tombstones it meets, not every one.
+#[derive(Default)]
+pub(super) struct GapCursor {
+    /// Indices of the tombstones taken up and not yet ended, in order by start.
+    open: Vec<usize>,
+    /// The first tombstone, by start, not yet taken up.
+    next: usize,
+}
+
+impl GapCursor {
+    /// The tombstones overlapping `[lower, upper)`, in order by start; `lower`
+    /// lies at or past every earlier gap's.
+    pub(super) fn overlapping<'t>(
+        &mut self,
+        tombstones: &'t [RangeTombstone],
+        (lower, upper): (&[u8], &[u8]),
+        comparator: &dyn UserComparator,
+    ) -> impl Iterator<Item = &'t RangeTombstone> {
+        while let Some(tombstone) = tombstones.get(self.next)
+            && comparator.compare(&tombstone.start, upper) == Ordering::Less
+        {
+            self.open.push(self.next);
+            self.next += 1;
+        }
+        self.open.retain(|&i| {
+            tombstones.get(i).is_some_and(|tombstone| {
+                comparator.compare(lower, &tombstone.end) == Ordering::Less
+            })
+        });
+        self.open.iter().filter_map(|&i| tombstones.get(i))
+    }
+}
+
 /// The pending tombstones starting at one key, whole.
 #[derive(Clone, Copy, Default)]
 pub(super) struct Group {

@@ -1,11 +1,45 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use super::TombstoneShare;
+use super::{GapCursor, TombstoneShare};
 use crate::{UserKey, comparator::default_comparator, range_tombstone::RangeTombstone};
 
 fn key(i: u64) -> Vec<u8> {
     format!("{i:08}").into_bytes()
+}
+
+/// Gaps taken in key order meet exactly the tombstones a scan of all of them
+/// finds overlapping each gap: short ones, one spanning several gaps, and
+/// none in a gap; the ones that ended are let go.
+#[test]
+fn gaps_in_key_order_meet_the_tombstones_overlapping_them() {
+    let comparator = default_comparator();
+    let cmp = comparator.as_ref();
+    let rt = |start: u64, end: u64| RangeTombstone::new(key(start).into(), key(end).into(), 1);
+    let tombstones = vec![rt(0, 3), rt(2, 40), rt(5, 6), rt(12, 14), rt(30, 31)];
+    let gaps = [(1, 4), (6, 9), (10, 13), (20, 25), (35, 50)];
+
+    let mut cursor = GapCursor::default();
+    for (lower, upper) in gaps {
+        let (lower, upper) = (key(lower), key(upper));
+        let met: Vec<_> = cursor
+            .overlapping(&tombstones, (&lower, &upper), cmp)
+            .cloned()
+            .collect();
+        let scanned: Vec<_> = tombstones
+            .iter()
+            .filter(|t| {
+                cmp.compare(&t.start, &upper).is_lt() && cmp.compare(&lower, &t.end).is_lt()
+            })
+            .cloned()
+            .collect();
+        assert_eq!(met, scanned, "gap {lower:?}..{upper:?}");
+    }
+    assert_eq!(
+        cursor.open,
+        [1],
+        "only the tombstone open past the last gap"
+    );
 }
 
 /// The tracking holds the tombstones open at the current key, not every

@@ -8,7 +8,7 @@ use crate::coding::{Decode, Encode};
 use crate::compaction::Input as CompactionPayload;
 use crate::compaction::worker::Options;
 use crate::range_tombstone::RangeTombstone;
-use crate::table::multi_writer::MultiWriter;
+use crate::table::multi_writer::{MultiWriter, TombstonesOutside};
 use crate::time::Instant;
 use crate::version::{SuperVersions, Version};
 use crate::vlog::blob_file::scanner::ScanEntry;
@@ -497,6 +497,9 @@ pub(super) fn prepare_table_writer(
         // filter writer (preserving the extractor). Only use_partitioned_filter
         // replaces the writer entirely (handled above, lines 85-90).
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
+        // A merge-on-read relocation, which bypasses this writer, refuses a
+        // source holding rows of two domains, so that source is rewritten here.
+        .use_key_domains(opts.config.key_domains.clone())
         .use_encryption(opts.config.encryption.clone())
         .use_clock(opts.config.clock.clone())
         // Read the ECC scheme from the same live snapshot as the other
@@ -784,8 +787,9 @@ pub(super) trait CompactionFlavour {
     #[cfg(feature = "columnar")]
     fn carrying(&mut self) -> Option<&mut StandardCompaction>;
 
-    /// Writes range tombstones to the current output table.
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]);
+    /// Writes range tombstones to the output tables, keeping the pieces of
+    /// `outside`'s that fall past them (see [`TombstonesOutside`]).
+    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone], outside: TombstonesOutside);
 
     /// Finalizes this (sub-)compaction's output files (flushing the table
     /// writer, finishing blob writers) WITHOUT installing a version edit. The
@@ -1461,8 +1465,12 @@ impl RelocatingCompaction {
 }
 
 impl CompactionFlavour for RelocatingCompaction {
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
-        self.inner.write_range_tombstones(tombstones);
+    fn write_range_tombstones(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        outside: TombstonesOutside,
+    ) {
+        self.inner.write_range_tombstones(tombstones, outside);
     }
 
     /// A relocating compaction moves the blob values its rows point at, so it
@@ -1903,8 +1911,13 @@ impl StandardCompaction {
 }
 
 impl CompactionFlavour for StandardCompaction {
-    fn write_range_tombstones(&mut self, tombstones: &[RangeTombstone]) {
+    fn write_range_tombstones(
+        &mut self,
+        tombstones: &[RangeTombstone],
+        outside: TombstonesOutside,
+    ) {
         self.table_writer.set_range_tombstones(tombstones.to_vec());
+        self.table_writer.keep_tombstones_outside(outside);
     }
 
     fn write(&mut self, item: InternalValue) -> crate::Result<()> {
