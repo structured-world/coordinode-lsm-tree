@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792967849371,
+  "lastUpdate": 1792967853262,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -68880,6 +68880,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.554702986,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "34ee18edd346bbc98e48e9f7642f91b5e271b61f",
+          "message": "fix(compaction): keep relocated and last-output tombstones in bounds (#990)\n\n## Summary\n- Under a key-domain policy, a merge-on-read relocation no longer keeps\na source whose own range tombstone reaches out of its rows' domain: the\nrelocated table would carry that tombstone's end, and its key range,\ninto the next domain. The copy-on-write merge splits such a source per\ndomain.\n- A compaction's last output keeps its last key under the tombstone over\nit whatever the comparator: it cut its tombstones at the last key's byte\nsuccessor, which sorts before that key under a non-byte comparator.\n\n## Changes\n- `plan_merge_on_read` refuses a source when any of its range tombstones\nstarts in another domain than its first row or ends past that domain, as\nwell as when its rows span two domains.\n- `MultiWriter::write_rts_to_writer` derives the last output's exclusive\nupper bound from the byte successor only under byte order; under another\ncomparator it clips on the lower bound alone, as it already did for a\nlast key with no successor.\n- The README states when expiring a domain removes its tables.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, aarch64,\nthe tool crates, the benches and the i686 builds pass on Linux. Both\nregression tests fail on the code before the change.\n\nCloses #989\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Improved compaction handling of range tombstones at key-domain\nboundaries, keeping table ranges consistent with their rows.\n* Prevented relocation when tombstones cross key-domain boundaries,\nwhile preserving relocation for tables whose rows and tombstones remain\nwithin one domain.\n* Fixed tombstone clipping during compaction with reversed key ordering.\n* **Documentation**\n* Clarified that expired key-domain tables are removed during compaction\nonly after the range tombstone is flushed and falls below the compaction\nwatermark.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-25T22:13:33Z",
+          "tree_id": "0e65e4746b35f73e2462037147d8d21ae810c0b5",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/34ee18edd346bbc98e48e9f7642f91b5e271b61f"
+        },
+        "date": 1792967852108,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 510.59399999999994,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.736017ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 130.2,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.429608ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 430.545,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 97.773615ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4847.386,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9859.445,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.607,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 67.174399,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.563925349,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.143,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 70.254591,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.55883017,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
