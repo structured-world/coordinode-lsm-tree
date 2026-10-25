@@ -518,3 +518,89 @@ fn a_table_spanning_domains_is_rewritten_not_relocated() -> lsm_tree::Result<()>
     assert_eq!(latest(&tree)?.len(), 190, "the deleted rows read as absent");
     Ok(())
 }
+
+/// The same for a lone columnar table whose rows lie in one domain and whose
+/// own range tombstone reaches into the next: relocated, its key range would
+/// keep the tombstone's end past the domain. It is rewritten instead, the
+/// pieces past the domain going to a table of tombstones alone.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_table_whose_tombstone_leaves_its_domain_is_rewritten_not_relocated() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{DeleteStrategy, DeleteStrategyPolicy};
+
+    let merge_on_read = |any: &AnyTree| -> lsm_tree::Result<()> {
+        let AnyTree::Standard(tree) = any else {
+            panic!("expected a standard tree");
+        };
+        tree.update_runtime_config(|cfg| {
+            cfg.columnar = true;
+            cfg.zone_map = true;
+            cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+        })
+    };
+    let folder = tempfile::tempdir()?;
+    {
+        let tree = open(folder.path(), None)?;
+        merge_on_read(&tree)?;
+        for i in 0..100 {
+            tree.insert(key(0, i), b"v", u64::from(i));
+        }
+        // Deleting the last rows of epoch 0 and reaching into epoch 1.
+        tree.remove_range(key(0, 90), key(1, 5), 1_000);
+        tree.flush_active_memtable(0)?;
+        assert_eq!(
+            table_epochs(&tree),
+            vec![(0, 1)],
+            "self-check: the tombstone takes the table's key range into epoch 1"
+        );
+    }
+
+    let tree = open(folder.path(), Some(Arc::new(Epochs)))?;
+    merge_on_read(&tree)?;
+    tree.major_compact(u64::MAX, 5_000)?;
+
+    let past = tables_past_their_epoch(&tree)?;
+    assert!(past.is_empty(), "{past:#?}");
+    let keys: Vec<Vec<u8>> = latest(&tree)?.into_iter().map(|(k, _)| k).collect();
+    let expected: Vec<Vec<u8>> = (0..90).map(|i| key(0, i)).collect();
+    assert_eq!(keys, expected, "rows 90 to 99 deleted, the rest kept");
+    Ok(())
+}
+
+/// Under the policy a lone columnar table whose rows and own range tombstone
+/// lie within one domain is still relocated with a delete bitmap: the policy
+/// refuses only the sources that leave their domain.
+#[cfg(feature = "columnar")]
+#[test]
+fn a_table_within_its_domain_is_still_relocated() -> lsm_tree::Result<()> {
+    use lsm_tree::config::{DeleteStrategy, DeleteStrategyPolicy};
+
+    let folder = tempfile::tempdir()?;
+    let any = open(folder.path(), Some(Arc::new(Epochs)))?;
+    let AnyTree::Standard(tree) = &any else {
+        panic!("expected a standard tree");
+    };
+    tree.update_runtime_config(|cfg| {
+        cfg.columnar = true;
+        cfg.zone_map = true;
+        cfg.delete_strategy = DeleteStrategyPolicy::all(DeleteStrategy::MergeOnRead);
+    })?;
+    for i in 0..100 {
+        any.insert(key(0, i), b"v", u64::from(i));
+    }
+    any.remove_range(key(0, 90), key(0, 95), 1_000);
+    any.flush_active_memtable(0)?;
+    any.major_compact(u64::MAX, 5_000)?;
+
+    let version = any.current_version();
+    let tables: Vec<_> = version.iter_tables().collect();
+    assert_eq!(tables.len(), 1);
+    assert!(
+        tables.iter().all(|t| !t.delete_bitmap().is_empty()),
+        "relocated with a delete bitmap, not rewritten"
+    );
+    let keys: Vec<Vec<u8>> = latest(&any)?.into_iter().map(|(k, _)| k).collect();
+    let expected: Vec<Vec<u8>> = (0..90).chain(95..100).map(|i| key(0, i)).collect();
+    assert_eq!(keys, expected);
+    Ok(())
+}
