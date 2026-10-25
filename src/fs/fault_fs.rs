@@ -70,6 +70,9 @@ pub enum FaultOp {
     Rename,
     /// [`Fs::sync_directory`] — directory fsync.
     SyncDirectory,
+    /// [`Fs::sync_device`]: the flush of a device's write cache, after the
+    /// syncs it makes durable.
+    SyncDevice,
     /// Buffered/streaming write through [`std::io::Write::write`] on an open
     /// file. The only op for which [`Fault::ShortWrite`] is meaningful.
     Write,
@@ -1216,6 +1219,9 @@ impl<F: Fs> Fs for FaultFs<F> {
 
     fn sync_device(&self, path: &Path) -> io::Result<()> {
         self.injector.note_sync(path, SyncKind::Device);
+        if let Some(Fault::Error(kind)) = self.injector.check(FaultOp::SyncDevice, Some(path)) {
+            return Err(fault_error(kind, FaultOp::SyncDevice));
+        }
         self.inner.sync_device(path)
     }
 

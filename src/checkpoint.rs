@@ -494,50 +494,12 @@ fn link_dictionaries(
     Ok(ids.len())
 }
 
-/// Copies an OPTIONAL metadata file from `src_root` to `target_root`.
+/// Installs `v<id>` in the checkpoint.
 ///
-/// "Optional" = the source file may legitimately be absent (recovery
-/// treats a missing manifest as a freshly-initialised tree). Required
-/// metadata is no longer copied through this path — `v<id>` is now
-/// serialised directly from the captured in-memory Version (see
-/// [`copy_metadata`]) so its source-file lifetime no longer matters.
-///
-/// Opens the source directly instead of `exists()` + `open()` to avoid
-/// the TOCTOU window where the file disappears between the two calls.
-fn copy_metadata_file_optional(
-    src_fs: &dyn Fs,
-    src_root: &Path,
-    target_fs: &dyn Fs,
-    target_root: &Path,
-    file_name: &str,
-    sync_mode: SyncMode,
-) -> crate::Result<()> {
-    let src = src_root.join(file_name);
-    let mut src_file = match src_fs.open(&src, &FsOpenOptions::new().read(true)) {
-        Ok(f) => f,
-        Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let dst = target_root.join(file_name);
-    let mut dst_file = target_fs.open(
-        &dst,
-        &FsOpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .write_origin(crate::fs::WriteOrigin::Checkpoint),
-    )?;
-
-    std::io::copy(&mut src_file, &mut dst_file)?;
-    dst_file.flush()?;
-    FsFile::sync_all_with(&*dst_file, sync_mode)?;
-    Ok(())
-}
-
-/// Replicates manifest + installs `v<id>` in the checkpoint.
-///
-/// Best-effort-copies the manifest from the source tree, then writes and
-/// installs `v<id>` (with its empty edit log) into the checkpoint directory
-/// from the captured in-memory `Version` rather than copying the source file.
+/// Writes and installs `v<id>` (with its empty edit log), the manifest
+/// snapshot that carries the level count and comparator name, into the
+/// checkpoint directory from the captured in-memory `Version` rather than
+/// copying the source file.
 ///
 /// `version` is the captured snapshot held by the checkpoint driver
 /// from `tree.current_version()`. Writing it through
@@ -551,15 +513,7 @@ fn copy_metadata_file_optional(
 /// the captured `version.id()` (NOT the source's newest), so a concurrent
 /// install of `v<N+1>` on the source can never leave the checkpoint naming
 /// a version whose tables it did not link.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "checkpoint metadata copy threads (src fs+root, target fs+root, version, \
-              comparator, runtime, encryption) — every parameter is load-bearing and \
-              wrapping into a struct would just move the count to the struct literal"
-)]
 pub fn copy_metadata(
-    src_fs: &dyn Fs,
-    src_root: &Path,
     target_fs: &dyn Fs,
     target_root: &Path,
     version: &crate::version::Version,
@@ -568,17 +522,6 @@ pub fn copy_metadata(
     encryption: Option<std::sync::Arc<dyn crate::encryption::EncryptionProvider>>,
     sync_mode: SyncMode,
 ) -> crate::Result<()> {
-    // Manifest stores level count + comparator name. On a never-written
-    // tree the manifest may legitimately be absent (recovery treats
-    // missing manifest as a freshly-initialised tree), so this is optional.
-    copy_metadata_file_optional(
-        src_fs,
-        src_root,
-        target_fs,
-        target_root,
-        "manifest",
-        sync_mode,
-    )?;
     // Re-serialise the captured Version into target/v<id> rather than
     // copying the source file. Reason: a manifest rotation can physically
     // remove the source v<id> between current_version() and this point.
@@ -857,8 +800,6 @@ pub fn run_checkpoint<T: AbstractTree>(
     )?;
 
     copy_metadata(
-        &**src_fs,
-        src_root,
         &**target_fs,
         target_root,
         &version,

@@ -209,12 +209,16 @@ struct Wrapped {
 }
 
 #[cfg(feature = "metrics")]
-impl Wrapped {
-    /// The backend `slot` holds with this wrapper taken off: the one it was
-    /// given while the wrapper is still there, what a caller put since if not.
+impl WriteCount {
+    /// Takes off `slot` whichever of this tree's wrappers it holds, the
+    /// primary backend's or any route's, wherever routes have moved since;
+    /// a backend a caller put there since is left as it is.
     fn unwrap(&self, slot: &mut Arc<dyn Fs>) {
-        if Arc::ptr_eq(slot, &self.counted) {
-            *slot = Arc::clone(&self.given);
+        if let Some(wrapped) = core::iter::once(&self.fs)
+            .chain(&self.routes)
+            .find(|wrapped| Arc::ptr_eq(slot, &wrapped.counted))
+        {
+            *slot = Arc::clone(&wrapped.given);
         }
     }
 }
@@ -772,7 +776,7 @@ pub struct Config {
 
     /// Number of levels of the LSM tree (depth of tree)
     ///
-    /// Once set, the level count is fixed (in the "manifest" file)
+    /// Once set, the level count is fixed (in the manifest snapshot `v<id>`)
     pub level_count: u8,
 
     /// Restart interval inside data blocks
@@ -1789,9 +1793,9 @@ impl Config {
     #[cfg(feature = "metrics")]
     pub(crate) fn count_writes(&mut self) {
         if let Some(earlier) = self.write_count.take() {
-            earlier.fs.unwrap(&mut self.fs);
-            for (route, wrapped) in self.level_routes.iter_mut().flatten().zip(&earlier.routes) {
-                wrapped.unwrap(&mut route.fs);
+            earlier.unwrap(&mut self.fs);
+            for route in self.level_routes.iter_mut().flatten() {
+                earlier.unwrap(&mut route.fs);
             }
         }
         let stats = Arc::<crate::fs::WriteIoStats>::default();

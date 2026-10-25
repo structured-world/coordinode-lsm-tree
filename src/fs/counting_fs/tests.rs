@@ -161,8 +161,19 @@ fn directory_operations_are_counted() -> crate::io::Result<()> {
         .once(),
     );
     assert!(fs.sync_directory(Path::new("/db")).is_err());
+    fs.sync_device(Path::new("/db"))?;
+    injector.arm(
+        FaultRule::new(
+            FaultOp::SyncDevice,
+            Fault::Error(crate::io::ErrorKind::Other),
+        )
+        .once(),
+    );
+    assert!(fs.sync_device(Path::new("/db")).is_err());
 
     let reading = fs.stats().snapshot();
+    assert_eq!(reading.directory.device_syncs, 2);
+    assert_eq!(reading.directory.device_sync_errors, 1);
     assert_eq!(reading.directory.linked, 1);
     assert_eq!(reading.directory.renamed, 1);
     assert_eq!(
@@ -172,7 +183,7 @@ fn directory_operations_are_counted() -> crate::io::Result<()> {
     assert_eq!(reading.directory.syncs, 2);
     assert_eq!(reading.directory.sync_errors, 1);
     assert_eq!(reading.files().bytes, 64, "the link copied nothing");
-    assert_eq!(reading.syncs(), 2);
+    assert_eq!(reading.syncs(), 4);
     Ok(())
 }
 

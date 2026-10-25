@@ -436,6 +436,58 @@ fn an_ingestion_charges_each_record_it_takes_in() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// A config cloned from an open tree whose routes are reordered counts each
+/// route once, into the new tree's counters only: the first tree's wrappers
+/// are taken off whichever route now holds them.
+#[test]
+fn a_cloned_config_with_reordered_routes_counts_into_its_own_tree_only() -> lsm_tree::Result<()> {
+    use lsm_tree::config::LevelRoute;
+
+    let warm: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let cold: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let first = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(MemFs::new()))
+    .level_routes(vec![
+        LevelRoute {
+            levels: 1..4,
+            path: "/warm".into(),
+            fs: warm,
+        },
+        LevelRoute {
+            levels: 4..7,
+            path: "/cold".into(),
+            fs: cold,
+        },
+    ])
+    .open()?;
+
+    let mut config = first.tree_config().clone();
+    if let Some(routes) = &mut config.level_routes {
+        routes.reverse();
+    }
+    let second = config.with_shared_fs(Arc::new(MemFs::new())).open()?;
+    for i in 0..100u32 {
+        second.insert(format!("key{i:03}"), "value", u64::from(i));
+    }
+    second.flush_active_memtable(0)?;
+    second.major_compact(u64::MAX, 0)?;
+
+    assert!(
+        second.write_io().origin(WriteOrigin::CompactionTable).bytes > 0,
+        "self-check: the second tree compacted into a route"
+    );
+    assert_eq!(
+        first.write_io().origin(WriteOrigin::CompactionTable),
+        FileWrites::default(),
+        "the first tree compacted nothing"
+    );
+    Ok(())
+}
+
 /// A config cloned from an open tree and given other backends opens on those
 /// backends, the primary one and every route's: the counting wrappers of the
 /// first tree are taken off only where they are still in place.
