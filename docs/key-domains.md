@@ -95,6 +95,10 @@ and table counts are the same in every round.
 - It pays a descriptor and a manifest per retained epoch, and reopens 4 to 9
   times slower.
 
+On btrfs the space and the table counts are the same and the layouts rank the
+same; the bytes written are 3% to 18% higher, the filesystem's own metadata
+writes counted with them.
+
 Choose a tree per domain when domains are few and smaller than a memtable and
 write volume matters most; choose domains in one tree when domains are many,
 or a reader needs one consistent view across them without opening a tree per
