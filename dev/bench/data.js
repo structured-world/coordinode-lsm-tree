@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792854027346,
+  "lastUpdate": 1792887682952,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -63866,6 +63866,92 @@ window.BENCHMARK_DATA = {
             "value": 335324.8370413925,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 12.5us | P99.9: 90.3us\nthreads: 1 | elapsed: 0.60s | num: 200000 | iterations: 3"
+          }
+        ]
+      }
+    ],
+    "lsm-tree db_bench 7.x · Linux · runner1-sw": [
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2960b110576e5a06b61c04e02cf782eeb28f4850",
+          "message": "feat(compaction)!: reclaim tables a range tombstone deletes (#984)\n\n## Summary\n- A range is deleted by `remove_range`, exactly and at once, and its\nspace comes back without rewriting: every compaction run first unlinks\nthe tables a flushed range tombstone below its watermark spans whole and\nis newer than.\n- `AbstractTree::drop_range` is removed. It deleted by table layout, so\nwhich keys vanished depended on where tables happened to be cut, the\nmemtable was untouched, and every older snapshot lost its history.\n- A point read and a scoped change scan honour a table's range\ntombstones past its key range, as a full scan already did.\n\nThe deletion is exact for any layout, so there is no partial outcome to\nrefuse: what a layout decides is only how much space comes back without\na rewrite.\n\n## Changes\n- `compaction::covered` picks the tables to unlink: a tombstone held by\nanother table of the version (never one still in a memtable), visible at\nthe run's watermark, newer than every row and tombstone of the table,\nand spanning both its key range and its own tombstones, which can reach\npast that range. A table whose seqno range does not fit the seqno space\nhas no provable age and stays; hidden tables stay with their compaction;\na tombstone in a table with a base seqno proves nothing.\n- The worker runs that drop in one version edit before the strategy\nchooses, on a clone of the version, so a merge never reads a table only\nto discard it. The run reports the strategy's action with every table it\ntook in.\n- The drop refuses only the snapshots that could have read a dropped\ntable: up to the oldest tombstone covering it\n(`RetentionEffect::GcBelow`), not every snapshot up to the install.\n- The tombstone keeps hiding older versions in tables reaching past it\nuntil a bottom merge applies it, so a drop uncovers nothing.\n- A point read no longer skips a table by its key range before its\ntombstones, and a scoped change scan delivers the tombstones of a table\nit does not read for rows: a compaction cuts a tombstone at the next\noutput's first key without widening the range up to it.\n- A run caches whether any of its tables holds a range tombstone,\ncleared by every change of its tables; the reclaim check and the point\nread skip runs without one.\n- A table records the greatest end of its range tombstones on open, so a\npoint read rules it out in two compares by the stretch its tombstones\ncover. `visible_range_tombstones` lends the stored tombstones and builds\none only where a restriction clamps it.\n- `remove_range` documents that nothing is rewritten only where the\nrange ends at table boundaries, and that keys indexed elsewhere are the\ncaller's to remove.\n- The drop-range strategy and `drop_range` on every tree type are\nremoved; `clear` empties a whole tree.\n- `structured-zstd` is required at 0.2.5.\n\n## Measurements\n`benches/range_reclaim.rs` on a Linux runner, trees on disk, three\nalternating rounds against v6.0.1, where a day goes through\n`drop_range`. Ten emulated days, one 2.2 MB table per day. Expiry and\nrolling retention are a byte report with median and maximum time; the\nidle run and the point reads go through criterion, the point reads over\nevery row of 400 tables.\n\n| | v6.0.1 | this PR |\n|---|---|---|\n| expire one day | `drop_range` 1.06-1.12 ms | tombstone flush 2.14-2.27\nms + reclaim 1.0 ms, 0 bytes read or written |\n| rolling retention, size-tiered: rewritten / disk growth at the end | 0\n/ 22.0 MB, no day ever freed | 0 / 2 KB |\n| rolling retention, leveled: read / rewritten / peak growth / growth at\nthe end | 61.6 / 45.9 / 8.8 / 4.4 MB | 44.0 / 45.9 / 2.2 / 2.2 MB |\n| compaction run that finds nothing, 400 tables | 5.18-5.52 µs |\n5.14-5.44 µs |\n| point read that finds its key (criterion mean) | 1.43-1.48 µs |\n0.79-0.88 µs |\n| the same, P50 / P99 / P999 of a get timed alone | 1.30 / 1.9-2.1 /\n8-12 µs | 0.71 / 1.2 / 7.1-7.4 µs |\n| the same over 40 older tombstones spanning the tables (mean) |\n1.86-1.90 µs | 1.02-1.04 µs |\n\nRolling retention writes the next day and expires the oldest ten times,\neach followed by the strategy until it is idle. Size-tiered keeps every\nday in a table of its own, so each expired day is unlinked whole and\nnothing is rewritten. Leveled merges neighbouring days into shared\ntables, which a day's tombstone no longer spans whole, so their\nsurvivors are rewritten as before; keeping such a layout aligned to the\ndays is #976. The leveled bytes of this PR depend on the host (another\nrunner read 48.4 MB and peaked at 6.6 MB), while v6.0.1's are the same\non both.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, the tool\ncrates and the i686 builds pass on Linux. The reclaim is tested against\na power loss after each of its syncs on a standard and a KV-separated\ntree, a tombstone lost from the memtable, a checkpoint taken before it,\nmerge operands, a reversed comparator and snapshots below the tombstone.\n\nReplaces #983, closed so the squashed history does not land under its\nthreads.\n\nBREAKING CHANGE: `AbstractTree::drop_range` is removed. Delete a range\nwith `remove_range`; a compaction whose watermark is above its seqno\nreclaims the tables it spans.\n\nCloses #977",
+          "timestamp": "2026-10-25T00:06:40Z",
+          "tree_id": "985c7c16c32a4ff39649053be2f5c93648e31ff6",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2960b110576e5a06b61c04e02cf782eeb28f4850"
+        },
+        "date": 1792887681808,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 67091.67542483324,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 20.0us | P99.9: 38.8us\nthreads: 1 | elapsed: 7.98s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2442496.1005855068,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 683727.1004880249,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.8us | P99.9: 15.2us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 466836.51081480697,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 7.3us | P99.9: 29.1us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3212198.078074434,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 327784.6821887978,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.4us | P99.9: 16.2us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 173314.58234778896,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 14.9us | P99.9: 94.4us\nthreads: 1 | elapsed: 1.15s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 705529.5209478894,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.8us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 743436.5490528857,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 8.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 327252.69732513383,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 12.3us | P99.9: 91.6us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
