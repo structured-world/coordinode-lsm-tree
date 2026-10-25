@@ -700,7 +700,8 @@ impl MultiWriter {
     ///   `clip_upper` is the first key of the *next* output table, so the
     ///   range extends past the table's last KV key and covers the gap.
     ///   For the final table `clip_upper` is `None` and we fall back to
-    ///   `upper_bound_exclusive(last_key)`.
+    ///   `upper_bound_exclusive(last_key)` under byte order, to the lower
+    ///   bound alone under any other comparator.
     /// - **clip=false** (flush): cut each RT to the table's zone, from `lower`
     ///   (`None` for the first output) to `clip_upper` (`None` for the last),
     ///   so the outputs together hold every RT once and still cover keys in
@@ -724,14 +725,19 @@ impl MultiWriter {
                 // the gap between tables so RTs spanning it are preserved.
                 //
                 // For the final table `clip_upper` is None and we derive the
-                // exclusive upper bound from the table's last KV key.
+                // exclusive upper bound from the table's last KV key: its byte
+                // successor, which follows it only in byte order. Under another
+                // comparator it may sort before the last key, so the final
+                // table clips on the lower bound alone, as below.
                 let derived_upper;
                 let max_exclusive: Option<&[u8]> = if let Some(upper) = clip_upper {
                     Some(upper.as_ref())
-                } else {
+                } else if comparator.is_lexicographic() {
                     derived_upper =
                         crate::range_tombstone::upper_bound_exclusive(last_key.as_ref());
                     derived_upper.as_deref()
+                } else {
+                    None
                 };
 
                 if let Some(max_exclusive) = max_exclusive {
@@ -772,10 +778,11 @@ impl MultiWriter {
                         }
                     }
                 } else {
-                    // `last_key` is the lexicographically maximal encodable user
-                    // key, so there is no strict successor. In that case clip
-                    // only on the lower bound and keep the persisted key_range
-                    // unchanged; widening it during compaction would break the
+                    // `last_key` has no successor to cut at: it is the
+                    // lexicographically maximal encodable user key, or the
+                    // comparator is not byte order. Clip only on the lower
+                    // bound and keep the persisted key_range unchanged;
+                    // widening it during compaction would break the
                     // disjoint-run invariant that point reads rely on.
                     for rt in tombstones {
                         let clipped_start = if comparator.compare(&rt.start, first_key.as_ref())

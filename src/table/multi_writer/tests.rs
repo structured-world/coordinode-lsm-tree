@@ -1826,6 +1826,79 @@ fn an_output_of_tombstones_alone_orders_its_range_by_the_comparator() -> crate::
     Ok(())
 }
 
+/// A compaction's last output cuts its tombstones past its last key in the
+/// comparator's order. The byte successor of the last key sorts before it
+/// under a reversed comparator, so cutting there would leave the last key out
+/// of the tombstone over it.
+#[test]
+fn a_last_output_keeps_its_last_key_under_its_tombstone_in_comparator_order() -> crate::Result<()> {
+    use crate::{InternalValue, UserKey, fs::StdFs, range_tombstone::RangeTombstone};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ReverseComparator;
+    impl crate::comparator::UserComparator for ReverseComparator {
+        fn name(&self) -> &'static str {
+            "reverse-test"
+        }
+        fn compare(&self, a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+            b.cmp(a)
+        }
+    }
+
+    let folder = tempfile::tempdir()?;
+    let base_path = folder.path().to_path_buf();
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(StdFs);
+    let comparator: crate::SharedComparator = Arc::new(ReverseComparator);
+    let mut mw = super::MultiWriter::new(
+        base_path.clone(),
+        SequenceNumberCounter::default(),
+        u64::MAX,
+        1,
+        fs,
+    )?
+    .set_comparator(comparator.clone())
+    .use_clip_range_tombstones();
+    // In reverse order "c" < "b" < "a" < "A": the tombstone covers "a", the
+    // output's last key.
+    mw.set_range_tombstones(vec![RangeTombstone::new(
+        UserKey::from(b"b" as &[u8]),
+        UserKey::from(b"A" as &[u8]),
+        5,
+    )]);
+    for key in [b"c" as &[u8], b"a"] {
+        mw.write(InternalValue::from_components(
+            UserKey::from(key),
+            b"v".to_vec(),
+            1,
+            crate::ValueType::Value,
+        ))?;
+    }
+    let results = mw.finish()?.tables;
+    let cache = Arc::new(crate::Cache::with_capacity_bytes(64 * 1_024));
+    let [(table_id, checksum)] = results.as_slice() else {
+        panic!("one output, got {}", results.len());
+    };
+    let table = crate::Table::recover(crate::table::RecoverParams::new(
+        base_path.join(table_id.to_string()),
+        *checksum,
+        *table_id,
+        Arc::new(StdFs),
+        comparator.clone(),
+        cache,
+    ))?;
+    let covers_a = table.range_tombstones().iter().any(|rt| {
+        comparator.compare(&rt.start, b"a") != core::cmp::Ordering::Greater
+            && comparator.compare(b"a", &rt.end) == core::cmp::Ordering::Less
+    });
+    assert!(
+        covers_a,
+        "the last key lies under its tombstone: {:?}",
+        table.range_tombstones()
+    );
+    Ok(())
+}
+
 /// Each output of a flush visits only the tombstones overlapping its zone, not
 /// the whole set: disjoint tombstones spread over many outputs cost a bounded
 /// number of comparisons each, however many outputs the flush writes.

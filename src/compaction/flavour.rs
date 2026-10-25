@@ -498,7 +498,8 @@ pub(super) fn prepare_table_writer(
         // replaces the writer entirely (handled above, lines 85-90).
         .use_prefix_extractor(opts.config.prefix_extractor.clone())
         // A merge-on-read relocation, which bypasses this writer, refuses a
-        // source holding rows of two domains, so that source is rewritten here.
+        // source holding rows of two domains or a range tombstone leaving its
+        // rows' domain, so that source is rewritten here.
         .use_key_domains(opts.config.key_domains.clone())
         .use_encryption(opts.config.encryption.clone())
         .use_clock(opts.config.clock.clone())
