@@ -13,7 +13,14 @@ fn key(epoch: u32, i: u32) -> Vec<u8> {
 }
 
 fn compact_all(tree: &AnyTree, watermark: SeqNo) -> lsm_tree::Result<()> {
-    let strategy = Arc::new(Leveled::default());
+    compact_all_with(tree, watermark, &Arc::new(Leveled::default()))
+}
+
+fn compact_all_with(
+    tree: &AnyTree,
+    watermark: SeqNo,
+    strategy: &Arc<Leveled>,
+) -> lsm_tree::Result<()> {
     while tree.compact(strategy.clone(), watermark)?.action != CompactionAction::Nothing {}
     Ok(())
 }
@@ -240,16 +247,19 @@ fn noisy(epoch: u32, series: u32, seq: u32) -> [u8; 100] {
     out
 }
 
-/// The same with default table sizes, memtables flushed at 4 MiB, rows
-/// interleaved across 64 series, and a share of each epoch arriving during
-/// the next one.
+/// The same with rows interleaved across 64 series, a share of each epoch
+/// arriving during the next one, and large compactions split into parallel
+/// sub-compactions: tables, memtables and level targets a sixteenth of the
+/// defaults, so the tree takes the same shape from a sixteenth of the rows.
 #[test]
 fn an_expired_range_stays_expired_with_interleaved_series_and_late_rows() -> lsm_tree::Result<()> {
     const EPOCHS: u32 = 30;
-    const ROWS: u32 = 20_000;
+    const ROWS: u32 = 1_250;
     const RETENTION: u32 = 12;
     const SERIES: u32 = 64;
     const LATE_EVERY: u32 = 100;
+    const TABLE: u64 = 4 * 1_024 * 1_024;
+    const MEMTABLE: u64 = 256 * 1_024;
 
     let folder = tempfile::tempdir()?;
     let seqno = SequenceNumberCounter::default();
@@ -258,17 +268,21 @@ fn an_expired_range_stays_expired_with_interleaved_series_and_late_rows() -> lsm
         seqno.clone(),
         SequenceNumberCounter::default(),
     )
+    .table_target_size(TABLE)
+    .compaction_threads(4)
+    .subcompaction_min_bytes(512 * 1_024)
     .open()?;
+    let strategy = Arc::new(Leveled::default().with_table_target_size(TABLE));
     let settle = |tree: &AnyTree| -> lsm_tree::Result<()> {
         tree.flush_active_memtable(seqno.get())?;
-        compact_all(tree, seqno.get())
+        compact_all_with(tree, seqno.get(), &strategy)
     };
     let insert = |tree: &AnyTree, epoch: u32, row: u32| -> lsm_tree::Result<()> {
         let (series, seq) = (row % SERIES, row / SERIES);
         let mut k = key(epoch, series);
         k.extend_from_slice(&seq.to_be_bytes());
         tree.insert(k, noisy(epoch, series, seq), seqno.next());
-        if tree.active_memtable().size() >= 4 * 1_024 * 1_024 {
+        if tree.active_memtable().size() >= MEMTABLE {
             settle(tree)?;
         }
         Ok(())
