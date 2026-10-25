@@ -1535,9 +1535,11 @@ impl MultiWriter {
             writer.mark_lineage_last();
         }
         let path = writer.path.clone();
-        if let Some((table_id, checksum)) =
-            writer.finish_deferring_dir_sync(self.inherited_age.as_mut())?
-        {
+        // Its age is its own, not the inputs': these outputs fall outside the
+        // key order the age sweep takes the others in, and a table of
+        // tombstones aged as of now is dropped by age no sooner than the rows
+        // it deletes.
+        if let Some((table_id, checksum)) = writer.finish_deferring_dir_sync(None)? {
             self.results.push((table_id, checksum));
             if let Some(outputs) = &self.outputs {
                 outputs.landed(&*self.fs, &path)?;

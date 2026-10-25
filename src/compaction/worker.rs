@@ -1318,7 +1318,6 @@ fn range_tombstones_after_gc(
 
 /// Whether a table outside the compaction holds keys in `rt`'s span, which
 /// only `rt` keeps deleted once the compaction's inputs are gone.
-#[cfg(feature = "std")]
 fn overlaps_a_table_outside(
     rt: &crate::range_tombstone::RangeTombstone,
     version: &Version,
@@ -1363,7 +1362,6 @@ fn answered_span(
 
 /// The tombstones of `rts` a writer answering for `[lower, upper)` keeps
 /// past its outputs' keys: those a table outside the compaction overlaps.
-#[cfg(feature = "std")]
 fn tombstones_outside(
     rts: &[crate::range_tombstone::RangeTombstone],
     version: &Version,
