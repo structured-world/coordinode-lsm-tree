@@ -292,9 +292,13 @@ matching entry (and add one for a new subsystem).
   a flush or compaction that collected nothing, or an empty drop leaves it
   alone. The one exception to "collected nothing, raises nothing" is the
   tight-space slice loop, which records `GcBelow(w)` for every slice whether
-  or not its merge collected (see the Compaction entry on `of_run`). The floor
-  only rises (`Version::with_retention_floor`), so a lower
+  or not its merge collected (see the Compaction entry on `of_run`). No
+  install lowers the floor (`Version::with_retention_floor`), so a lower
   watermark on a later run never makes a refused snapshot readable again.
+  The one call that does is `AbstractTree::lower_retention_floor`, made by a
+  caller that cleared the tree and reinstalled a source's history above that
+  source's floor; it refuses to raise the floor, and the clear's floor holds
+  until the call, so no snapshot reads the history half reinstalled.
   Merge-on-read relocation is NOT in that list: it is reached only for a
   non-empty delete bitmap built from below-watermark range tombstones, so the
   replacement masks rows an older snapshot could read, and it reports

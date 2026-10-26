@@ -549,6 +549,28 @@ pub enum Error {
         oldest_retained: SeqNo,
     },
 
+    /// [`AbstractTree::lower_retention_floor`](crate::AbstractTree::lower_retention_floor)
+    /// was asked for a floor above the current one. Only GC and the
+    /// installs that drop data raise the floor; the request changed nothing.
+    RetentionFloorRaise {
+        /// The retention floor in force.
+        current: SeqNo,
+
+        /// The floor the call asked for.
+        requested: SeqNo,
+    },
+
+    /// [`AbstractTree::lower_retention_floor`](crate::AbstractTree::lower_retention_floor)
+    /// was asked for a floor above the tree's seqno counter: it would refuse
+    /// snapshots the counter has yet to hand out. The request changed nothing.
+    RetentionFloorAboveSeqno {
+        /// The counter's current seqno.
+        seqno: SeqNo,
+
+        /// The floor the call asked for.
+        requested: SeqNo,
+    },
+
     /// A projected columnar scan cannot produce a field as its projection
     /// declares: the field is absent from a row and declared an error, a
     /// segment stores it under another type, a row value has to be read and

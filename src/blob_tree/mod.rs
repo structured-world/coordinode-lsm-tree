@@ -2426,6 +2426,11 @@ impl AbstractTree for BlobTree {
         self.index.retention_floor()
     }
 
+    fn lower_retention_floor(&self, floor: SeqNo) -> crate::Result<()> {
+        // The blob files share the index tree's version, and its floor.
+        self.index.lower_retention_floor(floor)
+    }
+
     fn compaction_rate_limiter(&self) -> alloc::sync::Arc<crate::rate_limiter::RateLimiter> {
         // Compactions run through the index tree, so its limiter is the one.
         self.index.compaction_rate_limiter()

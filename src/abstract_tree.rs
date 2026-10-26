@@ -1409,11 +1409,56 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// This is the value a deployment records for a later manifest repair
     /// ([`Config::repair_retention_floor`](crate::Config::repair_retention_floor)):
-    /// it already folds in every operation that advanced the boundary (GC
-    /// compactions, `clear`, table drops, filtering compactions), so no
+    /// it already folds in every operation that moved the boundary (GC
+    /// compactions, `clear`, table drops, filtering compactions, and
+    /// [`lower_retention_floor`](Self::lower_retention_floor)), so no
     /// caller-side bookkeeping of watermarks is needed. `0` until the first
     /// such install.
     fn retention_floor(&self) -> SeqNo;
+
+    /// Lowers the persisted retention floor to `floor`, so snapshots above it
+    /// are served again, now and after a reopen.
+    ///
+    /// For a rebuild from a source that kept history above its own floor:
+    /// [`clear`](Self::clear) the tree, reinstall the source's history at its
+    /// original seqnos, then lower the floor to the source's
+    /// [`retention_floor`](Self::retention_floor). Until this call the clear's
+    /// floor refuses every snapshot below it, so a reader never sees the
+    /// history half reinstalled, and a crash before the call leaves that
+    /// refusal in place.
+    ///
+    /// The tree cannot check the claim this call makes: that it holds every
+    /// version above `floor` a snapshot above `floor` could see. That includes
+    /// not collecting any of the reinstalled history with a GC watermark above
+    /// `floor + 1` before the call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RetentionFloorRaise`](crate::Error::RetentionFloorRaise) when
+    /// `floor` is above the current floor, which only GC and the installs that
+    /// drop data raise; nothing changes.
+    /// [`Error::RetentionFloorAboveSeqno`](crate::Error::RetentionFloorAboveSeqno)
+    /// when `floor` is above the seqno counter (one reset on reopen can stand
+    /// below the current floor); nothing changes. An I/O error persisting the
+    /// new floor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    ///
+    /// let tree = Config::new(folder, SequenceNumberCounter::new(100), Default::default()).open()?;
+    /// tree.clear()?;
+    /// // Reinstall a source's history, which it kept above seqno 5.
+    /// tree.insert("k", "v", 10);
+    /// tree.lower_retention_floor(5)?;
+    /// assert_eq!(tree.get("k", 11)?.as_deref(), Some(b"v".as_slice()));
+    /// assert!(tree.get("k", 5).is_err());
+    /// #
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    fn lower_retention_floor(&self, floor: SeqNo) -> crate::Result<()>;
 
     /// Returns the limiter that throttles this tree's compactions: the one
     /// supplied through

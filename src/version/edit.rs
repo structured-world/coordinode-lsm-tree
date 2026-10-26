@@ -161,8 +161,9 @@ pub struct VersionEdit {
     pub blob_restrictions: Vec<(u64, u64)>,
     /// The version's retention floor (highest snapshot seqno a reopen may no
     /// longer serve), or `None` when unchanged from the prior version. Only a
-    /// GC compaction, a `clear` or a table drop raises it, so the common edit
-    /// carries nothing here.
+    /// GC compaction, a `clear` or a table drop raises it, and only
+    /// `AbstractTree::lower_retention_floor` lowers it, so the common edit
+    /// carries nothing here. Recovery takes the value as written, either way.
     pub retention_floor: Option<u64>,
     /// The version's FULL set of registered dictionary ids, or `None` when the
     /// set is unchanged from the prior version. Carried whole rather than as a
