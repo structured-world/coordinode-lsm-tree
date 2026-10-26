@@ -570,6 +570,11 @@ impl MultiWriter {
 
     /// [`Self::decide_cut`] for an output weighing `load`, measured once for
     /// every share of the target the rule compares it with.
+    #[expect(
+        clippy::inline_always,
+        reason = "asked on every new key a write takes, which the copy path asks too"
+    )]
+    #[inline(always)]
     fn decide_cut_at(
         &self,
         key: &[u8],
@@ -1762,6 +1767,11 @@ impl MultiWriter {
     /// can be judged against several size targets; `None` before its first
     /// record, which no target counts as full: closing an empty table would
     /// write its tombstones alone, unclipped, over its successors' keys.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured on every new key a write takes"
+    )]
+    #[inline(always)]
     fn output_load(&self) -> Option<OutputLoad> {
         if self.writer.meta.key_count == 0 {
             return None;

@@ -256,7 +256,27 @@ impl CarryMatcher {
     /// # Errors
     ///
     /// Any error of the sink.
+    #[expect(
+        clippy::inline_always,
+        reason = "every row a carrying compaction emits passes here"
+    )]
+    #[inline(always)]
     pub(crate) fn write<S: CarrySink + ?Sized>(
+        &mut self,
+        row: InternalValue,
+        sink: &mut S,
+    ) -> crate::Result<()> {
+        // Most rows have no candidate held and none ahead of them: they go
+        // straight out, without a call into the rest.
+        if self.open.is_none() && !self.may_cover(&row) {
+            return sink.write(row);
+        }
+        self.write_watched(row, sink)
+    }
+
+    /// [`Self::write`] of a row a candidate is held for or may cover.
+    #[inline(never)]
+    fn write_watched<S: CarrySink + ?Sized>(
         &mut self,
         row: InternalValue,
         sink: &mut S,
@@ -372,6 +392,11 @@ impl CarryMatcher {
     /// Whether a candidate may cover `row`: `false` when the last search of
     /// the queue found none and left none starting at or below its key, and
     /// none was recorded since, which a row is told without the lock.
+    #[expect(
+        clippy::inline_always,
+        reason = "asked of every row a carrying compaction emits"
+    )]
+    #[inline(always)]
     fn may_cover(&self, row: &InternalValue) -> bool {
         let Some((seen, first)) = &self.none_below else {
             return true;

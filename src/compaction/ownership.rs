@@ -66,6 +66,11 @@ impl OwnershipLedger {
     ///
     /// Returns the error of `write`, or of a held cell row that does not
     /// decode.
+    #[expect(
+        clippy::inline_always,
+        reason = "every row of a compaction passes here, from two merge loops"
+    )]
+    #[inline(always)]
     pub fn admit(
         &mut self,
         item: InternalValue,
