@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792995037956,
+  "lastUpdate": 1793029967353,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64372,6 +64372,90 @@ window.BENCHMARK_DATA = {
             "value": 282117.4506377016,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 17.9us | P99.9: 92.0us\nthreads: 1 | elapsed: 0.71s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3f31747b878261d585e5f7d3fac03bfb2d6674f5",
+          "message": "feat(compaction): cumulative host-write budget per medium (#992)\n\n## Summary\n- A cumulative host-write budget per physical medium,\n`write_budget::WriteBudget`: a byte allowance per period of wall time,\ncapped at a burst, charged with everything the medium's write ledger\ncounts. Rate pacing (`RateLimiter`) stays a separate axis.\n- Compaction reserves its expected output from the budget of each medium\nit writes to before a merge runs, gives the hold back as its outputs\nland, and waits without credit, its inputs untouched. It runs past the\nbudget only as a counted override: the tree at a stop threshold on L0\nruns or pending compaction bytes, the reclaiming merge the space gate\nnarrowed to on a full volume or the tight-space pass where no merge\nfits, or the caller forcing the budget.\n- The budget reports credit, overrun, the work waiting and when the\nrefill covers it, overrides by reason and `unsustainable` load (writes\nit cannot hold back taking more than the allowance), and checkpoints for\nthe caller to resume from without a free refill.\n- The bench workflow generates the lock file before `cargo pkgid`, which\nfailed on a clean checkout.\n\n## Changes\n- `src/write_budget.rs`: `Allowance`, `WriteBudget` (`reserve`,\n`reserve_or_override`, `reserve_overriding`, `set_forced`,\n`set_allowance`, `checkpoint`/`resume`, `report`, `with_clock`),\n`BudgetHold`, `BudgetReport`, `Override`; every operation has an `_at`\nform taking the wall time, and none needs `std`.\n- `CountingFs::with_budget` and `Fs::write_budget` bind the budget to\nthe medium's backend; the fault and crash wrappers forward it.\n- `compaction/worker.rs`: `budget_gate` beside the space gate;\n`OutputLedger::landed` gives holds back as outputs land. A merge of a\ntree that separates values asks the blob folder's budget too, since a\nmerge operator, a compaction filter or a locality relocation may write\nnew blob files there. Moves and drops write no table and are not held\nback; the tight-space pass reserves at most what the merge it replaces\nwould write.\n- Planned compaction caps its compaction rate at the allowance rate of\nthe last level's medium, less its model's write rate when L0 shares that\nbudget; leveled compaction keeps its shape under the gate, and the docs\nrecommend planned compaction on a budgeted medium.\n- `benches/write_budget.rs`: one sensor trace (a quiet night, a restart,\na burst, then the allowance cut below the flushes at run time) under no\ngovernor, a rate limit, a budget, and planned compaction under the\nbudget.\n- `.github/workflows/benchmark.yml`: the version line step generates the\nlock file before reading the package id.\n- `docs/write-budget.md`, the README and `docs/INVARIANTS.md`.\n\n## Measurements\n`write_budget` bench on Linux, 4 sensors for 12 h, a restart, 64 sensors\nfor 6 h, 6 h with the allowance cut to a quarter (below the flushes),\nthen 3 h with the allowance restored under a storage quota a tenth past\nthe footprint:\n\n| | written MiB | host WA | read p99 | overrides | unsustainable |\nnearly full: checks refusing writes | CPU s |\n|---|---|---|---|---|---|---|---|\n| no governor | 887 | 7.12 | 151 µs | | | 17 of 18 | 23.3 |\n| rate limit | 887 | 7.12 | 159 µs | | | 17 of 18 | 37.0 |\n| budget | 477 | 3.83 | 152 µs | 4 | 5 h | 17 of 18 | 13.5 |\n| planned + budget | 245 | 1.97 | 23 µs | 2 | 5 h | 12 of 18 | 7.5 |\n\nThe rate limit writes what no governor writes, later. The budget holds\nleveled compaction at the L0 stop threshold, where merges run as\noverrides, and in the cut phase reports the load unsustainable once the\ncut allowance's burst is spent. Near the quota the budget changes\nnothing for leveled compaction: its cross-level merges are ones the\nspace gate skips there whatever the budget says.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, the tool\ncrates and the benches pass on Linux.\n\nCloses #978\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable write budgets that limit compaction writes over\ntime, with burst capacity and credit that refills as time passes.\n* Compaction can wait when credit is unavailable, while forced work and\ncertain backpressure or space-reclamation cases can proceed and are\nreported as overrides.\n* Added budget status reporting, including charged writes, refusals,\nwait estimates, and unsustainable load, plus checkpoint and resume\nsupport.\n* Planned compaction now accounts for applicable write budgets when\nchoosing its compaction rate.\n* **Documentation**\n* Added guidance on configuring budgets, how they affect compaction, and\ninterpreting reports.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-26T17:34:33+02:00",
+          "tree_id": "be7e367459fccf32b1e5ae6818867d6552aeea05",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3f31747b878261d585e5f7d3fac03bfb2d6674f5"
+        },
+        "date": 1793029965417,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 70713.17259464168,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 16.9us | P99.9: 24.8us\nthreads: 1 | elapsed: 7.57s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2545919.9303599247,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.1us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 612805.1732228333,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.1us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 461461.5401593619,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.1us | P99.9: 28.5us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3172061.296151192,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 316164.2018131366,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.4us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.63s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 187043.97783898833,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.5us | P99.9: 24.3us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 645858.4611968123,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.1us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 704310.0776390579,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 304976.6329419897,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 15.1us | P99.9: 109.4us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
           }
         ]
       }
