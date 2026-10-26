@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793029977109,
+  "lastUpdate": 1793034778811,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64456,6 +64456,90 @@ window.BENCHMARK_DATA = {
             "value": 304976.6329419897,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 15.1us | P99.9: 109.4us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "63e1e8be42394ab3a0ee87e9aca0c4c70f7faa99",
+          "message": "feat(tree): lower the retention floor after a rebuild (#994)\n\n## Summary\n- `AbstractTree::lower_retention_floor(floor)` lowers the persisted\nretention floor, for a caller that cleared the tree and reinstalled a\nsource's history at its original seqnos: that history is complete above\nthe source's floor, but the clear leaves the floor at its own seqno and\nrefuses all of it.\n- Until the call, the clear's floor refuses the history being\nreinstalled, so no snapshot reads it half done, and a crash before the\ncall leaves that refusal in place.\n- A floor above the current one is refused with\n`Error::RetentionFloorRaise`, and one above the seqno counter (a counter\nreset on reopen can stand below the floor) with\n`Error::RetentionFloorAboveSeqno`; nothing changes. Raising stays the\njob of GC and the installs that drop data.\n\n## Changes\n- `AbstractTree::lower_retention_floor` for `Tree`, `BlobTree` (through\nits index tree, whose version holds the blob files) and `AnyTree`; the\ncheck and the install run under one version-history lock.\n- `Version::with_lowered_retention_floor`; the install keeps\n`RetentionEffect::Keep`, and the existing version diff writes the\nchanged floor into the edit. Recovery already applies an edit's floor as\nwritten, so no format change.\n- `Error::RetentionFloorRaise { current, requested }` and\n`Error::RetentionFloorAboveSeqno { seqno, requested }`.\n- `docs/INVARIANTS.md`, `docs/manifest-recovery.md` and the method's\nrustdoc with a doctest.\n\n## Testing\nfmt, clippy in both feature configurations, the full nextest suite with\nand without all features, doc tests, doc build, the no-std check, the\ntool crates and the benches pass on Linux.\n\nCloses #993",
+          "timestamp": "2026-10-26T16:49:51Z",
+          "tree_id": "b597be23edf2d82850d27016ef696368ac465677",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/63e1e8be42394ab3a0ee87e9aca0c4c70f7faa99"
+        },
+        "date": 1793034776753,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 50695.2144071644,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.1us | P99.9: 28.3us\nthreads: 1 | elapsed: 10.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 1269454.3159856752,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 606453.6063749191,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.2us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 453479.4583215079,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 7.1us | P99.9: 27.0us\nthreads: 1 | elapsed: 0.44s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3136325.8115615477,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 7.5us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 304426.26535264275,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.7us | P99.9: 15.0us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189588.2727595484,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.2us | P99.9: 20.1us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 677074.7339552474,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.0us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 719485.2595241609,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 1.2us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 293545.7706854432,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 16.7us | P99.9: 99.6us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
           }
         ]
       }
