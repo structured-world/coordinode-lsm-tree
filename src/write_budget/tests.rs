@@ -136,8 +136,60 @@ fn a_landed_output_moves_from_the_hold_to_the_charge() {
     hold.landed(250);
     let report = budget.report_at(Duration::ZERO);
     assert_eq!((report.credit, report.reserved), (750, 350));
-    assert!(budget.reserve_at(400, Duration::ZERO).is_some());
+    let _rest = budget
+        .reserve_at(400, Duration::ZERO)
+        .expect("what the landed part freed");
     assert!(budget.reserve_at(1, Duration::ZERO).is_none());
+}
+
+// An override is asked for only when the credit falls short, and a refusal
+// is counted only when it answers no: work that ran past the budget was not
+// refused.
+#[test]
+fn a_refusal_is_counted_only_when_no_override_answers() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(100, DAY));
+    let asked = core::cell::Cell::new(0);
+    let fits = budget
+        .reserve_or_override_at(100, Duration::ZERO, || {
+            asked.set(asked.get() + 1);
+            None
+        })
+        .expect("within the burst");
+    assert_eq!(asked.get(), 0, "credit covered it: nothing asked");
+    let over = budget
+        .reserve_or_override_at(50, Duration::ZERO, || Some(Override::Forced))
+        .expect("forced past the budget");
+    let report = budget.report_at(Duration::ZERO);
+    assert_eq!(report.refused, 0);
+    assert_eq!(report.forced_overrides.reservations, 1);
+    assert!(
+        budget
+            .reserve_or_override_at(1, Duration::ZERO, || None)
+            .is_none()
+    );
+    assert_eq!(budget.report_at(Duration::ZERO).refused, 1);
+    drop((fits, over));
+}
+
+// A hold given back while the override was being worked out is seen: the
+// work is granted as ordinary work, not counted as an override.
+#[test]
+fn credit_freed_while_asking_grants_ordinary_work() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(100, DAY));
+    let first = budget.reserve_at(100, Duration::ZERO).expect("the burst");
+    let hold = budget
+        .reserve_or_override_at(100, Duration::ZERO, || {
+            drop(first);
+            None
+        })
+        .expect("freed while asked");
+    let report = budget.report_at(Duration::ZERO);
+    assert_eq!(report.refused, 0);
+    assert_eq!(report.forced_overrides.reservations, 0);
+    assert_eq!(report.backpressure_overrides.reservations, 0);
+    drop(hold);
 }
 
 // An output larger than its hold gives back only the hold: the excess is

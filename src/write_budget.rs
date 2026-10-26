@@ -265,7 +265,11 @@ struct Account {
     credit: i128,
     /// Wall time, in nanoseconds since the epoch, the credit is refilled to.
     as_of: u128,
-    /// The ledger as last charged.
+    /// The refill up to `as_of` short of a whole byte, in bytes times
+    /// nanoseconds over the period: below one period's nanoseconds.
+    partial: u128,
+    /// The ledger when the budget began, and as last charged.
+    start: Spend,
     seen: Spend,
     reserved: u64,
     refused: u64,
@@ -277,33 +281,36 @@ struct Account {
 
 impl Account {
     /// Adds what the allowance refilled since `as_of`, up to the burst. Only
-    /// whole bytes are credited; the time of a partial byte carries over.
+    /// whole bytes are credited; the part of a byte carries over exactly, so
+    /// reading often refills as much as reading once.
     fn refill(&mut self, now_nanos: u128) {
-        let elapsed = now_nanos.saturating_sub(self.as_of);
+        // A clock behind the time counted refills nothing until it passes it.
+        if now_nanos <= self.as_of {
+            return;
+        }
+        let elapsed = now_nanos - self.as_of;
+        self.as_of = now_nanos;
         let rate = u128::from(self.allowance.bytes_per_period);
         let period = self.allowance.period_nanos();
         let burst = i128::from(self.allowance.burst);
-        if elapsed == 0 {
-            return;
-        }
         if rate == 0 || self.credit >= burst {
             // Nothing to add, or nothing it could add: the time is spent.
-            self.as_of = now_nanos;
+            self.partial = 0;
             return;
         }
-        // An absurd span saturates and is capped at the burst below.
-        let refilled = elapsed.saturating_mul(rate) / period;
+        // An absurd span saturates, and what it comes to is capped at the
+        // burst below, as any span that long is.
+        let accrued = elapsed.saturating_mul(rate).saturating_add(self.partial);
+        let refilled = accrued / period;
         // Positive: the credit is below the burst.
         let room = u128::try_from(burst - self.credit).unwrap_or(u128::MAX);
         if refilled >= room {
             self.credit = burst;
-            self.as_of = now_nanos;
+            self.partial = 0;
         } else {
             // Below `room`, which fits an i128 as a difference of two.
             self.credit += i128::try_from(refilled).unwrap_or(i128::MAX);
-            // The time those bytes took, rounded up so none is paid twice;
-            // never past `now_nanos`, since `refilled` was rounded down.
-            self.as_of += (refilled * period).div_ceil(rate);
+            self.partial = accrued % period;
         }
     }
 
@@ -349,7 +356,11 @@ impl Account {
 ///
 /// let ledger = Arc::new(WriteIoStats::default());
 /// let day = Duration::from_secs(86_400);
-/// let budget = WriteBudget::new_at(Arc::clone(&ledger), Allowance::new(1_000, day), Duration::ZERO);
+/// let budget = Arc::new(WriteBudget::new_at(
+///     Arc::clone(&ledger),
+///     Allowance::new(1_000, day),
+///     Duration::ZERO,
+/// ));
 ///
 /// // Work that fits the credit is granted, and holds it while it runs.
 /// let hold = budget.reserve_at(600, Duration::ZERO).expect("within the burst");
@@ -424,6 +435,8 @@ impl WriteBudget {
                 allowance,
                 credit: credit.min(i128::from(allowance.burst)),
                 as_of,
+                partial: 0,
+                start: seen,
                 seen,
                 reserved: 0,
                 refused: 0,
@@ -481,17 +494,59 @@ impl WriteBudget {
     /// wait, or `None` when the credit left past what is reserved does not
     /// cover them.
     pub fn reserve_at(self: &Arc<Self>, bytes: u64, now: Duration) -> Option<BudgetHold> {
+        self.reserve_or_override_at(bytes, now, || None)
+    }
+
+    /// Reserves `bytes` as of wall time `now` when the credit covers them,
+    /// and otherwise asks `reason` whether the work runs past the budget
+    /// anyway: an [`Override`] reserves them as one, `None` refuses them.
+    ///
+    /// `reason` is asked only when the credit falls short, and without the
+    /// budget locked, so it may take its time; a refusal is counted only once
+    /// it has answered `None`.
+    pub fn reserve_or_override_at(
+        self: &Arc<Self>,
+        bytes: u64,
+        now: Duration,
+        reason: impl FnOnce() -> Option<Override>,
+    ) -> Option<BudgetHold> {
         let now_nanos = now.as_nanos();
         let mut account = self.account.lock();
         account.settle(Spend::of(&self.ledger.snapshot()), now_nanos);
+        if account.free() >= i128::from(bytes) {
+            let hold = self.take(&mut account, bytes);
+            drop(account);
+            return Some(hold);
+        }
+        drop(account);
+        let reason = reason();
+        let mut account = self.account.lock();
+        // Read again: holds may have gone back while `reason` ran.
+        account.settle(Spend::of(&self.ledger.snapshot()), now_nanos);
         if account.free() < i128::from(bytes) {
-            account.refused += 1;
-            account.waiting_since.get_or_insert(now_nanos);
-            return None;
+            match reason {
+                Some(Override::Backpressure) => account.backpressure_overrides.add(bytes),
+                Some(Override::Forced) => account.forced_overrides.add(bytes),
+                None => {
+                    account.refused += 1;
+                    account.waiting_since.get_or_insert(now_nanos);
+                    return None;
+                }
+            }
         }
         let hold = self.take(&mut account, bytes);
         drop(account);
         Some(hold)
+    }
+
+    /// Reserves `bytes` as of now, or asks `reason` whether to run past the
+    /// budget; see [`Self::reserve_or_override_at`].
+    pub fn reserve_or_override(
+        self: &Arc<Self>,
+        bytes: u64,
+        reason: impl FnOnce() -> Option<Override>,
+    ) -> Option<BudgetHold> {
+        self.reserve_or_override_at(bytes, self.now(), reason)
     }
 
     /// Reserves `bytes` as of wall time `now` whatever the credit, for work
@@ -552,12 +607,18 @@ impl WriteBudget {
     }
 
     /// Changes the allowance as of wall time `now`: time up to `now` refills
-    /// at the old one, and credit above the new burst is dropped.
+    /// at the old one, and credit above the new burst is dropped. The
+    /// unsustainable estimate starts over with the new period.
     pub fn set_allowance_at(&self, allowance: Allowance, now: Duration) {
+        let now_nanos = now.as_nanos();
         let mut account = self.account.lock();
-        account.settle(Spend::of(&self.ledger.snapshot()), now.as_nanos());
+        account.settle(Spend::of(&self.ledger.snapshot()), now_nanos);
         account.allowance = allowance;
         account.credit = account.credit.min(i128::from(allowance.burst));
+        // Less than a byte of the old rate, in units of the old period.
+        account.partial = 0;
+        account.window = Window::default();
+        account.window.advance(now_nanos, allowance.period_nanos());
     }
 
     /// Changes the allowance as of now; see [`Self::set_allowance_at`].
@@ -595,8 +656,8 @@ impl WriteBudget {
         BudgetReport {
             credit: clamp_i64(account.credit),
             reserved: account.reserved,
-            discretionary_bytes: account.seen.discretionary,
-            mandatory_bytes: account.seen.mandatory,
+            discretionary_bytes: account.seen.discretionary - account.start.discretionary,
+            mandatory_bytes: account.seen.mandatory - account.start.mandatory,
             refused: account.refused,
             waiting_since: account.waiting_since.map(nanos_to_duration),
             backpressure_overrides: account.backpressure_overrides,

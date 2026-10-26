@@ -543,20 +543,22 @@ fn budget_gate(
         }
     }
     let mut holds = Vec::with_capacity(demands.len());
+    // Worked out once, by the first budget short of credit.
     let mut stopped = None;
     for (budget, bytes) in demands {
-        if let Some(hold) = budget.reserve(bytes) {
-            holds.push(hold);
-            continue;
-        }
-        let reason = if budget.forced() {
-            Override::Forced
-        } else if *stopped.get_or_insert_with(|| at_compaction_stop(version, opts)) {
-            Override::Backpressure
-        } else {
+        let hold = budget.reserve_or_override(bytes, || {
+            if budget.forced() {
+                Some(Override::Forced)
+            } else if *stopped.get_or_insert_with(|| at_compaction_stop(version, opts)) {
+                Some(Override::Backpressure)
+            } else {
+                None
+            }
+        });
+        let Some(hold) = hold else {
             return BudgetGate::Wait;
         };
-        holds.push(budget.reserve_overriding(bytes, reason));
+        holds.push(hold);
     }
     BudgetGate::Run(holds)
 }
