@@ -332,9 +332,10 @@ caller has just made whole. The floor is therefore **supplied by the caller**:
 `Config::repair_retention_floor(floor)` seeds the rebuilt manifest with it,
 and the reopened tree refuses every snapshot at or below `floor` exactly as it
 did before the manifest was lost. Record `AbstractTree::retention_floor()` in
-the deployment's own durable state (it is the maximum over every operation
-that raised the boundary: GC compactions, `clear`, table drops, filtering
-compactions) and pass the last recorded value; deriving it from GC watermarks
+the deployment's own durable state (it folds in every operation that moved
+the boundary: GC compactions, `clear`, table drops, filtering compactions
+raise it, `lower_retention_floor` after a rebuild lowers it) and pass the
+last recorded value; deriving it from GC watermarks
 alone would miss the drops. Left at the default `0`, a repaired tree serves
 every snapshot, which is correct only if history was never collected. No
 resurrection question arises: the floor discards nothing, it only declines to

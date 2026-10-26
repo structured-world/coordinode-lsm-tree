@@ -475,6 +475,25 @@ impl Version {
         }
     }
 
+    /// The next version with its retention floor lowered to `floor`, unchanged
+    /// otherwise: what a caller that reinstalled every version above `floor`
+    /// installs. Raising goes through [`Self::with_retention_floor`].
+    #[must_use]
+    pub(crate) fn with_lowered_retention_floor(&self, floor: crate::SeqNo) -> Self {
+        debug_assert!(
+            floor <= self.retention_floor,
+            "a lowering never raises the floor ({floor} > {})",
+            self.retention_floor
+        );
+        Self {
+            inner: Arc::new(VersionInner {
+                id: self.id + 1,
+                retention_floor: floor,
+                ..VersionInner::clone(&self.inner)
+            }),
+        }
+    }
+
     /// Ids of the compression dictionaries this version's tables may reference,
     /// ascending. See [`VersionInner::dicts`].
     #[must_use]

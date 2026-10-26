@@ -547,6 +547,10 @@ impl AbstractTree for AnyTree {
         forward!(self.retention_floor())
     }
 
+    fn lower_retention_floor(&self, floor: SeqNo) -> crate::Result<()> {
+        forward!(self.lower_retention_floor(floor))
+    }
+
     #[inline]
     fn compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
         forward!(self.compaction_rate_limiter())

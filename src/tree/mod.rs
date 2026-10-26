@@ -1942,6 +1942,38 @@ impl AbstractTree for Tree {
             .retention_floor()
     }
 
+    fn lower_retention_floor(&self, floor: SeqNo) -> crate::Result<()> {
+        let config = self.tree_config();
+        let mut versions = self.get_version_history_lock();
+        // Checked under the lock the install takes, so no install raising the
+        // floor can land between the check and the edit.
+        let current = versions.latest_version_ref().version.retention_floor();
+        if floor > current {
+            return Err(crate::Error::RetentionFloorRaise {
+                current,
+                requested: floor,
+            });
+        }
+        if floor == current {
+            return Ok(());
+        }
+        versions.upgrade_version(
+            &config.path,
+            |v| {
+                let mut copy = v.clone();
+                copy.version = v.version.with_lowered_retention_floor(floor);
+                Ok(copy)
+            },
+            &config.seqno,
+            &config.visible_seqno,
+            &*config.fs,
+            self.0.runtime_config.load_full(),
+            self.0.config.encryption.clone(),
+            // The floor is the mutator's: `Keep` lets the install raise none.
+            crate::version::RetentionEffect::Keep,
+        )
+    }
+
     fn compaction_rate_limiter(&self) -> Arc<crate::rate_limiter::RateLimiter> {
         Arc::clone(&self.compaction_rate_limiter)
     }
