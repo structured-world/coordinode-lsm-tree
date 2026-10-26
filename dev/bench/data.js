@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793034784659,
+  "lastUpdate": 1793034789007,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -71940,6 +71940,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.601155214,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "63e1e8be42394ab3a0ee87e9aca0c4c70f7faa99",
+          "message": "feat(tree): lower the retention floor after a rebuild (#994)\n\n## Summary\n- `AbstractTree::lower_retention_floor(floor)` lowers the persisted\nretention floor, for a caller that cleared the tree and reinstalled a\nsource's history at its original seqnos: that history is complete above\nthe source's floor, but the clear leaves the floor at its own seqno and\nrefuses all of it.\n- Until the call, the clear's floor refuses the history being\nreinstalled, so no snapshot reads it half done, and a crash before the\ncall leaves that refusal in place.\n- A floor above the current one is refused with\n`Error::RetentionFloorRaise`, and one above the seqno counter (a counter\nreset on reopen can stand below the floor) with\n`Error::RetentionFloorAboveSeqno`; nothing changes. Raising stays the\njob of GC and the installs that drop data.\n\n## Changes\n- `AbstractTree::lower_retention_floor` for `Tree`, `BlobTree` (through\nits index tree, whose version holds the blob files) and `AnyTree`; the\ncheck and the install run under one version-history lock.\n- `Version::with_lowered_retention_floor`; the install keeps\n`RetentionEffect::Keep`, and the existing version diff writes the\nchanged floor into the edit. Recovery already applies an edit's floor as\nwritten, so no format change.\n- `Error::RetentionFloorRaise { current, requested }` and\n`Error::RetentionFloorAboveSeqno { seqno, requested }`.\n- `docs/INVARIANTS.md`, `docs/manifest-recovery.md` and the method's\nrustdoc with a doctest.\n\n## Testing\nfmt, clippy in both feature configurations, the full nextest suite with\nand without all features, doc tests, doc build, the no-std check, the\ntool crates and the benches pass on Linux.\n\nCloses #993",
+          "timestamp": "2026-10-26T16:49:51Z",
+          "tree_id": "b597be23edf2d82850d27016ef696368ac465677",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/63e1e8be42394ab3a0ee87e9aca0c4c70f7faa99"
+        },
+        "date": 1793034787679,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 513.308,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.342654ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 159.536,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.66066ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 456.481,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.422459ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3941.4,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 16832.097,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 25.167,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 68.550655,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.578128903,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.687,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 100.663295,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.611970418,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
