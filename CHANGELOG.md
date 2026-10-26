@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.0.0...v7.1.0) - 2026-10-26
+
+### Added
+
+- *(metrics)* count every host write by origin ([#991](https://github.com/structured-world/coordinode-lsm-tree/pull/991))
+- *(layout)* caller-defined key domains no table or blob file spans ([#987](https://github.com/structured-world/coordinode-lsm-tree/pull/987))
+
+### Fixed
+
+- *(compaction)* keep relocated and last-output tombstones in bounds ([#990](https://github.com/structured-world/coordinode-lsm-tree/pull/990))
+
 ## [7.0.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v6.0.1...v7.0.0) - 2026-10-25
 
 ### Added
