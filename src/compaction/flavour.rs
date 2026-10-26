@@ -1765,6 +1765,12 @@ impl StandardCompaction {
         self.table_writer.transforms_seen()
     }
 
+    /// Whether `key` is the user key of the last row the output took (see
+    /// [`crate::compaction::carry::CarrySink`]).
+    pub(super) fn continues_last(&self, key: &[u8]) -> bool {
+        self.table_writer.continues_last(key)
+    }
+
     /// Closes the current output's transformation window at `seen` for the
     /// row just put in it (see [`crate::compaction::carry::CarrySink`]).
     pub(super) fn settle_transforms(&mut self, seen: u64) {

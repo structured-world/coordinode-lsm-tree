@@ -4944,6 +4944,10 @@ impl super::carry::CarrySink for FlavourSink<'_> {
         self.flavour.transforms_seen()
     }
 
+    fn continues_last(&self, key: &[u8]) -> bool {
+        self.flavour.continues_last(key)
+    }
+
     fn settle_transforms(&mut self, seen: u64) {
         self.flavour.settle_transforms(seen);
     }

@@ -1358,6 +1358,13 @@ impl MultiWriter {
         self
     }
 
+    /// Whether `key` is the user key of the last row written or copied in.
+    pub(crate) fn continues_last(&self, key: &[u8]) -> bool {
+        self.current_key
+            .as_ref()
+            .is_some_and(|last| crate::comparator::same_user_key(last, key))
+    }
+
     /// The transform counter's value now; without a counter, the milestone
     /// as it stands, so settling it changes nothing.
     pub(crate) fn transforms_seen(&self) -> u64 {

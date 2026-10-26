@@ -90,6 +90,10 @@ pub trait CarrySink {
     /// The count of the compaction filter's transformations so far.
     fn transforms_seen(&self) -> u64;
 
+    /// Whether `key` is the user key of the last row the output took, written
+    /// or copied.
+    fn continues_last(&self, key: &[u8]) -> bool;
+
     /// Takes `seen`, read by [`Self::transforms_seen`] when the row last put
     /// in the output was emitted, as the count the output's window closes at:
     /// a row written or copied after being held must not take the
@@ -211,18 +215,6 @@ impl Open {
         self.seen.len()
     }
 
-    /// The key of the last row held.
-    fn last_held_key(&self) -> Option<&UserKey> {
-        if self.candidate.is_block() {
-            self.held()
-                .checked_sub(1)
-                .and_then(|last| self.candidate.rows.get(last))
-        } else {
-            self.emitted.last()
-        }
-        .map(|row| &row.key.user_key)
-    }
-
     /// Whether the merge has filled the range far past the group's rows, by
     /// their count or their bytes: it is no group of the source's shape any
     /// more, and holding it on would hold the merge. A data block never is,
@@ -239,8 +231,6 @@ pub struct CarryMatcher {
     comparator: crate::comparator::SharedComparator,
     /// The candidate whose key range the merge is emitting.
     open: Option<Open>,
-    /// The key of the last row passed on, written or held.
-    last_key: Option<UserKey>,
     /// What the last search of the queue that found nothing left: the count of
     /// candidates recorded then, and the smallest first key among the
     /// candidates still queued. Until another is recorded, a row below that key
@@ -256,7 +246,6 @@ impl CarryMatcher {
             queue,
             comparator,
             open: None,
-            last_key: None,
             none_below: None,
             carried: Carried::default(),
         }
@@ -289,14 +278,12 @@ impl CarryMatcher {
                         .is_some_and(|read| same_row(read, &row))
                 {
                     Self::write_rows(open, sink)?;
-                    self.last_key = Some(row.key.user_key.clone());
                     return sink.write(row);
                 }
                 open.hold(row, sink);
                 // An overfilled range goes out as rows, which bounds what is
                 // held to about two groups and one row.
                 if open.overfilled() {
-                    self.last_key = open.last_held_key().cloned();
                     Self::write_rows(open, sink)?;
                 } else {
                     self.open = Some(open);
@@ -306,13 +293,12 @@ impl CarryMatcher {
             self.resolve(open, sink)?;
         }
 
-        // A group starts a key: one whose range opens on the key passed on
-        // last would split that key's versions across the copy's edge.
-        let continues_last = self
-            .last_key
-            .as_ref()
-            .is_some_and(|last| crate::comparator::same_user_key(last, &row.key.user_key));
-        if !continues_last
+        // A group starts a key: one whose range opens on the key the output
+        // took last would split that key's versions across the copy's edge.
+        // Asked only of a row a candidate may cover, and of the output, which
+        // keeps that key anyway.
+        if self.may_cover(&row)
+            && !sink.continues_last(&row.key.user_key)
             && let Some(candidate) = self.take_covering(&row)
             // A data block whose first row is not this one can no longer come
             // out whole, and is dropped.
@@ -322,7 +308,6 @@ impl CarryMatcher {
             return Ok(());
         }
 
-        self.last_key = Some(row.key.user_key.clone());
         sink.write(row)
     }
 
@@ -344,7 +329,6 @@ impl CarryMatcher {
     fn resolve(&mut self, mut open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
         let candidate = &open.candidate;
         let emitted = &open.emitted;
-        self.last_key = open.last_held_key().cloned();
         // A data block was held only while each row came out as read.
         let unchanged = if candidate.is_block() {
             open.held() == candidate.rows.len()
@@ -381,6 +365,19 @@ impl CarryMatcher {
         Self::write_rows(open, sink)
     }
 
+    /// Whether a candidate may cover `row`: `false` when the last search of
+    /// the queue found none and left none starting at or below its key, and
+    /// none was recorded since, which a row is told without the lock.
+    fn may_cover(&self, row: &InternalValue) -> bool {
+        let Some((seen, first)) = &self.none_below else {
+            return true;
+        };
+        *seen != self.queue.recorded()
+            || first.as_ref().is_some_and(|first| {
+                self.comparator.compare(&row.key.user_key, first) != core::cmp::Ordering::Less
+            })
+    }
+
     /// The candidate whose key range holds `row`'s key, taken from the queue,
     /// after dropping every candidate the merge has moved past: rows come out
     /// in key order, so one whose last key sorts below `row`'s can no longer
@@ -390,14 +387,6 @@ impl CarryMatcher {
 
         let key = &row.key.user_key;
         let recorded = self.queue.recorded();
-        if let Some((seen, first)) = &self.none_below
-            && *seen == recorded
-            && first
-                .as_ref()
-                .is_none_or(|first| self.comparator.compare(key, first) == Less)
-        {
-            return None;
-        }
         let mut queue = self.queue.lock();
         queue.retain(|candidate| self.comparator.compare(candidate.last_key(), key) != Less);
         if let Some(at) = queue
