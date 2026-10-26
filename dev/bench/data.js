@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792995033345,
+  "lastUpdate": 1792995037956,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -69900,6 +69900,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.55883017,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7e61cd6ba459cac9abb28580842bd200e1810080",
+          "message": "feat(metrics): count every host write by origin (#991)\n\n## Summary\n- A host-write ledger, `fs::CountingFs`: every byte, write call, sync,\nstarted writeback, creation, rename and removal handed to a backend,\neach charged to what it was written for, with the bytes each install\nkept. It needs no cargo feature; a tree on a plain backend has no\nwrapper and pays nothing.\n- Counting is bound per physical medium by the caller: every tree and\nlevel route on a medium gets a `CountingFs` counting into that medium's\nshared `WriteIoStats`, another medium another set. A reopen on the same\nbackend counts on into the same set.\n- The payload a tree took in, the denominator of host write\namplification, is a profiling figure under `metrics`:\n`Metrics::accepted_writes`.\n\n## Changes\n- `fs::CountingFs`, `WriteIoStats` and the `WriteIoSnapshot` reading.\nEach counter set is numbered when made, and `since` refuses readings of\ntwo sets. Files opened for writing are counted under the `WriteOrigin`\ntheir open options name; files opened only for reading are the backend's\nown handles. Directory and device operations are counted apart; a clone\ncounts the length of what it made, the bound of what a copying backend\nwrote below the wrapper.\n- `FsOpenOptions::write_origin`, set by every write-side open in the\nengine: flush, ingestion and compaction tables and blob files, the\nmanifest and its edit log, dictionaries, pins, sidecars, the table file\npool's empty files, the lock file, salvage and in-place healing,\ncheckpoint copies. A file opened without one is counted as unattributed.\n- `Fs::write_io_stats` exposes a counting backend's set (wrappers hand\non the inner one's). Every flush, ingestion and compaction install\nrecords the bytes it kept into the set of the backend each table and\nblob file was written through, so a route on another medium is charged\nto that medium.\n- `Metrics::accepted_writes`: values, deletions, range deletions,\ningested records and their payload bytes, counted at the write entry\npoints and ingestion, a row of cells as its key and value fields.\n- `FaultOp::SyncDevice` in the fault-injection backend; the dead\noptional root-manifest copy in checkpoints removed.\n- `benches/write_ledger.rs`: a low-rate device workload in two key\norders on a `CountingFs` over the standard backend, with a `ledger,...`\nline per counter for a replay harness and a check against\n`/proc/self/io`.\n- `docs/write-ledger.md`, the README and `docs/INVARIANTS.md`.\n\n## Measurements\n`write_ledger`: 64 sensors at 1 Hz for six hours, flushed every ten\nminutes, three hours retained. Byte counts are the same on every run on\none filesystem; across ext4 and btrfs the sensor order differs by 124\nbytes.\n\n| | time order | sensor order |\n|---|---|---|\n| Payload | 47.46 MiB | 47.47 MiB |\n| `flush_table` | 46.70 MiB, 39 syncs | 47.53 MiB, 39 syncs |\n| `compaction_table` | 0 | 221.71 MiB, 40 syncs |\n| `manifest` | 0.03 MiB, 74 syncs | 0.02 MiB, 69 syncs |\n| Written | 46.74 MiB, 118 syncs | 269.26 MiB, 156 syncs |\n| Host write amplification | 0.98 | 5.67 |\n\nOn ext4 and btrfs, `/proc/self/io` `wchar` and `syscw` equal the\nledger's bytes and write calls exactly; `write_bytes` is 0.5 to 0.9%\nabove them on ext4 and 3.7 to 13.6% on btrfs, the filesystem's own\nwrites. Under `strace -f -c` the process's `write`, `fdatasync` +\n`fsync` and `sync_file_range` calls equal the ledger's writes, file and\ndirectory syncs, and started writebacks in both orders.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, the tool\ncrates, the benches and the i686 builds pass on Linux.\n\nCloses #975",
+          "timestamp": "2026-10-26T07:54:25+02:00",
+          "tree_id": "59e1aa11d77e9d6b0d02aa548c6555c01da788b9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7e61cd6ba459cac9abb28580842bd200e1810080"
+        },
+        "date": 1792995036585,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 471.77599999999995,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.911107ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 141.009,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.703758ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 436.03000000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.072833ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3863.5789999999997,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9669.942000000001,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.463,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 65.339391,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.560448519,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.159,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 70.778879,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.557311346,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
