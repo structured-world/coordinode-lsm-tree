@@ -79,11 +79,45 @@ impl CarryCandidate {
     pub(crate) fn last_key(&self) -> &UserKey {
         &self.keys.1
     }
+
+    /// Whether this is a data block, which is copied whole or not at all.
+    pub(crate) fn is_block(&self) -> bool {
+        matches!(self.unit, CarryUnit::DataBlock(_))
+    }
 }
 
 /// The candidates the scanners of one compaction recorded, in the order each
 /// read them; shared by every input's scanner and the write side.
-pub type CarryQueue = Arc<Mutex<VecDeque<CarryCandidate>>>;
+pub type CarryQueue = Arc<Candidates>;
+
+/// The candidates of a [`CarryQueue`], and how many were ever recorded: the
+/// write side learns from the count, without taking the lock, that none was
+/// added since it last looked.
+#[derive(Default)]
+pub struct Candidates {
+    queue: Mutex<VecDeque<CarryCandidate>>,
+    recorded: core::sync::atomic::AtomicUsize,
+}
+
+impl Candidates {
+    /// The candidates, locked.
+    pub(crate) fn lock(&self) -> impl core::ops::DerefMut<Target = VecDeque<CarryCandidate>> + '_ {
+        self.queue.lock()
+    }
+
+    /// How many candidates were ever recorded. It wraps, which only a reader
+    /// missing that many records between two looks could mistake.
+    pub(crate) fn recorded(&self) -> usize {
+        self.recorded.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Records `candidate`, into `queue` held locked.
+    fn record(&self, queue: &mut VecDeque<CarryCandidate>, candidate: CarryCandidate) {
+        queue.push_back(candidate);
+        self.recorded
+            .fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+}
 
 /// How the output lays out its data, which a copy keeps.
 #[derive(Clone, Copy)]
@@ -260,14 +294,17 @@ impl GroupCarry {
             && let (Some(first), Some(last)) = (self.rows.first(), self.rows.last())
         {
             let keys = (first.key.user_key.clone(), last.key.user_key.clone());
-            queue.push_back(CarryCandidate {
-                table: self.table.clone(),
-                group,
-                unit,
-                rows: Arc::clone(&self.rows),
-                keys,
-                bytes,
-            });
+            self.queue.record(
+                &mut queue,
+                CarryCandidate {
+                    table: self.table.clone(),
+                    group,
+                    unit,
+                    rows: Arc::clone(&self.rows),
+                    keys,
+                    bytes,
+                },
+            );
         }
         #[cfg(all(test, feature = "columnar"))]
         tests::note_queue_len(queue.len());

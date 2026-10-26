@@ -168,6 +168,11 @@ pub struct CarryMatcher {
     open: Option<Open>,
     /// The key of the last row passed on, written or held.
     last_key: Option<UserKey>,
+    /// What the last search of the queue that found nothing left: the count of
+    /// candidates recorded then, and the smallest first key among the
+    /// candidates still queued. Until another is recorded, a row below that key
+    /// has no candidate, and the queue is not searched for it.
+    none_below: Option<(usize, Option<UserKey>)>,
     carried: Carried,
 }
 
@@ -179,6 +184,7 @@ impl CarryMatcher {
             comparator,
             open: None,
             last_key: None,
+            none_below: None,
             carried: Carried::default(),
         }
     }
@@ -199,6 +205,20 @@ impl CarryMatcher {
                 .compare(&row.key.user_key, open.candidate.last_key())
                 != core::cmp::Ordering::Greater;
             if within {
+                // A data block is copied whole or not at all, so the first row
+                // that is not its next one as read sends the range out as rows
+                // at once, rather than holding the rest of it to find out.
+                if open.candidate.is_block()
+                    && !open
+                        .candidate
+                        .rows
+                        .get(open.emitted.len())
+                        .is_some_and(|read| same_row(read, &row))
+                {
+                    Self::write_rows(open, sink)?;
+                    self.last_key = Some(row.key.user_key.clone());
+                    return sink.write(row);
+                }
                 open.hold(row, sink);
                 // An overfilled range goes out as rows, which bounds what is
                 // held to about two groups and one row.
@@ -219,7 +239,12 @@ impl CarryMatcher {
             .last_key
             .as_ref()
             .is_some_and(|last| crate::comparator::same_user_key(last, &row.key.user_key));
-        if !continues_last && let Some(candidate) = self.take_covering(&row) {
+        if !continues_last
+            && let Some(candidate) = self.take_covering(&row)
+            // A data block whose first row is not this one can no longer come
+            // out whole, and is dropped.
+            && (!candidate.is_block() || candidate.rows.first().is_some_and(|read| same_row(read, &row)))
+        {
             self.open = Some(Open::new(candidate, row, sink));
             return Ok(());
         }
@@ -279,16 +304,37 @@ impl CarryMatcher {
     /// after dropping every candidate the merge has moved past: rows come out
     /// in key order, so one whose last key sorts below `row`'s can no longer
     /// be reached.
-    fn take_covering(&self, row: &InternalValue) -> Option<CarryCandidate> {
+    fn take_covering(&mut self, row: &InternalValue) -> Option<CarryCandidate> {
         use core::cmp::Ordering::{Greater, Less};
 
         let key = &row.key.user_key;
+        let recorded = self.queue.recorded();
+        if let Some((seen, first)) = &self.none_below
+            && *seen == recorded
+            && first
+                .as_ref()
+                .is_none_or(|first| self.comparator.compare(key, first) == Less)
+        {
+            return None;
+        }
         let mut queue = self.queue.lock();
         queue.retain(|candidate| self.comparator.compare(candidate.last_key(), key) != Less);
-        let at = queue
+        if let Some(at) = queue
             .iter()
-            .position(|candidate| self.comparator.compare(candidate.first_key(), key) != Greater)?;
-        queue.remove(at)
+            .position(|candidate| self.comparator.compare(candidate.first_key(), key) != Greater)
+        {
+            self.none_below = None;
+            return queue.remove(at);
+        }
+        // Every candidate left starts past the key; the smallest start bounds
+        // the rows that may find none until another is recorded.
+        let first = queue
+            .iter()
+            .map(CarryCandidate::first_key)
+            .min_by(|a, b| self.comparator.compare(a, b))
+            .cloned();
+        self.none_below = Some((recorded, first));
+        None
     }
 
     /// Writes the rows `open` held one by one, each closing the output's
