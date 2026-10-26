@@ -486,6 +486,24 @@ fn a_refused_zero_byte_request_is_forecast_from_the_overrun() {
     assert_eq!(dry.report_at(Duration::ZERO).credit_in, None);
 }
 
+// A clock stepped back refills nothing until it passes the time the credit
+// was refilled to, so the forecast waits for it to get there first.
+#[test]
+fn a_clock_stepped_back_forecasts_the_time_to_catch_up() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(1_000, DAY));
+    // Refilled to a day in, then spent.
+    assert!(!budget.report_at(DAY).unsustainable);
+    medium.write(WriteOrigin::FlushTable, 1_000);
+    assert!(budget.reserve_at(1_000, DAY).is_none());
+    // Back at day 0: a day to catch up, then a day to refill.
+    assert_eq!(budget.report_at(Duration::ZERO).credit_in, Some(DAY * 2));
+    // Credit to cover it is there no earlier than that.
+    let just_before = Duration::from_secs(2 * 86_400 - 1);
+    assert!(budget.reserve_at(1_000, just_before).is_none());
+    assert!(budget.reserve_at(1_000, DAY * 2).is_some());
+}
+
 // Work the burst cannot hold beside the reservations, or an allowance that
 // refills nothing, never gets credit: the forecast says so instead of a time.
 #[test]

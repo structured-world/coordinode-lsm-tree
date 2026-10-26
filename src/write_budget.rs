@@ -387,10 +387,10 @@ impl Account {
         self.credit - i128::from(self.reserved)
     }
 
-    /// How long until the credit covers `bytes` beside what is reserved, at
-    /// the refill alone; `None` when the burst cannot hold them past the
-    /// reservations, or nothing refills.
-    fn credit_in(&self, bytes: u64) -> Option<Duration> {
+    /// How long from wall time `now_nanos` until the credit covers `bytes`
+    /// beside what is reserved, at the refill alone; `None` when the burst
+    /// cannot hold them past the reservations, or nothing refills.
+    fn credit_in(&self, bytes: u64, now_nanos: u128) -> Option<Duration> {
         let needed = i128::from(bytes) + i128::from(self.reserved);
         if needed > i128::from(self.allowance.burst) {
             return None;
@@ -411,7 +411,10 @@ impl Account {
         // one byte. Rounded up so the credit is there when the wait ends; a
         // product past u128 is a wait no clock reaches.
         let owed = short.checked_mul(self.allowance.period_nanos())? - self.partial;
-        Some(nanos_to_duration(owed.div_ceil(rate)))
+        // A clock behind the time counted refills nothing until it passes it;
+        // one at or past it has nothing to catch up, hence the floor at zero.
+        let behind = self.as_of.saturating_sub(now_nanos);
+        Some(nanos_to_duration(owed.div_ceil(rate).checked_add(behind)?))
     }
 
     /// Whether the writes the budget cannot hold back take more than the
@@ -773,7 +776,7 @@ impl WriteBudget {
             // waits for the refill to repay it.
             credit_in: match account.waiting_since {
                 None => Some(Duration::ZERO),
-                Some(_) => account.credit_in(account.waiting_bytes),
+                Some(_) => account.credit_in(account.waiting_bytes, now_nanos),
             },
             unsustainable: account.unsustainable(now_nanos),
         }

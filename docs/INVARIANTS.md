@@ -223,10 +223,10 @@ matching entry (and add one for a new subsystem).
   makes are metadata. Enforced in `src/fs/counting_fs.rs` and every write-side
   open (tests `tests/write_io.rs`); see [write-ledger.md](write-ledger.md).
 
-- **A merge without write budget does not run, unless it is an override.**
+- **A merge without write-budget credit does not run, unless it is an override.**
   A merge reserves its expected output from the write budget of each medium
   it writes to before it writes anything; refused, it returns having changed
-  nothing. It runs past the budget only when the caller forces the budget, the
+  nothing. On media without a budget it reserves nothing and runs. It runs past the budget only when the caller forces the budget, the
   space gate narrowed it to the merge that reclaims room on a full volume or
   turned it into the tight-space pass where no merge fits, or the tree is at a
   stop threshold on L0 runs or pending compaction bytes, and

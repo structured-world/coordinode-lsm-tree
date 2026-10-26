@@ -429,6 +429,9 @@ fn gated_merge(
     opts: &Options,
     payload: &CompactionPayload,
 ) -> crate::Result<CompactionResult> {
+    // Read once: the budget is asked for the pass that then runs, whatever a
+    // runtime update sets in between.
+    let tight_space = tight_space_enabled(opts);
     let decision = {
         let super_version = version_history_lock.latest_version();
         // A strategy's choice naming a table the version does not hold is
@@ -466,7 +469,7 @@ fn gated_merge(
             // narrowed merge does: it reserves what it rewrites, at most the
             // merge as chosen, and runs past an empty budget as a space
             // override. Without the pass nothing runs, and nothing is asked.
-            SpaceGate::Skip(bytes) if tight_space_enabled(opts) => budget_gate(
+            SpaceGate::Skip(bytes) if tight_space => budget_gate(
                 &super_version.version,
                 opts,
                 payload.dest_level,
@@ -501,7 +504,7 @@ fn gated_merge(
         }
         SpaceGate::Skip(_) => {
             #[cfg(feature = "std")]
-            if tight_space_enabled(opts) {
+            if tight_space {
                 return run_tight_space_compaction(
                     compaction_state,
                     version_history_lock,
