@@ -728,6 +728,81 @@ fn budget_after_a_rate_change_is_the_new_rate() -> crate::Result<()> {
     Ok(())
 }
 
+/// A write budget on the medium of a level caps compaction at its allowance
+/// rate less the write rate, one byte a second once the writes take it all;
+/// a medium without one leaves no cap. The tighter of two budgets is the
+/// smaller one, a missing one never the tighter.
+#[test]
+fn the_endurance_budget_is_the_allowance_rate_less_the_writes() -> crate::Result<()> {
+    use crate::fs::{CountingFs, MemFs, WriteIoStats};
+    use crate::write_budget::{Allowance, WriteBudget};
+
+    let budget = Arc::new(WriteBudget::new_at(
+        Arc::new(WriteIoStats::default()),
+        // 100 bytes a second.
+        Allowance::new(8_640_000, core::time::Duration::from_secs(86_400)),
+        core::time::Duration::ZERO,
+    ));
+    let fs = Arc::new(CountingFs::with_budget(Arc::new(MemFs::new()), budget));
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    .open()?;
+    let config = tree.tree_config();
+    assert_eq!(endurance_budget(config, 6, 30), Some(70));
+    assert_eq!(endurance_budget(config, 6, 100), Some(1));
+    assert_eq!(endurance_budget(config, 6, 500), Some(1));
+
+    let plain = Config::new(
+        "/plain",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(MemFs::new()))
+    .open()?;
+    assert_eq!(endurance_budget(plain.tree_config(), 6, 30), None);
+
+    assert_eq!(tighter(0, 0), 0);
+    assert_eq!(tighter(0, 70), 70);
+    assert_eq!(tighter(500, 0), 500);
+    assert_eq!(tighter(500, 70), 70);
+    Ok(())
+}
+
+/// Flushes write L0: their rate comes off the last level's allowance only
+/// when L0 is on the same medium. Routed to another, the last level's
+/// compaction may write the whole allowance.
+#[test]
+fn flushes_on_another_medium_spend_nothing_of_the_last_levels_budget() -> crate::Result<()> {
+    use crate::fs::{CountingFs, MemFs, WriteIoStats};
+    use crate::write_budget::{Allowance, WriteBudget};
+
+    let budget = Arc::new(WriteBudget::new_at(
+        Arc::new(WriteIoStats::default()),
+        // 100 bytes a second.
+        Allowance::new(8_640_000, core::time::Duration::from_secs(86_400)),
+        core::time::Duration::ZERO,
+    ));
+    let cold = Arc::new(CountingFs::with_budget(Arc::new(MemFs::new()), budget));
+    let tree = Config::new(
+        "/db",
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(Arc::new(MemFs::new()))
+    .level_routes(vec![crate::config::LevelRoute {
+        levels: 1..7,
+        path: "/cold".into(),
+        fs: cold,
+    }])
+    .open()?;
+    assert_eq!(endurance_budget(tree.tree_config(), 6, 30), Some(100));
+    Ok(())
+}
+
 /// The same version, model and reads choose the same, on two strategies.
 #[test]
 fn the_choice_is_the_same_for_the_same_inputs() -> crate::Result<()> {

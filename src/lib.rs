@@ -339,6 +339,7 @@ pub mod rate_limiter;
 mod reseek;
 mod run_reader;
 mod run_scanner;
+pub mod write_budget;
 // Vendored sfa is std-only internally (`std::io` / `std::fs` /
 // `std::path`). Unconditional for the same cascading reason as
 // `manifest_blocks` above: ~20 consumers across the table /

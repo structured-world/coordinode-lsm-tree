@@ -119,7 +119,8 @@ uncounted across one, is the job of whoever keeps the budget.
 
 A reading is an observation of what was written, not a reservation of what
 may be: admission that must stay within a budget reserves before the work and
-reconciles against the ledger after it.
+reconciles against the ledger after it, as a [write budget](write-budget.md)
+on the medium does for compaction.
 
 ## Reconciling with the other counters
 

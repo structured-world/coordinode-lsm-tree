@@ -1251,6 +1251,10 @@ impl<F: Fs> Fs for FaultFs<F> {
         self.inner.write_io_stats()
     }
 
+    fn write_budget(&self) -> Option<&alloc::sync::Arc<crate::write_budget::WriteBudget>> {
+        self.inner.write_budget()
+    }
+
     fn volume_id(&self, path: &Path) -> Option<u64> {
         if self.injector.check(FaultOp::VolumeId, Some(path)).is_some() {
             return None;

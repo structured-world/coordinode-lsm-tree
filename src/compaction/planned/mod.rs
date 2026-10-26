@@ -51,6 +51,13 @@
 //! over [`Model::write_rate`] pays for, down to one. Set the model's write
 //! rate to what the tree takes in.
 //!
+//! A [write budget](crate::write_budget) on the medium of the last level caps
+//! the budget too: over the long run compaction may write the allowance's rate,
+//! less the write rate when L0 is on the same budget and its flushes spend
+//! from it. The
+//! plan then keeps a tree that budget pays for, rather than one whose merges
+//! the budget's gate would hold back.
+//!
 //! One measurement, made with `db_bench planned-sustained` (3M rows of
 //! 16-byte keys and 100-byte values, uncompressed, written at 8 MiB/s with
 //! point reads and scans between flushes, two compaction threads per tree;
@@ -363,6 +370,38 @@ fn budget(config: &Config) -> u64 {
         .map_or(config.compaction_rate_limit, |limiter| limiter.rate())
 }
 
+/// The bytes per second compaction may write over the long run on the medium
+/// of `level`, `None` without a write budget there: the budget's allowance
+/// rate, less `write_rate` when L0, which the flushes write, is on the same
+/// budget and spends from it. An allowance the writes alone use up leaves
+/// compaction one byte a second, the least a budget can say, since `0` reads
+/// as no limit.
+fn endurance_budget(config: &Config, level: u8, write_rate: u64) -> Option<u64> {
+    let (_, fs) = config.tables_folder_for_level(level);
+    let budget = fs.write_budget()?;
+    let allowance = budget.allowance();
+    let per_sec = u128::from(allowance.bytes_per_period()) * 1_000_000_000
+        / allowance.period().as_nanos().max(1);
+    let per_sec = u64::try_from(per_sec).unwrap_or(u64::MAX);
+    let (_, l0_fs) = config.tables_folder_for_level(0);
+    let flushes_here = l0_fs
+        .write_budget()
+        .is_some_and(|l0| Arc::ptr_eq(l0, budget));
+    if !flushes_here {
+        return Some(per_sec.max(1));
+    }
+    // Below the write rate nothing is left: none, not an error.
+    Some(per_sec.saturating_sub(write_rate).max(1))
+}
+
+/// The tighter of two budgets in bytes per second, `0` standing for none.
+fn tighter(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, other) | (other, 0) => other,
+        (a, b) => a.min(b),
+    }
+}
+
 /// The runs of the main level newest first, each with its bytes.
 fn main_runs(main: &crate::version::Level) -> Vec<(Vec<TableId>, u64)> {
     main.iter()
@@ -441,7 +480,11 @@ impl CompactionStrategy for Strategy {
             version.level(1).expect("L1"),
             version.level(last).expect("the last level"),
         );
-        let budget = budget(config);
+        #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
+        let budget = tighter(
+            budget(config),
+            endurance_budget(config, last as u8, self.model.write_rate).unwrap_or(0),
+        );
         self.budget_seen.store(budget, Ordering::Relaxed);
         let unit = self.unit(last_level.size(), budget);
         let runs = main_runs(main);
