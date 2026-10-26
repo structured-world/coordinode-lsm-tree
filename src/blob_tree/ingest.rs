@@ -58,12 +58,13 @@ impl<'a> BlobIngestion<'a> {
         let blob_compression = rc.blob_compression;
 
         let table = TableIngestion::with_runtime_snapshot(&tree.index, &rc)?;
-        let blob = BlobFileWriter::new(
+        let blob = BlobFileWriter::new_for(
             tree.index.0.blob_file_id_counter.clone(),
             tree.index.config.path.join(BLOBS_FOLDER),
             tree.index.id,
             tree.index.config.descriptor_table.clone(),
             tree.index.config.fs.clone(),
+            crate::fs::WriteOrigin::IngestBlob,
         )?
         .use_target_size(blob_file_size)
         .use_compression(blob_compression)
@@ -120,6 +121,10 @@ impl<'a> BlobIngestion<'a> {
         let value_size = value.len() as u32;
 
         if value_size >= self.separation_threshold {
+            // The table ingestion takes in the indirection only, so the value
+            // is charged here.
+            #[cfg(feature = "metrics")]
+            self.table.accept(1, (key.len() + value.len()) as u64);
             // An ingested key has a single version: nothing overwrote it.
             self.blob
                 .select_lifetime_class(self.lifetime.class_of(&key, false))?;
@@ -178,10 +183,16 @@ impl<'a> BlobIngestion<'a> {
         }
 
         let mut row = Vec::with_capacity(fields.len());
+        #[cfg(feature = "metrics")]
+        let mut payload = key.len();
         for field in fields {
             let Cell::Value(bytes) = field.cell else {
                 return Err(crate::Error::BlobRef("a reference in an ingested row"));
             };
+            #[cfg(feature = "metrics")]
+            {
+                payload += bytes.len();
+            }
             row.push(RowField {
                 column: field.column,
                 tag: field.tag,
@@ -190,6 +201,8 @@ impl<'a> BlobIngestion<'a> {
         }
         order_fields(&mut row)?;
         let row = encode_row(&row)?;
+        #[cfg(feature = "metrics")]
+        self.table.accept(1, payload as u64);
         let (thresholds, default) = (&self.cell_thresholds, self.separation_threshold);
         let (blob, seqno) = (&mut self.blob, self.seqno);
         let class = self.lifetime.class_of(&key, false);
@@ -414,6 +427,13 @@ impl<'a> BlobIngestion<'a> {
         // We use upgrade_version_with_seqno (instead of upgrade_version) because
         // we need precise control over the seqno: it must match the seqno we
         // already assigned to the recovered tables.
+        let mut installed = crate::tree::InstalledCharge::default();
+        installed.add(
+            &created_tables,
+            &blob_files,
+            crate::fs::WriteOrigin::IngestTable,
+            crate::fs::WriteOrigin::IngestBlob,
+        )?;
         version_lock.upgrade_version_with_seqno(
             &index.config.path,
             |current| {
@@ -433,6 +453,7 @@ impl<'a> BlobIngestion<'a> {
             // everything.
             crate::version::RetentionEffect::Keep,
         )?;
+        installed.charge();
         // The installed files name their dictionaries from here on.
         drop(write_pin);
 

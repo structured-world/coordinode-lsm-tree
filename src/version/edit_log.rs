@@ -61,7 +61,11 @@ pub fn create_log(
     };
     let file = fs.open(
         &path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
+        &FsOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .write_origin(crate::fs::WriteOrigin::Manifest),
     )?;
     if existed {
         file.sync_data_with(sync_mode)?;
@@ -103,7 +107,13 @@ pub fn append_edit(
         return Ok(None);
     }
     let mut file = fs
-        .open(path, &FsOpenOptions::new().write(true).append(true))
+        .open(
+            path,
+            &FsOpenOptions::new()
+                .write(true)
+                .append(true)
+                .write_origin(crate::fs::WriteOrigin::Manifest),
+        )
         .map_err(crate::Error::from)?;
     // A write that fails can leave part of the record behind, a tail the
     // strict recovery mode refuses. It is cut off again, so the log ends on a

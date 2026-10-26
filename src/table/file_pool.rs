@@ -22,7 +22,7 @@
 
 use crate::{
     SequenceNumberCounter, TableId,
-    fs::{Fs, FsFile, FsOpenOptions, SyncMode},
+    fs::{Fs, FsFile, FsOpenOptions, SyncMode, WriteOrigin},
     path::{Path, PathBuf},
 };
 #[cfg(not(feature = "std"))]
@@ -297,15 +297,19 @@ impl TableFilePools {
     /// claiming thread, such a first claim that finds the pool dry makes its
     /// file and starts a refill, as does one that leaves half a batch.
     ///
+    /// The file is opened for writing as `origin`'s; the empty files a refill
+    /// makes ahead are [`WriteOrigin::Metadata`].
+    ///
     /// # Errors
     ///
     /// An I/O error creating or opening a file, or syncing the folder.
-    pub fn claim(
+    pub fn claim_as(
         &self,
         folder: &Path,
         fs: &Arc<dyn Fs>,
         above: Option<TableId>,
         may_refill: bool,
+        origin: WriteOrigin,
     ) -> crate::Result<ClaimedFile> {
         // Held across the refill and the open, so two claims never take one
         // file.
@@ -329,7 +333,8 @@ impl TableFilePools {
         let (claimed, due) = if pool.unpooled || self.pools.batch == 0 {
             (Ok(None), false)
         } else {
-            self.pools.claim_pooled(pool, folder, fs, above, may_refill)
+            self.pools
+                .claim_pooled(pool, folder, fs, above, may_refill, origin)
         };
         // No pool, the pool is dry, or the backend cannot tell whether a file
         // is shared: a file is made for the table. It takes its id, listed,
@@ -342,12 +347,24 @@ impl TableFilePools {
         // never reaches the backend ahead of the file the write waits on.
         let claimed = match pooled {
             Ok(claimed) => Ok(claimed),
-            Err(made) => Pools::create(folder, fs, made),
+            Err(made) => Pools::create(folder, fs, made, origin),
         };
         if let Some(refill) = refill {
             self.start(refill);
         }
         claimed
+    }
+
+    /// [`Self::claim_as`] for a flush's table.
+    #[cfg(test)]
+    pub fn claim(
+        &self,
+        folder: &Path,
+        fs: &Arc<dyn Fs>,
+        above: Option<TableId>,
+        may_refill: bool,
+    ) -> crate::Result<ClaimedFile> {
+        self.claim_as(folder, fs, above, may_refill, WriteOrigin::FlushTable)
     }
 
     /// Runs `refill` off this thread. A thread that cannot be started leaves
@@ -420,6 +437,7 @@ impl Pools {
         fs: &Arc<dyn Fs>,
         above: Option<TableId>,
         may_refill: bool,
+        origin: WriteOrigin,
     ) -> (crate::Result<Option<ClaimedFile>>, bool) {
         let mut refilled = false;
         let claimed = loop {
@@ -447,7 +465,7 @@ impl Pools {
                 discard(&**fs, &path);
                 continue;
             }
-            match open_unshared_empty(&**fs, &path) {
+            match open_unshared_empty(&**fs, &path, origin) {
                 Ok(Opened::Unshared(file)) => {
                     break Ok(Some(ClaimedFile {
                         id,
@@ -512,10 +530,7 @@ impl Pools {
         let mut synced = true;
         for &id in &refill.ids {
             let path = refill.folder.join(id.to_string());
-            match refill
-                .fs
-                .open(&path, &FsOpenOptions::new().write(true).create_new(true))
-            {
+            match refill.fs.open(&path, &pool_file()) {
                 Ok(file) => {
                     drop(file);
                     made.push(id);
@@ -580,11 +595,22 @@ impl Pools {
     }
 
     /// A file created for the next table under the id `writing` lists, its
-    /// entry not yet durable.
-    fn create(folder: &Path, fs: &Arc<dyn Fs>, writing: Writing) -> crate::Result<ClaimedFile> {
+    /// entry not yet durable, opened as `origin`'s.
+    fn create(
+        folder: &Path,
+        fs: &Arc<dyn Fs>,
+        writing: Writing,
+        origin: WriteOrigin,
+    ) -> crate::Result<ClaimedFile> {
         let id = writing.id;
         let path = folder.join(id.to_string());
-        let file = fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?;
+        let file = fs.open(
+            &path,
+            &FsOpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .write_origin(origin),
+        )?;
         Ok(ClaimedFile {
             id,
             path,
@@ -603,7 +629,7 @@ impl Pools {
         for _ in 0..self.batch {
             let id = self.ids.next();
             let path = folder.join(id.to_string());
-            drop(fs.open(&path, &FsOpenOptions::new().write(true).create_new(true))?);
+            drop(fs.open(&path, &pool_file())?);
             pool.writing.lock().push(id);
             pool.ids.push_back(id);
         }
@@ -684,11 +710,12 @@ enum Opened {
 /// hard-linked is unlinked from the pool: its inode is shared with another
 /// tree, which must never see a write. A link count that cannot be read is
 /// treated as shared.
-fn open_unshared_empty(fs: &dyn Fs, path: &Path) -> crate::Result<Opened> {
+fn open_unshared_empty(fs: &dyn Fs, path: &Path, origin: WriteOrigin) -> crate::Result<Opened> {
     let opts = FsOpenOptions::new()
         .write(true)
         .no_follow(true)
-        .no_wait(true);
+        .no_wait(true)
+        .write_origin(origin);
     let file = match fs.open(path, &opts) {
         Ok(file) => file,
         Err(e) if e.kind() == crate::io::ErrorKind::NotFound => return Ok(Opened::Unusable),
@@ -723,6 +750,14 @@ fn open_unshared_empty(fs: &dyn Fs, path: &Path) -> crate::Result<Opened> {
             Ok(Opened::Unusable)
         }
     }
+}
+
+/// How a refill makes a pool file: empty, for tables of any origin to come.
+fn pool_file() -> FsOpenOptions {
+    FsOpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .write_origin(WriteOrigin::Metadata)
 }
 
 /// Removes a pool file that will not be written into. Nothing names it, so a

@@ -177,6 +177,9 @@ pub struct Metrics {
     /// The on-disk bytes copied instead of encoded: whole groups and pages.
     pub(crate) compaction_bytes_carried: AtomicU64,
 
+    /// What the tree took in from its caller.
+    accepted: AcceptedCounters,
+
     /// The work compactions were estimated to cost before they ran.
     compaction_work_estimated: WorkCounters,
 
@@ -210,6 +213,36 @@ pub struct Metrics {
     /// [`Self::ecc_secded_corrected`]; the two are disjoint by recovery
     /// mechanism and sum to the total on-read ECC recoveries.
     pub(crate) ecc_shard_recovered: AtomicUsize,
+}
+
+/// What a tree took in from its caller, before any encoding: the payload the
+/// bytes it writes are measured against.
+///
+/// Every value, deletion and record is counted as it arrives, so an overwrite
+/// or a retried write is counted each time. That is why the bytes a flush
+/// writes are no substitute for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AcceptedWrites {
+    /// Values written, merge operands included.
+    pub values: u64,
+    /// Point deletions.
+    pub deletions: u64,
+    /// Range deletions.
+    pub range_deletions: u64,
+    /// Records an ingestion took in.
+    pub ingested: u64,
+    /// The bytes of their keys, values, operands and range bounds.
+    pub payload_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct AcceptedCounters {
+    values: AtomicU64,
+    deletions: AtomicU64,
+    range_deletions: AtomicU64,
+    ingested: AtomicU64,
+    payload_bytes: AtomicU64,
 }
 
 /// One cumulative counter per kind of compaction work.
@@ -493,6 +526,73 @@ impl Metrics {
     /// [`Self::compaction_groups_partly_carried`].
     pub fn compaction_bytes_carried(&self) -> u64 {
         self.compaction_bytes_carried.load(Relaxed)
+    }
+
+    /// What the tree took in from its caller since it was opened.
+    ///
+    /// The denominator of host write amplification: divide the bytes its
+    /// backend counted (see [`crate::fs::CountingFs`]) by
+    /// [`AcceptedWrites::payload_bytes`] over the same interval, when the
+    /// tree is the only writer on that backend.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    /// use lsm_tree::fs::MemFs;
+    ///
+    /// let tree = Config::new(
+    ///     "/db",
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .with_fs(MemFs::new())
+    /// .open()?;
+    /// tree.insert("key", "value", 0);
+    /// tree.remove("key", 1);
+    ///
+    /// let accepted = tree.metrics().accepted_writes();
+    /// assert_eq!((accepted.values, accepted.deletions), (1, 1));
+    /// assert_eq!(accepted.payload_bytes, 8 + 3);
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    pub fn accepted_writes(&self) -> AcceptedWrites {
+        let accepted = &self.accepted;
+        AcceptedWrites {
+            values: accepted.values.load(Relaxed),
+            deletions: accepted.deletions.load(Relaxed),
+            range_deletions: accepted.range_deletions.load(Relaxed),
+            ingested: accepted.ingested.load(Relaxed),
+            payload_bytes: accepted.payload_bytes.load(Relaxed),
+        }
+    }
+
+    /// Records a value of `payload` bytes, key included, taken in.
+    pub(crate) fn accepted_value(&self, payload: usize) {
+        self.accepted.values.fetch_add(1, Relaxed);
+        self.accepted
+            .payload_bytes
+            .fetch_add(payload as u64, Relaxed);
+    }
+
+    /// Records a point deletion of a `key` bytes long key taken in.
+    pub(crate) fn accepted_deletion(&self, key: usize) {
+        self.accepted.deletions.fetch_add(1, Relaxed);
+        self.accepted.payload_bytes.fetch_add(key as u64, Relaxed);
+    }
+
+    /// Records a range deletion of `bounds` bytes of bounds taken in.
+    pub(crate) fn accepted_range_deletion(&self, bounds: usize) {
+        self.accepted.range_deletions.fetch_add(1, Relaxed);
+        self.accepted
+            .payload_bytes
+            .fetch_add(bounds as u64, Relaxed);
+    }
+
+    /// Records `records` ingested records of `payload` bytes taken in.
+    pub(crate) fn accepted_ingestion(&self, records: u64, payload: u64) {
+        self.accepted.ingested.fetch_add(records, Relaxed);
+        self.accepted.payload_bytes.fetch_add(payload, Relaxed);
     }
 
     /// The work compactions were estimated to cost before they ran, summed

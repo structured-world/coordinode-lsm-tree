@@ -236,7 +236,23 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Initializes a new blob file writer.
+    /// A blob file writer whose file carries no origin.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    #[cfg(test)]
+    pub fn new<P: AsRef<Path>>(
+        path: P,
+        blob_file_id: BlobFileId,
+        tree_id: TreeId,
+        fs: &dyn Fs,
+    ) -> crate::Result<Self> {
+        Self::open(path, blob_file_id, tree_id, fs, None)
+    }
+
+    /// Initializes a new blob file writer, its file written as `origin`'s
+    /// when given.
     ///
     /// Uses `create_new` (not `create+truncate`) because blob file IDs are
     /// monotonically unique — a path collision indicates a bug, not a retry.
@@ -245,16 +261,18 @@ impl Writer {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
-    #[doc(hidden)]
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn open<P: AsRef<Path>>(
         path: P,
         blob_file_id: BlobFileId,
         tree_id: TreeId,
         fs: &dyn Fs,
+        origin: Option<crate::fs::WriteOrigin>,
     ) -> crate::Result<Self> {
         let path = path.as_ref();
 
-        let file = fs.open(path, &FsOpenOptions::new().write(true).create_new(true))?;
+        let mut opts = FsOpenOptions::new().write(true).create_new(true);
+        opts.write_origin = origin;
+        let file = fs.open(path, &opts)?;
         // From here the file exists and is OURS (`create_new` proved it), so
         // this constructor owns cleanup: an init failure below must not leak a
         // partial file, and a CALLER must never remove `path` on a constructor

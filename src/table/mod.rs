@@ -2889,7 +2889,11 @@ impl Table {
             .fs
             .open(
                 &tmp_path,
-                &FsOpenOptions::new().read(true).write(true).create_new(true),
+                &FsOpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .write_origin(crate::fs::WriteOrigin::Repair),
             )
             .map_err(|e| alloc::format!("create heal copy: {e}"))?;
 
@@ -3125,10 +3129,13 @@ impl Table {
         // A single read+write handle for both the recovery read and the
         // write-back, opened directly (not via the read-only descriptor cache) so
         // the heal sees the medium and can mutate it.
-        let mut file = match self
-            .fs
-            .open(&self.path, &FsOpenOptions::new().read(true).write(true))
-        {
+        let mut file = match self.fs.open(
+            &self.path,
+            &FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .write_origin(crate::fs::WriteOrigin::Repair),
+        ) {
             Ok(f) => f,
             Err(e) => {
                 // Cannot persist corrections (a read-only replica, restrictive

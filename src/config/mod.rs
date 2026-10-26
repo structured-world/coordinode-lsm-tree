@@ -737,7 +737,7 @@ pub struct Config {
 
     /// Number of levels of the LSM tree (depth of tree)
     ///
-    /// Once set, the level count is fixed (in the "manifest" file)
+    /// Once set, the level count is fixed (in the manifest snapshot `v<id>`)
     pub level_count: u8,
 
     /// Restart interval inside data blocks
@@ -1361,7 +1361,8 @@ pub(crate) fn acquire_directory_lock(
         &crate::fs::FsOpenOptions::new()
             .read(true)
             .write(true)
-            .create(true),
+            .create(true)
+            .write_origin(crate::fs::WriteOrigin::Metadata),
     )?;
     if file.try_lock_exclusive()? {
         Ok(Some(file))

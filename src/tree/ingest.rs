@@ -141,6 +141,7 @@ impl<'a> Ingestion<'a> {
             tree.config.table_target_size,
             ingest_level,
             level_fs.clone(),
+            crate::fs::WriteOrigin::IngestTable,
         )?
         .set_comparator(tree.config.comparator.clone())
         .use_bloom_policy(bloom_policy)
@@ -336,6 +337,8 @@ impl<'a> Ingestion<'a> {
             );
         }
 
+        #[cfg(feature = "metrics")]
+        self.accept(1, (key.len() + value.len()) as u64);
         self.write_row(crate::InternalValue::from_components(
             key.clone(),
             value,
@@ -347,6 +350,13 @@ impl<'a> Ingestion<'a> {
         self.last_key = Some(key);
 
         Ok(())
+    }
+
+    /// Charges `records` taken in, of `payload` bytes, to the payload the
+    /// tree's writes are measured against.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn accept(&self, records: u64, payload: u64) {
+        self.tree.0.metrics.accepted_ingestion(records, payload);
     }
 
     /// Writes a tombstone for a key.
@@ -362,6 +372,8 @@ impl<'a> Ingestion<'a> {
             );
         }
 
+        #[cfg(feature = "metrics")]
+        self.accept(1, key.len() as u64);
         self.write_row(crate::InternalValue::from_components(
             key.clone(),
             crate::UserValue::empty(),
@@ -388,6 +400,8 @@ impl<'a> Ingestion<'a> {
             );
         }
 
+        #[cfg(feature = "metrics")]
+        self.accept(1, key.len() as u64);
         self.write_row(crate::InternalValue::from_components(
             key.clone(),
             crate::UserValue::empty(),
@@ -456,6 +470,8 @@ impl<'a> Ingestion<'a> {
         // one offset more per `Bytes` column than the batch has rows, which a
         // stream of small batches would add up into groups cut short.
         let rows_bytes = batch.rows_bytes()?;
+        #[cfg(feature = "metrics")]
+        self.accept(u64::from(batch.row_count), rows_bytes);
         match &mut self.pending_columnar {
             Some(pending)
                 if pending
@@ -671,6 +687,13 @@ impl<'a> Ingestion<'a> {
         // We use upgrade_version_with_seqno (instead of upgrade_version) because
         // we need precise control over the seqno: it must match the seqno we
         // already assigned to the recovered tables.
+        let mut installed = crate::tree::InstalledCharge::default();
+        installed.add(
+            &created_tables,
+            &[],
+            crate::fs::WriteOrigin::IngestTable,
+            crate::fs::WriteOrigin::IngestBlob,
+        )?;
         version_lock.upgrade_version_with_seqno(
             &self.tree.config.path,
             |current| {
@@ -690,6 +713,7 @@ impl<'a> Ingestion<'a> {
             // Ingestion only adds tables: older snapshots keep everything.
             crate::version::RetentionEffect::Keep,
         )?;
+        installed.charge();
         // The installed tables name their dictionary from here on.
         drop(write_pin);
 

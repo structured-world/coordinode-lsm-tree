@@ -447,6 +447,71 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
     IterGuardImpl::Standard(Guard(Err(e)))
 }
 
+/// The bytes an install keeps, for each counter set they go to: the set of
+/// the backend each file was written through (see
+/// [`Fs::write_io_stats`](crate::fs::Fs::write_io_stats)), so a route on
+/// another medium is charged to that medium's set. Files on a backend that
+/// counts nothing are not looked at.
+///
+/// Read before the install publishes the files, recorded once it has
+/// ([`Self::charge`]): an install that fails keeps nothing.
+#[derive(Default)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "reached from blob_tree and compaction as crate::tree::InstalledCharge"
+)]
+pub(crate) struct InstalledCharge(Vec<(Arc<crate::fs::WriteIoStats>, crate::fs::WriteOrigin, u64)>);
+
+impl InstalledCharge {
+    /// Adds the files of `tables`, written for `table_origin`, and of
+    /// `blob_files`, written for `blob_origin`.
+    ///
+    /// # Errors
+    ///
+    /// A counted blob file whose length cannot be read.
+    pub(crate) fn add(
+        &mut self,
+        tables: &[Table],
+        blob_files: &[crate::BlobFile],
+        table_origin: crate::fs::WriteOrigin,
+        blob_origin: crate::fs::WriteOrigin,
+    ) -> crate::Result<()> {
+        for table in tables {
+            if let Some(stats) = table.fs.write_io_stats() {
+                self.push(stats, table_origin, table.file_len());
+            }
+        }
+        for blob_file in blob_files {
+            if let Some(stats) = blob_file.0.fs.write_io_stats() {
+                self.push(stats, blob_origin, blob_file.physical_size()?);
+            }
+        }
+        Ok(())
+    }
+
+    fn push(
+        &mut self,
+        stats: &Arc<crate::fs::WriteIoStats>,
+        origin: crate::fs::WriteOrigin,
+        bytes: u64,
+    ) {
+        for (set, slot, sum) in &mut self.0 {
+            if *slot == origin && Arc::ptr_eq(set, stats) {
+                *sum += bytes;
+                return;
+            }
+        }
+        self.0.push((Arc::clone(stats), origin, bytes));
+    }
+
+    /// Records the bytes, once the install that keeps them is published.
+    pub(crate) fn charge(self) {
+        for (stats, origin, bytes) in self.0 {
+            stats.installed(origin, bytes);
+        }
+    }
+}
+
 /// Extract owned user-key bounds from any range.
 #[expect(
     clippy::redundant_pub_crate,
@@ -1095,6 +1160,7 @@ impl AbstractTree for Tree {
             self.config.table_target_size,
             0,
             level_fs.clone(),
+            crate::fs::WriteOrigin::FlushTable,
         )?;
         // The flush's L0 recency, taken once its first file is: flushes are
         // serialized, so it is above every table already flushed and below
@@ -1303,6 +1369,14 @@ impl AbstractTree for Tree {
             bf.bind_to_tree(&sinks);
         }
 
+        let mut installed = InstalledCharge::default();
+        installed.add(
+            tables,
+            blob_files.unwrap_or(&[]),
+            crate::fs::WriteOrigin::FlushTable,
+            crate::fs::WriteOrigin::FlushBlob,
+        )?;
+
         let mut _compaction_state = self.compaction_state.lock();
         let mut version_lock = self.version_history.write();
 
@@ -1364,6 +1438,7 @@ impl AbstractTree for Tree {
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
         )?;
+        installed.charge();
 
         Ok(())
     }
@@ -2050,6 +2125,11 @@ impl AbstractTree for Tree {
     }
 
     fn remove_range<K: Into<UserKey>>(&self, start: K, end: K, seqno: SeqNo) -> u64 {
+        let (start, end) = (start.into(), end.into());
+        #[cfg(feature = "metrics")]
+        self.0
+            .metrics
+            .accepted_range_deletion(start.len() + end.len());
         // The read guard is held through the insert, like `append_entry`: the
         // CDC scan's capture (write side of this lock) must exclude every
         // in-flight memtable write, or a backdated range deletion could land
@@ -2064,7 +2144,7 @@ impl AbstractTree for Tree {
         history
             .latest_version_ref()
             .active_memtable
-            .insert_range_tombstone(start.into(), end.into(), seqno)
+            .insert_range_tombstone(start, end, seqno)
     }
 }
 
@@ -5372,6 +5452,8 @@ impl Tree {
     #[doc(hidden)]
     #[must_use]
     pub fn append_entry(&self, value: InternalValue) -> (u64, u64) {
+        #[cfg(feature = "metrics")]
+        self.accept(&value);
         let kv_digest = self.insert_digest(&value);
 
         // The `.read()` guard is a temporary that lives until the end of this
@@ -5440,6 +5522,19 @@ impl Tree {
         Ok(inserted)
     }
 
+    /// Charges `value`, taken in from the caller, to the payload the tree's
+    /// writes are measured against: a deletion its key, anything else its key
+    /// and value.
+    #[cfg(feature = "metrics")]
+    fn accept(&self, value: &InternalValue) {
+        let key = value.key.user_key.len();
+        if value.key.value_type.is_tombstone() {
+            self.0.metrics.accepted_deletion(key);
+        } else {
+            self.0.metrics.accepted_value(key + value.value.len());
+        }
+    }
+
     /// The insert-time per-KV digest of `value`, when the runtime config asks
     /// for one.
     fn insert_digest(
@@ -5489,6 +5584,10 @@ impl Tree {
                 .kv_digest_at_insert
                 .load(core::sync::atomic::Ordering::Relaxed),
         );
+        #[cfg(feature = "metrics")]
+        for item in &items {
+            self.accept(item);
+        }
 
         // Hold the read guard for the entire insert to prevent rotate_memtable()
         // from sealing this memtable mid-batch (which could cause data loss if

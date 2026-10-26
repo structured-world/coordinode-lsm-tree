@@ -24,6 +24,7 @@
 //!   do not help for storage I/O patterns); [`StdFs`](crate::fs::StdFs) is the correct choice
 
 mod aligned_buf;
+mod counting_fs;
 // `direct_io` is std-only (touches `std::fs::OpenOptions`). It is
 // gated behind the `std` feature so a `no_std + alloc` build of
 // this crate does not even attempt to compile it. The wider
@@ -55,6 +56,9 @@ mod crash_fs;
 mod std_fs;
 
 pub use aligned_buf::AlignedBuf;
+pub use counting_fs::{
+    CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats, WriteOrigin,
+};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod io_uring_fs;
@@ -176,6 +180,10 @@ pub struct FsOpenOptions {
     /// cleared once the file is open, so its reads and writes block as
     /// usual). A backend without named pipes has nothing to wait for.
     pub no_wait: bool,
+    /// What the file is written for, so a counting backend such as
+    /// [`CountingFs`] charges its writes to that origin. Advisory: it never
+    /// changes what the open or the file does.
+    pub write_origin: Option<WriteOrigin>,
 }
 
 impl Default for FsOpenOptions {
@@ -198,6 +206,7 @@ impl FsOpenOptions {
             direct_io: false,
             no_follow: false,
             no_wait: false,
+            write_origin: None,
         }
     }
 
@@ -261,6 +270,13 @@ impl FsOpenOptions {
     #[must_use]
     pub const fn no_wait(mut self, no_wait: bool) -> Self {
         self.no_wait = no_wait;
+        self
+    }
+
+    /// Sets what the file is written for (see [`Self::write_origin`]).
+    #[must_use]
+    pub const fn write_origin(mut self, origin: WriteOrigin) -> Self {
+        self.write_origin = Some(origin);
         self
     }
 }
@@ -1713,6 +1729,30 @@ pub trait Fs: Send + Sync + 'static {
     fn truncate_file(&self, path: &Path) -> io::Result<()> {
         self.open(path, &FsOpenOptions::new().write(true))?
             .set_len(0)
+    }
+
+    /// The counters what is written through this backend is counted into,
+    /// when it counts (see [`CountingFs`]): a tree records there the bytes of
+    /// the files it installs on this backend.
+    ///
+    /// # Default implementation
+    ///
+    /// `None`: a backend that counts nothing. A backend wrapping another
+    /// returns the inner one's, so a counting backend under it is still
+    /// found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::{CountingFs, Fs, MemFs};
+    /// use std::sync::Arc;
+    ///
+    /// assert!(MemFs::new().write_io_stats().is_none());
+    /// let counted = CountingFs::new(Arc::new(MemFs::new()));
+    /// assert!(counted.write_io_stats().is_some());
+    /// ```
+    fn write_io_stats(&self) -> Option<&alloc::sync::Arc<WriteIoStats>> {
+        None
     }
 
     /// Number of hard links to the file at `path` (the inode's link count).

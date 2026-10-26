@@ -359,6 +359,12 @@ path = "benches/key_domains_retention.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "write_ledger"
+harness = false
+path = "benches/write_ledger.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "tight_space_disk"
 harness = false
 path = "benches/tight_space_disk.rs"

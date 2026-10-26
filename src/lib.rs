@@ -587,7 +587,7 @@ pub use tree::columnar_scan::{
 pub use compression::{ZstdDictionaries, ZstdDictionary};
 
 #[cfg(feature = "metrics")]
-pub use metrics::{CacheStats, Metrics};
+pub use metrics::{AcceptedWrites, CacheStats, Metrics};
 
 #[cfg(feature = "std")]
 pub use backpressure::WriteBufferBudget;

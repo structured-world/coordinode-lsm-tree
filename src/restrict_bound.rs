@@ -252,7 +252,11 @@ fn publish_many(items: &[(&dyn Fs, &Path, &[u8])], sync_mode: SyncMode) -> Vec<c
         .map(|&(fs, table_path, content)| {
             let mut file = fs.open(
                 &sidecar_tmp_path(table_path),
-                &FsOpenOptions::new().write(true).create(true).truncate(true),
+                &FsOpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .write_origin(crate::fs::WriteOrigin::Metadata),
             )?;
             file.write_all(content)?;
             file.flush()?;

@@ -449,6 +449,7 @@ pub(super) fn prepare_table_writer(
         payload.target_size,
         payload.dest_level,
         level_fs,
+        crate::fs::WriteOrigin::CompactionTable,
     )?
     .use_output_ledger(opts.outputs.clone())
     .set_comparator(opts.config.comparator.clone())
@@ -867,8 +868,15 @@ pub(super) fn install_merge(
     let mut released_objects = Vec::new();
     let mut carried = (0u64, 0u64, 0u64);
     let mut work = super::work::Installed::default();
+    let mut installed_files = crate::tree::InstalledCharge::default();
     for out in outputs {
         let installed = out.installed_work()?;
+        installed_files.add(
+            &out.created_tables,
+            &out.created_blob_files,
+            crate::fs::WriteOrigin::CompactionTable,
+            crate::fs::WriteOrigin::CompactionBlob,
+        )?;
         work.written += installed.written;
         work.carried += installed.carried;
         work.read += installed.read;
@@ -1052,6 +1060,7 @@ pub(super) fn install_merge(
             .released()
             .record(published, released_objects, []);
     }
+    installed_files.charge();
     #[cfg(feature = "metrics")]
     charge_installed(&opts.metrics, relocated_bytes, carried);
     #[cfg(not(feature = "metrics"))]

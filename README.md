@@ -100,6 +100,7 @@ tree.flush_active_memtable(0)?;
 - Per-level and per-segment size / entry / access stats (`level_segment_stats`) for tiering and placement decisions.
 - Approximate range size (`approximate_range_stats`) and cardinality + selectivity (`approximate_range_cardinality`) for query planning, estimated from block-index offsets and per-block zone maps without reading data blocks.
 - Compaction-debt estimate (`compaction_debt`): pending-compaction bytes above each level's target, a scheduler / tiering signal.
+- Host-write ledger (`fs::CountingFs`, no feature needed): every byte, write call, sync, creation, rename and removal the trees on a medium hand their filesystem, charged to what it was written for (flush, ingestion and compaction tables and blob files, the manifest, other metadata, repair, checkpoints), with the bytes each install kept, in one counter set per physical medium shared by its trees and level routes, for a write budget or a flash wear estimate. A tree on a plain backend pays nothing for it; the payload a tree took in is a `metrics` figure. See [docs/write-ledger.md](docs/write-ledger.md).
 
 ### Internals
 
@@ -216,7 +217,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 | `io-uring-raw` (linux only) | [`syscalls`](https://github.com/jasonwhite/syscalls) | Pure-Rust `no_std` io_uring `Fs` backend on raw Linux syscalls (no libc), for embedded or sandboxed Linux targets without `std`. |
 | `bytes_1` | [`bytes`](https://github.com/tokio-rs/bytes) | Consumer already speaks `bytes::Bytes` (tokio/hyper/tonic stack) and wants zero-copy interop with engine slices. |
 | `parallel` (default-on) | [`rayon`](https://github.com/rayon-rs/rayon) | Built-in rayon-backed parallel block-compression executor. `std`-only; the `CompactionSpawner` trait lets a caller inject a custom executor without this flag. |
-| `metrics` | (none) | Production observability or profiling. Compiles in atomic counters around block I/O, filter probes, compaction, and cache hit rates (`tree.metrics()`). Small but non-zero hot-path cost. |
+| `metrics` | (none) | Production observability or profiling. Compiles in atomic counters around block I/O, filter probes, compaction, and cache hit rates (`tree.metrics()`), and the payload a tree took in (`accepted_writes()`). Small but non-zero hot-path cost. |
 | `ribbon-serde` | `serde` | Snapshotting the internal `RibbonFilterRepr` for debugging or out-of-band transport. Not used by the on-disk format. |
 
 ## Benchmarks

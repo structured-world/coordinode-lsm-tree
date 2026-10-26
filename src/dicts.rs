@@ -115,7 +115,11 @@ pub fn write(
     // so overwriting it is the recovery, not a hazard.
     let mut file = fs.open(
         &tmp_path,
-        &FsOpenOptions::new().write(true).create(true).truncate(true),
+        &FsOpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .write_origin(crate::fs::WriteOrigin::Metadata),
     )?;
     let written = file
         .write_all(bytes)

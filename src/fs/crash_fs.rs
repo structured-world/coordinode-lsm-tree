@@ -1340,6 +1340,10 @@ impl Fs for CrashFs {
         self.inner.backend_id()
     }
 
+    fn write_io_stats(&self) -> Option<&Arc<super::WriteIoStats>> {
+        self.inner.write_io_stats()
+    }
+
     fn volume_id(&self, path: &Path) -> Option<u64> {
         self.inner.volume_id(path)
     }

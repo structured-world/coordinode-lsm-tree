@@ -811,10 +811,26 @@ impl BlobTree {
         let sourced: Vec<(BlobIndirection, u64)> = refs
             .map(|reference| (reference.indirection, reference.source))
             .collect();
-        self.index.append_cell_row(
+        // The caller's bytes, as an ingested row counts them: the key and the
+        // value fields, not the row's encoding; a reference brings none.
+        #[cfg(feature = "metrics")]
+        let payload = key.len()
+            + fields
+                .iter()
+                .map(|field| match &field.cell {
+                    field_row::Cell::Value(bytes) => bytes.len(),
+                    field_row::Cell::Ref(_) => 0,
+                })
+                .sum::<usize>();
+        let written = self.index.append_cell_row(
             InternalValue::from_components(key, value, seqno, crate::ValueType::CellRow),
             &sourced,
-        )
+        )?;
+        // Charged once the row is in: a row refused for a stale reference is
+        // written again, and counted, by the retry.
+        #[cfg(feature = "metrics")]
+        self.index.0.metrics.accepted_value(payload);
+        Ok(written)
     }
 
     /// The fields of `key` as of `seqno`, references included as references:
@@ -2005,6 +2021,7 @@ impl AbstractTree for BlobTree {
             self.index.config.table_target_size,
             0,
             level_fs.clone(),
+            crate::fs::WriteOrigin::FlushTable,
         )?;
         // The flush's L0 recency, taken as the standard tree's flush takes
         // it: a pooled file's id says nothing about when it was written, a
@@ -2115,12 +2132,13 @@ impl AbstractTree for BlobTree {
             .expect("kv separation options should exist");
 
         let mut blob_writer = {
-            let w = BlobFileWriter::new(
+            let w = BlobFileWriter::new_for(
                 self.index.0.blob_file_id_counter.clone(),
                 self.index.config.path.join(BLOBS_FOLDER),
                 self.id(),
                 self.index.config.descriptor_table.clone(),
                 self.index.config.fs.clone(),
+                crate::fs::WriteOrigin::FlushBlob,
             )?
             .use_target_size(kv_opts.file_target_size)
             .use_compression(rc.blob_compression)
