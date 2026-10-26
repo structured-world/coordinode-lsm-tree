@@ -51,8 +51,10 @@ pub struct CarryCandidate {
     pub(crate) group: BlockHandle,
     /// What it is.
     pub(crate) unit: CarryUnit,
-    /// Its rows, in the order the scanner handed them out; never empty.
-    pub(crate) rows: Arc<[InternalValue]>,
+    /// Its rows, in the order the scanner handed them out; never empty. A
+    /// shared vector rather than a slice, so the rows read are not copied
+    /// once more into a new allocation for every group or block.
+    pub(crate) rows: Arc<Vec<InternalValue>>,
     /// The first and the last of `rows`' keys.
     keys: (UserKey, UserKey),
     /// The bytes of `rows`' keys and values.
@@ -217,7 +219,9 @@ pub struct GroupCarry {
     queue: CarryQueue,
     /// The range the scan hands out rows of, `None` for the whole table.
     bounds: Option<KeyBounds>,
-    rows: Arc<[InternalValue]>,
+    rows: Arc<Vec<InternalValue>>,
+    /// The buffer of the group before, filled again once no candidate holds it.
+    spare: Arc<Vec<InternalValue>>,
     next: usize,
 }
 
@@ -228,7 +232,8 @@ impl GroupCarry {
             table,
             queue,
             bounds: None,
-            rows: Arc::from(Vec::new()),
+            rows: Arc::new(Vec::new()),
+            spare: Arc::new(Vec::new()),
             next: 0,
         }
     }
@@ -265,14 +270,8 @@ impl GroupCarry {
         &mut self,
         group: Option<BlockHandle>,
         frame: Option<crate::Slice>,
-        mut rows: Vec<InternalValue>,
+        rows: impl IntoIterator<Item = InternalValue>,
     ) {
-        let read = rows.len();
-        if let Some(bounds) = &self.bounds {
-            rows.retain(|row| bounds.contains(&row.key.user_key));
-        }
-        let whole = rows.len() == read;
-        let bytes = rows.iter().map(row_bytes).sum();
         let mut queue = self.queue.lock();
         if let Some(passed) = self.rows.last() {
             let comparator = &self.table.comparator;
@@ -280,7 +279,24 @@ impl GroupCarry {
                 comparator.compare(candidate.last_key(), &passed.key.user_key) == Ordering::Greater
             });
         }
-        self.rows = Arc::from(rows);
+        // The rows go into the buffer of the group before last when no
+        // candidate holds it any more, which is the usual case once the merge
+        // has moved past it, so a long scan allocates no buffer per group.
+        let mut buffer = Arc::get_mut(&mut self.spare)
+            .map(core::mem::take)
+            .unwrap_or_default();
+        buffer.clear();
+        buffer.extend(rows);
+        let read = buffer.len();
+        if let Some(bounds) = &self.bounds {
+            buffer.retain(|row| bounds.contains(&row.key.user_key));
+        }
+        let whole = buffer.len() == read;
+        match Arc::get_mut(&mut self.spare) {
+            Some(slot) => *slot = buffer,
+            None => self.spare = Arc::new(buffer),
+        }
+        core::mem::swap(&mut self.rows, &mut self.spare);
         self.next = 0;
         let unit = match (group, frame) {
             (Some(group), Some(frame)) => (!self.table.has_inner_block_layout(group.offset().0))
@@ -294,6 +310,7 @@ impl GroupCarry {
             && let (Some(first), Some(last)) = (self.rows.first(), self.rows.last())
         {
             let keys = (first.key.user_key.clone(), last.key.user_key.clone());
+            let bytes = self.rows.iter().map(row_bytes).sum();
             self.queue.record(
                 &mut queue,
                 CarryCandidate {

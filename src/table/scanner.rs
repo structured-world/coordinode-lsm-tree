@@ -390,12 +390,11 @@ impl Scanner {
             self.lower_bound.is_none() && self.global_seqno == 0,
             "only a table whose groups or blocks can be carried records them",
         );
-        let rows = self.iter.by_ref().collect();
         let (group, frame) = match self.frame.take() {
             Some((block, frame)) => (Some(block), Some(frame)),
             None => (self.current_group, None),
         };
-        carry.start(group, frame, rows);
+        carry.start(group, frame, self.iter.by_ref());
         self.carry = Some(carry);
         self
     }
@@ -413,7 +412,7 @@ impl Scanner {
             }
             let group = self.groups.next();
             let rows = match self.read_group(group) {
-                Ok(iter) => iter.collect(),
+                Ok(iter) => iter,
                 Err(e) => return Some(Err(e)),
             };
             self.current_group = group;
