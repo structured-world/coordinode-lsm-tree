@@ -252,6 +252,9 @@ struct Window {
     index: u128,
     current: u64,
     previous: u64,
+    /// Every byte since `origin`: what an allowance that refills nothing
+    /// sets against its burst.
+    total: u128,
 }
 
 impl Window {
@@ -361,6 +364,7 @@ impl Account {
         self.window
             .advance(now_nanos, self.allowance.period_nanos());
         self.window.current += mandatory;
+        self.window.total += u128::from(mandatory);
     }
 
     fn settle(&mut self, now: Spend, now_nanos: u128) {
@@ -416,11 +420,13 @@ impl Account {
     fn unsustainable(&self, now_nanos: u128) -> bool {
         let period = self.allowance.period_nanos();
         let rate = u128::from(self.allowance.bytes_per_period);
-        let (bytes, covered) = self.window.last_period(now_nanos, period);
         if rate == 0 {
-            // Nothing refills: past the burst, nothing ever repays them.
-            return bytes > u128::from(self.allowance.burst);
+            // Nothing refills, so the burst is spent once: every byte since
+            // the window began counts against it, and past it nothing ever
+            // repays them.
+            return self.window.total > u128::from(self.allowance.burst);
         }
+        let (bytes, covered) = self.window.last_period(now_nanos, period);
         // The time the burst takes to refill, at most a period: a product past
         // u128 is a refill longer than any period.
         let horizon = u128::from(self.allowance.burst)
@@ -494,7 +500,8 @@ impl WriteBudget {
     /// `allowance` from wall time `now`, less `unaccounted` bytes: the most
     /// that may have been written after the checkpoint without being
     /// charged. The refill between the checkpoint and `now` is credited, up
-    /// to the burst, and nothing else.
+    /// to the burst, and nothing else; `unaccounted` is charged after it,
+    /// since those writes may have come at any time up to `now`.
     #[must_use]
     pub fn resume_at(
         ledger: Arc<WriteIoStats>,
@@ -506,10 +513,15 @@ impl WriteBudget {
         let budget = Self::start(
             ledger,
             allowance,
-            i128::from(checkpoint.credit) - i128::from(unaccounted),
+            i128::from(checkpoint.credit),
             checkpoint.as_of,
         );
-        budget.account.lock().refill(now.as_nanos());
+        let mut account = budget.account.lock();
+        account.refill(now.as_nanos());
+        // Charged after the refill: charged before, a refill up to the burst
+        // would erase them.
+        account.credit -= i128::from(unaccounted);
+        drop(account);
         budget
     }
 
@@ -838,7 +850,8 @@ fn clamp_i64(value: i128) -> i64 {
 
 fn nanos_to_duration(nanos: u128) -> Duration {
     let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
-    let sub = (nanos % 1_000_000_000) as u32;
+    // Below one second's nanoseconds, so it fits a u32.
+    let sub = u32::try_from(nanos % 1_000_000_000).unwrap_or(0);
     Duration::new(secs, sub)
 }
 

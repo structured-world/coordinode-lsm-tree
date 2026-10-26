@@ -404,7 +404,7 @@ fn main() -> lsm_tree::Result<()> {
         mib(ALLOWANCE_PER_DAY),
     );
     println!(
-        "{:<8} {:>11} {:>14} {:>6} {:>8} {:>13} {:>9} {:>9} {:>8} {:>9} {:>14} {:>9} {:>7}",
+        "{:<8} {:>11} {:>14} {:>6} {:>8} {:>13} {:>9} {:>9} {:>10} {:>8} {:>9} {:>14} {:>9} {:>7}",
         "arm",
         "written MiB",
         "compacted MiB",
@@ -413,6 +413,7 @@ fn main() -> lsm_tree::Result<()> {
         "max debt MiB",
         "read p50",
         "read p99",
+        "read p999",
         "refused",
         "overrides",
         "unsustainable",
@@ -425,14 +426,15 @@ fn main() -> lsm_tree::Result<()> {
         }
         let mut outcome = run(arm)?;
         outcome.reads_ns.sort_unstable();
-        let (p50, p99) = (
+        let (p50, p99, p999) = (
             percentile(&outcome.reads_ns, 0.50),
             percentile(&outcome.reads_ns, 0.99),
+            percentile(&outcome.reads_ns, 0.999),
         );
         let overrides =
             outcome.backpressure_overrides + outcome.forced_overrides + outcome.space_overrides;
         println!(
-            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8} {:>9} {:>12} h {:>9.1} {:>7.1}",
+            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8}ns {:>8} {:>9} {:>12} h {:>9.1} {:>7.1}",
             arm.name(),
             mib(outcome.written),
             mib(outcome.compaction),
@@ -441,6 +443,7 @@ fn main() -> lsm_tree::Result<()> {
             mib(outcome.max_debt),
             p50,
             p99,
+            p999,
             outcome.refused,
             overrides,
             outcome.unsustainable_checks * FLUSH_EVERY_SECONDS / 3_600,
@@ -463,6 +466,7 @@ fn main() -> lsm_tree::Result<()> {
             ("max_debt_bytes", outcome.max_debt),
             ("read_p50_ns", p50),
             ("read_p99_ns", p99),
+            ("read_p999_ns", p999),
             ("refused", outcome.refused),
             ("backpressure_overrides", outcome.backpressure_overrides),
             ("forced_overrides", outcome.forced_overrides),

@@ -296,6 +296,24 @@ fn a_resumed_budget_refills_only_the_time_since_its_checkpoint() {
     assert_eq!(same_time.report_at(Duration::ZERO).credit, 100);
 }
 
+// Writes that went uncounted before a restart may have come just before it,
+// after the refill the restart grants: they are charged after that refill,
+// not before, where the refill would erase them.
+#[test]
+fn unaccounted_writes_are_charged_after_the_restart_refill() {
+    let resumed = WriteBudget::resume_at(
+        Medium::new().ledger(),
+        Allowance::new(1_000, DAY),
+        BudgetCheckpoint {
+            credit: 1_000,
+            as_of: Duration::ZERO,
+        },
+        900,
+        DAY,
+    );
+    assert_eq!(resumed.report_at(DAY).credit, 100);
+}
+
 // A checkpoint of an overrun budget carries the overrun across a restart.
 #[test]
 fn an_overrun_survives_a_restart() {
@@ -482,6 +500,23 @@ fn a_space_override_is_counted_apart() {
     assert_eq!(report.forced_overrides, Overrides::default());
     assert_eq!(report.refused, 0);
     drop(hold);
+}
+
+// An allowance that refills nothing never gives the burst back: mandatory
+// writes are unsustainable once they add up past it, however far apart they
+// come.
+#[test]
+fn without_a_refill_mandatory_writes_add_up_against_the_burst() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(0, DAY).with_burst(1_000));
+    medium.write(WriteOrigin::FlushTable, 600);
+    assert!(!budget.report_at(DAY / 2).unsustainable);
+    medium.write(WriteOrigin::FlushTable, 600);
+    assert!(budget.report_at(DAY * 3 / 2).unsustainable);
+    assert!(
+        budget.report_at(DAY * 10).unsustainable,
+        "nothing repays it"
+    );
 }
 
 // A forced request is a flag the caller sets and clears.
