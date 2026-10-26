@@ -15,7 +15,11 @@
 //!    checkpoint on a new ledger;
 //! 3. a burst: 6 h of `BURST_SENSORS` sensors at 1 Hz;
 //! 4. load above the budget: the allowance is cut, at run time, to a quarter,
-//!    below what the flushes alone write, and the burst goes on for 6 h.
+//!    below what the flushes alone write, and the burst goes on for 6 h;
+//! 5. a nearly full volume: the allowance is restored, a storage quota is set
+//!    a tenth above the tree's footprint with the admission check on, and the
+//!    burst goes on for 3 h; every ten minutes it counts whether the tree
+//!    refuses writes for want of space, and the largest footprint seen.
 //!
 //! Arms:
 //!
@@ -51,6 +55,7 @@ const BURST_SENSORS: u32 = 64;
 const QUIET_HOURS: u64 = 12;
 const BURST_HOURS: u64 = 6;
 const OVER_HOURS: u64 = 6;
+const FULL_HOURS: u64 = 3;
 const FLUSH_EVERY_SECONDS: u64 = 600;
 const RETENTION_HOURS: u64 = 3;
 const VALUE_BYTES: usize = 24;
@@ -148,6 +153,11 @@ struct Outcome {
     forced_overrides: u64,
     space_overrides: u64,
     unsustainable_checks: u64,
+    /// Checks in the nearly full phase, those that found the tree refusing
+    /// writes for want of space, and the largest footprint seen there.
+    full_checks: u64,
+    full_refusals: u64,
+    full_max_used: u64,
     elapsed: Duration,
     cpu: Duration,
 }
@@ -291,6 +301,7 @@ fn run(arm: Arm) -> lsm_tree::Result<Outcome> {
         (QUIET_HOURS, QUIET_SENSORS),
         (BURST_HOURS, BURST_SENSORS),
         (OVER_HOURS, BURST_SENSORS),
+        (FULL_HOURS, BURST_SENSORS),
     ];
     let mut second = 0u64;
     for (phase, (hours, sensors)) in phases.into_iter().enumerate() {
@@ -307,6 +318,23 @@ fn run(arm: Arm) -> lsm_tree::Result<Outcome> {
             budget.set_allowance(
                 Allowance::new(ALLOWANCE_PER_DAY / 4, DAY).with_burst(ALLOWANCE_PER_DAY / 96),
             );
+        }
+        if phase == 3 {
+            // A nearly full volume: the quota leaves a tenth past what the
+            // tree holds, and the space it frees must come from compaction.
+            if let Some(budget) = &medium.budget {
+                budget.set_allowance(
+                    Allowance::new(ALLOWANCE_PER_DAY, DAY).with_burst(ALLOWANCE_PER_DAY / 24),
+                );
+            }
+            let used = tree.storage_stats()?.used_bytes;
+            let AnyTree::Standard(standard) = &tree else {
+                unreachable!("the trace separates no blobs")
+            };
+            standard.update_runtime_config(|c| {
+                c.storage_admission_check = true;
+                c.storage_limit_bytes = Some(used + used / 10);
+            })?;
         }
         for _ in 0..hours * 3_600 {
             for sensor in 0..sensors {
@@ -325,6 +353,14 @@ fn run(arm: Arm) -> lsm_tree::Result<Outcome> {
                     .is_some_and(|b| b.report().unsustainable)
                 {
                     outcome.unsustainable_checks += 1;
+                }
+                if phase == 3 {
+                    outcome.full_checks += 1;
+                    if tree.write_admission().is_err() {
+                        outcome.full_refusals += 1;
+                    }
+                    let used = tree.storage_stats()?.used_bytes;
+                    outcome.full_max_used = outcome.full_max_used.max(used);
                 }
             }
             if second.is_multiple_of(3_600)
@@ -363,7 +399,8 @@ fn main() -> lsm_tree::Result<()> {
     let mib = |b: u64| b as f64 / (1_024.0 * 1_024.0);
     println!(
         "{QUIET_HOURS} h of {QUIET_SENSORS} sensors, a restart, {BURST_HOURS} h of {BURST_SENSORS}, \
-         then {OVER_HOURS} h more with the allowance cut to a quarter; budget {:.1} MiB a day\n",
+         then {OVER_HOURS} h more with the allowance cut to a quarter, then {FULL_HOURS} h \
+         under a quota a tenth past the footprint; budget {:.1} MiB a day\n",
         mib(ALLOWANCE_PER_DAY),
     );
     println!(
@@ -410,6 +447,13 @@ fn main() -> lsm_tree::Result<()> {
             outcome.elapsed.as_secs_f64(),
             outcome.cpu.as_secs_f64(),
         );
+        println!(
+            "{:<8} nearly full: {} of {} checks refused writes, largest footprint {:.2} MiB",
+            "",
+            outcome.full_refusals,
+            outcome.full_checks,
+            mib(outcome.full_max_used),
+        );
         let name = arm.name();
         for (field, value) in [
             ("payload_bytes", outcome.payload),
@@ -424,6 +468,9 @@ fn main() -> lsm_tree::Result<()> {
             ("forced_overrides", outcome.forced_overrides),
             ("space_overrides", outcome.space_overrides),
             ("unsustainable_checks", outcome.unsustainable_checks),
+            ("full_checks", outcome.full_checks),
+            ("full_refusals", outcome.full_refusals),
+            ("full_max_used_bytes", outcome.full_max_used),
             ("wall_ms", outcome.elapsed.as_millis() as u64),
             ("cpu_ms", outcome.cpu.as_millis() as u64),
         ] {

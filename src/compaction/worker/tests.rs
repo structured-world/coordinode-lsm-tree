@@ -5872,6 +5872,120 @@ mod budget_gate {
         Ok(())
     }
 
+    /// Merges exactly the named tables into `dest`.
+    struct MergeRun(Vec<crate::TableId>, u8);
+
+    impl CompactionStrategy for MergeRun {
+        fn get_name(&self) -> &'static str {
+            "MergeRunTest"
+        }
+
+        fn choose(
+            &self,
+            _: &crate::version::Version,
+            _: &crate::Config,
+            _: &crate::compaction::state::CompactionState,
+        ) -> crate::compaction::Choice {
+            crate::compaction::Choice::Merge(crate::compaction::Input {
+                table_ids: self.0.iter().copied().collect(),
+                dest_level: self.1,
+                canonical_level: self.1,
+                target_size: 64 * 1024 * 1024,
+            })
+        }
+    }
+
+    /// On a volume with no room for the merge chosen, the space gate runs the
+    /// smaller merge that reclaims room, and an empty budget lets it through
+    /// as a space override, end to end through a compaction. With room for
+    /// the merge as chosen, the same empty budget makes it wait.
+    #[test]
+    fn a_full_volume_runs_the_reclaiming_merge_past_an_empty_budget() -> crate::Result<()> {
+        use crate::Table;
+        use crate::config::BlockSizePolicy;
+
+        let dir = tempfile::tempdir()?;
+        let mem = MemFs::with_capacity(u64::MAX);
+        let budget = Arc::new(
+            WriteBudget::resume_at(
+                Arc::new(WriteIoStats::default()),
+                Allowance::new(1 << 30, DAY),
+                BudgetCheckpoint {
+                    credit: 0,
+                    as_of: Duration::ZERO,
+                },
+                0,
+                Duration::ZERO,
+            )
+            .with_clock(Arc::new(Epoch)),
+        );
+        let fs = Arc::new(CountingFs::with_budget(
+            Arc::new(mem.clone()),
+            Arc::clone(&budget),
+        ));
+        let tree = open_standard(dir.path(), |c| {
+            c.with_shared_fs(fs)
+                .data_block_size_policy(BlockSizePolicy::all(512))
+        })?;
+        for i in 0..3_000u64 {
+            tree.insert(format!("k{i:08}"), "v".repeat(40), i);
+        }
+        tree.flush_active_memtable(0)?;
+        // The setup's own merge runs on the caller's word.
+        budget.set_forced(true);
+        tree.major_compact(16 * 1024, 0)?;
+        budget.set_forced(false);
+
+        let version = tree.current_version();
+        let Some(run) = version
+            .iter_levels()
+            .flat_map(|level| level.iter())
+            .find(|run| run.len() >= 3)
+        else {
+            panic!("a bottom-level run with >= 3 tables");
+        };
+        let ids: Vec<_> = run.iter().map(Table::id).collect();
+        let run_sigma: u64 = run.iter().map(Table::file_len).sum();
+        drop(version);
+
+        // Room enough for the merge as chosen: the empty budget holds it.
+        tree.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.storage_limit_bytes = None;
+        })?;
+        let result = tree.compact(Arc::new(MergeRun(ids.clone(), 6)), 0)?;
+        assert_eq!(result.action, crate::compaction::CompactionAction::Nothing);
+        assert_eq!(budget.report().refused, 1);
+
+        // Room below the run but above a pair, as the space gate's own test
+        // sizes it: the gate narrows, and the budget lets the reclaiming
+        // merge through.
+        let probe_capacity = 1u64 << 40;
+        mem.set_capacity(probe_capacity);
+        let stored = probe_capacity
+            - crate::fs::Fs::available_space(&mem, dir.path()).unwrap_or(probe_capacity);
+        mem.set_capacity(stored + run_sigma - 1);
+        tree.update_runtime_config(|_| {})?;
+        let tables = tree.table_count();
+
+        let result = tree.compact(Arc::new(MergeRun(ids, 6)), 0)?;
+
+        assert_ne!(result.action, crate::compaction::CompactionAction::Nothing);
+        assert_eq!(result.tables_in, 2, "the narrowed pair");
+        assert!(tree.table_count() < tables);
+        let report = budget.report();
+        assert_eq!(report.space_overrides.reservations, 1);
+        assert_eq!(report.refused, 1, "only the earlier wait");
+        assert_eq!(report.reserved, 0);
+        for i in (0..3_000u64).step_by(97) {
+            assert_eq!(
+                tree.get(format!("k{i:08}"), crate::SeqNo::MAX)?.as_deref(),
+                Some("v".repeat(40).as_bytes()),
+            );
+        }
+        Ok(())
+    }
+
     /// The tables and the blob files of a merge whose folders are on one
     /// medium are reserved together, as one hold of their sum.
     #[test]
