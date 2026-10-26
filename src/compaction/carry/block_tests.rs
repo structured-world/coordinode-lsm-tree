@@ -14,8 +14,8 @@ fn value(i: u64, version: u64) -> Vec<u8> {
     format!("v{i}-{version}-row-major-payload").into_bytes()
 }
 
-/// A row-major tree of small data blocks, every level written without
-/// compression unless `configure` says otherwise.
+/// A row-major tree of small data blocks, every level compressed with lz4
+/// unless the test says otherwise: only compressed blocks are copied.
 fn tree(
     folder: &std::path::Path,
     configure: impl FnOnce(Config) -> Config,
@@ -30,7 +30,7 @@ fn tree(
         panic!("expected standard tree");
     };
     tree.update_runtime_config(|cfg| {
-        cfg.data_block_compression_policy = CompressionPolicy::all(CompressionType::None);
+        cfg.data_block_compression_policy = CompressionPolicy::all(CompressionType::Lz4);
     })?;
     Ok(tree)
 }
@@ -207,15 +207,16 @@ fn hash_indexed_blocks_merge_copies_only_under_the_same_ratio() -> crate::Result
 }
 
 /// An output compressed otherwise than the inputs writes every row.
-#[cfg(feature = "lz4")]
+#[cfg(feature = "zstd")]
 #[test]
 fn other_codec_merge_copies_nothing() -> crate::Result<()> {
     let folder = crate::get_tmp_folder();
     let tree = tree(folder.path(), |c| c)?;
     write_base(&tree)?;
     write_head(&tree, 2)?;
+    let zstd = CompressionType::zstd(1)?;
     tree.update_runtime_config(|c| {
-        c.data_block_compression_policy = CompressionPolicy::all(CompressionType::Lz4);
+        c.data_block_compression_policy = CompressionPolicy::all(zstd);
     })?;
 
     tree.major_compact(64 * 1024 * 1024, 0)?;
@@ -224,22 +225,22 @@ fn other_codec_merge_copies_nothing() -> crate::Result<()> {
     assert_contents(&tree, 10)
 }
 
-/// Compressed blocks are copied as compressed into an output of the same
-/// codec.
-#[cfg(feature = "lz4")]
+/// Uncompressed blocks are written again rather than copied: a copy would
+/// save no compression, and holding and comparing their rows costs as much as
+/// writing them.
 #[test]
-fn compressed_blocks_merge_copies_them_as_compressed() -> crate::Result<()> {
+fn uncompressed_blocks_merge_copies_nothing() -> crate::Result<()> {
     let folder = crate::get_tmp_folder();
     let tree = tree(folder.path(), |c| c)?;
     tree.update_runtime_config(|c| {
-        c.data_block_compression_policy = CompressionPolicy::all(CompressionType::Lz4);
+        c.data_block_compression_policy = CompressionPolicy::all(CompressionType::None);
     })?;
     write_base(&tree)?;
     write_head(&tree, 2)?;
 
     tree.major_compact(64 * 1024 * 1024, 0)?;
 
-    assert!(tree.metrics().compaction_blocks_carried() > 0);
+    assert_eq!(tree.metrics().compaction_blocks_carried(), 0);
     assert_contents(&tree, 10)
 }
 

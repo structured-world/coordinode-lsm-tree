@@ -9,7 +9,8 @@
 //! with: a block no updated key falls in comes out of the next merge exactly
 //! as it went in. `clustered` updates one contiguous 1% of the keys (few
 //! blocks touched), `scattered` every 100th key (most blocks of small rows
-//! touched), `overwrite` every key (nothing left as it was).
+//! touched), `overwrite` every key (nothing left as it was). Uncompressed
+//! blocks are never copied, so `none` measures that path stays as it was.
 //!
 //! Each iteration builds its tree outside the timed region and times one
 //! `major_compact`, on one compaction thread so the figure is the work done

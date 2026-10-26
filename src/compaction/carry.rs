@@ -21,7 +21,8 @@ use crate::{InternalValue, UserKey};
 /// groups, when the output is columnar, or their data blocks, when it is
 /// row-major; `None` when none of `inputs` could be carried. The output must
 /// be neither encrypted nor ECC-protected, since a copy keeps the plain
-/// transform of the tables that may be carried.
+/// transform of the tables that may be carried, and its data blocks must be
+/// compressed, since compressing them again is all a copied block saves.
 pub fn plan(
     config: &crate::Config,
     rc: &crate::runtime_config::RuntimeConfig,
@@ -49,12 +50,18 @@ pub fn plan(
     };
     #[cfg(not(feature = "columnar"))]
     let shape = blocks;
+    let codec = rc.data_block_compression_policy.get(dest_canonical);
+    // A copied data block saves its compression and nothing else: an
+    // uncompressed one costs as much to hold and compare as to write again.
+    let saves =
+        !matches!(shape, CarryShape::Blocks { .. }) || codec != crate::CompressionType::None;
     let target = CarryTarget {
         queue: CarryQueue::default(),
-        codec: rc.data_block_compression_policy.get(dest_canonical),
+        codec,
         shape,
     };
-    (config.encryption.is_none()
+    (saves
+        && config.encryption.is_none()
         && !config.page_ecc
         && inputs.iter().any(|table| target.takes(table)))
     .then_some(target)
@@ -543,7 +550,7 @@ pub fn changed_pages_fit(
 #[expect(clippy::indexing_slicing, reason = "test code")]
 mod tests;
 
-#[cfg(all(test, feature = "metrics"))]
+#[cfg(all(test, feature = "metrics", feature = "lz4"))]
 mod block_tests;
 
 /// Whether some row of `source` came out in `emitted` exactly as it was read.
