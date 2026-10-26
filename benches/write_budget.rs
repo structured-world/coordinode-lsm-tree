@@ -35,7 +35,7 @@
 //! merge overrun the budget. Every ten simulated minutes `READS` point reads
 //! of the last hour's readings are timed. Per arm it prints the bytes written
 //! (compaction's apart), the host write amplification, the most L0 runs and
-//! compaction debt seen, the read p50/p99, and the budget's refusals,
+//! compaction debt seen, the read p50/p99/p999, and the budget's refusals,
 //! overrides and unsustainable hours, with one `budget,<arm>,<field>,<value>`
 //! line per figure. `BUDGET_ARM` runs one arm only.
 

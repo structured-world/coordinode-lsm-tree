@@ -52,9 +52,11 @@ never holds them back. Compaction is the work it holds back: a merge reserves
 the bytes it expects to write (the inputs' file sizes and the blob files it
 relocates) on each medium before it runs, gives the reservation back as each
 output file lands in the ledger, and gives the rest back when it returns. A
-merge whose compaction filter may write new blob files, though it relocates
-none, asks the blob folder's budget too: it reserves nothing there, but an
-overrun budget holds it back, and what it writes is charged as it lands. A
+merge of a tree that separates values may write new blob files though it
+relocates none (a merge operator's result, a compaction filter's replacement,
+a locality relocation), so it asks the blob folder's budget too: it reserves
+nothing there, but an overrun budget holds it back, and what it writes is
+charged as it lands. A
 move and a drop write no table and need no credit; the tight-space pass
 reclaims space and is not held back either.
 

@@ -52,8 +52,9 @@
 //! rate to what the tree takes in.
 //!
 //! A [write budget](crate::write_budget) on the medium of the last level caps
-//! the budget too: over the long run compaction may write the allowance's rate
-//! less the write rate, which the flushes spend from the same allowance. The
+//! the budget too: over the long run compaction may write the allowance's rate,
+//! less the write rate when L0 is on the same budget and its flushes spend
+//! from it. The
 //! plan then keeps a tree that budget pays for, rather than one whose merges
 //! the budget's gate would hold back.
 //!
@@ -371,15 +372,24 @@ fn budget(config: &Config) -> u64 {
 
 /// The bytes per second compaction may write over the long run on the medium
 /// of `level`, `None` without a write budget there: the budget's allowance
-/// rate less `write_rate`, which the flushes spend from the same allowance.
-/// An allowance the writes alone use up leaves compaction one byte a second,
-/// the least a budget can say, since `0` reads as no limit.
+/// rate, less `write_rate` when L0, which the flushes write, is on the same
+/// budget and spends from it. An allowance the writes alone use up leaves
+/// compaction one byte a second, the least a budget can say, since `0` reads
+/// as no limit.
 fn endurance_budget(config: &Config, level: u8, write_rate: u64) -> Option<u64> {
     let (_, fs) = config.tables_folder_for_level(level);
-    let allowance = fs.write_budget()?.allowance();
+    let budget = fs.write_budget()?;
+    let allowance = budget.allowance();
     let per_sec = u128::from(allowance.bytes_per_period()) * 1_000_000_000
         / allowance.period().as_nanos().max(1);
     let per_sec = u64::try_from(per_sec).unwrap_or(u64::MAX);
+    let (_, l0_fs) = config.tables_folder_for_level(0);
+    let flushes_here = l0_fs
+        .write_budget()
+        .is_some_and(|l0| Arc::ptr_eq(l0, budget));
+    if !flushes_here {
+        return Some(per_sec.max(1));
+    }
     // Below the write rate nothing is left: none, not an error.
     Some(per_sec.saturating_sub(write_rate).max(1))
 }

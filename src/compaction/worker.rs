@@ -546,13 +546,13 @@ fn budget_gate(
     use crate::write_budget::Override;
 
     let (_, sst_fs) = opts.config.tables_folder_for_level(dest_level);
-    // A compaction filter may replace values past the separation threshold,
-    // which writes new blob files though the merge relocates none: their
-    // medium is asked too, for nothing reserved, so an overrun one holds the
-    // merge back and what lands there is charged through its ledger.
-    let may_write_blobs = blob_bytes > 0
-        || (opts.config.kv_separation_opts.is_some()
-            && opts.config.compaction_filter_factory.is_some());
+    // A merge of a tree that separates values may write new blob files though
+    // it relocates none: a merge operator's result, a compaction filter's
+    // replacement and a locality relocation picked as the merge runs all land
+    // in the blob folder. Their medium is asked for every such merge, for
+    // nothing reserved, so an overrun one holds the merge back and what lands
+    // there is charged through its ledger.
+    let may_write_blobs = blob_bytes > 0 || opts.config.kv_separation_opts.is_some();
     let mut demands: Vec<(&Arc<crate::write_budget::WriteBudget>, u64)> = Vec::new();
     for (fs, bytes, writes) in [
         (&*sst_fs, sst_bytes, sst_bytes > 0),
