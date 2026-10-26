@@ -197,7 +197,8 @@ pub struct DirectoryWrites {
     pub device_syncs: u64,
     /// Device syncs that failed.
     pub device_sync_errors: u64,
-    /// Directories created.
+    /// Directories created, each new chain of them once; one that already
+    /// existed is not.
     pub dirs_created: u64,
     /// Directories removed, each removal of a tree of them once.
     pub dirs_removed: u64,
@@ -601,10 +602,16 @@ impl Fs for CountingFs {
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
-        Self::count(
-            &self.stats.directory.dirs_created,
-            self.inner.create_dir_all(path),
-        )
+        // `create_dir_all` succeeds on a directory that exists, as every open
+        // finds its folders: only one that was absent counts, a new chain
+        // once. A probe that fails counts as existing, so nothing is claimed
+        // that was not seen.
+        let existed = self.inner.exists(path).unwrap_or(true);
+        self.inner.create_dir_all(path)?;
+        if !existed {
+            self.stats.directory.dirs_created.fetch_add(1, Relaxed);
+        }
+        Ok(())
     }
 
     fn create_dir(&self, path: &Path) -> io::Result<()> {

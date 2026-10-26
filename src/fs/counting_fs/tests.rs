@@ -187,6 +187,20 @@ fn directory_operations_are_counted() -> crate::io::Result<()> {
     Ok(())
 }
 
+/// A directory that already exists is not created again: an open that makes
+/// sure of its folders on every reopen counts each folder once.
+#[test]
+fn an_existing_directory_is_not_counted_as_created() -> crate::io::Result<()> {
+    let fs = CountingFs::new(Arc::new(MemFs::new()));
+    fs.create_dir_all(Path::new("/db/tables"))?;
+    fs.create_dir_all(Path::new("/db/tables"))?;
+    fs.create_dir_all(Path::new("/db"))?;
+    assert!(fs.create_dir(Path::new("/db")).is_err());
+
+    assert_eq!(fs.stats().snapshot().directory.dirs_created, 1);
+    Ok(())
+}
+
 /// The difference of two readings is what happened between them; readings
 /// from two lifetimes of the counters have none.
 #[test]

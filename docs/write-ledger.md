@@ -145,7 +145,9 @@ reconciles against the ledger after it.
 three hours retained and the oldest hour deleted every hour with range
 tombstones. Keyed by time first, every flush lies past the last; keyed by
 sensor first, every flush overlaps the tables before it. Byte counts are the
-same on every run and on both filesystems.
+same on every run on one filesystem; across ext4 and btrfs the time order
+matches, and the sensor order differs by a hundred-odd bytes of 269 MiB (the
+table below).
 
 | | time order | sensor order |
 |---|---|---|
