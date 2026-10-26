@@ -183,7 +183,7 @@ struct Open {
 }
 
 impl Open {
-    fn new(candidate: CarryCandidate, row: InternalValue, sink: &dyn CarrySink) -> Self {
+    fn new<S: CarrySink + ?Sized>(candidate: CarryCandidate, row: InternalValue, sink: &S) -> Self {
         let last_seen = sink.transforms_seen();
         let mut open = Self {
             candidate,
@@ -199,7 +199,7 @@ impl Open {
         open
     }
 
-    fn hold(&mut self, row: InternalValue, sink: &dyn CarrySink) {
+    fn hold<S: CarrySink + ?Sized>(&mut self, row: InternalValue, sink: &S) {
         self.last_seen = sink.transforms_seen();
         self.seen.push(self.last_seen);
         if !self.candidate.is_block() {
@@ -256,10 +256,10 @@ impl CarryMatcher {
     /// # Errors
     ///
     /// Any error of the sink.
-    pub(crate) fn write(
+    pub(crate) fn write<S: CarrySink + ?Sized>(
         &mut self,
         row: InternalValue,
-        sink: &mut dyn CarrySink,
+        sink: &mut S,
     ) -> crate::Result<()> {
         if let Some(mut open) = self.open.take() {
             let within = self
@@ -316,7 +316,7 @@ impl CarryMatcher {
     /// # Errors
     ///
     /// Any error of the sink.
-    pub(crate) fn finish(mut self, sink: &mut dyn CarrySink) -> crate::Result<Carried> {
+    pub(crate) fn finish<S: CarrySink + ?Sized>(mut self, sink: &mut S) -> crate::Result<Carried> {
         if let Some(open) = self.open.take() {
             self.resolve(open, sink)?;
         }
@@ -326,7 +326,11 @@ impl CarryMatcher {
     /// Writes what the merge emitted over `open`'s key range: the group as it
     /// lies when that is exactly its rows, else a group copying the pages of
     /// the row pages it left as they were, else the rows.
-    fn resolve(&mut self, mut open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
+    fn resolve<S: CarrySink + ?Sized>(
+        &mut self,
+        mut open: Open,
+        sink: &mut S,
+    ) -> crate::Result<()> {
         let candidate = &open.candidate;
         let emitted = &open.emitted;
         // A data block was held only while each row came out as read.
@@ -410,7 +414,7 @@ impl CarryMatcher {
     /// Writes the rows `open` held one by one, each closing the output's
     /// window at the count seen when it came out: rows the merge emitted
     /// that are not copied.
-    fn write_rows(open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
+    fn write_rows<S: CarrySink + ?Sized>(open: Open, sink: &mut S) -> crate::Result<()> {
         if open.candidate.is_block() {
             // The rows emitted are the block's own as read, byte for byte.
             for (at, row) in open.candidate.rows.iter().take(open.held()).enumerate() {
@@ -584,6 +588,14 @@ fn shares_a_row(
 fn same_row(read: &InternalValue, row: &InternalValue) -> bool {
     read.key.seqno == row.key.seqno
         && read.key.value_type == row.key.value_type
-        && crate::comparator::same_user_key(&read.key.user_key, &row.key.user_key)
-        && *read.value == *row.value
+        && same_bytes(&read.key.user_key, &row.key.user_key)
+        && same_bytes(&read.value, &row.value)
+}
+
+/// Whether `a` and `b` hold the same bytes. A row the merge passed on as read
+/// shares the bytes it was read with, which one pointer comparison tells
+/// without reading them.
+#[inline]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }

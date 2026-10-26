@@ -4958,6 +4958,7 @@ impl super::carry::CarrySink for FlavourSink<'_> {
         self.flavour.transforms_seen()
     }
 
+    #[inline]
     fn continues_last(&self, key: &[u8]) -> bool {
         self.flavour.continues_last(key)
     }

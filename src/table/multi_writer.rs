@@ -570,8 +570,6 @@ impl MultiWriter {
 
     /// [`Self::decide_cut`] for an output weighing `load`, measured once for
     /// every share of the target the rule compares it with.
-    // Asked on every new key a write takes: inlined into each caller.
-    #[inline]
     fn decide_cut_at(
         &self,
         key: &[u8],
