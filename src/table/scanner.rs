@@ -404,43 +404,48 @@ impl Scanner {
         self
     }
 
-    /// [`Iterator::next`] of a scan that records what it reads: each group's
-    /// or block's rows are taken at once, so the candidate holds them all
-    /// before the first is handed out.
-    fn next_carried(&mut self) -> Option<crate::Result<InternalValue>> {
-        loop {
-            let carry = self.carry.as_mut()?;
-            if let Some(row) = carry.next_row() {
-                return Some(Ok(row));
-            }
-            // A group handed out unrecorded comes straight from its block.
-            if carry.passing() {
-                if let Some(row) = self.iter.by_ref().find(|row| carry.hands_out(row)) {
-                    return Some(Ok(row));
-                }
-                carry.end_pass();
-            }
-            if self.read_count >= self.block_count {
-                return None;
-            }
-            let group = self.groups.next();
-            let rows = match self.read_group(group) {
-                Ok(iter) => iter,
-                Err(e) => return Some(Err(e)),
-            };
-            self.current_group = group;
-            let (group, frame) = match Self::row_block_frame(&mut self.reader, self.columnar) {
-                Some((block, frame)) => (Some(block), Some(frame)),
-                None => (group, None),
-            };
-            if let Some(carry) = self.carry.as_mut() {
-                if carry.skips_next() {
-                    self.iter = rows;
-                } else {
-                    carry.start(group, frame, rows);
-                }
-            }
+    /// Hands `rows`, the block of `group` just read, to the carry of a scan
+    /// that records what it reads: recorded, its rows are handed out from the
+    /// carry's list, each group's or block's taken at once so the candidate
+    /// holds them all before the first goes; unrecorded, they come straight
+    /// from the block, as a scan that records nothing reads them.
+    fn start_carried(&mut self, group: Option<super::BlockHandle>, rows: OwnedDataBlockIter) {
+        let (group, frame) = match Self::row_block_frame(&mut self.reader, self.columnar) {
+            Some((block, frame)) => (Some(block), Some(frame)),
+            None => (group, None),
+        };
+        let Some(carry) = self.carry.as_mut() else {
+            return;
+        };
+        if carry.skips_next() {
+            // A scan bounded to a range filters the block's rows by it.
+            self.filtering_below_bound = carry.filters_passed_rows();
+            self.iter = rows;
+        } else {
+            carry.start(group, frame, rows);
         }
+    }
+
+    /// Whether `item`, read from the current block, is handed out: one of a
+    /// restricted view's straddling block at or past its lower bound, or one
+    /// of a group a bounded carry passes within the carry's range. Called only
+    /// while `filtering_below_bound` is set.
+    #[cold]
+    fn hands_out(&mut self, item: &InternalValue) -> bool {
+        if let Some(carry) = &self.carry {
+            return carry.hands_out(item);
+        }
+        // Sub-bound entries of the straddling first block belong to the slice
+        // output that superseded the punched prefix; keys ascend, so the
+        // comparison retires at the first live entry.
+        if let Some(bound) = &self.lower_bound
+            && self.comparator.compare(&item.key.user_key, bound.as_ref())
+                == core::cmp::Ordering::Less
+        {
+            return false;
+        }
+        self.filtering_below_bound = false;
+        true
     }
 
     /// Reads and opens the block of `group`, the next in the stream. A block
@@ -752,37 +757,41 @@ impl Iterator for Scanner {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.carry.is_some() {
-            return self.next_carried();
-        }
         loop {
+            // A scan that records what it reads hands out a recorded group's
+            // rows from its carry, so the rows of the block come first only
+            // where nothing is recorded: the path every other scan takes.
             if let Some(mut item) = self.iter.next() {
-                // Sub-bound entries of the straddling first block belong to
-                // the slice output that superseded the punched prefix; keys
-                // ascend, so the comparison retires at the first live entry.
-                if self.filtering_below_bound {
-                    if let Some(bound) = &self.lower_bound
-                        && self.comparator.compare(&item.key.user_key, bound.as_ref())
-                            == core::cmp::Ordering::Less
-                    {
-                        continue;
-                    }
-                    self.filtering_below_bound = false;
+                if self.filtering_below_bound && !self.hands_out(&item) {
+                    continue;
                 }
                 item.key.seqno += self.global_seqno;
                 return Some(Ok(item));
+            }
+            if let Some(carry) = self.carry.as_mut() {
+                if let Some(row) = carry.next_row() {
+                    return Some(Ok(row));
+                }
+                // The group passed unrecorded, if one was, is done.
+                self.filtering_below_bound = false;
             }
 
             if self.read_count >= self.block_count {
                 return None;
             }
 
-            // Init new block; a scan that carries nothing keeps no frame.
-            self.frame = None;
-            self.current_group = self.groups.next();
-            match self.read_group(self.current_group) {
-                Ok(iter) => self.iter = iter,
+            let group = self.groups.next();
+            let iter = match self.read_group(group) {
+                Ok(iter) => iter,
                 Err(e) => return Some(Err(e)),
+            };
+            self.current_group = group;
+            if self.carry.is_some() {
+                self.start_carried(group, iter);
+            } else {
+                // A scan that carries nothing keeps no frame.
+                self.frame = None;
+                self.iter = iter;
             }
         }
     }

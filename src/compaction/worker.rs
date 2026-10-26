@@ -3328,19 +3328,26 @@ fn run_subcompaction(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
-    let mut emit = |row: InternalValue| -> crate::Result<()> {
-        if let Some(matcher) = matcher.as_mut()
-            && let Some(flavour) = compactor.carrying()
-        {
-            return matcher.write(
+    // Chosen once, so a compaction that copies nothing pays no check per row.
+    let mut carrying_emit;
+    let mut plain_emit;
+    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+        matcher.as_mut()
+        && let Some(flavour) = compactor.carrying()
+    {
+        carrying_emit = move |row: InternalValue| {
+            matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour,
+                    flavour: &mut *flavour,
                     pace: read_pace,
                 },
-            );
-        }
-        compactor.write(row)
+            )
+        };
+        &mut carrying_emit
+    } else {
+        plain_emit = |row: InternalValue| compactor.write(row);
+        &mut plain_emit
     };
 
     for (idx, item) in merge_iter.enumerate() {
@@ -3359,7 +3366,7 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger.borrow_mut().admit(item, &mut emit)?;
+        ledger.borrow_mut().admit(item, &mut *emit)?;
         if let Some(e) = ledger_error.borrow_mut().take() {
             return Err(e);
         }
@@ -3378,7 +3385,7 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    let (blob_frag_map, released_objects) = ledger.into_inner().finish(&mut emit)?;
+    let (blob_frag_map, released_objects) = ledger.into_inner().finish(&mut *emit)?;
     if let Some(e) = ledger_error.into_inner() {
         return Err(e);
     }
@@ -4701,19 +4708,26 @@ fn merge_tables(
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
     let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
-    let mut emit = |row: InternalValue| -> crate::Result<()> {
-        if let Some(matcher) = matcher.as_mut()
-            && let Some(flavour) = compactor.carrying()
-        {
-            return matcher.write(
+    // Chosen once, so a compaction that copies nothing pays no check per row.
+    let mut carrying_emit;
+    let mut plain_emit;
+    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+        matcher.as_mut()
+        && let Some(flavour) = compactor.carrying()
+    {
+        carrying_emit = move |row: InternalValue| {
+            matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour,
+                    flavour: &mut *flavour,
                     pace: read_pace,
                 },
-            );
-        }
-        compactor.write(row)
+            )
+        };
+        &mut carrying_emit
+    } else {
+        plain_emit = |row: InternalValue| compactor.write(row);
+        &mut plain_emit
     };
 
     hidden_guard(payload, opts, || {
@@ -4760,7 +4774,7 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            ledger.borrow_mut().admit(item, &mut emit)?;
+            ledger.borrow_mut().admit(item, &mut *emit)?;
             if let Some(e) = ledger_error.borrow_mut().take() {
                 return Err(e);
             }
@@ -4794,7 +4808,7 @@ fn merge_tables(
     // The rows the ledger still holds go out before the outputs are finished,
     // guarded like the merge: a failure here shows the inputs again.
     let (blob_frag_map, released_objects) = hidden_guard(payload, opts, || {
-        let settled = ledger.into_inner().finish(&mut emit)?;
+        let settled = ledger.into_inner().finish(&mut *emit)?;
         if let Some(e) = ledger_error.into_inner() {
             return Err(e);
         }

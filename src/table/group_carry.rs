@@ -296,8 +296,6 @@ pub struct GroupCarry {
     next: usize,
     /// How this scanner's candidates fared.
     odds: Arc<CarryOdds>,
-    /// Whether the scan hands out the current group as read, unrecorded.
-    passing: bool,
 }
 
 impl GroupCarry {
@@ -311,26 +309,19 @@ impl GroupCarry {
             spare: Arc::new(Vec::new()),
             next: 0,
             odds: Arc::default(),
-            passing: false,
         }
     }
 
     /// Whether the next group goes unrecorded, its rows handed out as read
-    /// (see [`CarryOdds`]); if so, the scan is passing it until
-    /// [`Self::end_pass`].
-    pub(crate) fn skips_next(&mut self) -> bool {
-        self.passing = self.odds.skips();
-        self.passing
+    /// (see [`CarryOdds`]).
+    pub(crate) fn skips_next(&self) -> bool {
+        self.odds.skips()
     }
 
-    /// Whether the scan is handing out an unrecorded group as read.
-    pub(crate) fn passing(&self) -> bool {
-        self.passing
-    }
-
-    /// Ends handing out an unrecorded group.
-    pub(crate) fn end_pass(&mut self) {
-        self.passing = false;
+    /// Whether the rows of a group handed out unrecorded must be filtered by
+    /// [`Self::hands_out`]: the scan is bounded to a range.
+    pub(crate) fn filters_passed_rows(&self) -> bool {
+        self.bounds.is_some()
     }
 
     /// Whether `row` of a group handed out unrecorded is handed out at all:
