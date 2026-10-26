@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.2.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.1.0...v7.2.0) - 2026-10-26
+
+### Added
+
+- *(tree)* lower the retention floor after a rebuild ([#994](https://github.com/structured-world/coordinode-lsm-tree/pull/994))
+- *(compaction)* cumulative host-write budget per medium ([#992](https://github.com/structured-world/coordinode-lsm-tree/pull/992))
+
 ## [7.1.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.0.0...v7.1.0) - 2026-10-26
 
 ### Added
