@@ -440,7 +440,11 @@ fn a_restart_hands_back_no_credit() -> lsm_tree::Result<()> {
         ),
     );
     let tree = config.with_shared_fs(Arc::clone(&after.fs)).open()?;
-    assert_eq!(after.budget.report().credit, checkpoint.credit);
+    // The checkpoint's credit, less what the reopen itself wrote (the table
+    // file pool, the manifest): nothing was refilled.
+    let report = after.budget.report();
+    let reopen = i64::try_from(report.mandatory_bytes + report.discretionary_bytes).expect("small");
+    assert_eq!(report.credit, checkpoint.credit - reopen);
 
     let result = tree.major_compact(u64::MAX, SeqNo::MAX)?;
     assert_eq!(result.action, CompactionAction::Nothing);
