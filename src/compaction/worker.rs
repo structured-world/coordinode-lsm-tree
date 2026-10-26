@@ -406,11 +406,12 @@ fn run_strategy(
 
 /// Where a merge stands once it asked for the room its outputs take.
 enum SpaceGate {
-    /// Run the merge as chosen, in the room reserved for it.
-    Run(super::capacity::Reservation),
+    /// Run the merge as chosen, in the room reserved for it, which is the
+    /// bytes it writes into its level's folder and into the blob folder.
+    Run(super::capacity::Reservation, (u64, u64)),
     /// Run a smaller fitting subset (a minimal reclaiming merge) instead of the
     /// chosen one, which did not fit, in the room reserved for it.
-    Narrowed(CompactionPayload, super::capacity::Reservation),
+    Narrowed(CompactionPayload, super::capacity::Reservation, (u64, u64)),
     /// No fitting subset exists; skip this cycle. The truly-too-big single merge
     /// is the opt-in tight-space mode's domain; meanwhile `Drop` / `Move` cycles
     /// still reclaim and reorganize.
@@ -441,14 +442,35 @@ fn gated_merge(
             );
             return Ok(CompactionResult::nothing());
         }
-        space_gate_for_merge(&super_version.version, opts, payload)?
+        let decision = space_gate_for_merge(&super_version.version, opts, payload)?;
+        // The merge that runs asks the write budgets of the media it writes
+        // to; one that waits for credit drops the room it reserved.
+        let budget = match &decision {
+            SpaceGate::Run(_, bytes) => {
+                budget_gate(&super_version.version, opts, payload.dest_level, *bytes)
+            }
+            SpaceGate::Narrowed(narrowed, _, bytes) => {
+                budget_gate(&super_version.version, opts, narrowed.dest_level, *bytes)
+            }
+            // The tight-space pass reclaims space: no budget holds it back.
+            SpaceGate::Skip => BudgetGate::Run(Vec::new()),
+        };
+        let BudgetGate::Run(holds) = budget else {
+            log::debug!(
+                "Compaction write budget: {}-table merge waits for credit",
+                payload.table_ids.len(),
+            );
+            return Ok(CompactionResult::nothing());
+        };
+        opts.outputs.hold_budget(holds);
+        decision
     };
     match decision {
-        SpaceGate::Run(room) => {
+        SpaceGate::Run(room, _) => {
             opts.outputs.reserve(room);
             merge_tables(compaction_state, version_history_lock, opts, payload)
         }
-        SpaceGate::Narrowed(narrowed, room) => {
+        SpaceGate::Narrowed(narrowed, room, _) => {
             log::debug!(
                 "Compaction space gate: narrowed merge from {} to {} tables to fit free space",
                 payload.table_ids.len(),
@@ -474,6 +496,89 @@ fn gated_merge(
             Ok(CompactionResult::nothing())
         }
     }
+}
+
+/// Where a merge stands once it asked the write budgets of the media it
+/// writes to.
+enum BudgetGate {
+    /// Run it, holding these reservations, one per budget.
+    Run(Vec<crate::write_budget::BudgetHold>),
+    /// A budget has no credit for it: it waits.
+    Wait,
+}
+
+/// Reserves, in the write budget of each medium a merge into `dest_level`
+/// writes to, the `sst_bytes` of tables it writes into the level's folder and
+/// the `blob_bytes` of blob files it writes into the blob folder: the two
+/// added up where both folders' backends name one budget.
+///
+/// A budget without credit for its part lets the merge run anyway when the
+/// caller forces discretionary work on it, or when the tree has reached a
+/// stop threshold on an axis compaction drains (its L0 runs, its pending
+/// compaction bytes): waiting for credit would then stall the writers. Both
+/// are reserved as overrides, charged and reported. Otherwise the merge
+/// waits, and the reservations it took on other budgets go back. A merge on
+/// media without a budget reserves nothing.
+fn budget_gate(
+    version: &Version,
+    opts: &Options,
+    dest_level: u8,
+    (sst_bytes, blob_bytes): (u64, u64),
+) -> BudgetGate {
+    use crate::write_budget::Override;
+
+    let (_, sst_fs) = opts.config.tables_folder_for_level(dest_level);
+    let mut demands: Vec<(&Arc<crate::write_budget::WriteBudget>, u64)> = Vec::new();
+    for (fs, bytes) in [(&*sst_fs, sst_bytes), (&*opts.config.fs, blob_bytes)] {
+        let Some(budget) = fs.write_budget() else {
+            continue;
+        };
+        if bytes == 0 {
+            continue;
+        }
+        if let Some(demand) = demands.iter_mut().find(|(b, _)| Arc::ptr_eq(b, budget)) {
+            demand.1 += bytes;
+        } else {
+            demands.push((budget, bytes));
+        }
+    }
+    let mut holds = Vec::with_capacity(demands.len());
+    let mut stopped = None;
+    for (budget, bytes) in demands {
+        if let Some(hold) = budget.reserve(bytes) {
+            holds.push(hold);
+            continue;
+        }
+        let reason = if budget.forced() {
+            Override::Forced
+        } else if *stopped.get_or_insert_with(|| at_compaction_stop(version, opts)) {
+            Override::Backpressure
+        } else {
+            return BudgetGate::Wait;
+        };
+        holds.push(budget.reserve_overriding(bytes, reason));
+    }
+    BudgetGate::Run(holds)
+}
+
+/// Whether the tree is at a stop threshold on an axis compaction drains: its
+/// L0 runs or its pending compaction bytes. The memtable axis is drained by
+/// flushes, which no budget holds back.
+fn at_compaction_stop(version: &Version, opts: &Options) -> bool {
+    let thresholds = crate::BackpressureThresholds {
+        memtable_slowdown: None,
+        memtable_stop: None,
+        ..opts.runtime_config.load().backpressure
+    };
+    if thresholds.is_off() {
+        return false;
+    }
+    let signals = crate::BackpressureSignals {
+        l0_runs: version.l0().run_count(),
+        pending_compaction_bytes: opts.strategy.pending_compaction_bytes(version),
+        unflushed_memtable_bytes: 0,
+    };
+    crate::Backpressure::compute(&signals, &thresholds) == crate::Backpressure::Stop
 }
 
 /// Whether two paths sit on PROVABLY separate free-space pools: both backends
@@ -606,7 +711,8 @@ fn space_gate_for_merge(
     // payload) the stale blob relocation set, so a narrowed merge can fit where
     // the full one did not. Stat failures propagate (a silent 0 would undercount
     // and admit the very rewrite this gate must block).
-    let reserve = |p: &CompactionPayload| -> crate::Result<Option<super::capacity::Reservation>> {
+    type Reserved = Option<(super::capacity::Reservation, (u64, u64))>;
+    let reserve = |p: &CompactionPayload| -> crate::Result<Reserved> {
         let sst_sigma: u64 = p
             .table_ids
             .iter()
@@ -623,19 +729,20 @@ fn space_gate_for_merge(
             p.dest_level,
             (sst_sigma, blob_sigma),
             |demands| opts.capacity.reserve(opts.tree_id, demands, check),
-        ))
+        )
+        .map(|room| (room, (sst_sigma, blob_sigma))))
     };
 
-    if let Some(room) = reserve(payload)? {
-        return Ok(SpaceGate::Run(room));
+    if let Some((room, bytes)) = reserve(payload)? {
+        return Ok(SpaceGate::Run(room, bytes));
     }
 
     // Constrained: try the run-adjacent narrowing candidates in ascending SST
     // size and run the first that fits. Skip only when none fit (a truly-too-big
     // single merge is the opt-in tight-space domain).
     for narrowed in narrow_merge_candidates(version, payload)? {
-        if let Some(room) = reserve(&narrowed)? {
-            return Ok(SpaceGate::Narrowed(narrowed, room));
+        if let Some((room, bytes)) = reserve(&narrowed)? {
+            return Ok(SpaceGate::Narrowed(narrowed, room, bytes));
         }
     }
     Ok(SpaceGate::Skip)

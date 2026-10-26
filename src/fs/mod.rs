@@ -1755,6 +1755,35 @@ pub trait Fs: Send + Sync + 'static {
         None
     }
 
+    /// The write budget of the medium this backend writes to, when one is set
+    /// (see [`CountingFs::with_budget`]): a compaction writing its output
+    /// here reserves the bytes it expects from it before it runs.
+    ///
+    /// # Default implementation
+    ///
+    /// `None`: no budget. A backend wrapping another returns the inner one's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::fs::{CountingFs, Fs, MemFs, WriteIoStats};
+    /// use lsm_tree::write_budget::{Allowance, WriteBudget};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let budget = Arc::new(WriteBudget::new(
+    ///     Arc::new(WriteIoStats::default()),
+    ///     Allowance::new(8 << 30, Duration::from_secs(86_400)),
+    /// ));
+    /// let medium = CountingFs::with_budget(Arc::new(MemFs::new()), Arc::clone(&budget));
+    /// assert!(medium.write_budget().is_some_and(|b| Arc::ptr_eq(b, &budget)));
+    /// // It counts into the budget's ledger.
+    /// assert!(medium.write_io_stats().is_some_and(|s| Arc::ptr_eq(s, budget.ledger())));
+    /// ```
+    fn write_budget(&self) -> Option<&alloc::sync::Arc<crate::write_budget::WriteBudget>> {
+        None
+    }
+
     /// Number of hard links to the file at `path` (the inode's link count).
     ///
     /// Used to keep [`Self::truncate_file`] safe: truncation frees the inode's

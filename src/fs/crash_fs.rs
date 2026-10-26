@@ -1344,6 +1344,10 @@ impl Fs for CrashFs {
         self.inner.write_io_stats()
     }
 
+    fn write_budget(&self) -> Option<&Arc<crate::write_budget::WriteBudget>> {
+        self.inner.write_budget()
+    }
+
     fn volume_id(&self, path: &Path) -> Option<u64> {
         self.inner.volume_id(path)
     }

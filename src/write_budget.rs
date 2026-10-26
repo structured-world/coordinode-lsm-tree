@@ -363,8 +363,8 @@ pub struct WriteBudget {
     account: Mutex<Account>,
     /// Whether the caller asks discretionary work to run past the budget.
     forced: portable_atomic::AtomicBool,
-    #[cfg(feature = "std")]
-    clock: Arc<dyn crate::Clock>,
+    /// The wall clock, when not the process one.
+    clock: Option<Arc<dyn crate::Clock>>,
 }
 
 impl core::fmt::Debug for WriteBudget {
@@ -433,26 +433,19 @@ impl WriteBudget {
                 window,
             }),
             forced: portable_atomic::AtomicBool::new(false),
-            #[cfg(feature = "std")]
-            clock: Arc::new(crate::SystemClock),
+            clock: None,
         }
     }
 
     /// A budget charging `ledger` against `allowance`, with a full burst of
-    /// credit as of now on the system clock.
-    #[cfg(feature = "std")]
+    /// credit as of now on the process clock.
     #[must_use]
     pub fn new(ledger: Arc<WriteIoStats>, allowance: Allowance) -> Self {
-        Self::new_at(
-            ledger,
-            allowance,
-            crate::Clock::unix_time(&crate::SystemClock),
-        )
+        Self::new_at(ledger, allowance, crate::time::unix_timestamp())
     }
 
-    /// A budget resumed from `checkpoint` as of now on the system clock; see
+    /// A budget resumed from `checkpoint` as of now on the process clock; see
     /// [`Self::resume_at`].
-    #[cfg(feature = "std")]
     #[must_use]
     pub fn resume(
         ledger: Arc<WriteIoStats>,
@@ -460,15 +453,15 @@ impl WriteBudget {
         checkpoint: BudgetCheckpoint,
         unaccounted: u64,
     ) -> Self {
-        let now = crate::Clock::unix_time(&crate::SystemClock);
+        let now = crate::time::unix_timestamp();
         Self::resume_at(ledger, allowance, checkpoint, unaccounted, now)
     }
 
-    /// Reads wall time from `clock` instead of the system clock.
-    #[cfg(feature = "std")]
+    /// Reads wall time from `clock` instead of the process clock: the system
+    /// clock under `std`, the registered one without it.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn crate::Clock>) -> Self {
-        self.clock = clock;
+        self.clock = Some(clock);
         self
     }
 
@@ -478,9 +471,10 @@ impl WriteBudget {
         &self.ledger
     }
 
-    #[cfg(feature = "std")]
     fn now(&self) -> Duration {
-        self.clock.unix_time()
+        self.clock
+            .as_ref()
+            .map_or_else(crate::time::unix_timestamp, |clock| clock.unix_time())
     }
 
     /// Reserves `bytes` of credit as of wall time `now` for work that may
@@ -530,14 +524,12 @@ impl WriteBudget {
     }
 
     /// Reserves `bytes` as of now; see [`Self::reserve_at`].
-    #[cfg(feature = "std")]
     pub fn reserve(self: &Arc<Self>, bytes: u64) -> Option<BudgetHold> {
         self.reserve_at(bytes, self.now())
     }
 
     /// Reserves `bytes` past the budget as of now; see
     /// [`Self::reserve_overriding_at`].
-    #[cfg(feature = "std")]
     pub fn reserve_overriding(self: &Arc<Self>, bytes: u64, reason: Override) -> BudgetHold {
         self.reserve_overriding_at(bytes, reason, self.now())
     }
@@ -569,7 +561,6 @@ impl WriteBudget {
     }
 
     /// Changes the allowance as of now; see [`Self::set_allowance_at`].
-    #[cfg(feature = "std")]
     pub fn set_allowance(&self, allowance: Allowance) {
         self.set_allowance_at(allowance, self.now());
     }
@@ -592,7 +583,6 @@ impl WriteBudget {
     }
 
     /// What the budget holds as of now; see [`Self::checkpoint_at`].
-    #[cfg(feature = "std")]
     pub fn checkpoint(&self) -> BudgetCheckpoint {
         self.checkpoint_at(self.now())
     }
@@ -616,7 +606,6 @@ impl WriteBudget {
     }
 
     /// Reads the budget as of now; see [`Self::report_at`].
-    #[cfg(feature = "std")]
     pub fn report(&self) -> BudgetReport {
         self.report_at(self.now())
     }

@@ -3063,10 +3063,10 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
     match super::space_gate_for_merge(&version, &opts, &payload)? {
-        super::SpaceGate::Narrowed(narrowed, _) => {
+        super::SpaceGate::Narrowed(narrowed, ..) => {
             assert_eq!(narrowed.table_ids.len(), 2, "narrowed to an adjacent pair");
         }
-        super::SpaceGate::Run(_) => {
+        super::SpaceGate::Run(..) => {
             panic!("expected Narrowed, got Run (full run wrongly admitted)")
         }
         super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
@@ -3328,7 +3328,7 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
         Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024)),
     );
     match super::space_gate_for_merge(&version, &opts, &payload)? {
-        super::SpaceGate::Run(_) => Ok(()),
+        super::SpaceGate::Run(..) => Ok(()),
         super::SpaceGate::Narrowed(..) => {
             panic!("expected Run, got Narrowed (a single-table merge cannot narrow)")
         }

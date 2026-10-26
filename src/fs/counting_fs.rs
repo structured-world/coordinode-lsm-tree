@@ -526,6 +526,7 @@ impl WriteIoStats {
 pub struct CountingFs {
     inner: Arc<dyn Fs>,
     stats: Arc<WriteIoStats>,
+    budget: Option<Arc<crate::write_budget::WriteBudget>>,
 }
 
 impl CountingFs {
@@ -539,7 +540,24 @@ impl CountingFs {
     /// backends may count into too.
     #[must_use]
     pub fn with_stats(inner: Arc<dyn Fs>, stats: Arc<WriteIoStats>) -> Self {
-        Self { inner, stats }
+        Self {
+            inner,
+            stats,
+            budget: None,
+        }
+    }
+
+    /// Counts what is written through `inner` into the ledger of `budget`,
+    /// the medium's write budget, and names that budget to the compactions
+    /// that write here (see [`Fs::write_budget`]). Give every backend on the
+    /// medium the same budget.
+    #[must_use]
+    pub fn with_budget(inner: Arc<dyn Fs>, budget: Arc<crate::write_budget::WriteBudget>) -> Self {
+        Self {
+            inner,
+            stats: Arc::clone(budget.ledger()),
+            budget: Some(budget),
+        }
     }
 
     /// The counters this backend counts into.
@@ -749,6 +767,10 @@ impl Fs for CountingFs {
 
     fn write_io_stats(&self) -> Option<&Arc<WriteIoStats>> {
         Some(&self.stats)
+    }
+
+    fn write_budget(&self) -> Option<&Arc<crate::write_budget::WriteBudget>> {
+        self.budget.as_ref()
     }
 
     fn hard_link_count(&self, path: &Path) -> io::Result<u64> {

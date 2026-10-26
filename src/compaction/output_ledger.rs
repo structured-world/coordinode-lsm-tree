@@ -49,6 +49,8 @@ pub struct OutputLedger(Arc<Ledger>);
 struct Ledger {
     files: Mutex<Vec<Output>>,
     room: Mutex<Option<Arc<super::capacity::Reservation>>>,
+    /// The write budget the run holds on each medium it writes to.
+    budget: Mutex<Vec<crate::write_budget::BudgetHold>>,
 }
 
 impl OutputLedger {
@@ -81,6 +83,12 @@ impl OutputLedger {
         drop(released);
     }
 
+    /// Holds `holds`, the write budget reserved for the run's outputs, until
+    /// the run returns, each given back as the outputs on its medium land.
+    pub fn hold_budget(&self, holds: Vec<crate::write_budget::BudgetHold>) {
+        self.0.budget.lock().extend(holds);
+    }
+
     /// The run's room, if it holds one.
     fn room(&self) -> Option<Arc<super::capacity::Reservation>> {
         self.0.room.lock().clone()
@@ -103,7 +111,8 @@ impl OutputLedger {
     }
 
     /// The file at `path` is finished: the bytes it holds land on its volume
-    /// and are taken from the run's room.
+    /// and are taken from the run's room, and the medium's write ledger has
+    /// charged them, so the run's budget hold there gives them back.
     ///
     /// # Errors
     ///
@@ -111,12 +120,25 @@ impl OutputLedger {
     /// [`crate::Error::StorageFull`] when the volume has no room for what the
     /// run wrote past its reservation.
     pub fn landed(&self, fs: &dyn Fs, path: &crate::path::Path) -> crate::Result<()> {
-        let Some(room) = self.room() else {
+        let room = self.room();
+        let budget = fs.write_budget();
+        if room.is_none() && budget.is_none() {
             return Ok(());
-        };
-        // Charged to the folder, which the room was reserved for: a backend
-        // may tell the folder's volume and not the file's.
-        room.landed(fs, path.parent().unwrap_or(path), fs.metadata(path)?.len)
+        }
+        let len = fs.metadata(path)?.len;
+        if let Some(budget) = budget {
+            for hold in self.0.budget.lock().iter() {
+                if Arc::ptr_eq(hold.budget(), budget) {
+                    hold.landed(len);
+                }
+            }
+        }
+        match room {
+            // Charged to the folder, which the room was reserved for: a
+            // backend may tell the folder's volume and not the file's.
+            Some(room) => room.landed(fs, path.parent().unwrap_or(path), len),
+            None => Ok(()),
+        }
     }
 
     /// Whether the run's room stopped it: its outputs outgrew the room and
