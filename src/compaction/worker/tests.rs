@@ -5986,6 +5986,96 @@ mod budget_gate {
         Ok(())
     }
 
+    /// A merge that relocates no blob files can still write new ones, when a
+    /// compaction filter replaces values past the separation threshold: the
+    /// blob folder's medium is asked even though the merge reserves nothing
+    /// there, and an overrun budget on it makes the merge wait. Without a
+    /// filter nothing can land there, and that budget is not asked.
+    #[test]
+    fn a_filter_that_may_write_blobs_asks_the_blob_medium() -> crate::Result<()> {
+        use crate::compaction::filter::{
+            CompactionFilter, Context, Factory, ItemAccessor, Verdict,
+        };
+
+        struct Keep;
+        impl CompactionFilter for Keep {
+            fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> crate::Result<Verdict> {
+                Ok(Verdict::Keep)
+            }
+        }
+        struct KeepFactory;
+        impl Factory for KeepFactory {
+            fn name(&self) -> &'static str {
+                "keep"
+            }
+            fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
+                Box::new(Keep)
+            }
+        }
+
+        let gate = |filter: bool| -> crate::Result<(super::super::BudgetGate, Arc<WriteBudget>)> {
+            let dir = tempfile::tempdir()?;
+            let blobs = Arc::new(
+                WriteBudget::resume_at(
+                    Arc::new(WriteIoStats::default()),
+                    Allowance::new(1 << 30, DAY),
+                    BudgetCheckpoint {
+                        credit: -1,
+                        as_of: Duration::ZERO,
+                    },
+                    0,
+                    Duration::ZERO,
+                )
+                .with_clock(Arc::new(Epoch)),
+            );
+            let primary = Arc::new(CountingFs::with_budget(
+                Arc::new(MemFs::new()),
+                Arc::clone(&blobs),
+            ));
+            let mut config = crate::Config::new(
+                dir.path(),
+                crate::SequenceNumberCounter::default(),
+                crate::SequenceNumberCounter::default(),
+            )
+            .with_shared_fs(primary)
+            .with_kv_separation(Some(crate::KvSeparationOptions::default()))
+            .level_routes(vec![crate::config::LevelRoute {
+                levels: 1..7,
+                path: dir.path().join("cold"),
+                fs: Arc::new(MemFs::new()),
+            }]);
+            if filter {
+                config = config.with_compaction_filter_factory(Some(Arc::new(KeepFactory)));
+            }
+            let crate::AnyTree::Blob(tree) = config.open()? else {
+                panic!("a tree that separates values");
+            };
+            let strategy: Arc<dyn CompactionStrategy> =
+                Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+            let opts = super::super::Options::from_tree(&tree.index, strategy);
+            let gate = super::super::budget_gate(
+                &tree.index.current_version(),
+                &opts,
+                6,
+                (1_000, 0),
+                super::super::Narrowing::None,
+            );
+            Ok((gate, blobs))
+        };
+
+        let (with_filter, blobs) = gate(true)?;
+        assert!(
+            matches!(with_filter, super::super::BudgetGate::Wait),
+            "the overrun blob medium holds back a merge that may write there"
+        );
+        assert_eq!(blobs.report().refused, 1);
+
+        let (without, blobs) = gate(false)?;
+        assert!(matches!(without, super::super::BudgetGate::Run(_)));
+        assert_eq!(blobs.report().refused, 0, "nothing can land there");
+        Ok(())
+    }
+
     /// The tables and the blob files of a merge whose folders are on one
     /// medium are reserved together, as one hold of their sum.
     #[test]
