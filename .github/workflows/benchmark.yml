@@ -264,6 +264,10 @@ jobs:
             exit 1
           fi
           release-plz update --no-changelog --config .release-plz.toml
+          # `cargo pkgid` reads the lock file, which the repository does not
+          # track and a clean checkout does not have; the builds below would
+          # make the same one.
+          cargo generate-lockfile
           id="$(cargo pkgid)"
           # The version follows the last `#` or `@`: cargo spells the id
           # `<url>#<name>@<version>`, or `<url>#<version>` when the package is
@@ -432,7 +436,7 @@ jobs:
         # run that fails before writing its own cannot publish the old one.
         run: |
           if [ "$LIBCLANG_OUTCOME" != success ]; then
-            echo "::error::compare-rocksdb cannot build without libclang; see the 'Verify libclang toolchain' step"
+            echo "::error::compare-rocksdb needs the libclang check to pass, and it ended '$LIBCLANG_OUTCOME'; see the 'Verify libclang toolchain' step, or the step that failed before it"
             exit 1
           fi
           cd tools/compare-rocksdb
