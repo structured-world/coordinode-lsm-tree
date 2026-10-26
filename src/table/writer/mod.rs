@@ -960,6 +960,8 @@ pub(crate) struct CarriedBlockShape {
     pub restart_interval: u8,
     /// The per-KV checksum footer's algorithm, `None` without one.
     pub kv_checksum: Option<crate::runtime_config::ChecksumAlgorithm>,
+    /// The bits of the data block hash index ratio.
+    pub hash_ratio_bits: u32,
 }
 
 /// The pages of another table's row group that a group written here copies:
@@ -4342,7 +4344,8 @@ impl Writer {
     /// as it is: a columnar table; one with a prebuilt filter; one whose
     /// restart interval differs, since the locator names a key's restart head
     /// by the table's interval; one whose per-KV footer differs, since a
-    /// table's reader strips the footer by its own descriptor; a frame that is
+    /// table's reader strips the footer by its own descriptor; one whose hash
+    /// index ratio differs, which the table records for all its blocks; a frame that is
     /// no data block; or rows that do not continue the table in internal-key
     /// order. The caller then writes the rows instead.
     ///
@@ -4370,6 +4373,7 @@ impl Writer {
             || self.prebuilt_filter.is_some()
             || self.data_block_restart_interval != shape.restart_interval
             || footer != shape.kv_checksum
+            || self.data_block_hash_ratio.to_bits() != shape.hash_ratio_bits
         {
             return Ok(false);
         }

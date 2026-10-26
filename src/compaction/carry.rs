@@ -28,6 +28,15 @@ pub fn plan(
     dest_canonical: usize,
     inputs: &[crate::Table],
 ) -> Option<CarryTarget> {
+    let blocks = CarryShape::Blocks {
+        restart_interval: config
+            .data_block_restart_interval_policy
+            .get(dest_canonical),
+        hash_ratio_bits: config
+            .data_block_hash_ratio_policy
+            .get(dest_canonical)
+            .to_bits(),
+    };
     #[cfg(feature = "columnar")]
     let shape = if rc.columnar {
         CarryShape::Groups(crate::table::meta::GroupShape {
@@ -36,18 +45,10 @@ pub fn plan(
             page_size: config.columnar_page_size_policy.get(dest_canonical),
         })
     } else {
-        CarryShape::Blocks {
-            restart_interval: config
-                .data_block_restart_interval_policy
-                .get(dest_canonical),
-        }
+        blocks
     };
     #[cfg(not(feature = "columnar"))]
-    let shape = CarryShape::Blocks {
-        restart_interval: config
-            .data_block_restart_interval_policy
-            .get(dest_canonical),
-    };
+    let shape = blocks;
     let target = CarryTarget {
         queue: CarryQueue::default(),
         codec: rc.data_block_compression_policy.get(dest_canonical),

@@ -57,7 +57,7 @@ fn valid_meta_items() -> Vec<InternalValue> {
         ),
         meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
         meta("created_at", &1_000_000u128.to_le_bytes()),
-        meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
+        meta("data_block_hash_ratio", &0.0f32.to_le_bytes()),
         meta("descriptor#kv_checksum", &[0u8]),
         meta("descriptor#page_ecc", &[0u8, 0, 0, 0]),
         meta("file_size", &4096u64.to_le_bytes()),

@@ -289,6 +289,12 @@ pub struct ParsedMeta {
     /// encoding instead of the writer default.
     pub index_block_restart_interval: u8,
 
+    /// The bits of the `f32` hash index ratio the data blocks were encoded with
+    /// (0 = none), as stored. Not consumed on the read path, where each block
+    /// describes its own hash index, but a block copied into another table must
+    /// have been built under that table's ratio.
+    pub data_block_hash_ratio_bits: u32,
+
     /// Whether this SST's data blocks are column-organized (PAX) rather than
     /// row-major. Read from the optional `descriptor#columnar` property;
     /// defaults to `false` for SSTs written without it (row-major). The reader
@@ -553,6 +559,14 @@ impl ParsedMeta {
         // index when partial-decoding a block (lazy read path).
         let data_block_restart_interval =
             validated_restart_interval_index(read_u8!(block, b"restart_interval#data", &cmp))?;
+        let data_block_hash_ratio_bits = {
+            let item = block
+                .point_read(b"data_block_hash_ratio", SeqNo::MAX, &cmp)?
+                .ok_or(crate::Error::InvalidHeader("TableMeta"))?;
+            let bytes = <[u8; 4]>::try_from(&item.value[..])
+                .map_err(|_| crate::Error::InvalidHeader("TableMeta"))?;
+            u32::from_le_bytes(bytes)
+        };
 
         // Optional layout descriptor: absent (older / row-major SSTs) means
         // row-major; otherwise exactly one byte, non-zero meaning columnar. An
@@ -902,6 +916,7 @@ impl ParsedMeta {
             ecc_unrecognized,
             data_block_restart_interval,
             index_block_restart_interval,
+            data_block_hash_ratio_bits,
             columnar,
             filter_format,
             columnar_format,

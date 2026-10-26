@@ -174,6 +174,38 @@ fn other_restart_interval_merge_copies_nothing() -> crate::Result<()> {
     assert_contents(&tree, 10)
 }
 
+/// Blocks carrying a hash index are copied into an output of the same ratio,
+/// and point reads through the copies' hash indexes find every key; an output
+/// of another ratio writes every row, since a table records one ratio for all
+/// its blocks.
+#[test]
+fn hash_indexed_blocks_merge_copies_only_under_the_same_ratio() -> crate::Result<()> {
+    use crate::config::HashRatioPolicy;
+
+    for (policy, copies) in [
+        (HashRatioPolicy::all(2.0), true),
+        (HashRatioPolicy::new([2.0, 0.0]), false),
+        (HashRatioPolicy::new([0.0, 2.0]), false),
+    ] {
+        let folder = crate::get_tmp_folder();
+        let tree = tree(folder.path(), |c| {
+            c.data_block_hash_ratio_policy(policy.clone())
+        })?;
+        write_base(&tree)?;
+        write_head(&tree, 2)?;
+
+        tree.major_compact(64 * 1024 * 1024, 0)?;
+
+        assert_eq!(
+            tree.metrics().compaction_blocks_carried() > 0,
+            copies,
+            "{policy:?}"
+        );
+        assert_contents(&tree, 10)?;
+    }
+    Ok(())
+}
+
 /// An output compressed otherwise than the inputs writes every row.
 #[cfg(feature = "lz4")]
 #[test]

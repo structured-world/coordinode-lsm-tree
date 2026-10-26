@@ -93,10 +93,13 @@ pub enum CarryShape {
     Groups(crate::table::meta::GroupShape),
     /// Row-major data blocks with restart heads every `restart_interval`
     /// entries: a table's locator names a key's restart head by that interval,
-    /// so a block copied in must have been written with it.
+    /// so a block copied in must have been written with it. A table records
+    /// one hash index ratio for all its blocks, so that is shared too.
     Blocks {
         /// The output's data block restart interval.
         restart_interval: u8,
+        /// The bits of the output's data block hash index ratio.
+        hash_ratio_bits: u32,
     },
 }
 
@@ -129,9 +132,13 @@ impl CarryTarget {
             CarryShape::Groups(shape) => {
                 table.carries_row_groups() && table.metadata.group_shape == Some(shape)
             }
-            CarryShape::Blocks { restart_interval } => {
+            CarryShape::Blocks {
+                restart_interval,
+                hash_ratio_bits,
+            } => {
                 table.carries_data_blocks()
                     && table.metadata.data_block_restart_interval == restart_interval
+                    && table.metadata.data_block_hash_ratio_bits == hash_ratio_bits
             }
         }
     }

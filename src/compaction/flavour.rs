@@ -1807,6 +1807,7 @@ impl StandardCompaction {
         let shape = crate::table::writer::CarriedBlockShape {
             restart_interval: table.metadata.data_block_restart_interval,
             kv_checksum: table.metadata.kv_checksum_algo,
+            hash_ratio_bits: table.metadata.data_block_hash_ratio_bits,
         };
         if !self.table_writer.carry_data_block(
             (frame, source),
