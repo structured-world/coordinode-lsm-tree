@@ -130,6 +130,14 @@ The clock is the process's wall clock, or one given with
 `WriteBudget::with_clock`. One that steps back refills nothing until it
 passes the time already counted.
 
+## Choosing a strategy
+
+Every strategy is held to the budget by the gate: a merge it chooses waits
+for credit. Only planned compaction also shapes the tree to the budget, as
+below; leveled compaction keeps its shape and waits, which under a tight
+budget holds L0 at its stop threshold, where merges run as overrides. For a
+medium with a budget, use planned compaction.
+
 ## Planned compaction
 
 [`Planned`](../src/compaction/planned/mod.rs) sizes its rounds to the
