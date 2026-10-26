@@ -66,6 +66,8 @@ impl OwnershipLedger {
     ///
     /// Returns the error of `write`, or of a held cell row that does not
     /// decode.
+    // Every row of a compaction passes here: inlined into its merge loop.
+    #[inline]
     pub fn admit(
         &mut self,
         item: InternalValue,
