@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793029972562,
+  "lastUpdate": 1793029977109,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -70920,6 +70920,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.557311346,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3f31747b878261d585e5f7d3fac03bfb2d6674f5",
+          "message": "feat(compaction): cumulative host-write budget per medium (#992)\n\n## Summary\n- A cumulative host-write budget per physical medium,\n`write_budget::WriteBudget`: a byte allowance per period of wall time,\ncapped at a burst, charged with everything the medium's write ledger\ncounts. Rate pacing (`RateLimiter`) stays a separate axis.\n- Compaction reserves its expected output from the budget of each medium\nit writes to before a merge runs, gives the hold back as its outputs\nland, and waits without credit, its inputs untouched. It runs past the\nbudget only as a counted override: the tree at a stop threshold on L0\nruns or pending compaction bytes, the reclaiming merge the space gate\nnarrowed to on a full volume or the tight-space pass where no merge\nfits, or the caller forcing the budget.\n- The budget reports credit, overrun, the work waiting and when the\nrefill covers it, overrides by reason and `unsustainable` load (writes\nit cannot hold back taking more than the allowance), and checkpoints for\nthe caller to resume from without a free refill.\n- The bench workflow generates the lock file before `cargo pkgid`, which\nfailed on a clean checkout.\n\n## Changes\n- `src/write_budget.rs`: `Allowance`, `WriteBudget` (`reserve`,\n`reserve_or_override`, `reserve_overriding`, `set_forced`,\n`set_allowance`, `checkpoint`/`resume`, `report`, `with_clock`),\n`BudgetHold`, `BudgetReport`, `Override`; every operation has an `_at`\nform taking the wall time, and none needs `std`.\n- `CountingFs::with_budget` and `Fs::write_budget` bind the budget to\nthe medium's backend; the fault and crash wrappers forward it.\n- `compaction/worker.rs`: `budget_gate` beside the space gate;\n`OutputLedger::landed` gives holds back as outputs land. A merge of a\ntree that separates values asks the blob folder's budget too, since a\nmerge operator, a compaction filter or a locality relocation may write\nnew blob files there. Moves and drops write no table and are not held\nback; the tight-space pass reserves at most what the merge it replaces\nwould write.\n- Planned compaction caps its compaction rate at the allowance rate of\nthe last level's medium, less its model's write rate when L0 shares that\nbudget; leveled compaction keeps its shape under the gate, and the docs\nrecommend planned compaction on a budgeted medium.\n- `benches/write_budget.rs`: one sensor trace (a quiet night, a restart,\na burst, then the allowance cut below the flushes at run time) under no\ngovernor, a rate limit, a budget, and planned compaction under the\nbudget.\n- `.github/workflows/benchmark.yml`: the version line step generates the\nlock file before reading the package id.\n- `docs/write-budget.md`, the README and `docs/INVARIANTS.md`.\n\n## Measurements\n`write_budget` bench on Linux, 4 sensors for 12 h, a restart, 64 sensors\nfor 6 h, 6 h with the allowance cut to a quarter (below the flushes),\nthen 3 h with the allowance restored under a storage quota a tenth past\nthe footprint:\n\n| | written MiB | host WA | read p99 | overrides | unsustainable |\nnearly full: checks refusing writes | CPU s |\n|---|---|---|---|---|---|---|---|\n| no governor | 887 | 7.12 | 151 µs | | | 17 of 18 | 23.3 |\n| rate limit | 887 | 7.12 | 159 µs | | | 17 of 18 | 37.0 |\n| budget | 477 | 3.83 | 152 µs | 4 | 5 h | 17 of 18 | 13.5 |\n| planned + budget | 245 | 1.97 | 23 µs | 2 | 5 h | 12 of 18 | 7.5 |\n\nThe rate limit writes what no governor writes, later. The budget holds\nleveled compaction at the L0 stop threshold, where merges run as\noverrides, and in the cut phase reports the load unsustainable once the\ncut allowance's burst is spent. Near the quota the budget changes\nnothing for leveled compaction: its cross-level merges are ones the\nspace gate skips there whatever the budget says.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, the tool\ncrates and the benches pass on Linux.\n\nCloses #978\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added configurable write budgets that limit compaction writes over\ntime, with burst capacity and credit that refills as time passes.\n* Compaction can wait when credit is unavailable, while forced work and\ncertain backpressure or space-reclamation cases can proceed and are\nreported as overrides.\n* Added budget status reporting, including charged writes, refusals,\nwait estimates, and unsustainable load, plus checkpoint and resume\nsupport.\n* Planned compaction now accounts for applicable write budgets when\nchoosing its compaction rate.\n* **Documentation**\n* Added guidance on configuring budgets, how they affect compaction, and\ninterpreting reports.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-26T17:34:33+02:00",
+          "tree_id": "be7e367459fccf32b1e5ae6818867d6552aeea05",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/3f31747b878261d585e5f7d3fac03bfb2d6674f5"
+        },
+        "date": 1793029975816,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 519.3720000000001,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 111.401434ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 154.417,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 51.404619ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 446.68399999999997,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.318259ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4610.426,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 19911.337,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.991,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 74.252287,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.602402579,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.591,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 72.613887,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.601155214,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
