@@ -83,9 +83,12 @@ an override charged like any other work and counted in the report, when:
   [backpressure](../src/backpressure.rs) on an axis compaction drains: its L0
   runs or its pending compaction bytes. The memtable axis is drained by
   flushes, which no budget holds back, and does not override it.
+- the volume has no room for the merge chosen, and the merge is the smaller,
+  reclaiming one the space gate ran instead: holding it back would leave the
+  volume as full as it is.
 - the caller forces the budget with `WriteBudget::set_forced`: a read latency
-  it cannot keep, or space it must reclaim. It clears the flag to let the
-  budget hold work back again.
+  it cannot keep, or space it must reclaim that the engine does not see. It
+  clears the flag to let the budget hold work back again.
 
 With backpressure thresholds set, an exhausted budget first slows the writers
 (the slowdown tier) and only then, at the stop tier, lets compaction overrun.
@@ -103,7 +106,9 @@ strategy merge what it would not.
 | `discretionary_bytes`, `mandatory_bytes` | Bytes charged since the budget began, compaction's and everything else's. |
 | `refused` | Merges that waited for want of credit. |
 | `waiting_since` | The earliest refusal since a merge last got credit: how long work has waited. |
-| `backpressure_overrides`, `forced_overrides` | Merges that ran past the budget, and their bytes, by reason. |
+| `waiting_bytes` | The largest merge refused since one last got credit: the work that waits. |
+| `credit_in` | How long until the refill covers that work beside what is reserved, if nothing else is charged meanwhile; `None` when it never will (the work is more than the burst holds, or nothing refills), so it runs only as an override. |
+| `backpressure_overrides`, `space_overrides`, `forced_overrides` | Merges that ran past the budget, and their bytes, by reason. |
 | `unsustainable` | The writes the budget does not hold back took more than the allowance refilled over the last period, or over as much of it as has passed since the budget began or its allowance changed: no throttle of compaction keeps this load within the budget. A span shorter than the burst takes to refill is not judged, since the burst absorbs it by design. |
 
 `unsustainable` is the signal that the allowance is too small for the offered

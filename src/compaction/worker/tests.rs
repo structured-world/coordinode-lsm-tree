@@ -5773,6 +5773,175 @@ fn merge_on_read_reads_lift_a_backoff_a_scan_left_low() -> crate::Result<()> {
     Ok(())
 }
 
+mod budget_gate {
+    use super::open_standard;
+    use crate::fs::{CountingFs, MemFs, WriteIoStats};
+    use crate::write_budget::{Allowance, BudgetCheckpoint, WriteBudget};
+    use crate::{AbstractTree, compaction::CompactionStrategy};
+    use core::time::Duration;
+    use std::sync::Arc;
+    use test_log::test;
+
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    /// A clock that stays at the epoch, so the budget refills nothing.
+    struct Epoch;
+
+    impl crate::Clock for Epoch {
+        fn unix_time(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    /// A tree on a medium whose budget holds `credit`, and its options.
+    fn on_budget(
+        dir: &std::path::Path,
+        credit: i64,
+    ) -> crate::Result<(Arc<WriteBudget>, crate::Tree, super::super::Options)> {
+        let budget = Arc::new(
+            WriteBudget::resume_at(
+                Arc::new(WriteIoStats::default()),
+                Allowance::new(1 << 30, DAY),
+                BudgetCheckpoint {
+                    credit,
+                    as_of: Duration::ZERO,
+                },
+                0,
+                Duration::ZERO,
+            )
+            .with_clock(Arc::new(Epoch)),
+        );
+        let fs = Arc::new(CountingFs::with_budget(
+            Arc::new(MemFs::new()),
+            Arc::clone(&budget),
+        ));
+        let tree = open_standard(dir, |c| c.with_shared_fs(fs))?;
+        let strategy: Arc<dyn CompactionStrategy> =
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+        let opts = super::super::Options::from_tree(&tree, strategy);
+        Ok((budget, tree, opts))
+    }
+
+    /// Without credit, a merge the space gate narrowed to reclaim room runs as
+    /// a space override; the merge as chosen waits. A forced budget names the
+    /// caller's reason first.
+    #[test]
+    fn a_space_narrowed_merge_runs_past_an_empty_budget() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (budget, tree, opts) = on_budget(dir.path(), 0)?;
+        let version = tree.current_version();
+
+        let gate = super::super::budget_gate(
+            &version,
+            &opts,
+            6,
+            (1_000, 0),
+            super::super::Narrowing::ForSpace,
+        );
+        let super::super::BudgetGate::Run(holds) = gate else {
+            panic!("a reclaiming merge must run");
+        };
+        assert_eq!(holds.len(), 1);
+        drop(holds);
+        let report = budget.report();
+        assert_eq!(report.space_overrides.reservations, 1);
+        assert_eq!(report.refused, 0);
+
+        let gate = super::super::budget_gate(
+            &version,
+            &opts,
+            6,
+            (1_000, 0),
+            super::super::Narrowing::None,
+        );
+        assert!(matches!(gate, super::super::BudgetGate::Wait));
+        assert_eq!(budget.report().refused, 1);
+
+        budget.set_forced(true);
+        let gate = super::super::budget_gate(
+            &version,
+            &opts,
+            6,
+            (1_000, 0),
+            super::super::Narrowing::ForSpace,
+        );
+        assert!(matches!(gate, super::super::BudgetGate::Run(_)));
+        let report = budget.report();
+        assert_eq!(report.forced_overrides.reservations, 1);
+        assert_eq!(report.space_overrides.reservations, 1, "not counted twice");
+        Ok(())
+    }
+
+    /// The tables and the blob files of a merge whose folders are on one
+    /// medium are reserved together, as one hold of their sum.
+    #[test]
+    fn two_folders_on_one_medium_reserve_one_hold() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (budget, tree, opts) = on_budget(dir.path(), 1 << 20)?;
+        let version = tree.current_version();
+
+        let gate = super::super::budget_gate(
+            &version,
+            &opts,
+            6,
+            (300, 200),
+            super::super::Narrowing::None,
+        );
+        let super::super::BudgetGate::Run(holds) = gate else {
+            panic!("covered by the credit");
+        };
+        assert_eq!(
+            holds
+                .iter()
+                .map(crate::write_budget::BudgetHold::held)
+                .collect::<Vec<_>>(),
+            [500]
+        );
+        assert_eq!(budget.report().reserved, 500);
+        drop(holds);
+        assert_eq!(budget.report().reserved, 0);
+        Ok(())
+    }
+
+    /// A merge writing nothing, or onto a medium with no budget, reserves
+    /// nothing and is never held back.
+    #[test]
+    fn nothing_to_reserve_holds_nothing() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (budget, tree, opts) = on_budget(dir.path(), 0)?;
+        let gate = super::super::budget_gate(
+            &tree.current_version(),
+            &opts,
+            6,
+            (0, 0),
+            super::super::Narrowing::None,
+        );
+        let super::super::BudgetGate::Run(holds) = gate else {
+            panic!("nothing written, nothing to wait for");
+        };
+        assert!(holds.is_empty());
+        assert_eq!(budget.report().refused, 0);
+
+        let plain_dir = tempfile::tempdir()?;
+        let plain = open_standard(plain_dir.path(), |c| c)?;
+        let strategy: Arc<dyn CompactionStrategy> =
+            Arc::new(crate::compaction::major::Strategy::new(64 * 1024 * 1024));
+        let plain_opts = super::super::Options::from_tree(&plain, strategy);
+        let gate = super::super::budget_gate(
+            &plain.current_version(),
+            &plain_opts,
+            6,
+            (1 << 30, 1 << 30),
+            super::super::Narrowing::None,
+        );
+        let super::super::BudgetGate::Run(holds) = gate else {
+            panic!("no budget, nothing to wait for");
+        };
+        assert!(holds.is_empty());
+        Ok(())
+    }
+}
+
 mod locality_relocation {
     use super::RewriteOneTable;
     use crate::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};

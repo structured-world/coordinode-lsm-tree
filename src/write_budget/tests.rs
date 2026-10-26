@@ -422,6 +422,68 @@ fn a_burst_within_its_refill_time_is_sustainable() {
     assert!(budget.report_at(DAY * 10 / 24).unsustainable);
 }
 
+// The report names the largest work that waits and when the refill covers it
+// beside the reservations; once work is granted nothing waits.
+#[test]
+fn the_report_forecasts_the_waiting_work() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(1_000, DAY));
+    let held = budget.reserve_at(200, Duration::ZERO).expect("the burst");
+    medium.write(WriteOrigin::FlushTable, 800);
+    assert!(budget.reserve_at(300, Duration::ZERO).is_none());
+    assert!(budget.reserve_at(100, Duration::ZERO).is_none());
+    let report = budget.report_at(Duration::ZERO);
+    assert_eq!(report.waiting_bytes, 300, "the largest that waits");
+    // 300 beside the 200 held, from 200 of credit: 300 bytes, 0.3 of a day.
+    assert_eq!(report.credit_in, Some(DAY * 3 / 10));
+    // Halfway there, half the wait is left.
+    assert_eq!(budget.report_at(DAY * 3 / 20).credit_in, Some(DAY * 3 / 20));
+
+    let granted = budget.reserve_at(300, DAY * 3 / 10).expect("covered");
+    let report = budget.report_at(DAY * 3 / 10);
+    assert_eq!(
+        (report.waiting_bytes, report.credit_in),
+        (0, Some(Duration::ZERO))
+    );
+    drop((held, granted));
+}
+
+// Work the burst cannot hold beside the reservations, or an allowance that
+// refills nothing, never gets credit: the forecast says so instead of a time.
+#[test]
+fn work_past_the_burst_is_forecast_never() {
+    let medium = Medium::new();
+    let narrow = budget(&medium, Allowance::new(1_000, DAY).with_burst(500));
+    assert!(narrow.reserve_at(501, Duration::ZERO).is_none());
+    assert_eq!(narrow.report_at(Duration::ZERO).credit_in, None);
+
+    let dry = budget(&medium, Allowance::new(0, DAY).with_burst(500));
+    medium.write(WriteOrigin::FlushTable, 500);
+    assert!(dry.reserve_at(1, Duration::ZERO).is_none());
+    assert_eq!(dry.report_at(Duration::ZERO).credit_in, None);
+}
+
+// A reservation past the budget to reclaim space is counted as such.
+#[test]
+fn a_space_override_is_counted_apart() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(10, DAY));
+    let hold = budget
+        .reserve_or_override_at(100, Duration::ZERO, || Some(Override::Space))
+        .expect("overridden");
+    let report = budget.report_at(Duration::ZERO);
+    assert_eq!(
+        report.space_overrides,
+        Overrides {
+            reservations: 1,
+            bytes: 100
+        }
+    );
+    assert_eq!(report.forced_overrides, Overrides::default());
+    assert_eq!(report.refused, 0);
+    drop(hold);
+}
+
 // A forced request is a flag the caller sets and clears.
 #[test]
 fn forcing_is_set_and_cleared_by_the_caller() {

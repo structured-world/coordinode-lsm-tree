@@ -4,7 +4,9 @@
 
 use lsm_tree::compaction::{CompactionAction, MoveDown};
 use lsm_tree::config::LevelRoute;
-use lsm_tree::fs::{CountingFs, Fs, MemFs, WriteIoStats, WriteOrigin};
+use lsm_tree::fs::{
+    CountingFs, CrashFs, Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs, WriteIoStats, WriteOrigin,
+};
 use lsm_tree::write_budget::{Allowance, BudgetCheckpoint, WriteBudget};
 use lsm_tree::{
     AbstractTree, AnyTree, BackpressureThresholds, Clock, Config, SeqNo, SequenceNumberCounter,
@@ -57,31 +59,38 @@ impl Medium {
     /// A budget of `allowance` holding no credit yet: every write overruns
     /// it until the refill catches up.
     fn empty(allowance: Allowance) -> Self {
-        Self::with(WriteBudget::resume_at(
-            Arc::new(WriteIoStats::default()),
-            allowance,
-            BudgetCheckpoint {
-                credit: 0,
-                as_of: Duration::ZERO,
-            },
-            0,
-            Duration::ZERO,
-        ))
+        Self::with(empty_budget(allowance))
     }
 
     fn with(budget: WriteBudget) -> Self {
+        Self::over(Arc::new(MemFs::new()), budget)
+    }
+
+    /// A medium writing through `inner` under `budget`.
+    fn over(inner: Arc<dyn Fs>, budget: WriteBudget) -> Self {
         let clock = Arc::new(HandClock::default());
         let budget = Arc::new(budget.with_clock(Arc::clone(&clock) as Arc<dyn Clock>));
-        let fs = Arc::new(CountingFs::with_budget(
-            Arc::new(MemFs::new()),
-            Arc::clone(&budget),
-        ));
+        let fs = Arc::new(CountingFs::with_budget(inner, Arc::clone(&budget)));
         Self { budget, fs, clock }
     }
 
     fn written(&self, origin: WriteOrigin) -> u64 {
         self.budget.ledger().snapshot().origin(origin).bytes
     }
+}
+
+/// A budget of `allowance` holding no credit yet.
+fn empty_budget(allowance: Allowance) -> WriteBudget {
+    WriteBudget::resume_at(
+        Arc::new(WriteIoStats::default()),
+        allowance,
+        BudgetCheckpoint {
+            credit: 0,
+            as_of: Duration::ZERO,
+        },
+        0,
+        Duration::ZERO,
+    )
 }
 
 fn config(path: &str, fs: Arc<dyn Fs>) -> Config {
@@ -342,5 +351,178 @@ fn a_backend_without_a_budget_holds_nothing_back() -> lsm_tree::Result<()> {
     assert_ne!(result.action, CompactionAction::Nothing);
     assert_eq!(tree.table_count(), 1);
     assert_latest_values(&tree)?;
+    Ok(())
+}
+
+/// A merge that fails on an I/O error gives its whole hold back: the budget
+/// is charged what it wrote and holds nothing for it, the tree keeps its
+/// tables, and the next merge reserves again and runs.
+#[test]
+fn a_failed_merge_gives_its_hold_back() -> lsm_tree::Result<()> {
+    let faulty = FaultFs::new(MemFs::new());
+    let injector = faulty.injector();
+    let medium = Medium::over(
+        Arc::new(faulty),
+        WriteBudget::new_at(Arc::new(WriteIoStats::default()), plenty(), Duration::ZERO),
+    );
+    let tree = config("/db", Arc::clone(&medium.fs)).open()?;
+    three_tables(&tree, 0)?;
+    let tables = tree.table_count();
+    for op in [FaultOp::SyncAll, FaultOp::SyncData] {
+        injector.arm(
+            FaultRule::new(op, Fault::Error(lsm_tree::io::ErrorKind::Other))
+                .on_path("tables")
+                .once(),
+        );
+    }
+
+    assert!(tree.major_compact(u64::MAX, SeqNo::MAX).is_err());
+
+    let report = medium.budget.report();
+    assert_eq!(report.reserved, 0, "the failed merge holds nothing");
+    assert_eq!(report.refused, 0);
+    assert_eq!(
+        report.discretionary_bytes,
+        medium.written(WriteOrigin::CompactionTable),
+        "what it wrote before failing is charged"
+    );
+    assert_eq!(tree.table_count(), tables);
+    assert_latest_values(&tree)?;
+
+    injector.clear();
+    let result = tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    assert_ne!(result.action, CompactionAction::Nothing);
+    assert_eq!(medium.budget.report().reserved, 0);
+    Ok(())
+}
+
+/// The fault and crash wrappers hand on the budget of the counting backend
+/// under them, so a tree on a wrapped medium still reserves from it.
+#[test]
+fn wrappers_hand_on_the_budget_under_them() {
+    let budget = Arc::new(WriteBudget::new_at(
+        Arc::new(WriteIoStats::default()),
+        plenty(),
+        Duration::ZERO,
+    ));
+    let counted = || CountingFs::with_budget(Arc::new(MemFs::new()), Arc::clone(&budget));
+    let found = |fs: &dyn Fs| fs.write_budget().is_some_and(|b| Arc::ptr_eq(b, &budget));
+    assert!(found(&FaultFs::new(counted())));
+    assert!(found(&CrashFs::new(counted())));
+    assert!(found(&CrashFs::new(FaultFs::new(counted()))));
+    assert!(!found(&FaultFs::new(MemFs::new())));
+}
+
+/// A tree reopened on a budget resumed from a checkpoint keeps the overrun
+/// the budget had: the restart hands back no credit, and a merge still waits
+/// until the refill covers it.
+#[test]
+fn a_restart_hands_back_no_credit() -> lsm_tree::Result<()> {
+    let inner: Arc<dyn Fs> = Arc::new(MemFs::new());
+    let before = Medium::over(Arc::clone(&inner), empty_budget(plenty()));
+    let tree = config("/db", Arc::clone(&before.fs)).open()?;
+    three_tables(&tree, 0)?;
+    let checkpoint = before.budget.checkpoint();
+    assert!(checkpoint.credit < 0);
+    let config = tree.tree_config().clone();
+    drop(tree);
+
+    // The new process: a new ledger, the same files, the budget resumed with
+    // nothing charged since the checkpoint.
+    let after = Medium::over(
+        inner,
+        WriteBudget::resume_at(
+            Arc::new(WriteIoStats::default()),
+            plenty(),
+            checkpoint,
+            0,
+            Duration::ZERO,
+        ),
+    );
+    let tree = config.with_shared_fs(Arc::clone(&after.fs)).open()?;
+    assert_eq!(after.budget.report().credit, checkpoint.credit);
+
+    let result = tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    assert_eq!(result.action, CompactionAction::Nothing);
+    assert_eq!(after.budget.report().refused, 1);
+    assert_latest_values(&tree)?;
+
+    after.clock.advance_secs(DAY.as_secs());
+    let result = tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    assert_ne!(result.action, CompactionAction::Nothing);
+    Ok(())
+}
+
+/// A merge that relocates separated values reserves their blob files too:
+/// without credit it waits and relocates nothing, with it the relocation is
+/// charged to the budget along with the tables.
+#[test]
+fn a_relocation_reserves_its_blob_files() -> lsm_tree::Result<()> {
+    let medium = Medium::empty(plenty());
+    let tree = config("/db", Arc::clone(&medium.fs))
+        .with_kv_separation(Some(
+            lsm_tree::KvSeparationOptions::default().age_cutoff(1.0),
+        ))
+        .blob_compression(lsm_tree::CompressionType::None)
+        .open()?;
+    let value = b"neptune!".repeat(16_000);
+    tree.insert("big", &value, 0);
+    tree.insert("big2", &value, 0);
+    tree.flush_active_memtable(0)?;
+    tree.insert("big", b"winter!".repeat(16_000), 1);
+    tree.flush_active_memtable(0)?;
+
+    tree.major_compact(64_000_000, 1_000)?;
+    assert_eq!(medium.written(WriteOrigin::CompactionBlob), 0);
+    assert!(medium.budget.report().refused >= 1);
+
+    medium.clock.advance_secs(DAY.as_secs());
+    tree.major_compact(64_000_000, 1_000)?;
+    tree.major_compact(64_000_000, 1_000)?;
+
+    let relocated = medium.written(WriteOrigin::CompactionBlob);
+    assert!(
+        relocated >= value.len() as u64,
+        "the live value was relocated"
+    );
+    let report = medium.budget.report();
+    assert_eq!(
+        report.discretionary_bytes,
+        medium.written(WriteOrigin::CompactionTable) + relocated
+    );
+    assert_eq!(report.reserved, 0);
+    assert_eq!(tree.get("big2", SeqNo::MAX)?.as_deref(), Some(&value[..]));
+    Ok(())
+}
+
+/// The report tells how much work waits and when the refill covers it, and
+/// that it never will when the work is more than the burst.
+#[test]
+fn the_report_forecasts_when_waiting_work_gets_credit() -> lsm_tree::Result<()> {
+    // A gibibyte a day, so a refill of N bytes takes N * 86 400 / 2^30 s.
+    let medium = Medium::empty(plenty());
+    let tree = config("/db", Arc::clone(&medium.fs)).open()?;
+    three_tables(&tree, 0)?;
+    assert_eq!(medium.budget.report().credit_in, Some(Duration::ZERO));
+
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+
+    let report = medium.budget.report();
+    assert!(report.waiting_bytes > 0);
+    let short = u64::try_from(-report.credit).expect("overrun") + report.waiting_bytes;
+    let expected = Duration::from_nanos(
+        u64::try_from((u128::from(short) * DAY.as_nanos()).div_ceil(1 << 30)).expect("short"),
+    );
+    assert_eq!(report.credit_in, Some(expected));
+
+    let small = Medium::empty(Allowance::new(1 << 30, DAY).with_burst(1));
+    let tree = config("/small", Arc::clone(&small.fs)).open()?;
+    three_tables(&tree, 0)?;
+    tree.major_compact(u64::MAX, SeqNo::MAX)?;
+    assert_eq!(
+        small.budget.report().credit_in,
+        None,
+        "past the burst: never"
+    );
     Ok(())
 }

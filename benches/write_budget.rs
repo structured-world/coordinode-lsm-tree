@@ -146,8 +146,10 @@ struct Outcome {
     refused: u64,
     backpressure_overrides: u64,
     forced_overrides: u64,
+    space_overrides: u64,
     unsustainable_checks: u64,
     elapsed: Duration,
+    cpu: Duration,
 }
 
 /// The medium of one arm: its backend, and the budget on it when it has one.
@@ -270,6 +272,7 @@ fn account(medium: &Medium, outcome: &mut Outcome) {
         outcome.refused += report.refused;
         outcome.backpressure_overrides += report.backpressure_overrides.reservations;
         outcome.forced_overrides += report.forced_overrides.reservations;
+        outcome.space_overrides += report.space_overrides.reservations;
     }
 }
 
@@ -280,6 +283,7 @@ fn run(arm: Arm) -> lsm_tree::Result<Outcome> {
     let strategy = arm.strategy();
     let mut outcome = Outcome::default();
     let started = Instant::now();
+    let cpu_started = cpu_time::ProcessTime::now();
 
     let mut medium = Medium::new(arm, &clock, None);
     let mut tree = open(arm, dir.path(), &seqno, &medium)?;
@@ -345,6 +349,7 @@ fn run(arm: Arm) -> lsm_tree::Result<Outcome> {
     }
     account(&medium, &mut outcome);
     outcome.elapsed = started.elapsed();
+    outcome.cpu = cpu_started.elapsed();
     Ok(outcome)
 }
 
@@ -362,7 +367,7 @@ fn main() -> lsm_tree::Result<()> {
         mib(ALLOWANCE_PER_DAY),
     );
     println!(
-        "{:<8} {:>11} {:>14} {:>6} {:>8} {:>13} {:>9} {:>9} {:>8} {:>9} {:>14} {:>9}",
+        "{:<8} {:>11} {:>14} {:>6} {:>8} {:>13} {:>9} {:>9} {:>8} {:>9} {:>14} {:>9} {:>7}",
         "arm",
         "written MiB",
         "compacted MiB",
@@ -375,6 +380,7 @@ fn main() -> lsm_tree::Result<()> {
         "overrides",
         "unsustainable",
         "wall s",
+        "CPU s",
     );
     for arm in Arm::ALL {
         if only.as_deref().is_some_and(|name| name != arm.name()) {
@@ -386,9 +392,10 @@ fn main() -> lsm_tree::Result<()> {
             percentile(&outcome.reads_ns, 0.50),
             percentile(&outcome.reads_ns, 0.99),
         );
-        let overrides = outcome.backpressure_overrides + outcome.forced_overrides;
+        let overrides =
+            outcome.backpressure_overrides + outcome.forced_overrides + outcome.space_overrides;
         println!(
-            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8} {:>9} {:>12} h {:>9.1}",
+            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8} {:>9} {:>12} h {:>9.1} {:>7.1}",
             arm.name(),
             mib(outcome.written),
             mib(outcome.compaction),
@@ -401,6 +408,7 @@ fn main() -> lsm_tree::Result<()> {
             overrides,
             outcome.unsustainable_checks * FLUSH_EVERY_SECONDS / 3_600,
             outcome.elapsed.as_secs_f64(),
+            outcome.cpu.as_secs_f64(),
         );
         let name = arm.name();
         for (field, value) in [
@@ -414,8 +422,10 @@ fn main() -> lsm_tree::Result<()> {
             ("refused", outcome.refused),
             ("backpressure_overrides", outcome.backpressure_overrides),
             ("forced_overrides", outcome.forced_overrides),
+            ("space_overrides", outcome.space_overrides),
             ("unsustainable_checks", outcome.unsustainable_checks),
             ("wall_ms", outcome.elapsed.as_millis() as u64),
+            ("cpu_ms", outcome.cpu.as_millis() as u64),
         ] {
             println!("budget,{name},{field},{value}");
         }

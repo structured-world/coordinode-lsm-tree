@@ -153,6 +153,10 @@ pub enum Override {
     /// [`WriteBudget::set_forced`]: a read latency it cannot keep, or space it
     /// must reclaim.
     Forced,
+    /// The volume had no room for the merge chosen, and the work is the
+    /// smaller merge that reclaims space instead: holding it back would leave
+    /// the volume as full as it is.
+    Space,
 }
 
 /// Reservations granted past the budget for one [`Override`] reason.
@@ -197,6 +201,18 @@ pub struct BudgetReport {
     /// Reservations granted past the budget because the caller asked
     /// ([`Override::Forced`]).
     pub forced_overrides: Overrides,
+    /// Reservations granted past the budget to reclaim space on a full volume
+    /// ([`Override::Space`]).
+    pub space_overrides: Overrides,
+    /// The largest reservation refused since one was last granted: the work
+    /// that waits. Zero when nothing waits.
+    pub waiting_bytes: u64,
+    /// How long until the credit covers [`Self::waiting_bytes`] beside what is
+    /// reserved, if nothing else is charged meanwhile; zero when nothing
+    /// waits. `None` when it never will: the work is more than the burst holds
+    /// past the reservations, or the allowance refills nothing, so it runs
+    /// only as an override.
+    pub credit_in: Option<Duration>,
     /// Whether the writes the budget cannot hold back alone take more than
     /// the allowance refills, over the last period or as much of it as has
     /// passed since the budget began or its allowance changed, once that span
@@ -293,8 +309,10 @@ struct Account {
     reserved: u64,
     refused: u64,
     waiting_since: Option<u128>,
+    waiting_bytes: u64,
     backpressure_overrides: Overrides,
     forced_overrides: Overrides,
+    space_overrides: Overrides,
     window: Window,
 }
 
@@ -350,9 +368,45 @@ impl Account {
         self.charge(now, now_nanos);
     }
 
+    /// Counts `bytes` reserved past the budget for `reason`.
+    fn overridden(&mut self, reason: Override, bytes: u64) {
+        match reason {
+            Override::Backpressure => self.backpressure_overrides.add(bytes),
+            Override::Forced => self.forced_overrides.add(bytes),
+            Override::Space => self.space_overrides.add(bytes),
+        }
+    }
+
     /// Credit left once what is reserved is set against it.
     fn free(&self) -> i128 {
         self.credit - i128::from(self.reserved)
+    }
+
+    /// How long until the credit covers `bytes` beside what is reserved, at
+    /// the refill alone; `None` when the burst cannot hold them past the
+    /// reservations, or nothing refills.
+    fn credit_in(&self, bytes: u64) -> Option<Duration> {
+        let needed = i128::from(bytes) + i128::from(self.reserved);
+        if needed > i128::from(self.allowance.burst) {
+            return None;
+        }
+        // Positive past this point: the credit is below what is needed.
+        let Ok(short) = u128::try_from(needed - self.credit) else {
+            return Some(Duration::ZERO);
+        };
+        if short == 0 {
+            return Some(Duration::ZERO);
+        }
+        let rate = u128::from(self.allowance.bytes_per_period);
+        if rate == 0 {
+            return None;
+        }
+        // The refill owes `short * period` units, less the part of a byte it
+        // has already accrued, which is below one period: `short` is at least
+        // one byte. Rounded up so the credit is there when the wait ends; a
+        // product past u128 is a wait no clock reaches.
+        let owed = short.checked_mul(self.allowance.period_nanos())? - self.partial;
+        Some(nanos_to_duration(owed.div_ceil(rate)))
     }
 
     /// Whether the writes the budget cannot hold back take more than the
@@ -481,8 +535,10 @@ impl WriteBudget {
                 reserved: 0,
                 refused: 0,
                 waiting_since: None,
+                waiting_bytes: 0,
                 backpressure_overrides: Overrides::default(),
                 forced_overrides: Overrides::default(),
+                space_overrides: Overrides::default(),
                 window,
             }),
             forced: portable_atomic::AtomicBool::new(false),
@@ -564,15 +620,13 @@ impl WriteBudget {
         // Read again: holds may have gone back while `reason` ran.
         account.settle(Spend::of(&self.ledger.snapshot()), now_nanos);
         if account.free() < i128::from(bytes) {
-            match reason {
-                Some(Override::Backpressure) => account.backpressure_overrides.add(bytes),
-                Some(Override::Forced) => account.forced_overrides.add(bytes),
-                None => {
-                    account.refused += 1;
-                    account.waiting_since.get_or_insert(now_nanos);
-                    return None;
-                }
-            }
+            let Some(reason) = reason else {
+                account.refused += 1;
+                account.waiting_since.get_or_insert(now_nanos);
+                account.waiting_bytes = account.waiting_bytes.max(bytes);
+                return None;
+            };
+            account.overridden(reason, bytes);
         }
         let hold = self.take(&mut account, bytes);
         drop(account);
@@ -600,10 +654,7 @@ impl WriteBudget {
     ) -> BudgetHold {
         let mut account = self.account.lock();
         account.settle(Spend::of(&self.ledger.snapshot()), now.as_nanos());
-        match reason {
-            Override::Backpressure => account.backpressure_overrides.add(bytes),
-            Override::Forced => account.forced_overrides.add(bytes),
-        }
+        account.overridden(reason, bytes);
         let hold = self.take(&mut account, bytes);
         drop(account);
         hold
@@ -612,6 +663,7 @@ impl WriteBudget {
     fn take(self: &Arc<Self>, account: &mut Account, bytes: u64) -> BudgetHold {
         account.reserved += bytes;
         account.waiting_since = None;
+        account.waiting_bytes = 0;
         BudgetHold {
             budget: Arc::clone(self),
             held: Mutex::new(bytes),
@@ -701,6 +753,13 @@ impl WriteBudget {
             waiting_since: account.waiting_since.map(nanos_to_duration),
             backpressure_overrides: account.backpressure_overrides,
             forced_overrides: account.forced_overrides,
+            space_overrides: account.space_overrides,
+            waiting_bytes: account.waiting_bytes,
+            credit_in: if account.waiting_bytes == 0 {
+                Some(Duration::ZERO)
+            } else {
+                account.credit_in(account.waiting_bytes)
+            },
             unsustainable: account.unsustainable(now_nanos),
         }
     }

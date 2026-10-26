@@ -446,12 +446,20 @@ fn gated_merge(
         // The merge that runs asks the write budgets of the media it writes
         // to; one that waits for credit drops the room it reserved.
         let budget = match &decision {
-            SpaceGate::Run(_, bytes) => {
-                budget_gate(&super_version.version, opts, payload.dest_level, *bytes)
-            }
-            SpaceGate::Narrowed(narrowed, _, bytes) => {
-                budget_gate(&super_version.version, opts, narrowed.dest_level, *bytes)
-            }
+            SpaceGate::Run(_, bytes) => budget_gate(
+                &super_version.version,
+                opts,
+                payload.dest_level,
+                *bytes,
+                Narrowing::None,
+            ),
+            SpaceGate::Narrowed(narrowed, _, bytes) => budget_gate(
+                &super_version.version,
+                opts,
+                narrowed.dest_level,
+                *bytes,
+                Narrowing::ForSpace,
+            ),
             // The tight-space pass reclaims space: no budget holds it back.
             SpaceGate::Skip => BudgetGate::Run(Vec::new()),
         };
@@ -507,23 +515,33 @@ enum BudgetGate {
     Wait,
 }
 
+/// Whether the merge asking the budget is the one chosen, or the smaller one
+/// the space gate ran instead because the volume had no room for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Narrowing {
+    None,
+    ForSpace,
+}
+
 /// Reserves, in the write budget of each medium a merge into `dest_level`
 /// writes to, the `sst_bytes` of tables it writes into the level's folder and
 /// the `blob_bytes` of blob files it writes into the blob folder: the two
 /// added up where both folders' backends name one budget.
 ///
 /// A budget without credit for its part lets the merge run anyway when the
-/// caller forces discretionary work on it, or when the tree has reached a
-/// stop threshold on an axis compaction drains (its L0 runs, its pending
-/// compaction bytes): waiting for credit would then stall the writers. Both
-/// are reserved as overrides, charged and reported. Otherwise the merge
-/// waits, and the reservations it took on other budgets go back. A merge on
-/// media without a budget reserves nothing.
+/// caller forces discretionary work on it, when the merge is the reclaiming
+/// one the space gate narrowed to on a full volume, or when the tree has
+/// reached a stop threshold on an axis compaction drains (its L0 runs, its
+/// pending compaction bytes): waiting for credit would then leave the volume
+/// full or stall the writers. Each is reserved as an override, charged and
+/// reported. Otherwise the merge waits, and the reservations it took on other
+/// budgets go back. A merge on media without a budget reserves nothing.
 fn budget_gate(
     version: &Version,
     opts: &Options,
     dest_level: u8,
     (sst_bytes, blob_bytes): (u64, u64),
+    narrowing: Narrowing,
 ) -> BudgetGate {
     use crate::write_budget::Override;
 
@@ -549,6 +567,8 @@ fn budget_gate(
         let hold = budget.reserve_or_override(bytes, || {
             if budget.forced() {
                 Some(Override::Forced)
+            } else if narrowing == Narrowing::ForSpace {
+                Some(Override::Space)
             } else if *stopped.get_or_insert_with(|| at_compaction_stop(version, opts)) {
                 Some(Override::Backpressure)
             } else {
