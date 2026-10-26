@@ -174,7 +174,13 @@ pub struct Metrics {
     /// Charged when the outputs are installed.
     pub(crate) compaction_groups_partly_carried: AtomicU64,
 
-    /// The on-disk bytes copied instead of encoded: whole groups and pages.
+    /// Row-major data blocks compactions copied into their output whole, as
+    /// they lay on disk, instead of encoding their rows again. Charged when
+    /// the outputs are installed.
+    pub(crate) compaction_blocks_carried: AtomicU64,
+
+    /// The on-disk bytes copied instead of encoded: whole groups, pages and
+    /// data blocks.
     pub(crate) compaction_bytes_carried: AtomicU64,
 
     /// What the tree took in from its caller.
@@ -521,9 +527,18 @@ impl Metrics {
         self.compaction_groups_partly_carried.load(Relaxed)
     }
 
+    /// Row-major data blocks compactions copied into their output as they lay
+    /// on disk, because the merge left every row of them as it was.
+    ///
+    /// Each one is a block neither encoded nor compressed again.
+    pub fn compaction_blocks_carried(&self) -> u64 {
+        self.compaction_blocks_carried.load(Relaxed)
+    }
+
     /// On-disk bytes compactions copied instead of encoding them again: the
-    /// row groups of [`Self::compaction_groups_carried`] and the pages of
-    /// [`Self::compaction_groups_partly_carried`].
+    /// row groups of [`Self::compaction_groups_carried`], the pages of
+    /// [`Self::compaction_groups_partly_carried`] and the data blocks of
+    /// [`Self::compaction_blocks_carried`].
     pub fn compaction_bytes_carried(&self) -> u64 {
         self.compaction_bytes_carried.load(Relaxed)
     }

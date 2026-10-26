@@ -34,12 +34,17 @@ const SCANNER_READAHEAD_BYTES: usize = 2 * 1024 * 1024;
 /// and a block's payload is handed out as a view of its chunk, not copied out
 /// of it. A view keeps its whole chunk alive, which a scan's consumers, all of
 /// them streaming, hold only until they move on; a block reaching past its
-/// chunk starts the next one, which takes over the bytes not yet handed out.
+/// chunk starts the next one, which takes over the bytes not yet handed out
+/// and those of the block being read, so a block's frame lies in one chunk.
 struct BlockStream {
     file: TimedFile,
     /// The bytes read from the file: those from `at` on are not handed out yet.
     chunk: crate::Slice,
     at: usize,
+    /// Where in `chunk` the block being read starts.
+    mark: usize,
+    /// The file offset the block being read starts at.
+    mark_position: u64,
     /// The bytes of the file not read into a chunk yet.
     unread: u64,
     /// The length a chunk is read at, unless less of the file is left or a
@@ -55,6 +60,8 @@ impl BlockStream {
             file,
             chunk: crate::Slice::empty(),
             at: 0,
+            mark: 0,
+            mark_position: start,
             // A start past the end leaves nothing to read: the first block
             // read then fails as a truncated file.
             unread: len.saturating_sub(start),
@@ -68,27 +75,43 @@ impl BlockStream {
         self.chunk.get(self.at..).unwrap_or_default()
     }
 
-    /// Reads the next chunk, at least `need` bytes long, the bytes not handed
-    /// out yet at its front. One shorter than `need` is a truncated file.
+    /// Marks the start of the next block.
+    fn begin_block(&mut self) {
+        self.mark = self.at;
+        self.mark_position = self.position;
+    }
+
+    /// The block read since [`Self::begin_block`]: the file offset it starts
+    /// at and its frame, as a view of the chunk holding it.
+    fn block_frame(&self) -> (u64, crate::Slice) {
+        (self.mark_position, self.chunk.slice(self.mark..self.at))
+    }
+
+    /// Reads the next chunk, at least `need` bytes past what the block being
+    /// read has taken, with that block's bytes and those not handed out yet at
+    /// its front. One shorter than `need` is a truncated file.
     fn refill(&mut self, need: usize) -> IoResult<()> {
-        let pending = self.chunk.get(self.at..).unwrap_or_default();
+        let kept = self.chunk.get(self.mark..).unwrap_or_default();
+        let taken = self.at - self.mark;
+        let pending_len = kept.len() - taken;
         // Bounded by the file's length, a u64.
-        let left = self.unread + pending.len() as u64;
+        let left = self.unread + pending_len as u64;
         let len = usize::try_from(left)
             .map_or(self.readahead, |left| left.min(self.readahead))
             .max(need);
         // `need` exceeds what is pending, so the chunk reads past it.
-        let read = len - pending.len();
+        let read = len - pending_len;
         let chunk = crate::Slice::from_reader(
             &mut PendingThenFile {
-                pending,
+                pending: kept,
                 file: &mut self.file,
             },
-            len,
+            taken + len,
         )?;
         self.unread = self.unread.saturating_sub(read as u64);
         self.chunk = chunk;
-        self.at = 0;
+        self.mark = 0;
+        self.at = taken;
         Ok(())
     }
 
@@ -226,9 +249,12 @@ pub struct Scanner {
     groups: alloc::vec::IntoIter<super::BlockHandle>,
     /// The index entry of the group whose rows are being handed out.
     current_group: Option<super::BlockHandle>,
-    /// Hands out each group's rows from the group's own list and records the
-    /// group as a candidate for a whole copy, when a compaction asked for it.
-    #[cfg(feature = "columnar")]
+    /// The extent and frame of the row-major block whose rows are being
+    /// handed out, until a carry takes them; `None` for a columnar table and
+    /// once handed on.
+    frame: Option<(super::BlockHandle, crate::Slice)>,
+    /// Hands out each group's or block's rows from its own list and records it
+    /// as a candidate for a whole copy, when a compaction asked for it.
     carry: Option<super::group_carry::GroupCarry>,
 }
 
@@ -299,6 +325,7 @@ impl Scanner {
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
+        let frame = Self::row_block_frame(&reader, columnar);
         let cmp = comparator.clone();
         let iter = OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp))?;
 
@@ -328,34 +355,54 @@ impl Scanner {
             lower_bound,
             groups,
             current_group,
-            #[cfg(feature = "columnar")]
+            frame,
             carry: None,
         })
     }
 
-    /// Records every row group this scan reads in `carry`'s queue, with the
-    /// rows it hands out for the group. Only the scan of a table whose groups
-    /// can be carried takes one (see `Table::carries_row_groups`): a columnar
-    /// table read whole and as stored, since a restricted view drops rows of
-    /// its first group and an ingested table shifts their seqnos, so what it
-    /// hands out is not what the group's bytes hold.
-    #[cfg(feature = "columnar")]
+    /// The extent and frame of the block just read, when the table is
+    /// row-major: one view of the chunk the stream read it from.
+    fn row_block_frame(
+        reader: &BlockStream,
+        columnar: bool,
+    ) -> Option<(super::BlockHandle, crate::Slice)> {
+        if columnar {
+            return None;
+        }
+        let (offset, frame) = reader.block_frame();
+        let size = u32::try_from(frame.len()).ok()?;
+        Some((
+            super::BlockHandle::new(crate::table::block::BlockOffset(offset), size),
+            frame,
+        ))
+    }
+
+    /// Records every row group or data block this scan reads in `carry`'s
+    /// queue, with the rows it hands out for it. Only the scan of a table
+    /// whose groups or blocks can be carried takes one (see
+    /// `Table::carries_row_groups` and `Table::carries_data_blocks`): a table
+    /// read whole and as stored, since a restricted view drops rows of its
+    /// first block and an ingested table shifts their seqnos, so what it hands
+    /// out is not what the bytes hold.
     #[must_use]
     pub(crate) fn with_carry(mut self, mut carry: super::group_carry::GroupCarry) -> Self {
         debug_assert!(
-            self.columnar && self.lower_bound.is_none() && self.global_seqno == 0,
-            "only a table whose groups can be carried records them",
+            self.lower_bound.is_none() && self.global_seqno == 0,
+            "only a table whose groups or blocks can be carried records them",
         );
         let rows = self.iter.by_ref().collect();
-        carry.start(self.current_group, rows);
+        let (group, frame) = match self.frame.take() {
+            Some((block, frame)) => (Some(block), Some(frame)),
+            None => (self.current_group, None),
+        };
+        carry.start(group, frame, rows);
         self.carry = Some(carry);
         self
     }
 
-    /// [`Iterator::next`] of a scan that records its groups: each group's rows
-    /// are taken from the block at once, so the candidate holds them all
+    /// [`Iterator::next`] of a scan that records what it reads: each group's
+    /// or block's rows are taken at once, so the candidate holds them all
     /// before the first is handed out.
-    #[cfg(feature = "columnar")]
     fn next_carried(&mut self) -> Option<crate::Result<InternalValue>> {
         loop {
             if let Some(row) = self.carry.as_mut()?.next_row() {
@@ -370,8 +417,12 @@ impl Scanner {
                 Err(e) => return Some(Err(e)),
             };
             self.current_group = group;
+            let (group, frame) = match Self::row_block_frame(&self.reader, self.columnar) {
+                Some((block, frame)) => (Some(block), Some(frame)),
+                None => (group, None),
+            };
             if let Some(carry) = self.carry.as_mut() {
-                carry.start(group, rows);
+                carry.start(group, frame, rows);
             }
         }
     }
@@ -469,6 +520,7 @@ impl Scanner {
         ecc: Option<crate::table::block::EccParams>,
         #[cfg(zstd_any)] zstd_dict: Option<&crate::compression::ZstdDictionary>,
     ) -> crate::Result<Block> {
+        stream.begin_block();
         let at = crate::table::block::ChecksumAt::table(table_id, stream.position);
         let block = Block::from_reader_taking(
             stream,
@@ -684,7 +736,6 @@ impl Iterator for Scanner {
     type Item = crate::Result<InternalValue>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        #[cfg(feature = "columnar")]
         if self.carry.is_some() {
             return self.next_carried();
         }
@@ -710,7 +761,8 @@ impl Iterator for Scanner {
                 return None;
             }
 
-            // Init new block
+            // Init new block; a scan that carries nothing keeps no frame.
+            self.frame = None;
             self.current_group = self.groups.next();
             match self.read_group(self.current_group) {
                 Ok(iter) => self.iter = iter,

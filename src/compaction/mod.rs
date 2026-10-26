@@ -5,7 +5,6 @@
 //! Contains compaction strategies
 
 pub(crate) mod capacity;
-#[cfg(feature = "columnar")]
 pub(crate) mod carry;
 pub(crate) mod covered;
 pub(crate) mod fifo;

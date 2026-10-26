@@ -932,15 +932,15 @@ impl MultiWriter {
     }
 
     /// Records the blob references of `rows`, written into the current table
-    /// not one by one but as a copied row group, each under its own row's key,
-    /// as [`Self::register_blob`] and [`Self::register_cell_row`] record a
-    /// written row's under the current key.
+    /// not one by one but as a copied row group or data block, each under its
+    /// own row's key, as [`Self::register_blob`] and
+    /// [`Self::register_cell_row`] record a written row's under the current
+    /// key.
     ///
     /// # Errors
     ///
     /// Returns an error if a row tagged as an indirection or a cell row does
     /// not decode as one.
-    #[cfg(feature = "columnar")]
     pub(crate) fn register_carried_rows(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
         use crate::coding::Decode;
 
@@ -1360,7 +1360,6 @@ impl MultiWriter {
 
     /// The transform counter's value now; without a counter, the milestone
     /// as it stands, so settling it changes nothing.
-    #[cfg(feature = "columnar")]
     pub(crate) fn transforms_seen(&self) -> u64 {
         self.transform_marker
             .as_ref()
@@ -1374,7 +1373,6 @@ impl MultiWriter {
     /// place of the value read as it was written: a record written after the
     /// merge held it would otherwise take the verdicts ticked meanwhile,
     /// which belong to the next output (see `transforms_after_last_write`).
-    #[cfg(feature = "columnar")]
     pub(crate) fn settle_transforms(&mut self, seen: u64) {
         self.transforms_after_last_write = seen;
     }
@@ -2019,7 +2017,7 @@ impl MultiWriter {
         columns: Option<Vec<crate::table::zone_map::ColumnStats>>,
     ) -> crate::Result<bool> {
         self.carry_into(
-            (compression, layout),
+            (compression, Some(layout)),
             (rows, raw.len() as u64),
             |writer, comparator| {
                 writer.append_carried_row_group(
@@ -2030,6 +2028,35 @@ impl MultiWriter {
                     columns,
                     comparator,
                 )
+            },
+        )
+    }
+
+    /// Writes `frame`, a data block of another table copied whole, in place of
+    /// its `rows`, which the compaction would otherwise write one by one;
+    /// `source` names where it lay, `compression` is its table's data codec
+    /// and `shape` how that table wrote its blocks. The block's first key is
+    /// taken as [`Self::write`] takes a new key, rotating first when the table
+    /// is full.
+    ///
+    /// Returns `false` when the block cannot be copied here, having written
+    /// none of it (see [`Writer::append_carried_data_block`]); the caller then
+    /// writes `rows` through [`Self::write`].
+    ///
+    /// # Errors
+    ///
+    /// Any error of the rotation or of the copy.
+    pub(crate) fn carry_data_block(
+        &mut self,
+        (frame, source): (&[u8], super::writer::VerbatimSource),
+        (compression, shape): (CompressionType, super::writer::CarriedBlockShape),
+        rows: &[InternalValue],
+    ) -> crate::Result<bool> {
+        self.carry_into(
+            (compression, None),
+            (rows, frame.len() as u64),
+            |writer, comparator| {
+                writer.append_carried_data_block((frame, source), shape, rows, comparator)
             },
         )
     }
@@ -2054,7 +2081,7 @@ impl MultiWriter {
         compression: CompressionType,
     ) -> crate::Result<bool> {
         self.carry_into(
-            (compression, crate::table::meta::ValueLayout::Whole),
+            (compression, Some(crate::table::meta::ValueLayout::Whole)),
             (rows, partly_carried_bound(carry.raw.len(), rows)),
             |writer, comparator| writer.append_partly_carried_row_group(rows, carry, comparator),
         )
@@ -2068,7 +2095,6 @@ impl MultiWriter {
     /// again every table past it that the group reaches, several where runs
     /// overlap there; written key by key, the group's bytes are
     /// encoded again now. The cheaper of the two is taken.
-    #[cfg(feature = "columnar")]
     fn splits_cheaper_than_straddling(
         &self,
         load: Option<OutputLoad>,
@@ -2103,7 +2129,6 @@ impl MultiWriter {
     /// `rotates` before it: when the copy would take an aligned output past
     /// twice the target, where written rows would have ended it, or when
     /// splitting it costs less than straddling a boundary inside it.
-    #[cfg(feature = "columnar")]
     fn writes_group_by_rows(
         &self,
         load: Option<OutputLoad>,
@@ -2129,12 +2154,13 @@ impl MultiWriter {
     }
 
     /// Takes `rows`' first key as [`Self::write`] takes a new key and has
-    /// `write` put the group in the current table, when this run writes the
-    /// copied pages' transform; `false`, having written nothing, otherwise.
-    #[cfg(feature = "columnar")]
+    /// `write` put the copied group or block in the current table, when this
+    /// run writes the copy's transform; `false`, having written nothing,
+    /// otherwise. `layout` is a copied group's value layout, `None` for a
+    /// row-major block, which has none.
     fn carry_into(
         &mut self,
-        (compression, layout): (CompressionType, crate::table::meta::ValueLayout),
+        (compression, layout): (CompressionType, Option<crate::table::meta::ValueLayout>),
         (rows, bytes): (&[InternalValue], u64),
         write: impl FnOnce(&mut Writer, &crate::comparator::SharedComparator) -> crate::Result<bool>,
     ) -> crate::Result<bool> {
@@ -2197,7 +2223,8 @@ impl MultiWriter {
         }
         // A table records one value layout: a group stored the other way
         // starts the next table, a run of groups stored one way shares it.
-        let layout_changes = self.value_layout.is_some_and(|current| current != layout);
+        let layout_changes =
+            layout.is_some_and(|layout| self.value_layout.is_some_and(|current| current != layout));
         // The output is weighed once for the cut and for the copy's checks.
         let load = self.output_load();
         let (cut, crossing) = self.decide_cut_at(&first.key.user_key, load);
@@ -2246,7 +2273,9 @@ impl MultiWriter {
             alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
         }
         self.current_key = Some(last.key.user_key.clone());
-        self.value_layout = Some(layout);
+        if layout.is_some() {
+            self.value_layout = layout;
+        }
         self.note_output_base();
         if let Some(marker) = &self.transform_marker {
             self.transforms_after_last_write = marker.load(core::sync::atomic::Ordering::Relaxed);

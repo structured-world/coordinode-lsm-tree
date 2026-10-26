@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Row groups a compaction may carry into its output whole.
+//! Row groups and data blocks a compaction may carry into its output whole.
 //!
 //! A scanner reading a compaction input hands out every row as usual and, for
-//! each columnar row group it read, records a [`CarryCandidate`]: the group's
-//! index entry and the rows it handed out for it. The compaction's write side
-//! sees what the merge made of those rows; when the merge passed every row of
-//! the group through untouched and nothing else landed among them, the group's
-//! bytes on disk already are what the output would encode for them, and they
-//! are copied instead of being encoded and compressed again.
+//! each columnar row group or row-major data block it read, records a
+//! [`CarryCandidate`]: where it lies and the rows it handed out for it. The
+//! compaction's write side sees what the merge made of those rows; when the
+//! merge passed every row through untouched and nothing else landed among
+//! them, the bytes on disk already are what the output would encode for them,
+//! and they are copied instead of being encoded and compressed again.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -27,17 +27,28 @@ use super::{BlockHandle, Table};
 use crate::comparator::SharedComparator;
 use crate::{InternalValue, UserKey};
 
-/// A row group a scanner read, with the rows it handed out for it.
+/// What a candidate copies.
+pub enum CarryUnit {
+    /// A columnar row group: the tag and lengths its directory carries, as its
+    /// index entry names them. Its bytes are read when it is copied.
+    #[cfg(feature = "columnar")]
+    RowGroup(super::index_block::RowGroupRef),
+    /// A row-major data block: its frame, header and payload, as the scan read
+    /// it and verified its checksum, so the copy is of the bytes the rows were
+    /// decoded from.
+    DataBlock(crate::Slice),
+}
+
+/// A row group or data block a scanner read, with the rows it handed out for
+/// it.
 pub struct CarryCandidate {
-    /// The table the group was read from.
+    /// The table it was read from.
     pub(crate) table: Table,
-    /// The group's index entry: where it lies.
+    /// Where it lies: its index entry for a group, its extent for a block.
     pub(crate) group: BlockHandle,
-    /// The tag and lengths the group's directory carries, as its index entry
-    /// names them.
-    pub(crate) row_group: super::index_block::RowGroupRef,
-    /// The rows of the group, in the order the scanner handed them out; never
-    /// empty.
+    /// What it is.
+    pub(crate) unit: CarryUnit,
+    /// Its rows, in the order the scanner handed them out; never empty.
     pub(crate) rows: Arc<[InternalValue]>,
     /// The first and the last of `rows`' keys.
     keys: (UserKey, UserKey),
@@ -71,31 +82,55 @@ impl CarryCandidate {
 /// read them; shared by every input's scanner and the write side.
 pub type CarryQueue = Arc<Mutex<VecDeque<CarryCandidate>>>;
 
-/// Where the scanners of one compaction record the groups they read, and
-/// which tables' groups they record.
+/// How the output lays out its data, which a copy keeps.
+#[derive(Clone, Copy)]
+pub(crate) enum CarryShape {
+    /// Columnar row groups, cut and encoded as this says.
+    #[cfg(feature = "columnar")]
+    Groups(crate::table::meta::GroupShape),
+    /// Row-major data blocks with restart heads every `restart_interval`
+    /// entries: a table's locator names a key's restart head by that interval,
+    /// so a block copied in must have been written with it.
+    Blocks {
+        /// The output's data block restart interval.
+        restart_interval: u8,
+    },
+}
+
+/// Where the scanners of one compaction record the groups and blocks they
+/// read, and which tables' they record.
 #[derive(Clone)]
 pub struct CarryTarget {
-    /// Where the groups are recorded.
+    /// Where the candidates are recorded.
     pub(crate) queue: CarryQueue,
-    /// The data codec of the output: a copied group keeps its pages' codec,
-    /// so only a table written with this one has groups worth recording.
+    /// The data codec of the output: a copy keeps its codec and dictionary,
+    /// so only a table written with this one has data worth recording.
     pub(crate) codec: crate::CompressionType,
-    /// How the output cuts and encodes its row groups: a copied group keeps
-    /// the shape it was written with, so only a table that recorded this one
-    /// has groups worth recording.
-    pub(crate) shape: crate::table::meta::GroupShape,
+    /// How the output lays out its data: only a table laid out the same has
+    /// data worth recording.
+    pub(crate) shape: CarryShape,
 }
 
 impl CarryTarget {
-    /// Whether `table`'s groups may be recorded: ones that can be copied
-    /// (see [`Table::carries_row_groups`]), compressed as the output
-    /// compresses and cut and encoded as it writes them, so none is read
-    /// twice only to be refused and none lands in a table that would hold
-    /// it in another shape.
+    /// Whether `table`'s groups or blocks may be recorded: ones that can be
+    /// copied (see [`Table::carries_row_groups`] and
+    /// [`Table::carries_data_blocks`]), compressed as the output compresses
+    /// and laid out as it writes them, so none is held only to be refused
+    /// and none lands in a table that would read it otherwise.
     pub(crate) fn takes(&self, table: &Table) -> bool {
-        table.carries_row_groups()
-            && table.metadata.data_block_compression == self.codec
-            && table.metadata.group_shape == Some(self.shape)
+        if table.metadata.data_block_compression != self.codec {
+            return false;
+        }
+        match self.shape {
+            #[cfg(feature = "columnar")]
+            CarryShape::Groups(shape) => {
+                table.carries_row_groups() && table.metadata.group_shape == Some(shape)
+            }
+            CarryShape::Blocks { restart_interval } => {
+                table.carries_data_blocks()
+                    && table.metadata.data_block_restart_interval == restart_interval
+            }
+        }
     }
 
     /// A scanner's carry state for `table`, recording into this target.
@@ -164,8 +199,13 @@ impl GroupCarry {
         }
     }
 
-    /// Starts handing out `rows`, the rows of the group `group` names, and
-    /// records the group as a candidate.
+    /// Starts handing out `rows`, the rows of the group or block `group` names,
+    /// and records it as a candidate: a block when `frame` holds its bytes as
+    /// read, else a group when `group` names one.
+    ///
+    /// A block split into several inner frames is not recorded: their
+    /// boundaries come from the table's layout section, which no checksum of
+    /// the block covers, and a copy would carry them unchecked.
     ///
     /// The scan is asked for a new group once the merge has taken the last
     /// row of the one before, so every key below that row has gone through
@@ -177,7 +217,12 @@ impl GroupCarry {
     /// the merge may still be emitting, is written as rows instead. The queue
     /// then holds about one group per input, however long a run the merge
     /// drops and however many groups one key's versions fill.
-    pub(crate) fn start(&mut self, group: Option<BlockHandle>, mut rows: Vec<InternalValue>) {
+    pub(crate) fn start(
+        &mut self,
+        group: Option<BlockHandle>,
+        frame: Option<crate::Slice>,
+        mut rows: Vec<InternalValue>,
+    ) {
         let read = rows.len();
         if let Some(bounds) = &self.bounds {
             rows.retain(|row| bounds.contains(&row.key.user_key));
@@ -193,22 +238,28 @@ impl GroupCarry {
         }
         self.rows = Arc::from(rows);
         self.next = 0;
+        let unit = match (group, frame) {
+            (Some(group), Some(frame)) => (!self.table.has_inner_block_layout(group.offset().0))
+                .then_some(CarryUnit::DataBlock(frame)),
+            #[cfg(feature = "columnar")]
+            (Some(group), None) => group.row_group().map(CarryUnit::RowGroup),
+            _ => None,
+        };
         if whole
-            && let Some(group) = group
-            && let Some(row_group) = group.row_group()
+            && let (Some(group), Some(unit)) = (group, unit)
             && let (Some(first), Some(last)) = (self.rows.first(), self.rows.last())
         {
             let keys = (first.key.user_key.clone(), last.key.user_key.clone());
             queue.push_back(CarryCandidate {
                 table: self.table.clone(),
                 group,
-                row_group,
+                unit,
                 rows: Arc::clone(&self.rows),
                 keys,
                 bytes,
             });
         }
-        #[cfg(test)]
+        #[cfg(all(test, feature = "columnar"))]
         tests::note_queue_len(queue.len());
     }
 
@@ -229,14 +280,28 @@ impl Table {
     /// without changing their bytes. A destination keeping a zone map takes
     /// the copy's per-column statistics from this table's, and refuses a group
     /// it has none for.
+    #[cfg(feature = "columnar")]
     pub(crate) fn carries_row_groups(&self) -> bool {
-        self.metadata.columnar
-            && self.encryption.is_none()
+        self.metadata.columnar && self.carries_as_stored() && !self.has_delete_bitmap_section()
+    }
+
+    /// Whether this table's data blocks can be carried into another table as
+    /// they lie on disk: a row-major table whose blocks are self-contained
+    /// once re-stamped for a new place, for the reasons
+    /// [`Self::carries_row_groups`] gives.
+    pub(crate) fn carries_data_blocks(&self) -> bool {
+        !self.metadata.columnar && self.carries_as_stored()
+    }
+
+    /// Whether this table's rows read as its bytes say: neither encrypted nor
+    /// parity-protected, no restricted view, no ingested seqno base and no
+    /// positional delete mask.
+    fn carries_as_stored(&self) -> bool {
+        self.encryption.is_none()
             && self.metadata.ecc_params.is_none()
             && !self.metadata.ecc_unrecognized
             && self.restrict_lower_bound().is_none()
             && self.global_seqno() == 0
-            && !self.has_delete_bitmap_section()
             && self.delete_bitmap.is_empty()
     }
 
@@ -323,6 +388,7 @@ impl Table {
     /// # Errors
     ///
     /// Any I/O error reading them.
+    #[cfg(feature = "columnar")]
     pub(crate) fn read_row_group_raw(
         &self,
         group: &BlockHandle,
@@ -342,5 +408,5 @@ impl Table {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "columnar"))]
 mod tests;

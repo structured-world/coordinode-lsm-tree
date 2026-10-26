@@ -952,6 +952,16 @@ pub(crate) struct VerbatimSource {
     pub offset: u64,
 }
 
+/// How the table a carried data block comes from wrote its blocks, as its
+/// metadata records it: what a table taking the block must share.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CarriedBlockShape {
+    /// The data block restart interval.
+    pub restart_interval: u8,
+    /// The per-KV checksum footer's algorithm, `None` without one.
+    pub kv_checksum: Option<crate::runtime_config::ChecksumAlgorithm>,
+}
+
 /// The pages of another table's row group that a group written here copies:
 /// the group keeps the source's tag and its row pages one for one, and on the
 /// row pages named copied takes the source's pages as they lie.
@@ -4322,6 +4332,68 @@ impl Writer {
             comparator,
         )?;
         self.value_layout = Some(layout);
+        Ok(true)
+    }
+
+    /// Appends `frame`, a data block of another table copied whole, whose rows
+    /// are `rows`, read from `source`, a table written with `shape`.
+    ///
+    /// Returns `false`, writing nothing, when this table cannot take the block
+    /// as it is: a columnar table; one with a prebuilt filter; one whose
+    /// restart interval differs, since the locator names a key's restart head
+    /// by the table's interval; one whose per-KV footer differs, since a
+    /// table's reader strips the footer by its own descriptor; a frame that is
+    /// no data block; or rows that do not continue the table in internal-key
+    /// order. The caller then writes the rows instead.
+    ///
+    /// The block's transform must be this writer's: compressed with this
+    /// writer's codec and dictionary, and neither encrypted nor ECC-protected,
+    /// which a caller establishes before offering it. A block split into
+    /// several inner frames is not offered.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_verbatim_data_block`].
+    pub(crate) fn append_carried_data_block(
+        &mut self,
+        (frame, source): (&[u8], VerbatimSource),
+        shape: CarriedBlockShape,
+        rows: &[InternalValue],
+        comparator: &crate::SharedComparator,
+    ) -> crate::Result<bool> {
+        let footer = self.kv_checksum.and_then(|(policy, algo)| {
+            policy
+                .applies(self.initial_level, self.table_id)
+                .then_some(algo)
+        });
+        if self.use_columnar
+            || self.prebuilt_filter.is_some()
+            || self.data_block_restart_interval != shape.restart_interval
+            || footer != shape.kv_checksum
+        {
+            return Ok(false);
+        }
+        let Ok(header) = carried_header(frame) else {
+            return Ok(false);
+        };
+        if header.block_type != crate::table::block::BlockType::Data
+            || header.on_disk_size_with(self.ecc) as usize != frame.len()
+        {
+            return Ok(false);
+        }
+        // Two inputs may hold one key at one seqno, and the merge emits both;
+        // rows written one by one keep such a tie as the merge emitted it.
+        if self.validate_direct_block_order(rows, comparator).is_err() {
+            return Ok(false);
+        }
+        self.append_verbatim_data_block(
+            (frame, source),
+            header,
+            Vec::new(),
+            rows,
+            None,
+            comparator,
+        )?;
         Ok(true)
     }
 

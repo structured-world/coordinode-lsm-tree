@@ -1,43 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-//! Copies a compaction input's row groups into the output whole where the
-//! merge left them as they were.
+//! Copies a compaction input's row groups or data blocks into the output
+//! whole where the merge left them as they were.
 //!
 //! The merge decides every row as it always does; this only watches what it
-//! emits. A group's rows that come out exactly as its scanner read them, all
-//! of them, with no other row among them and none of their keys continued on
-//! either side, are what the output would encode for that key range, so the
-//! group's bytes on disk are written in their place. Whether a group may be
+//! emits. A group's or block's rows that come out exactly as its scanner read
+//! them, all of them, with no other row among them and none of their keys
+//! continued on either side, are what the output would encode for that key
+//! range, so its bytes on disk are written in their place. Whether it may be
 //! carried is therefore proved by the merge's own output rather than
 //! predicted from metadata: a row the merge drops, rewrites, re-seqnos or
-//! interleaves sends the group's rows down the ordinary path.
+//! interleaves sends its rows down the ordinary path.
 
-use crate::table::group_carry::{CarryCandidate, CarryQueue, CarryTarget};
+use crate::table::group_carry::{CarryCandidate, CarryQueue, CarryShape, CarryTarget};
 use crate::{InternalValue, UserKey};
 
 /// Where the inputs of a compaction into the level whose policies are those
 /// of canonical level `dest_canonical`, writing under `rc`, record their row
-/// groups; `None` when none of `inputs` could be carried. The output must be
-/// columnar and neither encrypted nor ECC-protected, since a copied group's
-/// blocks keep the plain transform of the tables that may be carried.
+/// groups, when the output is columnar, or their data blocks, when it is
+/// row-major; `None` when none of `inputs` could be carried. The output must
+/// be neither encrypted nor ECC-protected, since a copy keeps the plain
+/// transform of the tables that may be carried.
 pub fn plan(
     config: &crate::Config,
     rc: &crate::runtime_config::RuntimeConfig,
     dest_canonical: usize,
     inputs: &[crate::Table],
 ) -> Option<CarryTarget> {
-    let target = CarryTarget {
-        queue: CarryQueue::default(),
-        codec: rc.data_block_compression_policy.get(dest_canonical),
-        shape: crate::table::meta::GroupShape {
+    #[cfg(feature = "columnar")]
+    let shape = if rc.columnar {
+        CarryShape::Groups(crate::table::meta::GroupShape {
             encoding: config.column_encoding_policy.get(dest_canonical),
             row_group_size: config.columnar_row_group_size_policy.get(dest_canonical),
             page_size: config.columnar_page_size_policy.get(dest_canonical),
-        },
+        })
+    } else {
+        CarryShape::Blocks {
+            restart_interval: config
+                .data_block_restart_interval_policy
+                .get(dest_canonical),
+        }
     };
-    (rc.columnar
-        && config.encryption.is_none()
+    #[cfg(not(feature = "columnar"))]
+    let shape = CarryShape::Blocks {
+        restart_interval: config
+            .data_block_restart_interval_policy
+            .get(dest_canonical),
+    };
+    let target = CarryTarget {
+        queue: CarryQueue::default(),
+        codec: rc.data_block_compression_policy.get(dest_canonical),
+        shape,
+    };
+    (config.encryption.is_none()
         && !config.page_ecc
         && inputs.iter().any(|table| target.takes(table)))
     .then_some(target)
@@ -79,12 +95,25 @@ pub trait CarrySink {
 pub struct Carried {
     /// Row groups copied whole.
     pub(crate) groups: u64,
-    /// Rows those groups hold.
+    /// Data blocks copied whole.
+    pub(crate) blocks: u64,
+    /// Rows those groups and blocks hold.
     pub(crate) rows: u64,
     /// Groups rebuilt around some of their pages, copied.
     pub(crate) partial_groups: u64,
-    /// The bytes on disk copied, whole groups and pages together.
+    /// The bytes on disk copied, whole groups, blocks and pages together.
     pub(crate) bytes: u64,
+}
+
+impl core::ops::AddAssign for Carried {
+    fn add_assign(&mut self, other: Self) {
+        // Each count is bounded by what one compaction's outputs hold.
+        self.groups += other.groups;
+        self.blocks += other.blocks;
+        self.rows += other.rows;
+        self.partial_groups += other.partial_groups;
+        self.bytes += other.bytes;
+    }
 }
 
 /// A candidate whose key range the merge is emitting, and what it emitted:
@@ -117,7 +146,7 @@ impl Open {
         self.held_bytes += crate::table::group_carry::row_bytes(&row);
         self.emitted.push(row);
         self.seen.push(self.last_seen);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "columnar"))]
         tests::note_held(&self.emitted);
     }
 
@@ -224,7 +253,11 @@ impl CarryMatcher {
                 .all(|(row, read)| same_row(read, row));
         if unchanged {
             if sink.carry(candidate)? {
-                self.carried.groups += 1;
+                match candidate.unit {
+                    #[cfg(feature = "columnar")]
+                    crate::table::group_carry::CarryUnit::RowGroup(_) => self.carried.groups += 1,
+                    crate::table::group_carry::CarryUnit::DataBlock(_) => self.carried.blocks += 1,
+                }
                 self.carried.rows += candidate.rows.len() as u64;
                 self.carried.bytes += u64::from(candidate.group.size());
                 sink.settle_transforms(open.last_seen);
@@ -280,6 +313,7 @@ impl CarryMatcher {
 /// the rows between two kept ones, or after the last, are spread over the row
 /// pages between them, so every row page keeps its ordinal, which a copied
 /// page's stamp names.
+#[cfg(feature = "columnar")]
 pub fn align_row_pages(
     source: &[InternalValue],
     source_pages: &[u32],
@@ -350,6 +384,7 @@ pub fn align_row_pages(
 /// `copied`, holds a single row or rows of at most `limit` bytes: a page past
 /// it is one the writer would have split, and a group rebuilt with it could
 /// grow a page past what one block may hold.
+#[cfg(feature = "columnar")]
 pub fn changed_pages_fit(
     emitted: &[InternalValue],
     (row_pages, copied): (&[u32], &[bool]),
@@ -375,9 +410,12 @@ pub fn changed_pages_fit(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "columnar"))]
 #[expect(clippy::indexing_slicing, reason = "test code")]
 mod tests;
+
+#[cfg(all(test, feature = "metrics"))]
+mod block_tests;
 
 /// Whether some row of `source` came out in `emitted` exactly as it was read.
 /// A copied page needs its rows so, and both lists are in the merge's order,

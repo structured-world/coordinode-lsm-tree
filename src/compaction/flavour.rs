@@ -633,10 +633,9 @@ pub(super) struct ProducedOutput {
     /// On-disk blob bytes this output's relocation copied into new blob
     /// files, charged to the tree's metrics once the output is installed.
     relocated_bytes: u64,
-    /// Row groups this output copied whole, groups it rebuilt around copied
-    /// pages, and the on-disk bytes copied, charged to the tree's metrics
-    /// once the output is installed.
-    carried: (u64, u64, u64),
+    /// What this output copied instead of encoding, charged to the tree's
+    /// metrics once the output is installed.
+    carried: super::carry::Carried,
     /// The bytes a relocated segment's file copied from its source as they
     /// lay.
     segment_copied: u64,
@@ -710,15 +709,13 @@ impl ProducedOutput {
 
     /// Records what the run copied instead of encoding (called by the
     /// producer, which owns the carry matcher).
-    #[cfg(feature = "columnar")]
     pub(super) fn set_carried(&mut self, carried: super::carry::Carried) {
-        self.carried = (carried.groups, carried.partial_groups, carried.bytes);
+        self.carried = carried;
     }
 
-    /// What the run copied instead of encoding, as groups, partly copied
-    /// groups and bytes, for the tight-space loop, which installs its slices
-    /// itself.
-    pub(super) fn carried(&self) -> (u64, u64, u64) {
+    /// What the run copied instead of encoding, for the tight-space loop,
+    /// which installs its slices itself.
+    pub(super) fn carried(&self) -> super::carry::Carried {
         self.carried
     }
 
@@ -739,7 +736,7 @@ impl ProducedOutput {
         }
         Ok(super::work::Installed {
             written: tables + blob_files,
-            carried: self.carried.2 + self.segment_copied + self.relocated_bytes,
+            carried: self.carried.bytes + self.segment_copied + self.relocated_bytes,
             read: self.frames_read,
         })
     }
@@ -772,7 +769,7 @@ impl ProducedOutput {
             filter_sizing: None,
             released_objects: Vec::new(),
             relocated_bytes: 0,
-            carried: (0, 0, 0),
+            carried: super::carry::Carried::default(),
             segment_copied: copied,
             frames_read: 0,
         }
@@ -786,7 +783,6 @@ pub(super) trait CompactionFlavour {
     /// This compaction as the one that copies row groups into its output,
     /// `None` for a flavour that writes its rows another way: a carry plan is
     /// made only for a compaction that writes every row itself (see `carry`).
-    #[cfg(feature = "columnar")]
     fn carrying(&mut self) -> Option<&mut StandardCompaction>;
 
     /// Writes range tombstones to the output tables, keeping the pieces of
@@ -808,14 +804,14 @@ pub(super) trait CompactionFlavour {
 }
 
 /// Charges the counters an installed output moves: the blob bytes its
-/// relocation copied, and the groups, partly copied groups and bytes it
-/// copied instead of encoding. Every path that installs an output calls it
+/// relocation copied, and the groups, partly copied groups, blocks and bytes
+/// it copied instead of encoding. Every path that installs an output calls it
 /// once the version edit is published.
 #[cfg(feature = "metrics")]
 pub(super) fn charge_installed(
     metrics: &crate::metrics::Metrics,
     relocated_bytes: u64,
-    carried: (u64, u64, u64),
+    carried: super::carry::Carried,
 ) {
     use core::sync::atomic::Ordering::Relaxed;
     metrics
@@ -823,13 +819,16 @@ pub(super) fn charge_installed(
         .fetch_add(relocated_bytes, Relaxed);
     metrics
         .compaction_groups_carried
-        .fetch_add(carried.0, Relaxed);
+        .fetch_add(carried.groups, Relaxed);
     metrics
         .compaction_groups_partly_carried
-        .fetch_add(carried.1, Relaxed);
+        .fetch_add(carried.partial_groups, Relaxed);
+    metrics
+        .compaction_blocks_carried
+        .fetch_add(carried.blocks, Relaxed);
     metrics
         .compaction_bytes_carried
-        .fetch_add(carried.2, Relaxed);
+        .fetch_add(carried.bytes, Relaxed);
 }
 
 /// Installs one atomic version edit replacing `payload.table_ids` with the SSTs
@@ -866,7 +865,7 @@ pub(super) fn install_merge(
     let mut filter_sizings = Vec::new();
 
     let mut released_objects = Vec::new();
-    let mut carried = (0u64, 0u64, 0u64);
+    let mut carried = super::carry::Carried::default();
     let mut work = super::work::Installed::default();
     let mut installed_files = crate::tree::InstalledCharge::default();
     for out in outputs {
@@ -882,11 +881,7 @@ pub(super) fn install_merge(
         work.read += installed.read;
         released_objects.extend(out.released_objects);
         relocated_bytes += out.relocated_bytes;
-        carried = (
-            carried.0 + out.carried.0,
-            carried.1 + out.carried.1,
-            carried.2 + out.carried.2,
-        );
+        carried += out.carried;
         filter_sizings.extend(out.filter_sizing);
         created_tables.extend(out.created_tables);
         created_blob_files.extend(out.created_blob_files);
@@ -1485,7 +1480,6 @@ impl CompactionFlavour for RelocatingCompaction {
 
     /// A relocating compaction moves the blob values its rows point at, so it
     /// writes every row and copies no group.
-    #[cfg(feature = "columnar")]
     fn carrying(&mut self) -> Option<&mut StandardCompaction> {
         None
     }
@@ -1683,8 +1677,8 @@ impl CompactionFlavour for RelocatingCompaction {
             // The producer owns the ownership ledger and sets this after.
             released_objects: Vec::new(),
             relocated_bytes: self.relocated_bytes,
-            // A relocating run writes its rows; it copies no group.
-            carried: (0, 0, 0),
+            // A relocating run writes its rows; it copies no group or block.
+            carried: super::carry::Carried::default(),
             segment_copied: 0,
             frames_read: self.frames_read,
         })
@@ -1710,7 +1704,6 @@ impl StandardCompaction {
     /// Records the blob objects `rows`, written into the output not one by
     /// one, reference, each under its own row's key, as
     /// [`CompactionFlavour::write`] records a written row's.
-    #[cfg(feature = "columnar")]
     fn register_references(&mut self, rows: &[InternalValue]) -> crate::Result<()> {
         self.table_writer.register_carried_rows(rows)
     }
@@ -1764,9 +1757,9 @@ impl StandardCompaction {
     }
 }
 
-/// The row group copies of a compaction that writes every row of its output
-/// itself: the only flavour a carry plan is made for (see `carry`).
-#[cfg(feature = "columnar")]
+/// The row group and data block copies of a compaction that writes every row
+/// of its output itself: the only flavour a carry plan is made for (see
+/// `carry`).
 impl StandardCompaction {
     /// The count of the compaction filter's transformations so far (see
     /// [`crate::compaction::carry::CarrySink`]).
@@ -1780,17 +1773,64 @@ impl StandardCompaction {
         self.table_writer.settle_transforms(seen);
     }
 
-    /// Copies `candidate`'s row group into the output in place of its rows,
-    /// returning `false`, having written nothing, when this output cannot
-    /// take it as it is; the caller then writes the rows. `pace` is told how
-    /// long reading the group takes.
+    /// Copies `candidate`'s row group or data block into the output in place
+    /// of its rows, returning `false`, having written nothing, when this output
+    /// cannot take it as it is; the caller then writes the rows. `pace` is
+    /// told how long reading a group takes; a block's bytes are already read.
     pub(super) fn carry(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<bool> {
+        use crate::table::group_carry::CarryUnit;
+
+        match &candidate.unit {
+            #[cfg(feature = "columnar")]
+            CarryUnit::RowGroup(group) => self.carry_group(candidate, *group, pace),
+            CarryUnit::DataBlock(frame) => {
+                let _ = pace;
+                self.carry_block(candidate, frame)
+            }
+        }
+    }
+
+    /// Copies `candidate`'s data block, whose bytes are `frame`, into the
+    /// output in place of its rows (see [`Self::carry`]).
+    fn carry_block(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        frame: &[u8],
+    ) -> crate::Result<bool> {
         let table = &candidate.table;
-        let group = candidate.row_group;
+        let source = crate::table::writer::VerbatimSource {
+            table_id: table.id(),
+            offset: candidate.group.offset().0,
+        };
+        let shape = crate::table::writer::CarriedBlockShape {
+            restart_interval: table.metadata.data_block_restart_interval,
+            kv_checksum: table.metadata.kv_checksum_algo,
+        };
+        if !self.table_writer.carry_data_block(
+            (frame, source),
+            (table.metadata.data_block_compression, shape),
+            &candidate.rows,
+        )? {
+            return Ok(false);
+        }
+        self.register_references(&candidate.rows)?;
+        Ok(true)
+    }
+
+    /// Copies `candidate`'s row group, named in its index entry as `group`,
+    /// into the output in place of its rows (see [`Self::carry`]).
+    #[cfg(feature = "columnar")]
+    fn carry_group(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        group: crate::table::index_block::RowGroupRef,
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<bool> {
+        let table = &candidate.table;
         let columns = table
             .zone_map
             .columns_for(candidate.group.offset().0)
@@ -1829,10 +1869,29 @@ impl StandardCompaction {
     /// they were, returning the bytes copied; `None`, having written nothing,
     /// when this output cannot. The caller then writes the rows. The matcher
     /// asks only once a row of the group came out as read, so the group is
-    /// not read for a merge that changed every row.
+    /// not read for a merge that changed every row. A data block has no pages
+    /// to copy apart: `None`.
     pub(super) fn carry_pages(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
+        emitted: &[InternalValue],
+        pace: Option<&dyn crate::table::util::ReadPacer>,
+    ) -> crate::Result<Option<u64>> {
+        #[cfg(feature = "columnar")]
+        if let crate::table::group_carry::CarryUnit::RowGroup(group) = candidate.unit {
+            return self.carry_group_pages(candidate, group, emitted, pace);
+        }
+        let _ = (candidate, emitted, pace);
+        Ok(None)
+    }
+
+    /// [`Self::carry_pages`] of a row group named in its index entry as
+    /// `group`.
+    #[cfg(feature = "columnar")]
+    fn carry_group_pages(
+        &mut self,
+        candidate: &crate::table::group_carry::CarryCandidate,
+        group: crate::table::index_block::RowGroupRef,
         emitted: &[InternalValue],
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<Option<u64>> {
@@ -1842,7 +1901,6 @@ impl StandardCompaction {
         let table = &candidate.table;
         // Pages of values stored whole only: a group of cells has the columns
         // its rows' fields make, which a rebuilt group need not repeat.
-        let group = candidate.row_group;
         if table.metadata.value_layout != crate::table::meta::ValueLayout::Whole {
             return Ok(None);
         }
@@ -1957,7 +2015,6 @@ impl CompactionFlavour for StandardCompaction {
         Ok(())
     }
 
-    #[cfg(feature = "columnar")]
     fn carrying(&mut self) -> Option<&mut StandardCompaction> {
         Some(self)
     }
@@ -1994,7 +2051,7 @@ impl CompactionFlavour for StandardCompaction {
             released_objects: Vec::new(),
             relocated_bytes: 0,
             // The producer owns the carry matcher and sets this after.
-            carried: (0, 0, 0),
+            carried: super::carry::Carried::default(),
             segment_copied: 0,
             frames_read: 0,
         })
