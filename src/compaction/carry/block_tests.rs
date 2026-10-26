@@ -308,6 +308,68 @@ fn garbage_collecting_merge_reads_back() -> crate::Result<()> {
     Ok(())
 }
 
+/// Blocks past a long run the merge changes are still copied: a scanner whose
+/// blocks keep failing to come out whole stops recording them for a while,
+/// and finds out once the run ends that they come out whole again, losing at
+/// most its longest skip of them.
+#[test]
+fn blocks_past_a_rewritten_run_are_copied_again() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = tree(folder.path(), |c| c)?;
+    write_base(&tree)?;
+    let blocks = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| table.metadata.data_block_count)
+        .sum::<u64>();
+    // The first 30% of the keys rewritten: their blocks interleave with the
+    // new versions and are written as rows.
+    for i in 0..KEYS * 3 / 10 {
+        tree.insert(key(i), value(i, 1), 2);
+    }
+    tree.flush_active_memtable(0)?;
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    let untouched = blocks * 7 / 10;
+    let carried = tree.metrics().compaction_blocks_carried();
+    assert!(
+        carried + 64 + 2 >= untouched,
+        "{carried} of about {untouched} untouched blocks copied"
+    );
+    assert_contents(&tree, KEYS * 3 / 10)
+}
+
+/// A merge split into ranges whose every block is rewritten hands out each
+/// range's rows only, whether its scanners record their blocks or, having
+/// given up on them, hand them out as read.
+#[test]
+fn subcompaction_of_rewritten_keys_hands_out_each_range_once() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = tree(folder.path(), |c| {
+        c.compaction_threads(4).subcompaction_min_bytes(0)
+    })?;
+    write_base(&tree)?;
+    tree.major_compact(8 * 1024, 0)?;
+    assert!(tree.current_version().iter_tables().count() > 2);
+    for i in 0..KEYS {
+        tree.insert(key(i), value(i, 1), 2);
+    }
+    tree.flush_active_memtable(0)?;
+
+    tree.major_compact(8 * 1024, 0)?;
+
+    assert_contents(&tree, KEYS)?;
+    // Both versions of every key kept, each once.
+    let stored = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| table.metadata.item_count)
+        .sum::<u64>();
+    assert_eq!(stored, 2 * KEYS);
+    Ok(())
+}
+
 /// A merge split into ranges run in parallel copies blocks in each.
 #[test]
 fn subcompaction_merge_copies_blocks() -> crate::Result<()> {

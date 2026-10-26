@@ -59,6 +59,72 @@ pub struct CarryCandidate {
     keys: (UserKey, UserKey),
     /// The bytes of `rows`' keys and values.
     bytes: u64,
+    /// Tells the scanner that recorded it whether it was copied, once it is
+    /// settled one way or the other.
+    outcome: Outcome,
+}
+
+/// How the recent candidates of one scanner fared, which decides whether it
+/// records the next: holding a group's rows and comparing them costs every
+/// row a little, which an input whose groups keep failing to come out whole,
+/// as one whose every key the merge rewrites, pays for nothing. After
+/// [`Self::PATIENCE`] misses in a row the scanner hands out groups unrecorded,
+/// one, then two, doubling up to [`Self::LONGEST_SKIP`], and records one
+/// between to see whether that still holds; a group copied ends the skipping.
+#[derive(Default)]
+pub struct CarryOdds {
+    misses: core::sync::atomic::AtomicU32,
+    skip: core::sync::atomic::AtomicU32,
+}
+
+impl CarryOdds {
+    /// The misses in a row before groups go unrecorded.
+    const PATIENCE: u32 = 4;
+    /// The most groups handed out unrecorded between two recorded.
+    const LONGEST_SKIP: u32 = 64;
+
+    fn settle(&self, carried: bool) {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        if carried {
+            self.misses.store(0, Relaxed);
+            self.skip.store(0, Relaxed);
+            return;
+        }
+        // Bounded by the groups of one table.
+        let misses = self.misses.load(Relaxed) + 1;
+        self.misses.store(misses, Relaxed);
+        if let Some(past) = misses.checked_sub(Self::PATIENCE) {
+            let skip = 1u32.checked_shl(past).unwrap_or(u32::MAX);
+            self.skip.store(skip.min(Self::LONGEST_SKIP), Relaxed);
+        }
+    }
+
+    /// Whether the next group goes unrecorded, counting it off if so.
+    fn skips(&self) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        let skip = self.skip.load(Relaxed);
+        if skip == 0 {
+            return false;
+        }
+        self.skip.store(skip - 1, Relaxed);
+        true
+    }
+}
+
+/// Reports a candidate's fate to its scanner's [`CarryOdds`] when dropped:
+/// missed, unless it was marked copied first. A candidate the merge passed
+/// without reaching it, or whose rows it changed, is a miss.
+struct Outcome {
+    odds: Arc<CarryOdds>,
+    carried: bool,
+}
+
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        self.odds.settle(self.carried);
+    }
 }
 
 /// The bytes of `row`'s key and value, as a carry counts what it holds.
@@ -85,6 +151,11 @@ impl CarryCandidate {
     /// Whether this is a data block, which is copied whole or not at all.
     pub(crate) fn is_block(&self) -> bool {
         matches!(self.unit, CarryUnit::DataBlock(_))
+    }
+
+    /// Marks it copied, whole or in part, for its scanner's odds.
+    pub(crate) fn mark_carried(&mut self) {
+        self.outcome.carried = true;
     }
 }
 
@@ -223,6 +294,8 @@ pub struct GroupCarry {
     /// The buffer of the group before, filled again once no candidate holds it.
     spare: Arc<Vec<InternalValue>>,
     next: usize,
+    /// How this scanner's candidates fared.
+    odds: Arc<CarryOdds>,
 }
 
 impl GroupCarry {
@@ -235,7 +308,22 @@ impl GroupCarry {
             rows: Arc::new(Vec::new()),
             spare: Arc::new(Vec::new()),
             next: 0,
+            odds: Arc::default(),
         }
+    }
+
+    /// Whether the next group goes unrecorded, its rows handed out as read
+    /// (see [`CarryOdds`]).
+    pub(crate) fn skips_next(&self) -> bool {
+        self.odds.skips()
+    }
+
+    /// Whether `row` of a group handed out unrecorded is handed out at all:
+    /// it lies within the scan's range.
+    pub(crate) fn hands_out(&self, row: &InternalValue) -> bool {
+        self.bounds
+            .as_ref()
+            .is_none_or(|bounds| bounds.contains(&row.key.user_key))
     }
 
     /// Carry state for a scanner of `table` handing out the rows within
@@ -320,6 +408,10 @@ impl GroupCarry {
                     rows: Arc::clone(&self.rows),
                     keys,
                     bytes,
+                    outcome: Outcome {
+                        odds: Arc::clone(&self.odds),
+                        carried: false,
+                    },
                 },
             );
         }

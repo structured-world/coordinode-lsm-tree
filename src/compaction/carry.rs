@@ -334,7 +334,7 @@ impl CarryMatcher {
     /// Writes what the merge emitted over `open`'s key range: the group as it
     /// lies when that is exactly its rows, else a group copying the pages of
     /// the row pages it left as they were, else the rows.
-    fn resolve(&mut self, open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
+    fn resolve(&mut self, mut open: Open, sink: &mut dyn CarrySink) -> crate::Result<()> {
         let candidate = &open.candidate;
         let emitted = &open.emitted;
         self.last_key = open.last_held_key().cloned();
@@ -358,6 +358,7 @@ impl CarryMatcher {
                 self.carried.rows += candidate.rows.len() as u64;
                 self.carried.bytes += u64::from(candidate.group.size());
                 sink.settle_transforms(open.last_seen);
+                open.candidate.mark_carried();
                 return Ok(());
             }
         } else if !candidate.is_block()
@@ -367,6 +368,7 @@ impl CarryMatcher {
             self.carried.partial_groups += 1;
             self.carried.bytes += bytes;
             sink.settle_transforms(open.last_seen);
+            open.candidate.mark_carried();
             return Ok(());
         }
         Self::write_rows(open, sink)

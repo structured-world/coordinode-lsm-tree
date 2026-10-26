@@ -41,8 +41,10 @@ struct BlockStream {
     /// The bytes read from the file: those from `at` on are not handed out yet.
     chunk: crate::Slice,
     at: usize,
-    /// Where in `chunk` the block being read starts.
-    mark: usize,
+    /// Where in `chunk` the block being read starts, once
+    /// [`Self::begin_block`] marked one: a chunk read meanwhile keeps its
+    /// bytes, so its frame lies in one chunk.
+    mark: Option<usize>,
     /// The file offset the block being read starts at.
     mark_position: u64,
     /// The bytes of the file not read into a chunk yet.
@@ -60,7 +62,7 @@ impl BlockStream {
             file,
             chunk: crate::Slice::empty(),
             at: 0,
-            mark: 0,
+            mark: None,
             mark_position: start,
             // A start past the end leaves nothing to read: the first block
             // read then fails as a truncated file.
@@ -77,22 +79,25 @@ impl BlockStream {
 
     /// Marks the start of the next block.
     fn begin_block(&mut self) {
-        self.mark = self.at;
+        self.mark = Some(self.at);
         self.mark_position = self.position;
     }
 
-    /// The block read since [`Self::begin_block`]: the file offset it starts
-    /// at and its frame, as a view of the chunk holding it.
-    fn block_frame(&self) -> (u64, crate::Slice) {
-        (self.mark_position, self.chunk.slice(self.mark..self.at))
+    /// The block read since [`Self::begin_block`], which it ends: the file
+    /// offset it starts at and its frame, as a view of the chunk holding it.
+    /// `None` when no block was marked.
+    fn block_frame(&mut self) -> Option<(u64, crate::Slice)> {
+        let mark = self.mark.take()?;
+        Some((self.mark_position, self.chunk.slice(mark..self.at)))
     }
 
     /// Reads the next chunk, at least `need` bytes past what the block being
     /// read has taken, with that block's bytes and those not handed out yet at
     /// its front. One shorter than `need` is a truncated file.
     fn refill(&mut self, need: usize) -> IoResult<()> {
-        let kept = self.chunk.get(self.mark..).unwrap_or_default();
-        let taken = self.at - self.mark;
+        let mark = self.mark.unwrap_or(self.at);
+        let kept = self.chunk.get(mark..).unwrap_or_default();
+        let taken = self.at - mark;
         let pending_len = kept.len() - taken;
         // Bounded by the file's length, a u64.
         let left = self.unread + pending_len as u64;
@@ -110,7 +115,7 @@ impl BlockStream {
         )?;
         self.unread = self.unread.saturating_sub(read as u64);
         self.chunk = chunk;
-        self.mark = 0;
+        self.mark = self.mark.map(|_| 0);
         self.at = taken;
         Ok(())
     }
@@ -256,6 +261,9 @@ pub struct Scanner {
     /// Hands out each group's or block's rows from its own list and records it
     /// as a candidate for a whole copy, when a compaction asked for it.
     carry: Option<super::group_carry::GroupCarry>,
+    /// Whether the rows of the current group come from `iter` as read: one
+    /// the carry did not record.
+    passing: bool,
 }
 
 impl Scanner {
@@ -325,7 +333,7 @@ impl Scanner {
             #[cfg(zstd_any)]
             zstd_dictionary.as_deref(),
         )?;
-        let frame = Self::row_block_frame(&reader, columnar);
+        let frame = Self::row_block_frame(&mut reader, columnar);
         let cmp = comparator.clone();
         let iter = OwnedDataBlockIter::try_new(block, |b| b.try_iter(cmp))?;
 
@@ -357,19 +365,20 @@ impl Scanner {
             current_group,
             frame,
             carry: None,
+            passing: false,
         })
     }
 
     /// The extent and frame of the block just read, when the table is
     /// row-major: one view of the chunk the stream read it from.
     fn row_block_frame(
-        reader: &BlockStream,
+        reader: &mut BlockStream,
         columnar: bool,
     ) -> Option<(super::BlockHandle, crate::Slice)> {
+        let (offset, frame) = reader.block_frame()?;
         if columnar {
             return None;
         }
-        let (offset, frame) = reader.block_frame();
         let size = u32::try_from(frame.len()).ok()?;
         Some((
             super::BlockHandle::new(crate::table::block::BlockOffset(offset), size),
@@ -404,8 +413,16 @@ impl Scanner {
     /// before the first is handed out.
     fn next_carried(&mut self) -> Option<crate::Result<InternalValue>> {
         loop {
-            if let Some(row) = self.carry.as_mut()?.next_row() {
+            let carry = self.carry.as_mut()?;
+            if let Some(row) = carry.next_row() {
                 return Some(Ok(row));
+            }
+            // A group handed out unrecorded comes straight from its block.
+            if self.passing {
+                if let Some(row) = self.iter.by_ref().find(|row| carry.hands_out(row)) {
+                    return Some(Ok(row));
+                }
+                self.passing = false;
             }
             if self.read_count >= self.block_count {
                 return None;
@@ -416,12 +433,17 @@ impl Scanner {
                 Err(e) => return Some(Err(e)),
             };
             self.current_group = group;
-            let (group, frame) = match Self::row_block_frame(&self.reader, self.columnar) {
+            let (group, frame) = match Self::row_block_frame(&mut self.reader, self.columnar) {
                 Some((block, frame)) => (Some(block), Some(frame)),
                 None => (group, None),
             };
             if let Some(carry) = self.carry.as_mut() {
-                carry.start(group, frame, rows);
+                if carry.skips_next() {
+                    self.iter = rows;
+                    self.passing = true;
+                } else {
+                    carry.start(group, frame, rows);
+                }
             }
         }
     }
