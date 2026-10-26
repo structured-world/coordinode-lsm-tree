@@ -497,6 +497,12 @@ path = "benches/compaction.rs"
 required-features = ["zstd"]
 
 [[bench]]
+name = "row_block_carry"
+harness = false
+path = "benches/row_block_carry.rs"
+required-features = ["lz4", "zstd"]
+
+[[bench]]
 name = "block_pipeline"
 harness = false
 path = "benches/block_pipeline.rs"
