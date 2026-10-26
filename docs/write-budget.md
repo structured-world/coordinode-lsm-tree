@@ -89,6 +89,8 @@ an override charged like any other work and counted in the report, when:
 
 With backpressure thresholds set, an exhausted budget first slows the writers
 (the slowdown tier) and only then, at the stop tier, lets compaction overrun.
+An override lets through a merge the strategy chose; it does not make a
+strategy merge what it would not.
 
 ## Reading it
 
@@ -102,7 +104,7 @@ With backpressure thresholds set, an exhausted budget first slows the writers
 | `refused` | Merges that waited for want of credit. |
 | `waiting_since` | The earliest refusal since a merge last got credit: how long work has waited. |
 | `backpressure_overrides`, `forced_overrides` | Merges that ran past the budget, and their bytes, by reason. |
-| `unsustainable` | The writes the budget does not hold back took more than the allowance over the last period: no throttle of compaction keeps this load within the budget. |
+| `unsustainable` | The writes the budget does not hold back took more than the allowance refilled over the last period, or over as much of it as has passed since the budget began or its allowance changed: no throttle of compaction keeps this load within the budget. A span shorter than the burst takes to refill is not judged, since the burst absorbs it by design. |
 
 `unsustainable` is the signal that the allowance is too small for the offered
 load. The budget never answers it by weakening durability: the writes it

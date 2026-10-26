@@ -25,7 +25,7 @@
 //!   `none` writes, only later;
 //! - `budget`: leveled compaction under a write budget on the medium;
 //! - `planned`: planned compaction under the same budget, its model told the
-//!   burst's write rate.
+//!   burst's write rate and its units sized to the trace (a mebibyte).
 //!
 //! The tree's backpressure stops writers at `L0_STOP` runs, which lets a
 //! merge overrun the budget. Every ten simulated minutes `READS` point reads
@@ -101,10 +101,16 @@ impl Arm {
 
     fn strategy(self) -> Arc<dyn CompactionStrategy> {
         match self {
-            Self::Planned => Arc::new(Planned::default().with_model(Model {
-                write_rate: u64::from(BURST_SENSORS) * (12 + VALUE_BYTES as u64),
-                ..Model::default()
-            })),
+            // Units of a mebibyte: at its default 64 MiB a tree of the trace's
+            // size never fills a unit, and its top level never comes down.
+            Self::Planned => Arc::new(
+                Planned::default()
+                    .with_table_target_size(1 << 20)
+                    .with_model(Model {
+                        write_rate: u64::from(BURST_SENSORS) * (12 + VALUE_BYTES as u64),
+                        ..Model::default()
+                    }),
+            ),
             _ => Arc::new(Leveled::default()),
         }
     }

@@ -364,11 +364,12 @@ fn only_mandatory_writes_past_the_allowance_are_unsustainable() {
     let medium = Medium::new();
     let budget = budget(&medium, Allowance::new(1_000, DAY));
     medium.write(WriteOrigin::CompactionTable, 5_000);
-    assert!(!budget.report_at(DAY / 2).unsustainable);
+    assert!(!budget.report_at(DAY).unsustainable);
     medium.write(WriteOrigin::FlushTable, 1_200);
-    assert!(budget.report_at(DAY / 2).unsustainable);
+    // The burst is a day's bytes: a day is the span that tells.
+    assert!(budget.report_at(DAY).unsustainable);
     // A period on, the old flushes fade out of the last period.
-    assert!(!budget.report_at(DAY * 2).unsustainable);
+    assert!(!budget.report_at(DAY * 3).unsustainable);
 }
 
 // The sliding estimate counts the part of the previous period that still
@@ -376,7 +377,8 @@ fn only_mandatory_writes_past_the_allowance_are_unsustainable() {
 #[test]
 fn the_last_period_slides_over_two() {
     let medium = Medium::new();
-    let budget = budget(&medium, Allowance::new(1_000, DAY));
+    // A burst that refills in 2.4 h, so a day's span is judged.
+    let budget = budget(&medium, Allowance::new(1_000, DAY).with_burst(100));
     medium.write(WriteOrigin::FlushTable, 800);
     let _ = budget.report_at(DAY / 2);
     medium.write(WriteOrigin::FlushTable, 600);
@@ -387,6 +389,37 @@ fn the_last_period_slides_over_two() {
     assert!(budget.report_at(DAY + DAY / 4).unsustainable);
     // Three quarters in, a quarter of it: 350.
     assert!(!budget.report_at(DAY + DAY * 3 / 4).unsustainable);
+}
+
+// A new allowance below what the writes that cannot wait take is
+// unsustainable as soon as the span since the change outlasts what the burst
+// absorbs, not a whole period later.
+#[test]
+fn a_cut_allowance_is_unsustainable_once_past_its_burst() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(1_000, DAY));
+    budget.set_allowance_at(Allowance::new(240, DAY).with_burst(10), DAY);
+    // 30 bytes an hour against 10 an hour; the burst refills in an hour.
+    for hour in 1..=3u32 {
+        medium.write(WriteOrigin::FlushTable, 30);
+        let _ = budget.report_at(DAY + DAY / 24 * hour);
+    }
+    assert!(budget.report_at(DAY + DAY / 8).unsustainable);
+}
+
+// A span shorter than the burst takes to refill tells nothing past the
+// burst: the bucket absorbs it by design.
+#[test]
+fn a_burst_within_its_refill_time_is_sustainable() {
+    let medium = Medium::new();
+    let budget = budget(&medium, Allowance::new(240, DAY).with_burst(100));
+    // The burst refills in ten hours.
+    medium.write(WriteOrigin::FlushTable, 100);
+    assert!(!budget.report_at(DAY / 24).unsustainable);
+    // Ten hours on, 100 bytes in ten hours is the allowance, not past it.
+    assert!(!budget.report_at(DAY * 10 / 24).unsustainable);
+    medium.write(WriteOrigin::FlushTable, 50);
+    assert!(budget.report_at(DAY * 10 / 24).unsustainable);
 }
 
 // A forced request is a flag the caller sets and clears.

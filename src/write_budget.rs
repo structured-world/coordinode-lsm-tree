@@ -198,8 +198,10 @@ pub struct BudgetReport {
     /// ([`Override::Forced`]).
     pub forced_overrides: Overrides,
     /// Whether the writes the budget cannot hold back alone take more than
-    /// the allowance refills: no throttle of compaction keeps such a load
-    /// within the budget.
+    /// the allowance refills, over the last period or as much of it as has
+    /// passed since the budget began or its allowance changed, once that span
+    /// outlasts the time the burst takes to refill: no throttle of compaction
+    /// keeps such a load within the budget.
     pub unsustainable: bool,
 }
 
@@ -224,20 +226,30 @@ impl Spend {
     }
 }
 
-/// Mandatory bytes over the current and the previous period, for a sliding
-/// estimate of the last period's.
+/// Mandatory bytes over the current and the previous period, counted from
+/// when the window began, for a sliding estimate of the last period's.
 #[derive(Clone, Copy, Debug, Default)]
 struct Window {
-    /// The index of the current period, counted from the epoch.
+    /// When the window began: the budget's start or its last new allowance.
+    origin: u128,
+    /// The index of the current period, counted from `origin`.
     index: u128,
     current: u64,
     previous: u64,
 }
 
 impl Window {
+    /// A window beginning at `origin_nanos`.
+    fn starting(origin_nanos: u128) -> Self {
+        Self {
+            origin: origin_nanos,
+            ..Self::default()
+        }
+    }
+
     /// Moves the window to the period of `now_nanos`.
     fn advance(&mut self, now_nanos: u128, period_nanos: u128) {
-        let index = now_nanos / period_nanos;
+        let index = now_nanos.saturating_sub(self.origin) / period_nanos;
         if index <= self.index {
             return;
         }
@@ -250,11 +262,18 @@ impl Window {
         self.index = index;
     }
 
-    /// The bytes of the last period up to `now_nanos`: all of the current
-    /// period's and the share of the previous one's that lies within it.
-    fn last_period(&self, now_nanos: u128, period_nanos: u128) -> u128 {
-        let into = now_nanos % period_nanos;
-        u128::from(self.current) + u128::from(self.previous) * (period_nanos - into) / period_nanos
+    /// The bytes of the last period up to `now_nanos`, and the span they
+    /// cover: in the first period everything since the window began, after
+    /// it all of the current period's and the share of the previous one's
+    /// that lies within the last period.
+    fn last_period(&self, now_nanos: u128, period_nanos: u128) -> (u128, u128) {
+        let since = now_nanos.saturating_sub(self.origin);
+        if self.index == 0 {
+            return (u128::from(self.current), since.min(period_nanos));
+        }
+        let into = since % period_nanos;
+        let previous = u128::from(self.previous) * (period_nanos - into) / period_nanos;
+        (u128::from(self.current) + previous, period_nanos)
     }
 }
 
@@ -336,10 +355,32 @@ impl Account {
         self.credit - i128::from(self.reserved)
     }
 
+    /// Whether the writes the budget cannot hold back take more than the
+    /// allowance refills, over the last period or as much of it as has
+    /// passed. A span shorter than the burst takes to refill is judged by
+    /// nothing: the burst absorbs it by design.
     fn unsustainable(&self, now_nanos: u128) -> bool {
-        self.window
-            .last_period(now_nanos, self.allowance.period_nanos())
-            > u128::from(self.allowance.bytes_per_period)
+        let period = self.allowance.period_nanos();
+        let rate = u128::from(self.allowance.bytes_per_period);
+        let (bytes, covered) = self.window.last_period(now_nanos, period);
+        if rate == 0 {
+            // Nothing refills: past the burst, nothing ever repays them.
+            return bytes > u128::from(self.allowance.burst);
+        }
+        // The time the burst takes to refill, at most a period: a product past
+        // u128 is a refill longer than any period.
+        let horizon = u128::from(self.allowance.burst)
+            .checked_mul(period)
+            .map_or(period, |scaled| (scaled / rate).min(period));
+        if covered == 0 || covered < horizon {
+            return false;
+        }
+        // What the allowance refilled over the span, in whole bytes; `covered`
+        // is at most a period, so it is at most a period's bytes.
+        let refilled = rate
+            .checked_mul(covered)
+            .map_or(rate, |scaled| scaled / period);
+        bytes > refilled
     }
 }
 
@@ -427,8 +468,7 @@ impl WriteBudget {
         // What the ledger counted before the budget is not the budget's.
         let seen = Spend::of(&ledger.snapshot());
         let as_of = as_of.as_nanos();
-        let mut window = Window::default();
-        window.advance(as_of, allowance.period_nanos());
+        let window = Window::starting(as_of);
         Self {
             ledger,
             account: Mutex::new(Account {
@@ -617,8 +657,7 @@ impl WriteBudget {
         account.credit = account.credit.min(i128::from(allowance.burst));
         // Less than a byte of the old rate, in units of the old period.
         account.partial = 0;
-        account.window = Window::default();
-        account.window.advance(now_nanos, allowance.period_nanos());
+        account.window = Window::starting(now_nanos);
     }
 
     /// Changes the allowance as of now; see [`Self::set_allowance_at`].
