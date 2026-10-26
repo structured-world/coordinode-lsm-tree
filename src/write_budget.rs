@@ -205,7 +205,8 @@ pub struct BudgetReport {
     /// ([`Override::Space`]).
     pub space_overrides: Overrides,
     /// The largest reservation refused since one was last granted: the work
-    /// that waits. Zero when nothing waits.
+    /// that waits. Zero when nothing waits, or when what waits asked for no
+    /// bytes ([`Self::waiting_since`] tells the two apart).
     pub waiting_bytes: u64,
     /// How long until the credit covers [`Self::waiting_bytes`] beside what is
     /// reserved, if nothing else is charged meanwhile; zero when nothing
@@ -767,10 +768,12 @@ impl WriteBudget {
             forced_overrides: account.forced_overrides,
             space_overrides: account.space_overrides,
             waiting_bytes: account.waiting_bytes,
-            credit_in: if account.waiting_bytes == 0 {
-                Some(Duration::ZERO)
-            } else {
-                account.credit_in(account.waiting_bytes)
+            // A refusal is what makes work wait, whatever it asked for: a
+            // request for no bytes is refused only by an overrun credit, and
+            // waits for the refill to repay it.
+            credit_in: match account.waiting_since {
+                None => Some(Duration::ZERO),
+                Some(_) => account.credit_in(account.waiting_bytes),
             },
             unsustainable: account.unsustainable(now_nanos),
         }

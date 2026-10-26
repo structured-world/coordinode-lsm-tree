@@ -414,8 +414,10 @@ enum SpaceGate {
     Narrowed(CompactionPayload, super::capacity::Reservation, (u64, u64)),
     /// No fitting subset exists; skip this cycle. The truly-too-big single merge
     /// is the opt-in tight-space mode's domain; meanwhile `Drop` / `Move` cycles
-    /// still reclaim and reorganize.
-    Skip,
+    /// still reclaim and reorganize. Carries the bytes the merge as chosen
+    /// writes into its level's folder and into the blob folder, which bound
+    /// what the tight-space pass rewrites.
+    Skip((u64, u64)),
 }
 
 /// Runs the merge of `payload` in the room its outputs take, a smaller merge
@@ -460,8 +462,18 @@ fn gated_merge(
                 *bytes,
                 Narrowing::ForSpace,
             ),
-            // The tight-space pass reclaims space: no budget holds it back.
-            SpaceGate::Skip => BudgetGate::Run(Vec::new()),
+            // The tight-space pass reclaims room on a full volume, as the
+            // narrowed merge does: it reserves what it rewrites, at most the
+            // merge as chosen, and runs past an empty budget as a space
+            // override. Without the pass nothing runs, and nothing is asked.
+            SpaceGate::Skip(bytes) if tight_space_enabled(opts) => budget_gate(
+                &super_version.version,
+                opts,
+                payload.dest_level,
+                *bytes,
+                Narrowing::ForSpace,
+            ),
+            SpaceGate::Skip(_) => BudgetGate::Run(Vec::new()),
         };
         let BudgetGate::Run(holds) = budget else {
             log::debug!(
@@ -487,9 +499,9 @@ fn gated_merge(
             opts.outputs.reserve(room);
             merge_tables(compaction_state, version_history_lock, opts, &narrowed)
         }
-        SpaceGate::Skip => {
+        SpaceGate::Skip(_) => {
             #[cfg(feature = "std")]
-            if opts.runtime_config.load().tight_space_compaction {
+            if tight_space_enabled(opts) {
                 return run_tight_space_compaction(
                     compaction_state,
                     version_history_lock,
@@ -504,6 +516,12 @@ fn gated_merge(
             Ok(CompactionResult::nothing())
         }
     }
+}
+
+/// Whether a merge the volume has no room for runs as the tight-space pass,
+/// which only a `std` build has.
+fn tight_space_enabled(opts: &Options) -> bool {
+    cfg!(feature = "std") && opts.runtime_config.load().tight_space_compaction
 }
 
 /// Where a merge stands once it asked the write budgets of the media it
@@ -530,7 +548,8 @@ enum Narrowing {
 ///
 /// A budget without credit for its part lets the merge run anyway when the
 /// caller forces discretionary work on it, when the merge is the reclaiming
-/// one the space gate narrowed to on a full volume, or when the tree has
+/// one the space gate narrowed to on a full volume or the tight-space pass
+/// that reclaims room where no merge fits, or when the tree has
 /// reached a stop threshold on an axis compaction drains (its L0 runs, its
 /// pending compaction bytes): waiting for credit would then leave the volume
 /// full or stall the writers. Each is reserved as an override, charged and
@@ -743,8 +762,7 @@ fn space_gate_for_merge(
     // payload) the stale blob relocation set, so a narrowed merge can fit where
     // the full one did not. Stat failures propagate (a silent 0 would undercount
     // and admit the very rewrite this gate must block).
-    type Reserved = Option<(super::capacity::Reservation, (u64, u64))>;
-    let reserve = |p: &CompactionPayload| -> crate::Result<Reserved> {
+    let demand = |p: &CompactionPayload| -> crate::Result<(u64, u64)> {
         let sst_sigma: u64 = p
             .table_ids
             .iter()
@@ -756,28 +774,29 @@ fn space_gate_for_merge(
                 .try_fold(0u64, |acc, bf| bf.physical_size().map(|size| acc + size))?,
             None => 0,
         };
-        Ok(with_merge_demands(
-            &opts.config,
-            p.dest_level,
-            (sst_sigma, blob_sigma),
-            |demands| opts.capacity.reserve(opts.tree_id, demands, check),
-        )
-        .map(|room| (room, (sst_sigma, blob_sigma))))
+        Ok((sst_sigma, blob_sigma))
+    };
+    let reserve = |bytes: (u64, u64), dest_level: u8| {
+        with_merge_demands(&opts.config, dest_level, bytes, |demands| {
+            opts.capacity.reserve(opts.tree_id, demands, check)
+        })
     };
 
-    if let Some((room, bytes)) = reserve(payload)? {
-        return Ok(SpaceGate::Run(room, bytes));
+    let chosen = demand(payload)?;
+    if let Some(room) = reserve(chosen, payload.dest_level) {
+        return Ok(SpaceGate::Run(room, chosen));
     }
 
     // Constrained: try the run-adjacent narrowing candidates in ascending SST
     // size and run the first that fits. Skip only when none fit (a truly-too-big
     // single merge is the opt-in tight-space domain).
     for narrowed in narrow_merge_candidates(version, payload)? {
-        if let Some((room, bytes)) = reserve(&narrowed)? {
+        let bytes = demand(&narrowed)?;
+        if let Some(room) = reserve(bytes, narrowed.dest_level) {
             return Ok(SpaceGate::Narrowed(narrowed, room, bytes));
         }
     }
-    Ok(SpaceGate::Skip)
+    Ok(SpaceGate::Skip(chosen))
 }
 
 /// The run-adjacent table-pair narrowing candidates for a too-large merge,

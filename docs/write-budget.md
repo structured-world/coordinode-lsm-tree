@@ -57,8 +57,9 @@ relocates none (a merge operator's result, a compaction filter's replacement,
 a locality relocation), so it asks the blob folder's budget too: it reserves
 nothing there, but an overrun budget holds it back, and what it writes is
 charged as it lands. A
-move and a drop write no table and need no credit; the tight-space pass
-reclaims space and is not held back either.
+move and a drop write no table and need no credit. The tight-space pass, which
+rewrites a merge no volume has room for slice by slice, reserves at most what
+that merge would write, and is let through when credit is short (see below).
 
 These are host writes. What the device then programs into its flash, with its
 own garbage collection, lies below them and is not known here.
@@ -89,8 +90,8 @@ an override charged like any other work and counted in the report, when:
   runs or its pending compaction bytes. The memtable axis is drained by
   flushes, which no budget holds back, and does not override it.
 - the volume has no room for the merge chosen, and the merge is the smaller,
-  reclaiming one the space gate ran instead: holding it back would leave the
-  volume as full as it is.
+  reclaiming one the space gate ran instead, or the tight-space pass where no
+  smaller merge fits: holding it back would leave the volume as full as it is.
 - the caller forces the budget with `WriteBudget::set_forced`: a read latency
   it cannot keep, or space it must reclaim that the engine does not see. It
   clears the flag to let the budget hold work back again.
@@ -111,7 +112,7 @@ strategy merge what it would not.
 | `discretionary_bytes`, `mandatory_bytes` | Bytes charged since the budget began, compaction's and everything else's. |
 | `refused` | Merges that waited for want of credit. |
 | `waiting_since` | The earliest refusal since a merge last got credit: how long work has waited. |
-| `waiting_bytes` | The largest merge refused since one last got credit: the work that waits. |
+| `waiting_bytes` | The largest merge refused since one last got credit: the work that waits. Zero for a merge refused only on a medium it reserves nothing on, such as the blob folder's, which waits for that budget's overrun to be repaid. |
 | `credit_in` | How long until the refill covers that work beside what is reserved, if nothing else is charged meanwhile; `None` when it never will (the work is more than the burst holds, or nothing refills), so it runs only as an override. |
 | `backpressure_overrides`, `space_overrides`, `forced_overrides` | Merges that ran past the budget, and their bytes, by reason. |
 | `unsustainable` | The writes the budget does not hold back took more than the allowance refilled over the last period, or over as much of it as has passed since the budget began or its allowance changed: no throttle of compaction keeps this load within the budget. A span shorter than the burst takes to refill is not judged, since the burst absorbs it by design. |

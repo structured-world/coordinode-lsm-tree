@@ -3069,7 +3069,7 @@ fn space_gate_for_merge_narrows_a_full_run_that_exceeds_free() -> crate::Result<
         super::SpaceGate::Run(..) => {
             panic!("expected Narrowed, got Run (full run wrongly admitted)")
         }
-        super::SpaceGate::Skip => panic!("expected Narrowed, got Skip (no pair admitted)"),
+        super::SpaceGate::Skip(_) => panic!("expected Narrowed, got Skip (no pair admitted)"),
     }
 
     // Run through a compaction, the narrowed merge is what runs: two of the
@@ -3332,7 +3332,7 @@ fn space_gate_sizes_a_restricted_input_by_its_live_suffix() -> crate::Result<()>
         super::SpaceGate::Narrowed(..) => {
             panic!("expected Run, got Narrowed (a single-table merge cannot narrow)")
         }
-        super::SpaceGate::Skip => {
+        super::SpaceGate::Skip(_) => {
             panic!("expected Run, got Skip (the punched prefix was charged to the output)")
         }
     }
@@ -5981,6 +5981,67 @@ mod budget_gate {
             assert_eq!(
                 tree.get(format!("k{i:08}"), crate::SeqNo::MAX)?.as_deref(),
                 Some("v".repeat(40).as_bytes()),
+            );
+        }
+        Ok(())
+    }
+
+    /// On a volume with room for no merge at all, the tight-space pass
+    /// reclaims it slice by slice. It asks the budget as the narrowed merge
+    /// does: an empty one lets it through as a space override, counted in the
+    /// report like any other byte past the budget.
+    #[test]
+    fn the_tight_space_pass_runs_past_an_empty_budget_as_a_space_override() -> crate::Result<()> {
+        use crate::config::BlockSizePolicy;
+
+        let dir = tempfile::tempdir()?;
+        let mem = MemFs::with_capacity(u64::MAX);
+        let budget = Arc::new(
+            WriteBudget::resume_at(
+                Arc::new(WriteIoStats::default()),
+                Allowance::new(1 << 30, DAY),
+                BudgetCheckpoint {
+                    credit: 0,
+                    as_of: Duration::ZERO,
+                },
+                0,
+                Duration::ZERO,
+            )
+            .with_clock(Arc::new(Epoch)),
+        );
+        let fs = Arc::new(CountingFs::with_budget(
+            Arc::new(mem.clone()),
+            Arc::clone(&budget),
+        ));
+        let tree = open_standard(dir.path(), |c| {
+            c.with_shared_fs(fs)
+                .data_block_size_policy(BlockSizePolicy::all(512))
+        })?;
+        for i in 0..2_000u64 {
+            tree.insert(format!("k{i:08}"), vec![0xCDu8; 64], i);
+        }
+        tree.flush_active_memtable(0)?;
+        // Room for a slice, not for the whole merge, and a lone table leaves
+        // no smaller merge to narrow to.
+        let used = tree.storage_stats()?.used_bytes;
+        mem.set_capacity(used + used / 8);
+        tree.update_runtime_config(|c| {
+            c.storage_admission_check = true;
+            c.tight_space_compaction = true;
+        })?;
+
+        tree.major_compact(64 * 1024 * 1024, 0)?;
+
+        assert!(mem.punched_bytes() > 0, "the tight-space pass ran");
+        let report = budget.report();
+        assert_eq!(report.space_overrides.reservations, 1);
+        assert!(report.space_overrides.bytes > 0);
+        assert_eq!(report.refused, 0);
+        assert_eq!(report.reserved, 0, "given back once the pass returns");
+        for i in (0..2_000u64).step_by(97) {
+            assert_eq!(
+                tree.get(format!("k{i:08}"), crate::SeqNo::MAX)?.as_deref(),
+                Some(vec![0xCDu8; 64].as_slice()),
             );
         }
         Ok(())

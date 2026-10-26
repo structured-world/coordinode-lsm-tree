@@ -38,6 +38,12 @@
 //! compaction debt seen, the read p50/p99/p999, and the budget's refusals,
 //! overrides and unsustainable hours, with one `budget,<arm>,<field>,<value>`
 //! line per figure. `BUDGET_ARM` runs one arm only.
+//!
+//! The arms run one after another, in the order above, each on its own
+//! directory. The byte columns (written, compacted, WA, max L0, max debt) do
+//! not depend on that order; the read latencies and the wall and CPU times
+//! may, through the state earlier arms leave in caches and clocks. To compare
+//! those, run each arm in a process of its own with `BUDGET_ARM`.
 
 use lsm_tree::compaction::planned::Model;
 use lsm_tree::compaction::{CompactionAction, CompactionStrategy, Leveled, Planned};
@@ -267,7 +273,9 @@ fn time_reads(tree: &AnyTree, now: u64, outcome: &mut Outcome) -> lsm_tree::Resu
         let sensor = (s >> 32) as u32 % QUIET_SENSORS;
         let start = Instant::now();
         let found = tree.get(key(second, sensor), SeqNo::MAX)?;
-        outcome.reads_ns.push(start.elapsed().as_nanos() as u64);
+        outcome.reads_ns.push(
+            u64::try_from(start.elapsed().as_nanos()).expect("a read shorter than 584 years"),
+        );
         assert!(found.is_some(), "a reading of the last hour is retained");
     }
     Ok(())
@@ -396,6 +404,8 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 
 fn main() -> lsm_tree::Result<()> {
     let only = std::env::var("BUDGET_ARM").ok();
+    let millis =
+        |d: Duration| u64::try_from(d.as_millis()).expect("a run shorter than 584 million years");
     let mib = |b: u64| b as f64 / (1_024.0 * 1_024.0);
     println!(
         "{QUIET_HOURS} h of {QUIET_SENSORS} sensors, a restart, {BURST_HOURS} h of {BURST_SENSORS}, \
@@ -434,7 +444,7 @@ fn main() -> lsm_tree::Result<()> {
         let overrides =
             outcome.backpressure_overrides + outcome.forced_overrides + outcome.space_overrides;
         println!(
-            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8}ns {:>8} {:>9} {:>12} h {:>9.1} {:>7.1}",
+            "{:<8} {:>11.2} {:>14.2} {:>6.2} {:>8} {:>13.2} {:>7}ns {:>7}ns {:>8}ns {:>8} {:>9} {:>12.1} h {:>9.1} {:>7.1}",
             arm.name(),
             mib(outcome.written),
             mib(outcome.compaction),
@@ -446,7 +456,8 @@ fn main() -> lsm_tree::Result<()> {
             p999,
             outcome.refused,
             overrides,
-            outcome.unsustainable_checks * FLUSH_EVERY_SECONDS / 3_600,
+            // Each check stands for a flush interval, a sixth of an hour.
+            (outcome.unsustainable_checks * FLUSH_EVERY_SECONDS) as f64 / 3_600.0,
             outcome.elapsed.as_secs_f64(),
             outcome.cpu.as_secs_f64(),
         );
@@ -475,8 +486,8 @@ fn main() -> lsm_tree::Result<()> {
             ("full_checks", outcome.full_checks),
             ("full_refusals", outcome.full_refusals),
             ("full_max_used_bytes", outcome.full_max_used),
-            ("wall_ms", outcome.elapsed.as_millis() as u64),
-            ("cpu_ms", outcome.cpu.as_millis() as u64),
+            ("wall_ms", millis(outcome.elapsed)),
+            ("cpu_ms", millis(outcome.cpu)),
         ] {
             println!("budget,{name},{field},{value}");
         }

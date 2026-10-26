@@ -466,6 +466,26 @@ fn the_report_forecasts_the_waiting_work() {
     drop((held, granted));
 }
 
+// A refused request for no bytes, such as the probe of a medium a merge may
+// write to, waits on the overrun as any other: the forecast is the time to
+// repay it, not zero, and never when nothing refills.
+#[test]
+fn a_refused_zero_byte_request_is_forecast_from_the_overrun() {
+    let medium = Medium::new();
+    let overrun = budget(&medium, Allowance::new(1_000, DAY));
+    medium.write(WriteOrigin::FlushTable, 2_000);
+    assert!(overrun.reserve_at(0, Duration::ZERO).is_none());
+    let report = overrun.report_at(Duration::ZERO);
+    assert_eq!(report.waiting_since, Some(Duration::ZERO));
+    // 1,000 overdrawn at 1,000 a day: a day to repay.
+    assert_eq!(report.credit_in, Some(DAY));
+
+    let dry = budget(&medium, Allowance::new(0, DAY).with_burst(500));
+    medium.write(WriteOrigin::FlushTable, 600);
+    assert!(dry.reserve_at(0, Duration::ZERO).is_none());
+    assert_eq!(dry.report_at(Duration::ZERO).credit_in, None);
+}
+
 // Work the burst cannot hold beside the reservations, or an allowance that
 // refills nothing, never gets credit: the forecast says so instead of a time.
 #[test]
