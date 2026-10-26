@@ -24,7 +24,6 @@
 use crate::UserKey;
 use crate::comparator::UserComparator;
 use alloc::sync::Arc;
-#[cfg(feature = "columnar")]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -36,13 +35,11 @@ pub struct Boundary {
     pub key: UserKey,
     /// The tables after it up to the next boundary, as their smallest key and
     /// their bytes, in key order: one table in a level of one run, a cluster
-    /// of overlapping ones in a level of several. Only a columnar writer, which
-    /// may copy a group across the boundary, weighs them.
-    #[cfg(feature = "columnar")]
+    /// of overlapping ones in a level of several. Only a writer copying a
+    /// group or block across the boundary weighs them.
     pub after: Vec<(UserKey, u64)>,
 }
 
-#[cfg(feature = "columnar")]
 impl Boundary {
     /// The bytes an output reaching past the boundary to `last` has the next
     /// merge read and write again: the tables after it that start at or
@@ -155,7 +152,6 @@ impl CutAlignment {
     /// The first boundary a run of keys from `first` to `last` crosses after
     /// `first`, past the boundaries `crossing` passes at `first`: one between
     /// two of its keys, where an output written key by key could end.
-    #[cfg(feature = "columnar")]
     pub(super) fn inside(
         &self,
         crossing: Crossing,
@@ -170,7 +166,6 @@ impl CutAlignment {
     /// Moves past the boundaries the keys up to `last` cross, written into the
     /// current output without a cut among them; they count toward its floor
     /// when it holds half the target, `past_half`.
-    #[cfg(feature = "columnar")]
     pub(super) fn pass_through(
         &mut self,
         last: &[u8],

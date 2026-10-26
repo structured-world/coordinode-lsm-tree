@@ -281,13 +281,11 @@ pub(super) fn boundaries_between<'a>(
         if comparator.compare(reach, after.key_range().min()) == Ordering::Less {
             boundaries.push(crate::table::multi_writer::Boundary {
                 key: reach.clone(),
-                #[cfg(feature = "columnar")]
                 after: Vec::new(),
             });
         }
         // Every table belongs to the cluster after the last boundary before
         // it; tables before the first boundary to none.
-        #[cfg(feature = "columnar")]
         if let Some(boundary) = boundaries.last_mut() {
             boundary
                 .after
@@ -1827,7 +1825,7 @@ impl StandardCompaction {
     fn carry_group(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
-        group: crate::table::index_block::RowGroupRef,
+        group: crate::table::group_carry::RowGroupRef,
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<bool> {
         let table = &candidate.table;
@@ -1871,6 +1869,15 @@ impl StandardCompaction {
     /// asks only once a row of the group came out as read, so the group is
     /// not read for a merge that changed every row. A data block has no pages
     /// to copy apart: `None`.
+    #[cfg_attr(
+        not(feature = "columnar"),
+        expect(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            clippy::needless_pass_by_ref_mut,
+            reason = "without columnar tables there are only data blocks, which copy no pages"
+        )
+    )]
     pub(super) fn carry_pages(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
@@ -1891,7 +1898,7 @@ impl StandardCompaction {
     fn carry_group_pages(
         &mut self,
         candidate: &crate::table::group_carry::CarryCandidate,
-        group: crate::table::index_block::RowGroupRef,
+        group: crate::table::group_carry::RowGroupRef,
         emitted: &[InternalValue],
         pace: Option<&dyn crate::table::util::ReadPacer>,
     ) -> crate::Result<Option<u64>> {

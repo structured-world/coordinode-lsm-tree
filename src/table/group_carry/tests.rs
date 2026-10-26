@@ -25,7 +25,7 @@ pub(super) fn note_raw_read(len: u32) {
 }
 
 /// The row group a columnar candidate stands for.
-fn row_group(candidate: &super::CarryCandidate) -> crate::table::index_block::RowGroupRef {
+fn row_group(candidate: &super::CarryCandidate) -> super::RowGroupRef {
     match candidate.unit {
         super::CarryUnit::RowGroup(group) => group,
         super::CarryUnit::DataBlock(_) => panic!("a columnar input yields row groups"),

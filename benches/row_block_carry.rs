@@ -15,7 +15,7 @@
 //! `major_compact`, on one compaction thread so the figure is the work done
 //! rather than how it spread.
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
 use lsm_tree::config::CompressionPolicy;
 use lsm_tree::{AbstractTree, AnyTree, CompressionType, Config, SeqNo, SequenceNumberCounter};
 use std::time::{Duration, Instant};
@@ -98,7 +98,9 @@ fn bench_row_block_carry(c: &mut Criterion) {
     ];
     for (name, codec, keys) in codecs {
         let mut group = c.benchmark_group(format!("row_block_carry_{name}"));
-        group.sample_size(10);
+        // Each iteration is a whole compaction plus its setup: flat sampling
+        // keeps the run to ten of them rather than a growing series.
+        group.sample_size(10).sampling_mode(SamplingMode::Flat);
         for update in [Update::Clustered, Update::Scattered, Update::Overwrite] {
             group.bench_function(update.name(), |b| {
                 b.iter_custom(|iters| {

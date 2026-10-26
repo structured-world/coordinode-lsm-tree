@@ -27,12 +27,15 @@ use super::{BlockHandle, Table};
 use crate::comparator::SharedComparator;
 use crate::{InternalValue, UserKey};
 
+#[cfg(feature = "columnar")]
+pub use super::index_block::RowGroupRef;
+
 /// What a candidate copies.
 pub enum CarryUnit {
     /// A columnar row group: the tag and lengths its directory carries, as its
     /// index entry names them. Its bytes are read when it is copied.
     #[cfg(feature = "columnar")]
-    RowGroup(super::index_block::RowGroupRef),
+    RowGroup(RowGroupRef),
     /// A row-major data block: its frame, header and payload, as the scan read
     /// it and verified its checksum, so the copy is of the bytes the rows were
     /// decoded from.
@@ -84,7 +87,7 @@ pub type CarryQueue = Arc<Mutex<VecDeque<CarryCandidate>>>;
 
 /// How the output lays out its data, which a copy keeps.
 #[derive(Clone, Copy)]
-pub(crate) enum CarryShape {
+pub enum CarryShape {
     /// Columnar row groups, cut and encoded as this says.
     #[cfg(feature = "columnar")]
     Groups(crate::table::meta::GroupShape),

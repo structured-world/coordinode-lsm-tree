@@ -8,7 +8,6 @@ fn key(i: u32) -> Vec<u8> {
     format!("{i:06}").into_bytes()
 }
 
-#[cfg(feature = "columnar")]
 fn index_of(key: &[u8]) -> u32 {
     core::str::from_utf8(key)
         .ok()
@@ -20,7 +19,6 @@ fn boundaries(keys: &[u32]) -> alloc::sync::Arc<[Boundary]> {
     keys.iter()
         .map(|&i| Boundary {
             key: UserKey::from(key(i)),
-            #[cfg(feature = "columnar")]
             after: vec![(UserKey::from(key(i + 1)), u64::from(i))],
         })
         .collect()
@@ -113,7 +111,6 @@ fn no_boundary_is_ahead_past_the_last_or_the_writer_s_range() {
 
 /// The boundary inside a run of keys is the first past those its first key
 /// crosses, and lies below its last key.
-#[cfg(feature = "columnar")]
 #[test]
 fn inside_finds_the_boundary_between_a_run_of_keys() {
     let cmp = default_comparator();

@@ -68,7 +68,7 @@ fn assert_contents(tree: &crate::Tree, newer: u64) -> crate::Result<()> {
     assert!(tree.get(b"k99999", SeqNo::MAX)?.is_none());
     let forward = tree
         .iter(SeqNo::MAX, None)
-        .map(|guard| guard.into_inner())
+        .map(Guard::into_inner)
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(forward.len() as u64, KEYS);
     for (i, (k, v)) in (0..KEYS).zip(&forward) {
@@ -78,7 +78,7 @@ fn assert_contents(tree: &crate::Tree, newer: u64) -> crate::Result<()> {
     let backward = tree
         .iter(SeqNo::MAX, None)
         .rev()
-        .map(|guard| guard.into_inner())
+        .map(Guard::into_inner)
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(backward.len() as u64, KEYS);
     assert_eq!(
@@ -267,7 +267,12 @@ fn garbage_collecting_merge_reads_back() -> crate::Result<()> {
 
     assert_contents(&tree, 10)?;
     // Only the newest version of a rewritten key is left.
-    assert!(tree.get(key(0), 2)?.is_none());
+    let stored = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| table.metadata.item_count)
+        .sum::<u64>();
+    assert_eq!(stored, KEYS);
     Ok(())
 }
 
@@ -320,7 +325,7 @@ fn custom_comparator_merge_copies_blocks() -> crate::Result<()> {
     assert!(tree.metrics().compaction_blocks_carried() > 0);
     let keys = tree
         .iter(SeqNo::MAX, None)
-        .map(|guard| guard.key())
+        .map(Guard::key)
         .collect::<crate::Result<Vec<_>>>()?;
     assert_eq!(keys.len() as u64, KEYS);
     assert_eq!(keys.first().map(|k| k.to_vec()), Some(key(KEYS - 1)));
