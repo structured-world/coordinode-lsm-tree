@@ -1436,7 +1436,11 @@ pub trait AbstractTree: sealed::Sealed {
     ///
     /// [`Error::RetentionFloorRaise`](crate::Error::RetentionFloorRaise) when
     /// `floor` is above the current floor, which only GC and the installs that
-    /// drop data raise; nothing changes. An I/O error persisting the new floor.
+    /// drop data raise; nothing changes.
+    /// [`Error::RetentionFloorAboveSeqno`](crate::Error::RetentionFloorAboveSeqno)
+    /// when `floor` is above the seqno counter (one reset on reopen can stand
+    /// below the current floor); nothing changes. An I/O error persisting the
+    /// new floor.
     ///
     /// # Examples
     ///

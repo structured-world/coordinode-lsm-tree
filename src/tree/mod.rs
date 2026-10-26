@@ -1957,6 +1957,14 @@ impl AbstractTree for Tree {
         if floor == current {
             return Ok(());
         }
+        // A counter reset on reopen can stand below the current floor.
+        let seqno = config.seqno.get();
+        if floor > seqno {
+            return Err(crate::Error::RetentionFloorAboveSeqno {
+                seqno,
+                requested: floor,
+            });
+        }
         versions.upgrade_version(
             &config.path,
             |v| {

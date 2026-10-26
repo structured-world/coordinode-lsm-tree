@@ -137,3 +137,44 @@ fn lower_retention_floor_above_the_current_is_refused() -> lsm_tree::Result<()> 
 fn lower_retention_floor_above_the_current_on_blob_tree_is_refused() -> lsm_tree::Result<()> {
     assert_raise_is_refused(true)
 }
+
+/// A tree reopened with its counter behind its floor: a floor between the two
+/// is below the current one, yet above every seqno the counter hands out, and
+/// is refused without changing anything.
+fn assert_floor_above_the_counter_is_refused(kv_separated: bool) -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open(folder.path(), kv_separated, COUNTER)?;
+    let cleared = cleared_and_reinstalled(&tree)?;
+    tree.flush_active_memtable(0)?;
+    drop(tree);
+
+    let behind = COUNTER / 2;
+    let tree = open(folder.path(), kv_separated, behind)?;
+    let between = behind + 10;
+    assert!(
+        between < cleared,
+        "fixture: the request is below the current floor"
+    );
+    match tree.lower_retention_floor(between) {
+        Err(Error::RetentionFloorAboveSeqno { seqno, requested }) => {
+            assert_eq!((seqno, requested), (behind, between));
+        }
+        other => panic!("expected RetentionFloorAboveSeqno, got {other:?}"),
+    }
+    assert_eq!(tree.retention_floor(), cleared, "a refusal changes nothing");
+
+    // At the counter, it is a floor the tree can stand on.
+    tree.lower_retention_floor(behind)?;
+    assert_eq!(tree.retention_floor(), behind);
+    Ok(())
+}
+
+#[test]
+fn lower_retention_floor_above_the_counter_is_refused() -> lsm_tree::Result<()> {
+    assert_floor_above_the_counter_is_refused(false)
+}
+
+#[test]
+fn lower_retention_floor_above_the_counter_on_blob_tree_is_refused() -> lsm_tree::Result<()> {
+    assert_floor_above_the_counter_is_refused(true)
+}
