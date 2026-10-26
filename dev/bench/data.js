@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792967853262,
+  "lastUpdate": 1792995027447,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64288,6 +64288,90 @@ window.BENCHMARK_DATA = {
             "value": 310747.4982126775,
             "unit": "ops/sec",
             "extra": "P50: 2.4us | P99: 16.9us | P99.9: 92.0us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7e61cd6ba459cac9abb28580842bd200e1810080",
+          "message": "feat(metrics): count every host write by origin (#991)\n\n## Summary\n- A host-write ledger, `fs::CountingFs`: every byte, write call, sync,\nstarted writeback, creation, rename and removal handed to a backend,\neach charged to what it was written for, with the bytes each install\nkept. It needs no cargo feature; a tree on a plain backend has no\nwrapper and pays nothing.\n- Counting is bound per physical medium by the caller: every tree and\nlevel route on a medium gets a `CountingFs` counting into that medium's\nshared `WriteIoStats`, another medium another set. A reopen on the same\nbackend counts on into the same set.\n- The payload a tree took in, the denominator of host write\namplification, is a profiling figure under `metrics`:\n`Metrics::accepted_writes`.\n\n## Changes\n- `fs::CountingFs`, `WriteIoStats` and the `WriteIoSnapshot` reading.\nEach counter set is numbered when made, and `since` refuses readings of\ntwo sets. Files opened for writing are counted under the `WriteOrigin`\ntheir open options name; files opened only for reading are the backend's\nown handles. Directory and device operations are counted apart; a clone\ncounts the length of what it made, the bound of what a copying backend\nwrote below the wrapper.\n- `FsOpenOptions::write_origin`, set by every write-side open in the\nengine: flush, ingestion and compaction tables and blob files, the\nmanifest and its edit log, dictionaries, pins, sidecars, the table file\npool's empty files, the lock file, salvage and in-place healing,\ncheckpoint copies. A file opened without one is counted as unattributed.\n- `Fs::write_io_stats` exposes a counting backend's set (wrappers hand\non the inner one's). Every flush, ingestion and compaction install\nrecords the bytes it kept into the set of the backend each table and\nblob file was written through, so a route on another medium is charged\nto that medium.\n- `Metrics::accepted_writes`: values, deletions, range deletions,\ningested records and their payload bytes, counted at the write entry\npoints and ingestion, a row of cells as its key and value fields.\n- `FaultOp::SyncDevice` in the fault-injection backend; the dead\noptional root-manifest copy in checkpoints removed.\n- `benches/write_ledger.rs`: a low-rate device workload in two key\norders on a `CountingFs` over the standard backend, with a `ledger,...`\nline per counter for a replay harness and a check against\n`/proc/self/io`.\n- `docs/write-ledger.md`, the README and `docs/INVARIANTS.md`.\n\n## Measurements\n`write_ledger`: 64 sensors at 1 Hz for six hours, flushed every ten\nminutes, three hours retained. Byte counts are the same on every run on\none filesystem; across ext4 and btrfs the sensor order differs by 124\nbytes.\n\n| | time order | sensor order |\n|---|---|---|\n| Payload | 47.46 MiB | 47.47 MiB |\n| `flush_table` | 46.70 MiB, 39 syncs | 47.53 MiB, 39 syncs |\n| `compaction_table` | 0 | 221.71 MiB, 40 syncs |\n| `manifest` | 0.03 MiB, 74 syncs | 0.02 MiB, 69 syncs |\n| Written | 46.74 MiB, 118 syncs | 269.26 MiB, 156 syncs |\n| Host write amplification | 0.98 | 5.67 |\n\nOn ext4 and btrfs, `/proc/self/io` `wchar` and `syscw` equal the\nledger's bytes and write calls exactly; `write_bytes` is 0.5 to 0.9%\nabove them on ext4 and 3.7 to 13.6% on btrfs, the filesystem's own\nwrites. Under `strace -f -c` the process's `write`, `fdatasync` +\n`fsync` and `sync_file_range` calls equal the ledger's writes, file and\ndirectory syncs, and started writebacks in both orders.\n\n## Testing\nfmt, clippy in every CI configuration, the full nextest suite with and\nwithout all features, doc tests, doc build, the no-std check, the tool\ncrates, the benches and the i686 builds pass on Linux.\n\nCloses #975",
+          "timestamp": "2026-10-26T07:54:25+02:00",
+          "tree_id": "59e1aa11d77e9d6b0d02aa548c6555c01da788b9",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7e61cd6ba459cac9abb28580842bd200e1810080"
+        },
+        "date": 1792995026068,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 66389.16819615263,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.2us | P99.9: 28.4us\nthreads: 1 | elapsed: 8.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2547302.9703819733,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 630481.2920485904,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.9us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 460597.53765339387,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 22.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3113078.417558111,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.9us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 311831.97989003046,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.4us | P99.9: 14.6us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 190059.6376733477,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.4us | P99.9: 19.8us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 671732.9008349703,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.1us | P99.9: 12.8us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 751162.5000239903,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 282117.4506377016,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 17.9us | P99.9: 92.0us\nthreads: 1 | elapsed: 0.71s | num: 200000 | iterations: 3"
           }
         ]
       }
