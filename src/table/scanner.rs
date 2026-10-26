@@ -261,9 +261,6 @@ pub struct Scanner {
     /// Hands out each group's or block's rows from its own list and records it
     /// as a candidate for a whole copy, when a compaction asked for it.
     carry: Option<super::group_carry::GroupCarry>,
-    /// Whether the rows of the current group come from `iter` as read: one
-    /// the carry did not record.
-    passing: bool,
 }
 
 impl Scanner {
@@ -365,7 +362,6 @@ impl Scanner {
             current_group,
             frame,
             carry: None,
-            passing: false,
         })
     }
 
@@ -418,11 +414,11 @@ impl Scanner {
                 return Some(Ok(row));
             }
             // A group handed out unrecorded comes straight from its block.
-            if self.passing {
+            if carry.passing() {
                 if let Some(row) = self.iter.by_ref().find(|row| carry.hands_out(row)) {
                     return Some(Ok(row));
                 }
-                self.passing = false;
+                carry.end_pass();
             }
             if self.read_count >= self.block_count {
                 return None;
@@ -440,7 +436,6 @@ impl Scanner {
             if let Some(carry) = self.carry.as_mut() {
                 if carry.skips_next() {
                     self.iter = rows;
-                    self.passing = true;
                 } else {
                     carry.start(group, frame, rows);
                 }
