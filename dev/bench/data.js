@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793128150438,
+  "lastUpdate": 1793129264282,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65128,6 +65128,90 @@ window.BENCHMARK_DATA = {
             "value": 361396.4226947421,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.5us | P99.9: 80.4us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "837cc75a87428d7bc4be88c9ac68901a4baf0fa2",
+          "message": "ci(deps): bump Swatinem/rust-cache from 2.9.2 to 2.9.3 (#1009)\n\nBumps [Swatinem/rust-cache](https://github.com/swatinem/rust-cache) from\n2.9.2 to 2.9.3.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/swatinem/rust-cache/releases\">Swatinem/rust-cache's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v2.9.3</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Issue-375: stop cleanup timestamp pruning after the first entry by\n<a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nin <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li>fix: log rustup toolchain list failure as info instead of warning by\n<a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a> in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li><a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3\">https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/Swatinem/rust-cache/blob/master/CHANGELOG.md\">Swatinem/rust-cache's\nchangelog</a>.</em></p>\n<blockquote>\n<h1>Changelog</h1>\n<h2>2.9.3</h2>\n<ul>\n<li>Fix timestamp based pruning</li>\n<li>Add missing <code>await</code>s</li>\n<li>Do not emit warning on missing <code>rustup</code></li>\n</ul>\n<h2>2.9.2</h2>\n<ul>\n<li>Fix <code>credentials.toml</code> cleanup</li>\n<li>Improvements to cleanup, preserving more valid targets</li>\n<li>Improvements to <code>cargo install</code> handling</li>\n<li>Correctly sort/dedupe Rust versions</li>\n</ul>\n<h2>2.9.1</h2>\n<ul>\n<li>Fix regression in hash calculation</li>\n</ul>\n<h2>2.9.0</h2>\n<ul>\n<li>Update to <code>node24</code></li>\n<li>Support running from within a <code>nix</code> shell</li>\n<li>Consider all installed toolchains for cache key</li>\n<li>Use case-insensitive comparison to determine exact cache hit</li>\n</ul>\n<h2>2.8.2</h2>\n<ul>\n<li>Don't overwrite env for cargo-metadata call</li>\n</ul>\n<h2>2.8.1</h2>\n<ul>\n<li>Set empty <code>CARGO_ENCODED_RUSTFLAGS</code> when retrieving\nmetadata</li>\n<li>Various dependency updates</li>\n</ul>\n<h2>2.8.0</h2>\n<ul>\n<li>Add support for <code>warpbuild</code> cache provider</li>\n<li>Add new <code>cache-workspace-crates</code> feature</li>\n</ul>\n<h2>2.7.8</h2>\n<ul>\n<li>Include CPU arch in the cache key</li>\n</ul>\n<h2>2.7.7</h2>\n<ul>\n<li>Also cache <code>cargo install</code> metadata</li>\n</ul>\n<h2>2.7.6</h2>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/d1527c8f67ef9af357290475d4af4b0fab8f12e0\"><code>d1527c8</code></a>\n2.9.3</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0fca6fc1c91b0c4158e7b92bdd2582341575c8e\"><code>f0fca6f</code></a>\nupdate dependencies and rebuild</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/b49b17f98024bf3c4d14fb465de5bad92750344b\"><code>b49b17f</code></a>\nadd missing awaits</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/6a7bc3ebce750e0a16a430dd57485acfdb38b05f\"><code>6a7bc3e</code></a>\nBump the dev-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/383\">#383</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/4ece996238f932eddbc3099e93131a4089950e4f\"><code>4ece996</code></a>\nBump the actions group across 1 directory with 6 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/392\">#392</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/8103aff431aa12c1132e226b21f6a655ea749803\"><code>8103aff</code></a>\nBump the prd-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/389\">#389</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/0e361f3528cccdd0ac5d0e0dda2bde9bcfc77a1f\"><code>0e361f3</code></a>\nfix: log rustup toolchain list failure as info instead of warning (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/393\">#393</a>)\n(<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/394\">#394</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0d9c3887740aee45f6153b24b3a6b815192ec16\"><code>f0d9c38</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/380\">#380</a>\nfrom Swatinem/dependabot/github_actions/actions-8ff58...</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/ccd9742ce3913201b7e871cc4b4f95ee3930f15b\"><code>ccd9742</code></a>\nBump the actions group with 2 updates</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/258712b0b7b1ddf8bddc9fc3b0faca682b2736c3\"><code>258712b</code></a>\nfix: stop cleanup timestamp pruning after the first entry (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/377\">#377</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/swatinem/rust-cache/compare/6323deb102c322ba6fcbdcafc7e3dddab59af2b6...d1527c8f67ef9af357290475d4af4b0fab8f12e0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-27T19:14:56Z",
+          "tree_id": "0ec88f3846a0471caf169cacde7b649e37b012c7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/837cc75a87428d7bc4be88c9ac68901a4baf0fa2"
+        },
+        "date": 1793129262986,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 135524.27178913748,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.4us | P99.9: 28.7us\nthreads: 1 | elapsed: 3.95s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2644526.094775293,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 714725.9522886191,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.9us | P99.9: 18.6us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 472242.52976601926,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 27.8us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3236032.8896791567,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.5us | P99.9: 6.0us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 329207.9570945903,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 7.2us | P99.9: 14.7us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 177362.7497316845,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 17.3us | P99.9: 40.4us\nthreads: 1 | elapsed: 1.13s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 623849.220434583,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 4.3us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 727676.1482832405,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 345839.6585389482,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 12.2us | P99.9: 83.5us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
           }
         ]
       }
