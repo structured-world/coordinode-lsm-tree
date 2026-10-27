@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793133063731,
+  "lastUpdate": 1793133068503,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -81120,6 +81120,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.564797991,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8d6ff847150b17d894e576d3589141f58f065da5",
+          "message": "perf(read): jump past long chains of a key's versions (#1008)\n\n## Summary\n\n- A scan no longer walks every version of a key with a long chain: after\neight versions it jumps past the rest, forward and backward, in every\nsource that can (memtable, table, run, merge).\n- A reverse scan over a memtable steps through a batch of nodes instead\nof searching the skiplist from the top for every entry.\n- Fixes range-deleted keys coming back after a compaction (#1006).\n\n## Changes\n\n- Forward: once a key is resolved, each source whose head is a version\nof it moves past the rest; a table passes the data blocks holding only\nthat key's versions on the index alone.\n- Backward: once eight versions are walked, each source moves up to the\nnewest version the snapshot sees; a table passes older-only blocks on\nthe index and trims the block holding the version in place. The merge\nmoves every source whose head is a version of the key, setting aside\nthose that stay the winner once moved. It jumps only when the back took\nits last eight items from one source, since versions held a few to a\nsource cost less to walk. A source failing during the jump ends the key,\nas an error met while walking does.\n- Memtable: a backward step fills a batch of up to 64 nodes from one\nsearch; the two ends of an iterator meet by key order.\n- Compaction: an output now waits for every block still compressing on\nthe workers before it cuts its range tombstones to its keys, so the cut\nreaches the output's last key. Previously the keys of those blocks were\nleft uncovered and showed again. A table holding only range tombstones\nkeeps the key range spanning them.\n- Benchmark `mvcc_versions`: full scans over chains of 1 to 4096\nversions per key, in a memtable, one table, eight tables, and a table\nplus memtable, both directions; the median per round with the p50 and\np99 of single scans.\n\n## Performance\n\nWindows, `mvcc_versions`, median ns per key handed out, before → after:\n\n| layout | 32 versions | 128 versions | 512 versions |\n|---|---|---|---|\n| mem fwd / rev | 7036 → 1660 / 23763 → 3530 | 26462 → 1270 / 95268 →\n2666 | 104359 → 1372 / 385666 → 2712 |\n| table fwd / rev | 2501 → 1665 / 3392 → 2069 | 9872 → 2732 / 13461 →\n2431 | 39119 → 3120 / 52584 → 3144 |\n| tables8 fwd / rev | 3879 → 2800 / 4762 → 4724 | 15421 → 7061 / 18752 →\n11129 | 58228 → 18149 / 72104 → 15335 |\n| mixed fwd / rev | 5041 → 2973 / 13583 → 3595 | 19541 → 3861 / 54052 →\n4452 | 75973 → 3965 / 216241 → 4740 |\n\nChains of eight versions or fewer stay within noise.\n\n## Testing\n\nFormatting, clippy in both feature sets, the full test suite with and\nwithout features, doc tests, rustdoc, the no-std check, and the sst-dump\nand db_bench tools pass on Linux. A differential property test checks\nevery scan shape over long chains against a model, under both\ncomparators and with a merge operator.\n\nCloses #968\nCloses #1006\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved forward and reverse scans across long version chains,\nincluding scans spanning multiple tables and memtables.\n\n* **Bug Fixes**\n* Improved scan behavior when seeking across versions, changing\ndirection, or reading at older snapshots.\n* Fixed range tombstones continuing to suppress covered keys after\ncompaction.\n\n* **Testing**\n* Added broader checks for versioned scans, seekable ranges, and\ntombstone behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-27T22:07:53+02:00",
+          "tree_id": "34adaf4f9b8023b44074c489b2e2ba2cc8a359d8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8d6ff847150b17d894e576d3589141f58f065da5"
+        },
+        "date": 1793133067056,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 509.874,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.453177ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 128.484,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.080875ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 454.023,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.112013ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3999.059,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 18941.269,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.815,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 68.222975,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.600069796,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.791,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 76.611583,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.602451832,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
