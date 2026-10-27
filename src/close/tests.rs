@@ -398,15 +398,54 @@ fn a_blob_tree_closes_once_its_blob_files_are_released() -> crate::Result<()> {
     Ok(())
 }
 
-// Through `AnyTree`, as most callers hold a tree.
-#[test]
-fn any_tree_downgrades_and_closes() -> crate::Result<()> {
+// Through `AnyTree`, as most callers hold a tree, of either kind: the weak
+// handle raises the kind it was made from, and both handles describe their
+// state when printed.
+fn any_tree_downgrades_and_closes(blob: bool) -> crate::Result<()> {
     let folder = crate::get_tmp_folder();
-    let tree = config(folder.path()).open()?;
+    let config = config(folder.path());
+    let config = if blob {
+        config.with_kv_separation(Some(KvSeparationOptions::default()))
+    } else {
+        config
+    };
+    let tree = config.open()?;
     let weak = tree.downgrade();
-    assert!(matches!(weak.upgrade(), Some(AnyTree::Standard(_))));
+    assert_eq!(
+        weak.upgrade().map(|tree| matches!(tree, AnyTree::Blob(_))),
+        Some(blob)
+    );
+    assert_eq!(
+        format!("{weak:?}"),
+        format!("WeakTree {{ blob: {blob}, .. }}")
+    );
+
     let closed = tree.close();
     assert!(closed.wait_timeout(SETTLE));
     assert!(weak.upgrade().is_none());
+    assert_eq!(format!("{closed:?}"), "TreeClose { closed: true }");
+    Ok(())
+}
+
+#[test]
+fn any_standard_tree_downgrades_and_closes() -> crate::Result<()> {
+    any_tree_downgrades_and_closes(false)
+}
+
+#[test]
+fn any_blob_tree_downgrades_and_closes() -> crate::Result<()> {
+    any_tree_downgrades_and_closes(true)
+}
+
+// The signal prints whether the tree is closed yet.
+#[test]
+fn an_open_tree_prints_as_not_closed() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open_standard(folder.path())?;
+    let clone = tree.clone();
+    let closed = tree.close();
+    assert_eq!(format!("{closed:?}"), "TreeClose { closed: false }");
+    drop(clone);
+    assert!(closed.wait_timeout(SETTLE));
     Ok(())
 }
