@@ -40,8 +40,16 @@ impl Signal {
             self.settled.notify_all();
             core::mem::take(&mut *waiting)
         };
-        // Outside the lock: a callback may register another, or wait.
+        // Outside the lock: a callback may register another, or wait. This
+        // runs inside a drop of the tree's own parts, possibly while a panic
+        // unwinds, so a callback's panic is contained: it would abort the
+        // process there, and would drop the callbacks after it unrun.
         for callback in callbacks {
+            #[cfg(feature = "std")]
+            if std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).is_err() {
+                log::error!("a TreeClose callback panicked; the others still run");
+            }
+            #[cfg(not(feature = "std"))]
             callback();
         }
     }
@@ -103,6 +111,8 @@ impl TreeClose {
     /// polls meanwhile: an async caller completes its own oneshot from it.
     ///
     /// `f` runs inside the drop that closed the tree, so it should be short.
+    /// With `std` a panic in `f` is caught and logged, and the other
+    /// callbacks still run.
     ///
     /// # Examples
     ///
@@ -118,7 +128,10 @@ impl TreeClose {
     /// .open()?;
     ///
     /// let (closed, on_closed) = mpsc::channel();
-    /// tree.close().on_closed(move || closed.send(()).unwrap());
+    /// // The receiver may be gone by then: a failed send is nothing to report.
+    /// tree.close().on_closed(move || {
+    ///     let _ = closed.send(());
+    /// });
     /// on_closed.recv()?;
     /// std::fs::remove_dir_all(folder.path())?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -140,6 +153,10 @@ impl TreeClose {
     }
 
     /// Blocks until the tree is closed.
+    ///
+    /// Blocks for good if the caller itself still holds a tree handle, an
+    /// iterator, a snapshot or a pin of the tree: drop them first, or use
+    /// [`on_closed`](Self::on_closed).
     ///
     /// # Examples
     ///
@@ -170,6 +187,9 @@ impl TreeClose {
 
     /// Blocks until the tree is closed or `timeout` passes; whether it is
     /// closed.
+    ///
+    /// Returns `false` at the timeout while anything of the tree is held, the
+    /// caller's own handles, iterators, snapshots and pins included.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn wait_timeout(&self, timeout: core::time::Duration) -> bool {

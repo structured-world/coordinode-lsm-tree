@@ -155,6 +155,31 @@ fn on_closed_runs_once_on_the_thread_that_drops_the_last_handle() -> crate::Resu
     Ok(())
 }
 
+// The last drop runs the callbacks inside a drop of the tree's own parts: a
+// callback that panics must neither unwind through that drop nor keep the
+// callbacks after it from running.
+#[test]
+fn a_panicking_callback_neither_escapes_the_drop_nor_skips_the_others() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open_standard(folder.path())?;
+    let clone = tree.clone();
+    let closed = tree.close();
+    closed.on_closed(|| panic!("a callback that fails"));
+    let ran = Arc::new(AtomicUsize::new(0));
+    {
+        let ran = Arc::clone(&ran);
+        closed.on_closed(move || {
+            ran.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(clone)));
+    assert!(dropped.is_ok(), "the panic escaped the drop");
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the second callback ran");
+    assert!(closed.is_closed());
+    Ok(())
+}
+
 // A weak handle is what a monitor holds: it must not keep the tree open, and
 // gives nothing back once the tree is closed.
 #[test]
