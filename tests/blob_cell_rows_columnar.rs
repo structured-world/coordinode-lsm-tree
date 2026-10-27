@@ -183,10 +183,11 @@ fn cell_rows_survive_compaction_and_reopen_in_columnar_tables() -> lsm_tree::Res
     );
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
+    // Charged once and dropped by the same install: a file is dead only when
+    // its charges equal its size.
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.stale_blob_bytes(), 4_096, "the body is charged once");
-    tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.blob_file_count(), 0);
+    assert_eq!(tree.blob_file_count(), 0, "the body is charged once");
+    assert_eq!(tree.stale_blob_bytes(), 0);
     Ok(())
 }
 

@@ -212,14 +212,14 @@ fn a_shared_object_is_charged_once_when_its_last_holder_goes() -> lsm_tree::Resu
     );
 
     // A plain overwrite lets go of the object: it is charged once, not once
-    // per version that held it, and the next install drops the file, which
-    // holds nothing else.
+    // per version that held it, and the install that charges it drops the
+    // file, which holds nothing else. A file is dead only when its charges
+    // equal its size, so one charged twice would stay.
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
-    tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
+    assert_eq!(tree.blob_file_count(), 0, "the object is charged once");
+    assert_eq!(tree.stale_blob_bytes(), 0, "nothing of the file is left");
     assert_eq!(tree.get("doc", SeqNo::MAX)?.as_deref(), Some(&b"gone"[..]));
     Ok(())
 }
@@ -263,7 +263,10 @@ fn a_weak_delete_consumes_a_cell_row_and_a_separated_value() -> lsm_tree::Result
         0,
         "each weak delete leaves with the put it consumed"
     );
-    assert_eq!(tree.stale_blob_bytes(), 2 * 4_096);
+    // Both objects charged, in full: their file, which held nothing else,
+    // goes with the same install.
+    assert_eq!(tree.blob_file_count(), 0);
+    assert_eq!(tree.stale_blob_bytes(), 0);
     for key in ["doc", "plain"] {
         assert_eq!(tree.get(key, SeqNo::MAX)?, None);
     }
@@ -1043,15 +1046,16 @@ fn an_interrupted_publication_loses_and_leaks_no_object() -> lsm_tree::Result<()
     );
 
     // The compaction runs again, then the object's last holder goes: it is
-    // charged once and its file is reclaimed.
+    // charged once and its file is reclaimed by the same install. A file is
+    // dead only when its charges equal its size, so a leaked or doubly
+    // charged object would keep it.
     tree.major_compact(64_000_000, SeqNo::MAX)?;
     assert_eq!(tree.stale_blob_bytes(), 0);
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
     tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
-    tree.major_compact(64_000_000, SeqNo::MAX)?;
-    assert_eq!(tree.blob_file_count(), 0, "no object leaked");
+    assert_eq!(tree.blob_file_count(), 0, "the object is charged once");
+    assert_eq!(tree.stale_blob_bytes(), 0, "no object leaked");
     Ok(())
 }
 

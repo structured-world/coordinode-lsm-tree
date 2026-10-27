@@ -337,6 +337,48 @@ fn relocated_values_are_charged_to_compaction_blob_files() -> lsm_tree::Result<(
     Ok(())
 }
 
+/// A blob file whose every value a compaction deletes goes with that
+/// compaction's install, which writes nothing to the blob folder for it: the
+/// file is removed, not rewritten, and a removal charges the medium no bytes,
+/// so the write budget pays only for the tables the compaction writes and no
+/// second compaction is needed to reclaim the file.
+#[test]
+fn an_emptied_blob_file_goes_without_a_byte_written_for_it() -> lsm_tree::Result<()> {
+    let (fs, stats) = counted(MemFs::new());
+    let tree = config("/db", fs)
+        .with_kv_separation(Some(lsm_tree::KvSeparationOptions::default()))
+        .blob_compression(lsm_tree::CompressionType::None)
+        .open()?;
+    let value = b"payload!".repeat(4_096);
+    for i in 0..64u64 {
+        tree.insert(format!("key{i:05}"), &value, i);
+    }
+    tree.flush_active_memtable(0)?;
+    for i in 0..64u64 {
+        tree.remove(format!("key{i:05}"), 64 + i);
+    }
+    tree.flush_active_memtable(0)?;
+    let before = stats.snapshot();
+
+    tree.major_compact(64_000_000, SeqNo::MAX)?;
+    assert_eq!(0, tree.blob_file_count(), "the emptied blob file stays");
+    tree.close().wait();
+
+    let compacted = stats.snapshot().since(&before).expect("one counter set");
+    assert_eq!(
+        compacted.origin(WriteOrigin::CompactionBlob),
+        FileWrites::default(),
+        "the compaction wrote to the blob folder"
+    );
+    assert_eq!(compacted.directory.cloned_bytes, 0);
+    assert!(
+        compacted.directory.removed >= 1,
+        "the blob file was removed: {compacted:?}"
+    );
+    assert_eq!(compacted.unattributed, FileWrites::default());
+    Ok(())
+}
+
 /// A manifest whose edit log rotates writes a snapshot per rotation: two files
 /// made, the snapshot and its empty log, and the snapshot renamed into place,
 /// all charged to the manifest.

@@ -37,25 +37,19 @@ fn blob_tree_major_compact_gc_stats() -> lsm_tree::Result<()> {
 
         tree.flush_active_memtable(0)?;
 
-        // Blob file has no fragmentation before compaction (in stats)
-        // so it is not rewritten
+        // Blob file has no fragmentation before compaction (in stats), so it
+        // is not rewritten: the compaction expires "big":0, the only value in
+        // it, which charges the file in full, and its install drops the file.
         tree.major_compact(64_000_000, 1_000)?;
         assert_eq!(1, tree.table_count());
-        assert_eq!(2, tree.blob_file_count());
-
-        let gc_stats = tree.current_version().gc_stats().clone();
-
-        // "big":0 is expired
+        assert_eq!(1, tree.blob_file_count());
         assert_eq!(
-            &{
-                let mut map = lsm_tree::HashMap::default();
-                let size = big_value.len() as u64;
-                map.insert(0, FragmentationEntry::new(1, size, size));
-                map
-            },
-            &*gc_stats,
+            &lsm_tree::HashMap::default(),
+            &*tree.current_version().gc_stats().clone()
         );
-        assert_eq!(big_value.len() as u64, tree.stale_blob_bytes());
+        assert_eq!(0, tree.stale_blob_bytes());
+        let value = tree.get("big", SeqNo::MAX)?.expect("should exist");
+        assert_eq!(&*value, new_big_value);
     }
 
     Ok(())

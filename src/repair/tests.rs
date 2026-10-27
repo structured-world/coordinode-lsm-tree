@@ -15549,14 +15549,15 @@ fn repair_hands_an_object_whose_owner_is_lost_to_the_oldest_borrower_left() -> c
         tree.get("doc", crate::MAX_SEQNO)?.as_deref(),
         Some(&framed(&[b"final", &body])[..])
     );
-    // The borrower now owns the body: overwritten, it is charged once, and
-    // the next install drops the file, which held nothing else.
+    // The borrower now owns the body: overwritten, it is charged, and the
+    // install that charges it drops the file, which held nothing else. A file
+    // is dead only when its charges equal its size: an object no row owned
+    // would never be charged, and the file would stay.
     tree.insert("doc", "gone", 2);
     tree.flush_active_memtable(0)?;
     tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
-    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged");
-    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
-    assert_eq!(tree.blob_file_count(), 0, "the file held only the object");
+    assert_eq!(tree.blob_file_count(), 0, "the object is charged");
+    assert_eq!(tree.stale_blob_bytes(), 0, "the file held only the object");
     Ok(())
 }
 
@@ -15695,17 +15696,17 @@ fn repair_hands_a_lost_owners_object_to_its_oldest_borrower_across_tables() -> c
     );
 
     // Overwritten, `doc`'s body is charged once, by the one row that owns it,
-    // and its file goes; `kept`'s body, owned as before, is not charged.
+    // and its file goes with the same install (a file is dead only when its
+    // charges equal its size); `kept`'s body, owned as before, is not charged.
     tree.insert("doc", "gone", 10);
     tree.flush_active_memtable(0)?;
-    tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
-    assert_eq!(tree.stale_blob_bytes(), 4_096, "the object is charged once");
     tree.major_compact(64_000_000, crate::MAX_SEQNO)?;
     assert_eq!(
         tree.blob_file_count(),
         2,
         "the file that held only the object goes; `kept`'s and `other`'s stay"
     );
+    assert_eq!(tree.stale_blob_bytes(), 0, "`kept`'s body is not charged");
     Ok(())
 }
 

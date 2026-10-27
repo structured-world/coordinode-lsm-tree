@@ -696,4 +696,19 @@ impl BlobFile {
             stale_bytes == all_bytes
         })
     }
+
+    /// [`Self::is_dead`] against `stats` with `pass`, the charges of an
+    /// install not merged into them yet, added: whether the install that lands
+    /// `pass` leaves the file dead. Reads the two maps in place, with no merged
+    /// copy made.
+    pub(crate) fn is_dead_after(&self, stats: &FragmentationMap, pass: &FragmentationMap) -> bool {
+        let (before, now) = (stats.get(&self.id()), pass.get(&self.id()));
+        if before.is_none() && now.is_none() {
+            return false;
+        }
+        // Each charge is at most the file's size, far below `u64::MAX`, so the
+        // sum cannot overflow.
+        let charged = before.map_or(0, |e| e.bytes) + now.map_or(0, |e| e.bytes);
+        charged == self.0.meta.total_uncompressed_bytes
+    }
 }
