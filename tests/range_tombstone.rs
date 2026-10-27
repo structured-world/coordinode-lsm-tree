@@ -1464,3 +1464,118 @@ fn range_tombstone_disjoint_survives_recovery_for_narrow_scans() -> lsm_tree::Re
 
     Ok(())
 }
+
+/// A compaction output cuts its range tombstones to its own keys. Its blocks
+/// may still be compressing on worker threads when it does, and a cut taken
+/// at the last block written so far left the keys of those blocks uncovered:
+/// here the output copies `k0`'s block from an earlier compaction and writes
+/// `k1` and `k3` after it, and `k3`, deleted before the merge, came back.
+#[test]
+fn range_tombstone_covers_every_key_of_an_output_after_a_copied_block() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = open_tree(folder.path());
+
+    tree.insert("k0", "a", 0);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    tree.insert("k3", "b", 1);
+    tree.remove_range("k0", "k4", 2);
+    tree.insert("k1", "c", 3);
+    tree.flush_active_memtable(0)?;
+    assert_eq!(collect_keys(&tree, 10)?, vec![b"k1"]);
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert_eq!(collect_keys(&tree, 10)?, vec![b"k1"]);
+    assert_eq!(collect_keys_rev(&tree, 10)?, vec![b"k1"]);
+    assert_eq!(tree.get("k3", 10)?, None);
+    assert_eq!(tree.get("k0", 10)?, None);
+    Ok(())
+}
+
+/// The same cut with no copy: rows of two tables merge into many blocks, more
+/// than the workers hold in flight at once, so the output has written some of
+/// them and still compresses the last when it cuts its tombstone. Every key
+/// is older than the tombstone and must stay deleted.
+#[test]
+fn range_tombstone_covers_the_blocks_an_output_still_compresses() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .compaction_threads(2)
+    .open()?;
+
+    let key = |i: u32| format!("k{i:05}");
+    let value = |i: u32| format!("value-{i}-{}", "x".repeat(40));
+    let mut seqno = 0;
+    for parity in [0, 1] {
+        for i in (parity..4_000).step_by(2) {
+            tree.insert(key(i), value(i), seqno);
+            seqno += 1;
+        }
+        tree.flush_active_memtable(0)?;
+    }
+    tree.remove_range(key(0), key(4_000), seqno);
+    tree.flush_active_memtable(0)?;
+    let read = seqno + 1;
+    assert_eq!(collect_keys(&tree, read)?, Vec::<Vec<u8>>::new());
+
+    tree.major_compact(64 * 1024 * 1024, 0)?;
+
+    assert_eq!(collect_keys(&tree, read)?, Vec::<Vec<u8>>::new());
+    assert_eq!(collect_keys_rev(&tree, read)?, Vec::<Vec<u8>>::new());
+    for i in [0, 1_999, 3_998, 3_999] {
+        assert_eq!(tree.get(key(i), read)?, None, "key {i}");
+    }
+    Ok(())
+}
+
+/// A table holding only range tombstones gets one placeholder entry and a key
+/// range spanning its tombstones. Compressed on a worker thread, that entry's
+/// block landed after the range was set and narrowed it to the entry's own
+/// key, so the table claimed fewer keys than its tombstone deletes.
+#[cfg(feature = "lz4")]
+#[test]
+fn range_tombstone_alone_in_a_compressed_table_keeps_its_key_range() -> lsm_tree::Result<()> {
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_compression_policy(lsm_tree::config::CompressionPolicy::all(
+        lsm_tree::CompressionType::Lz4,
+    ))
+    .compaction_threads(2)
+    .open()?;
+
+    tree.insert("m", "old", 1);
+    tree.flush_active_memtable(0)?;
+    tree.remove_range("a", "z", 2);
+    tree.flush_active_memtable(0)?;
+
+    let ranges: Vec<(Vec<u8>, Vec<u8>)> = tree
+        .current_version()
+        .iter_tables()
+        .map(|table| {
+            let range = &table.metadata.key_range;
+            (range.min().to_vec(), range.max().to_vec())
+        })
+        .collect();
+    assert!(
+        ranges.contains(&(b"a".to_vec(), b"z".to_vec())),
+        "the tombstone's table spans it: {ranges:?}",
+    );
+    assert_eq!(tree.get("m", 3)?, None);
+    assert_eq!(collect_keys(&tree, 3)?, Vec::<Vec<u8>>::new());
+    assert_eq!(
+        collect_range_keys(&tree, "l"..="n", 3)?,
+        Vec::<Vec<u8>>::new()
+    );
+    Ok(())
+}

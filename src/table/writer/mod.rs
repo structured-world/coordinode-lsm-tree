@@ -3997,8 +3997,9 @@ impl Writer {
     /// index order), and every block still being compressed on worker threads,
     /// which would otherwise be written over the direct block's bytes.
     /// `spill_block` only drains down to the parallel cap, so the full drain is
-    /// separate. A no-op when nothing is pending.
-    fn settle_pending_blocks(&mut self) -> crate::Result<()> {
+    /// separate. A no-op when nothing is pending. Once it returns, the table's
+    /// key range reaches its last key written.
+    pub(crate) fn settle_pending_blocks(&mut self) -> crate::Result<()> {
         self.spill_block()?;
         #[cfg(feature = "std")]
         while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
@@ -4724,14 +4725,9 @@ impl Writer {
         #[cfg(feature = "std")]
         use std::io::Write;
 
-        self.spill_block()?;
-
-        // Drain any blocks still being compressed on worker threads before we
-        // read item_count or write the index, filter and metadata.
-        #[cfg(feature = "std")]
-        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
-            self.drain_one_parallel()?;
-        }
+        // Every block written before item_count is read or the index, filter
+        // and metadata are written.
+        self.settle_pending_blocks()?;
 
         // No items and no range tombstones — delete the empty table file.
         if self.meta.item_count == 0 && self.range_tombstones.is_empty() {
@@ -4793,7 +4789,9 @@ impl Writer {
                     sentinel_key,
                     sentinel_seqno,
                 ))?;
-                self.spill_block()?;
+                // Written out now: its block, landing later, would set the key
+                // range back to the sentinel's own key over the one set below.
+                self.settle_pending_blocks()?;
 
                 // Restore seqno bounds — sentinel seqno is derived from RT
                 // metadata, not from user data, so it should not shift the
@@ -4814,14 +4812,6 @@ impl Writer {
         if let Some((start, end)) = self.key_range_cover.take() {
             self.meta.first_key = Some(start);
             self.meta.last_key = Some(end);
-        }
-
-        // Drain any block submitted to the parallel pipeline after the initial
-        // drain above — notably the RT-only sentinel spill — so the index sees
-        // every data block before it is finalized.
-        #[cfg(feature = "std")]
-        while self.parallel.as_ref().map_or(0, BlockCompressor::pending) > 0 {
-            self.drain_one_parallel()?;
         }
 
         // The index and filter writers are taken out whole (their stand-ins
