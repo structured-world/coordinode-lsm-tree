@@ -663,6 +663,84 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
         }
         Ok(true)
     }
+
+    /// Moves each source whose back head is a version of `key` up to its
+    /// newest visible one, and refills its leaf with it, as `next_back()`
+    /// refills it. The head goes: it is older than what the source then
+    /// yields. The winner is the oldest version of `key` the sources hold,
+    /// so the sources are taken from it on, until one has nothing older to
+    /// pass.
+    ///
+    /// Only while the merge runs backward alone, the mirror of
+    /// [`Self::skip_front_past`]. Returns whether a head was replaced or
+    /// dropped with an error queued for `next_back()`.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
+        if self.forward_primed
+            || !self.backward_primed
+            || self.pending_forward_error.is_some()
+            || self.pending_backward_error.is_some()
+        {
+            return Ok(false);
+        }
+        let Self {
+            sources,
+            backward_tree,
+            pending_backward_error,
+            backward_vacated,
+            backward_parked_best,
+            ..
+        } = self;
+        let Some(tree) = backward_tree.as_mut() else {
+            return Ok(false);
+        };
+        let mut moved = false;
+        while let Some(slot) = tree.winner_slot() {
+            let at_key = tree.peek_slot(slot).is_some_and(|head| {
+                crate::comparator::same_user_key(&head.value.key.user_key, key)
+            });
+            if !at_key {
+                break;
+            }
+            let Some(source) = sources.get_mut(slot) else {
+                break;
+            };
+            match source.skip_back_to_newest(key, seqno) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    // The source is done, as when `next_back()` fails it; its
+                    // head was an older version, never the key's value.
+                    tree.pop_min();
+                    pending_backward_error.get_or_insert(e);
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                    moved = true;
+                    continue;
+                }
+            }
+            moved = true;
+            match MergeSource::next_back(source) {
+                Some(Ok(value)) => {
+                    tree.replace_min(MergerEntry {
+                        source: slot,
+                        value,
+                    });
+                }
+                Some(Err(e)) => {
+                    tree.pop_min();
+                    pending_backward_error.get_or_insert(e);
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                }
+                None => {
+                    tree.pop_min();
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                }
+            }
+        }
+        Ok(moved)
+    }
 }
 
 // `DoubleEndedIterator` is gated on `CoherentMergeSource`. The

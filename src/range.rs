@@ -111,6 +111,12 @@ impl<I: SkipKey> SkipKey for Visible<I> {
     fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
         self.inner.skip_front_past(key)
     }
+
+    /// The newest version this source's snapshot sees, which is what the
+    /// caller resolves the key from.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        self.inner.skip_back_to_newest(key, seqno.min(self.seqno))
+    }
 }
 
 /// A memtable's rows over a range.
@@ -144,6 +150,10 @@ impl SkipKey for MemtableRows<'_> {
     fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
         self.0.skip_front_past(key);
         Ok(true)
+    }
+
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        Ok(self.0.skip_back_to_newest(key, seqno))
     }
 }
 
@@ -507,6 +517,11 @@ impl<I: SkipKey, T> SkipKey for FilterPassReader<I, T> {
     /// versions it passes are no miss to count.
     fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
         self.inner.skip_front_past(key)
+    }
+
+    /// As [`Self::skip_front_past`]: the jump follows a version handed out.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        self.inner.skip_back_to_newest(key, seqno)
     }
 }
 
@@ -1457,6 +1472,15 @@ impl SkipKey for SeekableLeaf<'_> {
                 l.range.skip_front_past(key);
                 Ok(true)
             }
+        }
+    }
+
+    /// The newest version the leaf's snapshot sees, as its filter passes.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        match self {
+            SeekableLeaf::Table(l) => l.iter.skip_back_to_newest(key, seqno.min(l.seqno)),
+            SeekableLeaf::Run(l) => l.reader.skip_back_to_newest(key, seqno.min(l.seqno)),
+            SeekableLeaf::Memtable(l) => Ok(l.range.skip_back_to_newest(key, seqno.min(l.seqno))),
         }
     }
 }

@@ -274,6 +274,18 @@ impl crate::skip_key::SkipKey for RunReader {
             }
         }
     }
+
+    /// Moves the back up to `key`'s newest visible version in the table the
+    /// back reads. A table is cut only before a new key, so a key's versions
+    /// in a run all lie in one table.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
+        match (&mut self.hi_reader, &mut self.lo_reader) {
+            (Some(reader), _) => reader.skip_back_to_newest(key, seqno),
+            // The back reads the low table once the high one is used up.
+            (None, Some(reader)) if self.hi_initialized => reader.skip_back_to_newest(key, seqno),
+            _ => Ok(false),
+        }
+    }
 }
 
 impl DoubleEndedIterator for RunReader {

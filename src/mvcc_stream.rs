@@ -76,6 +76,14 @@ pub trait PassVersions<I> {
     ///
     /// The error the source met on the way.
     fn jump(inner: &mut I, key: &[u8]) -> crate::Result<bool>;
+
+    /// Moves the back of `inner` up to the newest version of `key` it holds,
+    /// past the older ones; `false` when it cannot, and the stream walks them.
+    ///
+    /// # Errors
+    ///
+    /// The error the source met on the way.
+    fn jump_back(inner: &mut I, key: &[u8]) -> crate::Result<bool>;
 }
 
 /// Walks every version of a resolved key: what a source that cannot jump
@@ -86,6 +94,10 @@ pub struct Walk;
 
 impl<I> PassVersions<I> for Walk {
     fn jump(_inner: &mut I, _key: &[u8]) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    fn jump_back(_inner: &mut I, _key: &[u8]) -> crate::Result<bool> {
         Ok(false)
     }
 }
@@ -100,6 +112,12 @@ pub struct Jump;
 impl<I: crate::skip_key::SkipKey> PassVersions<I> for Jump {
     fn jump(inner: &mut I, key: &[u8]) -> crate::Result<bool> {
         inner.skip_front_past(key)
+    }
+
+    /// The sources filter by their own snapshot; the stream sees only what
+    /// they pass.
+    fn jump_back(inner: &mut I, key: &[u8]) -> crate::Result<bool> {
+        inner.skip_back_to_newest(key, SeqNo::MAX)
     }
 }
 
@@ -670,6 +688,7 @@ impl<
         // the base Value needed by the merge function.
         let has_merge_op = self.merge_operator.is_some();
         self.key_entries_buf.clear();
+        let mut walked = 0usize;
 
         loop {
             let tail = fail_iter!(self.inner.next_back()?);
@@ -733,8 +752,26 @@ impl<
             // we don't yet know if the newest entry will be a MergeOperand.
             if has_merge_op {
                 self.key_entries_buf.push(tail);
+                continue;
             }
-            // Without merge operator: skip older versions (loop continues)
+            // Without merge operator: skip older versions (loop continues).
+            // Every `WALKED_BEFORE_JUMP` of them the back jumps up to the
+            // newest version the source holds. The peeked `prev` was handed
+            // over before that, so it is older than anything the source still
+            // holds and goes too. A merge keeps every operand, so it walks.
+            walked += 1;
+            if walked.is_multiple_of(WALKED_BEFORE_JUMP) && self.inner.front_unpeeked() {
+                match P::jump_back(self.inner.inner_mut(), &tail.key.user_key) {
+                    Ok(true) => self.inner.reset_back_peeked(),
+                    Ok(false) => {}
+                    Err(e) => {
+                        // As an error met while walking: the key's newer
+                        // versions are skipped, none resolves it.
+                        self.skip_back = Some(tail.key.user_key);
+                        return Some(Err(e));
+                    }
+                }
+            }
         }
     }
 }

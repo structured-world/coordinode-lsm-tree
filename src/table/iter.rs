@@ -147,6 +147,11 @@ impl OwnedDataBlockIter {
     fn skip_past(&mut self, key: &[u8]) -> bool {
         self.with_dependent_mut(|_, m| m.skip_past(key))
     }
+
+    /// See [`crate::table::data_block::Iter::trim_back_above`].
+    fn trim_back_above(&mut self, key: &[u8], seqno: SeqNo) -> bool {
+        self.with_dependent_mut(|_, m| m.trim_back_above(key, seqno))
+    }
 }
 
 impl Iterator for OwnedDataBlockIter {
@@ -250,6 +255,26 @@ impl ColumnarBlockIter {
         }
         false
     }
+
+    /// Moves `hi` down to just past the lowest remaining entry above
+    /// `(key, seqno)` in internal-key order; whether one is left.
+    fn trim_back_above(&mut self, key: &[u8], seqno: SeqNo) -> bool {
+        let cmp = self.comparator.as_ref();
+        let Some(window) = self.entries.get(self.lo..self.hi) else {
+            return false;
+        };
+        let first_above =
+            window.partition_point(|e| match cmp.compare(e.key.user_key.as_ref(), key) {
+                core::cmp::Ordering::Greater => false,
+                core::cmp::Ordering::Equal => e.key.seqno >= seqno,
+                core::cmp::Ordering::Less => true,
+            });
+        if first_above == window.len() {
+            return false;
+        }
+        self.hi = self.lo + first_above + 1;
+        true
+    }
 }
 
 #[cfg(feature = "columnar")]
@@ -320,6 +345,16 @@ impl BlockReader {
             Self::Row(r) => r.skip_past(key),
             #[cfg(feature = "columnar")]
             Self::Columnar(c) => c.skip_past(key),
+        }
+    }
+
+    /// Moves the back down to the lowest remaining entry above `(key,
+    /// seqno)`; whether one is left.
+    fn trim_back_above(&mut self, key: &[u8], seqno: SeqNo) -> bool {
+        match self {
+            Self::Row(r) => r.trim_back_above(key, seqno),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.trim_back_above(key, seqno),
         }
     }
 }
@@ -443,6 +478,12 @@ pub struct Iter {
     hi_offset: BlockOffset,
     hi_data_block: Option<BlockReader>,
 
+    /// A block handle taken from the back of the index but not yet read: the
+    /// block right before the high block, which a backward jump looked at
+    /// to learn where the version it seeks starts. Either end reads it
+    /// before going on to the index.
+    back_held: Option<crate::table::KeyedBlockHandle>,
+
     range: Bounds,
 
     /// Set on unrecoverable block-init error so subsequent `next()` /
@@ -525,6 +566,8 @@ impl Iter {
 
             hi_offset: BlockOffset(u64::MAX),
             hi_data_block: None,
+
+            back_held: None,
 
             range: (None, None),
             poisoned: false,
@@ -1062,6 +1105,27 @@ impl Iter {
         ok
     }
 
+    /// The next block handle the front reads: from the index, then the one a
+    /// backward jump holds, which lies after everything the index has left.
+    fn next_front_handle(&mut self) -> Option<crate::Result<crate::table::KeyedBlockHandle>> {
+        let read = self.fd.lookup();
+        let handle = self.index_iter.next_with(&read);
+        self.fd.keep(read);
+        handle.or_else(|| self.back_held.take().map(Ok))
+    }
+
+    /// The next block handle the back reads: the one a backward jump holds,
+    /// then the index.
+    fn next_back_handle(&mut self) -> Option<crate::Result<crate::table::KeyedBlockHandle>> {
+        if let Some(handle) = self.back_held.take() {
+            return Some(Ok(handle));
+        }
+        let read = self.fd.lookup();
+        let handle = self.index_iter.next_back_with(&read);
+        self.fd.keep(read);
+        handle
+    }
+
     /// The reader of the data block `handle` names, clamped to the range;
     /// `None` when a delete mask leaves nothing of it.
     fn open_front_block(
@@ -1105,6 +1169,140 @@ impl Iter {
         Ok(Some(reader))
     }
 
+    /// The reader of the data block `handle` names for the back, clamped to
+    /// the range; `None` when a delete mask leaves nothing of it.
+    fn open_back_block(
+        &self,
+        handle: &crate::table::KeyedBlockHandle,
+    ) -> crate::Result<Option<BlockReader>> {
+        // Partial-decode fast path: for a large multi-inner-block zstd block
+        // whose recorded layout lets us skip the inner blocks past the query
+        // upper bound, decode only the covering prefix. Falls back to a full
+        // load (which checks the block cache) otherwise. Positional masking
+        // needs the whole block, so a masked table never takes it.
+        #[cfg(feature = "zstd")]
+        let partial = if self.delete_mask.is_some() {
+            None
+        } else {
+            self.try_partial_block(handle)?
+        };
+        #[cfg(not(feature = "zstd"))]
+        let partial: Option<DataBlock> = None;
+
+        let block = if let Some(db) = partial {
+            BlockSource::Row(db)
+        } else {
+            match self.load_and_resolve(handle.as_ref())? {
+                Some(b) => b,
+                None => return Ok(None),
+            }
+        };
+
+        let mut reader = create_data_block_reader(block, self.comparator.clone())?;
+
+        // The high side first, so `next_back` never yields an entry above the
+        // upper bound, then the low side, so it never steps below the lower.
+        if let Some(bound) = &self.range.1 {
+            reader.seek_upper_bound(bound, SeqNo::MAX);
+        }
+        if let Some(bound) = &self.range.0 {
+            reader.seek_lower_bound(bound, SeqNo::MAX);
+        }
+        Ok(Some(reader))
+    }
+
+    /// Moves the back up to the newest version of `key` visible below
+    /// `seqno` (see [`crate::skip_key::SkipKey::skip_back_to_newest`]).
+    ///
+    /// The index's handles name each data block's last entry. A block whose
+    /// predecessor ends above the newest visible version's position holds only
+    /// older versions of `key` and is passed on the index alone, never loaded;
+    /// the handle that showed it is held for the next read from either end.
+    /// The block the version is in is then trimmed in place.
+    ///
+    /// # Errors
+    ///
+    /// An error reading the index or a block, which fails the iterator as
+    /// `next_back()` would.
+    pub(crate) fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        // A masked table's handles may name a deleted last row, which says
+        // nothing of the rows that survive.
+        if self.poisoned || self.delete_mask.is_some() {
+            return Ok(false);
+        }
+        // The table stores seqnos less its global seqno, so a stored seqno is
+        // visible below `seqno - global_seqno`; below a snapshot at or under
+        // the global seqno nothing is.
+        let Some(seqno) = seqno.checked_sub(self.global_seqno) else {
+            return Ok(false);
+        };
+        if !self.index_initialized && !self.init_index() {
+            return Ok(false);
+        }
+        // An entry `above` lies past `(key, seqno)` in internal-key order: a
+        // later key, or a version of `key` the snapshot sees. The version
+        // sought is the lowest such entry. A cold path: the comparator is
+        // cloned so the closure does not hold `self`.
+        let comparator = self.comparator.clone();
+        let above = |end_key: &[u8], end_seqno: SeqNo| match comparator.compare(end_key, key) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => end_seqno < seqno,
+            core::cmp::Ordering::Less => false,
+        };
+
+        // The block the back reads next: the high block while it is open,
+        // or a handle not yet read.
+        let mut pending: Option<crate::table::KeyedBlockHandle> = None;
+        loop {
+            let Some(handle) = self.next_back_handle() else {
+                break;
+            };
+            let handle = match handle {
+                Ok(h) => h,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            };
+            if above(handle.end_key(), handle.seqno()) {
+                // Every entry after that block lies above its last one, itself
+                // above `(key, seqno)`: the back's block holds only versions
+                // older than the one sought.
+                self.hi_data_block = None;
+                pending = Some(handle);
+            } else {
+                // The version sought lies after that block.
+                self.back_held = Some(handle);
+                break;
+            }
+        }
+
+        if let Some(handle) = pending {
+            match self.open_back_block(&handle) {
+                Ok(reader) => {
+                    self.hi_offset = handle.offset();
+                    self.hi_data_block = reader;
+                }
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            }
+        }
+
+        // The back reads the high block, or the low block once the index is
+        // used up and no high block is open.
+        let block = match &mut self.hi_data_block {
+            Some(block) => block,
+            None if self.back_held.is_none() => match &mut self.lo_data_block {
+                Some(block) => block,
+                None => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+        Ok(block.trim_back_above(key, seqno))
+    }
+
     /// Moves the front past every entry whose user key is `key` (see
     /// [`crate::skip_key::SkipKey`]); whether an entry of a later key is left.
     /// A data block whose last key is `key` holds nothing else and is passed
@@ -1128,10 +1326,7 @@ impl Iter {
         }
 
         loop {
-            let read = self.fd.lookup();
-            let handle = self.index_iter.next_with(&read);
-            self.fd.keep(read);
-            let Some(handle) = handle else {
+            let Some(handle) = self.next_front_handle() else {
                 // The blocks left were read from the back: the front goes on
                 // in the last of them.
                 return Ok(self
@@ -1171,6 +1366,10 @@ impl crate::skip_key::SkipKey for Iter {
     fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
         self.skip_past(key).map(|_| true)
     }
+
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: SeqNo) -> crate::Result<bool> {
+        Self::skip_back_to_newest(self, key, seqno)
+    }
 }
 
 impl Iterator for Iter {
@@ -1200,10 +1399,7 @@ impl Iterator for Iter {
         }
 
         loop {
-            let read = self.fd.lookup();
-            let handle = self.index_iter.next_with(&read);
-            self.fd.keep(read);
-            let Some(handle) = handle else {
+            let Some(handle) = self.next_front_handle() else {
                 // No more block handles coming from the index.  Flush any pending items buffered on
                 // the high side (used by reverse iteration) before signalling completion.
                 if let Some(block) = &mut self.hi_data_block
@@ -1302,10 +1498,7 @@ impl DoubleEndedIterator for Iter {
         }
 
         loop {
-            let read = self.fd.lookup();
-            let handle = self.index_iter.next_back_with(&read);
-            self.fd.keep(read);
-            let Some(handle) = handle else {
+            let Some(handle) = self.next_back_handle() else {
                 // Once we exhaust the index in reverse order, flush any items that were buffered on
                 // the low side (set when iterating forward first) before signalling completion.
                 if let Some(block) = &mut self.lo_data_block
@@ -1330,49 +1523,12 @@ impl DoubleEndedIterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Partial-decode fast path: for a large multi-inner-block zstd block
-            // whose recorded layout lets us skip the inner blocks past the query
-            // upper bound, decode only the covering prefix. Falls back to a full
-            // load (which checks the block cache) otherwise.
-            #[cfg(feature = "zstd")]
-            let partial = if self.delete_mask.is_some() {
-                // Positional masking needs the whole block; skip the partial-decode
-                // fast path so deleted rows are dropped during reconstruction.
-                None
-            } else {
-                match self.try_partial_block(&handle) {
-                    Ok(p) => p,
-                    Err(e) => return self.poison(e),
-                }
-            };
-            #[cfg(not(feature = "zstd"))]
-            let partial: Option<DataBlock> = None;
-
-            let block = if let Some(db) = partial {
-                BlockSource::Row(db)
-            } else {
-                match self.load_and_resolve(handle.as_ref()) {
-                    Ok(Some(b)) => b,
-                    // The block was wholly deleted by the mask; skip to the next.
-                    Ok(None) => continue,
-                    Err(e) => return self.poison(e),
-                }
-            };
-
-            let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
-                Ok(r) => r,
+            let mut reader = match self.open_back_block(&handle) {
+                Ok(Some(r)) => r,
+                // The block was wholly deleted by the mask; skip to the next.
+                Ok(None) => continue,
                 Err(e) => return self.poison(e),
             };
-
-            // Reverse path: clamp the high side first so `next_back` never yields an entry above
-            // the upper bound, then apply the low-side seek to avoid stepping below the lower
-            // bound during reverse traversal.
-            if let Some(bound) = &self.range.1 {
-                reader.seek_upper_bound(bound, SeqNo::MAX);
-            }
-            if let Some(bound) = &self.range.0 {
-                reader.seek_lower_bound(bound, SeqNo::MAX);
-            }
 
             let item = reader.next_back();
 

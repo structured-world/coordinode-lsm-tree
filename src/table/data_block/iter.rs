@@ -5,7 +5,7 @@
 use crate::{
     InternalValue, SeqNo,
     comparator::SharedComparator,
-    double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt},
+    double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt, MaybePeeked},
     table::{
         block::{Decoder, ParsedItem},
         data_block::DataBlockParsedItem,
@@ -181,6 +181,47 @@ impl<'a> Iter<'a> {
                 return true;
             }
             self.decoder.next();
+        }
+    }
+
+    /// Moves the back down to the lowest remaining entry above `(needle,
+    /// seqno)` in internal-key order, a later key or a version of `needle`
+    /// below `seqno`, dropping the entries after it; whether the next
+    /// `next_back` yields such an entry. The entries dropped are compared as
+    /// parsed, never materialized, and an entry the back has handed out is
+    /// never brought back.
+    pub fn trim_back_above(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
+        let cmp = self.comparator.as_ref();
+        let above =
+            |item: &DataBlockParsedItem, bytes: &[u8]| match item.compare_key(needle, bytes, cmp) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => item.seqno() < seqno,
+                core::cmp::Ordering::Less => false,
+            };
+        let head_above = |key: &[u8], head_seqno: SeqNo| match cmp.compare(key, needle) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => head_seqno < seqno,
+            core::cmp::Ordering::Less => false,
+        };
+
+        // A peeked back entry is the next one out and sits past everything
+        // the decoder still holds.
+        match self.decoder.take_back_peeked() {
+            MaybePeeked::Unpeeked => self.decoder.inner_mut().trim_back_above(head_above, above),
+            MaybePeeked::Peeked(Some(item)) if above(&item, self.bytes) => {
+                // It goes only if the decoder still holds a lower entry above.
+                if !self.decoder.inner_mut().trim_back_above(head_above, above) {
+                    self.decoder
+                        .put_back_peeked(MaybePeeked::Peeked(Some(item)));
+                }
+                true
+            }
+            // Nothing left, or the next entry is not above, and nothing
+            // before it is: nothing is dropped.
+            peeked @ MaybePeeked::Peeked(_) => {
+                self.decoder.put_back_peeked(peeked);
+                false
+            }
         }
     }
 

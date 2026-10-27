@@ -180,7 +180,7 @@ struct LoScanner {
     base_seqno: SeqNo,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct HiScanner {
     offset: usize,
     ptr_idx: usize,
@@ -1223,6 +1223,155 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
             return;
         };
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "blocks do not even come close to 4 GiB in size"
+        )]
+        if Self::parse_current_item(&mut reader, offset, self.hi_base(), is_restart, entries_end)
+            .is_some()
+        {
+            self.hi_scanner.offset = offset + reader.position() as usize;
+        }
+    }
+
+    /// Moves the back cursor down to the lowest remaining item `above` holds
+    /// for, dropping the items after it; returns whether the next
+    /// `next_back` yields an item `above` holds for.
+    ///
+    /// `above` must hold for an upper part of the block: false up to some
+    /// item, true from it on. `head_above` is the same test on a restart
+    /// head's `(key, seqno)`, which a binary search over the restart heads
+    /// asks. Items the back has handed out are never brought back: an
+    /// interval is refilled only below the one the back stands in. Nothing
+    /// is dropped when no remaining item is above, or only one is.
+    pub fn trim_back_above(
+        &mut self,
+        head_above: impl Fn(&[u8], SeqNo) -> bool,
+        above: impl Fn(&Parsed, &[u8]) -> bool,
+    ) -> bool {
+        // The back's next item sits on top of the stack: load the interval
+        // below a used-up one, as `next_back` would.
+        if self.hi_scanner.stack.is_empty() {
+            if self.hi_scanner.ptr_idx == 0 || self.hi_scanner.ptr_idx == usize::MAX {
+                return false;
+            }
+            self.hi_scanner.ptr_idx -= 1;
+            self.fill_stack();
+            if self.hi_scanner.stack.is_empty() {
+                return false;
+            }
+        }
+        let current = self.hi_scanner.ptr_idx;
+
+        // The heads up to `below` are not above: the lowest item above is in
+        // the last of them, past its head, or is the next one's head.
+        let Some(below) = self.partition_count(|key, seqno| !head_above(key, seqno)) else {
+            return false;
+        };
+        let Some(last_below) = below.checked_sub(1) else {
+            // Every head is above: the lowest item above is the first one.
+            if current != 0 {
+                self.hi_scanner.ptr_idx = 0;
+                self.fill_stack();
+            }
+            return self.keep_head_only();
+        };
+        match last_below.cmp(&current) {
+            // The lowest item above is past what the back still holds, so
+            // nothing it holds is above.
+            core::cmp::Ordering::Greater => false,
+            core::cmp::Ordering::Equal => self.trim_stack_above(&above),
+            core::cmp::Ordering::Less => {
+                let held = self.hi_scanner.clone();
+                self.hi_scanner.ptr_idx = last_below;
+                self.fill_stack();
+                if self.top_above(&above) == Some(true) {
+                    return self.trim_stack_above(&above);
+                }
+                // Nothing in that interval is above: the lowest item above
+                // is the next head. The interval the back stands in keeps
+                // only its head; one below it is loaded whole first.
+                let next = last_below + 1;
+                if next == current {
+                    self.hi_scanner = held;
+                } else {
+                    self.hi_scanner.ptr_idx = next;
+                    self.fill_stack();
+                }
+                self.keep_head_only()
+            }
+        }
+    }
+
+    /// How many restart heads `pred` holds for, `pred` being true up to some
+    /// head and false from it on.
+    fn partition_count(&self, pred: impl Fn(&[u8], SeqNo) -> bool) -> Option<usize> {
+        let binary_index = self.get_binary_index_reader()?;
+        let entries_end = self.entries_end()?;
+        let mut left = 0usize;
+        let mut right = binary_index.len();
+        while left < right {
+            let mid = usize::midpoint(left, right);
+            let (key, seqno) = self.get_key_at(binary_index.get(mid), entries_end)?;
+            if pred(key, seqno) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        Some(left)
+    }
+
+    /// The item at `depth` in the back's stack, parsed.
+    fn stack_item(&self, depth: usize) -> Option<Parsed> {
+        let &offset = self.hi_scanner.stack.get(depth)?;
+        let entries_end = self.entries_end()?;
+        let mut reader = Self::reader_at(self.entries(), offset)?;
+        Self::parse_current_item(&mut reader, offset, self.hi_base(), depth == 0, entries_end)
+    }
+
+    /// Whether the back's next item is above; `None` when there is none.
+    fn top_above(&self, above: &impl Fn(&Parsed, &[u8]) -> bool) -> Option<bool> {
+        let depth = self.hi_scanner.stack.len().checked_sub(1)?;
+        self.stack_item(depth)
+            .map(|item| above(&item, self.entries()))
+    }
+
+    /// Pops the stack while the item below the top is above too, so the top
+    /// is the lowest item above in the interval; whether the top is above.
+    fn trim_stack_above(&mut self, above: &impl Fn(&Parsed, &[u8]) -> bool) -> bool {
+        while let Some(depth) = self.hi_scanner.stack.len().checked_sub(2) {
+            match self.stack_item(depth) {
+                Some(item) if above(&item, self.entries()) => {
+                    self.hi_scanner.stack.pop();
+                }
+                _ => break,
+            }
+        }
+        self.end_back_at_top();
+        self.top_above(above).unwrap_or(false)
+    }
+
+    /// Keeps only the interval's head, which is above; `true`.
+    fn keep_head_only(&mut self) -> bool {
+        self.hi_scanner.stack.truncate(1);
+        self.end_back_at_top();
+        !self.hi_scanner.stack.is_empty()
+    }
+
+    /// Ends what the front may read just past the back's next item, as a
+    /// trimmed upper bound does.
+    fn end_back_at_top(&mut self) {
+        let Some(&offset) = self.hi_scanner.stack.last() else {
+            return;
+        };
+        let Some(entries_end) = self.entries_end() else {
+            return;
+        };
+        let is_restart = self.hi_scanner.stack.len() == 1;
+        let Some(mut reader) = Self::reader_at(self.entries(), offset) else {
+            return;
+        };
         #[expect(
             clippy::cast_possible_truncation,
             reason = "blocks do not even come close to 4 GiB in size"

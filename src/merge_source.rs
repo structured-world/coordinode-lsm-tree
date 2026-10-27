@@ -253,6 +253,11 @@ impl<I: crate::skip_key::SkipKey> crate::skip_key::SkipKey for CoherentIterSourc
     fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
         self.iter.skip_front_past(key)
     }
+
+    #[inline]
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
+        self.iter.skip_back_to_newest(key, seqno)
+    }
 }
 
 #[cfg(test)]

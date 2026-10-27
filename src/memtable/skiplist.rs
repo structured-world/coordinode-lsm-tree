@@ -1485,6 +1485,36 @@ impl Range<'_> {
             self.front = next;
         }
     }
+
+    /// Moves the back up to the newest version of `user_key` below `seqno`
+    /// with one search from the top of the list; whether the next backward
+    /// step yields it. Only a back standing on an older version moves, and
+    /// never past the front.
+    pub fn skip_back_to_newest(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
+        if self.done || !self.back_init || self.back == UNSET {
+            return false;
+        }
+        // Versions sort by descending seqno: the first node at or after
+        // `(user_key, seqno - 1)` is the newest one below `seqno`.
+        let Some(newest_seqno) = seqno.checked_sub(1) else {
+            return false;
+        };
+        let node = self.map.seek_ge_parts(user_key, newest_seqno);
+        if node == UNSET
+            || !crate::comparator::same_user_key(self.map.node_user_key_bytes(node), user_key)
+            || self.map.compare_nodes(node, self.back) == CmpOrdering::Greater
+            || self.map.back_passed_front(node, self.front)
+        {
+            return false;
+        }
+        self.back = node;
+        // The batch held the nodes below the old back; the new back's are
+        // fetched on the next step.
+        if let Some(batch) = &mut self.batch {
+            batch.clear();
+        }
+        true
+    }
 }
 
 impl<'a> Iterator for Range<'a> {
