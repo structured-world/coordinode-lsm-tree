@@ -517,6 +517,12 @@ path = "benches/flush.rs"
 required-features = ["zstd"]
 
 [[bench]]
+name = "overwrite"
+harness = false
+path = "benches/overwrite.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "flush_split"
 harness = false
 path = "benches/flush_split.rs"
