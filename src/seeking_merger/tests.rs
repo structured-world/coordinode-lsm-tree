@@ -726,3 +726,260 @@ fn adopting_a_parked_leaf_keeps_the_forward_stream_sorted() {
 
     assert_eq!(keys, ["a", "b", "c"], "the forward stream must stay sorted");
 }
+
+/// What a [`JumpSource`] does when the merge asks it to jump.
+#[derive(Clone, Copy)]
+enum OnJump {
+    /// Passes the key's versions, as a table does.
+    Pass,
+    /// Cannot jump, its position unchanged.
+    Refuse,
+    /// Fails, as a table does when the index read on the way fails.
+    Fail,
+    /// Passes the versions, then fails the pull that refills its leaf.
+    FailRefill,
+}
+
+/// A coherent source over a sorted queue that jumps over one key's versions
+/// as `on_jump` says.
+struct JumpSource {
+    items: VecDeque<InternalValue>,
+    on_jump: OnJump,
+    fail_next_pull: bool,
+}
+
+impl JumpSource {
+    fn new(items: impl IntoIterator<Item = InternalValue>, on_jump: OnJump) -> Self {
+        Self {
+            items: items.into_iter().collect(),
+            on_jump,
+            fail_next_pull: false,
+        }
+    }
+
+    fn pull(&mut self, from_back: bool) -> Option<IterItem> {
+        if core::mem::take(&mut self.fail_next_pull) {
+            return Some(Err(jump_error()));
+        }
+        if from_back {
+            self.items.pop_back().map(Ok)
+        } else {
+            self.items.pop_front().map(Ok)
+        }
+    }
+
+    fn at(&self, idx: usize, key: &[u8]) -> bool {
+        self.items
+            .get(idx)
+            .is_some_and(|item| &*item.key.user_key == key)
+    }
+
+    /// Whether the jump goes ahead, failing or arming the failed refill as
+    /// `on_jump` says.
+    fn jumps(&mut self) -> crate::Result<bool> {
+        match self.on_jump {
+            OnJump::Pass => Ok(true),
+            OnJump::Refuse => Ok(false),
+            OnJump::Fail => Err(jump_error()),
+            OnJump::FailRefill => {
+                self.fail_next_pull = true;
+                Ok(true)
+            }
+        }
+    }
+}
+
+fn jump_error() -> crate::Error {
+    crate::Error::Io(crate::io::Error::other("jump"))
+}
+
+impl MergeSource for JumpSource {
+    fn next(&mut self) -> Option<IterItem> {
+        self.pull(false)
+    }
+
+    fn next_back(&mut self) -> Option<IterItem> {
+        self.pull(true)
+    }
+
+    fn seek(&mut self, _target: &InternalKey) -> crate::Result<()> {
+        Ok(())
+    }
+}
+impl CoherentMergeSource for JumpSource {}
+
+impl crate::skip_key::SkipKey for JumpSource {
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        if !self.jumps()? {
+            return Ok(false);
+        }
+        while self.at(0, key) {
+            self.items.pop_front();
+        }
+        Ok(true)
+    }
+
+    fn skip_back_to_newest(&mut self, key: &[u8], _seqno: u64) -> crate::Result<bool> {
+        if !self.jumps()? {
+            return Ok(false);
+        }
+        // Keeps the newest version: the one with no version of `key` before it.
+        while let Some(last) = self.items.len().checked_sub(1)
+            && last > 0
+            && self.at(last, key)
+            && self.at(last - 1, key)
+        {
+            self.items.pop_back();
+        }
+        Ok(self
+            .items
+            .len()
+            .checked_sub(1)
+            .is_some_and(|last| self.at(last, key)))
+    }
+}
+
+/// `key`'s versions from `newest` down to `oldest`, newest first.
+fn versions(key: &'static [u8], newest: u64, oldest: u64) -> impl Iterator<Item = InternalValue> {
+    (oldest..=newest)
+        .rev()
+        .map(move |seqno| make_iv(key, seqno))
+}
+
+/// An item shown as its key and seqno, or `err`.
+fn shown(item: IterItem) -> String {
+    match item {
+        Ok(v) => format!("{}{}", k(&v), v.key.seqno),
+        Err(_) => "err".to_owned(),
+    }
+}
+
+/// A forward merge over `a`, ten versions of `b` in each of two sources,
+/// `c` and `d`, the first `b` handed out: the second source's jump behaves
+/// as `on_jump` says. Returns what the jump answered and what follows it.
+fn front_jump(on_jump: OnJump) -> (bool, Vec<String>) {
+    let cmp = comparator::default_comparator();
+    let older = JumpSource::new(
+        core::iter::once(make_iv(b"a", 0))
+            .chain(versions(b"b", 5, 1))
+            .chain([make_iv(b"c", 0)]),
+        OnJump::Pass,
+    );
+    let newer = JumpSource::new(versions(b"b", 15, 6).chain([make_iv(b"d", 0)]), on_jump);
+    let mut m = SeekingMerger::new(alloc::vec![older, newer], cmp);
+    assert_eq!(m.next().map(shown).as_deref(), Some("a0"));
+    assert_eq!(m.next().map(shown).as_deref(), Some("b15"));
+    let jumped = crate::skip_key::SkipKey::skip_front_past(&mut m, b"b").unwrap();
+    (jumped, m.map(shown).collect())
+}
+
+/// The front jump moves every source whose head is a version of the key
+/// past the rest of them.
+#[test]
+fn front_jump_passes_every_source_at_the_key() {
+    assert_eq!(
+        front_jump(OnJump::Pass),
+        (true, vec!["c0".into(), "d0".into()])
+    );
+}
+
+/// A source that cannot jump stops the jump with nothing dropped: the merge
+/// walks the versions.
+#[test]
+fn front_jump_a_source_refuses_leaves_the_versions() {
+    let (jumped, rest) = front_jump(OnJump::Refuse);
+    assert!(!jumped);
+    let mut expected: Vec<String> = (6..=14).rev().map(|s| format!("b{s}")).collect();
+    expected.extend((1..=5).rev().map(|s| format!("b{s}")));
+    expected.extend(["c0".into(), "d0".into()]);
+    assert_eq!(rest, expected);
+}
+
+/// A source failing in its jump, or in the pull after it, is done, as when
+/// `next()` fails it: its error comes out first, and the other sources go
+/// on past the key.
+#[test]
+fn front_jump_a_source_fails_queues_its_error() {
+    for on_jump in [OnJump::Fail, OnJump::FailRefill] {
+        assert_eq!(front_jump(on_jump), (true, vec!["err".into(), "c0".into()]));
+    }
+}
+
+/// Once the back was pulled, a source's next item may be parked where a
+/// source-level jump does not see it: the front does not jump.
+#[test]
+fn front_jump_after_the_back_was_pulled_does_not_jump() {
+    let cmp = comparator::default_comparator();
+    let source = JumpSource::new(versions(b"b", 20, 1), OnJump::Pass);
+    let mut m = SeekingMerger::new(alloc::vec![source], cmp);
+    assert_eq!(m.next_back().map(shown).as_deref(), Some("b1"));
+    assert_eq!(m.next().map(shown).as_deref(), Some("b20"));
+    assert!(!crate::skip_key::SkipKey::skip_front_past(&mut m, b"b").unwrap());
+}
+
+/// A backward merge over `a`, ten versions of `b` in one source and twenty
+/// in another, the eight oldest handed out: the second source's jump behaves
+/// as `on_jump` says. Returns what the jump answered and what follows it.
+fn back_jump(on_jump: OnJump) -> (bool, Vec<String>) {
+    let cmp = comparator::default_comparator();
+    let newer = JumpSource::new(
+        core::iter::once(make_iv(b"a", 0)).chain(versions(b"b", 30, 21)),
+        OnJump::Pass,
+    );
+    let older = JumpSource::new(versions(b"b", 20, 1), on_jump);
+    let mut m = SeekingMerger::new(alloc::vec![newer, older], cmp);
+    for seqno in 1..=8 {
+        assert_eq!(
+            m.next_back().map(shown),
+            Some(format!("b{seqno}")),
+            "walked from the back"
+        );
+    }
+    let jumped = crate::skip_key::SkipKey::skip_back_to_newest(&mut m, b"b", u64::MAX).unwrap();
+    (jumped, m.rev().map(shown).collect())
+}
+
+/// The back jump moves every source at the key up to its newest version;
+/// a source that stays the oldest once moved is set aside to reach the next.
+#[test]
+fn back_jump_moves_every_source_to_its_newest() {
+    assert_eq!(
+        back_jump(OnJump::Pass),
+        (true, vec!["b20".into(), "b30".into(), "a0".into()])
+    );
+}
+
+/// A source that cannot jump keeps its versions, while the others still
+/// move.
+#[test]
+fn back_jump_a_source_refuses_keeps_its_versions() {
+    let (jumped, rest) = back_jump(OnJump::Refuse);
+    assert!(jumped);
+    let mut expected: Vec<String> = (9..=20).map(|s| format!("b{s}")).collect();
+    expected.extend(["b30".into(), "a0".into()]);
+    assert_eq!(rest, expected);
+}
+
+/// A source failing in its jump, or in the pull after it, is done, as when
+/// `next_back()` fails it: its error comes out first.
+#[test]
+fn back_jump_a_source_fails_queues_its_error() {
+    for on_jump in [OnJump::Fail, OnJump::FailRefill] {
+        assert_eq!(
+            back_jump(on_jump),
+            (true, vec!["err".into(), "b30".into(), "a0".into()])
+        );
+    }
+}
+
+/// Versions held a few to a source are walked: until the back took its last
+/// eight items from one source, it does not jump.
+#[test]
+fn back_jump_after_a_short_run_does_not_jump() {
+    let cmp = comparator::default_comparator();
+    let source = JumpSource::new(versions(b"b", 20, 1), OnJump::Pass);
+    let mut m = SeekingMerger::new(alloc::vec![source], cmp);
+    assert_eq!(m.next_back().map(shown).as_deref(), Some("b1"));
+    assert!(!crate::skip_key::SkipKey::skip_back_to_newest(&mut m, b"b", u64::MAX).unwrap());
+    assert_eq!(m.next_back().map(shown).as_deref(), Some("b2"));
+}

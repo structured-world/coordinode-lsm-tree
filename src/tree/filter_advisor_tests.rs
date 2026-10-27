@@ -1425,6 +1425,82 @@ fn prefix_scans_count_their_filter_probes() -> crate::Result<()> {
     Ok(())
 }
 
+/// A prefix scan over tables whose filters let the prefix through passes a
+/// long chain of one key's versions in each of them, from either end, and
+/// reads the newest: the reader that counts the filter's answer jumps as the
+/// table's reader does.
+#[test]
+fn a_prefix_scan_through_counted_filters_reads_a_long_chain_newest() -> crate::Result<()> {
+    use alloc::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(BlockSizePolicy::all(512))
+    .prefix_extractor(Arc::new(UpToColon))
+    .filter_advisor(Some(FilterAdvisor::new(u64::MAX)))
+    .open()?;
+    let mut seqno = 0;
+    let mut write = |key: &str| {
+        tree.insert(key, seqno.to_string(), seqno);
+        seqno += 1;
+    };
+    write("p:a");
+    for _ in 0..30 {
+        write("p:k");
+    }
+    write("q:z");
+    tree.flush_active_memtable(0)?;
+    for _ in 0..30 {
+        write("p:k");
+    }
+    write("p:z");
+    tree.flush_active_memtable(0)?;
+    assert_eq!(tables(&tree).len(), 2);
+    for t in tables(&tree) {
+        assert!(t.probe_stats().is_some(), "the tables count their probes");
+    }
+
+    let expected = [("p:a", "0"), ("p:k", "61"), ("p:z", "62")];
+    let pairs = |items: Vec<crate::KvPair>| -> Vec<(String, String)> {
+        items
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    String::from_utf8_lossy(&k).into_owned(),
+                    String::from_utf8_lossy(&v).into_owned(),
+                )
+            })
+            .collect()
+    };
+    let forward = pairs(
+        tree.prefix("p:", SeqNo::MAX, None)
+            .map(crate::Guard::into_inner)
+            .collect::<crate::Result<_>>()?,
+    );
+    assert_eq!(
+        forward,
+        expected.map(|(k, v)| (k.to_owned(), v.to_owned())),
+        "forward"
+    );
+    let mut backward = pairs(
+        tree.prefix("p:", SeqNo::MAX, None)
+            .rev()
+            .map(crate::Guard::into_inner)
+            .collect::<crate::Result<_>>()?,
+    );
+    backward.reverse();
+    assert_eq!(
+        backward,
+        expected.map(|(k, v)| (k.to_owned(), v.to_owned())),
+        "backward"
+    );
+    Ok(())
+}
+
 /// A prefix the filter lets through, whose scan then finds no key under it,
 /// is a false positive and counts as a negative probe, as a point read's is:
 /// with a one-bit filter about half the absent prefixes pass, and every scan

@@ -462,6 +462,82 @@ fn mvcc_stream_error_in_a_backward_jump_skips_the_key() {
     assert_eq!(items, ["jump", "a"]);
 }
 
+/// A source whose every jump fails, as a table does when the index read on
+/// the way fails.
+struct FailingJump {
+    items: std::collections::VecDeque<crate::Result<InternalValue>>,
+}
+
+impl Iterator for FailingJump {
+    type Item = crate::Result<InternalValue>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.items.pop_front()
+    }
+}
+
+impl DoubleEndedIterator for FailingJump {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.items.pop_back()
+    }
+}
+
+impl crate::skip_key::SkipKey for FailingJump {
+    fn skip_front_past(&mut self, _key: &[u8]) -> crate::Result<bool> {
+        Err(crate::Error::Io(crate::io::Error::other("jump")))
+    }
+
+    fn skip_back_to_newest(&mut self, _key: &[u8], _seqno: SeqNo) -> crate::Result<bool> {
+        Err(crate::Error::Io(crate::io::Error::other("jump")))
+    }
+}
+
+/// `a`, twenty versions of `b`, newest first, and `c`.
+fn chain_of_b() -> Vec<crate::Result<InternalValue>> {
+    let mut items = vec![kv("a", "a", 1, ValueType::Value)];
+    for seqno in (1..=20).rev() {
+        items.push(kv("b", &format!("b{seqno}"), seqno, ValueType::Value));
+    }
+    items.push(kv("c", "c", 1, ValueType::Value));
+    items
+}
+
+/// A jump that fails ends the key it was passing at either end: the error
+/// stands for it, and the versions left are skipped rather than resolved.
+#[test]
+fn mvcc_stream_failed_jump_ends_the_key() {
+    let source = FailingJump {
+        items: chain_of_b().into(),
+    };
+    let forward: Vec<String> = MvccStream::new(source, None).jumping().map(shown).collect();
+    assert_eq!(forward, ["a", "jump", "c"], "front");
+
+    let source = FailingJump {
+        items: chain_of_b().into(),
+    };
+    let backward: Vec<String> = MvccStream::new(source, None)
+        .jumping()
+        .rev()
+        .map(shown)
+        .collect();
+    assert_eq!(backward, ["c", "jump", "a"], "back");
+}
+
+/// A stream that walks resolves a long chain from its newest version at
+/// either end, as one that jumps does.
+#[test]
+fn mvcc_stream_walking_a_long_chain_resolves_its_newest() {
+    let forward: Vec<String> = MvccStream::new(Scripted::new(chain_of_b()), None)
+        .map(shown)
+        .collect();
+    assert_eq!(forward, ["a", "b20", "c"]);
+
+    let backward: Vec<String> = MvccStream::new(Scripted::new(chain_of_b()), None)
+        .rev()
+        .map(shown)
+        .collect();
+    assert_eq!(backward, ["c", "b20", "a"]);
+}
+
 /// What is left of a key that failed at one end is skipped by the other end
 /// before it is resolved: resolving it could only fail again (here the
 /// operator always fails) and report a second error for the same key.

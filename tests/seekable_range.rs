@@ -794,3 +794,56 @@ fn reseek_after_a_backward_version_jump_matches_range() -> lsm_tree::Result<()> 
     }
     Ok(())
 }
+
+/// Long chains of a key's versions spread over a run of tables, a table
+/// above it and the memtable: a seekable scan passes them in every kind of
+/// source, at either end and at older snapshots, as the plain range does.
+#[test]
+fn seekable_passes_chains_in_every_kind_of_source() -> lsm_tree::Result<()> {
+    let value = vec![b'v'; 40];
+    let folder = get_tmp_folder();
+    let tree = Config::new(
+        &folder,
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+    .open()?;
+    let mut seqno = 0;
+    let mut chain = |keys: &[&str], versions: u32| {
+        for key in keys {
+            for _ in 0..versions {
+                tree.insert(*key, &value, seqno);
+                seqno += 1;
+            }
+        }
+    };
+    // A run of narrow tables, one key's chain to a table.
+    chain(&["a", "b", "c", "d", "e"], 40);
+    tree.flush_active_memtable(0)?;
+    tree.major_compact(512, 0)?;
+    // A table above the run, then the memtable.
+    chain(&["b", "d"], 30);
+    tree.flush_active_memtable(0)?;
+    chain(&["c", "d"], 20);
+
+    let end = seqno;
+    for snapshot in [SeqNo::MAX, end - 10, 230, 120] {
+        let forward: Vec<_> = tree
+            .range_seekable::<&[u8], _>(.., snapshot, None)
+            .map(kv)
+            .collect();
+        let expected: Vec<_> = tree.range::<&[u8], _>(.., snapshot, None).map(kv).collect();
+        assert_eq!(forward, expected, "forward at {snapshot}");
+
+        let mut it = tree.range_seekable::<&[u8], _>(.., snapshot, None);
+        let backward: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        let expected: Vec<_> = tree
+            .range::<&[u8], _>(.., snapshot, None)
+            .rev()
+            .map(kv)
+            .collect();
+        assert_eq!(backward, expected, "backward at {snapshot}");
+    }
+    Ok(())
+}

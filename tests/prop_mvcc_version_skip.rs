@@ -149,6 +149,10 @@ enum Variant {
     Lexicographic,
     Reverse,
     Merge,
+    /// Tables written in the columnar layout, read through its own block
+    /// reader.
+    #[cfg(feature = "columnar")]
+    Columnar,
 }
 
 fn open(dir: &std::path::Path, variant: Variant) -> AnyTree {
@@ -163,6 +167,17 @@ fn open(dir: &std::path::Path, variant: Variant) -> AnyTree {
         Variant::Lexicographic => config,
         Variant::Reverse => config.comparator(Arc::new(Reverse)),
         Variant::Merge => config.with_merge_operator(Some(Arc::new(Concat))),
+        #[cfg(feature = "columnar")]
+        Variant::Columnar => {
+            let tree = config.open().expect("open");
+            let AnyTree::Standard(standard) = &tree else {
+                panic!("a standard tree");
+            };
+            standard
+                .update_runtime_config(|cfg| cfg.columnar = true)
+                .expect("enable the columnar layout");
+            return tree;
+        }
     };
     config.open().expect("open")
 }
@@ -205,7 +220,13 @@ enum Op {
     },
     Flush,
     Compact,
+    /// A compaction into tables of a few hundred bytes: a run of several
+    /// tables, each cut before a new key.
+    CompactNarrow,
 }
+
+/// The table size [`Op::CompactNarrow`] compacts into.
+const NARROW_TABLE: u64 = 512;
 
 fn op_strategy(merge: bool) -> impl Strategy<Value = Op> {
     let merges = if merge { 2 } else { 0 };
@@ -218,6 +239,7 @@ fn op_strategy(merge: bool) -> impl Strategy<Value = Op> {
         1 => (0..=KEY_SPACE, 0..=KEY_SPACE).prop_map(|(a, b)| Op::RemoveRange { a, b }),
         2 => Just(Op::Flush),
         1 => Just(Op::Compact),
+        1 => Just(Op::CompactNarrow),
     ]
 }
 
@@ -375,6 +397,10 @@ fn run(
                 tree.major_compact(COMPACTION_TARGET, 0)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
             }
+            Op::CompactNarrow => {
+                tree.major_compact(NARROW_TABLE, 0)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            }
         }
     }
 
@@ -423,6 +449,58 @@ proptest! {
     ) {
         run(Variant::Merge, ops, reads, bounds)?;
     }
+
+    #[cfg(feature = "columnar")]
+    #[test]
+    fn long_chains_in_columnar_tables(
+        ops in prop::collection::vec(op_strategy(false), 1..40),
+        reads in prop::collection::vec(any::<u64>(), 1..4),
+        bounds in bounds_strategy(),
+    ) {
+        run(Variant::Columnar, ops, reads, bounds)?;
+    }
+}
+
+/// Chains in a run of narrow tables, one key's versions to a table, with
+/// newer versions in a table above and in the memtable: each end moves
+/// through the run's tables as it passes a key.
+#[test]
+fn chains_in_a_run_of_tables_read_their_newest() -> Result<(), TestCaseError> {
+    let mut ops: Vec<Op> = (0..KEY_SPACE).map(|key| Op::Burst { key, n: 30 }).collect();
+    ops.push(Op::CompactNarrow);
+    ops.extend([
+        Op::Burst { key: 2, n: 12 },
+        Op::Flush,
+        Op::Burst { key: 4, n: 12 },
+    ]);
+    run(
+        Variant::Lexicographic,
+        ops,
+        vec![40, 100, 190],
+        (None, None),
+    )
+}
+
+/// Long chains in columnar tables, a run of them and a table above: the
+/// columnar block reader passes a key's versions at either end.
+#[cfg(feature = "columnar")]
+#[test]
+fn chains_in_columnar_tables_read_their_newest() -> Result<(), TestCaseError> {
+    let mut ops: Vec<Op> = (0..KEY_SPACE).map(|key| Op::Burst { key, n: 30 }).collect();
+    ops.extend([
+        Op::Flush,
+        Op::CompactNarrow,
+        Op::Burst { key: 1, n: 20 },
+        Op::Burst { key: 3, n: 20 },
+        Op::Flush,
+        Op::Burst { key: 3, n: 10 },
+    ]);
+    run(
+        Variant::Columnar,
+        ops,
+        vec![50, 150, 205],
+        (Some((1, true)), Some((4, false))),
+    )
 }
 
 /// A reverse scan with a lower bound over one table whose chain the back
