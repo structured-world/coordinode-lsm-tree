@@ -208,7 +208,7 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: Format
         # `--all` covers the workspace MEMBERS only. The tool and fuzz crates
         # are `workspace.exclude`d, so nothing checked their formatting and one
@@ -311,7 +311,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo-clippy
       - name: Clippy (strict)
@@ -345,7 +345,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo
       # The installer downloads a prebuilt binary from GitHub Releases. That
@@ -411,7 +411,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ${{ runner.os }}-cargo-tools
           workspaces: |
@@ -474,7 +474,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ubuntu-cargo
       # Same GitHub-Releases outage exposure as the test job; same fallback.
@@ -545,7 +545,7 @@ jobs:
         # the no-std check can never break for a target-not-installed reason
         # (which would mask real migration progress).
         run: rustup target add thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ubuntu-cargo-no-std
       - name: Check (no_std + alloc)
@@ -626,7 +626,7 @@ jobs:
           toolchain: stable
       # One cache per target: cross builds into ./target/<target>, which the
       # cache keeps like any other build.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           prefix-key: ubuntu-cargo-cross
           key: ${{ matrix.target }}
@@ -654,7 +654,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       # Same GitHub-Releases outage exposure as the test job; same fallback.
       - uses: taiki-e/install-action@6bd9352acd589686fbc4cff533c083c3366dd444  # cargo-llvm-cov
         id: install-llvm-cov
