@@ -587,6 +587,84 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
     }
 }
 
+impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate::skip_key::SkipKey
+    for SeekingMerger<S, C>
+{
+    /// Moves each source whose head is a version of `key` past the rest of
+    /// them, and refills its leaf with what follows, as `next()` refills it.
+    ///
+    /// Only while the merge runs forward alone: once the back was pulled, a
+    /// source's next item may be parked in the backward tournament, which a
+    /// source-level jump does not see. A queued error is left for `next()` to
+    /// surface first. Returns `false` in either case, or as soon as a source
+    /// cannot jump: the sources passed so far only dropped versions the caller
+    /// drops anyway, and it walks the rest.
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        if self.backward_primed
+            || !self.forward_primed
+            || self.pending_forward_error.is_some()
+            || self.pending_backward_error.is_some()
+        {
+            return Ok(false);
+        }
+        let Self {
+            sources,
+            forward_tree,
+            pending_forward_error,
+            forward_vacated,
+            forward_parked_best,
+            ..
+        } = self;
+        let Some(tree) = forward_tree.as_mut() else {
+            return Ok(false);
+        };
+        while let Some(slot) = tree.winner_slot() {
+            let at_key = tree.peek_slot(slot).is_some_and(|head| {
+                crate::comparator::same_user_key(&head.value.key.user_key, key)
+            });
+            if !at_key {
+                break;
+            }
+            let Some(source) = sources.get_mut(slot) else {
+                break;
+            };
+            match source.skip_front_past(key) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    // The head was a version of `key`, dropped with the rest;
+                    // the source is done, as when `next()` fails it.
+                    tree.pop_min();
+                    pending_forward_error.get_or_insert(e);
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                    continue;
+                }
+            }
+            match MergeSource::next(source) {
+                Some(Ok(value)) => {
+                    tree.replace_min(MergerEntry {
+                        source: slot,
+                        value,
+                    });
+                }
+                Some(Err(e)) => {
+                    tree.pop_min();
+                    pending_forward_error.get_or_insert(e);
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                }
+                None => {
+                    tree.pop_min();
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
 // `DoubleEndedIterator` is gated on `CoherentMergeSource`. The
 // marker's no-duplicates-under-mixed-direction promise is what
 // makes backward iteration safe given that the merger does NOT

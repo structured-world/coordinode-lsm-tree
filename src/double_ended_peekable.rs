@@ -64,6 +64,12 @@ where
         &mut self.iter
     }
 
+    /// Whether neither end holds a peeked item: the inner iterator's cursors
+    /// then stand exactly where this one's do.
+    pub(crate) fn holds_no_peek(&self) -> bool {
+        self.front.is_unpeeked() && self.back.is_unpeeked()
+    }
+
     /// Returns a reference to the `next()` value without advancing the iterator.
     ///
     /// See [`Peekable::peek`] for more information.

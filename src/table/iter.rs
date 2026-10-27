@@ -142,6 +142,11 @@ impl OwnedDataBlockIter {
             Bound::Excluded(key) => self.seek_upper_exclusive(key, seqno),
         }
     }
+
+    /// See [`crate::table::data_block::Iter::skip_past`].
+    fn skip_past(&mut self, key: &[u8]) -> bool {
+        self.with_dependent_mut(|_, m| m.skip_past(key))
+    }
 }
 
 impl Iterator for OwnedDataBlockIter {
@@ -229,6 +234,22 @@ impl ColumnarBlockIter {
         self.hi = self.lo + pos;
         self.lo < self.hi
     }
+
+    /// Moves `lo` past every entry whose key is `key`; whether one of a later
+    /// key is left.
+    fn skip_past(&mut self, key: &[u8]) -> bool {
+        let cmp = self.comparator.as_ref();
+        while self.lo < self.hi {
+            let Some(entry) = self.entries.get(self.lo) else {
+                return false;
+            };
+            if cmp.compare(entry.key.user_key.as_ref(), key) == core::cmp::Ordering::Greater {
+                return true;
+            }
+            self.lo += 1;
+        }
+        false
+    }
 }
 
 #[cfg(feature = "columnar")]
@@ -289,6 +310,16 @@ impl BlockReader {
             Self::Row(r) => r.seek_upper_bound(bound, seqno),
             #[cfg(feature = "columnar")]
             Self::Columnar(c) => c.seek_upper_bound(bound, seqno),
+        }
+    }
+
+    /// Moves the front past every entry whose key is `key`; whether one of a
+    /// later key is left.
+    fn skip_past(&mut self, key: &[u8]) -> bool {
+        match self {
+            Self::Row(r) => r.skip_past(key),
+            #[cfg(feature = "columnar")]
+            Self::Columnar(c) => c.skip_past(key),
         }
     }
 }
@@ -999,6 +1030,147 @@ impl Iter {
         self.poisoned = true;
         Some(Err(err.into()))
     }
+
+    /// Positions the index on the blocks the range reaches, on the first pull
+    /// rather than in `new`, so bounds set after construction cost no seek or
+    /// I/O. Bound exclusivity is enforced in the data blocks; the index only
+    /// narrows the span. `false` when no block overlaps the range.
+    fn init_index(&mut self) -> bool {
+        let mut ok = if let Some(bound) = &self.range.0 {
+            // The first block whose end key is >= the lower bound.
+            let key = match bound {
+                Bound::Included(k) | Bound::Excluded(k) => k,
+            };
+            self.index_iter.seek_lower(key, u64::MAX)
+        } else {
+            true
+        };
+
+        if ok && let Some(bound) = &self.range.1 {
+            let key = match bound {
+                Bound::Included(k) | Bound::Excluded(k) => k,
+            };
+            ok = self.index_iter.seek_upper(key, u64::MAX);
+        }
+
+        self.index_initialized = true;
+
+        if !ok {
+            self.lo_data_block = None;
+            self.hi_data_block = None;
+        }
+        ok
+    }
+
+    /// The reader of the data block `handle` names, clamped to the range;
+    /// `None` when a delete mask leaves nothing of it.
+    fn open_front_block(
+        &self,
+        handle: &crate::table::KeyedBlockHandle,
+    ) -> crate::Result<Option<BlockReader>> {
+        // Partial-decode fast path: for a large multi-inner-block zstd block
+        // whose recorded layout lets us skip the inner blocks past the query
+        // upper bound, decode only the covering prefix. Falls back to a full
+        // load (which checks the block cache) otherwise. Positional masking
+        // needs the whole block, so a masked table never takes it.
+        #[cfg(feature = "zstd")]
+        let partial = if self.delete_mask.is_some() {
+            None
+        } else {
+            self.try_partial_block(handle)?
+        };
+        #[cfg(not(feature = "zstd"))]
+        let partial: Option<DataBlock> = None;
+
+        let block = if let Some(db) = partial {
+            BlockSource::Row(db)
+        } else {
+            match self.load_and_resolve(handle.as_ref())? {
+                Some(b) => b,
+                None => return Ok(None),
+            }
+        };
+
+        let mut reader = create_data_block_reader(block, self.comparator.clone())?;
+
+        // The low side first, so no entry below the lower bound is returned,
+        // then the high side, which keeps the block in [low, high] with exact
+        // inclusivity.
+        if let Some(bound) = &self.range.0 {
+            reader.seek_lower_bound(bound, SeqNo::MAX);
+        }
+        if let Some(bound) = &self.range.1 {
+            reader.seek_upper_bound(bound, SeqNo::MAX);
+        }
+        Ok(Some(reader))
+    }
+
+    /// Moves the front past every entry whose user key is `key` (see
+    /// [`crate::skip_key::SkipKey`]); whether an entry of a later key is left.
+    /// A data block whose last key is `key` holds nothing else and is passed
+    /// on the index alone, never loaded.
+    ///
+    /// # Errors
+    ///
+    /// An error reading the index or a block, which fails the iterator as
+    /// `next()` would.
+    pub(crate) fn skip_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        if self.poisoned {
+            return Ok(false);
+        }
+        if let Some(block) = &mut self.lo_data_block
+            && block.skip_past(key)
+        {
+            return Ok(true);
+        }
+        if !self.index_initialized && !self.init_index() {
+            return Ok(false);
+        }
+
+        loop {
+            let read = self.fd.lookup();
+            let handle = self.index_iter.next_with(&read);
+            self.fd.keep(read);
+            let Some(handle) = handle else {
+                // The blocks left were read from the back: the front goes on
+                // in the last of them.
+                return Ok(self
+                    .hi_data_block
+                    .as_mut()
+                    .is_some_and(|block| block.skip_past(key)));
+            };
+            let handle = match handle {
+                Ok(h) => h,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            };
+            if self.comparator.compare(handle.end_key(), key) != core::cmp::Ordering::Greater {
+                continue;
+            }
+            let mut reader = match self.open_front_block(&handle) {
+                Ok(Some(reader)) => reader,
+                Ok(None) => continue,
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            };
+            let more = reader.skip_past(key);
+            self.lo_offset = handle.offset();
+            self.lo_data_block = Some(reader);
+            if more {
+                return Ok(true);
+            }
+        }
+    }
+}
+
+impl crate::skip_key::SkipKey for Iter {
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.skip_past(key).map(|_| true)
+    }
 }
 
 impl Iterator for Iter {
@@ -1023,39 +1195,8 @@ impl Iterator for Iter {
             return Some(item);
         }
 
-        if !self.index_initialized {
-            // Lazily initialize the index iterator here (not in `new`) so callers can set bounds
-            // before we incur any seek or I/O cost. Bounds exclusivity is enforced at the data-
-            // block level; index seeks only narrow the span of blocks to touch.
-            let mut ok = if let Some(bound) = &self.range.0 {
-                // Seek to the first block whose end key is ≥ lower bound.
-                // If this fails we can immediately conclude the range is empty.
-                let key = match bound {
-                    Bound::Included(k) | Bound::Excluded(k) => k,
-                };
-                self.index_iter.seek_lower(key, u64::MAX)
-            } else {
-                true
-            };
-
-            if ok && let Some(bound) = &self.range.1 {
-                // Apply an upper-bound seek to cap the block span, but keep exact high-key
-                // handling inside the data block so exclusivity is respected precisely.
-                let key = match bound {
-                    Bound::Included(k) | Bound::Excluded(k) => k,
-                };
-                ok = self.index_iter.seek_upper(key, u64::MAX);
-            }
-
-            self.index_initialized = true;
-
-            if !ok {
-                // No block in the index overlaps the requested window, so we clear state and return
-                // EOF without attempting to touch any data blocks.
-                self.lo_data_block = None;
-                self.hi_data_block = None;
-                return None;
-            }
+        if !self.index_initialized && !self.init_index() {
+            return None;
         }
 
         loop {
@@ -1087,49 +1228,12 @@ impl Iterator for Iter {
                 Err(e) => return self.poison(e),
             };
 
-            // Partial-decode fast path: for a large multi-inner-block zstd block
-            // whose recorded layout lets us skip the inner blocks past the query
-            // upper bound, decode only the covering prefix. Falls back to a full
-            // load (which checks the block cache) otherwise.
-            #[cfg(feature = "zstd")]
-            let partial = if self.delete_mask.is_some() {
-                // Positional masking needs the whole block; skip the partial-decode
-                // fast path so deleted rows are dropped during reconstruction.
-                None
-            } else {
-                match self.try_partial_block(&handle) {
-                    Ok(p) => p,
-                    Err(e) => return self.poison(e),
-                }
-            };
-            #[cfg(not(feature = "zstd"))]
-            let partial: Option<DataBlock> = None;
-
-            let block = if let Some(db) = partial {
-                BlockSource::Row(db)
-            } else {
-                match self.load_and_resolve(handle.as_ref()) {
-                    Ok(Some(b)) => b,
-                    // The block was wholly deleted by the mask; skip to the next.
-                    Ok(None) => continue,
-                    Err(e) => return self.poison(e),
-                }
-            };
-
-            let mut reader = match create_data_block_reader(block, self.comparator.clone()) {
-                Ok(r) => r,
+            let mut reader = match self.open_front_block(&handle) {
+                Ok(Some(reader)) => reader,
+                // The block was wholly deleted by the mask; skip to the next.
+                Ok(None) => continue,
                 Err(e) => return self.poison(e),
             };
-
-            // Forward path: seek the low side first to avoid returning entries below the lower
-            // bound, then clamp the iterator on the high side. This guarantees iteration stays in
-            // [low, high] with exact control over inclusivity/exclusivity.
-            if let Some(bound) = &self.range.0 {
-                reader.seek_lower_bound(bound, SeqNo::MAX);
-            }
-            if let Some(bound) = &self.range.1 {
-                reader.seek_upper_bound(bound, SeqNo::MAX);
-            }
 
             let item = reader.next();
 

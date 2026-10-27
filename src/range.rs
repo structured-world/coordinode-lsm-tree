@@ -3,7 +3,7 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 use crate::{
-    BoxedIterator, InternalValue,
+    InternalValue,
     comparator::SharedComparator,
     key::InternalKey,
     memtable::Memtable,
@@ -15,6 +15,7 @@ use crate::{
     reseek::{ReseekCtx, Reseekable},
     run_reader::RunReader,
     seeking_merger::SeekingMerger,
+    skip_key::SkipKey,
     value::{SeqNo, UserKey},
     version::{Run, SuperVersion},
 };
@@ -30,22 +31,34 @@ pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
     item_seqno < seqno
 }
 
+/// One source of a scan: double-ended, and able to jump past a resolved key's
+/// versions (see [`SkipKey`]).
+trait ScanSource: DoubleEndedIterator<Item = crate::Result<InternalValue>> + SkipKey + Send {}
+
+impl<T: DoubleEndedIterator<Item = crate::Result<InternalValue>> + SkipKey + Send> ScanSource
+    for T
+{
+}
+
+/// A boxed [`ScanSource`].
+type ScanBox<'a> = Box<dyn ScanSource + 'a>;
+
 /// Wrap a vector of boxed double-ended source iterators into a
 /// `SeekingMerger`, the loser-tree-based merging iterator that
 /// replaces the legacy `Merger` (sorted-vector heap) on the read
-/// path. The `BoxedIterator`s become `MergeSource`s via the
+/// path. The `ScanBox`es become `MergeSource`s via the
 /// `CoherentIterSource` adapter — its coherent-cursor contract
 /// is satisfied by every memtable / run / table iter we feed in
 /// here (they all share a single front/back cursor over the
 /// remaining range).
 ///
-/// The source type stays concrete (`CoherentIterSource<BoxedIterator<'a>>`)
+/// The source type stays concrete (`CoherentIterSource<ScanBox<'a>>`)
 /// rather than being re-boxed behind a `dyn MergeSource` trait
-/// object: `BoxedIterator` is itself already a heap-allocated
+/// object: `ScanBox` is itself already a heap-allocated
 /// trait object, so wrapping it in another `Box<dyn ...>` would
 /// cost an extra allocation per source AND an extra vtable
 /// dispatch on every `next`/`next_back`. With the concrete
-/// adapter type, only the inner `BoxedIterator`'s vtable
+/// adapter type, only the inner `ScanBox`'s vtable
 /// remains — exactly one indirect call per per-step source pull.
 ///
 /// The compaction merge path still uses the legacy `Merger`
@@ -53,12 +66,98 @@ pub fn seqno_filter(item_seqno: SeqNo, seqno: SeqNo) -> bool {
 /// not `DoubleEndedIterator`) and `MergeSource` requires
 /// `next_back`. That swap is a separate refactor.
 fn build_seeking<'a>(
-    iters: Vec<BoxedIterator<'a>>,
+    iters: Vec<ScanBox<'a>>,
     comparator: SharedComparator,
-) -> SeekingMerger<CoherentIterSource<BoxedIterator<'a>>, SharedComparator> {
-    let sources: Vec<CoherentIterSource<BoxedIterator<'a>>> =
+) -> SeekingMerger<CoherentIterSource<ScanBox<'a>>, SharedComparator> {
+    let sources: Vec<CoherentIterSource<ScanBox<'a>>> =
         iters.into_iter().map(CoherentIterSource::new).collect();
     SeekingMerger::new(sources, comparator)
+}
+
+/// The rows of a source the scan's snapshot sees: those below its seqno.
+/// Errors pass through.
+struct Visible<I> {
+    inner: I,
+    seqno: SeqNo,
+}
+
+impl<I: Iterator<Item = crate::Result<InternalValue>>> Iterator for Visible<I> {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Ok(item) if !seqno_filter(item.key.seqno, self.seqno) => {}
+                other => return Some(other),
+            }
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> DoubleEndedIterator
+    for Visible<I>
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next_back()? {
+                Ok(item) if !seqno_filter(item.key.seqno, self.seqno) => {}
+                other => return Some(other),
+            }
+        }
+    }
+}
+
+impl<I: SkipKey> SkipKey for Visible<I> {
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.inner.skip_front_past(key)
+    }
+}
+
+/// A memtable's rows over a range.
+struct MemtableRows<'a>(crate::memtable::skiplist::Range<'a>);
+
+impl Iterator for MemtableRows<'_> {
+    type Item = crate::Result<InternalValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|entry| {
+            Ok(InternalValue {
+                key: entry.key(),
+                value: entry.value(),
+            })
+        })
+    }
+}
+
+impl DoubleEndedIterator for MemtableRows<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|entry| {
+            Ok(InternalValue {
+                key: entry.key(),
+                value: entry.value(),
+            })
+        })
+    }
+}
+
+impl SkipKey for MemtableRows<'_> {
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.0.skip_front_past(key);
+        Ok(true)
+    }
+}
+
+/// The source over `memtable`'s rows in `range` that a snapshot at `seqno`
+/// sees.
+fn memtable_source(
+    memtable: &Memtable,
+    range: (Bound<InternalKey>, Bound<InternalKey>),
+    seqno: SeqNo,
+) -> ScanBox<'_> {
+    Box::new(Visible {
+        inner: MemtableRows(memtable.items.range(range)),
+        seqno,
+    })
 }
 
 /// Calculates the prefix's upper range.
@@ -403,6 +502,14 @@ where
     }
 }
 
+impl<I: SkipKey, T> SkipKey for FilterPassReader<I, T> {
+    /// A jump follows a version handed out, so the reader has settled: the
+    /// versions it passes are no miss to count.
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.inner.skip_front_past(key)
+    }
+}
+
 /// The reader of `table` over `user_range` at `seqno`, which its filters did
 /// not rule out: it counts a miss when `answer` says a filter was asked and
 /// let the read through, the probe that miss belongs to.
@@ -411,27 +518,26 @@ fn table_reader<'a, T>(
     table: T,
     user_range: (Bound<UserKey>, Bound<UserKey>),
     seqno: SeqNo,
-) -> BoxedIterator<'a>
+) -> ScanBox<'a>
 where
     T: core::borrow::Borrow<crate::table::Table> + Send + 'a,
 {
-    let reader = table.borrow().range(user_range);
+    let reader = table.borrow().range_iter(user_range);
     let counts = answer.passed() && table.borrow().probe_stats().is_some();
-    let visible = move |item: &crate::Result<InternalValue>| match item {
-        Ok(item) => seqno_filter(item.key.seqno, seqno),
-        Err(_) => true,
-    };
     if counts {
-        Box::new(
-            FilterPassReader {
+        Box::new(Visible {
+            inner: FilterPassReader {
                 inner: reader,
                 table,
                 settled: false,
-            }
-            .filter(visible),
-        )
+            },
+            seqno,
+        })
     } else {
-        Box::new(reader.filter(visible))
+        Box::new(Visible {
+            inner: reader,
+            seqno,
+        })
     }
 }
 
@@ -439,11 +545,11 @@ where
 /// the table is its only source and can be read without the indirection.
 enum Source<'a> {
     Table(crate::table::Table, FilterAnswer),
-    Boxed(BoxedIterator<'a>),
+    Boxed(ScanBox<'a>),
 }
 
 impl<'a> Source<'a> {
-    fn into_boxed(self, user_range: &UserBounds, seqno: SeqNo) -> BoxedIterator<'a> {
+    fn into_boxed(self, user_range: &UserBounds, seqno: SeqNo) -> ScanBox<'a> {
         match self {
             Self::Table(table, answer) => table_reader(answer, table, user_range.clone(), seqno),
             Self::Boxed(iter) => iter,
@@ -706,12 +812,10 @@ impl TreeIter {
                         .map(RunReader::counting_scans)
                 {
                     one_version.push(run_one_version);
-                    iters.push(Source::Boxed(Box::new(reader.filter(
-                        move |item| match item {
-                            Ok(item) => seqno_filter(item.key.seqno, seqno),
-                            Err(_) => true,
-                        },
-                    ))));
+                    iters.push(Source::Boxed(Box::new(Visible {
+                        inner: reader,
+                        seqno,
+                    })));
                 }
             }
 
@@ -737,12 +841,12 @@ impl TreeIter {
                 if memtable.items.is_empty() {
                     continue;
                 }
-                let iter = memtable.range_internal(range.clone());
 
                 one_version.push(false);
-                iters.push(Source::Boxed(Box::new(
-                    iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                        .map(Ok),
+                iters.push(Source::Boxed(memtable_source(
+                    memtable,
+                    range.clone(),
+                    seqno,
                 )));
             }
 
@@ -769,12 +873,11 @@ impl TreeIter {
                 // A write backdated below the seqno after the scan began is
                 // one the live walk could miss anyway.
                 if !lock.version.active_memtable.items.is_empty() {
-                    let iter = lock.version.active_memtable.range_internal(range.clone());
-
                     one_version.push(false);
-                    iters.push(Source::Boxed(Box::new(
-                        iter.filter(move |item| seqno_filter(item.key.seqno, seqno))
-                            .map(Ok),
+                    iters.push(Source::Boxed(memtable_source(
+                        &lock.version.active_memtable,
+                        range.clone(),
+                        seqno,
                     )));
                 }
             }
@@ -794,13 +897,8 @@ impl TreeIter {
                 );
 
                 if !mt.items.is_empty() {
-                    let iter = Box::new(
-                        mt.range_internal(range)
-                            .filter(move |item| seqno_filter(item.key.seqno, *eph_seqno))
-                            .map(Ok),
-                    );
                     one_version.push(false);
-                    iters.push(Source::Boxed(iter));
+                    iters.push(Source::Boxed(memtable_source(mt, range, *eph_seqno)));
                 }
             }
 
@@ -872,6 +970,7 @@ impl TreeIter {
                         lock.merge_operator.clone(),
                         lock.comparator.clone(),
                     )
+                    .jumping()
                     .with_value_log(lock.value_log())
                     .with_range_tombstones(mvcc_tombstones)
                     .filter(is_live),
@@ -890,6 +989,7 @@ impl TreeIter {
                         lock.merge_operator.clone(),
                         lock.comparator.clone(),
                     )
+                    .jumping()
                     .with_value_log(lock.value_log())
                     .with_range_tombstones(mvcc_tombstones)
                     .filter(is_live),
@@ -1348,6 +1448,19 @@ impl MergeSource for SeekableLeaf<'_> {
 
 impl CoherentMergeSource for SeekableLeaf<'_> {}
 
+impl SkipKey for SeekableLeaf<'_> {
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        match self {
+            SeekableLeaf::Table(l) => l.iter.skip_past(key).map(|_| true),
+            SeekableLeaf::Run(l) => l.reader.skip_front_past(key),
+            SeekableLeaf::Memtable(l) => {
+                l.range.skip_front_past(key);
+                Ok(true)
+            }
+        }
+    }
+}
+
 impl Reseekable for SeekableLeaf<'_> {
     fn reseek(&mut self, ctx: &ReseekCtx) {
         match self {
@@ -1368,6 +1481,7 @@ type SeekPipeline<'a> = RangeTombstoneFilter<
         MvccStream<
             SeekingMerger<SeekableLeaf<'a>, SharedComparator>,
             Option<crate::mvcc_stream::ValueLog<'a>>,
+            crate::mvcc_stream::Jump,
         >,
     >,
 >;
@@ -1440,6 +1554,7 @@ fn build_seek_pipeline<'a>(
         state.merge_operator.clone(),
         state.comparator.clone(),
     )
+    .jumping()
     .with_value_log(state.value_log())
     .with_range_tombstones(collected.range_tombstones.clone());
     let skip = TombstoneSkip { inner: mvcc };

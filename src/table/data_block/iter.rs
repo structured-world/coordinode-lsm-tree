@@ -167,6 +167,23 @@ impl<'a> Iter<'a> {
         }
     }
 
+    /// Moves the front past every entry whose key is `needle`, from where it
+    /// stands, never back; whether an entry of a later key is left. The entries
+    /// passed are compared as parsed, never materialized.
+    pub fn skip_past(&mut self, needle: &[u8]) -> bool {
+        loop {
+            let Some(item) = self.decoder.peek() else {
+                return false;
+            };
+            if item.compare_key(needle, self.bytes, self.comparator.as_ref())
+                == core::cmp::Ordering::Greater
+            {
+                return true;
+            }
+            self.decoder.next();
+        }
+    }
+
     pub fn seek_exclusive(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
         // Exclusive lower bound: same seqno-aware binary search, but the linear
         // scan below skips entries equal to `needle`.

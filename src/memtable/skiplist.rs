@@ -1090,6 +1090,33 @@ impl SkipMap {
         next
     }
 
+    /// Finds the first node of a user key after `user_key`, or UNSET.
+    ///
+    /// Versions sort by descending seqno and seqno 0 is the lowest, so the
+    /// first node after `(user_key, 0)` is past every version of it, one at
+    /// seqno 0 included.
+    fn seek_past_user_key(&self, user_key: &[u8]) -> u32 {
+        let mut node = self.head;
+        let mut next = UNSET;
+        let list_h = self.height.load(Ordering::Acquire);
+
+        for level in (0..list_h).rev() {
+            loop {
+                next = self.next_at(node, level);
+                if next == UNSET {
+                    break;
+                }
+                if self.compare_key_parts(next, user_key, 0) == CmpOrdering::Greater {
+                    break;
+                }
+                node = next;
+            }
+        }
+
+        // The compared level-0 successor, for the reason `seek_ge_parts` gives.
+        next
+    }
+
     /// Finds the last node whose key <= `target`, or UNSET if all nodes > target.
     fn seek_le(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
@@ -1329,6 +1356,29 @@ impl Range<'_> {
             Bound::Unbounded => true,
             Bound::Included(k) => self.map.compare_key(node, k) != CmpOrdering::Greater,
             Bound::Excluded(k) => self.map.compare_key(node, k) == CmpOrdering::Less,
+        }
+    }
+
+    /// Moves the front past every remaining version of `user_key` with one
+    /// search from the top of the list, rather than node by node. The front
+    /// holds no node of an earlier key (the caller resolved `user_key` from
+    /// the merge), so the search lands at or after it, never back.
+    pub fn skip_front_past(&mut self, user_key: &[u8]) {
+        if self.done || self.front == UNSET {
+            return;
+        }
+        let next = self.map.seek_past_user_key(user_key);
+        // The back has not yet handed out what lies up to it, so a search that
+        // lands past it leaves nothing for either end.
+        let passes_back = self.back_init
+            && (self.back == UNSET
+                || next == UNSET
+                || self.map.compare_nodes(next, self.back) == CmpOrdering::Greater);
+        if next == UNSET || passes_back {
+            self.front = UNSET;
+            self.done = true;
+        } else {
+            self.front = next;
         }
     }
 }

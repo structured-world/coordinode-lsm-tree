@@ -248,6 +248,13 @@ where
     }
 }
 
+impl<I: crate::skip_key::SkipKey> crate::skip_key::SkipKey for CoherentIterSource<I> {
+    #[inline]
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.iter.skip_front_past(key)
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test assertions")]
 mod tests;

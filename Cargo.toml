@@ -535,6 +535,12 @@ path = "benches/scan_split.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "mvcc_versions"
+harness = false
+path = "benches/mvcc_versions.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "scan_since"
 harness = false
 path = "benches/scan_since.rs"
