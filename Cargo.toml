@@ -170,7 +170,7 @@ spin = { version = "0.12", default-features = false, features = ["mutex", "spin_
 # std-bound map. `parking_lot::RwLock` is the per-shard lock under `std` (small,
 # userspace fast-path, concurrent readers); `spin::RwLock` is the no_std lock.
 hashbrown = { version = "0.17", default-features = false, features = ["default-hasher"] }
-parking_lot = { version = "0.12", optional = true }
+parking_lot = { version = "0.13", optional = true }
 # The parking primitive under `parking_lot`: a cold load's waiters park on
 # the address of the load and its lead wakes them all at once, rather than
 # one after another through a condition variable's mutex.
