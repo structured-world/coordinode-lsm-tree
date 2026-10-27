@@ -103,3 +103,44 @@ fn alternating_ends_cover_every_key() -> lsm_tree::Result<()> {
     assert_covers_every_key(seen);
     Ok(())
 }
+
+/// Alternation over a table and a memtable, where one end claims the other
+/// tournament's buffered leaf for a source that is not that tournament's
+/// winner. Claiming such a leaf used to knock the real winner out of the
+/// tournament, and the next step popped an empty slot.
+#[test_log::test]
+fn alternating_ends_claim_a_losing_buffered_leaf() -> lsm_tree::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let seqno = SequenceNumberCounter::default();
+    let tree = Config::new(dir.path(), seqno.clone(), SequenceNumberCounter::default()).open()?;
+
+    tree.insert("k3", "table", seqno.next());
+    tree.insert("k0", "table", seqno.next());
+    tree.flush_active_memtable(0)?;
+    for version in 0..9u8 {
+        tree.insert("k1", [version], seqno.next());
+    }
+
+    let mut iter = tree.iter(SeqNo::MAX, None);
+    let mut front = Vec::new();
+    let mut back = Vec::new();
+    loop {
+        let Some(guard) = iter.next() else { break };
+        front.push(guard.into_inner()?);
+        let Some(guard) = iter.next_back() else { break };
+        back.push(guard.into_inner()?);
+    }
+    back.reverse();
+    front.extend(back);
+
+    let rows: Vec<(&[u8], &[u8])> = front.iter().map(|(k, v)| (&**k, &**v)).collect();
+    assert_eq!(
+        rows,
+        [
+            (b"k0".as_ref(), b"table".as_ref()),
+            (b"k1".as_ref(), [8u8].as_ref()),
+            (b"k3".as_ref(), b"table".as_ref()),
+        ],
+    );
+    Ok(())
+}
