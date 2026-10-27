@@ -50,15 +50,13 @@ fn chain() -> Vec<InternalValue> {
 }
 
 /// An item shown as its key and seqno.
-fn shown(item: Option<crate::Result<InternalValue>>) -> Option<String> {
-    item.map(|item| {
-        let item = item.expect("the read succeeds");
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&item.key.user_key),
-            item.key.seqno
-        )
-    })
+fn shown(item: crate::Result<InternalValue>) -> String {
+    let item = item.expect("the read succeeds");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&item.key.user_key),
+        item.key.seqno
+    )
 }
 
 /// The front passes the blocks holding only the key's versions and goes on
@@ -67,11 +65,11 @@ fn shown(item: Option<crate::Result<InternalValue>>) -> Option<String> {
 fn table_front_jump_lands_on_the_next_key() -> crate::Result<()> {
     with_table(&chain(), 3, |table| {
         let mut iter = table.range_iter(..);
-        assert_eq!(shown(iter.next()).as_deref(), Some("a0"));
-        assert_eq!(shown(iter.next()).as_deref(), Some("b40"));
+        assert_eq!(iter.next().map(shown).as_deref(), Some("a0"));
+        assert_eq!(iter.next().map(shown).as_deref(), Some("b40"));
         assert!(iter.skip_past(b"b")?);
-        assert_eq!(shown(iter.next()).as_deref(), Some("c0"));
-        assert_eq!(shown(iter.next()), None);
+        assert_eq!(iter.next().map(shown).as_deref(), Some("c0"));
+        assert_eq!(iter.next().map(shown), None);
         Ok(())
     })
 }
@@ -83,12 +81,12 @@ fn table_front_jump_goes_on_in_the_block_the_back_read() -> crate::Result<()> {
     let items = [iv("a", 0), iv("b", 3), iv("b", 2), iv("b", 1), iv("c", 0)];
     with_table(&items, 2, |table| {
         let mut iter = table.range_iter(..);
-        assert_eq!(shown(iter.next_back()).as_deref(), Some("c0"));
-        assert_eq!(shown(iter.next_back()).as_deref(), Some("b1"));
-        assert_eq!(shown(iter.next()).as_deref(), Some("a0"));
+        assert_eq!(iter.next_back().map(shown).as_deref(), Some("c0"));
+        assert_eq!(iter.next_back().map(shown).as_deref(), Some("b1"));
+        assert_eq!(iter.next().map(shown).as_deref(), Some("a0"));
         assert!(!iter.skip_past(b"b")?, "nothing is left past b");
-        assert_eq!(shown(iter.next()), None);
-        assert_eq!(shown(iter.next_back()), None);
+        assert_eq!(iter.next().map(shown), None);
+        assert_eq!(iter.next_back().map(shown), None);
         Ok(())
     })
 }
@@ -100,10 +98,10 @@ fn table_back_jump_lands_on_the_newest_visible_version() -> crate::Result<()> {
     with_table(&chain(), 3, |table| {
         for (snapshot, newest) in [(SeqNo::MAX, "b40"), (21, "b20")] {
             let mut iter = table.range_iter(..);
-            assert_eq!(shown(iter.next_back()).as_deref(), Some("c0"));
-            assert_eq!(shown(iter.next_back()).as_deref(), Some("b1"));
+            assert_eq!(iter.next_back().map(shown).as_deref(), Some("c0"));
+            assert_eq!(iter.next_back().map(shown).as_deref(), Some("b1"));
             assert!(iter.skip_back_to_newest(b"b", snapshot)?);
-            assert_eq!(shown(iter.next_back()).as_deref(), Some(newest));
+            assert_eq!(iter.next_back().map(shown).as_deref(), Some(newest));
         }
         Ok(())
     })
@@ -114,25 +112,16 @@ fn table_back_jump_lands_on_the_newest_visible_version() -> crate::Result<()> {
 #[test]
 fn table_back_jump_short_of_the_key_holds_the_block_it_read() -> crate::Result<()> {
     with_table(&chain(), 3, |table| {
-        let expected: Vec<String> = table
-            .range_iter(..)
-            .rev()
-            .map(|item| shown(Some(item)).expect("an item"))
-            .collect();
+        let expected: Vec<String> = table.range_iter(..).rev().map(shown).collect();
 
         let mut iter = table.range_iter(..);
         assert!(!iter.skip_back_to_newest(b"z", SeqNo::MAX)?);
-        let got: Vec<String> = iter
-            .rev()
-            .map(|item| shown(Some(item)).expect("an item"))
-            .collect();
+        let got: Vec<String> = iter.rev().map(shown).collect();
         assert_eq!(got, expected, "from the back");
 
         let mut iter = table.range_iter(..);
         assert!(!iter.skip_back_to_newest(b"z", SeqNo::MAX)?);
-        let mut forward: Vec<String> = iter
-            .map(|item| shown(Some(item)).expect("an item"))
-            .collect();
+        let mut forward: Vec<String> = iter.map(shown).collect();
         forward.reverse();
         assert_eq!(forward, expected, "from the front");
         Ok(())
@@ -151,7 +140,7 @@ fn table_jumps_in_an_empty_range_move_nothing() -> crate::Result<()> {
         assert!(!iter.skip_past(b"x")?);
         let mut iter = table.range_iter(past);
         assert!(!iter.skip_back_to_newest(b"x", SeqNo::MAX)?);
-        assert_eq!(shown(iter.next_back()), None);
+        assert_eq!(iter.next_back().map(shown), None);
         Ok(())
     })
 }
