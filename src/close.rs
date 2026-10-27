@@ -40,19 +40,24 @@ impl Signal {
             self.settled.notify_all();
             core::mem::take(&mut *waiting)
         };
-        // Outside the lock: a callback may register another, or wait. This
-        // runs inside a drop of the tree's own parts, possibly while a panic
-        // unwinds, so a callback's panic is contained: it would abort the
-        // process there, and would drop the callbacks after it unrun.
+        // Outside the lock: a callback may register another, or wait.
         for callback in callbacks {
-            #[cfg(feature = "std")]
-            if std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).is_err() {
-                log::error!("a TreeClose callback panicked; the others still run");
-            }
-            #[cfg(not(feature = "std"))]
-            callback();
+            run(callback);
         }
     }
+}
+
+/// Runs a callback of a closing tree. It runs inside a drop of the tree's own
+/// parts, possibly while a panic unwinds, or at registration on the caller's
+/// thread; either way its panic is contained, so it aborts no process and
+/// keeps no other callback from running.
+fn run(callback: impl FnOnce()) {
+    #[cfg(feature = "std")]
+    if std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).is_err() {
+        log::error!("a TreeClose callback panicked; the others still run");
+    }
+    #[cfg(not(feature = "std"))]
+    callback();
 }
 
 /// A tree's liveness: held, as an `Arc`, by everything of the tree that owns
@@ -140,7 +145,7 @@ impl TreeClose {
         let mut waiting = self.signal.waiting.lock();
         if self.signal.closed.load(Ordering::Acquire) {
             drop(waiting);
-            f();
+            run(f);
         } else {
             waiting.push(Box::new(f));
         }

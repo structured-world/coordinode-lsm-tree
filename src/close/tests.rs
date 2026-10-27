@@ -180,6 +180,23 @@ fn a_panicking_callback_neither_escapes_the_drop_nor_skips_the_others() -> crate
     Ok(())
 }
 
+// A callback registered once the tree is closed runs at once, on the caller's
+// thread: its panic is contained the same way, whichever side of the closing
+// it was registered on.
+#[test]
+fn a_panicking_callback_registered_after_closing_is_contained() -> crate::Result<()> {
+    let folder = crate::get_tmp_folder();
+    let tree = open_standard(folder.path())?;
+    let closed = tree.close();
+    assert!(closed.wait_timeout(SETTLE));
+
+    let registered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        closed.on_closed(|| panic!("a callback that fails"));
+    }));
+    assert!(registered.is_ok(), "the panic escaped on_closed");
+    Ok(())
+}
+
 // A weak handle is what a monitor holds: it must not keep the tree open, and
 // gives nothing back once the tree is closed.
 #[test]
