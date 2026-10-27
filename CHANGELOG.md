@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.2.0...v7.3.0) - 2026-10-27
+
+### Added
+
+- *(tree)* close a tree and learn when it leaves its directory ([#999](https://github.com/structured-world/coordinode-lsm-tree/pull/999))
+
+### Fixed
+
+- *(compaction)* drop a blob file in the install that empties it ([#1001](https://github.com/structured-world/coordinode-lsm-tree/pull/1001))
+
+### Performance
+
+- *(compaction)* copy unchanged compressed data blocks as stored ([#997](https://github.com/structured-world/coordinode-lsm-tree/pull/997))
+
 ## [7.2.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.1.0...v7.2.0) - 2026-10-26
 
 ### Added
