@@ -1716,7 +1716,9 @@ impl MultiWriter {
             old_writer.mark_lineage_transformed();
         }
         self.transforms_at_output_start = self.transforms_after_last_write;
-        old_writer.spill_block()?;
+        // Every block written, so the key range the tombstones are cut to
+        // below reaches the output's last key, not the last block registered.
+        old_writer.settle_pending_blocks()?;
 
         // Write range tombstones to the finishing writer, cut to its zone:
         // up to current_key, the first key of the NEW table, so the gap
@@ -2614,9 +2616,9 @@ impl MultiWriter {
         // triggering record, so the writer finishing here is the run's last
         // non-empty output (or the run produced nothing at all and no meta
         // is written).
-        self.writer.spill_block()?;
+        self.writer.settle_pending_blocks()?;
 
-        // Outputs of tombstones alone, read once the last block is spilled,
+        // Outputs of tombstones alone, read once every block is written,
         // which sets the last output's key bounds: a flush's pieces outside
         // the last output's key domain, and the pieces past a compaction's
         // outputs that a table outside it needs, each run of overlapping

@@ -64,6 +64,33 @@ where
         &mut self.iter
     }
 
+    /// Whether neither end holds a peeked item: the inner iterator's cursors
+    /// then stand exactly where this one's do.
+    pub(crate) fn holds_no_peek(&self) -> bool {
+        self.front.is_unpeeked() && self.back.is_unpeeked()
+    }
+
+    /// Whether the front holds no peeked item.
+    pub(crate) fn front_unpeeked(&self) -> bool {
+        self.front.is_unpeeked()
+    }
+
+    /// The item the front holds peeked, which the back yields last once the
+    /// inner iterator runs out.
+    pub(crate) fn front_peeked(&self) -> Option<&T> {
+        self.front.peeked_value_ref()
+    }
+
+    /// Takes what the back holds peeked, leaving it unpeeked.
+    pub(crate) fn take_back_peeked(&mut self) -> MaybePeeked<T> {
+        self.back.take()
+    }
+
+    /// Puts back what [`Self::take_back_peeked`] took.
+    pub(crate) fn put_back_peeked(&mut self, peeked: MaybePeeked<T>) {
+        self.back = peeked;
+    }
+
     /// Returns a reference to the `next()` value without advancing the iterator.
     ///
     /// See [`Peekable::peek`] for more information.
@@ -153,8 +180,10 @@ where
     }
 }
 
+/// What one end of a [`DoubleEndedPeekable`] holds: nothing peeked, or the
+/// item a peek found (`None` at the end).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum MaybePeeked<T> {
+pub enum MaybePeeked<T> {
     #[default]
     Unpeeked,
     Peeked(Option<T>),

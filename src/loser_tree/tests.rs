@@ -58,6 +58,26 @@ fn non_pow2_padding() {
     assert_eq!(collect(t), [10, 20, 30, 40, 50]);
 }
 
+/// Winners popped aside and put back, with new values, rank again among the
+/// leaves that stayed: the tree drains in order and counts them as present.
+#[test]
+fn restore_reranks_set_aside_winners() {
+    let mut t = LoserTree::build(
+        alloc::vec![Some(1_u32), Some(2), Some(30), Some(4), Some(50)],
+        cmp_u32,
+    );
+    let mut aside = Vec::new();
+    for _ in 0..3 {
+        let slot = t.winner_slot().unwrap();
+        t.pop_min().unwrap();
+        aside.push((slot, 100 + slot as u32));
+    }
+    assert_eq!(t.active_count(), 2);
+    t.restore(aside);
+    assert_eq!(t.active_count(), 5);
+    assert_eq!(collect(t), [30, 50, 100, 101, 103]);
+}
+
 #[test]
 fn replace_min_stays_winner_when_still_smallest() {
     // Slot 0 keeps yielding monotonically increasing values that

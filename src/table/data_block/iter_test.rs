@@ -377,6 +377,104 @@ mod tests {
         Ok(())
     }
 
+    /// Trimming the back to the lowest entry above `(k, seqno)` leaves exactly
+    /// that entry and the ones before it, whatever the restart interval, the
+    /// entries the back or the front already handed out, the snapshot, an
+    /// entry the back holds peeked from an upper-bound seek, and one the front
+    /// holds peeked from a lower-bound seek. With no entry above left, nothing
+    /// is dropped.
+    #[test]
+    fn data_block_trim_back_above_keeps_the_lowest_entry_above() -> crate::Result<()> {
+        let mut items = vec![InternalValue::from_components("a", "a", 0, Value)];
+        items.extend(
+            (1..=20u64)
+                .rev()
+                .map(|s| InternalValue::from_components("k", "k", s, Value)),
+        );
+        items.push(InternalValue::from_components("z", "z", 0, Value));
+        let above = |item: &InternalValue, seqno: SeqNo| match &*item.key.user_key {
+            b"z" => true,
+            b"k" => item.key.seqno < seqno,
+            _ => false,
+        };
+
+        for restart_interval in 1..=8 {
+            let bytes = DataBlock::encode_into_vec(&items, restart_interval, 0.0)?;
+            let data_block = DataBlock::new(Block {
+                data: bytes.into(),
+                header: Header::test_dummy(BlockType::Data),
+            });
+
+            for (front, back, peeked, lower) in [
+                (0, 0, false, false),
+                (0, 1, false, false),
+                (0, 3, false, false),
+                (0, 9, false, false),
+                (1, 0, false, false),
+                (1, 4, false, false),
+                (0, 0, true, false),
+                (0, 2, true, false),
+                (0, 0, false, true),
+                (0, 5, false, true),
+                (0, 19, false, true),
+                (0, 20, false, true),
+                (1, 10, false, true),
+                // The back used up: nothing is left to trim, and nothing it
+                // handed out may come back.
+                (0, 22, false, false),
+                (0, 21, false, true),
+                (1, 21, false, false),
+            ] {
+                for seqno in [0, 1, 2, 7, 13, 20, 21, SeqNo::MAX] {
+                    let mut iter = data_block.iter(default_comparator());
+                    if peeked {
+                        // Leaves the back's next entry peeked.
+                        assert!(iter.seek_upper(b"z", SeqNo::MAX), "seek lands");
+                    }
+                    if lower {
+                        // Leaves the front's next entry, the first "k", peeked
+                        // and the decoder's front cursor past it: the back
+                        // reaches it only through the peek.
+                        assert!(iter.seek_exclusive(b"a", SeqNo::MAX), "seek lands");
+                    }
+                    for _ in 0..front {
+                        iter.next().expect("front entry");
+                    }
+                    for _ in 0..back {
+                        iter.next_back().expect("back entry");
+                    }
+                    let start = front + usize::from(lower);
+                    let rest = items.get(start..items.len() - back).expect("in range");
+                    let lowest = rest.iter().position(|item| above(item, seqno));
+                    let expected: Vec<_> = match lowest {
+                        Some(t) => rest
+                            .get(..=t)
+                            .expect("in range")
+                            .iter()
+                            .rev()
+                            .cloned()
+                            .collect(),
+                        None => rest.iter().rev().cloned().collect(),
+                    };
+
+                    let trimmed = iter.trim_back_above(b"k", seqno);
+                    let walked: Vec<_> = iter
+                        .rev()
+                        .map(|item| item.materialize(&data_block.inner.data))
+                        .collect();
+                    let case = format!(
+                        "interval {restart_interval}, front {front}, back {back}, \
+                         peeked {peeked}, lower {lower}, seqno {seqno}"
+                    );
+                    assert_eq!(trimmed, lowest.is_some(), "{case}");
+                    assert_eq!(walked, expected, "{case}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn data_block_iter_range_edges() -> crate::Result<()> {
         let items = [

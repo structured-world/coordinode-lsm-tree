@@ -37,6 +37,12 @@ const MAX_HEIGHT: usize = 20;
 /// Sentinel offset meaning "no node".  Offset 0 is reserved in the arena.
 const UNSET: u32 = 0;
 
+/// Most nodes a backward step keeps batched ahead (a power of two).
+const BACK_BATCH: usize = 64;
+
+/// Level down to which a back-batch search descends before walking level 0.
+const BACK_BATCH_LEVEL: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Node layout (offsets within a node allocation)
 // ---------------------------------------------------------------------------
@@ -477,6 +483,7 @@ impl SkipMap {
             front: self.first_node(),
             back: UNSET,
             back_init: false,
+            batch: None,
             done: false,
         }
     }
@@ -501,6 +508,7 @@ impl SkipMap {
             front,
             back: UNSET,
             back_init: false,
+            batch: None,
             done: false,
         }
     }
@@ -1090,6 +1098,33 @@ impl SkipMap {
         next
     }
 
+    /// Finds the first node of a user key after `user_key`, or UNSET.
+    ///
+    /// Versions sort by descending seqno and seqno 0 is the lowest, so the
+    /// first node after `(user_key, 0)` is past every version of it, one at
+    /// seqno 0 included.
+    fn seek_past_user_key(&self, user_key: &[u8]) -> u32 {
+        let mut node = self.head;
+        let mut next = UNSET;
+        let list_h = self.height.load(Ordering::Acquire);
+
+        for level in (0..list_h).rev() {
+            loop {
+                next = self.next_at(node, level);
+                if next == UNSET {
+                    break;
+                }
+                if self.compare_key_parts(next, user_key, 0) == CmpOrdering::Greater {
+                    break;
+                }
+                node = next;
+            }
+        }
+
+        // The compared level-0 successor, for the reason `seek_ge_parts` gives.
+        next
+    }
+
     /// Finds the last node whose key <= `target`, or UNSET if all nodes > target.
     fn seek_le(&self, target: &InternalKey) -> u32 {
         let mut node = self.head;
@@ -1151,22 +1186,25 @@ impl SkipMap {
         if node == self.head { UNSET } else { node }
     }
 
-    /// Finds the predecessor of `target_node` at level 0 using a top-down
-    /// search.  Returns UNSET if `target_node` is the first data node.
+    /// Fills `batch` with the nodes right before `target_node`, the closest
+    /// [`BACK_BATCH`] of them at most, so the next backward steps pop them
+    /// instead of searching from the top once per node.
     ///
-    /// This is O(log n) — used only for `next_back()` which is called
-    /// infrequently on memtable iterators.
-    fn find_predecessor(&self, target_node: u32) -> u32 {
+    /// The search stops at level [`BACK_BATCH_LEVEL`] on the last node before
+    /// `target_node` and walks level 0 from there: a level-2 gap holds about
+    /// 16 nodes, so one search pays for that many steps. An empty batch means
+    /// `target_node` is the first node.
+    fn fill_back_batch(&self, target_node: u32, batch: &mut BackBatch) {
+        batch.clear();
         let mut node = self.head;
         let list_h = self.height.load(Ordering::Acquire);
 
-        for level in (0..list_h).rev() {
+        for level in (BACK_BATCH_LEVEL..list_h).rev() {
             loop {
                 let next = self.next_at(node, level);
                 if next == UNSET || next == target_node {
                     break;
                 }
-                // Compare without allocating InternalKey — reads arena bytes directly.
                 if self.compare_nodes(next, target_node) == CmpOrdering::Less {
                     node = next;
                 } else {
@@ -1175,21 +1213,18 @@ impl SkipMap {
             }
         }
 
-        // At level 0, walk forward until we find the node whose next IS
-        // target_node (handles equal-key adjacency).
-        loop {
-            let next = self.next_at(node, 0);
-            if next == UNSET || next == target_node {
-                break;
-            }
-            if self.compare_nodes(next, target_node) == CmpOrdering::Less {
-                node = next;
-            } else {
-                break;
-            }
+        // `node` sorts before `target_node` and is itself a predecessor unless
+        // it is the head. `target_node` is linked at level 0, so the walk
+        // reaches it; a node linked meanwhile in between is batched like any
+        // other.
+        if node != self.head {
+            batch.push(node);
         }
-
-        if node == self.head { UNSET } else { node }
+        let mut next = self.next_at(node, 0);
+        while next != UNSET && next != target_node {
+            batch.push(next);
+            next = self.next_at(next, 0);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1237,6 +1272,90 @@ impl Entry<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Back batch
+// ---------------------------------------------------------------------------
+
+/// The nodes just before an iterator's back end, in ascending order: a ring
+/// that keeps the last [`BACK_BATCH`] pushed, popped from the high end.
+struct BackBatch {
+    nodes: [u32; BACK_BATCH],
+    start: usize,
+    len: usize,
+}
+
+impl BackBatch {
+    const fn new() -> Self {
+        Self {
+            nodes: [UNSET; BACK_BATCH],
+            start: 0,
+            len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.start = 0;
+        self.len = 0;
+    }
+
+    /// Appends `node`, dropping the lowest one once the ring is full.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "masked with BACK_BATCH - 1, a power of two"
+    )]
+    fn push(&mut self, node: u32) {
+        self.nodes[(self.start + self.len) & (BACK_BATCH - 1)] = node;
+        if self.len == BACK_BATCH {
+            self.start = (self.start + 1) & (BACK_BATCH - 1);
+        } else {
+            self.len += 1;
+        }
+    }
+
+    /// Takes the highest node, or `None` once the batch is used up.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "masked with BACK_BATCH - 1, a power of two"
+    )]
+    fn pop(&mut self) -> Option<u32> {
+        let len = self.len.checked_sub(1)?;
+        self.len = len;
+        Some(self.nodes[(self.start + len) & (BACK_BATCH - 1)])
+    }
+}
+
+impl SkipMap {
+    /// The node before `node`, taken from `batch` and refilled from the list
+    /// when it runs out; UNSET when `node` is the first node. The batch is
+    /// allocated on the first backward step, so a forward-only iterator
+    /// carries no ring.
+    fn step_back(&self, node: u32, batch: &mut Option<alloc::boxed::Box<BackBatch>>) -> u32 {
+        let batch = batch.get_or_insert_with(|| alloc::boxed::Box::new(BackBatch::new()));
+        if let Some(prev) = batch.pop() {
+            return prev;
+        }
+        self.fill_back_batch(node, batch);
+        batch.pop().unwrap_or(UNSET)
+    }
+
+    // The two ends of an iterator meet by key order, not only by reaching the
+    // same node: a node linked meanwhile between nodes the back has batched is
+    // not in the batch, so the front can step onto it, past the back's next
+    // node, and the back can step below the front. Either end stops there
+    // instead of handing out what the other already did.
+
+    /// Whether the front's next `node` lies past the back's next node (or the
+    /// back has handed out everything down to the start).
+    fn front_passed_back(&self, node: u32, back: u32) -> bool {
+        back == UNSET || self.compare_nodes(node, back) == CmpOrdering::Greater
+    }
+
+    /// Whether the back's next `node` lies before the front's next node.
+    fn back_passed_front(&self, node: u32, front: u32) -> bool {
+        front != UNSET && self.compare_nodes(node, front) == CmpOrdering::Less
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Full iterator
 // ---------------------------------------------------------------------------
 
@@ -1244,8 +1363,11 @@ impl Entry<'_> {
 pub struct Iter<'a> {
     map: &'a SkipMap,
     front: u32,
+    /// The node the next backward step hands out.
     back: u32,
     back_init: bool,
+    /// The nodes below `back`, batched ahead of the backward steps.
+    batch: Option<alloc::boxed::Box<BackBatch>>,
     done: bool,
 }
 
@@ -1258,6 +1380,12 @@ impl<'a> Iterator for Iter<'a> {
         }
 
         let node = self.front;
+
+        if self.back_init && self.map.front_passed_back(node, self.back) {
+            self.front = UNSET;
+            self.done = true;
+            return None;
+        }
 
         // If front and back have converged, this is the last element.
         if self.back_init && node == self.back {
@@ -1287,7 +1415,7 @@ impl DoubleEndedIterator for Iter<'_> {
             self.back_init = true;
         }
 
-        if self.back == UNSET {
+        if self.back == UNSET || self.map.back_passed_front(self.back, self.front) {
             self.done = true;
             return None;
         }
@@ -1298,7 +1426,7 @@ impl DoubleEndedIterator for Iter<'_> {
         if node == self.front {
             self.done = true;
         } else {
-            self.back = self.map.find_predecessor(node);
+            self.back = self.map.step_back(node, &mut self.batch);
         }
 
         Some(Entry {
@@ -1317,8 +1445,11 @@ pub struct Range<'a> {
     map: &'a SkipMap,
     end_bound: Bound<InternalKey>,
     front: u32,
+    /// The node the next backward step hands out.
     back: u32,
     back_init: bool,
+    /// The nodes below `back`, batched ahead of the backward steps.
+    batch: Option<alloc::boxed::Box<BackBatch>>,
     done: bool,
 }
 
@@ -1330,6 +1461,59 @@ impl Range<'_> {
             Bound::Included(k) => self.map.compare_key(node, k) != CmpOrdering::Greater,
             Bound::Excluded(k) => self.map.compare_key(node, k) == CmpOrdering::Less,
         }
+    }
+
+    /// Moves the front past every remaining version of `user_key` with one
+    /// search from the top of the list, rather than node by node. The front
+    /// holds no node of an earlier key (the caller resolved `user_key` from
+    /// the merge), so the search lands at or after it, never back.
+    pub fn skip_front_past(&mut self, user_key: &[u8]) {
+        if self.done || self.front == UNSET {
+            return;
+        }
+        let next = self.map.seek_past_user_key(user_key);
+        // The back has not yet handed out what lies up to it, so a search that
+        // lands past it leaves nothing for either end.
+        let passes_back = self.back_init
+            && (self.back == UNSET
+                || next == UNSET
+                || self.map.compare_nodes(next, self.back) == CmpOrdering::Greater);
+        if next == UNSET || passes_back {
+            self.front = UNSET;
+            self.done = true;
+        } else {
+            self.front = next;
+        }
+    }
+
+    /// Moves the back up to the newest version of `user_key` below `seqno`
+    /// with one search from the top of the list; whether the next backward
+    /// step yields it. Only a back standing on an older version moves, and
+    /// never past the front.
+    pub fn skip_back_to_newest(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
+        if self.done || !self.back_init || self.back == UNSET {
+            return false;
+        }
+        // Versions sort by descending seqno: the first node at or after
+        // `(user_key, seqno - 1)` is the newest one below `seqno`.
+        let Some(newest_seqno) = seqno.checked_sub(1) else {
+            return false;
+        };
+        let node = self.map.seek_ge_parts(user_key, newest_seqno);
+        if node == UNSET
+            || !crate::comparator::same_user_key(self.map.node_user_key_bytes(node), user_key)
+            || self.map.compare_nodes(node, self.back) == CmpOrdering::Greater
+            || self.map.back_passed_front(node, self.front)
+        {
+            return false;
+        }
+        self.back = node;
+        // The batch held the nodes below the old back; the new back's are
+        // fetched on the next step.
+        if let Some(batch) = &mut self.batch {
+            batch.clear();
+        }
+        true
     }
 }
 
@@ -1343,8 +1527,9 @@ impl<'a> Iterator for Range<'a> {
 
         let node = self.front;
 
-        // Check end bound.
-        if !self.within_end(node) {
+        // Check end bound, and the back once it has started.
+        if !self.within_end(node) || (self.back_init && self.map.front_passed_back(node, self.back))
+        {
             self.front = UNSET;
             self.done = true;
             return None;
@@ -1387,9 +1572,9 @@ impl DoubleEndedIterator for Range<'_> {
             return None;
         }
 
-        // If back is before front in key order, the range is empty
-        // (e.g., start bound > end bound).
-        if self.map.compare_nodes(self.back, self.front) == CmpOrdering::Less {
+        // Back before front in key order: the range is empty (e.g. start bound
+        // > end bound), or the back stepped below the front.
+        if self.map.back_passed_front(self.back, self.front) {
             self.done = true;
             return None;
         }
@@ -1400,7 +1585,7 @@ impl DoubleEndedIterator for Range<'_> {
         if node == self.front {
             self.done = true;
         } else {
-            self.back = self.map.find_predecessor(node);
+            self.back = self.map.step_back(node, &mut self.batch);
         }
 
         Some(Entry {

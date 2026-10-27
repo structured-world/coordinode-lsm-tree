@@ -2,7 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use crate::{BoxedIterator, InternalValue, Table, UserKey, version::Run};
+use crate::{InternalValue, Table, UserKey, table::iter::Iter, version::Run};
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -34,8 +34,9 @@ pub struct RunReader {
     range: OwnedRange,
     lo: usize,
     hi: usize,
-    lo_reader: Option<BoxedIterator<'static>>,
-    hi_reader: Option<BoxedIterator<'static>>,
+    // Boxed: a table reader is large, and the run reader is held per source.
+    lo_reader: Option<Box<Iter>>,
+    hi_reader: Option<Box<Iter>>,
     lo_initialized: bool,
     hi_initialized: bool,
     /// Whether, and how, the tables it opens count a scan.
@@ -176,7 +177,7 @@ impl RunReader {
                 reason = "we trust the caller to pass valid indexes"
             )]
             let lo_table = self.run.deref().get(self.lo).expect("should exist");
-            self.lo_reader = Some(Box::new(lo_table.range(self.range.clone())));
+            self.lo_reader = Some(Box::new(lo_table.range_iter(self.range.clone())));
             self.lo_initialized = true;
         }
     }
@@ -189,7 +190,7 @@ impl RunReader {
                 reason = "we trust the caller to pass valid indexes"
             )]
             let hi_table = self.run.deref().get(self.hi).expect("should exist");
-            self.hi_reader = Some(Box::new(hi_table.range(self.range.clone())));
+            self.hi_reader = Some(Box::new(hi_table.range_iter(self.range.clone())));
             self.hi_initialized = true;
         }
     }
@@ -222,7 +223,7 @@ impl Iterator for RunReader {
                         reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
                     )]
                     let table = self.run.get(self.lo).expect("should exist");
-                    self.lo_reader = Some(Box::new(table.iter()));
+                    self.lo_reader = Some(Box::new(table.range_iter(..)));
                 }
             } else {
                 // Lo exhausted — initialize hi reader if needed and consume from it
@@ -233,6 +234,56 @@ impl Iterator for RunReader {
                 }
                 return None;
             }
+        }
+    }
+}
+
+impl crate::skip_key::SkipKey for RunReader {
+    /// Passes `key`'s versions in the table the front is in, then in the tables
+    /// after it while they hold nothing else, as `next()` opens them.
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        self.ensure_lo_initialized();
+
+        loop {
+            if let Some(lo_reader) = &mut self.lo_reader {
+                if lo_reader.skip_past(key)? {
+                    return Ok(true);
+                }
+
+                self.lo_reader = None;
+                self.lo += 1;
+
+                // As `next()`: the table the window ends in is read through
+                // its bounded reader below.
+                if self.lo < self.hi {
+                    self.note_scan(self.lo);
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "hi is at most equal to the last slot; so because 0 <= lo < hi, it must be a valid index"
+                    )]
+                    let table = self.run.get(self.lo).expect("should exist");
+                    self.lo_reader = Some(Box::new(table.range_iter(..)));
+                }
+            } else {
+                self.ensure_hi_initialized();
+
+                if let Some(hi_reader) = &mut self.hi_reader {
+                    hi_reader.skip_past(key)?;
+                }
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Moves the back up to `key`'s newest visible version in the table the
+    /// back reads. A table is cut only before a new key, so a key's versions
+    /// in a run all lie in one table.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
+        match (&mut self.hi_reader, &mut self.lo_reader) {
+            (Some(reader), _) => reader.skip_back_to_newest(key, seqno),
+            // The back reads the low table once the high one is used up.
+            (None, Some(reader)) if self.hi_initialized => reader.skip_back_to_newest(key, seqno),
+            _ => Ok(false),
         }
     }
 }
@@ -258,7 +309,7 @@ impl DoubleEndedIterator for RunReader {
                         reason = "because 0 <= lo <= hi, and hi monotonically decreases, hi must be a valid index"
                     )]
                     let table = self.run.get(self.hi).expect("should exist");
-                    self.hi_reader = Some(Box::new(table.iter()));
+                    self.hi_reader = Some(Box::new(table.range_iter(..)));
                 }
             } else {
                 // Hi exhausted — initialize lo reader if needed and consume from it

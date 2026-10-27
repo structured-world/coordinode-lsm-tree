@@ -61,10 +61,77 @@ impl SeparatedBase for Option<ValueLog<'_>> {
     }
 }
 
+/// How a stream passes the older versions of a key it has resolved.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot pass the versions of a resolved key for a stream over `{I}`",
+    label = "not a version-passing policy for this source",
+    note = "`Walk` walks any source; `Jump` needs a source implementing `SkipKey`"
+)]
+pub trait PassVersions<I> {
+    /// Moves `inner` past the rest of `key`'s versions in one step; `false`
+    /// when it cannot, and the stream walks them.
+    ///
+    /// # Errors
+    ///
+    /// The error the source met on the way.
+    fn jump(inner: &mut I, key: &[u8]) -> crate::Result<bool>;
+
+    /// Moves the back of `inner` up to the newest version of `key` it holds,
+    /// past the older ones; `false` when it cannot, and the stream walks them.
+    ///
+    /// # Errors
+    ///
+    /// The error the source met on the way.
+    fn jump_back(inner: &mut I, key: &[u8]) -> crate::Result<bool>;
+}
+
+/// Walks every version of a resolved key: what a source that cannot jump
+/// gets, and what a point read, which holds few versions, needs.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Walk;
+
+impl<I> PassVersions<I> for Walk {
+    fn jump(_inner: &mut I, _key: &[u8]) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    fn jump_back(_inner: &mut I, _key: &[u8]) -> crate::Result<bool> {
+        Ok(false)
+    }
+}
+
+/// Walks the first [`WALKED_BEFORE_JUMP`] versions of a resolved key, then
+/// jumps past the rest: a short chain costs a jump more than it saves, a long
+/// one costs a step per version walked.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Jump;
+
+impl<I: crate::skip_key::SkipKey> PassVersions<I> for Jump {
+    fn jump(inner: &mut I, key: &[u8]) -> crate::Result<bool> {
+        inner.skip_front_past(key)
+    }
+
+    /// The sources filter by their own snapshot; the stream sees only what
+    /// they pass.
+    fn jump_back(inner: &mut I, key: &[u8]) -> crate::Result<bool> {
+        inner.skip_back_to_newest(key, SeqNo::MAX)
+    }
+}
+
+/// The versions of a resolved key [`Jump`] walks before it jumps.
+const WALKED_BEFORE_JUMP: usize = 8;
+
 /// Consumes a stream of KVs and emits a new stream according to MVCC and tombstone rules
 ///
 /// This iterator is used for read operations.
-pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L = NoValueLog> {
+pub struct MvccStream<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L = NoValueLog,
+    P = Walk,
+> {
     inner: DoubleEndedPeekable<crate::Result<InternalValue>, I>,
     merge_operator: Option<Arc<dyn MergeOperator>>,
     comparator: SharedComparator,
@@ -90,6 +157,9 @@ pub struct MvccStream<I: DoubleEndedIterator<Item = crate::Result<InternalValue>
     /// The same for the back: the newer versions of a key whose older ones
     /// went with an error, which never resolve without them.
     skip_back: Option<UserKey>,
+
+    /// How the versions of a resolved key are passed.
+    pass: core::marker::PhantomData<P>,
 }
 
 impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> {
@@ -119,15 +189,18 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             key_entries_buf: Vec::new(),
             skip_front: None,
             skip_back: None,
+            pass: core::marker::PhantomData,
         }
     }
+}
 
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, P> MvccStream<I, NoValueLog, P> {
     /// Installs the value log a merge reads a base kept there from.
     #[must_use]
     pub(crate) fn with_value_log(
         self,
         value_log: Option<ValueLog<'_>>,
-    ) -> MvccStream<I, Option<ValueLog<'_>>> {
+    ) -> MvccStream<I, Option<ValueLog<'_>>, P> {
         MvccStream {
             inner: self.inner,
             merge_operator: self.merge_operator,
@@ -137,12 +210,38 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             key_entries_buf: self.key_entries_buf,
             skip_front: self.skip_front,
             skip_back: self.skip_back,
+            pass: core::marker::PhantomData,
         }
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
-    MvccStream<I, L>
+impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L> MvccStream<I, L, Walk> {
+    /// Jumps past the versions of a resolved key past the first few, rather
+    /// than walking them all: for a source that can (see [`Jump`]).
+    #[must_use]
+    pub(crate) fn jumping(self) -> MvccStream<I, L, Jump>
+    where
+        Jump: PassVersions<I>,
+    {
+        MvccStream {
+            inner: self.inner,
+            merge_operator: self.merge_operator,
+            comparator: self.comparator,
+            value_log: self.value_log,
+            range_tombstones: self.range_tombstones,
+            key_entries_buf: self.key_entries_buf,
+            skip_front: self.skip_front,
+            skip_back: self.skip_back,
+            pass: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> MvccStream<I, L, P>
 {
     /// Installs range tombstones for merge-resolution awareness.
     ///
@@ -321,7 +420,12 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     // An error ends the drain and is returned at once; the key is remembered
     // in `skip_front` so the next call skips its remaining versions instead of
     // yielding the next older one as the key's value.
+    //
+    // A chain longer than `WALKED_BEFORE_JUMP` is jumped past when the policy
+    // and the source allow, and only while no item is peeked: a peeked item is
+    // one the source has already handed over, which a jump would not see.
     fn drain_key_min(&mut self, key: &UserKey) -> crate::Result<()> {
+        let mut walked = 0usize;
         loop {
             let Some(next) = self.inner.next_if(|kv| {
                 if let Ok(kv) = kv {
@@ -336,6 +440,18 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
             if let Err(e) = next {
                 self.skip_front = Some(key.clone());
                 return Err(e);
+            }
+
+            walked += 1;
+            if walked == WALKED_BEFORE_JUMP && self.inner.holds_no_peek() {
+                match P::jump(self.inner.inner_mut(), key) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) => {
+                        self.skip_front = Some(key.clone());
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -378,7 +494,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     }
 }
 
-impl<I, L> crate::reseek::Reseekable for MvccStream<I, L>
+impl<I, L, P> crate::reseek::Reseekable for MvccStream<I, L, P>
 where
     I: DoubleEndedIterator<Item = crate::Result<InternalValue>> + crate::reseek::Reseekable,
 {
@@ -396,8 +512,11 @@ where
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase> Iterator
-    for MvccStream<I, L>
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> Iterator for MvccStream<I, L, P>
 {
     type Item = crate::Result<InternalValue>;
 
@@ -436,8 +555,11 @@ enum Skipped {
     Error(crate::Error),
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
-    MvccStream<I, L>
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> MvccStream<I, L, P>
 {
     // Skips `key`'s versions at the front, up to the first error met.
     fn skip_key_at_front(&mut self, key: &UserKey) -> Skipped {
@@ -490,8 +612,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
-    MvccStream<I, L>
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> MvccStream<I, L, P>
 {
     // One forward item, once `next` has dealt with both ends' failed keys.
     fn step_front(&mut self) -> Option<crate::Result<InternalValue>> {
@@ -515,8 +640,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
-    DoubleEndedIterator for MvccStream<I, L>
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> DoubleEndedIterator for MvccStream<I, L, P>
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         // The mirror of `next`: the back's own failed key first, then a key
@@ -540,8 +668,11 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
     }
 }
 
-impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBase>
-    MvccStream<I, L>
+impl<
+    I: DoubleEndedIterator<Item = crate::Result<InternalValue>>,
+    L: SeparatedBase,
+    P: PassVersions<I>,
+> MvccStream<I, L, P>
 {
     // One backward item, once `next_back` has dealt with both ends' failed keys.
     fn step_back(&mut self) -> Option<crate::Result<InternalValue>> {
@@ -557,6 +688,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
         // the base Value needed by the merge function.
         let has_merge_op = self.merge_operator.is_some();
         self.key_entries_buf.clear();
+        let mut walked = 0usize;
 
         loop {
             let tail = fail_iter!(self.inner.next_back()?);
@@ -620,8 +752,44 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L: SeparatedBa
             // we don't yet know if the newest entry will be a MergeOperand.
             if has_merge_op {
                 self.key_entries_buf.push(tail);
+                continue;
             }
-            // Without merge operator: skip older versions (loop continues)
+            // Without merge operator: skip older versions (loop continues).
+            // Every `WALKED_BEFORE_JUMP` of them the back jumps up to the
+            // newest version the source holds. The peeked `prev` was handed
+            // over before that, so it is older than anything the source still
+            // holds and goes too. A merge keeps every operand, so it walks.
+            walked += 1;
+            if walked.is_multiple_of(WALKED_BEFORE_JUMP) && self.inner.front_unpeeked() {
+                match P::jump_back(self.inner.inner_mut(), &tail.key.user_key) {
+                    Ok(true) => {
+                        self.inner.reset_back_peeked();
+                        // A source that failed on the way left its error to
+                        // come out first: it may have held newer versions
+                        // than the ones left, so none of them resolves the key.
+                        if let Some(Err(_)) = self.inner.peek_back() {
+                            #[expect(
+                                clippy::expect_used,
+                                reason = "we just asserted, the peeked value is an error"
+                            )]
+                            let error = self
+                                .inner
+                                .next_back()
+                                .expect("should exist")
+                                .expect_err("should be error");
+                            self.skip_back = Some(tail.key.user_key);
+                            return Some(Err(error));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // As an error met while walking: the key's newer
+                        // versions are skipped, none resolves it.
+                        self.skip_back = Some(tail.key.user_key);
+                        return Some(Err(e));
+                    }
+                }
+            }
         }
     }
 }

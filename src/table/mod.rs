@@ -60,6 +60,10 @@ pub(crate) mod zone_map;
 )]
 mod tests;
 
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod skip_tests;
+
 #[cfg(all(test, feature = "std", feature = "metrics"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod lookup_fd_tests;

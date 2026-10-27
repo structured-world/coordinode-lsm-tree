@@ -299,7 +299,22 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     forward_parked_best: ParkedCache,
     /// Mirror of `forward_parked_best` for the backward direction.
     backward_parked_best: ParkedCache,
+    /// Scratch of [`SkipKey::skip_back_to_newest`](crate::skip_key::SkipKey):
+    /// the slots it moved, and the heads it set aside to reach the sources
+    /// behind them. Empty between calls; kept for their allocations.
+    backward_jumped: Vec<usize>,
+    backward_set_aside: Vec<MergerEntry>,
+    /// The source the back took its last item from, and how many it took
+    /// from it in a row: what tells a backward jump whether the sources hold
+    /// long chains of a key's versions.
+    back_run_slot: usize,
+    back_run: u32,
 }
+
+/// Items in a row the back takes from one source before a backward jump
+/// moves the sources: a shorter run means the key's versions lie a few to a
+/// source, where moving each costs more than walking its few.
+const BACK_RUN_BEFORE_JUMP: u32 = 8;
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
     /// Construct an empty merger ready to consume from `sources`.
@@ -322,6 +337,21 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_vacated: Vec::new(),
             forward_parked_best: ParkedCache::Stale,
             backward_parked_best: ParkedCache::Stale,
+            backward_jumped: Vec::new(),
+            backward_set_aside: Vec::new(),
+            back_run_slot: usize::MAX,
+            back_run: 0,
+        }
+    }
+
+    /// Counts an item the back takes from `slot` into the run.
+    #[inline]
+    fn note_back_item(back_run_slot: &mut usize, back_run: &mut u32, slot: usize) {
+        if *back_run_slot == slot {
+            *back_run += 1;
+        } else {
+            *back_run_slot = slot;
+            *back_run = 1;
         }
     }
 
@@ -444,6 +474,7 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
         backward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
         *forward_parked_best = ParkedCache::Stale;
         *backward_parked_best = ParkedCache::Stale;
+        self.back_run = 0;
     }
 }
 
@@ -587,6 +618,182 @@ impl<S: MergeSource, C: UserComparator + Clone> Iterator for SeekingMerger<S, C>
     }
 }
 
+impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate::skip_key::SkipKey
+    for SeekingMerger<S, C>
+{
+    /// Moves each source whose head is a version of `key` past the rest of
+    /// them, and refills its leaf with what follows, as `next()` refills it.
+    ///
+    /// Only while the merge runs forward alone: once the back was pulled, a
+    /// source's next item may be parked in the backward tournament, which a
+    /// source-level jump does not see. A queued error is left for `next()` to
+    /// surface first. Returns `false` in either case, or as soon as a source
+    /// cannot jump: the sources passed so far only dropped versions the caller
+    /// drops anyway, and it walks the rest.
+    fn skip_front_past(&mut self, key: &[u8]) -> crate::Result<bool> {
+        if self.backward_primed
+            || !self.forward_primed
+            || self.pending_forward_error.is_some()
+            || self.pending_backward_error.is_some()
+        {
+            return Ok(false);
+        }
+        let Self {
+            sources,
+            forward_tree,
+            pending_forward_error,
+            forward_vacated,
+            forward_parked_best,
+            ..
+        } = self;
+        let Some(tree) = forward_tree.as_mut() else {
+            return Ok(false);
+        };
+        while let Some(slot) = tree.winner_slot() {
+            let at_key = tree.peek_slot(slot).is_some_and(|head| {
+                crate::comparator::same_user_key(&head.value.key.user_key, key)
+            });
+            if !at_key {
+                break;
+            }
+            let Some(source) = sources.get_mut(slot) else {
+                break;
+            };
+            match source.skip_front_past(key) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    // The head was a version of `key`, dropped with the rest;
+                    // the source is done, as when `next()` fails it.
+                    tree.pop_min();
+                    pending_forward_error.get_or_insert(e);
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                    continue;
+                }
+            }
+            match MergeSource::next(source) {
+                Some(Ok(value)) => {
+                    tree.replace_min(MergerEntry {
+                        source: slot,
+                        value,
+                    });
+                }
+                Some(Err(e)) => {
+                    tree.pop_min();
+                    pending_forward_error.get_or_insert(e);
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                }
+                None => {
+                    tree.pop_min();
+                    forward_vacated.push(slot);
+                    *forward_parked_best = ParkedCache::Stale;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Moves each source whose back head is a version of `key` up to its
+    /// newest visible one, and refills its leaf with it, as `next_back()`
+    /// refills it. The head goes: it is older than what the source then
+    /// yields. The heads of `key` lead the backward order, the oldest first,
+    /// so the sources are taken by winner; one that stays the winner once
+    /// moved, or has nothing older to pass, is set aside to reach the next,
+    /// and the heads set aside go back together when no head of `key` is
+    /// left in the tournament.
+    ///
+    /// Only while the merge runs backward alone, the mirror of
+    /// [`Self::skip_front_past`], and once the back took its last
+    /// [`BACK_RUN_BEFORE_JUMP`] items from one source: versions a few to a
+    /// source are walked. Returns whether a head was replaced or dropped
+    /// with an error queued for `next_back()`.
+    fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
+        if self.back_run < BACK_RUN_BEFORE_JUMP
+            || self.forward_primed
+            || !self.backward_primed
+            || self.pending_forward_error.is_some()
+            || self.pending_backward_error.is_some()
+        {
+            return Ok(false);
+        }
+        let Self {
+            sources,
+            backward_tree,
+            pending_backward_error,
+            backward_vacated,
+            backward_parked_best,
+            backward_jumped,
+            backward_set_aside,
+            ..
+        } = self;
+        let Some(tree) = backward_tree.as_mut() else {
+            return Ok(false);
+        };
+        let mut moved = false;
+        while let Some(slot) = tree.winner_slot() {
+            let at_key = tree.peek_slot(slot).is_some_and(|head| {
+                crate::comparator::same_user_key(&head.value.key.user_key, key)
+            });
+            if !at_key {
+                break;
+            }
+            if backward_jumped.contains(&slot) {
+                // Taken already: its head is the newest it holds and still
+                // the oldest left, so the next source is behind it.
+                if let Some(head) = tree.pop_min() {
+                    backward_set_aside.push(head);
+                }
+                continue;
+            }
+            backward_jumped.push(slot);
+            let Some(source) = sources.get_mut(slot) else {
+                break;
+            };
+            match source.skip_back_to_newest(key, seqno) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    // The source is done, as when `next_back()` fails it; its
+                    // head was an older version, never the key's value.
+                    tree.pop_min();
+                    pending_backward_error.get_or_insert(e);
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                    moved = true;
+                    continue;
+                }
+            }
+            moved = true;
+            match MergeSource::next_back(source) {
+                Some(Ok(value)) => {
+                    tree.replace_min(MergerEntry {
+                        source: slot,
+                        value,
+                    });
+                }
+                Some(Err(e)) => {
+                    tree.pop_min();
+                    pending_backward_error.get_or_insert(e);
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                }
+                None => {
+                    tree.pop_min();
+                    backward_vacated.push(slot);
+                    *backward_parked_best = ParkedCache::Stale;
+                }
+            }
+        }
+        backward_jumped.clear();
+        if !backward_set_aside.is_empty() {
+            tree.restore(backward_set_aside.drain(..).map(|head| (head.source, head)));
+        }
+        Ok(moved)
+    }
+}
+
 // `DoubleEndedIterator` is gated on `CoherentMergeSource`. The
 // marker's no-duplicates-under-mixed-direction promise is what
 // makes backward iteration safe given that the merger does NOT
@@ -625,6 +832,8 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             backward_vacated,
             forward_parked_best,
             backward_parked_best,
+            back_run_slot,
+            back_run,
             ..
         } = self;
         let tree = backward_tree.as_mut()?;
@@ -644,9 +853,11 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             // consumed the cached candidate.
             forward_vacated.push(slot);
             *backward_parked_best = ParkedCache::Stale;
+            Self::note_back_item(back_run_slot, back_run, slot);
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
+        Self::note_back_item(back_run_slot, back_run, source);
         #[expect(
             clippy::indexing_slicing,
             reason = "source index < n_sources by construction"

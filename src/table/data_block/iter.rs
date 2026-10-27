@@ -5,7 +5,7 @@
 use crate::{
     InternalValue, SeqNo,
     comparator::SharedComparator,
-    double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt},
+    double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt, MaybePeeked},
     table::{
         block::{Decoder, ParsedItem},
         data_block::DataBlockParsedItem,
@@ -163,6 +163,80 @@ impl<'a> Iter<'a> {
                     )]
                     self.decoder.next_back().expect("should exist");
                 }
+            }
+        }
+    }
+
+    /// Moves the front past every entry whose key is `needle`, from where it
+    /// stands, never back; whether an entry of a later key is left. The entries
+    /// passed are compared as parsed, never materialized.
+    pub fn skip_past(&mut self, needle: &[u8]) -> bool {
+        loop {
+            let Some(item) = self.decoder.peek() else {
+                return false;
+            };
+            if item.compare_key(needle, self.bytes, self.comparator.as_ref())
+                == core::cmp::Ordering::Greater
+            {
+                return true;
+            }
+            self.decoder.next();
+        }
+    }
+
+    /// Moves the back down to the lowest remaining entry above `(needle,
+    /// seqno)` in internal-key order, a later key or a version of `needle`
+    /// below `seqno`, dropping the entries after it; whether the next
+    /// `next_back` yields such an entry. The entries dropped are compared as
+    /// parsed, never materialized, and an entry the back has handed out is
+    /// never brought back.
+    pub fn trim_back_above(&mut self, needle: &[u8], seqno: SeqNo) -> bool {
+        let cmp = self.comparator.as_ref();
+        let above =
+            |item: &DataBlockParsedItem, bytes: &[u8]| match item.compare_key(needle, bytes, cmp) {
+                core::cmp::Ordering::Greater => true,
+                core::cmp::Ordering::Equal => item.seqno() < seqno,
+                core::cmp::Ordering::Less => false,
+            };
+        let head_above = |key: &[u8], head_seqno: SeqNo| match cmp.compare(key, needle) {
+            core::cmp::Ordering::Greater => true,
+            core::cmp::Ordering::Equal => head_seqno < seqno,
+            core::cmp::Ordering::Less => false,
+        };
+
+        // An entry the front holds peeked lies below everything else left and
+        // reaches the back last. When it is above, it is the lowest entry
+        // above: everything else the back holds, a peeked entry included,
+        // goes.
+        if self
+            .decoder
+            .front_peeked()
+            .is_some_and(|item| above(item, self.bytes))
+        {
+            if let peeked @ MaybePeeked::Peeked(None) = self.decoder.take_back_peeked() {
+                self.decoder.put_back_peeked(peeked);
+            }
+            self.decoder.inner_mut().drop_back();
+            return true;
+        }
+
+        // A peeked back entry is the next one out and sits past everything
+        // the decoder still holds.
+        match self.decoder.take_back_peeked() {
+            MaybePeeked::Unpeeked => self.decoder.inner_mut().trim_back_above(head_above, above),
+            MaybePeeked::Peeked(Some(item)) if above(&item, self.bytes) => {
+                // It goes only if the decoder still holds a lower entry above.
+                if !self.decoder.inner_mut().trim_back_above(head_above, above) {
+                    self.decoder
+                        .put_back_peeked(MaybePeeked::Peeked(Some(item)));
+                }
+                true
+            }
+            // Nothing left, or the next entry is not above, and nothing
+            // before it is: nothing is dropped.
+            peeked @ MaybePeeked::Peeked(_) => {
+                self.decoder.put_back_peeked(peeked);
+                false
             }
         }
     }

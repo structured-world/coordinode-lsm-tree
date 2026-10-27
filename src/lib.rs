@@ -212,6 +212,8 @@ mod abstract_tree;
 
 mod close;
 
+mod skip_key;
+
 pub(crate) mod deletion_pause;
 pub mod heal_hints;
 

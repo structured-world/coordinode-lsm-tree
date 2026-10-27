@@ -315,6 +315,109 @@ fn double_ended_range() {
     assert_eq!(rev, vec![b'g', b'f', b'e', b'd', b'c']);
 }
 
+/// Backward steps over a list far larger than one back batch hand out every
+/// node once, in reverse order, for the whole list and for a bounded range.
+#[test]
+fn backward_steps_over_many_batches_reverse_the_forward_order() {
+    let map = new_map();
+    for i in 0u32..5_000 {
+        map.insert(
+            &make_key(&i.to_be_bytes(), u64::from(i % 3)),
+            make_value(b"v"),
+        );
+    }
+
+    let forward: Vec<_> = map.iter().map(|e| e.key()).collect();
+    let mut backward: Vec<_> = map.iter().rev().map(|e| e.key()).collect();
+    backward.reverse();
+    assert_eq!(backward, forward);
+
+    let lo = make_key(&700u32.to_be_bytes(), crate::MAX_SEQNO);
+    let hi = make_key(&4_321u32.to_be_bytes(), 0);
+    let forward: Vec<_> = map
+        .range(lo.clone()..=hi.clone())
+        .map(|e| e.key())
+        .collect();
+    let mut backward: Vec<_> = map.range(lo..=hi).rev().map(|e| e.key()).collect();
+    backward.reverse();
+    assert_eq!(backward, forward);
+    assert_eq!(forward.len(), 4_321 - 700 + 1);
+}
+
+/// Both ends taken in turn meet once over a long list: nothing repeated,
+/// nothing skipped, wherever the meeting point falls in a back batch.
+#[test]
+fn alternating_ends_over_many_batches_meet_once() {
+    let map = new_map();
+    for i in 0u32..3_001 {
+        map.insert(&make_key(&i.to_be_bytes(), 0), make_value(b"v"));
+    }
+    for front_steps in [0usize, 1, 7, 100, 1_499, 1_500, 2_999] {
+        let mut iter = map.iter();
+        let mut seen = Vec::new();
+        for _ in 0..front_steps {
+            seen.push(iter.next().unwrap().key());
+        }
+        while let Some(e) = iter.next_back() {
+            seen.push(e.key());
+            let Some(e) = iter.next() else { break };
+            seen.push(e.key());
+        }
+        seen.sort();
+        let all: Vec<_> = map.iter().map(|e| e.key()).collect();
+        assert_eq!(seen, all, "front_steps={front_steps}");
+    }
+}
+
+/// A node linked between nodes the back end has already batched, while the
+/// front is still before them, must not make either end hand a node out
+/// twice: the ends meet by key order, not by meeting the same node.
+#[test]
+fn an_insert_inside_a_back_batch_never_repeats_a_key() {
+    for (range, alternate) in [(false, true), (true, true), (false, false), (true, false)] {
+        let map = new_map();
+        for k in [b"a", b"c", b"e", b"g"] {
+            map.insert(&make_key(k, 0), make_value(b"v"));
+        }
+        let lo = make_key(b"a", crate::MAX_SEQNO);
+        let hi = make_key(b"z", 0);
+        let mut iter: Box<dyn DoubleEndedIterator<Item = Entry<'_>>> = if range {
+            Box::new(map.range(lo..=hi))
+        } else {
+            Box::new(map.iter())
+        };
+
+        let mut seen = vec![iter.next().unwrap().key()];
+        seen.push(iter.next_back().unwrap().key());
+        map.insert(&make_key(b"d", 0), make_value(b"v"));
+        // Front takes "c", back takes "e" and pops "c" as its next node,
+        // which the front has already handed out.
+        seen.push(iter.next().unwrap().key());
+        seen.push(iter.next_back().unwrap().key());
+        if alternate {
+            while let Some(e) = iter.next() {
+                seen.push(e.key());
+                let Some(e) = iter.next_back() else { break };
+                seen.push(e.key());
+            }
+        } else {
+            // The front alone first: it reaches the inserted "d", then "e",
+            // which the back has already handed out.
+            seen.extend(iter.by_ref().map(|e| e.key()));
+            seen.extend(iter.rev().map(|e| e.key()));
+        }
+
+        let mut keys: Vec<_> = seen.iter().map(|k| k.user_key.to_vec()).collect();
+        keys.sort();
+        let len = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), len, "a key came out twice (range={range})");
+        for k in [b"a", b"c", b"e", b"g"] {
+            assert!(keys.contains(&k.to_vec()), "{k:?} missing (range={range})");
+        }
+    }
+}
+
 #[test]
 fn empty_value() {
     let map = new_map();
