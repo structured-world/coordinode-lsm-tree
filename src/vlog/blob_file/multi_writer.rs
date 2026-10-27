@@ -60,6 +60,10 @@ pub struct MultiWriter {
     /// rotated blob writer.
     sync_mode: SyncMode,
 
+    /// Whether the files and their folder are synced at finish, stamped on
+    /// every rotated blob writer.
+    durability: crate::config::FlushDurability,
+
     /// `Config::writeback_bytes`, stamped on every rotated blob writer.
     writeback_bytes: u64,
 
@@ -174,6 +178,7 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
 
             #[cfg(zstd_any)]
@@ -248,6 +253,17 @@ impl MultiWriter {
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.active_writer.sync_mode = sync_mode;
+        self
+    }
+
+    /// Leaves every blob file this writer finishes, and their folder,
+    /// unsynced under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred),
+    /// for the install that persists them to sync.
+    #[must_use]
+    pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
+        self.durability = durability;
+        self.active_writer.durability = durability;
         self
     }
 
@@ -384,6 +400,7 @@ impl MultiWriter {
             .use_sync_mode(self.sync_mode)
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
+        w.durability = self.durability;
         // Carry the passthrough metadata codec onto the new writer so every
         // file in a relocation records the real compression.
         if passthrough != CompressionType::None {
@@ -757,8 +774,10 @@ impl MultiWriter {
         // files follows: synced once here for every file the write made. The
         // manifest is in the folder above; on another device (a nested mount)
         // a barrier would not order this sync before it, so that is in full.
+        // A deferred write leaves this to the install that persists it.
         let mode = crate::file::folder_sync_mode(&*self.fs, &self.folder, self.sync_mode);
         if !self.results.is_empty()
+            && self.durability == crate::config::FlushDurability::Synced
             && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, mode)
         {
             // Not durable, so no version may name them.

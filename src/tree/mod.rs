@@ -632,6 +632,10 @@ impl AbstractTree for Tree {
         self.version_history.write()
     }
 
+    fn persist_flushes(&self) -> crate::Result<()> {
+        self.0.persist_flushes()
+    }
+
     fn next_table_id(&self) -> TableId {
         self.0.table_id_counter.get()
     }
@@ -1277,6 +1281,7 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
         table_writer = table_writer
             .use_sync_mode(self.config.sync_mode)
+            .use_durability(self.config.flush_durability)
             .use_writeback_bytes(self.config.writeback_bytes);
 
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
@@ -1453,7 +1458,24 @@ impl AbstractTree for Tree {
             return Ok(());
         }
 
-        version_lock.upgrade_version(
+        // A deferred flush wrote its files unsynced: installed in memory only,
+        // they are synced and written to the manifest by the next persist.
+        let deferred = (self.config.flush_durability == crate::config::FlushDurability::Deferred)
+            .then(|| {
+                tables
+                    .iter()
+                    .cloned()
+                    .map(crate::version::UnsyncedFile::Table)
+                    .chain(
+                        blob_files
+                            .unwrap_or(&[])
+                            .iter()
+                            .cloned()
+                            .map(crate::version::UnsyncedFile::Blob),
+                    )
+                    .collect()
+            });
+        version_lock.upgrade_version_deferring(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -1489,6 +1511,7 @@ impl AbstractTree for Tree {
             // `false` for the filter: the flush stream carries no user
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
+            deferred,
         )?;
         installed.charge();
 
@@ -1975,7 +1998,12 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo> {
-        self.current_version()
+        // The version on disk, not the current one: a deferred flush is not
+        // persisted until a persist writes it, and a caller trimming its log
+        // by this seqno must keep what such a flush holds.
+        self.version_history
+            .read()
+            .persisted_version()
             .iter_tables()
             .map(Table::get_highest_seqno)
             .max()

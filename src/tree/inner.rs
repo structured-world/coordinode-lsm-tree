@@ -321,6 +321,27 @@ pub struct TreeInner {
 }
 
 impl TreeInner {
+    /// Makes every flush installed so far durable (see
+    /// [`AbstractTree::persist_flushes`](crate::AbstractTree::persist_flushes)).
+    ///
+    /// The files the deferred flushes wrote are synced without the version
+    /// lock, so flushes and reads go on meanwhile; under the lock only the
+    /// files flushed in between are synced before the manifest is written.
+    pub(crate) fn persist_flushes(&self) -> crate::Result<()> {
+        let pending = self.version_history.read().unsynced_files();
+        if !pending.is_empty() {
+            SuperVersions::sync_files(&pending, self.config.sync_mode)?;
+        }
+        let mut versions = self.version_history.write();
+        versions.forget_synced(&pending);
+        versions.persist_current(
+            &self.config.path,
+            &*self.config.fs,
+            self.runtime_config.load_full(),
+            self.config.encryption.clone(),
+        )
+    }
+
     pub(crate) fn create_new(
         mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
@@ -481,6 +502,15 @@ impl Drop for TreeInner {
 
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
+
+        // A tree closing persists its deferred flushes, so a reopen needs no
+        // replay of them. A failure loses nothing a caller still needs: what
+        // was not persisted is still in the caller's log.
+        if self.config.flush_durability == crate::config::FlushDurability::Deferred
+            && let Err(e) = self.persist_flushes()
+        {
+            log::warn!("closing tree: could not persist its deferred flushes: {e}");
+        }
 
         // A pool shared by trees that come and go would keep every one's
         // account otherwise.

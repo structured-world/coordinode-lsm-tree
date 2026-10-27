@@ -279,6 +279,11 @@ impl AbstractTree for AnyTree {
     }
 
     #[inline]
+    fn persist_flushes(&self) -> crate::Result<()> {
+        forward!(self.persist_flushes())
+    }
+
+    #[inline]
     fn sync_devices(&self) -> crate::Result<()> {
         forward!(self.sync_devices())
     }

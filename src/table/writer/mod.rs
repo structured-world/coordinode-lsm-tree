@@ -736,6 +736,10 @@ pub struct Writer {
     /// [`Self::use_sync_mode`].
     sync_mode: SyncMode,
 
+    /// Whether `finish` syncs the file; a deferred one is synced by the
+    /// install that persists it. Set via [`Self::use_durability`].
+    durability: crate::config::FlushDurability,
+
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
     writeback_bytes: u64,
@@ -1345,6 +1349,7 @@ impl Writer {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
             written_back: 0,
 
@@ -2403,6 +2408,15 @@ impl Writer {
     #[must_use]
     pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
+        self
+    }
+
+    /// Leaves the file unsynced at finish under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred):
+    /// the install that persists the table syncs it.
+    #[must_use]
+    pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
+        self.durability = durability;
         self
     }
 
@@ -5415,11 +5429,14 @@ impl Writer {
 
         // Write fixed-size trailer and make the table durable. Data and size
         // are all a read of it needs (POSIX synchronized I/O data integrity
-        // completion), so `sync_data`; its name is the directory sync's.
+        // completion), so `sync_data`; its name is the directory sync's. A
+        // deferred table is synced by the install that persists it.
         let mut checksum = self.file_writer.into_inner()?;
         {
             let file = checksum.inner_mut().get_mut();
-            FsFile::sync_data_with(&**file, self.sync_mode)?;
+            if self.durability == crate::config::FlushDurability::Synced {
+                FsFile::sync_data_with(&**file, self.sync_mode)?;
+            }
             // Cold-level output (L1+) is compaction product: it isn't read
             // back immediately, so drop its just-written pages from the OS
             // page cache (advisory POSIX_FADV_DONTNEED) instead of letting

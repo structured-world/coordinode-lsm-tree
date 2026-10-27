@@ -163,6 +163,9 @@ pub struct MultiWriter {
     /// finishes its SST with the same durability level.
     sync_mode: SyncMode,
 
+    /// Whether every successor [`Writer`] syncs its file at finish.
+    durability: crate::config::FlushDurability,
+
     /// `Config::writeback_bytes`, preserved for every successor [`Writer`].
     writeback_bytes: u64,
 
@@ -501,6 +504,7 @@ impl MultiWriter {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
 
             kv_checksum: None,
@@ -1198,6 +1202,16 @@ impl MultiWriter {
         self
     }
 
+    /// Leaves every table this writer finishes unsynced under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred),
+    /// for the install that persists them to sync.
+    #[must_use]
+    pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
+        self.durability = durability;
+        self.writer = self.writer.use_durability(durability);
+        self
+    }
+
     /// Wires the tree's `Config::writeback_bytes` through to the inner
     /// [`Writer`] and every successor.
     #[must_use]
@@ -1658,6 +1672,7 @@ impl MultiWriter {
         new_writer = new_writer.use_ecc(self.ecc);
         new_writer = new_writer
             .use_sync_mode(self.sync_mode)
+            .use_durability(self.durability)
             .use_writeback_bytes(self.writeback_bytes);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);

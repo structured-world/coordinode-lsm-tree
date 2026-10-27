@@ -736,6 +736,11 @@ pub fn run_checkpoint<T: AbstractTree>(
     // lock, and a heal patrol holds that heal lock while waiting for the
     // link window's read half.
     tree.flush_active_memtable(0)?;
+    // A link shares the source file's bytes, so a table a deferred flush left
+    // unsynced would be as fragile in the checkpoint as in the tree: persist
+    // first. Before the link window for the same reason as the flush: the
+    // persist takes the version lock.
+    tree.persist_flushes()?;
 
     // Hold the link window from here on: an in-place heal that has already
     // probed an SST's link count as exclusive must not observe this

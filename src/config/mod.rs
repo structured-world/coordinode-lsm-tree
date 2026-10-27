@@ -8,6 +8,7 @@ mod column_encoding;
 mod compression;
 mod delete_strategy;
 mod filter;
+mod flush_durability;
 mod hash_ratio;
 mod locator;
 mod pinning;
@@ -19,6 +20,7 @@ pub use column_encoding::{ColumnEncoding, ColumnEncodingPolicy};
 pub use compression::CompressionPolicy;
 pub use delete_strategy::{DeleteStrategy, DeleteStrategyPolicy};
 pub use filter::{BloomConstructionPolicy, FilterAdvisor, FilterPolicy, FilterPolicyEntry};
+pub use flush_durability::FlushDurability;
 pub use hash_ratio::HashRatioPolicy;
 pub use locator::{LocatorPolicy, LocatorPolicyEntry, LocatorPrecision};
 pub use pinning::PinningPolicy;
@@ -917,6 +919,10 @@ pub struct Config {
     /// [`Config::sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// When a flush's tables become durable. Set via
+    /// [`Config::flush_durability`].
+    pub(crate) flush_durability: FlushDurability,
+
     /// Bytes a table or blob file gathers between the writebacks its writer
     /// starts. Set via [`Config::writeback_bytes`].
     pub(crate) writeback_bytes: u64,
@@ -1245,6 +1251,7 @@ impl Default for Config {
             clock: None,
             manifest_recovery_mode: ManifestRecoveryMode::AbsoluteConsistency,
             sync_mode: SyncMode::Normal,
+            flush_durability: FlushDurability::Synced,
             writeback_bytes: 1_024 * 1_024,
             table_target_size: DEFAULT_TABLE_TARGET_SIZE,
             directory_lock: true,
@@ -2696,6 +2703,40 @@ impl Config {
     #[must_use]
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
+        self
+    }
+
+    /// Sets when the tables a flush writes become durable.
+    ///
+    /// Defaults to [`FlushDurability::Synced`]: a flush that returns `Ok` is
+    /// on disk. [`FlushDurability::Deferred`] leaves a flush unsynced until
+    /// [`AbstractTree::persist_flushes`](crate::AbstractTree::persist_flushes),
+    /// for a caller whose own write-ahead log already makes its writes
+    /// durable.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, config::FlushDurability};
+    ///
+    /// let tree = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .flush_durability(FlushDurability::Deferred)
+    /// .open()?;
+    /// tree.insert("a", "1", 0);
+    /// // Written and readable, not yet durable: the caller's log still holds it.
+    /// tree.flush_active_memtable(0)?;
+    /// // Durable from here: the caller may drop its log up to this point.
+    /// tree.persist_flushes()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn flush_durability(mut self, durability: FlushDurability) -> Self {
+        self.flush_durability = durability;
         self
     }
 

@@ -216,6 +216,10 @@ pub struct Writer {
     /// [`Self::use_sync_mode`].
     pub(crate) sync_mode: SyncMode,
 
+    /// Whether `finish` syncs the file; a deferred one is synced by the
+    /// install that persists it.
+    pub(crate) durability: crate::config::FlushDurability,
+
     /// Bytes gathered between writebacks the writer starts while writing; `0`
     /// starts none. Set via [`Self::use_writeback_bytes`].
     writeback_bytes: u64,
@@ -317,6 +321,7 @@ impl Writer {
             created_at: None,
             clock: None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
             written_back: 0,
 
@@ -646,8 +651,11 @@ impl Writer {
         metadata.encode_into(&mut self.writer)?;
 
         let mut checksum = self.writer.into_inner()?;
-        // Data and size are all a read of the file needs, so `sync_data`.
-        FsFile::sync_data_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
+        // Data and size are all a read of the file needs, so `sync_data`. A
+        // deferred file is synced by the install that persists it.
+        if self.durability == crate::config::FlushDurability::Synced {
+            FsFile::sync_data_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
+        }
         let checksum = checksum.checksum();
 
         Ok((metadata, checksum))

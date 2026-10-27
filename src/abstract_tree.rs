@@ -647,6 +647,47 @@ pub trait AbstractTree: sealed::Sealed {
         Ok(())
     }
 
+    /// Makes every flush installed before this call durable, under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred):
+    /// the tables and blob files those flushes wrote are synced, then their
+    /// folders, then the manifest is written. Once it returns `Ok` a caller
+    /// may drop its own log up to the writes those flushes held; under
+    /// [`SyncMode::Barrier`](crate::fs::SyncMode::Barrier) after
+    /// [`sync_devices`](Self::sync_devices) as well. A no-op when nothing is
+    /// pending, and under [`FlushDurability::Synced`](crate::config::FlushDurability::Synced)
+    /// every flush is durable when it returns.
+    ///
+    /// Every other install (a compaction, an ingestion, a drop) persists the
+    /// pending flushes with it, and so do a checkpoint and a dropped tree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, Config, SequenceNumberCounter, config::FlushDurability};
+    ///
+    /// let tree = Config::new(
+    ///     folder.path(),
+    ///     SequenceNumberCounter::default(),
+    ///     SequenceNumberCounter::default(),
+    /// )
+    /// .flush_durability(FlushDurability::Deferred)
+    /// .open()?;
+    /// for i in 0..3_u64 {
+    ///     tree.insert(i.to_be_bytes(), "v", i);
+    ///     tree.flush_active_memtable(0)?;
+    /// }
+    /// // One barrier for the three flushes.
+    /// tree.persist_flushes()?;
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a sync or manifest write error; the flushes stay installed and
+    /// readable, and the next persist retries them.
+    fn persist_flushes(&self) -> crate::Result<()>;
+
     /// Makes durable everything this tree synced on each device it lies on:
     /// the tree folder's, that of every level's tables, that of the
     /// dictionaries folder and, with KV separation, that of the blobs folder.
@@ -1347,6 +1388,10 @@ pub trait AbstractTree: sealed::Sealed {
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo>;
 
     /// Returns the highest sequence number that is flushed to disk.
+    ///
+    /// Under [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred)
+    /// only the flushes a persist made durable count: a flush that is
+    /// installed but not yet persisted would be lost by a power loss.
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo>;
 
     /// Returns the retention floor: the lower bound of the readable snapshot

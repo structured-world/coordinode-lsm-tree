@@ -35,7 +35,7 @@ pub use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
 pub use run::Run;
 pub use super_version::RetentionEffect;
 pub use super_version::SnapshotRef;
-pub use super_version::{SuperVersion, SuperVersions};
+pub use super_version::{SuperVersion, SuperVersions, UnsyncedFile};
 
 use crate::TreeType;
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
