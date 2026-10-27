@@ -452,7 +452,7 @@ where
         };
         self.present[slot] = 0;
         self.active -= 1;
-        self.replay(slot);
+        self.replay_removed(slot);
         Some(taken)
     }
 
@@ -538,6 +538,38 @@ where
             // Smaller wins. If the stored loser is actually smaller
             // than our running winner, swap them: the running winner
             // becomes the new loser stored at this node.
+            if self.cmp_indices(other, winner) == Ordering::Less {
+                self.tree[node] = winner;
+                winner = other;
+            }
+            node >>= 1;
+        }
+        self.tree[0] = winner;
+    }
+
+    /// Replay after `leaf` was emptied, whether or not it was the winner.
+    ///
+    /// [`Self::replay`] alone is only right for the winner: a loser's path
+    /// stops holding its subtree's winner at the node where it lost, so
+    /// replaying past that node drops the real winner out of the tournament.
+    /// Below that node every stored loser is the winner of the sibling
+    /// subtree, so the games replay as usual. At that node the opponent that
+    /// beat `leaf` still beats whatever now leads `leaf`'s side (emptying a
+    /// leaf only makes its side worse), so the new side leader is stored as
+    /// the loser there and nothing above changes. O(log cap).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "node traverses 1..cap by construction; tree[0] always exists"
+    )]
+    fn replay_removed(&mut self, leaf: usize) {
+        let mut winner = leaf;
+        let mut node = usize::midpoint(self.leaves.len(), leaf);
+        while node >= 1 {
+            let other = self.tree[node];
+            if other == leaf {
+                self.tree[node] = winner;
+                return;
+            }
             if self.cmp_indices(other, winner) == Ordering::Less {
                 self.tree[node] = winner;
                 winner = other;

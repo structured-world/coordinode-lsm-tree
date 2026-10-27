@@ -146,6 +146,45 @@ fn deterministic_tiebreak_by_cmp() {
 }
 
 #[test]
+fn take_slot_of_a_loser_keeps_the_winner() {
+    // Slot 1 lost its first game to slot 0, the overall winner. Taking
+    // slot 1 must leave slot 0 on top: replaying only slot 1's path
+    // would drop slot 0 out of the tournament while it is still present.
+    let mut t = LoserTree::build(alloc::vec![Some(1_u32), Some(5), Some(2), Some(7)], cmp_u32);
+    assert_eq!(t.take_slot(1), Some(5));
+    assert_eq!(t.winner_slot(), Some(0));
+    assert_eq!(collect(t), [1, 2, 7]);
+}
+
+#[test]
+fn take_slot_in_any_order_drains_the_rest_sorted() {
+    // Taking arbitrary slots, winners or not, leaves a tournament that
+    // drains exactly the untaken values in order.
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5107_7A4E);
+    for n in [2_usize, 3, 5, 8, 9, 17, 32] {
+        for trial in 0..32 {
+            let mut values: Vec<u32> = (0..n as u32).collect();
+            values.shuffle(&mut rng);
+            let mut t = LoserTree::build(values.iter().copied().map(Some).collect(), cmp_u32);
+            let mut slots: Vec<usize> = (0..n).collect();
+            slots.shuffle(&mut rng);
+            let (taken, kept) = slots.split_at(n / 2);
+            for &slot in taken {
+                #[expect(clippy::indexing_slicing, reason = "slot < n by construction")]
+                let expected = values[slot];
+                assert_eq!(t.take_slot(slot), Some(expected), "n={n} trial={trial}");
+            }
+            #[expect(clippy::indexing_slicing, reason = "slot < n by construction")]
+            let mut rest: Vec<u32> = kept.iter().map(|&slot| values[slot]).collect();
+            rest.sort_unstable();
+            assert_eq!(collect(t), rest, "n={n} trial={trial}");
+        }
+    }
+}
+
+#[test]
 fn random_inputs_match_sorted_reference() {
     // Property-style: random multi-source data must drain in the
     // same order a sorted concatenation produces.
