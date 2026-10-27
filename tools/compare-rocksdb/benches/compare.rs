@@ -64,9 +64,9 @@
 //! enum so the per-engine glue (open, put, get, flush, close) lives
 //! in exactly one place per engine and the workload code stays
 //! engine-agnostic. Three engines today: `ours`, `rocksdb`, and
-//! `surrealkv` (pure-Rust embedded LSM/MVCC). SurrealKV has no zstd
-//! codec, so it overlays ONLY on the `None`-compression groups (see
-//! [`engines_for`]); the `_zstd22` groups stay ours-vs-rocksdb.
+//! `surrealkv` (pure-Rust embedded LSM/MVCC). SurrealKV compresses with zstd
+//! at a fixed level 3 only, so it overlays ONLY on the `None`-compression
+//! groups (see [`engines_for`]); the `_zstd22` groups stay ours-vs-rocksdb.
 //!
 //! ## Compression axis + cross-engine overlay
 //!
@@ -251,9 +251,9 @@ fn setup_surrealkv_warm(
 enum Engine {
     Ours,
     RocksDb,
-    /// SurrealKV — pure-Rust embedded LSM/MVCC store. No zstd codec
-    /// (only None / Snappy), so it participates ONLY in the
-    /// None-compression (codec-neutral) groups — see [`engines_for`].
+    /// SurrealKV — pure-Rust embedded LSM/MVCC store. Its zstd runs at a
+    /// fixed level 3, so it participates ONLY in the None-compression
+    /// (codec-neutral) groups — see [`engines_for`].
     SurrealKv,
     /// Our engine in its KV-separated (`blob_tree`) configuration: values at or
     /// above [`BLOB_SEPARATION_THRESHOLD`] are stored out-of-line in blob files,
@@ -289,9 +289,9 @@ const BLOB_SEPARATION_THRESHOLD: u32 = 128;
 
 /// Engines to overlay for a given compression variant.
 ///
-/// SurrealKV has no zstd codec (its `CompressionType` is `None` / `Snappy`
-/// only), so it cannot match the `Zstd22` variant apples-to-apples — adding a
-/// non-zstd line to a zstd22 graph would misrepresent the comparison. It is
+/// SurrealKV's zstd is fixed at level 3 (no level setting), so it cannot match
+/// the `Zstd22` variant apples-to-apples — adding a level-3 line to a zstd22
+/// graph would misrepresent the comparison. It is
 /// therefore restricted to the `None`-compression groups, where all three
 /// engines run codec-neutral. The `_zstd22` groups stay ours-vs-rocksdb.
 fn engines_for(compression: Compression) -> &'static [Engine] {

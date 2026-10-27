@@ -48,7 +48,7 @@ rocksdb = { version = "0.25", default-features = false, features = ["zstd"] }
 # exact release: this crate commits no Cargo.lock, so a caret range would let
 # the comparison point move between runs of the same commit, and a published
 # version, unlike a git tag, cannot be retargeted.
-surrealkv = "=0.21.4"
+surrealkv = "=1.1.1"
 # SurrealKV needs a tokio runtime: its `build()` spawns background
 # compaction tasks via `tokio::spawn`, and `commit()` is async. The
 # harness is sync, so each surrealkv arm owns a multi-thread
