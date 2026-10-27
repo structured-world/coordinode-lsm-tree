@@ -199,13 +199,16 @@ pub struct TableFilePools {
     /// go: none makes a file in a folder after its tree is closed.
     #[cfg(feature = "std")]
     refills: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// The liveness of the tree whose folders these are, given up only once
+    /// the last refill is joined.
+    life: Option<Arc<crate::close::Life>>,
 }
 
 impl TableFilePools {
     /// Pools that refill on the claiming thread.
     #[cfg(test)]
     pub fn new(ids: SequenceNumberCounter, batch: usize, sync_mode: SyncMode) -> Self {
-        Self::with(ids, batch, sync_mode, false)
+        Self::with(ids, batch, sync_mode, false, None)
     }
 
     /// Pools that refill off the claiming thread: no claim waits on a batch.
@@ -215,19 +218,20 @@ impl TableFilePools {
         batch: usize,
         sync_mode: SyncMode,
     ) -> Self {
-        Self::with(ids, batch, sync_mode, true)
+        Self::with(ids, batch, sync_mode, true, None)
     }
 
     /// A tree's pools: refilling where `refill` says, and on the claiming
-    /// thread without `std`.
+    /// thread without `std`, keeping the tree open until dropped.
     pub fn for_tree(
         ids: SequenceNumberCounter,
         batch: usize,
         sync_mode: SyncMode,
         refill: RefillOn,
+        life: Arc<crate::close::Life>,
     ) -> Self {
         let background = cfg!(feature = "std") && refill == RefillOn::Background;
-        Self::with(ids, batch, sync_mode, background)
+        Self::with(ids, batch, sync_mode, background, Some(life))
     }
 
     fn with(
@@ -235,6 +239,7 @@ impl TableFilePools {
         batch: usize,
         sync_mode: SyncMode,
         background: bool,
+        life: Option<Arc<crate::close::Life>>,
     ) -> Self {
         Self {
             pools: Arc::new(Pools {
@@ -248,6 +253,7 @@ impl TableFilePools {
             }),
             #[cfg(feature = "std")]
             refills: Mutex::new(Vec::new()),
+            life,
         }
     }
 
@@ -421,6 +427,8 @@ impl TableFilePools {
 impl Drop for TableFilePools {
     fn drop(&mut self) {
         self.wait_for_refills();
+        // Only now: no refill makes a file once the tree may close.
+        drop(self.life.take());
     }
 }
 

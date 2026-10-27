@@ -210,6 +210,8 @@ mod any_tree;
 
 mod abstract_tree;
 
+mod close;
+
 pub(crate) mod deletion_pause;
 pub mod heal_hints;
 
@@ -571,6 +573,7 @@ pub use {
     abstract_tree::{AbstractTree, CheckpointInfo},
     any_tree::AnyTree,
     blob_tree::BlobTree,
+    close::{TreeClose, WeakTree},
     descriptor_table::DescriptorTable,
     ingestion::AnyIngestion,
     scan_since::ScanSinceEvent,

@@ -22,6 +22,9 @@ use core::ops::RangeBounds;
 mod tests;
 
 /// May be a standard [`Tree`] or a [`BlobTree`]
+///
+/// Closed like either: once the [`TreeClose`](crate::TreeClose) of
+/// [`close`](Self::close) fires, the tree writes nothing into its directory.
 #[derive(Clone)]
 pub enum AnyTree {
     /// Standard LSM-tree, see [`Tree`]
@@ -34,6 +37,24 @@ pub enum AnyTree {
 impl crate::abstract_tree::sealed::Sealed for AnyTree {}
 
 impl AnyTree {
+    /// A handle that does not keep the tree open; see [`WeakTree`](crate::WeakTree).
+    #[must_use]
+    pub fn downgrade(&self) -> crate::WeakTree {
+        match self {
+            Self::Standard(tree) => tree.downgrade(),
+            Self::Blob(tree) => tree.downgrade(),
+        }
+    }
+
+    /// Gives up this handle and returns the signal of the tree being closed;
+    /// see [`Tree::close`](crate::Tree::close).
+    pub fn close(self) -> crate::TreeClose {
+        match self {
+            Self::Standard(tree) => tree.close(),
+            Self::Blob(tree) => tree.close(),
+        }
+    }
+
     /// Starts a multi-get of `keys` at `seqno` that its caller drives: see
     /// [`Tree::start_multi_get`].
     ///

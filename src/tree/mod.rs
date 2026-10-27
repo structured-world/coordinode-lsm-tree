@@ -417,6 +417,12 @@ fn ignore_tombstone_value(item: InternalValue) -> Option<InternalValue> {
 }
 
 /// A log-structured merge tree (LSM-tree/LSMT)
+///
+/// Clones share one tree. Background work of the tree (the table file pool,
+/// the file deleter) may still touch its directory after a handle drops; to
+/// remove the directory, [`close`](Self::close) the tree and wait for the
+/// returned [`TreeClose`](crate::TreeClose): once it fires, the tree writes
+/// nothing into its directory any more.
 #[derive(Clone)]
 pub struct Tree(#[doc(hidden)] pub Arc<TreeInner>);
 
@@ -429,6 +435,52 @@ impl core::ops::Deref for Tree {
 }
 
 impl crate::abstract_tree::sealed::Sealed for Tree {}
+
+impl Tree {
+    /// A handle that does not keep the tree open; see [`WeakTree`](crate::WeakTree).
+    #[must_use]
+    pub fn downgrade(&self) -> crate::WeakTree {
+        crate::WeakTree::of(self, None)
+    }
+
+    /// Gives up this handle and returns the signal of the tree being closed.
+    ///
+    /// The tree is closed once nothing of it owns a file of its directory or
+    /// works in it any more: other strong handles, iterators, snapshots and
+    /// pins keep it open until they drop, and the table file pool and the
+    /// background deleter finish what they started. Once closed, the tree
+    /// writes nothing into its directory and removing the directory is safe.
+    ///
+    /// From this call on no [`WeakTree`](crate::WeakTree) raises the tree
+    /// again; strong handles already held keep working until dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # let folder = tempfile::tempdir()?;
+    /// use lsm_tree::{AbstractTree, AnyTree};
+    ///
+    /// let AnyTree::Standard(tree) = lsm_tree::Config::new(
+    ///     folder.path(),
+    ///     lsm_tree::SequenceNumberCounter::default(),
+    ///     lsm_tree::SequenceNumberCounter::default(),
+    /// )
+    /// .open()?
+    /// else {
+    ///     unreachable!("no key-value separation configured");
+    /// };
+    /// let monitor = tree.downgrade();
+    ///
+    /// let closed = tree.close();
+    /// assert!(monitor.upgrade().is_none());
+    /// closed.wait();
+    /// std::fs::remove_dir_all(folder.path())?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn close(self) -> crate::TreeClose {
+        crate::close::close(self)
+    }
+}
 
 /// Maps a raw merge-pipeline item into a standard-tree iterator guard.
 fn standard_guard(item: crate::Result<InternalValue>) -> IterGuardImpl {
@@ -5771,11 +5823,13 @@ impl Tree {
             .max()
             .unwrap_or_default();
         let table_id_counter = SequenceNumberCounter::new(highest_table_id + 1);
+        let life = crate::close::Life::new();
         let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
             table_id_counter.clone(),
             config.table_file_pool,
             config.sync_mode,
             config.table_file_refill,
+            Arc::clone(&life),
         ));
         for (folder, folder_fs, ids) in pooled {
             table_files.adopt(&folder, &folder_fs, ids);
@@ -5783,9 +5837,10 @@ impl Tree {
 
         let comparator = config.comparator.clone();
 
-        let deletion_pause = crate::deletion_pause::DeletionPause::new_shared();
+        let deletion_pause = crate::deletion_pause::DeletionPause::for_tree(Arc::clone(&life));
         #[cfg(feature = "std")]
-        let background_deleter = Arc::new(crate::BackgroundDeleter::new(None));
+        let background_deleter =
+            Arc::new(crate::BackgroundDeleter::for_tree(None, Arc::clone(&life)));
         let heal_hints =
             crate::heal_hints::HealHints::new_shared(config.initial_runtime_config.auto_heal);
 
@@ -5827,6 +5882,8 @@ impl Tree {
         }
         let inner = TreeInner {
             id: tree_id,
+            life,
+            closing: core::sync::atomic::AtomicBool::new(false),
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter,
             table_files,

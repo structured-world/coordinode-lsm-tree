@@ -439,16 +439,33 @@ impl BlobSource {
 /// This tree is a composite structure, consisting of an
 /// index tree (LSM-tree) and a log-structured value log
 /// to reduce write amplification.
+///
+/// Closed like a [`Tree`](crate::Tree): once the [`TreeClose`](crate::TreeClose)
+/// of [`close`](Self::close) fires, the tree writes nothing into its directory,
+/// its blob folder included.
 #[derive(Clone)]
 pub struct BlobTree {
     /// Index tree that holds value handles or small inline values
     #[doc(hidden)]
     pub index: crate::Tree,
 
-    blobs_folder: Arc<PathBuf>,
+    pub(crate) blobs_folder: Arc<PathBuf>,
 }
 
 impl BlobTree {
+    /// A handle that does not keep the tree open; see [`WeakTree`](crate::WeakTree).
+    #[must_use]
+    pub fn downgrade(&self) -> crate::WeakTree {
+        crate::WeakTree::of(&self.index, Some(Arc::clone(&self.blobs_folder)))
+    }
+
+    /// Gives up this handle and returns the signal of the tree being closed;
+    /// see [`Tree::close`](crate::Tree::close). A blob file an iterator or a
+    /// snapshot still holds keeps the tree open, as a table does.
+    pub fn close(self) -> crate::TreeClose {
+        crate::close::close(self.index)
+    }
+
     /// Physical footprint of the stale blob files a full compaction would
     /// relocate: the linked, stale, non-dead subset across every live table (the
     /// SAME set the merge gate budgets via `pick_blob_files_to_rewrite`), summed
