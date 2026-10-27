@@ -344,12 +344,15 @@ fn count(codec: Codec, n: usize) {
         .expect("one set of counters");
     let files = flush.files();
     println!(
-        "overwrite/{}/{n}/flush-io: {} writes, {} bytes, {} files created, {} syncs in all",
+        "overwrite/{}/{n}/flush-io: {} writes, {} bytes, {} files created, {} syncs in all ({} of files, {} of directories, {} of devices)",
         codec.label(),
         files.writes,
         files.bytes,
         files.created,
         flush.syncs(),
+        files.syncs,
+        flush.directory.syncs,
+        flush.directory.device_syncs,
     );
     for origin in WriteOrigin::ALL {
         let writes = flush.origin(origin);
