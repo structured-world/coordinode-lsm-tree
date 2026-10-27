@@ -458,3 +458,29 @@ fn a_used_up_block_back_keeps_the_newest_version() -> Result<(), TestCaseError> 
         (Some((1, false)), None),
     )
 }
+
+/// A chain spread over several tables, a dozen versions in each, the newest
+/// in the memtable. A reverse scan moves every table holding the key up to
+/// its newest version, the tables whose newest is still the oldest left
+/// included, and hands out the chain's newest; snapshots between the tables
+/// read the newest they see.
+#[test]
+fn a_chain_over_several_tables_reads_its_newest_backward() -> Result<(), TestCaseError> {
+    for variant in [Variant::Lexicographic, Variant::Reverse, Variant::Merge] {
+        let mut ops = Vec::new();
+        for _ in 0..6 {
+            ops.extend([
+                Op::Burst { key: 1, n: 12 },
+                Op::Burst { key: 2, n: 12 },
+                Op::Put { key: 3, value: 0 },
+                Op::Flush,
+            ]);
+        }
+        if matches!(variant, Variant::Merge) {
+            ops.push(Op::MergeBurst { key: 2, n: 12 });
+        }
+        ops.push(Op::Burst { key: 1, n: 12 });
+        run(variant, ops, vec![20, 75, 140, 151, 260], (None, None))?;
+    }
+    Ok(())
+}

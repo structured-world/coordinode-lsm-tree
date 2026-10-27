@@ -299,6 +299,11 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     forward_parked_best: ParkedCache,
     /// Mirror of `forward_parked_best` for the backward direction.
     backward_parked_best: ParkedCache,
+    /// Scratch of [`SkipKey::skip_back_to_newest`](crate::skip_key::SkipKey):
+    /// the slots it moved, and the heads it set aside to reach the sources
+    /// behind them. Empty between calls; kept for their allocations.
+    backward_jumped: Vec<usize>,
+    backward_set_aside: Vec<MergerEntry>,
 }
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
@@ -322,6 +327,8 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_vacated: Vec::new(),
             forward_parked_best: ParkedCache::Stale,
             backward_parked_best: ParkedCache::Stale,
+            backward_jumped: Vec::new(),
+            backward_set_aside: Vec::new(),
         }
     }
 
@@ -667,9 +674,11 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
     /// Moves each source whose back head is a version of `key` up to its
     /// newest visible one, and refills its leaf with it, as `next_back()`
     /// refills it. The head goes: it is older than what the source then
-    /// yields. The winner is the oldest version of `key` the sources hold,
-    /// so the sources are taken from it on, until one has nothing older to
-    /// pass.
+    /// yields. The heads of `key` lead the backward order, the oldest first,
+    /// so the sources are taken by winner; one that stays the winner once
+    /// moved, or has nothing older to pass, is set aside to reach the next,
+    /// and the heads set aside go back together when no head of `key` is
+    /// left in the tournament.
     ///
     /// Only while the merge runs backward alone, the mirror of
     /// [`Self::skip_front_past`]. Returns whether a head was replaced or
@@ -688,6 +697,8 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
             pending_backward_error,
             backward_vacated,
             backward_parked_best,
+            backward_jumped,
+            backward_set_aside,
             ..
         } = self;
         let Some(tree) = backward_tree.as_mut() else {
@@ -701,12 +712,21 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
             if !at_key {
                 break;
             }
+            if backward_jumped.contains(&slot) {
+                // Taken already: its head is the newest it holds and still
+                // the oldest left, so the next source is behind it.
+                if let Some(head) = tree.pop_min() {
+                    backward_set_aside.push(head);
+                }
+                continue;
+            }
+            backward_jumped.push(slot);
             let Some(source) = sources.get_mut(slot) else {
                 break;
             };
             match source.skip_back_to_newest(key, seqno) {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => continue,
                 Err(e) => {
                     // The source is done, as when `next_back()` fails it; its
                     // head was an older version, never the key's value.
@@ -738,6 +758,10 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
                     *backward_parked_best = ParkedCache::Stale;
                 }
             }
+        }
+        backward_jumped.clear();
+        if !backward_set_aside.is_empty() {
+            tree.restore(backward_set_aside.drain(..).map(|head| (head.source, head)));
         }
         Ok(moved)
     }

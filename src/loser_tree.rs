@@ -456,6 +456,31 @@ where
         Some(taken)
     }
 
+    /// Puts each `(slot, value)` back into its slot, emptied by
+    /// [`Self::pop_min`] before, and plays the whole tournament again: O(cap)
+    /// for any number of them, where a caller set several winners aside to
+    /// reach the ones behind them.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "slot is checked < n_sources <= leaves.len() == present.len() before indexing"
+    )]
+    pub fn restore(&mut self, entries: impl IntoIterator<Item = (usize, E)>) {
+        for (slot, value) in entries {
+            // A present slot would be overwritten without its drop.
+            debug_assert!(
+                slot < self.n_sources && self.present[slot] == 0,
+                "restore into an occupied or foreign slot"
+            );
+            if slot >= self.n_sources || self.present[slot] != 0 {
+                continue;
+            }
+            self.leaves[slot] = MaybeUninit::new(value);
+            self.present[slot] = 1;
+            self.active += 1;
+        }
+        self.build_subtree(1, 0, self.leaves.len());
+    }
+
     /// The leaf buffered for `slot`, without removing it or disturbing the
     /// tournament. `None` when the slot is exhausted or out of range.
     ///
