@@ -927,10 +927,15 @@ pub(super) fn install_merge(
         blob_file.bind_to_tree(&sinks);
     }
 
-    // Globally-dead blob files are dropped once, from the install-time version.
+    // Globally-dead blob files are dropped once, from the install-time version,
+    // counting what this install charges too: a file whose last values this
+    // compaction dropped goes with it, not with whichever install comes next,
+    // which on a store gone quiet may never come.
     let current_version = super_version.latest_version();
     for blob_file in current_version.version.blob_files.iter() {
-        if blob_file.is_dead(current_version.version.gc_stats()) {
+        if blob_file.is_dead_after(current_version.version.gc_stats(), &blob_frag_map)
+            && !blob_files_to_drop.contains(blob_file)
+        {
             blob_files_to_drop.push(blob_file.clone());
         }
     }
