@@ -374,7 +374,7 @@ fn alternating_ends_over_many_batches_meet_once() {
 /// twice: the ends meet by key order, not by meeting the same node.
 #[test]
 fn an_insert_inside_a_back_batch_never_repeats_a_key() {
-    for range in [false, true] {
+    for (range, alternate) in [(false, true), (true, true), (false, false), (true, false)] {
         let map = new_map();
         for k in [b"a", b"c", b"e", b"g"] {
             map.insert(&make_key(k, 0), make_value(b"v"));
@@ -390,10 +390,21 @@ fn an_insert_inside_a_back_batch_never_repeats_a_key() {
         let mut seen = vec![iter.next().unwrap().key()];
         seen.push(iter.next_back().unwrap().key());
         map.insert(&make_key(b"d", 0), make_value(b"v"));
-        while let Some(e) = iter.next() {
-            seen.push(e.key());
-            let Some(e) = iter.next_back() else { break };
-            seen.push(e.key());
+        // Front takes "c", back takes "e" and pops "c" as its next node,
+        // which the front has already handed out.
+        seen.push(iter.next().unwrap().key());
+        seen.push(iter.next_back().unwrap().key());
+        if alternate {
+            while let Some(e) = iter.next() {
+                seen.push(e.key());
+                let Some(e) = iter.next_back() else { break };
+                seen.push(e.key());
+            }
+        } else {
+            // The front alone first: it reaches the inserted "d", then "e",
+            // which the back has already handed out.
+            seen.extend(iter.by_ref().map(|e| e.key()));
+            seen.extend(iter.rev().map(|e| e.key()));
         }
 
         let mut keys: Vec<_> = seen.iter().map(|k| k.user_key.to_vec()).collect();
