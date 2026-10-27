@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793080618765,
+  "lastUpdate": 1793080623039,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -73980,6 +73980,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.667665954,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9a17ab708f19acc7c912c02ee0965b7573814d04",
+          "message": "perf(compaction): copy unchanged compressed data blocks as stored (#997)\n\n## Summary\n\n- Compaction copies a compressed row-major data block into its output as\nstored when the merge emits every row of it exactly as read, instead of\ndecompressing and compressing it again. The rule is the one columnar row\ngroups already use: the copy is proved by the merge's own output, not\npredicted from metadata.\n- Uncompressed blocks are never copied: a copy saves only the\ncompression.\n- An input whose blocks keep coming out changed stops being recorded for\na while (exponential backoff, a recorded probe in between), so a merge\nthat rewrites everything pays almost nothing for the machinery.\n\n## Changes\n\n- The scanner keeps each row-major block's verified frame as a view of\nits chunk, so the copy is of the bytes the rows were decoded from; the\nblock stream keeps a marked block's bytes in one chunk across a refill.\n- `Writer::append_carried_data_block` takes a block only when its codec\nand dictionary, restart interval, per-KV footer and hash index ratio\nmatch the output, the output is neither encrypted nor ECC-protected,\nkeeps no prebuilt filter, is not columnar, and the rows continue the\ntable in order. A block split into inner frames, or from a table with a\nseqno base, a restricted view or a delete mask, is never recorded. Table\nmetadata now exposes the stored hash index ratio.\n- `MultiWriter::carry_data_block` places a copied block under the same\nrotation, cut-alignment, range-tombstone and key-domain rules as a\ncopied row group; those checks no longer depend on the `columnar`\nfeature.\n- The matcher drops a block at the first row that is not its next one as\nread, keeps no copy of a held block's rows, and skips the candidate\nqueue's lock for rows below the next candidate. The scanner reuses its\nrow buffers.\n- New metric `Metrics::compaction_blocks_carried`.\n- New bench `row_block_carry`: a bottommost compaction of a settled\nlevel after a clustered, scattered or full update, per codec.\n- `structured-zstd` required at 0.2.6.\n\nBench (ABBA on one Linux host, compaction time vs main):\n\n| codec | 1% of keys, clustered | every 100th key | every key |\n|---|---|---|---|\n| lz4 | -17% | -5% | within ±3% |\n| zstd 1 | -41% | -18% | within ±3% |\n| zstd 22 | -94% | -50% | within ±3% |\n\nThe last column copies nothing: an input whose blocks keep changing is\nno longer recorded, and the per-row checks of the copy path stay off the\npath of compactions and scans that copy nothing.\n\n## Testing\n\nfmt, nextest (all features and default), clippy (all features and\ndefault), doc tests, `cargo doc` without warnings, the no-std check,\nsst-dump and db_bench pass on Linux.\n\nCloses #953",
+          "timestamp": "2026-10-27T07:41:36+02:00",
+          "tree_id": "0ef64bf5a6e17d92145e1b6b2d734bff99495f59",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9a17ab708f19acc7c912c02ee0965b7573814d04"
+        },
+        "date": 1793080621630,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 508.3349999999999,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 110.338553ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 135.31900000000002,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.321724ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 456.474,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.787212ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4092.586,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 11171.222,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 23.583,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 66.486271,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.577042003,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.775,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 69.140479,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.552819539,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
