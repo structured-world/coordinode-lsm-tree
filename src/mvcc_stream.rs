@@ -762,7 +762,25 @@ impl<
             walked += 1;
             if walked.is_multiple_of(WALKED_BEFORE_JUMP) && self.inner.front_unpeeked() {
                 match P::jump_back(self.inner.inner_mut(), &tail.key.user_key) {
-                    Ok(true) => self.inner.reset_back_peeked(),
+                    Ok(true) => {
+                        self.inner.reset_back_peeked();
+                        // A source that failed on the way left its error to
+                        // come out first: it may have held newer versions
+                        // than the ones left, so none of them resolves the key.
+                        if let Some(Err(_)) = self.inner.peek_back() {
+                            #[expect(
+                                clippy::expect_used,
+                                reason = "we just asserted, the peeked value is an error"
+                            )]
+                            let error = self
+                                .inner
+                                .next_back()
+                                .expect("should exist")
+                                .expect_err("should be error");
+                            self.skip_back = Some(tail.key.user_key);
+                            return Some(Err(error));
+                        }
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         // As an error met while walking: the key's newer

@@ -748,7 +748,7 @@ impl Iter {
     /// table's `Arc` handles.
     ///
     /// Clears the bound pair, the materialized low/high data blocks, the offset
-    /// cursors, and the poison flag, and rewinds the retained `index_iter` to
+    /// cursors, a block handle a backward jump held, and the poison flag, and rewinds the retained `index_iter` to
     /// the table start. The rewind is load-bearing: lazy init only calls
     /// `seek_lower` when the new range HAS a lower bound, so a re-seek to a
     /// range with an UNBOUNDED lower would otherwise inherit the previous pass's
@@ -763,6 +763,9 @@ impl Iter {
         self.lo_data_block = None;
         self.hi_offset = BlockOffset(u64::MAX);
         self.hi_data_block = None;
+        // A handle a backward jump held belongs to the previous pass: either
+        // end would read it before the index and replay a block out of range.
+        self.back_held = None;
         // A fresh `table.range()` would produce a non-poisoned iterator; match
         // that so a re-seek past a previously-corrupt block can make progress
         // again (the block is re-read, and re-poisons only if still corrupt).

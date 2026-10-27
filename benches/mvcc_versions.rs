@@ -20,7 +20,7 @@
 //! Each layout is scanned forward (`fwd`) and backward (`rev`). No criterion,
 //! for the reason `scan_split` gives: each round runs every arm once, starting
 //! one arm later than the round before, and the median over the rounds is
-//! reported. Values are 64 bytes and blocks uncompressed, so a chain of a few
+//! reported, with the p50 and p99 of single scans beside it. Values are 64 bytes and blocks uncompressed, so a chain of a few
 //! hundred versions spans several data blocks.
 //!
 //! `MVCC_VERSIONS` (comma-separated, default `1,4,8,32,128,512,4096`) sets the
@@ -175,12 +175,15 @@ impl Arm {
     }
 
     /// Nanoseconds per key handed out over scans adding up to at least
-    /// `budget`.
-    fn time(&self, budget: Duration) -> f64 {
+    /// `budget`; each scan's own nanoseconds per key go to `scans`.
+    fn time(&self, budget: Duration, scans: &mut Vec<f64>) -> f64 {
         let start = Instant::now();
         let mut keys = 0u64;
         while start.elapsed() < budget {
-            keys += self.scan();
+            let scan_start = Instant::now();
+            let scanned = self.scan();
+            scans.push(scan_start.elapsed().as_nanos() as f64 / scanned.max(1) as f64);
+            keys += scanned;
         }
         start.elapsed().as_nanos() as f64 / keys as f64
     }
@@ -213,9 +216,16 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 /// The median of `v`, which is not empty.
-fn median(mut v: Vec<f64>) -> f64 {
+fn median(v: Vec<f64>) -> f64 {
+    percentile(v, 50)
+}
+
+/// The `pct`-th percentile of `v` (nearest rank), which is not empty.
+fn percentile(mut v: Vec<f64>, pct: usize) -> f64 {
     v.sort_by(f64::total_cmp);
-    *v.get(v.len() / 2).expect("a median of at least one sample")
+    let rank = (v.len() * pct).div_ceil(100).max(1);
+    *v.get(rank - 1)
+        .expect("a percentile of at least one sample")
 }
 
 fn main() {
@@ -242,8 +252,13 @@ fn main() {
             .find(|arm| arm.label == only)
             .unwrap_or_else(|| panic!("no arm named {only}"));
         let secs: u64 = env_or("MVCC_SECS", 20);
-        let ns = arm.time(Duration::from_secs(secs));
-        println!("{only}/{versions}: {ns:.1} ns/key over {secs} s");
+        let mut scans = Vec::new();
+        let ns = arm.time(Duration::from_secs(secs), &mut scans);
+        println!(
+            "{only}/{versions}: {ns:.1} ns/key over {secs} s, per scan p50 {:.1} p99 {:.1}",
+            percentile(scans.clone(), 50),
+            percentile(scans, 99),
+        );
         return;
     }
 
@@ -254,19 +269,22 @@ fn main() {
             assert_eq!(arm.scan(), arm.keys, "{}: every key once", arm.label);
         }
         let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); arms.len()];
+        let mut scans: Vec<Vec<f64>> = vec![Vec::new(); arms.len()];
         for round in 0..rounds {
             for place in 0..arms.len() {
                 let at = (round + place) % arms.len();
                 let (arm, out) = (&arms[at], &mut samples[at]);
-                out.push(arm.time(Duration::from_millis(200)));
+                out.push(arm.time(Duration::from_millis(200), &mut scans[at]));
             }
         }
-        for (arm, out) in arms.iter().zip(samples) {
+        for ((arm, out), scans) in arms.iter().zip(samples).zip(scans) {
             let per_key = median(out);
             let per_version = per_key * arm.keys as f64 / arm.entries as f64;
+            // Per scan: a round's median hides a slow scan among fast ones.
+            let (p50, p99) = (percentile(scans.clone(), 50), percentile(scans, 99));
             println!(
                 "mvcc_versions/{versions}/{}: {per_key:.1} ns/key, {per_version:.2} ns/version \
-                 ({} keys)",
+                 ({} keys); per scan p50 {p50:.1} p99 {p99:.1} ns/key",
                 arm.label, arm.keys,
             );
             #[cfg(feature = "metrics")]

@@ -406,6 +406,62 @@ fn mvcc_stream_failed_key_is_skipped_from_the_other_end() {
     assert_eq!(rest, ["x"], "back failure, front drain");
 }
 
+/// A source that jumps backward as a merger does when one of its sources
+/// fails on the way: the older versions go, the newest one left stays, and
+/// the error is queued to come out first.
+struct FailingBackJump {
+    items: std::collections::VecDeque<crate::Result<InternalValue>>,
+}
+
+impl Iterator for FailingBackJump {
+    type Item = crate::Result<InternalValue>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.items.pop_front()
+    }
+}
+
+impl DoubleEndedIterator for FailingBackJump {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.items.pop_back()
+    }
+}
+
+impl crate::skip_key::SkipKey for FailingBackJump {
+    fn skip_front_past(&mut self, _key: &[u8]) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    fn skip_back_to_newest(&mut self, key: &[u8], _seqno: SeqNo) -> crate::Result<bool> {
+        let at_key = |item: Option<&crate::Result<InternalValue>>| matches!(item, Some(Ok(kv)) if &*kv.key.user_key == key);
+        // Keep the newest version: the one with no version of `key` before it.
+        while at_key(self.items.back())
+            && self.items.len() >= 2
+            && at_key(self.items.get(self.items.len() - 2))
+        {
+            self.items.pop_back();
+        }
+        self.items.push_back(named_error("jump"));
+        Ok(true)
+    }
+}
+
+/// An error a source meets while the back jumps over a key's versions ends
+/// that key: the versions left may be older than the ones the failed source
+/// held, so none of them stands for the key.
+#[test]
+fn mvcc_stream_error_in_a_backward_jump_skips_the_key() {
+    let mut items = vec![kv("a", "a", 1, ValueType::Value)];
+    for seqno in (1..=20).rev() {
+        items.push(kv("b", &format!("b{seqno}"), seqno, ValueType::Value));
+    }
+    let source = FailingBackJump {
+        items: items.into(),
+    };
+    let stream = MvccStream::new(source, None).jumping();
+    let items: Vec<String> = stream.rev().map(shown).collect();
+    assert_eq!(items, ["jump", "a"]);
+}
+
 /// What is left of a key that failed at one end is skipped by the other end
 /// before it is resolved: resolving it could only fail again (here the
 /// operator always fails) and report a second error for the same key.

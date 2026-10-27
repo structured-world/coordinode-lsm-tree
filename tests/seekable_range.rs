@@ -741,3 +741,56 @@ fn backward_scan_then_seek_reseek_matches_range() -> lsm_tree::Result<()> {
     }
     Ok(())
 }
+
+/// A backward scan that jumps over a long chain of one key's versions keeps
+/// the handle of the block before the version it lands on, for the next pull
+/// from either end. A reposition starts a new range, so that handle must go
+/// with it: read first, it hands out the keys of a block below the new upper
+/// bound ahead of the ones right under it.
+///
+/// Where the block boundaries fall decides whether the handle is still held
+/// when the key resolves, so the fixture runs with every count of keys ahead
+/// of the chain up to a block's worth.
+#[test]
+fn reseek_after_a_backward_version_jump_matches_range() -> lsm_tree::Result<()> {
+    let value = vec![b'v'; 40];
+    for lead in 0..24u32 {
+        let folder = get_tmp_folder();
+        let tree = Config::new(
+            &folder,
+            SequenceNumberCounter::default(),
+            SequenceNumberCounter::default(),
+        )
+        .data_block_size_policy(lsm_tree::config::BlockSizePolicy::all(512))
+        .open()?;
+        let mut seqno = 0;
+        for i in 0..lead {
+            tree.insert(format!("a{i:03}"), &value, seqno);
+            seqno += 1;
+        }
+        tree.insert("b", &value, seqno);
+        seqno += 1;
+        for _ in 0..300 {
+            tree.insert("c", &value, seqno);
+            seqno += 1;
+        }
+        tree.insert("d", &value, seqno);
+        tree.flush_active_memtable(0)?;
+
+        let mut it = tree.range_seekable::<&[u8], _>(.., SeqNo::MAX, None);
+        // `d`, then `c`, resolved through the backward jump.
+        for _ in 0..2 {
+            if let Some(g) = it.next_back() {
+                g.into_inner()?;
+            }
+        }
+        it.seek_to_for_prev(b"c");
+        let got: Vec<_> = std::iter::from_fn(|| it.next_back()).map(kv).collect();
+        let expected: Vec<_> = tree.range(..="c", SeqNo::MAX, None).rev().map(kv).collect();
+        assert_eq!(
+            got, expected,
+            "seek_to_for_prev(c) after a backward jump must equal range(..=c).rev() (lead {lead})",
+        );
+    }
+    Ok(())
+}
