@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793129270751,
+  "lastUpdate": 1793129276170,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -80100,6 +80100,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.577029534,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "49699333+dependabot[bot]@users.noreply.github.com",
+            "name": "dependabot[bot]",
+            "username": "dependabot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "837cc75a87428d7bc4be88c9ac68901a4baf0fa2",
+          "message": "ci(deps): bump Swatinem/rust-cache from 2.9.2 to 2.9.3 (#1009)\n\nBumps [Swatinem/rust-cache](https://github.com/swatinem/rust-cache) from\n2.9.2 to 2.9.3.\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/swatinem/rust-cache/releases\">Swatinem/rust-cache's\nreleases</a>.</em></p>\n<blockquote>\n<h2>v2.9.3</h2>\n<h2>What's Changed</h2>\n<ul>\n<li>Issue-375: stop cleanup timestamp pruning after the first entry by\n<a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nin <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li>fix: log rustup toolchain list failure as info instead of warning by\n<a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a> in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<h2>New Contributors</h2>\n<ul>\n<li><a\nhref=\"https://github.com/TethysSvensson\"><code>@​TethysSvensson</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/377\">Swatinem/rust-cache#377</a></li>\n<li><a href=\"https://github.com/SDAChess\"><code>@​SDAChess</code></a>\nmade their first contribution in <a\nhref=\"https://redirect.github.com/Swatinem/rust-cache/pull/394\">Swatinem/rust-cache#394</a></li>\n</ul>\n<p><strong>Full Changelog</strong>: <a\nhref=\"https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3\">https://github.com/Swatinem/rust-cache/compare/v2.9.2...v2.9.3</a></p>\n</blockquote>\n</details>\n<details>\n<summary>Changelog</summary>\n<p><em>Sourced from <a\nhref=\"https://github.com/Swatinem/rust-cache/blob/master/CHANGELOG.md\">Swatinem/rust-cache's\nchangelog</a>.</em></p>\n<blockquote>\n<h1>Changelog</h1>\n<h2>2.9.3</h2>\n<ul>\n<li>Fix timestamp based pruning</li>\n<li>Add missing <code>await</code>s</li>\n<li>Do not emit warning on missing <code>rustup</code></li>\n</ul>\n<h2>2.9.2</h2>\n<ul>\n<li>Fix <code>credentials.toml</code> cleanup</li>\n<li>Improvements to cleanup, preserving more valid targets</li>\n<li>Improvements to <code>cargo install</code> handling</li>\n<li>Correctly sort/dedupe Rust versions</li>\n</ul>\n<h2>2.9.1</h2>\n<ul>\n<li>Fix regression in hash calculation</li>\n</ul>\n<h2>2.9.0</h2>\n<ul>\n<li>Update to <code>node24</code></li>\n<li>Support running from within a <code>nix</code> shell</li>\n<li>Consider all installed toolchains for cache key</li>\n<li>Use case-insensitive comparison to determine exact cache hit</li>\n</ul>\n<h2>2.8.2</h2>\n<ul>\n<li>Don't overwrite env for cargo-metadata call</li>\n</ul>\n<h2>2.8.1</h2>\n<ul>\n<li>Set empty <code>CARGO_ENCODED_RUSTFLAGS</code> when retrieving\nmetadata</li>\n<li>Various dependency updates</li>\n</ul>\n<h2>2.8.0</h2>\n<ul>\n<li>Add support for <code>warpbuild</code> cache provider</li>\n<li>Add new <code>cache-workspace-crates</code> feature</li>\n</ul>\n<h2>2.7.8</h2>\n<ul>\n<li>Include CPU arch in the cache key</li>\n</ul>\n<h2>2.7.7</h2>\n<ul>\n<li>Also cache <code>cargo install</code> metadata</li>\n</ul>\n<h2>2.7.6</h2>\n<!-- raw HTML omitted -->\n</blockquote>\n<p>... (truncated)</p>\n</details>\n<details>\n<summary>Commits</summary>\n<ul>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/d1527c8f67ef9af357290475d4af4b0fab8f12e0\"><code>d1527c8</code></a>\n2.9.3</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0fca6fc1c91b0c4158e7b92bdd2582341575c8e\"><code>f0fca6f</code></a>\nupdate dependencies and rebuild</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/b49b17f98024bf3c4d14fb465de5bad92750344b\"><code>b49b17f</code></a>\nadd missing awaits</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/6a7bc3ebce750e0a16a430dd57485acfdb38b05f\"><code>6a7bc3e</code></a>\nBump the dev-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/383\">#383</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/4ece996238f932eddbc3099e93131a4089950e4f\"><code>4ece996</code></a>\nBump the actions group across 1 directory with 6 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/392\">#392</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/8103aff431aa12c1132e226b21f6a655ea749803\"><code>8103aff</code></a>\nBump the prd-minor group across 1 directory with 2 updates (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/389\">#389</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/0e361f3528cccdd0ac5d0e0dda2bde9bcfc77a1f\"><code>0e361f3</code></a>\nfix: log rustup toolchain list failure as info instead of warning (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/393\">#393</a>)\n(<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/394\">#394</a>)</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/f0d9c3887740aee45f6153b24b3a6b815192ec16\"><code>f0d9c38</code></a>\nMerge pull request <a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/380\">#380</a>\nfrom Swatinem/dependabot/github_actions/actions-8ff58...</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/ccd9742ce3913201b7e871cc4b4f95ee3930f15b\"><code>ccd9742</code></a>\nBump the actions group with 2 updates</li>\n<li><a\nhref=\"https://github.com/Swatinem/rust-cache/commit/258712b0b7b1ddf8bddc9fc3b0faca682b2736c3\"><code>258712b</code></a>\nfix: stop cleanup timestamp pruning after the first entry (<a\nhref=\"https://redirect.github.com/swatinem/rust-cache/issues/377\">#377</a>)</li>\n<li>Additional commits viewable in <a\nhref=\"https://github.com/swatinem/rust-cache/compare/6323deb102c322ba6fcbdcafc7e3dddab59af2b6...d1527c8f67ef9af357290475d4af4b0fab8f12e0\">compare\nview</a></li>\n</ul>\n</details>\n<br />\n\nSigned-off-by: dependabot[bot] <support@github.com>\nCo-authored-by: dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-27T19:14:56Z",
+          "tree_id": "0ec88f3846a0471caf169cacde7b649e37b012c7",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/837cc75a87428d7bc4be88c9ac68901a4baf0fa2"
+        },
+        "date": 1793129274497,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 524.221,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.805726ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 162.372,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 51.87426ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 454.374,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 100.731146ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4319.608,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 11007.498,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.775,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 67.436543,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.573000406,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.879,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 72.941567,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.564797991,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
