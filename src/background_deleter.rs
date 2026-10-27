@@ -72,6 +72,9 @@ struct DeleteJob {
 pub struct BackgroundDeleter {
     sender: Option<Sender<DeleteJob>>,
     worker: Option<JoinHandle<()>>,
+    /// The liveness of the tree whose files this deleter removes, given up
+    /// only once the worker removed the last of them.
+    life: Option<Arc<crate::close::Life>>,
 }
 
 impl core::fmt::Debug for BackgroundDeleter {
@@ -89,6 +92,15 @@ impl BackgroundDeleter {
     /// (delete as fast as the queue drains, still off the foreground thread).
     #[must_use]
     pub fn new(min_interval: Option<Duration>) -> Self {
+        Self::spawn(min_interval, None)
+    }
+
+    /// A tree's deleter, keeping the tree open until its queue is drained.
+    pub(crate) fn for_tree(min_interval: Option<Duration>, life: Arc<crate::close::Life>) -> Self {
+        Self::spawn(min_interval, Some(life))
+    }
+
+    fn spawn(min_interval: Option<Duration>, life: Option<Arc<crate::close::Life>>) -> Self {
         let (sender, receiver) = channel::<DeleteJob>();
         let worker = std::thread::Builder::new()
             .name("lsm-deleter".into())
@@ -97,6 +109,7 @@ impl BackgroundDeleter {
         Self {
             sender: Some(sender),
             worker,
+            life,
         }
     }
 
@@ -157,6 +170,8 @@ impl Drop for BackgroundDeleter {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        // Only now: the tree may close on this thread once the worker is gone.
+        drop(self.life.take());
     }
 }
 

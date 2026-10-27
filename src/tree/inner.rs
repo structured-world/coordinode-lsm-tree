@@ -84,6 +84,9 @@ pub struct TestHooks {
     /// inserting the tombstone, so a test can prove the version-history read
     /// guard spans the whole insert.
     pub(crate) range_write: std::sync::Mutex<Option<TestHook>>,
+    /// Fired by `WeakTree::upgrade` between taking its strong handle and
+    /// reading the closing flag, so a test can order it against `close`.
+    pub(crate) upgrade: std::sync::Mutex<Option<TestHook>>,
 }
 
 #[cfg(test)]
@@ -107,6 +110,12 @@ impl TestHooks {
 pub struct TreeInner {
     /// Unique tree ID
     pub id: TreeId,
+
+    /// The tree's liveness, which every tree handle holds through this.
+    pub(crate) life: Arc<crate::close::Life>,
+
+    /// Set by `close`: no weak handle raises the tree from then on.
+    pub(crate) closing: core::sync::atomic::AtomicBool,
 
     /// Hands out a unique (monotonically increasing) memtable ID
     #[doc(hidden)]
@@ -345,12 +354,14 @@ impl TreeInner {
 
         let comparator = config.comparator.clone();
         let sync_mode = config.sync_mode;
+        let life = crate::close::Life::new();
         let table_id_counter = SequenceNumberCounter::default();
         let table_files = Arc::new(crate::table::file_pool::TableFilePools::for_tree(
             table_id_counter.clone(),
             config.table_file_pool,
             sync_mode,
             config.table_file_refill,
+            Arc::clone(&life),
         ));
         // Built before `config` is moved into the Arc below.
         let compaction_rate_limiter = config.tree_compaction_rate_limiter();
@@ -388,6 +399,14 @@ impl TreeInner {
 
         Ok(Self {
             id: get_next_tree_id(),
+            deletion_pause: DeletionPause::for_tree(Arc::clone(&life)),
+            #[cfg(feature = "std")]
+            background_deleter: Arc::new(crate::BackgroundDeleter::for_tree(
+                None,
+                Arc::clone(&life),
+            )),
+            life,
+            closing: core::sync::atomic::AtomicBool::new(false),
             memtable_id_counter: SequenceNumberCounter::new(1),
             table_id_counter,
             table_files,
@@ -402,9 +421,6 @@ impl TreeInner {
             #[cfg(feature = "std")]
             directory_lock: directory_lock.map(Arc::from),
             compaction_state: Arc::new(Mutex::new(CompactionState::default())),
-            deletion_pause: DeletionPause::new_shared(),
-            #[cfg(feature = "std")]
-            background_deleter: Arc::new(crate::BackgroundDeleter::new(None)),
             heal_hints: crate::heal_hints::HealHints::new_shared(initial_runtime.auto_heal),
             filter_budget,
             compaction_rate_limiter,

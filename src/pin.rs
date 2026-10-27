@@ -150,11 +150,12 @@ pub struct PinnedVersion {
     tables: Vec<PinnedFile>,
     blob_files: Vec<PinnedFile>,
     dictionaries: Vec<PinnedFile>,
-    pause: Arc<DeletionPause>,
     /// The source tree's directory lock: while the pin lives, no other opener
     /// gets the folder (with a registry of its own that knows nothing of the
-    /// pin), even after the tree drops.
+    /// pin), even after the tree drops. Declared before `pause`, so it is
+    /// released before the pin lets the tree close.
     _directory_lock: Option<Arc<dyn FsFile>>,
+    pause: Arc<DeletionPause>,
     comparator_name: Arc<str>,
     runtime: Arc<RuntimeConfig>,
     encryption: Option<Arc<dyn EncryptionProvider>>,

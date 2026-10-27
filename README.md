@@ -89,6 +89,7 @@ tree.flush_active_memtable(0)?;
 - `SequenceNumberGenerator` trait: pluggable seqno source.
 - Custom `UserComparator` for non-lexicographic ordering.
 - MVCC: snapshot reads at a chosen `SeqNo`.
+- Lifecycle: `close` gives up a tree handle and returns a `TreeClose` signal that fires (`on_closed`, `wait`) once nothing of the tree touches its directory any more: other handles, iterators, snapshots and pins have dropped, and the background file pool and deleter have finished. Removing the directory is safe from then on. A `WeakTree` (`downgrade`) lets a monitor or a queued request refer to a tree without keeping it open, and stops handing it out once it is being closed.
 - Point-in-time recovery snapshots via `Tree::create_checkpoint`: hard-link
   every live SST + blob file into a fresh directory in O(1) per file, zero
   extra disk until the source files compact away. Compaction continues

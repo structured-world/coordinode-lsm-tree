@@ -89,6 +89,11 @@ pub struct DeletionPause {
     /// Signalled when the last in-flight mutation finishes.
     #[cfg(feature = "std")]
     pins_settled: parking_lot::Condvar,
+
+    /// The liveness of the tree this gate belongs to. Every table, blob file,
+    /// pin and checkpoint of the tree holds the gate, so through it each keeps
+    /// the tree open until it drops, at no cost of its own.
+    _life: Option<Arc<crate::close::Life>>,
 }
 
 /// See [`DeletionPause::pins`].
@@ -171,22 +176,20 @@ impl core::fmt::Debug for DeletionPause {
 }
 
 impl DeletionPause {
-    /// Creates a new pause controller in the inactive state.
-    ///
-    /// This is the plain constructor — owns the value, no allocation
-    /// decision baked in. Use [`Self::new_shared`] when you specifically
-    /// want an `Arc`-wrapped controller (the common case for tree
-    /// installation where every table / blob file holds a clone).
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Convenience: creates a new pause controller and wraps it in an
-    /// [`Arc`]. Equivalent to `Arc::new(DeletionPause::new())`.
+    /// An inactive gate of no tree, for a test that drives one alone.
+    #[cfg(test)]
     #[must_use]
     pub fn new_shared() -> Arc<Self> {
-        Arc::new(Self::new())
+        Arc::new(Self::default())
+    }
+
+    /// The gate of a tree, inactive, keeping the tree open while held (see
+    /// [`Self::_life`]).
+    pub(crate) fn for_tree(life: Arc<crate::close::Life>) -> Arc<Self> {
+        Arc::new(Self {
+            _life: Some(life),
+            ..Self::default()
+        })
     }
 
     /// Returns `true` if there is at least one active [`Pause`] guard and
