@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793092692776,
+  "lastUpdate": 1793126131313,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64876,6 +64876,90 @@ window.BENCHMARK_DATA = {
             "value": 322630.1720149221,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 13.8us | P99.9: 92.0us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dadacdabd863c69fca5e9c6f9fd23372d88a936c",
+          "message": "fix(merge): keep the winner when claiming a losing leaf (#1003)\n\n## Summary\n- A scan read from both ends in turn no longer loses the merge\ntournament's winner when one end claims the other end's buffered leaf.\nDebug builds panicked in `LoserTree::pop_min`; release builds read a\nmoved-out slot and returned duplicated and shadowed rows.\n\n## Changes\n- `LoserTree::take_slot` replays the emptied slot's path only up to the\nnode where that slot lost and stores its side's new leader there; for\nthe winner's slot it replays to the root as before. Still O(log cap).\n- Unit tests: taking a losing slot keeps the winner; taking arbitrary\nslots in random order drains exactly the remaining values in order.\n- Integration test: an alternating scan over a table and a memtable\nreturns each key once with its newest version.\n\n## Testing\nFormatting, clippy (default and all features), the no-std check, docs,\ndoc tests and the full nextest suite pass on Linux.\n\nCloses #1002\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Fixed an issue that could affect result ordering when consuming sorted\ndata after removing entries.\n* Improved forward and backward iteration over combined table data.\nAlternating directions now returns the expected keys and the latest\nvalue for keys with multiple versions.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-27T20:17:30+02:00",
+          "tree_id": "a291122633d166d2867dd1e5cb79d86557af6a52",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/dadacdabd863c69fca5e9c6f9fd23372d88a936c"
+        },
+        "date": 1793126129413,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 91852.84984545826,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 16.8us | P99.9: 27.4us\nthreads: 1 | elapsed: 5.83s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2428050.8145873747,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.9us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 605470.1735644432,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.8us | P99.9: 20.7us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 463243.5534436467,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 7.6us | P99.9: 37.4us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2772838.351371248,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 13.4us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 313021.9455084573,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 7.5us | P99.9: 22.2us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 191204.47722185892,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 10.3us | P99.9: 25.0us\nthreads: 1 | elapsed: 1.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 691991.6679636033,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.8us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 748827.6662947901,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 358445.19093443366,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 11.7us | P99.9: 84.8us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
           }
         ]
       }
