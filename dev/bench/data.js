@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793036043351,
+  "lastUpdate": 1793080613821,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64624,6 +64624,90 @@ window.BENCHMARK_DATA = {
             "value": 341593.4699325312,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.9us | P99.9: 90.5us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9a17ab708f19acc7c912c02ee0965b7573814d04",
+          "message": "perf(compaction): copy unchanged compressed data blocks as stored (#997)\n\n## Summary\n\n- Compaction copies a compressed row-major data block into its output as\nstored when the merge emits every row of it exactly as read, instead of\ndecompressing and compressing it again. The rule is the one columnar row\ngroups already use: the copy is proved by the merge's own output, not\npredicted from metadata.\n- Uncompressed blocks are never copied: a copy saves only the\ncompression.\n- An input whose blocks keep coming out changed stops being recorded for\na while (exponential backoff, a recorded probe in between), so a merge\nthat rewrites everything pays almost nothing for the machinery.\n\n## Changes\n\n- The scanner keeps each row-major block's verified frame as a view of\nits chunk, so the copy is of the bytes the rows were decoded from; the\nblock stream keeps a marked block's bytes in one chunk across a refill.\n- `Writer::append_carried_data_block` takes a block only when its codec\nand dictionary, restart interval, per-KV footer and hash index ratio\nmatch the output, the output is neither encrypted nor ECC-protected,\nkeeps no prebuilt filter, is not columnar, and the rows continue the\ntable in order. A block split into inner frames, or from a table with a\nseqno base, a restricted view or a delete mask, is never recorded. Table\nmetadata now exposes the stored hash index ratio.\n- `MultiWriter::carry_data_block` places a copied block under the same\nrotation, cut-alignment, range-tombstone and key-domain rules as a\ncopied row group; those checks no longer depend on the `columnar`\nfeature.\n- The matcher drops a block at the first row that is not its next one as\nread, keeps no copy of a held block's rows, and skips the candidate\nqueue's lock for rows below the next candidate. The scanner reuses its\nrow buffers.\n- New metric `Metrics::compaction_blocks_carried`.\n- New bench `row_block_carry`: a bottommost compaction of a settled\nlevel after a clustered, scattered or full update, per codec.\n- `structured-zstd` required at 0.2.6.\n\nBench (ABBA on one Linux host, compaction time vs main):\n\n| codec | 1% of keys, clustered | every 100th key | every key |\n|---|---|---|---|\n| lz4 | -17% | -5% | within ±3% |\n| zstd 1 | -41% | -18% | within ±3% |\n| zstd 22 | -94% | -50% | within ±3% |\n\nThe last column copies nothing: an input whose blocks keep changing is\nno longer recorded, and the per-row checks of the copy path stay off the\npath of compactions and scans that copy nothing.\n\n## Testing\n\nfmt, nextest (all features and default), clippy (all features and\ndefault), doc tests, `cargo doc` without warnings, the no-std check,\nsst-dump and db_bench pass on Linux.\n\nCloses #953",
+          "timestamp": "2026-10-27T07:41:36+02:00",
+          "tree_id": "0ef64bf5a6e17d92145e1b6b2d734bff99495f59",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/9a17ab708f19acc7c912c02ee0965b7573814d04"
+        },
+        "date": 1793080612579,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 78620.7422468204,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.2us | P99.9: 21.3us\nthreads: 1 | elapsed: 6.81s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2378483.147346853,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 641469.9535441686,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 2.9us | P99.9: 14.2us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 462397.649725226,
+            "unit": "ops/sec",
+            "extra": "P50: 2.1us | P99: 6.9us | P99.9: 24.0us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3232650.337353732,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 305084.1121702328,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.7us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 183935.53364143113,
+            "unit": "ops/sec",
+            "extra": "P50: 4.6us | P99: 10.7us | P99.9: 23.0us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 635327.7933088598,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.31s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 729422.6621088254,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 313679.3810492255,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 12.6us | P99.9: 92.9us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
