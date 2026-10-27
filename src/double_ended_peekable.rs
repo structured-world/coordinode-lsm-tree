@@ -75,6 +75,12 @@ where
         self.front.is_unpeeked()
     }
 
+    /// The item the front holds peeked, which the back yields last once the
+    /// inner iterator runs out.
+    pub(crate) fn front_peeked(&self) -> Option<&T> {
+        self.front.peeked_value_ref()
+    }
+
     /// Takes what the back holds peeked, leaving it unpeeked.
     pub(crate) fn take_back_peeked(&mut self) -> MaybePeeked<T> {
         self.back.take()

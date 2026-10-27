@@ -1244,11 +1244,23 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
     /// asks. Items the back has handed out are never brought back: an
     /// interval is refilled only below the one the back stands in. Nothing
     /// is dropped when no remaining item is above, or only one is.
+    ///
+    /// An item before the front cursor is the front's, read or held peeked
+    /// above this decoder, and never reaches the back here: it counts as not
+    /// above, which keeps the test an upper part of the block.
     pub fn trim_back_above(
         &mut self,
         head_above: impl Fn(&[u8], SeqNo) -> bool,
         above: impl Fn(&Parsed, &[u8]) -> bool,
     ) -> bool {
+        // As `consume_stack_top` decides what the back may still yield.
+        let lo = self.lo_scanner.offset;
+        let reachable = |offset: usize| lo == 0 || offset >= lo;
+        let head_above =
+            |key: &[u8], seqno: SeqNo, offset: usize| reachable(offset) && head_above(key, seqno);
+        let above =
+            |item: &Parsed, bytes: &[u8], offset: usize| reachable(offset) && above(item, bytes);
+
         // The back's next item sits on top of the stack: load the interval
         // below a used-up one, as `next_back` would.
         if self.hi_scanner.stack.is_empty() {
@@ -1265,7 +1277,9 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         // The heads up to `below` are not above: the lowest item above is in
         // the last of them, past its head, or is the next one's head.
-        let Some(below) = self.partition_count(|key, seqno| !head_above(key, seqno)) else {
+        let Some(below) =
+            self.partition_count(|key, seqno, offset| !head_above(key, seqno, offset))
+        else {
             return false;
         };
         let Some(last_below) = below.checked_sub(1) else {
@@ -1305,15 +1319,16 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
     /// How many restart heads `pred` holds for, `pred` being true up to some
     /// head and false from it on.
-    fn partition_count(&self, pred: impl Fn(&[u8], SeqNo) -> bool) -> Option<usize> {
+    fn partition_count(&self, pred: impl Fn(&[u8], SeqNo, usize) -> bool) -> Option<usize> {
         let binary_index = self.get_binary_index_reader()?;
         let entries_end = self.entries_end()?;
         let mut left = 0usize;
         let mut right = binary_index.len();
         while left < right {
             let mid = usize::midpoint(left, right);
-            let (key, seqno) = self.get_key_at(binary_index.get(mid), entries_end)?;
-            if pred(key, seqno) {
+            let offset = binary_index.get(mid);
+            let (key, seqno) = self.get_key_at(offset, entries_end)?;
+            if pred(key, seqno, offset) {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -1330,22 +1345,32 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         Self::parse_current_item(&mut reader, offset, self.hi_base(), depth == 0, entries_end)
     }
 
-    /// Whether the back's next item is above; `None` when there is none.
-    fn top_above(&self, above: &impl Fn(&Parsed, &[u8]) -> bool) -> Option<bool> {
-        let depth = self.hi_scanner.stack.len().checked_sub(1)?;
+    /// Whether the item at `depth` in the back's stack is above; `None` when
+    /// there is none.
+    fn stack_item_above(
+        &self,
+        depth: usize,
+        above: &impl Fn(&Parsed, &[u8], usize) -> bool,
+    ) -> Option<bool> {
+        let &offset = self.hi_scanner.stack.get(depth)?;
         self.stack_item(depth)
-            .map(|item| above(&item, self.entries()))
+            .map(|item| above(&item, self.entries(), offset))
+    }
+
+    /// Whether the back's next item is above; `None` when there is none.
+    fn top_above(&self, above: &impl Fn(&Parsed, &[u8], usize) -> bool) -> Option<bool> {
+        let depth = self.hi_scanner.stack.len().checked_sub(1)?;
+        self.stack_item_above(depth, above)
     }
 
     /// Pops the stack while the item below the top is above too, so the top
     /// is the lowest item above in the interval; whether the top is above.
-    fn trim_stack_above(&mut self, above: &impl Fn(&Parsed, &[u8]) -> bool) -> bool {
+    fn trim_stack_above(&mut self, above: &impl Fn(&Parsed, &[u8], usize) -> bool) -> bool {
         while let Some(depth) = self.hi_scanner.stack.len().checked_sub(2) {
-            match self.stack_item(depth) {
-                Some(item) if above(&item, self.entries()) => {
-                    self.hi_scanner.stack.pop();
-                }
-                _ => break,
+            if self.stack_item_above(depth, above) == Some(true) {
+                self.hi_scanner.stack.pop();
+            } else {
+                break;
             }
         }
         self.end_back_at_top();
