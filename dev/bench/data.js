@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793080623039,
+  "lastUpdate": 1793091197560,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -64708,6 +64708,90 @@ window.BENCHMARK_DATA = {
             "value": 313679.3810492255,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 12.6us | P99.9: 92.9us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0249784ebe5b569686da414a81016669ed6f65e1",
+          "message": "fix(compaction): drop a blob file in the install that empties it (#1001)\n\n## Summary\n\n- A blob file whose last live values a compaction drops goes with that\ncompaction's install, not with whichever install comes next, which on a\nstore gone quiet may never come.\n- No extra I/O and no extra write budget: the file is removed, not\nrewritten, and a removal charges the medium's ledger no bytes. A caller\nno longer needs a second compaction to reclaim the file.\n\n## Changes\n\n- The compaction install decides which blob files are dead against the\nfragmentation stats with its own charges added\n(`BlobFile::is_dead_after`, reading both maps in place), instead of the\nstats before them. A file a kept or created table or a memtable row\nstill references stays, as before.\n- Tests that expected a fully charged file to survive the compaction\nthat emptied it, and go with a second one, now expect it gone after the\nfirst; the recovery test of the fragmentation stats keeps a live value\nin its file so the stats it reopens are not empty.\n\n## Testing\n\nfmt, clippy (all features and default), the no-std check, nextest (all\nfeatures and default), doc tests and sst-dump pass.\n\nCloses #1000\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Compaction now reclaims blob files when their contents are no longer\nneeded, rather than leaving them behind until a later compaction.\n* Garbage accounting is updated during the same compaction, helping\navoid stale blob data and reduce disk usage.\n* Updated coverage confirms that live values remain available while\nfiles containing only deleted or replaced values are reclaimed.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-27T08:38:37Z",
+          "tree_id": "f2487bd5efc80765581e4a329ff5cefafcf66070",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/0249784ebe5b569686da414a81016669ed6f65e1"
+        },
+        "date": 1793091196258,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 100119.91555927026,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 18.5us | P99.9: 60.2us\nthreads: 1 | elapsed: 5.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2600131.317032035,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 587364.1380860783,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.6us | P99.9: 14.5us\nthreads: 1 | elapsed: 0.34s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 357631.4673032945,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 10.0us | P99.9: 35.5us\nthreads: 1 | elapsed: 0.56s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3082216.808000177,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.6us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 238586.5889972521,
+            "unit": "ops/sec",
+            "extra": "P50: 3.1us | P99: 13.8us | P99.9: 30.2us\nthreads: 1 | elapsed: 0.84s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 172618.67316496337,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 22.9us | P99.9: 40.1us\nthreads: 1 | elapsed: 1.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 543175.936228364,
+            "unit": "ops/sec",
+            "extra": "P50: 1.5us | P99: 5.2us | P99.9: 15.8us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 537941.0451204157,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 2.4us | P99.9: 11.1us\nthreads: 1 | elapsed: 0.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 290601.9151741437,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 14.6us | P99.9: 97.1us\nthreads: 1 | elapsed: 0.69s | num: 200000 | iterations: 3"
           }
         ]
       }
