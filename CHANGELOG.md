@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.3.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.3.0...v7.3.1) - 2026-10-27
+
+### Fixed
+
+- *(merge)* keep the winner when claiming a losing leaf ([#1003](https://github.com/structured-world/coordinode-lsm-tree/pull/1003))
+
+### Performance
+
+- *(read)* jump past long chains of a key's versions ([#1008](https://github.com/structured-world/coordinode-lsm-tree/pull/1008))
+
 ## [7.3.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.2.0...v7.3.0) - 2026-10-27
 
 ### Added
