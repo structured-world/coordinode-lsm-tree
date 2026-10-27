@@ -304,7 +304,17 @@ pub struct SeekingMerger<S: MergeSource, C: UserComparator + Clone> {
     /// behind them. Empty between calls; kept for their allocations.
     backward_jumped: Vec<usize>,
     backward_set_aside: Vec<MergerEntry>,
+    /// The source the back took its last item from, and how many it took
+    /// from it in a row: what tells a backward jump whether the sources hold
+    /// long chains of a key's versions.
+    back_run_slot: usize,
+    back_run: u32,
 }
+
+/// Items in a row the back takes from one source before a backward jump
+/// moves the sources: a shorter run means the key's versions lie a few to a
+/// source, where moving each costs more than walking its few.
+const BACK_RUN_BEFORE_JUMP: u32 = 8;
 
 impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
     /// Construct an empty merger ready to consume from `sources`.
@@ -329,6 +339,19 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
             backward_parked_best: ParkedCache::Stale,
             backward_jumped: Vec::new(),
             backward_set_aside: Vec::new(),
+            back_run_slot: usize::MAX,
+            back_run: 0,
+        }
+    }
+
+    /// Counts an item the back takes from `slot` into the run.
+    #[inline]
+    fn note_back_item(back_run_slot: &mut usize, back_run: &mut u32, slot: usize) {
+        if *back_run_slot == slot {
+            *back_run += 1;
+        } else {
+            *back_run_slot = slot;
+            *back_run = 1;
         }
     }
 
@@ -451,6 +474,7 @@ impl<S: MergeSource, C: UserComparator + Clone> SeekingMerger<S, C> {
         backward_vacated.extend((0..n).filter(|&i| tree.peek_slot(i).is_none()));
         *forward_parked_best = ParkedCache::Stale;
         *backward_parked_best = ParkedCache::Stale;
+        self.back_run = 0;
     }
 }
 
@@ -681,10 +705,13 @@ impl<S: MergeSource + crate::skip_key::SkipKey, C: UserComparator + Clone> crate
     /// left in the tournament.
     ///
     /// Only while the merge runs backward alone, the mirror of
-    /// [`Self::skip_front_past`]. Returns whether a head was replaced or
-    /// dropped with an error queued for `next_back()`.
+    /// [`Self::skip_front_past`], and once the back took its last
+    /// [`BACK_RUN_BEFORE_JUMP`] items from one source: versions a few to a
+    /// source are walked. Returns whether a head was replaced or dropped
+    /// with an error queued for `next_back()`.
     fn skip_back_to_newest(&mut self, key: &[u8], seqno: crate::SeqNo) -> crate::Result<bool> {
-        if self.forward_primed
+        if self.back_run < BACK_RUN_BEFORE_JUMP
+            || self.forward_primed
             || !self.backward_primed
             || self.pending_forward_error.is_some()
             || self.pending_backward_error.is_some()
@@ -805,6 +832,8 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             backward_vacated,
             forward_parked_best,
             backward_parked_best,
+            back_run_slot,
+            back_run,
             ..
         } = self;
         let tree = backward_tree.as_mut()?;
@@ -824,9 +853,11 @@ impl<S: CoherentMergeSource, C: UserComparator + Clone> DoubleEndedIterator
             // consumed the cached candidate.
             forward_vacated.push(slot);
             *backward_parked_best = ParkedCache::Stale;
+            Self::note_back_item(back_run_slot, back_run, slot);
             return Some(Ok(entry.value));
         }
         let source = tree.winner_slot()?;
+        Self::note_back_item(back_run_slot, back_run, source);
         #[expect(
             clippy::indexing_slicing,
             reason = "source index < n_sources by construction"
