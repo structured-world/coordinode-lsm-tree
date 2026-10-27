@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793129276170,
+  "lastUpdate": 1793133057685,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65212,6 +65212,90 @@ window.BENCHMARK_DATA = {
             "value": 345839.6585389482,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 12.2us | P99.9: 83.5us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8d6ff847150b17d894e576d3589141f58f065da5",
+          "message": "perf(read): jump past long chains of a key's versions (#1008)\n\n## Summary\n\n- A scan no longer walks every version of a key with a long chain: after\neight versions it jumps past the rest, forward and backward, in every\nsource that can (memtable, table, run, merge).\n- A reverse scan over a memtable steps through a batch of nodes instead\nof searching the skiplist from the top for every entry.\n- Fixes range-deleted keys coming back after a compaction (#1006).\n\n## Changes\n\n- Forward: once a key is resolved, each source whose head is a version\nof it moves past the rest; a table passes the data blocks holding only\nthat key's versions on the index alone.\n- Backward: once eight versions are walked, each source moves up to the\nnewest version the snapshot sees; a table passes older-only blocks on\nthe index and trims the block holding the version in place. The merge\nmoves every source whose head is a version of the key, setting aside\nthose that stay the winner once moved. It jumps only when the back took\nits last eight items from one source, since versions held a few to a\nsource cost less to walk. A source failing during the jump ends the key,\nas an error met while walking does.\n- Memtable: a backward step fills a batch of up to 64 nodes from one\nsearch; the two ends of an iterator meet by key order.\n- Compaction: an output now waits for every block still compressing on\nthe workers before it cuts its range tombstones to its keys, so the cut\nreaches the output's last key. Previously the keys of those blocks were\nleft uncovered and showed again. A table holding only range tombstones\nkeeps the key range spanning them.\n- Benchmark `mvcc_versions`: full scans over chains of 1 to 4096\nversions per key, in a memtable, one table, eight tables, and a table\nplus memtable, both directions; the median per round with the p50 and\np99 of single scans.\n\n## Performance\n\nWindows, `mvcc_versions`, median ns per key handed out, before → after:\n\n| layout | 32 versions | 128 versions | 512 versions |\n|---|---|---|---|\n| mem fwd / rev | 7036 → 1660 / 23763 → 3530 | 26462 → 1270 / 95268 →\n2666 | 104359 → 1372 / 385666 → 2712 |\n| table fwd / rev | 2501 → 1665 / 3392 → 2069 | 9872 → 2732 / 13461 →\n2431 | 39119 → 3120 / 52584 → 3144 |\n| tables8 fwd / rev | 3879 → 2800 / 4762 → 4724 | 15421 → 7061 / 18752 →\n11129 | 58228 → 18149 / 72104 → 15335 |\n| mixed fwd / rev | 5041 → 2973 / 13583 → 3595 | 19541 → 3861 / 54052 →\n4452 | 75973 → 3965 / 216241 → 4740 |\n\nChains of eight versions or fewer stay within noise.\n\n## Testing\n\nFormatting, clippy in both feature sets, the full test suite with and\nwithout features, doc tests, rustdoc, the no-std check, and the sst-dump\nand db_bench tools pass on Linux. A differential property test checks\nevery scan shape over long chains against a model, under both\ncomparators and with a merge operator.\n\nCloses #968\nCloses #1006\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved forward and reverse scans across long version chains,\nincluding scans spanning multiple tables and memtables.\n\n* **Bug Fixes**\n* Improved scan behavior when seeking across versions, changing\ndirection, or reading at older snapshots.\n* Fixed range tombstones continuing to suppress covered keys after\ncompaction.\n\n* **Testing**\n* Added broader checks for versioned scans, seekable ranges, and\ntombstone behavior.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-27T22:07:53+02:00",
+          "tree_id": "34adaf4f9b8023b44074c489b2e2ba2cc8a359d8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/8d6ff847150b17d894e576d3589141f58f065da5"
+        },
+        "date": 1793133056316,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 61913.14251667722,
+            "unit": "ops/sec",
+            "extra": "P50: 0.6us | P99: 20.1us | P99.9: 42.0us\nthreads: 1 | elapsed: 8.65s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2660109.1783289844,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 674903.4584347882,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.2us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 443227.2508134123,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.1us | P99.9: 21.9us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3140229.3271794887,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 298341.52023486816,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.6us | P99.9: 17.9us\nthreads: 1 | elapsed: 0.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 186205.9675059433,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.2us | P99.9: 19.2us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 622206.5976466783,
+            "unit": "ops/sec",
+            "extra": "P50: 1.3us | P99: 3.4us | P99.9: 13.6us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 705944.4586125537,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 2.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 312619.96595806157,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 16.6us | P99.9: 98.0us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
