@@ -230,8 +230,12 @@ fn compaction_filter_gc_stats_change_blob_writer_rotation() -> lsm_tree::Result<
 
         tree.major_compact(64_000_000, 1_000)?;
         assert_eq!(1, tree.table_count());
-        // Because we are creating a new value, a new blob file is created
-        assert_eq!(5, tree.blob_file_count());
+        // Each replaced value lands in a new blob file; the files of the two
+        // values it replaced held nothing else, so their install drops them.
+        assert_eq!(3, tree.blob_file_count());
+
+        let value = tree.get("big", SeqNo::MAX)?.expect("should exist");
+        assert_eq!(&*value, big_value);
 
         let value = tree.get("changethis", SeqNo::MAX)?.expect("should exist");
         assert_eq!(&*value, b"winter2".repeat(128_000));
@@ -239,20 +243,12 @@ fn compaction_filter_gc_stats_change_blob_writer_rotation() -> lsm_tree::Result<
         let value = tree.get("changethis2", SeqNo::MAX)?.expect("should exist");
         assert_eq!(&*value, b"winter2".repeat(128_000));
 
-        let gc_stats = tree.current_version().gc_stats().clone();
-
-        // "changethis":0,"changethis2":0 were changed
+        // "changethis":0,"changethis2":0 were changed, and their files went.
         assert_eq!(
-            &{
-                let mut map = lsm_tree::HashMap::default();
-                let size = other_big_value.len() as u64;
-                map.insert(1, FragmentationEntry::new(1, size, size));
-                map.insert(2, FragmentationEntry::new(1, size, size));
-                map
-            },
-            &*gc_stats,
+            &lsm_tree::HashMap::default(),
+            &*tree.current_version().gc_stats().clone()
         );
-        assert_eq!(2 * other_big_value.len() as u64, tree.stale_blob_bytes());
+        assert_eq!(0, tree.stale_blob_bytes());
     }
 
     Ok(())

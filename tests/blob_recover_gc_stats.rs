@@ -24,6 +24,9 @@ fn blob_tree_recover_gc_stats() -> lsm_tree::Result<()> {
 
         assert!(tree.get("big", SeqNo::MAX)?.is_none());
         tree.insert("big", &big_value, 0);
+        // Keeps blob file 0 alive once "big":0 expires: a file whose every
+        // value is gone leaves the version, and its stats with it.
+        tree.insert("kept", &big_value, 0);
         tree.insert("smol", "small value", 0);
 
         let value = tree.get("big", SeqNo::MAX)?.expect("should exist");
@@ -39,6 +42,7 @@ fn blob_tree_recover_gc_stats() -> lsm_tree::Result<()> {
         assert_eq!(2, tree.blob_file_count());
 
         tree.major_compact(64_000_000, 1_000)?;
+        assert_eq!(2, tree.blob_file_count(), "file 0 still holds \"kept\"");
 
         let gc_stats = tree.current_version().gc_stats().clone();
 
