@@ -24,6 +24,14 @@ pub(super) fn note_raw_read(len: u32) {
     RAW_READ.with(|read| read.set(read.get() + u64::from(len)));
 }
 
+/// The row group a columnar candidate stands for.
+fn row_group(candidate: &super::CarryCandidate) -> super::RowGroupRef {
+    match candidate.unit {
+        super::CarryUnit::RowGroup(group) => group,
+        super::CarryUnit::DataBlock(_) => panic!("a columnar input yields row groups"),
+    }
+}
+
 /// The inputs' groups lack the per-column statistics an output keeping a
 /// zone map needs, so none can be copied whole: none is read raw only to be
 /// refused, and every row is written and readable.
@@ -592,7 +600,7 @@ fn a_carried_group_cut_short_is_refused() -> crate::Result<()> {
 
     let result = writer.append_carried_row_group(
         (cut, source),
-        candidate.row_group,
+        row_group(&candidate),
         crate::table::meta::ValueLayout::Whole,
         &candidate.rows,
         None,
@@ -623,7 +631,7 @@ fn a_carried_group_with_a_torn_header_is_refused() -> crate::Result<()> {
 
     let result = writer.append_carried_row_group(
         (&torn, source),
-        candidate.row_group,
+        row_group(&candidate),
         crate::table::meta::ValueLayout::Whole,
         &candidate.rows,
         None,
@@ -665,7 +673,7 @@ fn a_partly_carried_group_is_refused_where_it_cannot_land() -> crate::Result<()>
     let directory = crate::table::column_page::PageDirectory::decode(&directory_block.data)?;
     assert!(directory.row_pages().len() > 1, "several row pages");
     let carry = |row_pages: Vec<u32>| crate::table::writer::PageCarry {
-        tag: candidate.row_group.tag.get(),
+        tag: row_group(&candidate).tag.get(),
         copied: vec![true; row_pages.len()],
         row_pages,
         raw: &raw,
@@ -693,7 +701,7 @@ fn a_partly_carried_group_is_refused_where_it_cannot_land() -> crate::Result<()>
     let mut holding_the_tag = columnar_writer(dir.path(), 3)?;
     assert!(holding_the_tag.append_carried_row_group(
         (&raw, source),
-        candidate.row_group,
+        row_group(&candidate),
         crate::table::meta::ValueLayout::Whole,
         &candidate.rows,
         None,
@@ -741,7 +749,7 @@ fn a_run_copies_a_group_only_where_its_rows_could_go() -> crate::Result<()> {
     let mut empty = run("empty")?;
     assert!(!empty.carry_row_group(
         (&raw, source),
-        candidate.row_group,
+        row_group(&candidate),
         (codec, layout),
         &[],
         None
@@ -752,7 +760,7 @@ fn a_run_copies_a_group_only_where_its_rows_could_go() -> crate::Result<()> {
         let mut other_codec = run("codec")?;
         assert!(!other_codec.carry_row_group(
             (&raw, source),
-            candidate.row_group,
+            row_group(&candidate),
             (crate::CompressionType::Lz4, layout),
             &candidate.rows,
             None,
@@ -766,7 +774,7 @@ fn a_run_copies_a_group_only_where_its_rows_could_go() -> crate::Result<()> {
     continuing.write(first.clone())?;
     assert!(!continuing.carry_row_group(
         (&raw, source),
-        candidate.row_group,
+        row_group(&candidate),
         (codec, layout),
         &candidate.rows,
         None,
@@ -775,7 +783,7 @@ fn a_run_copies_a_group_only_where_its_rows_could_go() -> crate::Result<()> {
     let mut fresh = run("fresh")?;
     assert!(fresh.carry_row_group(
         (&raw, source),
-        candidate.row_group,
+        row_group(&candidate),
         (codec, layout),
         &candidate.rows,
         None,

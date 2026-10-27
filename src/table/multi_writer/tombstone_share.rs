@@ -192,7 +192,6 @@ impl TombstoneShare {
     /// Whether a pending tombstone starts past `after`, the key last advanced
     /// to, and at or before `through`: one that would open between two keys
     /// written at once.
-    #[cfg(feature = "columnar")]
     pub(super) fn starts_within(
         &self,
         tombstones: &[RangeTombstone],

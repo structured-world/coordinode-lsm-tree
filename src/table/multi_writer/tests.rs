@@ -2227,13 +2227,11 @@ fn key_index(key: &[u8]) -> u32 {
 
 /// The boundaries at the largest keys `marks` of the tables below, each
 /// followed by one table of `after_bytes` starting at the next key.
-#[cfg_attr(not(feature = "columnar"), expect(unused_variables))]
 fn marks_at(marks: &[u32], after_bytes: u64) -> std::sync::Arc<[super::Boundary]> {
     marks
         .iter()
         .map(|&i| super::Boundary {
             key: crate::UserKey::from(seq_key(i)),
-            #[cfg(feature = "columnar")]
             after: vec![(crate::UserKey::from(seq_key(i + 1)), after_bytes)],
         })
         .collect()
@@ -2550,7 +2548,6 @@ fn a_reversed_comparator_aligns_as_the_byte_comparator() -> crate::Result<()> {
 /// key when its bytes cost less than the table the output would otherwise
 /// straddle, and copied when they cost more. An output not yet at that share,
 /// or a group holding no boundary, is copied.
-#[cfg(feature = "columnar")]
 #[test]
 fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> {
     use crate::{InternalValue, UserKey, fs::StdFs};
@@ -2610,7 +2607,6 @@ fn a_group_holding_a_boundary_is_split_only_when_cheaper() -> crate::Result<()> 
 /// floor when the output held less than half the target before the group:
 /// written key by key, the output reaches the boundary below half and does not
 /// count it either, though the copy takes it past half.
-#[cfg(feature = "columnar")]
 #[test]
 fn a_copied_group_counts_no_boundary_it_crosses_below_half() -> crate::Result<()> {
     use crate::{InternalValue, UserKey, fs::StdFs};
@@ -2643,7 +2639,7 @@ fn a_copied_group_counts_no_boundary_it_crosses_below_half() -> crate::Result<()
     let group: Vec<InternalValue> = (45..75).map(row).collect();
     let compression = mw.data_block_compression;
     let copied = mw.carry_into(
-        (compression, crate::table::meta::ValueLayout::Whole),
+        (compression, Some(crate::table::meta::ValueLayout::Whole)),
         (&group, 30_000),
         |writer, _| {
             for item in &group {
@@ -2677,7 +2673,6 @@ fn a_copied_group_counts_no_boundary_it_crosses_below_half() -> crate::Result<()
 /// make it, whether or not the group holds a boundary; a smaller group is
 /// copied. Opening a fresh output, only a group past the ceiling on its own is
 /// written so.
-#[cfg(feature = "columnar")]
 #[test]
 fn a_group_whose_copy_would_pass_twice_the_target_is_written_by_rows() -> crate::Result<()> {
     use crate::{InternalValue, UserKey, fs::StdFs};

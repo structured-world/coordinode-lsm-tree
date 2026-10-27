@@ -16,9 +16,8 @@ pub struct RunScanner {
     lo_reader: Option<Scanner>,
     /// Told how long each table's reads take, for every table of the run.
     pace: Option<crate::table::util::Pacer>,
-    /// Where each table's scanner records the row groups it reads, for a
-    /// compaction that copies groups whole.
-    #[cfg(feature = "columnar")]
+    /// Where each table's scanner records the row groups or data blocks it
+    /// reads, for a compaction that copies them whole.
     carry: Option<crate::table::group_carry::CarryTarget>,
 }
 
@@ -47,14 +46,13 @@ impl RunScanner {
             hi,
             lo_reader: Some(lo_reader),
             pace,
-            #[cfg(feature = "columnar")]
             carry: None,
         })
     }
 
     /// Has the scanner of every table of the run `target` takes record its
-    /// groups there (see [`crate::table::group_carry::CarryTarget::takes`]).
-    #[cfg(feature = "columnar")]
+    /// groups or blocks there (see
+    /// [`crate::table::group_carry::CarryTarget::takes`]).
     #[must_use]
     pub(crate) fn with_carry(mut self, target: crate::table::group_carry::CarryTarget) -> Self {
         // Called on a scanner just built: its first reader is open and its
@@ -82,7 +80,6 @@ impl RunScanner {
             )));
         };
         let scanner = table.scan_paced(self.pace.as_ref())?;
-        #[cfg(feature = "columnar")]
         if let Some(target) = &self.carry {
             return Ok(carrying(scanner, table, target));
         }
@@ -90,8 +87,8 @@ impl RunScanner {
     }
 }
 
-/// `scanner` of `table`, recording its groups in `target` when it takes them.
-#[cfg(feature = "columnar")]
+/// `scanner` of `table`, recording its groups or blocks in `target` when it
+/// takes them.
 fn carrying(
     scanner: Scanner,
     table: &Table,

@@ -68,6 +68,7 @@ tree.flush_active_memtable(0)?;
 - Major compaction (full force flush + merge).
 - Optional compaction filters for custom logic during compactions.
 - Merge-aware compaction resolves operands lazily.
+- Compaction copies a compressed data block into its output as stored when the merge leaves every row of it as read, instead of decompressing and compressing it again; the copy is decided by what the merge emits, not by metadata. An input whose blocks keep coming out changed stops being watched for a while, so a merge that rewrites everything pays almost nothing for it. `Metrics::compaction_blocks_carried` counts the blocks copied.
 - Optional **tight-space compaction**: a merge that cannot fit the usual transient headroom is rewritten one key-range slice at a time, reclaiming each consumed input in place by punching holes, so it completes on a disk far smaller than the data it rewrites — where the space-admission gate would otherwise skip the merge and leave the disk full. Opt-in, Linux filesystems with `fallocate(PUNCH_HOLE)`; see [docs/tight-space-compaction.md](docs/tight-space-compaction.md).
 
 ### Storage & encoding

@@ -69,7 +69,6 @@ fn the_share_tracks_only_the_open_tombstones() {
 /// A tombstone starting past the key advanced to and at or before the last
 /// key of a run would open within it; one starting at the key advanced to
 /// opened there already, and one starting past the run opens after it.
-#[cfg(feature = "columnar")]
 #[test]
 fn starts_within_finds_a_tombstone_opening_inside_a_run() {
     let comparator = default_comparator();

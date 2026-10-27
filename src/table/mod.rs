@@ -18,7 +18,6 @@ pub mod data_block;
 pub mod delete_bitmap;
 pub(crate) mod file_pool;
 pub mod filter;
-#[cfg(feature = "columnar")]
 pub(crate) mod group_carry;
 mod id;
 mod index_block;
@@ -2235,6 +2234,26 @@ impl Table {
         {
             let _ = offset;
             alloc::vec::Vec::new()
+        }
+    }
+
+    /// Whether the data block at `offset` is split into several inner zstd
+    /// frames ([`Self::inner_block_layout`] is not empty).
+    #[cfg_attr(
+        not(feature = "zstd"),
+        expect(clippy::unused_self, reason = "without zstd no data block splits")
+    )]
+    pub(crate) fn has_inner_block_layout(&self, offset: u64) -> bool {
+        #[cfg(feature = "zstd")]
+        {
+            self.block_layout
+                .ends_for(offset)
+                .is_some_and(|ends| !ends.is_empty())
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            let _ = offset;
+            false
         }
     }
 

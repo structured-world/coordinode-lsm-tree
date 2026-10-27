@@ -92,7 +92,6 @@ impl DomainCursor {
 
     /// Whether `last`, a key past `first` taken in the same output, still lies
     /// in `first`'s domain.
-    #[cfg(feature = "columnar")]
     pub fn holds(
         &self,
         first: &[u8],

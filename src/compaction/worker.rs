@@ -897,9 +897,8 @@ fn merge_estimate(
         RangeTombstoneUse,
     )>,
 ) -> super::work::WorkEstimate {
-    // The groups are recorded as the merge records them: a merge relocating
-    // blob files writes every row itself.
-    #[cfg(feature = "columnar")]
+    // The groups and blocks are recorded as the merge records them: a merge
+    // relocating blob files writes every row itself.
     let carry = if blob_files.is_empty() {
         super::carry::plan(
             &opts.config,
@@ -910,8 +909,6 @@ fn merge_estimate(
     } else {
         None
     };
-    #[cfg(not(feature = "columnar"))]
-    let _ = payload;
     // Only a deleting tombstone changes the rows it covers; a boundary one
     // ends an operand chain, which a merge operator's rows answer for.
     let deleting = match rt_plan {
@@ -928,15 +925,7 @@ fn merge_estimate(
             range_tombstones: deleting,
             comparator: opts.config.comparator.as_ref(),
         },
-        |table| {
-            #[cfg(feature = "columnar")]
-            return carry.as_ref().is_some_and(|carry| carry.takes(table));
-            #[cfg(not(feature = "columnar"))]
-            {
-                let _ = table;
-                false
-            }
-        },
+        |table| carry.as_ref().is_some_and(|carry| carry.takes(table)),
     )
 }
 
@@ -947,7 +936,7 @@ fn create_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
-    #[cfg(feature = "columnar")] carry: Option<&crate::table::group_carry::CarryTarget>,
+    carry: Option<&crate::table::group_carry::CarryTarget>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -959,7 +948,6 @@ fn create_compaction_stream<'a>(
             };
 
             let scanner = RunScanner::culled(run.clone(), (Some(lo), Some(hi)), pace.cloned())?;
-            #[cfg(feature = "columnar")]
             let scanner = match carry {
                 Some(target) => scanner.with_carry(target.clone()),
                 None => scanner,
@@ -971,7 +959,6 @@ fn create_compaction_stream<'a>(
             for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
                 found += 1;
                 let scanner = table.scan_paced(pace)?;
-                #[cfg(feature = "columnar")]
                 let scanner = match carry {
                     Some(target) if target.takes(table) => {
                         scanner.with_carry(target.carry_for(table))
@@ -1001,19 +988,9 @@ fn create_compaction_stream<'a>(
 /// slice. The bounds must partition the key space across sub-compactions
 /// (`Excluded(lo)..=Included(hi)`) so every entry lands in exactly one.
 #[cfg(feature = "std")]
-#[cfg_attr(
-    feature = "columnar",
-    expect(
-        clippy::too_many_arguments,
-        reason = "the serial stream's inputs plus the range and the carry plan"
-    )
-)]
-#[cfg_attr(
-    not(feature = "columnar"),
-    expect(
-        clippy::unnecessary_wraps,
-        reason = "only the columnar build's carrying scan can fail to open"
-    )
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the serial stream's inputs plus the range and the carry plan"
 )]
 fn create_bounded_compaction_stream<'a>(
     version: &'a Version,
@@ -1023,7 +1000,7 @@ fn create_bounded_compaction_stream<'a>(
     merge_operator: Option<Arc<dyn crate::merge_operator::MergeOperator>>,
     comparator: crate::comparator::SharedComparator,
     pace: Option<&crate::table::util::Pacer>,
-    #[cfg(feature = "columnar")] carry: Option<&crate::table::group_carry::CarryTarget>,
+    carry: Option<&crate::table::group_carry::CarryTarget>,
 ) -> crate::Result<Option<CompactionStream<'a, Merger<CompactionReader<'a>>>>> {
     let mut readers: Vec<CompactionReader<'_>> = vec![];
     let mut found = 0;
@@ -1031,9 +1008,8 @@ fn create_bounded_compaction_stream<'a>(
     for run in version.iter_levels().flat_map(|lvl| lvl.iter()) {
         for table in run.iter().filter(|x| to_compact.contains(&x.metadata.id)) {
             found += 1;
-            // A table whose groups can be carried is scanned group by group,
-            // recording the groups wholly within this range.
-            #[cfg(feature = "columnar")]
+            // A table whose groups or blocks can be carried is scanned one by
+            // one, recording those wholly within this range.
             if let Some(target) = carry
                 && target.takes(table)
             {
@@ -3086,11 +3062,10 @@ fn run_subcompaction(
         core::ops::Bound::Unbounded => None,
     };
 
-    // Row groups of this range the merge leaves as they were are copied into
-    // the output instead of being encoded again (see `carry`). Each range
-    // records and matches its own. A relocating slice writes every row
-    // itself, so its scans record nothing.
-    #[cfg(feature = "columnar")]
+    // Row groups and data blocks of this range the merge leaves as they were
+    // are copied into the output instead of being encoded again (see
+    // `carry`). Each range records and matches its own. A relocating slice
+    // writes every row itself, so its scans record nothing.
     let carry = if relocation.is_some() {
         None
     } else {
@@ -3115,7 +3090,6 @@ fn run_subcompaction(
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
         Some(&pace),
-        #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
     else {
@@ -3350,26 +3324,30 @@ fn run_subcompaction(
         }
     }
 
-    #[cfg(feature = "columnar")]
     let mut matcher = compactor.carrying().and(carry.as_ref()).map(|carry| {
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
-    #[cfg(feature = "columnar")]
     let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
-    let mut emit = |row: InternalValue| -> crate::Result<()> {
-        #[cfg(feature = "columnar")]
-        if let Some(matcher) = matcher.as_mut()
-            && let Some(flavour) = compactor.carrying()
-        {
-            return matcher.write(
+    // Chosen once, so a compaction that copies nothing pays no check per row.
+    let mut carrying_emit;
+    let mut plain_emit;
+    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+        matcher.as_mut()
+        && let Some(flavour) = compactor.carrying()
+    {
+        carrying_emit = move |row: InternalValue| {
+            matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour,
+                    flavour: &mut *flavour,
                     pace: read_pace,
                 },
-            );
-        }
-        compactor.write(row)
+            )
+        };
+        &mut carrying_emit
+    } else {
+        plain_emit = |row: InternalValue| compactor.write(row);
+        &mut plain_emit
     };
 
     for (idx, item) in merge_iter.enumerate() {
@@ -3388,7 +3366,7 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger.borrow_mut().admit(item, &mut emit)?;
+        ledger.borrow_mut().admit(item, &mut *emit)?;
         if let Some(e) = ledger_error.borrow_mut().take() {
             return Err(e);
         }
@@ -3407,11 +3385,10 @@ fn run_subcompaction(
         .transpose()?
         .unwrap_or_default();
 
-    let (blob_frag_map, released_objects) = ledger.into_inner().finish(&mut emit)?;
+    let (blob_frag_map, released_objects) = ledger.into_inner().finish(&mut *emit)?;
     if let Some(e) = ledger_error.into_inner() {
         return Err(e);
     }
-    #[cfg(feature = "columnar")]
     let carried = match (matcher.take(), compactor.carrying()) {
         (Some(matcher), Some(flavour)) => matcher.finish(&mut FlavourSink {
             flavour,
@@ -3421,7 +3398,6 @@ fn run_subcompaction(
     };
     let mut produced = compactor.produce(opts, dst_lvl, blob_frag_map, extra_blob_files)?;
     produced.set_released_objects(released_objects);
-    #[cfg(feature = "columnar")]
     produced.set_carried(carried);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produced.mark_filter_transformed();
@@ -4473,10 +4449,10 @@ fn merge_tables(
     // and its filter's blob files, held until its output is installed.
     let rc = opts.runtime_config.load_full();
 
-    // Row groups the merge leaves as they were are copied into the output
-    // instead of being encoded again (see `carry`). A compaction relocating
-    // blob files writes every row itself, so its scans record nothing.
-    #[cfg(feature = "columnar")]
+    // Row groups and data blocks the merge leaves as they were are copied into
+    // the output instead of being encoded again (see `carry`). A compaction
+    // relocating blob files writes every row itself, so its scans record
+    // nothing.
     let carry = if blob_files_to_rewrite.is_empty() {
         super::carry::plan(&opts.config, &rc, payload.canonical_level.into(), &tables)
     } else {
@@ -4490,7 +4466,6 @@ fn merge_tables(
         opts.config.merge_operator.clone(),
         opts.config.comparator.clone(),
         Some(&pace),
-        #[cfg(feature = "columnar")]
         carry.as_ref(),
     )?
     else {
@@ -4727,28 +4702,32 @@ fn merge_tables(
     }
 
     // Every row the merge emits goes to the output through here: written, or,
-    // when a run of them is an input's row group as it was read, copied as
-    // the group.
-    #[cfg(feature = "columnar")]
+    // when a run of them is an input's row group or data block as it was
+    // read, copied as it lies.
     let mut matcher = compactor.carrying().and(carry.as_ref()).map(|carry| {
         super::carry::CarryMatcher::new(Arc::clone(&carry.queue), opts.config.comparator.clone())
     });
-    #[cfg(feature = "columnar")]
     let read_pace: Option<&dyn crate::table::util::ReadPacer> = Some(&*pace);
-    let mut emit = |row: InternalValue| -> crate::Result<()> {
-        #[cfg(feature = "columnar")]
-        if let Some(matcher) = matcher.as_mut()
-            && let Some(flavour) = compactor.carrying()
-        {
-            return matcher.write(
+    // Chosen once, so a compaction that copies nothing pays no check per row.
+    let mut carrying_emit;
+    let mut plain_emit;
+    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+        matcher.as_mut()
+        && let Some(flavour) = compactor.carrying()
+    {
+        carrying_emit = move |row: InternalValue| {
+            matcher.write(
                 row,
                 &mut FlavourSink {
-                    flavour,
+                    flavour: &mut *flavour,
                     pace: read_pace,
                 },
-            );
-        }
-        compactor.write(row)
+            )
+        };
+        &mut carrying_emit
+    } else {
+        plain_emit = |row: InternalValue| compactor.write(row);
+        &mut plain_emit
     };
 
     hidden_guard(payload, opts, || {
@@ -4795,7 +4774,7 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            ledger.borrow_mut().admit(item, &mut emit)?;
+            ledger.borrow_mut().admit(item, &mut *emit)?;
             if let Some(e) = ledger_error.borrow_mut().take() {
                 return Err(e);
             }
@@ -4829,7 +4808,7 @@ fn merge_tables(
     // The rows the ledger still holds go out before the outputs are finished,
     // guarded like the merge: a failure here shows the inputs again.
     let (blob_frag_map, released_objects) = hidden_guard(payload, opts, || {
-        let settled = ledger.into_inner().finish(&mut emit)?;
+        let settled = ledger.into_inner().finish(&mut *emit)?;
         if let Some(e) = ledger_error.into_inner() {
             return Err(e);
         }
@@ -4837,7 +4816,6 @@ fn merge_tables(
     })?;
 
     // What the matcher still holds goes out after the last row, guarded alike.
-    #[cfg(feature = "columnar")]
     let carried = match (matcher.take(), compactor.carrying()) {
         (Some(matcher), Some(flavour)) => hidden_guard(payload, opts, || {
             matcher.finish(&mut FlavourSink {
@@ -4847,10 +4825,10 @@ fn merge_tables(
         })?,
         _ => super::carry::Carried::default(),
     };
-    #[cfg(feature = "columnar")]
     log::debug!(
-        "Carried {} row groups ({} rows, {} bytes) into the output whole",
+        "Carried {} row groups and {} data blocks ({} rows, {} bytes) into the output whole",
         carried.groups,
+        carried.blocks,
         carried.rows,
         carried.bytes,
     );
@@ -4901,7 +4879,6 @@ fn merge_tables(
                 .show(payload.table_ids.iter().copied());
         })?;
     produce_output.set_released_objects(released_objects);
-    #[cfg(feature = "columnar")]
     produce_output.set_carried(carried);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
         produce_output.mark_filter_transformed();
@@ -4951,14 +4928,12 @@ fn merge_tables(
 }
 
 /// A compaction's output as the carry matcher sees it.
-#[cfg(feature = "columnar")]
 struct FlavourSink<'a> {
     flavour: &'a mut StandardCompaction,
     /// Told how long reading a carried group takes.
     pace: Option<&'a dyn crate::table::util::ReadPacer>,
 }
 
-#[cfg(feature = "columnar")]
 impl super::carry::CarrySink for FlavourSink<'_> {
     fn write(&mut self, row: InternalValue) -> crate::Result<()> {
         super::flavour::CompactionFlavour::write(self.flavour, row)
@@ -4981,6 +4956,11 @@ impl super::carry::CarrySink for FlavourSink<'_> {
 
     fn transforms_seen(&self) -> u64 {
         self.flavour.transforms_seen()
+    }
+
+    #[inline]
+    fn continues_last(&self, key: &[u8]) -> bool {
+        self.flavour.continues_last(key)
     }
 
     fn settle_transforms(&mut self, seen: u64) {

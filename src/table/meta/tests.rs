@@ -57,7 +57,7 @@ fn valid_meta_items() -> Vec<InternalValue> {
         ),
         meta("crate_version", env!("CARGO_PKG_VERSION").as_bytes()),
         meta("created_at", &1_000_000u128.to_le_bytes()),
-        meta("data_block_hash_ratio", &0.0f64.to_le_bytes()),
+        meta("data_block_hash_ratio", &0.0f32.to_le_bytes()),
         meta("descriptor#kv_checksum", &[0u8]),
         meta("descriptor#page_ecc", &[0u8, 0, 0, 0]),
         meta("file_size", &4096u64.to_le_bytes()),
@@ -514,6 +514,47 @@ fn load_with_handle_bulk_ingested_wrong_width_returns_err() {
     let result = load_meta_from_items(&meta_items_with(meta(
         "descriptor#bulk_ingested",
         &[1u8, 2],
+    )));
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// The data block hash ratio is read as the bits of the `f32` stored, which a
+/// carried block's table is compared by.
+#[test]
+fn load_with_handle_data_block_hash_ratio_reads_its_bits() {
+    let parsed = load_meta_from_items(&meta_items_with(meta(
+        "data_block_hash_ratio",
+        &1.5f32.to_le_bytes(),
+    )))
+    .unwrap();
+    assert_eq!(parsed.data_block_hash_ratio_bits, 1.5f32.to_bits());
+}
+
+/// A meta block without `data_block_hash_ratio` is corrupt: every table is
+/// written with it.
+#[test]
+fn load_with_handle_missing_data_block_hash_ratio_returns_err() {
+    let items: Vec<_> = valid_meta_items()
+        .into_iter()
+        .filter(|iv| &*iv.key.user_key != b"data_block_hash_ratio")
+        .collect();
+    let result = load_meta_from_items(&items);
+    assert!(
+        matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),
+        "expected InvalidHeader(\"TableMeta\"), got {result:?}",
+    );
+}
+
+/// A `data_block_hash_ratio` that is not exactly four bytes, an `f32`, is
+/// corrupt meta.
+#[test]
+fn load_with_handle_wrong_width_data_block_hash_ratio_returns_err() {
+    let result = load_meta_from_items(&meta_items_with(meta(
+        "data_block_hash_ratio",
+        &0.0f64.to_le_bytes(),
     )));
     assert!(
         matches!(result, Err(crate::Error::InvalidHeader("TableMeta"))),

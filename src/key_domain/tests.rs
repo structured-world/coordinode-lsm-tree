@@ -74,7 +74,6 @@ fn the_last_domain_is_never_left() {
 
 /// A run of keys from `first` to `last` stays in one domain exactly when
 /// `last` is below `first`'s domain end.
-#[cfg(feature = "columnar")]
 #[test]
 fn holds_a_run_within_one_domain_only() {
     let shared = default_comparator();
