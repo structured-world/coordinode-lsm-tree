@@ -1261,10 +1261,16 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
         let above =
             |item: &Parsed, bytes: &[u8], offset: usize| reachable(offset) && above(item, bytes);
 
+        // A back past the first interval is used up, whatever its stack still
+        // lists: `next_back` yields nothing more, and refilling an interval
+        // here would hand out again what it already did.
+        if self.hi_scanner.ptr_idx == usize::MAX {
+            return false;
+        }
         // The back's next item sits on top of the stack: load the interval
         // below a used-up one, as `next_back` would.
         if self.hi_scanner.stack.is_empty() {
-            if self.hi_scanner.ptr_idx == 0 || self.hi_scanner.ptr_idx == usize::MAX {
+            if self.hi_scanner.ptr_idx == 0 {
                 return false;
             }
             self.hi_scanner.ptr_idx -= 1;
@@ -1315,6 +1321,12 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
                 self.keep_head_only()
             }
         }
+    }
+
+    /// Drops everything the back still holds: neither cursor yields another
+    /// item.
+    pub fn drop_back(&mut self) {
+        self.clamp_upper_to_lo();
     }
 
     /// How many restart heads `pred` holds for, `pred` being true up to some

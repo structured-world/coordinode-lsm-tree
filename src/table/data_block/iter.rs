@@ -204,19 +204,26 @@ impl<'a> Iter<'a> {
             core::cmp::Ordering::Less => false,
         };
 
+        // An entry the front holds peeked lies below everything else left and
+        // reaches the back last. When it is above, it is the lowest entry
+        // above: everything else the back holds, a peeked entry included,
+        // goes.
+        if self
+            .decoder
+            .front_peeked()
+            .is_some_and(|item| above(item, self.bytes))
+        {
+            if let peeked @ MaybePeeked::Peeked(None) = self.decoder.take_back_peeked() {
+                self.decoder.put_back_peeked(peeked);
+            }
+            self.decoder.inner_mut().drop_back();
+            return true;
+        }
+
         // A peeked back entry is the next one out and sits past everything
         // the decoder still holds.
         match self.decoder.take_back_peeked() {
-            // An entry the front holds peeked lies below everything the
-            // decoder still holds and reaches the back last: when the decoder
-            // holds nothing above, it is the lowest entry above if any is.
-            MaybePeeked::Unpeeked => {
-                self.decoder.inner_mut().trim_back_above(head_above, above)
-                    || self
-                        .decoder
-                        .front_peeked()
-                        .is_some_and(|item| above(item, self.bytes))
-            }
+            MaybePeeked::Unpeeked => self.decoder.inner_mut().trim_back_above(head_above, above),
             MaybePeeked::Peeked(Some(item)) if above(&item, self.bytes) => {
                 // It goes only if the decoder still holds a lower entry above.
                 if !self.decoder.inner_mut().trim_back_above(head_above, above) {

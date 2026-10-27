@@ -424,3 +424,37 @@ proptest! {
         run(Variant::Merge, ops, reads, bounds)?;
     }
 }
+
+/// A reverse scan with a lower bound over one table whose chain the back
+/// walks to its end: the block's back is used up when the jump asks it, and
+/// must not hand out an older version again in place of the newest.
+#[test]
+fn a_used_up_block_back_keeps_the_newest_version() -> Result<(), TestCaseError> {
+    run(
+        Variant::Reverse,
+        vec![
+            Op::Burst { key: 2, n: 10 },
+            Op::Del { key: 4 },
+            Op::Flush,
+            Op::Put { key: 3, value: 0 },
+        ],
+        vec![0],
+        (Some((3, false)), None),
+    )?;
+    run(
+        Variant::Lexicographic,
+        vec![
+            Op::Burst { key: 3, n: 10 },
+            Op::Put { key: 0, value: 0 },
+            Op::Flush,
+            Op::Del { key: 0 },
+            Op::Burst { key: 0, n: 11 },
+            Op::Put { key: 0, value: 0 },
+            Op::Put { key: 0, value: 0 },
+            Op::Put { key: 0, value: 0 },
+            Op::Put { key: 0, value: 0 },
+        ],
+        vec![0],
+        (Some((1, false)), None),
+    )
+}

@@ -419,6 +419,11 @@ mod tests {
                 (0, 19, false, true),
                 (0, 20, false, true),
                 (1, 10, false, true),
+                // The back used up: nothing is left to trim, and nothing it
+                // handed out may come back.
+                (0, 22, false, false),
+                (0, 21, false, true),
+                (1, 21, false, false),
             ] {
                 for seqno in [0, 1, 2, 7, 13, 20, 21, SeqNo::MAX] {
                     let mut iter = data_block.iter(default_comparator());
