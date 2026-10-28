@@ -90,7 +90,7 @@ fn test_with_table_impl(
             let metrics = Arc::new(Metrics::default());
 
             let table = {
-                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                #[cfg_attr(not(any(zstd_any, feature = "metrics")), expect(unused_mut))]
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
@@ -291,7 +291,7 @@ fn test_with_table_impl(
             let metrics = Arc::new(Metrics::default());
 
             let table = {
-                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                #[cfg_attr(not(any(zstd_any, feature = "metrics")), expect(unused_mut))]
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
