@@ -982,6 +982,7 @@ fn point_read_variant(
             .map(|(label, warm)| paired::Arm {
                 label,
                 routine: point_read_routine(warm, &inputs),
+                metrics: None,
             })
             .collect();
         run.measure(group_name, n, arms);
@@ -1371,6 +1372,7 @@ fn multi_get_variant(
             .map(|(engine, warm)| paired::Arm {
                 label: engine.label(),
                 routine: multi_get_routine(warm, &inputs),
+                metrics: None,
             })
             .collect();
         run.measure(group_name, n, arms);
@@ -1506,6 +1508,7 @@ fn warm_read_group(
             .map(|(engine, warm)| paired::Arm {
                 label: engine.label(),
                 routine: routine(warm, &inputs),
+                metrics: None,
             })
             .collect();
         run.measure(group_name, n, arms);
