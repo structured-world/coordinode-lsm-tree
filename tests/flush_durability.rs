@@ -13,6 +13,7 @@ use lsm_tree::fs::{
 use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter, io};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use test_log::test;
 
@@ -336,6 +337,33 @@ fn the_persisted_seqno_waits_for_the_barrier() -> lsm_tree::Result<()> {
     tree.persist_flushes()?;
     assert_eq!(tree.get_highest_persisted_seqno(), Some(5));
     Ok(())
+}
+
+/// The highest seqno never goes back while flushes move writes out of the
+/// memtables into tables. Guards against reading the tables and the memtables
+/// from two snapshots: a flush installed between the reads leaves its write in
+/// neither.
+#[test]
+fn the_highest_seqno_never_goes_back_across_a_flush() -> lsm_tree::Result<()> {
+    let tree = open(deferred(Arc::new(MemFs::new())));
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut seen = None;
+            while !done.load(Ordering::Acquire) {
+                let now = tree.get_highest_seqno();
+                assert!(now >= seen, "went back from {seen:?} to {now:?}");
+                seen = now;
+            }
+        });
+        let flushes = (0..2_000).try_for_each(|seqno| {
+            tree.insert("k", "v", seqno);
+            tree.flush_active_memtable(0)
+        });
+        // Set on every path, or a failed flush leaves the reader spinning.
+        done.store(true, Ordering::Release);
+        flushes
+    })
 }
 
 /// A barrier that fails leaves its flushes installed and pending, whether it

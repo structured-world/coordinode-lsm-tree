@@ -126,7 +126,10 @@
 // CI holds the count of `unreachable_pub` warnings to a baseline that only
 // goes down (`.github/scripts/unreachable-pub-ratchet.sh`); at zero the lint
 // is denied here.
-#![allow(clippy::redundant_pub_crate)]
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "unreachable_pub writes crate-visible items as pub(crate)"
+)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 // `alloc` is the minimal hard dependency — the crate uses `Arc`, `Vec`,

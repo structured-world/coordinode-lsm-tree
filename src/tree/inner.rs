@@ -9,7 +9,7 @@ use crate::{
     deletion_pause::DeletionPause,
     runtime_config::handle::RuntimeConfigHandle,
     stop_signal::StopSignal,
-    version::{SuperVersions, UnsyncedFile, Version, persist_version},
+    version::{SuperVersions, Version, persist_version},
 };
 use alloc::sync::Arc;
 use portable_atomic::AtomicU64;
@@ -346,7 +346,9 @@ impl TreeInner {
     /// it names, read under one lock: a flush installed between two reads
     /// would be named by the version and missing from the files.
     #[cfg(feature = "std")]
-    pub(crate) fn current_version_and_unsynced(&self) -> (Version, Vec<UnsyncedFile>) {
+    pub(crate) fn current_version_and_unsynced(
+        &self,
+    ) -> (Version, Vec<crate::version::UnsyncedFile>) {
         let versions = self.version_history.read();
         let version = versions.latest_version_ref().version.clone();
         let unsynced = versions.unsynced_named_by(&version);

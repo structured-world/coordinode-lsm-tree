@@ -556,6 +556,17 @@ impl InstalledCharge {
     }
 }
 
+/// The highest seqno the memtables of `snapshot` hold, active and sealed.
+fn highest_memtable_seqno(snapshot: &SuperVersion) -> Option<SeqNo> {
+    let sealed = snapshot
+        .sealed_memtables
+        .iter()
+        .map(|mt| mt.get_highest_seqno())
+        .max()
+        .flatten();
+    snapshot.active_memtable.get_highest_seqno().max(sealed)
+}
+
 /// Extract owned user-key bounds from any range.
 pub(crate) fn range_to_user_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
     range: &R,
@@ -1972,29 +1983,21 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
-        let version = self.version_history.read().latest_version();
-
-        let active = version.active_memtable.get_highest_seqno();
-
-        let sealed = version
-            .sealed_memtables
-            .iter()
-            .map(|mt| mt.get_highest_seqno())
-            .max()
-            .flatten();
-
-        active.max(sealed)
+        highest_memtable_seqno(&self.version_history.read().latest_version())
     }
 
     fn get_highest_seqno(&self) -> Option<SeqNo> {
-        // The current version, not the one on disk: a deferred flush moves its
-        // writes out of the memtable before any persist names them.
-        let tables = self
-            .current_version()
+        // One snapshot for the tables and the memtables: a flush installed
+        // between two reads would leave its writes in neither. Its current
+        // version, not the one on disk: a deferred flush moves its writes out
+        // of the memtable before any persist names them.
+        let snapshot = self.version_history.read().latest_version();
+        let tables = snapshot
+            .version
             .iter_tables()
             .map(Table::get_highest_seqno)
             .max();
-        self.get_highest_memtable_seqno().max(tables)
+        highest_memtable_seqno(&snapshot).max(tables)
     }
 
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo> {
