@@ -2734,11 +2734,13 @@ impl Tree {
         // even splitting one batch. A consumer that advanced past the returned
         // watermark would lose the change for good.
         //
-        // So freeze it: writers hold the version-history READ guard for their
-        // whole insert (that is what keeps `rotate_memtable` from sealing
-        // mid-batch), so taking the WRITE guard excludes them. The cap and the
-        // active memtable's raw entries are captured under it; everything else —
-        // sealed memtables, tables — is immutable and needs no coordination.
+        // So freeze it: a batch or range write holds the version-history READ
+        // guard for its whole insert, and a single-entry insert holds its shard
+        // of the insert gate instead, so taking the WRITE guard and closing the
+        // gate excludes both, in the order a version change takes them. The cap
+        // and the active memtable's raw entries are captured under them;
+        // everything else — sealed memtables, tables — is immutable and needs
+        // no coordination.
         //
         // Mapping runs AFTER the guard drops: it resolves blob indirections,
         // which reads a blob file, and no I/O may happen with writers blocked.
@@ -2750,6 +2752,8 @@ impl Tree {
         );
         let (super_version, end_seqno, active_entries, active_range_tombstones) = {
             let guard = self.version_history.write();
+            #[cfg(feature = "std")]
+            let gate = self.insert_gate.close();
             let super_version = guard.latest_version();
             #[cfg(test)]
             inner::TestHooks::fire(&self.test_hooks.scan_freeze);
@@ -2776,8 +2780,10 @@ impl Tree {
                     .collect()
             });
             let rts = super_version.active_memtable.range_tombstones_sorted();
-            // Explicit: the guard must outlive the capture above, and writers
-            // resume the moment it goes.
+            // Explicit: the gate and the guard must outlive the capture above,
+            // and writers resume the moment they go.
+            #[cfg(feature = "std")]
+            drop(gate);
             drop(guard);
             (super_version, end_seqno, entries, rts)
         };

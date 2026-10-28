@@ -79,6 +79,66 @@ fn a_concurrent_write_cannot_land_while_the_scan_captures_the_memtable() {
     );
 }
 
+/// A single-entry insert reaches the active memtable through the insert gate,
+/// not the version-history lock, so the capture must close that gate too: an
+/// insert backdated at or below the watermark landing mid-walk would be seen
+/// or missed by where its node falls, and lost for good to a consumer past
+/// the watermark.
+#[test]
+fn a_concurrent_single_insert_cannot_land_while_the_scan_captures_the_memtable() {
+    let folder = tempfile::tempdir().expect("tempdir");
+    let any = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()
+    .expect("open");
+    let AnyTree::Standard(tree) = any else {
+        panic!("expected a standard tree");
+    };
+    tree.insert("k", "v", 10);
+
+    let tree_for_hook = Arc::new(tree);
+    let writer_tree = Arc::clone(&tree_for_hook);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
+    super::inner::TestHooks::install(
+        &tree_for_hook.test_hooks.scan_freeze,
+        Box::new(move || {
+            let writer_tree = Arc::clone(&writer_tree);
+            let done_tx = done_tx.clone();
+            let started_tx = started_tx.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).ok();
+                // Backdated: at the cap, so the seqno bound would NOT exclude it.
+                writer_tree.insert("a", "concurrent", 10);
+                done_tx.send(()).ok();
+            });
+            started_rx.recv().expect("writer thread started");
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(250))
+                    .is_err(),
+                "a single insert must not be able to commit while the scan \
+                 captures the active memtable",
+            );
+        }),
+    );
+
+    let events: Vec<_> = tree_for_hook
+        .scan_since_seqno(0)
+        .expect("scan")
+        .collect::<Vec<_>>();
+    let keys: Vec<_> = events.iter().map(|e| e.key().to_vec()).collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        vec![b"k".to_vec()],
+        "the frozen capture holds exactly the state at scan start: {events:?}",
+    );
+}
+
 /// The scan's writer exclusion works only if EVERY memtable write holds the
 /// version-history read guard for its whole insert. A range deletion that
 /// snapshots the memtable handle under a temporary guard and inserts after
