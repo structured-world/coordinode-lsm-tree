@@ -349,6 +349,72 @@ impl Strategy {
     }
 }
 
+/// The plan a [`Strategy`] would follow for one version, and what it was
+/// worked out from.
+#[derive(Clone, Debug)]
+pub struct PlanView {
+    /// What the plan is worked out from.
+    pub inputs: dp::Inputs,
+    /// The plan of the round.
+    pub plan: Arc<dp::Plan>,
+    /// The unit runs that have come down in the round so far.
+    pub units: u32,
+}
+
+impl Strategy {
+    /// The plan this strategy would follow for `version` under `config`'s
+    /// compaction budget, worked out as [`CompactionStrategy::choose`] works it
+    /// out but choosing nothing: for comparing models side by side on one
+    /// tree. `None` for a tree with no main level apart from the last, which
+    /// has no plan.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsm_tree::{AbstractTree, Config, SequenceNumberCounter};
+    /// use lsm_tree::compaction::Planned;
+    ///
+    /// # let folder = tempfile::tempdir()?;
+    /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default()).open()?;
+    /// let strategy = Planned::default();
+    /// // A fresh tree has a single level, and no plan.
+    /// assert!(strategy.plan_for(&tree.current_version(), tree.tree_config()).is_none());
+    /// # Ok::<(), lsm_tree::Error>(())
+    /// ```
+    #[must_use]
+    pub fn plan_for(&self, version: &Version, config: &Config) -> Option<PlanView> {
+        let last = version.level_count() - 1;
+        if last < DRAIN {
+            return None;
+        }
+        let budget = self.budget_for(config, last);
+        let unit = self.unit(
+            version.level(last).map_or(0, crate::version::Level::size),
+            budget,
+        );
+        let bytes: u64 = version.level(1).map_or(0, |main| {
+            main_runs(main).iter().map(|(_, bytes)| bytes).sum()
+        });
+        let inputs = self.inputs(version, unit, budget);
+        Some(PlanView {
+            inputs,
+            plan: self.plan(inputs),
+            units: u32::try_from(bytes / unit).unwrap_or(u32::MAX),
+        })
+    }
+
+    /// The tree's compaction budget in bytes per second, `0` for no limit:
+    /// the tighter of its rate limit and the write budget of the medium of
+    /// `last`, its last level.
+    fn budget_for(&self, config: &Config, last: usize) -> u64 {
+        #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
+        tighter(
+            budget(config),
+            endurance_budget(config, last as u8, self.model.write_rate).unwrap_or(0),
+        )
+    }
+}
+
 /// The bytes a merge may encode or copy per second: the model's rate, capped
 /// by the tree's compaction `budget` when it has one (`0` for none).
 fn within_budget(model_rate: u64, budget: u64) -> u64 {
@@ -480,11 +546,7 @@ impl CompactionStrategy for Strategy {
             version.level(1).expect("L1"),
             version.level(last).expect("the last level"),
         );
-        #[expect(clippy::cast_possible_truncation, reason = "level index below 255")]
-        let budget = tighter(
-            budget(config),
-            endurance_budget(config, last as u8, self.model.write_rate).unwrap_or(0),
-        );
+        let budget = self.budget_for(config, last);
         self.budget_seen.store(budget, Ordering::Relaxed);
         let unit = self.unit(last_level.size(), budget);
         let runs = main_runs(main);
