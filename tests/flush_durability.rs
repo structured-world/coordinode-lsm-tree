@@ -601,3 +601,34 @@ fn a_blob_trees_deferred_flush_persists_its_blob_files() -> lsm_tree::Result<()>
     assert_eq!(tree.blob_file_count(), 1, "the barrier's blob file alone");
     Ok(())
 }
+
+/// A compaction over deferred flushes of a blob tree keeps their blob files,
+/// and its persist syncs them: the compacted table still points into them.
+/// Guards against a persist that syncs only the deferred tables a version
+/// names, which after a power loss leaves the compacted table pointing at
+/// values that are gone.
+#[test]
+fn a_blob_trees_compaction_syncs_the_blob_files_it_keeps() -> lsm_tree::Result<()> {
+    let blob_config = |fs: Arc<dyn Fs>| {
+        deferred(fs)
+            .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
+    };
+    let big = "x".repeat(4_096);
+
+    let disk = Disk::new();
+    let tree = open(blob_config(disk.fs()));
+    for (seqno, key) in [(0, "a"), (1, "b")] {
+        tree.insert(key, &big, seqno);
+        tree.flush_active_memtable(0)?;
+    }
+    tree.major_compact(u64::MAX, 0)?;
+    assert_eq!(tree.table_count(), 1);
+    assert_eq!(tree.blob_file_count(), 2, "the compaction keeps both");
+    let crash = disk.power_loss(tree);
+
+    let tree = open(blob_config(Arc::new(crash)));
+    for key in ["a", "b"] {
+        assert_eq!(value(&tree, key).as_deref(), Some(big.as_str()), "{key}");
+    }
+    Ok(())
+}
