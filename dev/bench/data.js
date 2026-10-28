@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793226728850,
+  "lastUpdate": 1793226733045,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -85200,6 +85200,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.551945271,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "5be0854a0780b5704a41a8198bccc9d915f0c9f3",
+          "message": "build: build, lint and test on the latest stable only (#1019)\n\n## Summary\n\n- The crate builds, lints and tests on the latest stable only: no\ntoolchain version is pinned anywhere.\n- Lints and rustdoc checks that the old pin never ran are fixed in the\ncode.\n\n## Changes\n\n- `rust-toolchain.toml` uses `channel = \"stable\"`; the test, tools and\nno-std jobs run on stable instead of 1.92.0.\n- clippy fixes for the current stable: `as_chunks` for fixed-size\nchunking, `checked_div` behind zero checks, `isolate_lowest_one` /\n`bit_width`, `try_update` instead of the deprecated `fetch_update`,\n`assert_eq!` against an empty collection in tests, and smaller cleanups.\n- Two lints stay with a reason: `suboptimal_flops` (`f64::mul_add` needs\nstd and is a software routine without FMA) and `if_same_then_else` on\nthe cache's eviction order (the branches differ in which queue `||`\ntries first).\n- Intra-doc links the current rustdoc rejects are fixed.\n- The tests build in the metrics-only configuration again: two lint\nexpectations account for `metrics` and `columnar` changing which\nbindings are mutated.\n- `rust-version` is 1.99, the release the crate is built and tested on;\nthe README states it.\n- The 32-bit io_uring tests run on every Linux test job, with no\ntoolchain axis left to select them by.\n- Crate-internal items in the files this change touches are written\n`pub(crate)`, and the visibility baseline drops to what is left.\n\n## Testing\n\nfmt, clippy in every CI configuration, tools and fuzz clippy, `cargo doc\n-D warnings`, the no-std check, the unreachable-pub ratchet, nextest and\ndoctests run on the current stable.\n\nCloses #1018\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Bug Fixes**\n* Scans now continue to return matching rows when a prefix-filter read\nfails.\n* Improved handling of transient read errors and checksum mismatches\nduring data recovery and validation.\n* **Compatibility**\n* Building the project now requires Rust 1.99 or newer. The project is\ntested with the latest stable Rust release.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-29T00:14:11+02:00",
+          "tree_id": "ccaef11efbb5fd8d8f05a50c0da3558ddfff616f",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/5be0854a0780b5704a41a8198bccc9d915f0c9f3"
+        },
+        "date": 1793226731831,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 473.926,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 75.277944ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 126.117,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 49.79131ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 415.083,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 96.648961ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3667.425,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9427.554,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 22.479,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 65.372159,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.542769118,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 22.207,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 70.123519,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.540475364,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
