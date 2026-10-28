@@ -1845,6 +1845,10 @@ impl Sustained {
     /// L0 runs at which a write waits for compaction: RocksDB's default
     /// `level0_stop_writes_trigger`, applied to ours by the writer.
     const L0_STOP: usize = 36;
+    /// Deferred flushes one durability barrier covers on ours: up to this many
+    /// memtables' worth of tables wait unsynced, a bound a caller's own log
+    /// would hold.
+    const PERSIST_EVERY: u32 = 8;
 
     fn new(measuring: bool) -> Self {
         if measuring {
@@ -2029,6 +2033,7 @@ fn sustained_ours(
 ) -> (Duration, SustainedSample) {
     let dir = tempfile::tempdir().expect("ours sustained dir");
     let tree = ours_config(dir.path(), compression, false, IndexStrategy::Binary, false)
+        .flush_durability(FlushDurability::Deferred)
         .open()
         .expect("ours sustained: open");
     let strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy> = Arc::new(
@@ -2075,6 +2080,7 @@ fn sustained_ours(
     let stalled = AtomicU64::new(0);
 
     let stop = AtomicBool::new(false);
+    let writing_done = AtomicBool::new(false);
     let watermark = AtomicU64::new(shape.keys);
     let (elapsed, disk, compacted, mut reads) = std::thread::scope(|scope| {
         let compactor = scope.spawn(|| {
@@ -2100,6 +2106,30 @@ fn sustained_ours(
                 std::hint::black_box(tree.get(key, MAX_SEQNO).expect("ours sustained: get"));
             })
         });
+        // Flushes run on a thread of their own, as RocksDB's do: the writer
+        // only seals a full memtable. Under deferred durability a flush writes
+        // its table unsynced, and every `PERSIST_EVERY` flushes one barrier
+        // syncs them all and writes the manifest once.
+        let flusher = scope.spawn(|| {
+            let mut flushes = 0u32;
+            loop {
+                let lock = tree.get_flush_lock();
+                let flushed = tree
+                    .flush(&lock, watermark.load(Ordering::Acquire))
+                    .expect("ours sustained: flush");
+                drop(lock);
+                if flushed.is_some() {
+                    flushes += 1;
+                    if flushes % Sustained::PERSIST_EVERY == 0 {
+                        tree.persist_flushes().expect("ours sustained: persist");
+                    }
+                } else if writing_done.load(Ordering::Acquire) {
+                    break;
+                } else {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            }
+        });
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
             #[cfg(feature = "metrics")]
@@ -2116,10 +2146,20 @@ fn sustained_ours(
             let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
             tree.insert(key, pool.value(seqno), seqno);
             watermark.store(seqno + 1, Ordering::Release);
-            flush_at(&tree);
+            if tree.active_memtable().size() >= Sustained::MEMTABLE_BYTES {
+                // One sealed memtable at a time, as RocksDB's two write
+                // buffers allow: the writer waits for the flusher to take it.
+                while tree.sealed_memtable_count() > 0 {
+                    std::thread::yield_now();
+                }
+                tree.rotate_memtable();
+            }
         }
-        tree.flush_active_memtable(0)
-            .expect("ours sustained: last flush");
+        tree.rotate_memtable();
+        writing_done.store(true, Ordering::Release);
+        flusher.join().expect("ours sustained: flusher");
+        tree.persist_flushes()
+            .expect("ours sustained: last persist");
         let elapsed = start.elapsed();
         let disk = dir_bytes(dir.path());
         stop.store(true, Ordering::Release);
@@ -2598,7 +2638,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "overwrite_sustained",
-        "100,000 keys, then 15 rewrites of a hot set of 20,000 of them, with compaction behind the writes and a reader alongside. 4 MiB memtables, 2 MiB tables, 4 L0 runs per compaction; ours runs leveled compaction on a thread of its own and stops writes at 36 L0 runs, RocksDB's stop trigger. Time per write; beside it the compaction bytes per written byte until compaction rests, the disk bytes over live bytes when the last write lands, and the reader's p50 and p99.",
+        "100,000 keys, then 15 rewrites of a hot set of 20,000 of them, with compaction behind the writes and a reader alongside. 4 MiB memtables, 2 MiB tables, 4 L0 runs per compaction, no write-ahead log on either. Ours flushes on a thread of its own as RocksDB does, one sealed memtable at a time as RocksDB's two write buffers allow, with deferred durability and one sync barrier per 8 flushes; it runs leveled compaction on another thread and stops writes at 36 L0 runs, RocksDB's stop trigger. Time per write; beside it the compaction bytes per written byte until compaction rests, the disk bytes over live bytes when the last write lands, and the reader's p50 and p99.",
     ),
     (
         "point_read",
