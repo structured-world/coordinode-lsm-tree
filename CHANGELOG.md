@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.3.1...v7.4.0) - 2026-10-28
+
+### Added
+
+- *(flush)* defer a flush's durability to a barrier ([#1016](https://github.com/structured-world/coordinode-lsm-tree/pull/1016))
+
 ## [7.3.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.3.0...v7.3.1) - 2026-10-27
 
 ### Fixed
