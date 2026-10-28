@@ -114,7 +114,7 @@
 //!   `ours-deferred-wal` series runs our engine with a caller-kept log and a
 //!   deferred flush: one sync per batch, the durability SurrealKV's commit
 //!   gives.
-//! - `overwrite_sustained` — rounds of rewrites of a hot key set over a tree
+//! - `overwrite_sustained`: rounds of rewrites of a hot key set over a tree
 //!   several memtables large, compaction running behind the writes and a
 //!   reader alongside. Time per write, with write and space amplification and
 //!   the read percentiles reported beside it (see [`Sustained`]).
@@ -262,9 +262,9 @@ fn setup_surrealkv_warm(
 enum Engine {
     Ours,
     RocksDb,
-    /// SurrealKV — pure-Rust embedded LSM/MVCC store. Its zstd runs at a
+    /// SurrealKV, the pure-Rust embedded LSM/MVCC store. Its zstd runs at a
     /// fixed level 3, so it participates ONLY in the None-compression
-    /// (codec-neutral) groups — see [`engines_for`].
+    /// (codec-neutral) groups (see [`engines_for`]).
     SurrealKv,
     /// Our engine in its KV-separated (`blob_tree`) configuration: values at or
     /// above [`BLOB_SEPARATION_THRESHOLD`] are stored out-of-line in blob files,
@@ -301,7 +301,7 @@ const BLOB_SEPARATION_THRESHOLD: u32 = 128;
 /// Engines to overlay for a given compression variant.
 ///
 /// SurrealKV's zstd is fixed at level 3 (no level setting), so it cannot match
-/// the `Zstd22` variant apples-to-apples — adding a level-3 line to a zstd22
+/// the `Zstd22` variant apples-to-apples: adding a level-3 line to a zstd22
 /// graph would misrepresent the comparison. It is
 /// therefore restricted to the `None`-compression groups, where all three
 /// engines run codec-neutral. The `_zstd22` groups stay ours-vs-rocksdb.

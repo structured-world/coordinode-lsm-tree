@@ -2739,7 +2739,7 @@ impl Tree {
         // of the insert gate instead, so taking the WRITE guard and closing the
         // gate excludes both, in the order a version change takes them. The cap
         // and the active memtable's raw entries are captured under them;
-        // everything else — sealed memtables, tables — is immutable and needs
+        // everything else (sealed memtables, tables) is immutable and needs
         // no coordination.
         //
         // Mapping runs AFTER the guard drops: it resolves blob indirections,

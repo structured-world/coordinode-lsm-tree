@@ -396,7 +396,7 @@ impl SkipMap {
                 }
                 #[cfg(feature = "metrics")]
                 self.cas_retries.fetch_add(1, Ordering::Relaxed);
-                // Predecessor changed — re-search at this level.
+                // Predecessor changed: re-search at this level.
                 self.find_splice_for_level(key, &mut preds, &mut succs, level);
             }
         }
