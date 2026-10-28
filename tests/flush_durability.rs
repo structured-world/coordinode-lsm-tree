@@ -199,6 +199,11 @@ impl Fs for ProbeFs {
     fn hard_link(&self, src: &Path, dst: &Path) -> io::Result<()> {
         self.inner.hard_link(src, dst)
     }
+    // Without it a checkpoint sees two namespaces and copies with a sync
+    // instead of linking, which hides an unsynced table.
+    fn backend_id(&self) -> Option<u64> {
+        self.inner.backend_id()
+    }
 }
 
 /// A deferred flush issues no sync at all, of a file, a folder or the
@@ -510,15 +515,18 @@ fn a_checkpoint_syncs_a_flush_installed_after_its_persist() -> lsm_tree::Result<
 #[test]
 fn a_restore_persists_its_flush_before_it_clears_its_marker() -> lsm_tree::Result<()> {
     let src = tempfile::tempdir()?;
+    let visible = SequenceNumberCounter::default();
     let source = Config::new(
         src.path(),
         SequenceNumberCounter::default(),
-        SequenceNumberCounter::default(),
+        visible.clone(),
     )
     .open()?;
     source.insert("flushed", "1", 0);
     source.flush_active_memtable(0)?;
     source.insert("streamed", "2", 1);
+    // A pin sees what the visible watermark has published.
+    visible.set(2);
     let pin = source.pin();
     assert!(
         pin.memtable_entries().count() > 0,
