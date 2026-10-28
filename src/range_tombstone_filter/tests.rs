@@ -21,7 +21,9 @@ fn items_no_tombstones_return_all() {
 
     let filter = RangeTombstoneFilter::new(items.into_iter(), vec![]);
     let results: Vec<_> = filter.flatten().collect();
-    assert_eq!(results.len(), 3);
+
+    let keys: Vec<&[u8]> = results.iter().map(|v| v.key.user_key.as_ref()).collect();
+    assert_eq!(keys, vec![b"a".as_ref(), b"b", b"c"]);
 }
 
 #[test]
@@ -93,7 +95,8 @@ fn tombstone_newer_than_read_seqno_not_visible() {
     let filter = RangeTombstoneFilter::new(items.into_iter(), tombstones);
     let results: Vec<_> = filter.flatten().collect();
 
-    assert_eq!(results.len(), 1);
+    let keys: Vec<&[u8]> = results.iter().map(|v| v.key.user_key.as_ref()).collect();
+    assert_eq!(keys, vec![b"b".as_ref()]);
 }
 
 #[test]

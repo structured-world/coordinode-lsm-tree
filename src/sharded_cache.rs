@@ -42,7 +42,7 @@ const MAX_FREQ: u8 = 3;
 
 /// Assigns a byte weight to a cached `(key, value)` pair. The cache evicts to
 /// keep the summed weight under its capacity.
-pub trait Weighter<K, V> {
+pub(crate) trait Weighter<K, V> {
     /// Weight of this entry in the same unit as the cache's capacity (bytes for
     /// the block/blob cache, a unit count for the descriptor cache).
     fn weight(&self, key: &K, value: &V) -> u64;
@@ -51,7 +51,7 @@ pub trait Weighter<K, V> {
 /// A [`Weighter`] that assigns every entry a weight of 1, turning a byte-capacity
 /// cache into a count-capacity (max-entries) cache. Used by the descriptor cache.
 #[derive(Clone, Copy, Default)]
-pub struct UnitWeighter;
+pub(crate) struct UnitWeighter;
 
 impl<K, V> Weighter<K, V> for UnitWeighter {
     #[inline]
@@ -78,7 +78,7 @@ enum Location {
 /// bounded: `evict_from_main` decrements the credit, so a high-priority entry can
 /// eventually evict if such entries alone overflow capacity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Priority {
+pub(crate) enum Priority {
     /// Normal admission: ghost-hit → main, otherwise the probationary small queue.
     Normal,
     /// Pinned admission: straight to main with a full frequency credit.
@@ -309,6 +309,10 @@ where
     /// hold no live entry. A small→main migration returns `true` (progress) even
     /// though it frees no bytes: it shrinks the small queue, so a bounded number
     /// of further calls reach a real eviction.
+    #[expect(
+        clippy::if_same_then_else,
+        reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
+    )]
     fn evict_one(&mut self) -> bool {
         let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
         if prefer_small {
@@ -407,7 +411,7 @@ fn adjust(total: u64, old: u64, new: u64) -> u64 {
 
 /// A sharded, byte-weighted S3-FIFO cache. Generic over key, value, [`Weighter`]
 /// and hasher; cloned values are returned from `get` / `peek`.
-pub struct ShardedCache<K, V, W, S> {
+pub(crate) struct ShardedCache<K, V, W, S> {
     shards: Vec<Padded<RwLock<ShardCore<K, V, S>>>>,
     /// `shards.len() - 1`; `shards.len()` is always a power of two so this masks
     /// a hash to a shard index.
@@ -430,7 +434,7 @@ where
     /// Builds a cache with `capacity` total weight, split across
     /// `shard_count_hint` shards (rounded up to a power of two, clamped to
     /// `[1, 256]`). `est_items` seeds the ghost-queue capacity per shard.
-    pub fn with_weighter(
+    pub(crate) fn with_weighter(
         capacity: u64,
         shard_count_hint: usize,
         est_items: usize,
@@ -467,7 +471,7 @@ where
     /// The heaviest entry this cache can actually keep: one shard's capacity.
     /// Heavier inserts are refused (see [`Self::insert_with_priority`]);
     /// callers producing large entries can skip building them entirely.
-    pub fn max_entry_weight(&self) -> u64 {
+    pub(crate) fn max_entry_weight(&self) -> u64 {
         self.per_shard_capacity
     }
 
@@ -496,33 +500,33 @@ where
     }
 
     /// Returns the value for `key`, counting the access as a hit (promotes).
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
         shard.read().get(h, key)
     }
 
     /// Returns the value for `key` WITHOUT counting it as a hit (no promotion).
-    pub fn peek(&self, key: &K) -> Option<V> {
+    pub(crate) fn peek(&self, key: &K) -> Option<V> {
         let (h, shard) = self.locate(key);
         shard.read().peek(h, key)
     }
 
     /// Whether `key` is resident, without cloning it out or counting a hit.
-    pub fn contains(&self, key: &K) -> bool {
+    pub(crate) fn contains(&self, key: &K) -> bool {
         let (h, shard) = self.locate(key);
         shard.read().contains(h, key)
     }
 
     /// Inserts or replaces `key` at [`Priority::Normal`], evicting as needed to
     /// stay within capacity.
-    pub fn insert(&self, key: K, value: V) {
+    pub(crate) fn insert(&self, key: K, value: V) {
         self.insert_with_priority(key, value, Priority::Normal);
     }
 
     /// Inserts or replaces `key` at the given admission [`Priority`], evicting as
     /// needed to stay within capacity. [`Priority::High`] pins the entry against
     /// churn (see the enum docs).
-    pub fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
+    pub(crate) fn insert_with_priority(&self, key: K, value: V, priority: Priority) {
         let weight = self.weighter.weight(&key, &value);
         // An entry heavier than its shard can never stay resident: admitting it
         // would evict the shard's whole population and then be evicted itself.
@@ -540,7 +544,7 @@ where
     /// is; a derived value heavier than a shard is refused, as by
     /// [`Self::insert_with_priority`].
     #[cfg(feature = "zstd")]
-    pub fn insert_merged(&self, key: K, merge: impl FnOnce(Option<&V>) -> Option<V>) {
+    pub(crate) fn insert_merged(&self, key: K, merge: impl FnOnce(Option<&V>) -> Option<V>) {
         let (h, shard) = self.locate(&key);
         let mut core = shard.write();
         let Some(value) = merge(core.find(h, &key)) else {
@@ -554,7 +558,7 @@ where
     }
 
     /// Removes `key` if present.
-    pub fn remove(&self, key: &K) {
+    pub(crate) fn remove(&self, key: &K) {
         let (h, shard) = self.locate(key);
         shard.write().remove(h, key);
     }
@@ -563,7 +567,7 @@ where
     /// shared (read) lock — not the hot path (metrics / tests), and avoids a
     /// 64-bit atomic (unavailable on 32-bit no-std targets like
     /// `thumbv7em-none-eabihf`).
-    pub fn weight(&self) -> u64 {
+    pub(crate) fn weight(&self) -> u64 {
         self.shards
             .iter()
             .map(|s| s.0.read().resident_bytes())
@@ -571,13 +575,13 @@ where
     }
 
     /// Total cache capacity (the value passed to [`Self::with_weighter`]).
-    pub fn capacity(&self) -> u64 {
+    pub(crate) fn capacity(&self) -> u64 {
         self.capacity
     }
 
     /// Removes every entry whose key `doomed` picks. Walks every shard under
     /// its write lock: for a sweep, not the hot path.
-    pub fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
+    pub(crate) fn remove_where(&self, mut doomed: impl FnMut(&K) -> bool) {
         for shard in &self.shards {
             let mut core = shard.0.write();
             let keys: alloc::vec::Vec<K> = core
@@ -595,7 +599,7 @@ where
 
     /// Number of resident entries across all shards (takes each shard's read
     /// lock; intended for diagnostics, not the hot path).
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|s| s.0.read().len()).sum()
     }
 }

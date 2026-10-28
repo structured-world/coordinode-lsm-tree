@@ -469,7 +469,7 @@ impl Writer {
         value: &[u8],
         uncompressed_len: u32,
     ) -> crate::Result<u32> {
-        assert!(!key.is_empty());
+        assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
         assert!(u16::try_from(key.len()).is_ok());
         assert!(u32::try_from(value.len()).is_ok());
 
@@ -499,7 +499,7 @@ impl Writer {
         encoded: &[u8],
         uncompressed_len: u32,
     ) -> crate::Result<u32> {
-        assert!(!key.is_empty());
+        assert_ne!(key.len(), 0, "a blob is written under a non-empty key");
         assert!(u16::try_from(key.len()).is_ok());
 
         check_size_cap(uncompressed_len as usize)?;

@@ -124,7 +124,7 @@ fn covering_rt_highest_seqno() {
 #[test]
 fn iter_sorted_empty() {
     let tree = IntervalTree::new();
-    assert!(tree.iter_sorted().is_empty());
+    assert_eq!(tree.iter_sorted(), Vec::new());
 }
 
 #[test]

@@ -46,7 +46,7 @@ use spin::Mutex;
 /// and a compaction running together draw on this one figure, so the room
 /// one of them builds into is not handed to the other.
 #[derive(Debug, Default)]
-pub struct FilterBudget {
+pub(crate) struct FilterBudget {
     /// The over-budget state has been logged, so it is logged once.
     logged: AtomicBool,
     /// Filter bytes the budget holds, see above. Signed: a rewrite takes the
@@ -137,7 +137,7 @@ impl FilterBudget {
 
 /// The width choices of one flush or compaction.
 #[derive(Debug)]
-pub struct FilterSizing {
+pub(crate) struct FilterSizing {
     /// Admissible widths in bits per key, ascending.
     widths: Vec<u8>,
     /// What the static policy would build, used before any probe is observed.
@@ -241,7 +241,7 @@ pub struct FilterSizing {
 /// of its reference only after the rewrite has returned, and the budget
 /// would hold the rewrite's filters twice until then.
 #[derive(Debug)]
-pub struct FilterPlan(Arc<FilterSizing>);
+pub(crate) struct FilterPlan(Arc<FilterSizing>);
 
 impl FilterPlan {
     fn new(sizing: Arc<FilterSizing>) -> Self {
@@ -251,7 +251,7 @@ impl FilterPlan {
 
     /// The sizing alone, for work that outlives none of the plan's owners
     /// yet may let go of it after them: a partition built on a pool thread.
-    pub fn sizing(&self) -> Arc<FilterSizing> {
+    pub(crate) fn sizing(&self) -> Arc<FilterSizing> {
         Arc::clone(&self.0)
     }
 }
@@ -282,7 +282,7 @@ impl Drop for FilterPlan {
 
 /// What a flush or compaction rewrites, for its filter plan.
 #[derive(Default)]
-pub struct Rewrite {
+pub(crate) struct Rewrite {
     /// The tables it replaces; none for a flush.
     pub inputs: Vec<Table>,
     /// The key ranges a compaction runs side by side, when it is split.
@@ -303,7 +303,7 @@ pub struct Rewrite {
 /// keys under a prefix extractor, which a full filter hashes each distinct
 /// prefix for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FilterCount {
+pub(crate) struct FilterCount {
     pub keys: u64,
     pub hashes: u64,
 }
@@ -312,7 +312,7 @@ pub struct FilterCount {
 /// `upper`, ordered by `comparator`. The inputs hold no key below `lower`
 /// still to be written, so an input ending before `upper` is rewritten
 /// whole and the ones reaching past it stay live.
-pub struct Span {
+pub(crate) struct Span {
     pub lower: Bound<crate::UserKey>,
     pub upper: Bound<crate::UserKey>,
     pub comparator: crate::comparator::SharedComparator,
@@ -353,7 +353,7 @@ impl core::fmt::Debug for Span {
 /// How a rewrite frames each filter block on disk: the budget counts the
 /// framed bytes, so the price does too.
 #[derive(Clone, Default)]
-pub struct Framing {
+pub(crate) struct Framing {
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
     pub ecc: Option<crate::table::block::EccParams>,
 }
@@ -437,7 +437,7 @@ impl KeyOrder {
 
 /// Key ranges of one compaction that run side by side, each writing its own
 /// tables: split at `boundaries`, ascending by `comparator`.
-pub struct Split {
+pub(crate) struct Split {
     pub boundaries: Vec<crate::UserKey>,
     pub comparator: crate::comparator::SharedComparator,
 }
@@ -452,7 +452,7 @@ impl core::fmt::Debug for Split {
 
 /// A live table with the filter settings it was built under, which the price
 /// models its filter by.
-pub struct Live<'a> {
+pub(crate) struct Live<'a> {
     pub table: &'a Table,
     /// Width in bits per key of the static policy it was built under, which
     /// breaks ties.
@@ -473,7 +473,7 @@ pub struct Live<'a> {
 /// A table without a filter takes no filter bytes and draws no filter
 /// probes; counting its keys would price the others for filters that are
 /// never built.
-pub fn live(version: &crate::version::Version) -> Vec<Live<'_>> {
+pub(crate) fn live(version: &crate::version::Version) -> Vec<Live<'_>> {
     version
         .iter_tables()
         .filter(|table| table.filter_size() > 0)
@@ -510,7 +510,7 @@ pub fn live(version: &crate::version::Version) -> Vec<Live<'_>> {
 /// `partition_bytes` the filter partition size there when its filters are
 /// partitioned. `None` when that policy builds no filter there: the advisor
 /// sizes filters, it does not add them.
-pub fn plan(
+pub(crate) fn plan(
     advisor: &FilterAdvisor,
     state: &Arc<FilterBudget>,
     live: &[Live<'_>],
@@ -685,7 +685,7 @@ pub fn plan(
 impl FilterSizing {
     /// The widest filter any choice builds: what a writer bounds its output
     /// by before the choice is made.
-    pub fn bound_policy(&self) -> BloomConstructionPolicy {
+    pub(crate) fn bound_policy(&self) -> BloomConstructionPolicy {
         let widest = self.widths.last().copied().unwrap_or(self.fallback_bits);
         if widest > self.fallback_bits {
             BloomConstructionPolicy::BitsPerKey(f32::from(widest))
@@ -702,7 +702,7 @@ impl FilterSizing {
     ///
     /// The filter counts as in flight from here until [`Self::admit`] takes
     /// it: its data is still to come for every filter priced meanwhile.
-    pub fn candidates(
+    pub(crate) fn candidates(
         &self,
         bounds: (Bound<&[u8]>, Bound<&[u8]>),
         n: usize,
@@ -1009,7 +1009,7 @@ impl FilterSizing {
     /// The narrowest width a filter can be built at: the narrowest configured
     /// one once probes are observed; before, while the static policy decides,
     /// the narrowest configured one below it, or the static policy itself.
-    pub fn narrowest(&self) -> BloomConstructionPolicy {
+    pub(crate) fn narrowest(&self) -> BloomConstructionPolicy {
         match self.widths.first() {
             Some(&bits) if self.observed || bits < self.fallback_bits => {
                 BloomConstructionPolicy::BitsPerKey(f32::from(bits))
@@ -1046,7 +1046,7 @@ impl FilterSizing {
         clippy::too_many_arguments,
         reason = "the filter's place, counts and bytes, as the build produced them"
     )]
-    pub fn admit(
+    pub(crate) fn admit(
         &self,
         bounds: (Bound<&[u8]>, Bound<&[u8]>),
         n: usize,
@@ -1248,7 +1248,7 @@ impl FilterSizing {
     /// Gives up the credit for the filters this rewrite replaces, before its
     /// install drops them from the published version: from then on the room
     /// it builds into is what the held bytes leave, as for any rewrite.
-    pub fn release_replaced(&self) {
+    pub(crate) fn release_replaced(&self) {
         let _admission = self.state.admission.lock();
         self.release_locked();
     }
@@ -1261,7 +1261,7 @@ impl FilterSizing {
     }
 
     /// Records that a table's filters, over `keys` hashes in all, are built.
-    pub fn table_finished(&self, keys: usize) {
+    pub(crate) fn table_finished(&self, keys: usize) {
         self.table_keys
             .fetch_max(u64::try_from(keys).unwrap_or(u64::MAX), Relaxed);
     }
@@ -1269,7 +1269,7 @@ impl FilterSizing {
     /// Sets the keys this rewrite writes filters for in all, an upper bound,
     /// for a writer that learns the count only after the plan (an ingestion
     /// its caller tells): the ones no filter holds yet count as still to come.
-    pub fn expect_keys(&self, keys: u64) {
+    pub(crate) fn expect_keys(&self, keys: u64) {
         let _admission = self.state.admission.lock();
         self.total_keys.store(keys, Relaxed);
         let pending = self.pending_hashes();
@@ -1322,7 +1322,14 @@ impl FilterSizing {
     fn estimated_keys(&self, bounds: (Bound<&[u8]>, Bound<&[u8]>)) -> crate::Result<u64> {
         let mut keys = 0.0;
         for (input, &distinct) in self.inputs.iter().zip(&self.input_distinct) {
-            keys += as_f64(distinct) * self.share_of(input, bounds)?;
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "`f64::mul_add` needs std, and `libm::fma` is a software routine \
+                          where the target has no FMA"
+            )]
+            {
+                keys += as_f64(distinct) * self.share_of(input, bounds)?;
+            }
         }
         #[expect(
             clippy::cast_possible_truncation,
@@ -1806,6 +1813,11 @@ fn shrunk_densities(counts: &[(f64, usize)]) -> Vec<f64> {
     } else {
         0.0
     };
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "`f64::mul_add` needs std, and `libm::fma` is a software routine \
+                  where the target has no FMA"
+    )]
     counts
         .iter()
         .map(|entry| mean + keep * (density(entry) - mean))
@@ -1842,7 +1854,7 @@ fn estimate(n: usize, bits: u8) -> u64 {
 
 /// The width in bits per key a policy builds at: its own for bits per key,
 /// the narrowest reaching the rate for a false-positive rate.
-pub fn bits_of(policy: BloomConstructionPolicy) -> u8 {
+pub(crate) fn bits_of(policy: BloomConstructionPolicy) -> u8 {
     match policy {
         #[expect(
             clippy::cast_possible_truncation,

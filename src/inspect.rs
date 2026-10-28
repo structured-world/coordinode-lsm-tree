@@ -7,7 +7,7 @@
 //! every block and checks per-block XXH3, this module exposes a public
 //! read-only view of an SST's stored metadata ([`TableProperties`](crate::inspect::TableProperties)) for
 //! diagnostic tooling like `sst-dump properties` that needs the
-//! metadata fields without spinning up a [`Tree`](crate::Tree) or
+//! metadata fields without spinning up a [`Tree`] or
 //! recovering the manifest.
 //!
 //! The reader follows the same TAIL-first / MID-fallback pattern as

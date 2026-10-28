@@ -132,11 +132,8 @@ macro_rules! define_workloads {
             }
         }
 
-        /// List all available benchmark names.
-        #[expect(
-            clippy::vec_init_then_push,
-            reason = "each push can carry a cfg, which a vec! element cannot"
-        )]
+        /// List all available benchmark names. One push per name, since each
+        /// can carry a cfg, which a `vec!` element cannot.
         pub fn available_benchmarks() -> Vec<&'static str> {
             let mut names = Vec::new();
             $( $(#[$attr])* names.push($name); )+

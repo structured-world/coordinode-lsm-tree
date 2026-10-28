@@ -31,7 +31,7 @@ impl SequenceNumberGenerator for OffsetGenerator {
     fn next(&self) -> SeqNo {
         match self
             .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current >= MAX_SEQNO {
                     None
                 } else {

@@ -255,7 +255,7 @@ fn range_tombstones_populated_tree_concurrent_reads_succeed() {
                 for _ in 0..500 {
                     let _ = mt.is_key_suppressed_by_range_tombstone(b"c", 5, SeqNo::MAX);
                     let sorted = mt.range_tombstones_sorted();
-                    assert!(!sorted.is_empty());
+                    assert_ne!(sorted, Vec::new());
                     let count = mt.range_tombstone_count();
                     assert!(count > 0);
                 }

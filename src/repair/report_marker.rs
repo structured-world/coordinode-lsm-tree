@@ -224,13 +224,11 @@ impl<'a> Reader<'a> {
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
-            if bytes.len() % 2 != 0 {
+            let (units, odd) = bytes.as_chunks::<2>();
+            if !odd.is_empty() {
                 return None;
             }
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|unit| unit.try_into().ok().map(u16::from_le_bytes))
-                .collect::<Option<_>>()?;
+            let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
             Some(PathBuf::from(std::ffi::OsString::from_wide(&units)))
         }
         #[cfg(not(any(unix, windows)))]

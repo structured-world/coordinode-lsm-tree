@@ -569,7 +569,7 @@ fn leveled_builder_chaining() {
         .with_multi_level(true);
 
     let config = strategy.get_config();
-    assert!(!config.is_empty());
+    assert_ne!(config, Vec::new());
     assert_eq!(strategy.get_name(), "LeveledCompaction");
 }
 

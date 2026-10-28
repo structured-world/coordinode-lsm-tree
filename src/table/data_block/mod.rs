@@ -1072,8 +1072,8 @@ impl DataBlock {
             // Entry precision the slot is an exact entry index, mapped to its
             // restart via the block's restart_interval.
             let restart_idx = if is_entry {
-                let ri = u64::from(decoder.restart_interval());
-                if ri == 0 { slot } else { slot / ri }
+                slot.checked_div(u64::from(decoder.restart_interval()))
+                    .unwrap_or(slot)
             } else {
                 slot
             };

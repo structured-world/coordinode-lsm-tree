@@ -74,7 +74,7 @@ fn transpose_ignores_bits_above_r() {
 
 #[test]
 fn transpose_of_no_rows_is_empty() {
-    assert!(transpose(&[], 10).is_empty());
+    assert_eq!(transpose(&[], 10), Vec::<u64>::new());
     assert_eq!(z_byte_len(0, 10), Some(0));
 }
 

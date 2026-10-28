@@ -88,6 +88,7 @@ type Shape = (&'static str, fn(Writer) -> Writer);
 /// Table shapes whose point lookups load a filter, index and data block (or
 /// their partitions) from the file.
 fn shapes() -> Vec<Shape> {
+    #[cfg_attr(not(feature = "columnar"), expect(unused_mut))]
     let mut shapes: Vec<Shape> = vec![
         ("monolithic", |w| w),
         ("partitioned", |w| {
@@ -154,6 +155,7 @@ fn cold_point_reads_take_the_descriptor_once_per_lookup() -> crate::Result<()> {
 /// Table shapes whose scans read many data blocks (or row groups) and, when
 /// partitioned, many index partitions from the file.
 fn scan_shapes() -> Vec<Shape> {
+    #[cfg_attr(not(feature = "columnar"), expect(unused_mut))]
     let mut shapes: Vec<Shape> = vec![
         ("monolithic", |w| w.use_data_block_size(64)),
         ("partitioned", |w| {

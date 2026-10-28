@@ -251,7 +251,7 @@ pub struct Error {
 impl Error {
     /// Construct an error with the given kind and a context message.
     ///
-    /// Analogous to [`std::io::Error::new`] but intentionally
+    /// Analogous to `std::io::Error::new` but intentionally
     /// narrower: this constructor takes a `String`-coercible
     /// message and stores it verbatim, where std's `new()`
     /// accepts `E: Into<Box<dyn std::error::Error + Send + Sync>>`
@@ -287,7 +287,7 @@ impl Error {
     }
 
     /// Construct an [`ErrorKind::Other`] error carrying `message`.
-    /// Mirrors [`std::io::Error::other`].
+    /// Mirrors `std::io::Error::other`.
     pub fn other<M: Into<String>>(message: M) -> Self {
         Self::new(ErrorKind::Other, message)
     }

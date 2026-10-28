@@ -60,7 +60,7 @@ const MAX_BLOCKS: usize = 1 << (32 - BLOCK_SHIFT);
 /// The u32 offset returned by [`alloc`](Self::alloc) encodes the block
 /// index in the high bits and the within-block offset in the low
 /// `BLOCK_SHIFT` bits.
-pub struct Arena {
+pub(crate) struct Arena {
     /// Block pointers.  Null means not yet allocated.  Once set to non-null,
     /// a block pointer is never modified — reads may use `Relaxed` ordering
     /// as long as the caller establishes happens-before via the skiplist CAS
@@ -78,7 +78,7 @@ pub struct Arena {
 impl Arena {
     /// Creates a new empty arena.  No memory is allocated until the first
     /// [`alloc`](Self::alloc) call.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut blocks = Vec::with_capacity(MAX_BLOCKS);
         for _ in 0..MAX_BLOCKS {
             blocks.push(AtomicPtr::new(ptr::null_mut()));
@@ -96,7 +96,7 @@ impl Arena {
     /// Returns the encoded offset, or `None` if `size` is zero,
     /// `size >= BLOCK_SIZE`, `align` is not a power of two, or the
     /// arena is exhausted (> 4 GiB total).
-    pub fn alloc(&self, size: u32, align: u32) -> Option<u32> {
+    pub(crate) fn alloc(&self, size: u32, align: u32) -> Option<u32> {
         if !align.is_power_of_two() || size == 0 || size >= BLOCK_SIZE {
             return None;
         }
@@ -112,51 +112,48 @@ impl Arena {
             // Cannot overflow: offset < BLOCK_SIZE (2^22), align < BLOCK_SIZE.
             let aligned = (offset + align - 1) & !(align - 1);
 
-            if let Some(new_end) = aligned.checked_add(size) {
-                if new_end < BLOCK_SIZE {
-                    // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
-                    // on the next line would set bit BLOCK_SHIFT in new_end,
-                    // colliding with the block_idx bits and wrapping the
-                    // cursor back to offset 0 of the *current* block.
-                    // Falling through to the next-block path abandons any
-                    // remaining bytes in the current block (at most
-                    // `BLOCK_SIZE - offset`, including a would-have-fit
-                    // allocation at the end).  This waste is acceptable
-                    // for typical node sizes.  See #119.
-                    //
-                    // Ensure the block exists BEFORE publishing the offset via
-                    // CAS — otherwise another thread could read the cursor,
-                    // compute the same block_idx, and call decode() before the
-                    // block pointer is set.
-                    self.ensure_block(block_idx as usize);
+            let new_end = aligned.checked_add(size)?;
+            if new_end < BLOCK_SIZE {
+                // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
+                // on the next line would set bit BLOCK_SHIFT in new_end,
+                // colliding with the block_idx bits and wrapping the
+                // cursor back to offset 0 of the *current* block.
+                // Falling through to the next-block path abandons any
+                // remaining bytes in the current block (at most
+                // `BLOCK_SIZE - offset`, including a would-have-fit
+                // allocation at the end).  This waste is acceptable
+                // for typical node sizes.  See #119.
+                //
+                // Ensure the block exists BEFORE publishing the offset via
+                // CAS: otherwise another thread could read the cursor,
+                // compute the same block_idx, and call decode() before the
+                // block pointer is set.
+                self.ensure_block(block_idx as usize);
 
-                    let new_cursor = (block_idx << BLOCK_SHIFT) | new_end;
-                    if self
-                        .cursor
-                        .compare_exchange_weak(cur, new_cursor, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        return Some((block_idx << BLOCK_SHIFT) | aligned);
-                    }
-                } else {
-                    // Advance to the next block.  Ensure it exists BEFORE
-                    // publishing the new cursor, so that any thread reading
-                    // the cursor will find a valid block pointer.
-                    let new_block = block_idx + 1;
-                    if new_block as usize >= MAX_BLOCKS {
-                        return None;
-                    }
-                    self.ensure_block(new_block as usize);
-                    let new_cursor = new_block << BLOCK_SHIFT;
-                    let _ = self.cursor.compare_exchange_weak(
-                        cur,
-                        new_cursor,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                let new_cursor = (block_idx << BLOCK_SHIFT) | new_end;
+                if self
+                    .cursor
+                    .compare_exchange_weak(cur, new_cursor, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some((block_idx << BLOCK_SHIFT) | aligned);
                 }
             } else {
-                return None;
+                // Advance to the next block.  Ensure it exists BEFORE
+                // publishing the new cursor, so that any thread reading
+                // the cursor will find a valid block pointer.
+                let new_block = block_idx + 1;
+                if new_block as usize >= MAX_BLOCKS {
+                    return None;
+                }
+                self.ensure_block(new_block as usize);
+                let new_cursor = new_block << BLOCK_SHIFT;
+                let _ = self.cursor.compare_exchange_weak(
+                    cur,
+                    new_cursor,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
             }
         }
     }
@@ -169,7 +166,7 @@ impl Arena {
     /// allocated by this arena and fully initialised.  The caller must also
     /// establish happens-before (typically via the skiplist CAS chain) so
     /// that the block pointer is visible.
-    pub unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
+    pub(crate) unsafe fn get_bytes(&self, offset: u32, len: u32) -> &[u8] {
         let (ptr, off) = unsafe { self.decode(offset) };
         debug_assert!(
             off + len as usize <= BLOCK_SIZE as usize,
@@ -195,7 +192,7 @@ impl Arena {
     /// The `bytes` slice backend cannot wrap a foreign view, so this only
     /// compiles for the default backend.
     #[cfg(not(feature = "bytes_1"))]
-    pub unsafe fn get_view(&self, offset: u32, len: u32) -> crate::byteview::ByteView {
+    pub(crate) unsafe fn get_view(&self, offset: u32, len: u32) -> crate::byteview::ByteView {
         let (ptr, off) = unsafe { self.decode(offset) };
         debug_assert!(
             off + len as usize <= BLOCK_SIZE as usize,
@@ -223,7 +220,7 @@ impl Arena {
         clippy::mut_from_ref,
         reason = "interior mutability by design; caller guarantees exclusive access"
     )]
-    pub unsafe fn get_bytes_mut(&self, offset: u32, len: u32) -> &mut [u8] {
+    pub(crate) unsafe fn get_bytes_mut(&self, offset: u32, len: u32) -> &mut [u8] {
         let (ptr, off) = unsafe { self.decode(offset) };
         // SAFETY: caller guarantees exclusive access (typically right after alloc,
         // before the node offset is published to other threads).
@@ -237,7 +234,7 @@ impl Arena {
     /// - `offset` must be 4-byte aligned.
     /// - The region `[offset, offset+4)` must have been previously allocated.
     /// - No `&mut` reference to the same 4 bytes may exist concurrently.
-    pub unsafe fn get_atomic_u32(&self, offset: u32) -> &AtomicU32 {
+    pub(crate) unsafe fn get_atomic_u32(&self, offset: u32) -> &AtomicU32 {
         let (ptr, off) = unsafe { self.decode(offset) };
         // SAFETY: caller guarantees alignment and prior allocation.
         // alloc(..., 4) ensures within-block alignment; the block base has

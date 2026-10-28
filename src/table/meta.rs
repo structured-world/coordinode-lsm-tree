@@ -28,7 +28,7 @@ use core::ops::Deref;
 /// `V6`, changes to its index entries, directory or pages are made in place
 /// under the same number; the number moves with the first change after `V6`
 /// is released.
-pub const COLUMNAR_FORMAT_VERSION: u8 = 2;
+pub(crate) const COLUMNAR_FORMAT_VERSION: u8 = 2;
 
 /// How a columnar table stores each row's value, from the optional
 /// `descriptor#value_layout` property.
@@ -847,13 +847,11 @@ impl ParsedMeta {
                 }
                 Some(
                     item.value
-                        .chunks_exact(8)
-                        .map(|chunk| {
-                            <[u8; 8]>::try_from(chunk)
-                                .map(u64::from_le_bytes)
-                                .map_err(|_| crate::Error::InvalidHeader("TableMeta"))
-                        })
-                        .collect::<crate::Result<Vec<u64>>>()?,
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|&id| u64::from_le_bytes(id))
+                        .collect(),
                 )
             }
             None => None,
@@ -874,13 +872,11 @@ impl ParsedMeta {
                     return Err(crate::Error::InvalidHeader("TableMeta"));
                 }
                 item.value
-                    .chunks_exact(8)
-                    .map(|chunk| {
-                        <[u8; 8]>::try_from(chunk)
-                            .map(u64::from_le_bytes)
-                            .map_err(|_| crate::Error::InvalidHeader("TableMeta"))
-                    })
-                    .collect::<crate::Result<Vec<u64>>>()?
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&id| u64::from_le_bytes(id))
+                    .collect()
             }
             None => Vec::new(),
         };

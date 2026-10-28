@@ -553,7 +553,7 @@ fn compaction_stream_filter_1() {
     ]);
 }
 
-pub mod custom_mvcc {
+pub(crate) mod custom_mvcc {
     use super::*;
     use crate::io::{BE, ReadBytesExt, WriteBytesExt};
     use test_log::test;
@@ -1546,7 +1546,7 @@ mod merge_operator_tests {
         // DroppedKvCallback fires for entries DRAINED after base is found.
         // In this case there are no entries after the base, so callback
         // should have no items.
-        assert!(callback.items.is_empty());
+        assert_eq!(callback.items, Vec::new());
 
         Ok(())
     }

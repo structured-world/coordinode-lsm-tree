@@ -40,7 +40,7 @@ fn lazy_block_decodes_only_touched_inner_blocks() {
 
     let mut lazy = LazyBlock::new(frame, ends.clone()).expect("new lazy block");
     assert_eq!(lazy.decoded_blocks(), 0, "no block bodies decoded up front");
-    assert!(lazy.decoded().is_empty());
+    assert_eq!(lazy.decoded(), b"");
 
     // Touch a byte inside the first inner block → only block 0 decoded.
     lazy.ensure_decoded_to(1).expect("decode to byte 1");
@@ -514,7 +514,7 @@ fn synthesize_handles_truncated_prefix() {
         .iter(cmp)
         .map(|x| x.materialize(synth.as_slice()))
         .collect();
-    assert!(!got.is_empty());
+    assert_ne!(got.len(), 0, "the synthetic block yields some items");
     assert!(
         got.len() < items.len(),
         "truncated tail entry must be dropped"

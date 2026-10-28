@@ -81,7 +81,7 @@ use core::fmt;
 /// How deep an expression nests: a dictionary whose codes run-length encode
 /// and whose ends delta-encode into FFOR is four levels, the deepest shape
 /// the writer chooses.
-pub const MAX_DEPTH: u8 = 5;
+pub(crate) const MAX_DEPTH: u8 = 5;
 
 const PLAIN: u8 = 0;
 const CONSTANT: u8 = 1;
@@ -162,7 +162,7 @@ impl fmt::Display for Expression {
 /// An FFOR vector as stored: its fields and its packed bits, borrowed from the
 /// page.
 #[derive(Clone, Debug)]
-pub struct Ffor<'a> {
+pub(crate) struct Ffor<'a> {
     base: u64,
     bit_width: u8,
     packed: &'a [u8],
@@ -173,7 +173,7 @@ pub struct Ffor<'a> {
 
 /// An integer vector as stored.
 #[derive(Clone, Debug)]
-pub enum Ints<'a> {
+pub(crate) enum Ints<'a> {
     /// One value for every row.
     Constant(u64),
     /// Offsets from a base, with exceptions.
@@ -192,7 +192,7 @@ pub enum Ints<'a> {
 
 /// A column page's values as stored, borrowed from the page.
 #[derive(Clone, Debug)]
-pub enum Values<'a> {
+pub(crate) enum Values<'a> {
     /// The column's own layout, checked for its framing.
     Plain(&'a [u8]),
     /// The one value of every row.
@@ -742,7 +742,7 @@ impl<'a> Values<'a> {
 
 /// What a filter asks of a column's values, in the form its encoding compares.
 #[derive(Clone, Copy, Debug)]
-pub enum Bounds<'b> {
+pub(crate) enum Bounds<'b> {
     /// An inclusive byte-wise range over a bytes column's values, either side
     /// unbounded when `None`.
     Bytes {
@@ -926,7 +926,7 @@ impl Values<'_> {
 /// One row's value: a view of the page, or a number rebuilt from its ordinal,
 /// which has no bytes in the page to view.
 #[derive(Clone, Copy, Debug)]
-pub enum Cell<'a> {
+pub(crate) enum Cell<'a> {
     /// The value's bytes, in the page.
     Borrowed(&'a [u8]),
     /// A value rebuilt in place, its first `len` bytes.
@@ -952,7 +952,7 @@ impl core::ops::Deref for Cell<'_> {
 /// An integer vector read one value at a time: what a lookup of a few rows
 /// needs, without decoding the rest.
 #[derive(Clone, Debug)]
-pub enum IntRows<'a> {
+pub(crate) enum IntRows<'a> {
     /// One value for every row.
     Constant(u64),
     /// Offsets from a base in `bit_width` bits, the exceptions sorted by row.
@@ -1022,7 +1022,7 @@ impl<'a> IntRows<'a> {
     ///
     /// [`Error::InvalidHeader`] for a row past the vector or an offset past
     /// the base's range.
-    pub fn get(&self, row: u32) -> Result<u64> {
+    pub(crate) fn get(&self, row: u32) -> Result<u64> {
         match self {
             Self::Constant(value) => Ok(*value),
             Self::Ffor {
@@ -1095,7 +1095,7 @@ fn unpack_one(packed: &[u8], bit_width: u8, row: u32) -> Result<u64> {
 /// needs, without decoding the page. Built from the page's parsed
 /// [`Values`], borrowing it.
 #[derive(Clone, Debug)]
-pub enum Rows<'a> {
+pub(crate) enum Rows<'a> {
     /// The column's own layout.
     Plain(&'a [u8]),
     /// The one value of every row.
@@ -1222,7 +1222,7 @@ impl<'a> Rows<'a> {
     ///
     /// [`Error::InvalidHeader`] for a row past the column, a code past its
     /// dictionary or an ordinal no value of the type has.
-    pub fn get(&self, type_tag: TypeTag, n: u32, row: u32) -> Result<Cell<'a>> {
+    pub(crate) fn get(&self, type_tag: TypeTag, n: u32, row: u32) -> Result<Cell<'a>> {
         // Checked here for every operator: a bit-packed vector's padding or a
         // constant would otherwise answer for a row the column does not have.
         if row >= n {
@@ -1336,7 +1336,7 @@ fn view_of(page: &Slice, data: &[u8]) -> Slice {
 
 /// The width a number column's ordinals are encoded at, when its values are
 /// encoded by them at all: numbers of at most 8 bytes.
-pub fn ordinal_width(type_tag: TypeTag) -> Option<u8> {
+pub(crate) fn ordinal_width(type_tag: TypeTag) -> Option<u8> {
     match type_tag {
         TypeTag::Number(number) if number.width() <= 8 => Some(number.width()),
         _ => None,
@@ -1398,12 +1398,17 @@ fn plain_bytes_cells(data: &[u8], n: u32) -> impl Iterator<Item = &[u8]> {
     let table = (n as usize + 1) * 4;
     let (offsets, payload) = data.split_at_checked(table).unwrap_or_default();
     let mut start = 0usize;
-    offsets.chunks_exact(4).skip(1).map_while(move |end| {
-        let end = u32::from_le_bytes(end.try_into().ok()?) as usize;
-        let value = payload.get(start..end)?;
-        start = end;
-        Some(value)
-    })
+    offsets
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .skip(1)
+        .map_while(move |end| {
+            let end = u32::from_le_bytes(*end) as usize;
+            let value = payload.get(start..end)?;
+            start = end;
+            Some(value)
+        })
 }
 
 /// The rows of a plain layout that `bounds` keeps, tested in one pass over
@@ -1614,7 +1619,7 @@ fn cheapest(trials: Vec<Trial>) -> Option<Trial> {
 /// The bits `value` needs.
 #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
 const fn bits(value: u64) -> u8 {
-    (u64::BITS - value.leading_zeros()) as u8
+    value.bit_width() as u8
 }
 
 /// The bytes `value` takes as a varint.
@@ -2043,7 +2048,7 @@ fn values_trials(cells: &Cells<'_>) -> Result<Vec<Trial>> {
 
 /// A column page's values encoded as the cheapest expression the writer
 /// considers.
-pub struct Choice {
+pub(crate) struct Choice {
     /// The encoded expression, ready for the page.
     pub bytes: Vec<u8>,
     /// What it is.
@@ -2060,7 +2065,7 @@ pub struct Choice {
 ///
 /// [`Error::InvalidHeader`] when a bytes column's values do not fit its
 /// offsets, which a validated column cannot reach.
-pub fn choose(
+pub(crate) fn choose(
     type_tag: TypeTag,
     rows: u32,
     data: &[u8],

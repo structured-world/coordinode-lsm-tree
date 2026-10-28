@@ -720,7 +720,9 @@ impl<
                         && !self.is_rt_suppressed(&tail)
                     {
                         self.key_entries_buf.push(tail);
-                        let entries = self.key_entries_buf.drain(..).collect();
+                        // The stream ends here, so the buffer's capacity has
+                        // no next key to serve: hand the buffer over whole.
+                        let entries = core::mem::take(&mut self.key_entries_buf);
                         return Some(self.resolve_merge_buffered(entries));
                     }
                     return Some(Ok(tail));

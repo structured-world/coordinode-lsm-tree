@@ -90,7 +90,7 @@ fn test_with_table_impl(
             let metrics = Arc::new(Metrics::default());
 
             let table = {
-                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                #[cfg_attr(not(any(zstd_any, feature = "metrics")), expect(unused_mut))]
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
@@ -291,7 +291,7 @@ fn test_with_table_impl(
             let metrics = Arc::new(Metrics::default());
 
             let table = {
-                #[cfg_attr(not(zstd_any), expect(unused_mut))]
+                #[cfg_attr(not(any(zstd_any, feature = "metrics")), expect(unused_mut))]
                 let mut params = test_recover_params(file.clone(), checksum);
                 #[cfg(zstd_any)]
                 {
@@ -310,7 +310,7 @@ fn test_with_table_impl(
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
-            assert!(table.regions.index.is_some(), "should use two-level index",);
+            assert!(table.regions.index.is_some(), "should use two-level index");
             assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
                 table.file_accessor,
@@ -344,7 +344,7 @@ fn test_with_table_impl(
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
-            assert!(table.regions.index.is_some(), "should use two-level index",);
+            assert!(table.regions.index.is_some(), "should use two-level index");
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
                 table.file_accessor,
@@ -378,7 +378,7 @@ fn test_with_table_impl(
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
-            assert!(table.regions.index.is_some(), "should use two-level index",);
+            assert!(table.regions.index.is_some(), "should use two-level index");
             assert!(table.pinned_block_index_size() > 0, "should pin index");
             // assert_eq!(0, table.pinned_filter_size(), "should not pin filter");
             assert!(matches!(
@@ -414,7 +414,7 @@ fn test_with_table_impl(
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
-            assert!(table.regions.index.is_some(), "should use two-level index",);
+            assert!(table.regions.index.is_some(), "should use two-level index");
             assert!(table.pinned_block_index_size() > 0, "should pin index");
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(
@@ -450,7 +450,7 @@ fn test_with_table_impl(
 
             assert_eq!(0, table.id());
             assert_eq!(items.len(), table.metadata.item_count as usize);
-            assert!(table.regions.index.is_some(), "should use two-level index",);
+            assert!(table.regions.index.is_some(), "should use two-level index");
             assert!(table.pinned_block_index_size() > 0, "should pin index");
             // assert!(table.pinned_filter_size() > 0, "should pin filter");
             assert!(matches!(table.file_accessor, FileAccessor::File(..)));

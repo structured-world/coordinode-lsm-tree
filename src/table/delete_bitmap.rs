@@ -317,7 +317,7 @@ impl DeleteBitmap {
                 }
                 Container::Dense(words) => {
                     out.push(KIND_DENSE);
-                    for &word in words.iter() {
+                    for &word in &**words {
                         out.extend_from_slice(&word.to_le_bytes());
                     }
                 }
@@ -391,7 +391,7 @@ impl DeleteBitmap {
                 }
                 KIND_DENSE => {
                     let mut words = Box::new([0u64; WORDS_PER_CHUNK]);
-                    for word in words.iter_mut() {
+                    for word in &mut *words {
                         *word = cur.u64()?;
                     }
                     Container::Dense(words)

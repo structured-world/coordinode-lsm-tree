@@ -1175,11 +1175,7 @@ impl<'a, Item: Decodable<Parsed>, Parsed: ParsedItem<Item>> Decoder<'a, Item, Pa
 
         let mut last_popped = None;
 
-        loop {
-            let Some(&offset) = self.hi_scanner.stack.last() else {
-                break;
-            };
-
+        while let Some(&offset) = self.hi_scanner.stack.last() {
             let is_restart = self.hi_scanner.stack.len() == 1;
 
             let Some(mut reader) = Self::reader_at(self.entries(), offset) else {

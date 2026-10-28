@@ -188,8 +188,8 @@ fn many_tables(spans: u32) -> lsm_tree::Result<(AnyTree, tempfile::TempDir, u64)
     let folder = tempfile::tempdir()?;
     let tree = open(&folder)?;
     let mut seqno = 0;
-    if spans > 0 {
-        let width = IDLE_TABLES / spans;
+    // No spans: no tombstone tables at all.
+    if let Some(width) = IDLE_TABLES.checked_div(spans) {
         for span in 0..spans {
             tree.remove_range(
                 day_start(span * width),

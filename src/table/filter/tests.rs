@@ -76,7 +76,7 @@ fn expected_size_of_no_keys_is_zero() {
 fn build_burr_filter_bytes_empty_returns_empty() {
     let policy = BloomConstructionPolicy::BitsPerKey(10.0);
     let bytes = build_burr_filter_bytes(policy, Vec::new()).unwrap();
-    assert!(bytes.is_empty());
+    assert_eq!(bytes, Vec::<u8>::new());
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn build_burr_filter_bytes_round_trips_via_reader() {
         .map(|i| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
     let bytes = build_burr_filter_bytes(policy, hashes.clone()).unwrap();
-    assert!(!bytes.is_empty());
+    assert_ne!(bytes.len(), 0, "a filter over 1000 keys has bytes");
     let reader = BurrFilterReader::new(&bytes).expect("reader");
     for h in &hashes {
         assert!(reader.contains_hash(*h), "inserted hash {h} not found");

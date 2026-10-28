@@ -23,19 +23,19 @@ struct ChecksummedReader<R: Read> {
 }
 
 impl<R: Read> ChecksummedReader<R> {
-    pub fn new(reader: R) -> Self {
+    pub(crate) fn new(reader: R) -> Self {
         Self {
             inner: reader,
             hasher: xxhash_rust::xxh3::Xxh3Default::new(),
         }
     }
 
-    pub fn checksum(&self) -> Checksum {
+    pub(crate) fn checksum(&self) -> Checksum {
         Checksum::from_raw(self.hasher.digest128())
     }
 
     /// Optionally expose the inner reader if needed
-    pub fn into_inner(self) -> R {
+    pub(crate) fn into_inner(self) -> R {
         self.inner
     }
 }
@@ -83,13 +83,13 @@ impl<R: Read> crate::io::Read for ChecksummedReader<R> {
 /// transform layer. A compressed, encrypted, per-KV-checked data
 /// block is still `BlockType::Data` with three bits set — the layers
 /// compose, the role does not.
-pub mod block_flags {
+pub(crate) mod block_flags {
     /// The payload is followed by a per-entry checksum footer
     /// (per-KV integrity). The footer's algorithm + entry count
     /// self-describe in its tail; this bit says only that it is
     /// present and must be split off before the inner payload is
     /// decoded as a plain block of its role.
-    pub const KV_CHECKSUM_FOOTER: u8 = 1 << 0;
+    pub(crate) const KV_CHECKSUM_FOOTER: u8 = 1 << 0;
 
     /// The payload is followed by a Reed-Solomon parity trailer.
     /// Its byte length is NOT stored: the reader derives it as
@@ -97,7 +97,7 @@ pub mod block_flags {
     /// deterministic). This bit is the canonical, presence-authoritative
     /// signal that a trailer follows; a block whose payload is empty
     /// emits a zero-length trailer and leaves this bit clear.
-    pub const ECC_PARITY: u8 = 1 << 1;
+    pub(crate) const ECC_PARITY: u8 = 1 << 1;
 
     /// The payload was compressed. The codec (and any zstd dict) is
     /// not stored per block — it comes from the owning SST's
@@ -105,14 +105,14 @@ pub mod block_flags {
     /// `BlockTransform`. This bit is a presence-only self-describing
     /// signal; the read path decodes using the caller-supplied
     /// transform and does not currently validate this bit against it.
-    pub const COMPRESSED: u8 = 1 << 2;
+    pub(crate) const COMPRESSED: u8 = 1 << 2;
 
     /// The payload was encrypted. The scheme/key comes from the
     /// owning SST's encryption config (caller-supplied via the
     /// `BlockTransform`). The read path refuses the bit when the
     /// transform has no provider, so a missing key surfaces as a
     /// configuration error instead of ciphertext parsed as plaintext.
-    pub const ENCRYPTED: u8 = 1 << 3;
+    pub(crate) const ENCRYPTED: u8 = 1 << 3;
 
     /// Mask of every defined transform-layer bit. The header decoder
     /// rejects any byte with a bit set outside this mask: `block_flags`
@@ -120,7 +120,7 @@ pub mod block_flags {
     /// newer writer or a forged header is trying to declare a layer this
     /// build does not understand. Failing fast beats silently treating
     /// it as a partially-known block.
-    pub const KNOWN: u8 = KV_CHECKSUM_FOOTER | ECC_PARITY | COMPRESSED | ENCRYPTED;
+    pub(crate) const KNOWN: u8 = KV_CHECKSUM_FOOTER | ECC_PARITY | COMPRESSED | ENCRYPTED;
 }
 
 /// Where a block's stored checksum is bound.
@@ -428,11 +428,11 @@ impl Header {
 }
 
 impl Encode for Header {
-    fn encode_into<W: Write>(&self, mut writer: &mut W) -> Result<(), crate::Error> {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
         use crate::io::LE;
 
         let checksum = {
-            let mut writer = ChecksummedWriter::new(&mut writer);
+            let mut writer = ChecksummedWriter::new(&mut *writer);
 
             // Write header
             writer.write_all(&MAGIC_BYTES)?;

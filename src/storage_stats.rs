@@ -500,7 +500,7 @@ impl PrefixMax {
         let mut node = at + 1;
         while let Some(slot) = self.0.get_mut(node - 1) {
             *slot = (*slot).max(value);
-            node += node & node.wrapping_neg();
+            node += node.isolate_lowest_one();
         }
     }
 
@@ -561,7 +561,7 @@ impl PrefixCheapest {
         let mut node = at + 1;
         while let Some(slot) = self.0.get_mut(node - 1) {
             slot.add(offer);
-            node += node & node.wrapping_neg();
+            node += node.isolate_lowest_one();
         }
     }
 
@@ -939,11 +939,9 @@ impl StorageStats {
     /// there is no basis for the estimate.
     #[must_use]
     pub fn estimated_remaining_entries(&self, budget_bytes: u64) -> u64 {
-        if self.avg_entry_on_disk_bytes == 0 {
-            0
-        } else {
-            budget_bytes / self.avg_entry_on_disk_bytes
-        }
+        budget_bytes
+            .checked_div(self.avg_entry_on_disk_bytes)
+            .unwrap_or(0)
     }
 }
 
@@ -1170,11 +1168,8 @@ pub(crate) fn compute_storage_stats(
         used_bytes += blob_on_disk_bytes(blob)?;
     }
 
-    let avg_entry_on_disk_bytes = if item_count == 0 {
-        0
-    } else {
-        used_bytes / item_count
-    };
+    // An empty tree has no average entry.
+    let avg_entry_on_disk_bytes = used_bytes.checked_div(item_count).unwrap_or(0);
 
     let have_shape = all_have_shape && item_count > 0;
     let avg_key_bytes = have_shape.then(|| sum_key / item_count);

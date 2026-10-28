@@ -40,7 +40,7 @@ fn vlog_recovery_nonexistent_folder_no_ids_returns_empty() {
     )
     .unwrap();
     assert!(blob_files.is_empty());
-    assert!(orphans.is_empty());
+    assert_eq!(orphans, Vec::<std::path::PathBuf>::new());
 }
 
 #[test]

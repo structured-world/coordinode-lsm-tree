@@ -58,9 +58,9 @@ fn key_for(i: u64) -> [u8; 16] {
 /// A value distinct per key and version.
 fn value_for(i: u64, version: u64) -> [u8; VALUE_SIZE] {
     let mut out = [0u8; VALUE_SIZE];
-    for (chunk, word) in out.chunks_exact_mut(8).zip(0u64..) {
+    for (chunk, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(0u64..) {
         let mixed = (i ^ (version << 40) ^ word).wrapping_mul(0x2545_F491_4F6C_DD1D);
-        chunk.copy_from_slice(&mixed.to_le_bytes());
+        *chunk = mixed.to_le_bytes();
     }
     out
 }

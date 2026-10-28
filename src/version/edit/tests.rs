@@ -82,7 +82,7 @@ fn retention_floor_roundtrips_with_and_without_blob_frontiers() {
     let mut payload = Vec::new();
     floor_only.encode_payload(&mut payload).expect("encode");
     let decoded = VersionEdit::decode_payload(&payload).expect("decode");
-    assert!(decoded.blob_restrictions.is_empty());
+    assert_eq!(decoded.blob_restrictions, Vec::new());
     assert_eq!(decoded.retention_floor, Some(77));
 
     // Neither: the payload ends after the restrictions (the pre-floor shape).
@@ -92,7 +92,7 @@ fn retention_floor_roundtrips_with_and_without_blob_frontiers() {
     let mut payload = Vec::new();
     plain.encode_payload(&mut payload).expect("encode");
     let decoded = VersionEdit::decode_payload(&payload).expect("decode");
-    assert!(decoded.blob_restrictions.is_empty());
+    assert_eq!(decoded.blob_restrictions, Vec::new());
     assert_eq!(decoded.retention_floor, None);
 }
 
@@ -264,7 +264,7 @@ fn payload_without_the_blob_frontier_section_decodes_as_empty() {
     let mut payload = Vec::new();
     edit.encode_payload(&mut payload).expect("encode");
     let decoded = VersionEdit::decode_payload(&payload).expect("decode");
-    assert!(decoded.blob_restrictions.is_empty());
+    assert_eq!(decoded.blob_restrictions, Vec::new());
 
     // ...and an edit that carries frontiers still round-trips them.
     let mut with_frontiers = sample();

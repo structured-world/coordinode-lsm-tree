@@ -195,7 +195,7 @@ fn matching_rows_all_true_for_an_opaque_fixed_column() {
     assert_eq!(pred.matching_rows(&batch), vec![true, true]);
     assert_eq!(pred.support_in(&batch), PredicateSupport::Unsupported);
     // No statistics describe it either, so no block is skipped on it.
-    assert!(batch.zone_stats().is_empty());
+    assert_eq!(batch.zone_stats(), Vec::new());
 }
 
 #[test]

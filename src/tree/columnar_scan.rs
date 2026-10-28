@@ -105,7 +105,7 @@ use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 mod cells;
 mod merge;
-pub mod projection;
+pub(crate) mod projection;
 mod rows;
 
 use rows::{RowCursor, SourceCursor};
@@ -1651,13 +1651,13 @@ impl ColumnarScan {
         #[expect(unsafe_code, reason = "see safety")]
         let mut out = unsafe { crate::Slice::builder_unzeroed(len) };
         for (row, (dst, src)) in out
-            .chunks_exact_mut(8)
-            .zip(col.data.chunks_exact(8))
+            .as_chunks_mut::<8>()
+            .0
+            .iter_mut()
+            .zip(col.data.as_chunks::<8>().0)
             .enumerate()
         {
-            let mut local = [0u8; 8];
-            local.copy_from_slice(src);
-            let Some(effective) = u64::from_le_bytes(local).checked_add(global) else {
+            let Some(effective) = u64::from_le_bytes(*src).checked_add(global) else {
                 // The rows before this one were already rewritten.
                 #[cfg(feature = "metrics")]
                 self.metrics.record_gather(row * 8);
@@ -1667,7 +1667,7 @@ impl ColumnarScan {
                     "columnar_scan: effective seqno overflows",
                 ));
             };
-            dst.copy_from_slice(&effective.to_le_bytes());
+            *dst = effective.to_le_bytes();
         }
         col.data = crate::Slice::from(out.freeze());
         #[cfg(feature = "metrics")]

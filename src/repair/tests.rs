@@ -11410,7 +11410,7 @@ fn an_installed_snapshot_sync_failure_carries_the_report() -> crate::Result<()> 
                 return Ok(());
             }
             Err(other) => {
-                panic!("a failure after the install must carry the report, got {other:?}",)
+                panic!("a failure after the install must carry the report, got {other:?}")
             }
         }
     }
@@ -12293,7 +12293,7 @@ fn an_abandoned_repair_temp_sweep_takes_its_restriction_sidecar() -> crate::Resu
         tree.get(b"a", crate::MAX_SEQNO)?.is_some(),
         "the healthy manifest reopens",
     );
-    assert!(!memfs.exists(&tmp)?, "the abandoned replacement is swept",);
+    assert!(!memfs.exists(&tmp)?, "the abandoned replacement is swept");
     assert!(
         !memfs.exists(&sidecar)?,
         "its restriction sidecar goes with it — left behind it classifies \

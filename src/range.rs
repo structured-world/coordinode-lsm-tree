@@ -394,7 +394,7 @@ fn filter_answer(query: FilterQuery<'_>, table: &crate::table::Table) -> FilterA
                 answer = FilterAnswer::PrefixPassed;
             }
             Err(e) => {
-                log::debug!("prefix bloom check failed for table {:?}: {e}", table.id(),);
+                log::debug!("prefix bloom check failed for table {:?}: {e}", table.id());
             }
             Ok(true) => {}
         }
@@ -442,7 +442,7 @@ fn filter_answer(query: FilterQuery<'_>, table: &crate::table::Table) -> FilterA
                 return FilterAnswer::KeyPassed;
             }
             Err(e) => {
-                log::debug!("key bloom check failed for table {:?}: {e}", table.id(),);
+                log::debug!("key bloom check failed for table {:?}: {e}", table.id());
             }
             Ok(KeyFilterAnswer::MayContain) => {}
         }

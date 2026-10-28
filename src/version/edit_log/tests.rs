@@ -256,10 +256,9 @@ fn an_edit_too_large_for_one_record_writes_nothing() -> crate::Result<()> {
 fn replay_absent_log_is_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("edits-missing");
-    assert!(
-        replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency)
-            .expect("replay")
-            .is_empty()
+    assert_eq!(
+        replay_log(&StdFs, &path, ManifestRecoveryMode::AbsoluteConsistency).expect("replay"),
+        Vec::new()
     );
     assert_eq!(log_size(&StdFs, &path).expect("size"), 0);
 }

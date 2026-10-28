@@ -5781,7 +5781,7 @@ mod budget_gate {
     use std::sync::Arc;
     use test_log::test;
 
-    const DAY: Duration = Duration::from_secs(86_400);
+    const DAY: Duration = Duration::from_hours(24);
 
     /// A clock that stays at the epoch, so the budget refills nothing.
     struct Epoch;

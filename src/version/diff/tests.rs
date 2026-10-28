@@ -14,8 +14,8 @@ fn diff_of_two_empty_versions_only_bumps_the_id() {
     let edit = v2.diff(&v1).expect("diff");
     assert_eq!(edit.new_version_id, 2);
     assert!(edit.changed_levels.is_empty(), "no level changed");
-    assert!(edit.added_blob_files.is_empty());
-    assert!(edit.removed_blob_file_ids.is_empty());
+    assert_eq!(edit.added_blob_files, Vec::new());
+    assert_eq!(edit.removed_blob_file_ids, Vec::<u64>::new());
     assert!(
         edit.gc_stats.is_none(),
         "identical (empty) GC stats are not re-emitted",

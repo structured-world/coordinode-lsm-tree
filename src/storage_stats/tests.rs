@@ -385,7 +385,7 @@ fn storage_statistics_is_object_safe_via_mock() -> crate::Result<()> {
     let mock = MockStats;
     let stats: &dyn StorageStatistics = &mock;
     assert_eq!(stats.storage_stats()?.avg_entry_on_disk_bytes, 6);
-    assert!(stats.level_segment_stats()?.is_empty());
+    assert_eq!(stats.level_segment_stats()?, Vec::new());
     let strategy = crate::compaction::leveled::Strategy::default();
     assert_eq!(stats.compaction_debt(&strategy), 123);
     #[cfg(feature = "metrics")]

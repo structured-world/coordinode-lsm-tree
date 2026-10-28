@@ -466,8 +466,10 @@ fn a_dictionary_is_sorted_in_the_column_order() {
         .materialize(TypeTag::Number(i16_le), size, &page, u64::MAX)
         .expect("dictionary");
     let decoded: Vec<i16> = dictionary
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&c| i16::from_le_bytes(c))
         .collect();
     assert_eq!(decoded, [-300, -3, 7, 200]);
 }

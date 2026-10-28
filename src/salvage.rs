@@ -1573,7 +1573,12 @@ fn rewrite_row_refs(
             changed = true;
         }
         match rewrite.blob(indirection.vhandle.blob_file_id) {
-            None => {}
+            Some(BlobFileRewrite::DropBelow(frontier))
+                if indirection.vhandle.offset < *frontier =>
+            {
+                return Ok(RowRewrite::Lost);
+            }
+            None | Some(BlobFileRewrite::DropBelow(_)) => {}
             Some(BlobFileRewrite::Remap { new_id, offsets }) => {
                 let Some(&relocation) = offsets.get(&indirection.vhandle.offset) else {
                     return Ok(RowRewrite::Lost);
@@ -1582,11 +1587,6 @@ fn rewrite_row_refs(
                 indirection.vhandle.offset = relocation.offset;
                 indirection.vhandle.on_disk_size = relocation.on_disk_size;
                 changed = true;
-            }
-            Some(BlobFileRewrite::DropBelow(frontier)) => {
-                if indirection.vhandle.offset < *frontier {
-                    return Ok(RowRewrite::Lost);
-                }
             }
         }
     }

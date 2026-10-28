@@ -454,11 +454,11 @@ impl PreparedBlock<'_> {
     /// run in on-disk order.
     pub(crate) fn write_to<W: crate::io::Write>(
         mut self,
-        mut writer: &mut W,
+        writer: &mut W,
         at: ChecksumAt,
     ) -> crate::Result<Header> {
         self.header.bind_checksum(self.payload_checksum, at);
-        self.header.encode_into(&mut writer)?;
+        self.header.encode_into(&mut *writer)?;
         writer.write_all(&self.payload)?;
         if let Some(parity) = &self.parity {
             writer.write_all(parity)?;
@@ -713,7 +713,7 @@ impl Block {
         }
 
         if ecc_length == 0 {
-            log::error!("Checksum mismatch for block payload, got={computed}, expected={expected}",);
+            log::error!("Checksum mismatch for block payload, got={computed}, expected={expected}");
             computed.check(expected)?;
             return Ok(None); // unreachable: check() errored above
         }

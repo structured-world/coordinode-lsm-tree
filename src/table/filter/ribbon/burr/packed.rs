@@ -88,8 +88,10 @@ pub(crate) fn transpose(rows: &[u64], r: u8) -> Vec<u64> {
     let mut bytes = alloc::vec![0u8; z_byte_len(rows.len(), r).unwrap_or(0)];
     transpose_into(rows, r, &mut bytes);
     bytes
-        .chunks_exact(8)
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap_or_default()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&word| u64::from_le_bytes(word))
         .collect()
 }
 

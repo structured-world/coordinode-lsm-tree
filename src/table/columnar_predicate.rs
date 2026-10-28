@@ -633,7 +633,7 @@ unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
     use core::arch::x86_64::{
         _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
     };
-    let mut chunks = data.chunks_exact(32);
+    let (chunks, tail) = data.as_chunks::<32>();
     let mut out = Vec::with_capacity(data.len());
     // SAFETY: the AVX2 intrinsics are enabled by `#[target_feature]`, which the
     // caller has verified present; the load is unaligned (`loadu`) over a full
@@ -642,7 +642,7 @@ unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
         // Reinterpret the byte as i8 and the movemask as u32 (bit-preserving,
         // since the comparison and the lane mask are width-exact).
         let needle = _mm256_set1_epi8(i8::from_ne_bytes([value]));
-        for chunk in &mut chunks {
+        for chunk in chunks {
             let v = _mm256_loadu_si256(chunk.as_ptr().cast());
             let cmp = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, needle));
             let mask = u32::from_ne_bytes(cmp.to_ne_bytes());
@@ -651,7 +651,7 @@ unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
             }
         }
     }
-    out.extend(byte_eq_scalar(chunks.remainder(), value));
+    out.extend(byte_eq_scalar(tail, value));
     out
 }
 
@@ -660,14 +660,14 @@ unsafe fn byte_eq_avx2(data: &[u8], value: u8) -> Vec<bool> {
 #[target_feature(enable = "neon")]
 unsafe fn byte_eq_neon(data: &[u8], value: u8) -> Vec<bool> {
     use core::arch::aarch64::{vceqq_u8, vdupq_n_u8, vld1q_u8, vst1q_u8};
-    let mut chunks = data.chunks_exact(16);
+    let (chunks, tail) = data.as_chunks::<16>();
     let mut out = Vec::with_capacity(data.len());
     // SAFETY: the NEON intrinsics are enabled by `#[target_feature]` (a baseline
     // aarch64 feature); the load and store cover a full 16-byte chunk / a local
     // 16-byte array, so both stay in bounds.
     unsafe {
         let needle = vdupq_n_u8(value);
-        for chunk in &mut chunks {
+        for chunk in chunks {
             let eq = vceqq_u8(vld1q_u8(chunk.as_ptr()), needle); // 0xFF where equal
             let mut lanes = [0u8; 16];
             vst1q_u8(lanes.as_mut_ptr(), eq);
@@ -676,7 +676,7 @@ unsafe fn byte_eq_neon(data: &[u8], value: u8) -> Vec<bool> {
             }
         }
     }
-    out.extend(byte_eq_scalar(chunks.remainder(), value));
+    out.extend(byte_eq_scalar(tail, value));
     out
 }
 
