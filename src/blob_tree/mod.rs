@@ -1496,6 +1496,7 @@ impl AbstractTree for BlobTree {
                 include_blobs: true,
                 runtime_config: self.index.0.runtime_config.load_full(),
                 encryption: self.index.0.config.encryption.clone(),
+                source: &self.index.0,
             },
         )
     }

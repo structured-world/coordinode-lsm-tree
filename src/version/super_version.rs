@@ -716,17 +716,9 @@ impl SuperVersions {
     ) -> crate::Result<()> {
         let persisted = self.persisted.clone();
         if !self.unsynced.is_empty() {
-            let tables: crate::HashSet<crate::TableId> =
-                next.iter_tables().map(crate::Table::id).collect();
-            let named: Vec<UnsyncedFile> = self
-                .unsynced
-                .iter()
-                .filter(|file| file.named_by(&tables, next))
-                .cloned()
-                .collect();
             // Kept until the persist succeeds: a failure leaves them for the
             // next one to sync again.
-            Self::sync_files(&named, self.sync_mode)?;
+            Self::sync_files(&self.unsynced_named_by(next), self.sync_mode)?;
         }
         sync_new_table_directories(&persisted, next, tree_path, fs, self.sync_mode)?;
         let manifest_mode = manifest_sync_mode(&persisted, next, tree_path, fs, self.sync_mode);
@@ -821,6 +813,20 @@ impl SuperVersions {
     /// it takes the write lock to persist (see [`Self::forget_synced`]).
     pub(crate) fn unsynced_files(&self) -> Vec<UnsyncedFile> {
         self.unsynced.clone()
+    }
+
+    /// The files deferred flushes left unsynced that `version` names.
+    pub(crate) fn unsynced_named_by(&self, version: &Version) -> Vec<UnsyncedFile> {
+        if self.unsynced.is_empty() {
+            return Vec::new();
+        }
+        let tables: crate::HashSet<crate::TableId> =
+            version.iter_tables().map(crate::Table::id).collect();
+        self.unsynced
+            .iter()
+            .filter(|file| file.named_by(&tables, version))
+            .cloned()
+            .collect()
     }
 
     /// Takes `synced`, which [`Self::sync_files`] made durable, off the files

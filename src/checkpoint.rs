@@ -588,6 +588,9 @@ pub struct CheckpointParams<'a> {
     /// chain the source tree uses — a checkpoint of an encrypted
     /// tree is itself encrypted end-to-end.
     pub encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
+    /// The tree (the index tree of a blob tree) whose version is linked, read
+    /// together with the files deferred flushes left unsynced in it.
+    pub source: &'a crate::tree::inner::TreeInner,
 }
 
 /// RAII guard that removes a partially-built checkpoint directory on
@@ -764,10 +767,18 @@ pub fn run_checkpoint<T: AbstractTree>(
          and the held link window excludes the mutation window reconciliation needs",
     )?;
 
-    let version = tree.current_version();
-
     // Checkpoint fsyncs follow the source tree's configured durability.
     let sync_mode = tree.tree_config().sync_mode;
+
+    // A deferred flush another thread installed after the persist above is in
+    // this version with its files unsynced, and a link would share those
+    // fragile bytes: they are synced first. Read with the version, so a flush
+    // installed in between cannot be named and missed, and a compaction that
+    // consumes one later cannot take it off the list before the sync.
+    let (version, unsynced) = params.source.current_version_and_unsynced();
+    if !unsynced.is_empty() {
+        crate::version::SuperVersions::sync_files(&unsynced, sync_mode)?;
+    }
 
     // Reflink the snapshot files when the live config opts in (default) and
     // the destination filesystem supports it; otherwise the hard-link path is

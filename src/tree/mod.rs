@@ -665,6 +665,7 @@ impl AbstractTree for Tree {
                 include_blobs: false,
                 runtime_config: self.0.runtime_config.load_full(),
                 encryption: self.0.config.encryption.clone(),
+                source: &self.0,
             },
         )
     }
@@ -1995,6 +1996,17 @@ impl AbstractTree for Tree {
             .flatten();
 
         active.max(sealed)
+    }
+
+    fn get_highest_seqno(&self) -> Option<SeqNo> {
+        // The current version, not the one on disk: a deferred flush moves its
+        // writes out of the memtable before any persist names them.
+        let tables = self
+            .current_version()
+            .iter_tables()
+            .map(Table::get_highest_seqno)
+            .max();
+        self.get_highest_memtable_seqno().max(tables)
     }
 
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo> {
