@@ -285,7 +285,9 @@ fn a_failed_sub_compaction_leaves_none_of_the_compactions_tables() -> lsm_tree::
     }
     f.tree.flush_active_memtable(0)?;
 
-    assert_fails_cleanly(&f, [io_error(FaultOp::Write, "tables", 4)], u64::MAX, |i| {
+    // An output this small reaches its file in one write, so the third write
+    // fails one sub-compaction after two outputs are already on disk.
+    assert_fails_cleanly(&f, [io_error(FaultOp::Write, "tables", 2)], u64::MAX, |i| {
         value(i, 1)
     })
 }
