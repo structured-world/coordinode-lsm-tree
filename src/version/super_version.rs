@@ -655,10 +655,10 @@ impl SuperVersions {
         // and be dropped with it, above the floor a clear raises. The `Arc`
         // clone lets the guard outlive the `&mut self` persist below.
         #[cfg(feature = "std")]
-        let gate = Arc::clone(&self.insert_gate);
+        let gate = (!Arc::ptr_eq(&prior.active_memtable, &next_version.active_memtable))
+            .then(|| Arc::clone(&self.insert_gate));
         #[cfg(feature = "std")]
-        let closed = (!Arc::ptr_eq(&prior.active_memtable, &next_version.active_memtable))
-            .then(|| gate.close());
+        let closed = gate.as_deref().map(super::insert_gate::InsertGate::close);
         // Install seqnos are non-decreasing. The counter is caller-owned, and a
         // deployment that reopens with it reset would otherwise install below
         // the current version: a drop or a filtering compaction there raises
