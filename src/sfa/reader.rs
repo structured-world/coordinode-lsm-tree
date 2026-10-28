@@ -9,7 +9,7 @@ use crate::sfa::{
     trailer::reader::TrailerReader,
 };
 #[cfg(feature = "std")]
-use std::io::{BufReader, Read, Seek};
+use std::io::{Read, Seek};
 
 /// Archive reader
 pub struct Reader {
@@ -27,19 +27,10 @@ impl Reader {
     // [`Reader::from_reader`] with a caller-provided Fs-backed reader.
     #[cfg(feature = "std")]
     pub fn new(path: impl AsRef<std::path::Path>) -> crate::sfa::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mut file = BufReader::with_capacity(4_096, file);
-        let trailer = TrailerReader::from_reader(&mut file)?;
-        let toc = TocReader::from_reader(
-            &mut file,
-            trailer.toc_pos,
-            trailer.toc_len,
-            trailer.toc_checksum,
-        )?;
-        Ok(Self {
-            toc,
-            toc_pos: trailer.toc_pos,
-        })
+        // Unbuffered: the trailer and the TOC are one read each, and a
+        // buffer would only copy them once more.
+        let mut file = std::fs::File::open(path)?;
+        Self::from_reader(&mut file)
     }
 
     /// Creates a new [`Reader`] from a reader.
@@ -49,12 +40,7 @@ impl Reader {
     /// Returns error, if an IO error occurred.
     pub fn from_reader<R: Read + Seek>(reader: &mut R) -> crate::sfa::Result<Self> {
         let trailer = TrailerReader::from_reader(reader)?;
-        let toc = TocReader::from_reader(
-            reader,
-            trailer.toc_pos,
-            trailer.toc_len,
-            trailer.toc_checksum,
-        )?;
+        let toc = TocReader::from_reader(reader, &trailer)?;
         Ok(Self {
             toc,
             toc_pos: trailer.toc_pos,

@@ -31,11 +31,13 @@ pub struct ParsedTrailer {
     pub toc_checksum: Checksum,
     pub toc_pos: u64,
     /// On-disk byte length of the TOC region, copied from the
-    /// trailer. The `TocReader` uses this to bound its own reads
-    /// via `Read::take(toc_len)` so a forged TOC `len` prefix
-    /// can't force unbounded work / memory before the checksum
-    /// catches it.
+    /// trailer. The `TocReader` reads exactly this many bytes, so a
+    /// forged TOC `len` prefix can't force unbounded work / memory
+    /// before the checksum catches it.
     pub toc_len: u64,
+    /// Where the trailer starts: the end of everything before it, the TOC
+    /// included.
+    pub trailer_pos: u64,
 }
 
 pub struct TrailerReader;
@@ -46,7 +48,12 @@ impl TrailerReader {
 
         log::trace!("Reading trailer");
 
-        reader.seek(SeekFrom::End(-TRAILER_SIZE))?;
+        let trailer_pos = reader.seek(SeekFrom::End(-TRAILER_SIZE))?;
+        // One read for the whole trailer, parsed from memory: a read per
+        // field is a system call per field on an unbuffered file.
+        let mut trailer = [0u8; super::TRAILER_LEN];
+        reader.read_exact(&mut trailer)?;
+        let reader = &mut &trailer[..];
 
         {
             let mut buf = [0u8; TRAILER_MAGIC.len()];
@@ -82,6 +89,7 @@ impl TrailerReader {
             toc_checksum,
             toc_pos,
             toc_len,
+            trailer_pos,
         })
     }
 }

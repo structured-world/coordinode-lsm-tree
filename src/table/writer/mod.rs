@@ -5488,16 +5488,17 @@ fn write_back_tail(
 ) -> crate::Result<()> {
     if *writeback_bytes > 0 {
         #[cfg(not(feature = "std"))]
-        use crate::io::Seek;
+        use crate::io::Write;
         #[cfg(feature = "std")]
-        use std::io::Seek;
-        let buffered = file_writer.get_mut().inner_mut();
-        // Flushes the buffer, as the section start every call precedes does
-        // anyway.
-        let position = buffered.stream_position()?;
+        use std::io::Write;
+        let checksummed = file_writer.get_mut();
+        let position = checksummed.position();
         // `written_back` is a position the file already reached.
         let pending = position - *written_back;
         if pending >= *writeback_bytes {
+            // The range is in the buffer until it is flushed to the file.
+            let buffered = checksummed.inner_mut();
+            buffered.flush()?;
             crate::fs::hint_writeback(
                 &**buffered.get_ref(),
                 *written_back,

@@ -2,8 +2,105 @@ use super::*;
 use crate::sfa::toc::reader::TocReader;
 use crate::sfa::trailer::reader::TrailerReader;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use test_log::test;
+
+/// An in-memory file that counts the calls a reader or writer makes on it:
+/// each is a system call on a real, unbuffered file.
+#[derive(Default)]
+struct Counting {
+    file: Cursor<Vec<u8>>,
+    reads: usize,
+    seeks: usize,
+}
+
+impl Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        self.file.read(buf)
+    }
+}
+
+impl Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for Counting {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.seeks += 1;
+        self.file.seek(pos)
+    }
+}
+
+/// An archive of `sections` sections, written as a table writes one: through
+/// a checksumming writer.
+fn archive(sections: usize) -> crate::sfa::Result<Counting> {
+    let mut writer =
+        Writer::from_writer(crate::checksum::ChecksummedWriter::new(Counting::default()));
+    for i in 0..sections {
+        writer.start(format!("section{i}").as_str())?;
+        writer.write_all(b"payload")?;
+    }
+    let mut file = std::mem::take(writer.into_inner()?.inner_mut());
+    file.reads = 0;
+    file.seeks = 0;
+    Ok(file)
+}
+
+/// Writing an archive asks the file for no position: the writer counts the
+/// bytes it wrote. Guards against a seek per section, which on a buffered
+/// file is also a flush.
+#[test]
+fn writing_an_archive_seeks_nothing() -> crate::sfa::Result<()> {
+    let mut writer =
+        Writer::from_writer(crate::checksum::ChecksummedWriter::new(Counting::default()));
+    for i in 0..50 {
+        writer.start(format!("section{i}").as_str())?;
+        writer.write_all(b"payload")?;
+    }
+    let file = std::mem::take(writer.into_inner()?.inner_mut());
+    assert_eq!(file.seeks, 0);
+    Ok(())
+}
+
+/// Opening an archive reads its trailer and its table of contents in one read
+/// each, however many sections it holds. Guards against a read per field,
+/// which costs a system call per section on every table open.
+#[test]
+fn opening_an_archive_reads_its_trailer_and_toc_once_each() -> crate::sfa::Result<()> {
+    for sections in [5, 50] {
+        let mut file = archive(sections)?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        assert_eq!(reader.toc().len(), sections);
+        assert_eq!(file.reads, 2, "{sections} sections");
+        assert_eq!(file.seeks, 2, "{sections} sections");
+    }
+    Ok(())
+}
+
+/// A trailer whose table of contents runs past the end of the file is
+/// refused before a buffer that long is allocated. Guards against a forged
+/// length forcing an allocation of up to 16 EiB.
+#[test]
+fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
+    let mut file = archive(3)?;
+    let bytes = file.file.get_mut();
+    // The trailer ends in the TOC's length.
+    let at = bytes.len() - 8;
+    let forged = u64::MAX.to_le_bytes();
+    bytes
+        .get_mut(at..at + 8)
+        .expect("the trailer ends in the TOC length")
+        .copy_from_slice(&forged);
+    assert!(crate::sfa::Reader::from_reader(&mut file).is_err());
+    Ok(())
+}
 
 /// The length a table budgets for an archive's table of contents and trailer
 /// is exactly what the writer appends after the sections.
@@ -48,12 +145,7 @@ fn writer_empty() -> crate::sfa::Result<()> {
     let trailer = TrailerReader::from_reader(&mut reader)?;
     assert_eq!(0, trailer.toc_pos);
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(0, toc.len());
     assert!(toc.is_empty());
     assert!(toc.section(b"hello").is_none());
@@ -79,12 +171,7 @@ fn writer_simple() -> crate::sfa::Result<()> {
     let trailer = TrailerReader::from_reader(&mut reader)?;
     assert_eq!(data.len() as u64, trailer.toc_pos);
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(1, toc.len());
     assert!(toc.section(b"hello").is_none());
     assert!(toc.section(b"").is_some());
@@ -123,12 +210,7 @@ fn writer_multiple_sections() -> crate::sfa::Result<()> {
         trailer.toc_pos,
     );
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(3, toc.len());
     assert!(toc.section(b"hello").is_none());
     assert!(toc.section(b"").is_some());
