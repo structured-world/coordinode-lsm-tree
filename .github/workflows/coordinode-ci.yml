@@ -405,7 +405,7 @@ jobs:
         # register pairs, O_LARGEFILE). The cross job's container has no
         # io_uring, so these tests run here natively, as a 32-bit binary on
         # the 64-bit kernel.
-        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        if: matrix.os == 'ubuntu-latest'
         env:
           CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER: gcc
         run: |
