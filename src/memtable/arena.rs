@@ -24,6 +24,7 @@
 //! creation. This removes the per-flush zeroing cost (a fresh memtable no
 //! longer eagerly zeroes its arena block).
 
+use super::own_line::OwnLine;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
@@ -69,7 +70,9 @@ pub(crate) struct Arena {
 
     /// Allocation cursor.  High 10 bits = block index, low 22 bits = offset
     /// within that block.  Starts at 1 (offset 0 is the UNSET sentinel).
-    cursor: AtomicU32,
+    /// Every insert moves it; every search step reads `blocks`, so the two
+    /// keep apart.
+    cursor: OwnLine<AtomicU32>,
 }
 
 // Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32)
@@ -87,7 +90,7 @@ impl Arena {
         Self {
             blocks: blocks.into_boxed_slice(),
             // Offset 0 is reserved as the UNSET sentinel.
-            cursor: AtomicU32::new(1),
+            cursor: OwnLine(AtomicU32::new(1)),
         }
     }
 

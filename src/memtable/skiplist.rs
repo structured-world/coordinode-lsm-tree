@@ -15,6 +15,7 @@
 //! `InternalKey` ordering (`user_key` ASC, seqno DESC).
 
 use super::arena::Arena;
+use super::own_line::OwnLine;
 use super::value_store::ValueStore;
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
@@ -152,8 +153,9 @@ pub(crate) struct SkipMap {
     /// re-validates it and the level-0 CAS is what makes the link correct,
     /// so a stale hint costs one comparison and falls back to the full
     /// splice search. Nodes are never freed while the map lives, so the
-    /// offset stays dereferenceable.
-    tail_hint: AtomicU32,
+    /// offset stays dereferenceable. Each append moves it, so it keeps off
+    /// the fields every search reads.
+    tail_hint: OwnLine<AtomicU32>,
     /// Links an insert retried because another writer changed its predecessor
     /// between the splice search and the link: the contention concurrent
     /// writers meet. Counted on the failed path only.
@@ -230,7 +232,7 @@ impl SkipMap {
             head,
             height: AtomicUsize::new(1),
             height_seed: seed,
-            tail_hint: AtomicU32::new(UNSET),
+            tail_hint: OwnLine(AtomicU32::new(UNSET)),
             #[cfg(feature = "metrics")]
             cas_retries: AtomicUsize::new(0),
             #[cfg(test)]

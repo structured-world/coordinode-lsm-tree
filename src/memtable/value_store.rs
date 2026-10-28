@@ -12,6 +12,7 @@
 //! This replaces `Mutex<Vec<UserValue>>` which serialised all value accesses
 //! and caused 15-27% throughput regression under concurrent reads.
 
+use super::own_line::OwnLine;
 use crate::value::UserValue;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
@@ -48,8 +49,9 @@ pub(crate) struct ValueStore {
     /// Segment pointers.  Null = not yet allocated.  Once set, never modified.
     segments: Box<[AtomicPtr<UserValue>]>,
 
-    /// Next index to allocate (monotonically increasing).
-    next_idx: AtomicU32,
+    /// Next index to allocate (monotonically increasing). Every insert moves
+    /// it, so it keeps off the segment table every read goes through.
+    next_idx: OwnLine<AtomicU32>,
 }
 
 // Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32)
@@ -69,7 +71,7 @@ impl ValueStore {
 
         Self {
             segments: segments.into_boxed_slice(),
-            next_idx: AtomicU32::new(0),
+            next_idx: OwnLine(AtomicU32::new(0)),
         }
     }
 

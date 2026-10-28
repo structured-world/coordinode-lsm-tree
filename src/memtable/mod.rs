@@ -4,6 +4,8 @@
 
 pub(crate) mod arena;
 pub(crate) mod interval_tree;
+mod own_line;
+use own_line::OwnLine;
 pub(crate) mod skiplist;
 pub(crate) mod value_store;
 
@@ -129,12 +131,15 @@ pub struct Memtable {
     /// of other memory from it (entry visibility comes from the skiplist's
     /// release/acquire tower stores; `highest_seqno` keeps `AcqRel` so a
     /// reader that observes a seqno also observes its entry).
-    pub(crate) approximate_size: AtomicU64,
+    ///
+    /// Each counter every insert writes sits on a line of its own, apart from
+    /// the fields reads and inserts only load.
+    pub(crate) approximate_size: OwnLine<AtomicU64>,
 
     /// Highest encountered sequence number.
     ///
     /// This is used so that `get_highest_seqno` has O(1) complexity.
-    pub(crate) highest_seqno: AtomicU64,
+    pub(crate) highest_seqno: OwnLine<AtomicU64>,
 
     pub(crate) requested_rotation: AtomicBool,
 
@@ -188,8 +193,8 @@ impl Memtable {
             range_tombstones: RwLock::new(interval_tree::IntervalTree::new_with_comparator(
                 comparator.clone(),
             )),
-            approximate_size: AtomicU64::default(),
-            highest_seqno: AtomicU64::default(),
+            approximate_size: OwnLine(AtomicU64::default()),
+            highest_seqno: OwnLine(AtomicU64::default()),
             requested_rotation: AtomicBool::default(),
             has_at_insert_digests: AtomicBool::default(),
             blob_refs: RwLock::new(crate::HashSet::default()),
