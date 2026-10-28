@@ -553,7 +553,7 @@ fn compaction_stream_filter_1() {
     ]);
 }
 
-pub mod custom_mvcc {
+pub(crate) mod custom_mvcc {
     use super::*;
     use crate::io::{BE, ReadBytesExt, WriteBytesExt};
     use test_log::test;

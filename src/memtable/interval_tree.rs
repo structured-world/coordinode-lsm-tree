@@ -16,7 +16,7 @@ use core::cmp::Ordering;
 
 /// An AVL-balanced BST keyed by range tombstone `start`, augmented with
 /// subtree-level metadata for efficient interval queries.
-pub struct IntervalTree {
+pub(crate) struct IntervalTree {
     comparator: SharedComparator,
     root: Option<Box<Node>>,
     len: usize,
@@ -338,13 +338,13 @@ fn collect_covering(
 impl IntervalTree {
     /// Creates a new empty interval tree.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::new_with_comparator(crate::comparator::default_comparator())
     }
 
     /// Creates a new empty interval tree with the given comparator.
     #[must_use]
-    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
+    pub(crate) fn new_with_comparator(comparator: SharedComparator) -> Self {
         Self {
             comparator,
             root: None,
@@ -353,7 +353,7 @@ impl IntervalTree {
     }
 
     /// Inserts a range tombstone into the tree. O(log n).
-    pub fn insert(&mut self, tombstone: RangeTombstone) {
+    pub(crate) fn insert(&mut self, tombstone: RangeTombstone) {
         let (root, was_new) = insert_node(self.root.take(), tombstone, self.comparator.as_ref());
         self.root = Some(root);
         if was_new {
@@ -366,7 +366,12 @@ impl IntervalTree {
     ///
     /// O(log n + k) where k is the number of overlapping tombstones.
     /// Uses early-exit traversal to avoid allocating a Vec.
-    pub fn query_suppression(&self, key: &[u8], key_seqno: SeqNo, read_seqno: SeqNo) -> bool {
+    pub(crate) fn query_suppression(
+        &self,
+        key: &[u8],
+        key_seqno: SeqNo,
+        read_seqno: SeqNo,
+    ) -> bool {
         any_overlapping_suppresses(
             self.root.as_deref(),
             key,
@@ -378,7 +383,7 @@ impl IntervalTree {
 
     /// Hands `visit` the tombstones holding `key`. O(log n + k) where k is
     /// the number of overlapping tombstones.
-    pub fn for_each_containing(&self, key: &[u8], mut visit: impl FnMut(&RangeTombstone)) {
+    pub(crate) fn for_each_containing(&self, key: &[u8], mut visit: impl FnMut(&RangeTombstone)) {
         visit_containing(
             self.root.as_deref(),
             key,
@@ -392,7 +397,7 @@ impl IntervalTree {
     ///
     /// Used for table-skip decisions.
     #[cfg_attr(not(test), expect(dead_code, reason = "used for table-skip decisions"))]
-    pub fn query_covering_rt_for_range(
+    pub(crate) fn query_covering_rt_for_range(
         &self,
         min: &[u8],
         max: &[u8],
@@ -413,7 +418,7 @@ impl IntervalTree {
     /// Returns all tombstones in sorted order (by `RangeTombstone::Ord`).
     ///
     /// Used for flush.
-    pub fn iter_sorted(&self) -> Vec<RangeTombstone> {
+    pub(crate) fn iter_sorted(&self) -> Vec<RangeTombstone> {
         let mut result = Vec::with_capacity(self.len);
         inorder(self.root.as_deref(), &mut result);
         result
@@ -421,7 +426,7 @@ impl IntervalTree {
 
     /// Returns the number of tombstones in the tree.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
@@ -431,7 +436,7 @@ impl IntervalTree {
         reason = "tree may have tombstones but is_empty not called in all paths"
     )]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 }

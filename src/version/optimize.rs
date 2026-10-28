@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 /// Fuses L0 runs, given newest first, into as few runs as the overlaps allow,
 /// keeping them newest first: a table never ends up behind a run holding
 /// older data it overlaps, so the run order stays recency order.
-pub fn optimize_runs<T: Clone + Ranged>(
+pub(crate) fn optimize_runs<T: Clone + Ranged>(
     runs: Vec<Run<T>>,
     cmp: &dyn UserComparator,
 ) -> Vec<Run<T>> {
@@ -57,7 +57,7 @@ pub fn optimize_runs<T: Clone + Ranged>(
 
 /// What orders L0 tables by recency: a table whose age compares greater
 /// holds newer data.
-pub trait Aged {
+pub(crate) trait Aged {
     /// The table's age; greater is newer.
     type Age: Ord;
 
@@ -91,7 +91,7 @@ impl Aged for crate::table::Table {
 /// it does not overlap), so a flush that joined a compaction input's run, an
 /// output placed among runs it did not come from, or an order a manifest
 /// persisted wrongly all come out in recency order again.
-pub fn order_by_age<T: Clone + Ranged + Aged>(
+pub(crate) fn order_by_age<T: Clone + Ranged + Aged>(
     tables: impl IntoIterator<Item = T>,
     cmp: &dyn UserComparator,
 ) -> Vec<Run<T>> {
@@ -114,7 +114,10 @@ pub fn order_by_age<T: Clone + Ranged + Aged>(
 /// is checked against the newer ones it overlaps through a range maximum of
 /// their run positions over the key space, so an open does not compare every
 /// pair of a wide L0.
-pub fn in_recency_order<T: Ranged + Aged>(runs: &[&Run<T>], cmp: &dyn UserComparator) -> bool {
+pub(crate) fn in_recency_order<T: Ranged + Aged>(
+    runs: &[&Run<T>],
+    cmp: &dyn UserComparator,
+) -> bool {
     let mut placed: Vec<(usize, &T)> = runs
         .iter()
         .enumerate()

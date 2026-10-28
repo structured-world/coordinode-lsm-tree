@@ -28,7 +28,7 @@ use core::ops::Deref;
 /// `V6`, changes to its index entries, directory or pages are made in place
 /// under the same number; the number moves with the first change after `V6`
 /// is released.
-pub const COLUMNAR_FORMAT_VERSION: u8 = 2;
+pub(crate) const COLUMNAR_FORMAT_VERSION: u8 = 2;
 
 /// How a columnar table stores each row's value, from the optional
 /// `descriptor#value_layout` property.

@@ -105,7 +105,7 @@ use crate::{Error, SeqNo, Table, Tree, UserKey};
 
 mod cells;
 mod merge;
-pub mod projection;
+pub(crate) mod projection;
 mod rows;
 
 use rows::{RowCursor, SourceCursor};

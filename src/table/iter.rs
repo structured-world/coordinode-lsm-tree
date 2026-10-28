@@ -66,7 +66,7 @@ std::thread_local! {
 
 /// Engages the partial-decode tier for reads on the calling thread.
 #[cfg(all(test, feature = "zstd"))]
-pub fn force_partial_decode_on_this_thread() {
+pub(crate) fn force_partial_decode_on_this_thread() {
     FORCE_PARTIAL_DECODE.with(|f| f.set(true));
 }
 
@@ -128,14 +128,14 @@ impl OwnedDataBlockIter {
         self.with_dependent_mut(|_, m| m.seek_upper_exclusive(needle, seqno))
     }
 
-    pub fn seek_lower_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
+    pub(crate) fn seek_lower_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
         match bound {
             Bound::Included(key) => self.seek_lower_inclusive(key, seqno),
             Bound::Excluded(key) => self.seek_lower_exclusive(key, seqno),
         }
     }
 
-    pub fn seek_upper_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
+    pub(crate) fn seek_upper_bound(&mut self, bound: &Bound, seqno: SeqNo) -> bool {
         match bound {
             Bound::Included(key) => self.seek_upper_inclusive(key, seqno),
             Bound::Excluded(key) => self.seek_upper_exclusive(key, seqno),

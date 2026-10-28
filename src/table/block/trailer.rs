@@ -9,7 +9,7 @@ use super::{
 use crate::io::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crate::table::block::hash_index::MAX_POINTERS_FOR_HASH_INDEX;
 
-pub const TRAILER_START_MARKER: u8 = 255;
+pub(crate) const TRAILER_START_MARKER: u8 = 255;
 
 const TRAILER_SIZE: usize = 5 * core::mem::size_of::<u32>()
     + (2 * core::mem::size_of::<u8>())
@@ -24,7 +24,7 @@ const TRAILER_SIZE: usize = 5 * core::mem::size_of::<u32>()
 
 /// Bytes a block ends with past its entries and its binary and hash indexes:
 /// the start marker and the fixed trailer.
-pub const TRAILER_LEN: usize = 1 + TRAILER_SIZE;
+pub(crate) const TRAILER_LEN: usize = 1 + TRAILER_SIZE;
 
 /// Block trailer
 ///
@@ -32,7 +32,7 @@ pub const TRAILER_LEN: usize = 1 + TRAILER_SIZE;
 ///
 /// \[restart_interval\] \[binary_index_offset\] \[binary_index_len\] \[hash_index_offset\] \[hash_index_len\] \[item_count\]
 #[expect(clippy::doc_markdown)]
-pub struct Trailer<'a> {
+pub(crate) struct Trailer<'a> {
     block: &'a Block,
 }
 
@@ -45,7 +45,7 @@ impl<'a> Trailer<'a> {
         clippy::expect_used,
         reason = "infallible wrapper, callers guarantee valid blocks"
     )]
-    pub fn new(block: &'a Block) -> Self {
+    pub(crate) fn new(block: &'a Block) -> Self {
         Self::try_new(block).expect("block too small for trailer")
     }
 
@@ -55,7 +55,7 @@ impl<'a> Trailer<'a> {
     /// # Errors
     ///
     /// Returns [`crate::Error::InvalidTrailer`] if the block is too small.
-    pub fn try_new(block: &'a Block) -> crate::Result<Self> {
+    pub(crate) fn try_new(block: &'a Block) -> crate::Result<Self> {
         if block.data.len() < TRAILER_SIZE {
             return Err(crate::Error::InvalidTrailer);
         }
@@ -63,13 +63,13 @@ impl<'a> Trailer<'a> {
     }
 
     /// Returns the trailer position.
-    pub fn trailer_offset(&self) -> usize {
+    pub(crate) fn trailer_offset(&self) -> usize {
         self.block.data.len() - TRAILER_SIZE
     }
 
     /// Returns the number of items in the block
     #[must_use]
-    pub fn item_count(&self) -> usize {
+    pub(crate) fn item_count(&self) -> usize {
         let reader = self.as_slice();
 
         #[expect(
@@ -89,7 +89,7 @@ impl<'a> Trailer<'a> {
         }
     }
 
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         let start = self.trailer_offset();
 
         // SAFETY: We know that a block always has a trailer, so the
@@ -100,7 +100,9 @@ impl<'a> Trailer<'a> {
         }
     }
 
-    pub fn write<S: Default, T: Encodable<S>>(encoder: Encoder<'_, S, T>) -> crate::Result<()> {
+    pub(crate) fn write<S: Default, T: Encodable<S>>(
+        encoder: Encoder<'_, S, T>,
+    ) -> crate::Result<()> {
         // IMPORTANT: Terminator marker
         encoder.writer.write_u8(TRAILER_START_MARKER)?;
 
