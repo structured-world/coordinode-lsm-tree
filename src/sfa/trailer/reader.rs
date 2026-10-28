@@ -21,12 +21,6 @@ use std::io::{Read, Seek, SeekFrom};
 const TRAILER_SIZE: i64 = super::TRAILER_LEN as i64;
 
 #[derive(Debug, Eq, PartialEq)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "all three fields describe TOC metadata recorded in the trailer; \
-              the `toc_` prefix is part of the upstream sfa format wording \
-              and keeps the diff vs vendored upstream mechanical"
-)]
 pub struct ParsedTrailer {
     pub toc_checksum: Checksum,
     pub toc_pos: u64,

@@ -93,11 +93,8 @@ fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
     let bytes = file.file.get_mut();
     // The trailer ends in the TOC's length.
     let at = bytes.len() - 8;
-    let forged = u64::MAX.to_le_bytes();
-    bytes
-        .get_mut(at..at + 8)
-        .expect("the trailer ends in the TOC length")
-        .copy_from_slice(&forged);
+    let (_, toc_len) = bytes.split_at_mut(at);
+    toc_len.copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(crate::sfa::Reader::from_reader(&mut file).is_err());
     Ok(())
 }
