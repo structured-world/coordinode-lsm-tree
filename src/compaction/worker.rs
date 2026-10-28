@@ -4837,6 +4837,28 @@ fn merge_tables(
         filter.finish();
     }
 
+    log::trace!("Blob fragmentation diff: {blob_frag_map:#?}");
+
+    // `produce` finalizes this compaction's own output files (the last table's
+    // index, filter and trailer, its sync, the reopen of every output) and
+    // touches no version, so it runs before the locks: under the version write
+    // lock it held every read and every write of the tree for a table's worth
+    // of I/O. Only the install below needs the lock. A failure shows the
+    // inputs again; the files finished so far are named by no version, so the
+    // run removes them with everything else it never installed.
+    let mut produce_output = hidden_guard(payload, opts, || {
+        let extra_blob_files = filter_blob_writer
+            .map(BlobFileWriter::finish)
+            .transpose()
+            .inspect_err(|e| {
+                log::error!("Compaction failed while finishing filter blob writer: {e:?}");
+            })?
+            .unwrap_or_default();
+        compactor
+            .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
+            .inspect_err(|e| log::error!("Compaction failed: {e:?}"))
+    })?;
+
     #[cfg(test)]
     opts.config.fire_before_output_install();
 
@@ -4846,38 +4868,6 @@ fn merge_tables(
     let mut version_history_lock = opts.version_history.write();
     log::trace!("Acquired super version write lock");
 
-    log::trace!("Blob fragmentation diff: {blob_frag_map:#?}");
-
-    let extra_blob_files = filter_blob_writer
-        .map(BlobFileWriter::finish)
-        .transpose()
-        .inspect_err(|e| {
-            // NOTE: We cannot use hidden_guard here because we already locked the compaction state
-
-            log::error!("Compaction failed while finishing filter blob writer: {e:?}");
-
-            compaction_state
-                .hidden_set_mut()
-                .show(payload.table_ids.iter().copied());
-        })?
-        .unwrap_or_default();
-
-    // Phase split: `produce` finalizes this compaction's output files (no
-    // version touch); `install_merge` commits one atomic version edit. With a
-    // single output the result is identical to the old combined `finish`; the
-    // split is what lets parallel sub-compactions each produce independently
-    // and then share one install.
-    let mut produce_output = compactor
-        .produce(opts, dst_lvl, blob_frag_map, extra_blob_files)
-        .inspect_err(|e| {
-            // NOTE: We cannot use hidden_guard here because we already locked the compaction state
-
-            log::error!("Compaction failed: {e:?}");
-
-            compaction_state
-                .hidden_set_mut()
-                .show(payload.table_ids.iter().copied());
-        })?;
     produce_output.set_released_objects(released_objects);
     produce_output.set_carried(carried);
     if filter_marker.load(core::sync::atomic::Ordering::Relaxed) > 0 {
