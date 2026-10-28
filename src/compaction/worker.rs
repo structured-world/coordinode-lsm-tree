@@ -40,7 +40,7 @@ use spin::{Mutex, RwLock};
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
 
-pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalValue>> + 'a>;
+pub(crate) type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalValue>> + 'a>;
 
 /// Minimum total input size for a compaction to be split into parallel
 /// sub-compactions. Below this the per-thread setup + the extra output tables
@@ -48,11 +48,11 @@ pub type CompactionReader<'a> = Box<dyn Iterator<Item = crate::Result<InternalVa
 /// stays single-threaded (which also keeps small/test compactions producing a
 /// single merged table). Default for [`Config::subcompaction_min_bytes`].
 #[cfg(feature = "std")]
-pub const SUBCOMPACTION_MIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const SUBCOMPACTION_MIN_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Compaction options
 #[derive(Clone)]
-pub struct Options {
+pub(crate) struct Options {
     pub tree_id: TreeId,
 
     pub global_seqno: SharedSequenceNumberGenerator,
@@ -147,7 +147,7 @@ pub struct Options {
 }
 
 impl Options {
-    pub fn from_tree(tree: &crate::Tree, strategy: Arc<dyn CompactionStrategy>) -> Self {
+    pub(crate) fn from_tree(tree: &crate::Tree, strategy: Arc<dyn CompactionStrategy>) -> Self {
         Self {
             global_seqno: tree.config.seqno.clone(),
             visible_seqno: tree.config.visible_seqno.clone(),
@@ -184,7 +184,7 @@ impl Options {
 /// Runs compaction task.
 ///
 /// This will block until the compactor is fully finished.
-pub fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
+pub(crate) fn do_compaction(opts: &Options) -> crate::Result<CompactionResult> {
     // Ledgers of this run's own: the caller may share its options with runs
     // that overlap this one, and their outputs and work are theirs.
     let opts = &Options {
@@ -693,7 +693,7 @@ fn with_merge_demands<T>(
 /// `pool` have still to write, taking the flush floor if it must. The storage
 /// statistics ask it of a full compaction, so that what they report is what
 /// the gate admits.
-pub fn merge_would_fit(
+pub(crate) fn merge_would_fit(
     pool: &crate::CapacityPool,
     tree: TreeId,
     config: &Config,
@@ -1455,11 +1455,11 @@ fn range_tombstones_after_gc(
 /// The keys the tables outside a compaction hold, as disjoint inclusive spans
 /// in key order: whether a table outside overlaps a range tombstone is then a
 /// binary search, not a walk of the whole version per tombstone.
-pub struct OutsideSpans(Vec<(UserKey, UserKey)>);
+pub(crate) struct OutsideSpans(Vec<(UserKey, UserKey)>);
 
 impl OutsideSpans {
     /// The spans of `version`'s tables other than `input_ids`.
-    pub fn new(
+    pub(crate) fn new(
         version: &Version,
         input_ids: &HashSet<TableId>,
         cmp: &dyn crate::comparator::UserComparator,
@@ -3488,9 +3488,7 @@ fn move_tables(
 /// files a compaction of `picked_tables` would relocate. Also the basis for the
 /// `storage_stats` blob-relocation estimate, so the reported status budgets the
 /// SAME stale subset the gate does (not every live blob file).
-// `pub` (not `pub(crate)`) inside this crate-private module: clippy flags the
-// redundant restriction since the module itself is already crate-scoped.
-pub fn pick_blob_files_to_rewrite(
+pub(crate) fn pick_blob_files_to_rewrite(
     picked_tables: &HashSet<TableId>,
     current_version: &Version,
     blob_opts: &crate::KvSeparationOptions,

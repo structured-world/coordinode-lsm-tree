@@ -21,23 +21,23 @@ use std::io::{Read, Seek, SeekFrom};
 const TRAILER_SIZE: i64 = super::TRAILER_LEN as i64;
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct ParsedTrailer {
-    pub toc_checksum: Checksum,
-    pub toc_pos: u64,
+pub(crate) struct ParsedTrailer {
+    pub(crate) toc_checksum: Checksum,
+    pub(crate) toc_pos: u64,
     /// On-disk byte length of the TOC region, copied from the
-    /// trailer. The `TocReader` reads exactly this many bytes, so a
+    /// trailer. The `TocReader` reads no more than this many bytes, so a
     /// forged TOC `len` prefix can't force unbounded work / memory
     /// before the checksum catches it.
-    pub toc_len: u64,
+    pub(crate) toc_len: u64,
     /// Where the trailer starts: the end of everything before it, the TOC
     /// included.
-    pub trailer_pos: u64,
+    pub(crate) trailer_pos: u64,
 }
 
-pub struct TrailerReader;
+pub(crate) struct TrailerReader;
 
 impl TrailerReader {
-    pub fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<ParsedTrailer> {
+    pub(crate) fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<ParsedTrailer> {
         use crate::io::LE;
 
         log::trace!("Reading trailer");
