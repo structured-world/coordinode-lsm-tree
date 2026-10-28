@@ -44,7 +44,7 @@ const MAX_SEGMENTS: usize =
 /// Entries are addressed by a u32 index returned from [`append`](Self::append).
 /// Reads via [`get`](Self::get) are wait-free.  The store never shrinks —
 /// it is dropped in bulk when the memtable is dropped.
-pub struct ValueStore {
+pub(crate) struct ValueStore {
     /// Segment pointers.  Null = not yet allocated.  Once set, never modified.
     segments: Box<[AtomicPtr<UserValue>]>,
 
@@ -59,7 +59,7 @@ impl ValueStore {
     /// Creates a new empty store.
     ///
     /// Allocates the segment-pointer array (~18 KiB on 64-bit).
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // Vec optimizes the repeated-null pattern into a single memset.
         // Using Box::new_zeroed_slice would be cleaner but requires nightly.
         let mut segments = Vec::with_capacity(MAX_SEGMENTS);
@@ -83,17 +83,26 @@ impl ValueStore {
     /// Panics when the segment table is exhausted, rather than writing past
     /// it. Unreachable in practice: the table covers every value the arena
     /// backing their nodes can hold, and the arena reports exhaustion first.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "seg_idx < MAX_SEGMENTS enforced by the assert below"
-    )]
-    pub fn append(&self, value: UserValue) -> u32 {
+    #[cfg(test)]
+    pub(crate) fn append(&self, value: UserValue) -> u32 {
+        let idx = self.reserve();
+        // SAFETY: `idx` was just reserved and is written once, here.
+        unsafe { self.write(idx, value) };
+        idx
+    }
+
+    /// Reserves the next index, unique to the caller, for one
+    /// [`write`](Self::write).
+    ///
+    /// # Panics
+    ///
+    /// As [`append`](Self::append), when the segment table is exhausted.
+    pub(crate) fn reserve(&self) -> u32 {
         // One atomic RMW rather than a CAS loop guarding the bound: the
-        // counter cannot get there. Every value belongs to one skiplist node,
-        // the node is allocated BEFORE this call and occupies at least
-        // `MIN_NODE_SIZE` arena bytes, and arena offsets are `u32` (2^32
-        // bytes total), so the arena panics on exhaustion before the counter
-        // leaves the table.
+        // counter cannot get there. Every value belongs to one skiplist node
+        // occupying at least `MIN_NODE_SIZE` arena bytes, and arena offsets are
+        // `u32` (2^32 bytes total), so the arena panics on exhaustion before
+        // the counter leaves the table.
         //
         // The assert is nonetheless a real one, not a `debug_assert`: the
         // bound above is an invariant spanning two modules, and if a future
@@ -104,28 +113,44 @@ impl ValueStore {
         // path that cannot be taken. A refused index is never written, and
         // `Drop` skips it: it lies past every segment.
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
         assert!(
-            seg_idx < MAX_SEGMENTS,
+            ((idx >> SEGMENT_SHIFT) as usize) < MAX_SEGMENTS,
             "ValueStore::append: index space exhausted"
         );
+        idx
+    }
+
+    /// Moves `value` into the slot of `idx`: the caller's handle becomes the
+    /// stored one, so the insert path does no refcount traffic.
+    ///
+    /// # Safety
+    ///
+    /// `idx` came from [`reserve`](Self::reserve) and is written exactly once,
+    /// before any reader can reach it.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "seg_idx < MAX_SEGMENTS, checked by reserve"
+    )]
+    pub(crate) unsafe fn write(&self, idx: u32, value: UserValue) {
+        let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
         let slot = (idx & SEGMENT_MASK) as usize;
 
         self.ensure_segment(seg_idx);
 
-        // SAFETY: ensure_segment guarantees the segment is allocated.
-        // The atomic fetch_add guarantees `slot` is unique: no two threads
-        // write the same slot.  We write before publishing the node (via the
-        // skiplist CAS), so readers see the value only after it's fully
-        // written. The value MOVES into its slot: the caller's handle is the
-        // stored one, so the insert path does no refcount traffic.
+        // SAFETY: ensure_segment guarantees the segment is allocated, and the
+        // reservation makes `slot` unique: no two threads write it. The write
+        // precedes the node's publication (the skiplist CAS), so a reader sees
+        // the value only once it is fully written.
         unsafe {
             let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
             debug_assert!(!seg_ptr.is_null());
             ptr::write(seg_ptr.add(slot), value);
         }
+    }
 
-        idx
+    /// Indices reserved so far: one per value, written or about to be.
+    pub(crate) fn len(&self) -> usize {
+        self.next_idx.load(Ordering::Relaxed) as usize
     }
 
     /// Test-only: positions the reservation counter so a test can reach the
@@ -146,7 +171,7 @@ impl ValueStore {
         clippy::indexing_slicing,
         reason = "idx came from append, which keeps seg_idx < MAX_SEGMENTS"
     )]
-    pub unsafe fn get(&self, idx: u32) -> UserValue {
+    pub(crate) unsafe fn get(&self, idx: u32) -> UserValue {
         let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
         let slot = (idx & SEGMENT_MASK) as usize;
 

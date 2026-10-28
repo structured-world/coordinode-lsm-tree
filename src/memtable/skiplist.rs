@@ -25,7 +25,6 @@ use crate::{UserKey, ValueType};
 use core::cmp::Ordering as CmpOrdering;
 use core::ops::{Bound, RangeBounds};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use portable_atomic::AtomicU64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -143,10 +142,10 @@ pub(crate) struct SkipMap {
     head: u32,
     /// Current maximum height of any inserted node.
     height: AtomicUsize,
-    /// Number of entries (not counting the head sentinel).
-    len: AtomicUsize,
-    /// PRNG counter for height generation (splitmix64-based).
-    rng_state: AtomicU64,
+    /// Seed of the node heights, mixed with each node's value index: the
+    /// index reservation is already one per insert, so the heights need no
+    /// counter of their own for the writers to share.
+    height_seed: u64,
     /// The most recently appended TAIL node (`UNSET` until one exists), a
     /// hint for the sequential-insert fast path in
     /// [`Self::insert_with_kv_digest`]. Purely advisory: the fast path
@@ -230,8 +229,7 @@ impl SkipMap {
             is_lexicographic,
             head,
             height: AtomicUsize::new(1),
-            len: AtomicUsize::new(0),
-            rng_state: AtomicU64::new(seed),
+            height_seed: seed,
             tail_hint: AtomicU32::new(UNSET),
             #[cfg(feature = "metrics")]
             cas_retries: AtomicUsize::new(0),
@@ -327,8 +325,9 @@ impl SkipMap {
         value: UserValue,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
-        let height = self.random_height();
-        let node = self.alloc_node(key, value, height, kv_digest);
+        let value_idx = self.values.reserve();
+        let height = node_height(self.height_seed, value_idx);
+        let node = self.alloc_node(key, value, value_idx, height, kv_digest);
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -406,13 +405,12 @@ impl SkipMap {
         if succs[0] == UNSET {
             self.tail_hint.store(node, Ordering::Relaxed);
         }
-
-        self.len.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns the number of entries.
+    /// Returns the number of entries, an insert in progress included: each
+    /// holds one value index from before its node is linked.
     pub(crate) fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.values.len()
     }
 
     /// Test-only: flips a bit in the first node's user-key bytes, simulating a
@@ -572,6 +570,7 @@ impl SkipMap {
         &self,
         key: &InternalKey,
         value: UserValue,
+        value_idx: u32,
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) -> u32 {
@@ -604,7 +603,8 @@ impl SkipMap {
         }
 
         // Store value in the lock-free segmented store.
-        let value_idx = self.values.append(value);
+        // SAFETY: `value_idx` was reserved by this insert and is written once.
+        unsafe { self.values.write(value_idx, value) };
 
         // Write immutable metadata using direct byte offsets matching the
         // node layout comment above.  The arena guarantees 24+ bytes at `node`.
@@ -1269,27 +1269,23 @@ impl SkipMap {
             next = self.next_at(next, 0);
         }
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Internal: random height
-    // -----------------------------------------------------------------------
+/// The tower height of the node holding value `value_idx`: geometric with
+/// P = 1/4, from the splitmix64 finaliser over `seed + value_idx`. The index
+/// is unique per insert, so the heights are as independent as a shared counter
+/// would make them, without one.
+fn node_height(seed: u64, value_idx: u32) -> usize {
+    let mut z = seed
+        .wrapping_add(u64::from(value_idx))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
 
-    /// Generates a random tower height using a geometric distribution (P = 1/4).
-    fn random_height(&self) -> usize {
-        // Each thread gets a unique seed from fetch_add, then we hash it.
-        let state = self.rng_state.fetch_add(1, Ordering::Relaxed);
-
-        // splitmix64 finaliser for good bit mixing
-        let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-
-        // Count pairs of trailing zero bits → geometric(P=1/4)
-        let tz = z.trailing_zeros() as usize;
-        // Each pair of trailing zero bits adds one level
-        (1 + tz / 2).min(MAX_HEIGHT)
-    }
+    // Each pair of trailing zero bits adds one level.
+    let tz = z.trailing_zeros() as usize;
+    (1 + tz / 2).min(MAX_HEIGHT)
 }
 
 // ---------------------------------------------------------------------------
