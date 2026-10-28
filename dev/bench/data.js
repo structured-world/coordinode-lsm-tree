@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793179234011,
+  "lastUpdate": 1793179238447,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -83160,6 +83160,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.55867865,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "74d8452a111cd93d3c627708577fd6a6abaf79a6",
+          "message": "feat(flush): defer a flush's durability to a barrier (#1016)\n\n## Summary\n\n- A flush durability setting: under `FlushDurability::Deferred` a flush\nwrites its tables and blob files unsynced and installs them in memory\nonly; `AbstractTree::persist_flushes` is the barrier that makes every\nflush before it durable.\n- For a caller with its own write-ahead log, which already makes its\nwrites durable: the syncs a flush issues are nearly the whole cost of a\nsmall flush, and they move off the write path.\n- No on-disk format change. After a power loss the tree opens at the\nlast persisted state; the later flushes' tables are named by no manifest\nand are removed on open.\n\n## Changes\n\n- `Config::flush_durability(FlushDurability)`, default `Synced`\n(unchanged behaviour).\n- Table and blob writers skip their file sync (the blob writer also its\nfolder sync) on the flush path under `Deferred`.\n- `SuperVersions` keeps the version on disk apart from the current one\nand the files deferred flushes left unsynced. Every install other than a\ndeferred flush persists from the version on disk: it syncs the deferred\nfiles it still names, their folders, then writes one manifest edit. A\ndeferred table a compaction consumed never reaches the manifest.\n- `persist_flushes` syncs the pending files without the version lock,\nconcurrently (up to 16 at once, so a journaling file system folds them\ninto a shared commit), then writes the edit under the lock.\n- `create_checkpoint` persists before it links, and reads the version it\nlinks together with the deferred files that version names, syncing them\nbefore the links: a flush another thread installs in between is linked\ndurable too.\n- A pinned restore under `Deferred` persists its flush before it clears\nits restore marker; a dropped tree persists what is pending.\n- `get_highest_persisted_seqno` reads the version on disk, so a caller\ntrimming its log by it keeps what a deferred flush holds;\n`get_highest_seqno` reads the tables of the current version and the\nmemtables from one snapshot, so it counts every installed flush and\nnever goes back across one.\n- `docs/external-wal.md` describes the barrier.\n- Visibility: an item no other crate can reach is written `pub(crate)`\n(rustc's `unreachable_pub`; clippy's opposing `redundant_pub_crate` is\nallowed crate-wide). A lint step holds the warning count to\n`.github/unreachable-pub-baseline`, which only goes down, and allows\nnone in the files a PR touches; the files this PR touches are at zero.\n\n## Measurements\n\n`benches/deferred_flush.rs`: a long-lived tree flushing a few rows at a\ntime, per flush.\n\nLinux bench host:\n\n| rows | synced p50 | deferred p50 | deferred, barrier every 16 flushes,\nmean |\n|---|---|---|---|\n| 16 | 5.36 ms | 0.65 ms | 1.32 ms |\n| 1000 | 7.63 ms | 1.78 ms | 3.01 ms |\n\nWindows (before the concurrent barrier sync; the flush path is the\nsame):\n\n| rows | synced p50 | deferred p50 |\n|---|---|---|\n| 16 | 6.38 ms | 5.86 ms |\n| 1000 | 7.84 ms | 7.08 ms |\n\nOn Windows the syncs are a small part of a small flush; the rest of its\nfile system cost is outside this change.\n\n## Testing\n\n`tests/flush_durability.rs` checks sync counts and takes the power\n(`CrashFs`) before and after the barrier. Full nextest in the default\nand all-features configurations, doc tests, clippy in both\nconfigurations, rustdoc and the no-std check run on Linux, macOS and\nWindows.\n\nCloses #1015",
+          "timestamp": "2026-10-28T09:05:12Z",
+          "tree_id": "462670e34473ea48b6fe61ea31ab32d2f0a67fe4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/74d8452a111cd93d3c627708577fd6a6abaf79a6"
+        },
+        "date": 1793179237006,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 483.17199999999997,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 82.816076ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 152.727,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 52.768369ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 439.119,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.824398ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4080.2520000000004,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 19626.872,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 25.375,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 71.237631,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.577756133,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.783,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 70.975487,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.580652574,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
