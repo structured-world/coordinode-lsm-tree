@@ -277,6 +277,51 @@ fn prefix_scan_over_two_tables_of_a_run_counts_both() -> crate::Result<()> {
     Ok(())
 }
 
+/// A prefix filter that cannot be read rules nothing out: the scan reads the
+/// table and hands out every row under the prefix. Guards against an
+/// unreadable filter being taken as an absent prefix, which would drop rows.
+#[expect(clippy::expect_used, reason = "test code")]
+#[test]
+fn an_unreadable_prefix_filter_still_lets_the_scan_read_the_table() -> crate::Result<()> {
+    use crate::config::PinningPolicy;
+    use crate::{AbstractTree, Cache, Config, SeqNo, SequenceNumberCounter};
+
+    let dir = tempfile::tempdir()?;
+    let tree = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .prefix_extractor(alloc::sync::Arc::new(UpToColon))
+    // The filter is read from the file at every scan: not pinned, not cached.
+    .filter_block_pinning_policy(PinningPolicy::all(false))
+    .use_cache(alloc::sync::Arc::new(Cache::with_capacity_bytes(0)))
+    .open()?;
+    for i in 0..50u64 {
+        tree.insert(format!("a:{i:03}"), "v", i + 1);
+    }
+    tree.flush_active_memtable(0)?;
+    let version = tree.current_version();
+    let table = version.iter_tables().next().expect("one table");
+    let filter = table.regions.filter.expect("the table has a full filter");
+
+    let mut bytes = std::fs::read(&*table.path)?;
+    let at = usize::try_from(filter.offset().0).expect("offset fits usize")
+        + crate::table::block::Header::MIN_LEN
+        + 3;
+    *bytes.get_mut(at).expect("a byte of the filter block") ^= 0xFF;
+    std::fs::write(&*table.path, &bytes)?;
+
+    assert!(
+        table
+            .maybe_contains_prefix(crate::hash::hash64(b"a:"))
+            .is_err(),
+        "the case under test: the filter cannot be read"
+    );
+    assert_eq!(tree.prefix("a:", SeqNo::MAX, None).count(), 50);
+    Ok(())
+}
+
 /// A scan counts once on every table of a run it reaches, and on no other:
 /// one table, two, or more.
 #[expect(clippy::expect_used, reason = "test code")]

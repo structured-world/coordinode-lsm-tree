@@ -59,6 +59,30 @@ fn expected_parity_len_saturates_on_max_data_length_even_rounding() {
     assert_eq!(expected_parity_len(u32::MAX, params), u32::MAX);
 }
 
+/// A resident payload whose checksum does not match and that carries no
+/// parity has nothing to recover from: the mismatch is the answer. Guards
+/// against such a block being handed out as unrecovered-but-fine.
+#[test]
+fn a_resident_payload_without_parity_reports_its_mismatch() {
+    let payload = b"payload bytes of a resident block";
+    let wrong = Checksum::from_raw(crate::hash::hash128(payload) ^ 1);
+    let params = EccParams::Shard {
+        data_shards: 4,
+        parity_shards: 2,
+    };
+    let result = Block::verify_resident_payload(
+        payload,
+        u32::try_from(payload.len()).unwrap_or(u32::MAX),
+        0,
+        wrong,
+        params,
+    );
+    assert!(
+        matches!(result, Err(crate::Error::ChecksumMismatch { .. })),
+        "{result:?}"
+    );
+}
+
 /// Result of [`write_block_to_tempfile`]. Bundles the open
 /// file, the pre-computed [`crate::table::BlockHandle`], and
 /// the owning [`tempfile::TempDir`].

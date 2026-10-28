@@ -429,16 +429,6 @@ impl IntervalTree {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
-
-    /// Returns `true` if the tree is empty.
-    #[expect(
-        dead_code,
-        reason = "tree may have tombstones but is_empty not called in all paths"
-    )]
-    #[must_use]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 impl Default for IntervalTree {

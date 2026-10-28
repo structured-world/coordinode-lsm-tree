@@ -150,6 +150,193 @@ fn ecc_heal_strategy_rewrites_flagged_sst_so_reread_is_clean() -> crate::Result<
     Ok(())
 }
 
+/// Where a [`FlipOnce`] flips its byte: a file whose path holds `name`, at
+/// `offset`, for the first read covering it.
+#[derive(Default)]
+struct FlipTarget {
+    target: std::sync::Mutex<Option<(String, u64)>>,
+}
+
+/// A file system flipping one byte of one read, as a transient fault on the
+/// way from the medium does: the file itself stays intact.
+struct FlipOnce {
+    inner: crate::fs::StdFs,
+    flip: Arc<FlipTarget>,
+}
+
+/// A file of a [`FlipOnce`], flipping its byte when a read covers it.
+struct FlipFile {
+    inner: Box<dyn crate::fs::FsFile>,
+    path: String,
+    flip: Arc<FlipTarget>,
+}
+
+impl std::io::Read for FlipFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Write for FlipFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl std::io::Seek for FlipFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl crate::fs::FsFile for FlipFile {
+    fn sync_all(&self) -> crate::io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn sync_data(&self) -> crate::io::Result<()> {
+        self.inner.sync_data()
+    }
+    fn metadata(&self) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata()
+    }
+    fn set_len(&self, size: u64) -> crate::io::Result<()> {
+        self.inner.set_len(size)
+    }
+    fn lock_exclusive(&self) -> crate::io::Result<()> {
+        self.inner.lock_exclusive()
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
+        let n = self.inner.read_at(buf, offset)?;
+        let hit = self
+            .flip
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|(name, at)| {
+                self.path.contains(name.as_str()) && (offset..offset + n as u64).contains(at)
+            })
+            .map(|(_, at)| at);
+        if let Some(at) = hit {
+            #[expect(clippy::cast_possible_truncation, reason = "within this read")]
+            if let Some(byte) = buf.get_mut((at - offset) as usize) {
+                *byte ^= 0x80;
+            }
+        }
+        Ok(n)
+    }
+}
+
+impl crate::fs::Fs for FlipOnce {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        opts: &crate::fs::FsOpenOptions,
+    ) -> crate::io::Result<Box<dyn crate::fs::FsFile>> {
+        Ok(Box::new(FlipFile {
+            inner: self.inner.open(path, opts)?,
+            path: path.to_string_lossy().into_owned(),
+            flip: Arc::clone(&self.flip),
+        }))
+    }
+    fn create_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.create_dir_all(path)
+    }
+    fn read_dir(&self, path: &std::path::Path) -> crate::io::Result<Vec<crate::fs::FsDirEntry>> {
+        self.inner.read_dir(path)
+    }
+    fn remove_file(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.remove_dir_all(path)
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn metadata(&self, path: &std::path::Path) -> crate::io::Result<crate::fs::FsMetadata> {
+        self.inner.metadata(path)
+    }
+    fn sync_directory(&self, path: &std::path::Path) -> crate::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> crate::io::Result<bool> {
+        self.inner.exists(path)
+    }
+}
+
+/// A block whose parity corrects a fault that a second read no longer shows
+/// was hurt on the way from the medium, not on it: the read returns the right
+/// value and nothing is queued for healing. Guards against rewriting a table
+/// for a fault its file does not hold.
+#[test]
+fn a_transient_ecc_correction_queues_no_heal() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let flip = Arc::new(FlipTarget::default());
+    let fs: Arc<dyn crate::fs::Fs> = Arc::new(FlipOnce {
+        inner: crate::fs::StdFs,
+        flip: Arc::clone(&flip),
+    });
+    let crate::AnyTree::Standard(tree) = Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .with_shared_fs(fs)
+    // Every read of a block goes to the file.
+    .use_cache(Arc::new(crate::Cache::with_capacity_bytes(0)))
+    .page_ecc(true)
+    .ecc_scheme(EccScheme::ReedSolomon {
+        data_shards: 8,
+        parity_shards: 2,
+    })
+    .open()?
+    else {
+        unreachable!("standard tree configured (no kv separation)");
+    };
+    for i in 0u64..2_000 {
+        tree.insert(format!("key-{i:06}"), format!("v{i:06}"), i);
+    }
+    tree.flush_active_memtable(2_000)?;
+    tree.update_runtime_config(|c| c.auto_heal = true)?;
+
+    let binding = tree.version_history.read().latest_version();
+    #[expect(clippy::expect_used, reason = "flush produced exactly one table")]
+    let table = binding.version.iter_tables().next().expect("one table");
+    #[expect(clippy::expect_used, reason = "table has at least one data block")]
+    let keyed = table.block_index.iter().next().expect("a data block")?;
+    let name = table
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let at = keyed.offset().0 + Header::MIN_LEN as u64 + 3;
+    *flip
+        .target
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((name, at));
+
+    #[expect(clippy::expect_used, reason = "key was inserted before flush")]
+    let got = tree.get(b"key-000000", MAX_SEQNO)?.expect("key present");
+    assert_eq!(&*got, b"v000000", "ECC must repair the value on read");
+    assert!(
+        flip.target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the case under test: the read met the flipped byte"
+    );
+    assert!(
+        tree.heal_hints().is_empty(),
+        "a fault the re-read does not show queues no heal"
+    );
+    #[cfg(feature = "metrics")]
+    assert_eq!(tree.metrics().ecc_recovered_count(), 1, "one recovery");
+    Ok(())
+}
+
 /// End-to-end SEC-DED recovery through a tree read: a single-bit flip in a
 /// SEC-DED-protected SST is healed on read by the SEC-DED fast path and
 /// attributed to the SEC-DED counter (NOT the RS shard counter), proving the
