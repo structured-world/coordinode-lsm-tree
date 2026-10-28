@@ -74,6 +74,22 @@
 //! (3.6–4.1 vs 4.5–4.6). These are figures of one machine and one workload:
 //! another device, key and value size, read mix or budget can move each of
 //! them either way. Measure the workload that runs, the bench above included.
+//!
+//! # A model calibrated from observation
+//!
+//! The [`Model`] is set, not learned. A model moved toward what a tree
+//! observes (its merges' rate, the filters' false positive rate, the speed
+//! queries keep beside a merge, a scan's cost per run against a point read's)
+//! was measured against it with `db_bench planned-sustained`: 1M rows, four
+//! read mixes (even points and 100-key scans, Zipf-hot points with short
+//! scans, 1000-key scans, 32 runs in L0), both budgets, three runs. It won
+//! every run on three mixes (even 8×, long scans 8×, 32 L0 runs 2×) and lost
+//! every run on three (Zipf-hot 8× by 24% to 63%, long scans 2×, 32 L0 runs
+//! 8×), its plan changed several times a run where the set model's never did,
+//! and neither model's query cost tracked the observed one within 50%: the
+//! main level's run count does not explain what a query costs. The set model
+//! is kept. With 32 runs in L0 at 8× the write rate, leveled served the most
+//! queries of the three.
 
 pub mod dp;
 
