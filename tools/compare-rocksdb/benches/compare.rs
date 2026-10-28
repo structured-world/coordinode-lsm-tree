@@ -2025,6 +2025,19 @@ impl Diagnosis {
     }
 }
 
+/// Spawns `f` on a scoped thread named `name`, so a profile of the sustained
+/// scenario tells its reader, flusher and compactor apart.
+fn spawn_named<'scope, 'env, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn_scoped(scope, f)
+        .expect("spawn a named bench thread")
+}
+
 fn sustained_ours(
     shape: Sustained,
     compression: Compression,
@@ -2083,7 +2096,7 @@ fn sustained_ours(
     let writing_done = AtomicBool::new(false);
     let watermark = AtomicU64::new(shape.keys);
     let (elapsed, disk, compacted, mut reads) = std::thread::scope(|scope| {
-        let compactor = scope.spawn(|| {
+        let compactor = spawn_named(scope, "ours-compactor", || {
             let mut written = 0;
             while !stop.load(Ordering::Acquire) {
                 let result = tree
@@ -2099,7 +2112,7 @@ fn sustained_ours(
             }
             written + drain(&tree, watermark.load(Ordering::Acquire))
         });
-        let reader = scope.spawn(|| {
+        let reader = spawn_named(scope, "ours-reader", || {
             read_while(&stop, keys, |key| {
                 #[cfg(feature = "metrics")]
                 l0_seen.fetch_add(tree.l0_run_count() as u64, Ordering::Relaxed);
@@ -2110,7 +2123,7 @@ fn sustained_ours(
         // only seals a full memtable. Under deferred durability a flush writes
         // its table unsynced, and every `PERSIST_EVERY` flushes one barrier
         // syncs them all and writes the manifest once.
-        let flusher = scope.spawn(|| {
+        let flusher = spawn_named(scope, "ours-flusher", || {
             let mut flushes = 0u32;
             loop {
                 let lock = tree.get_flush_lock();
