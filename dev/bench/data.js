@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793139983508,
+  "lastUpdate": 1793179228641,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65380,6 +65380,90 @@ window.BENCHMARK_DATA = {
             "value": 301432.5070476503,
             "unit": "ops/sec",
             "extra": "P50: 2.5us | P99: 17.9us | P99.9: 92.9us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "74d8452a111cd93d3c627708577fd6a6abaf79a6",
+          "message": "feat(flush): defer a flush's durability to a barrier (#1016)\n\n## Summary\n\n- A flush durability setting: under `FlushDurability::Deferred` a flush\nwrites its tables and blob files unsynced and installs them in memory\nonly; `AbstractTree::persist_flushes` is the barrier that makes every\nflush before it durable.\n- For a caller with its own write-ahead log, which already makes its\nwrites durable: the syncs a flush issues are nearly the whole cost of a\nsmall flush, and they move off the write path.\n- No on-disk format change. After a power loss the tree opens at the\nlast persisted state; the later flushes' tables are named by no manifest\nand are removed on open.\n\n## Changes\n\n- `Config::flush_durability(FlushDurability)`, default `Synced`\n(unchanged behaviour).\n- Table and blob writers skip their file sync (the blob writer also its\nfolder sync) on the flush path under `Deferred`.\n- `SuperVersions` keeps the version on disk apart from the current one\nand the files deferred flushes left unsynced. Every install other than a\ndeferred flush persists from the version on disk: it syncs the deferred\nfiles it still names, their folders, then writes one manifest edit. A\ndeferred table a compaction consumed never reaches the manifest.\n- `persist_flushes` syncs the pending files without the version lock,\nconcurrently (up to 16 at once, so a journaling file system folds them\ninto a shared commit), then writes the edit under the lock.\n- `create_checkpoint` persists before it links, and reads the version it\nlinks together with the deferred files that version names, syncing them\nbefore the links: a flush another thread installs in between is linked\ndurable too.\n- A pinned restore under `Deferred` persists its flush before it clears\nits restore marker; a dropped tree persists what is pending.\n- `get_highest_persisted_seqno` reads the version on disk, so a caller\ntrimming its log by it keeps what a deferred flush holds;\n`get_highest_seqno` reads the tables of the current version and the\nmemtables from one snapshot, so it counts every installed flush and\nnever goes back across one.\n- `docs/external-wal.md` describes the barrier.\n- Visibility: an item no other crate can reach is written `pub(crate)`\n(rustc's `unreachable_pub`; clippy's opposing `redundant_pub_crate` is\nallowed crate-wide). A lint step holds the warning count to\n`.github/unreachable-pub-baseline`, which only goes down, and allows\nnone in the files a PR touches; the files this PR touches are at zero.\n\n## Measurements\n\n`benches/deferred_flush.rs`: a long-lived tree flushing a few rows at a\ntime, per flush.\n\nLinux bench host:\n\n| rows | synced p50 | deferred p50 | deferred, barrier every 16 flushes,\nmean |\n|---|---|---|---|\n| 16 | 5.36 ms | 0.65 ms | 1.32 ms |\n| 1000 | 7.63 ms | 1.78 ms | 3.01 ms |\n\nWindows (before the concurrent barrier sync; the flush path is the\nsame):\n\n| rows | synced p50 | deferred p50 |\n|---|---|---|\n| 16 | 6.38 ms | 5.86 ms |\n| 1000 | 7.84 ms | 7.08 ms |\n\nOn Windows the syncs are a small part of a small flush; the rest of its\nfile system cost is outside this change.\n\n## Testing\n\n`tests/flush_durability.rs` checks sync counts and takes the power\n(`CrashFs`) before and after the barrier. Full nextest in the default\nand all-features configurations, doc tests, clippy in both\nconfigurations, rustdoc and the no-std check run on Linux, macOS and\nWindows.\n\nCloses #1015",
+          "timestamp": "2026-10-28T09:05:12Z",
+          "tree_id": "462670e34473ea48b6fe61ea31ab32d2f0a67fe4",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/74d8452a111cd93d3c627708577fd6a6abaf79a6"
+        },
+        "date": 1793179226889,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 88503.81892837737,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 19.0us | P99.9: 37.4us\nthreads: 1 | elapsed: 6.05s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2110972.11532494,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 612672.7054282161,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 14.0us\nthreads: 1 | elapsed: 0.33s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 461949.5066969409,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 6.8us | P99.9: 32.8us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2993369.521873726,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 291577.30041092046,
+            "unit": "ops/sec",
+            "extra": "P50: 3.0us | P99: 7.8us | P99.9: 17.3us\nthreads: 1 | elapsed: 0.69s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 188829.97792218783,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.1us | P99.9: 19.2us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 718518.8062453828,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 2.6us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 725201.1519443195,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 6.1us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 339686.5687912017,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 13.4us | P99.9: 91.9us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
           }
         ]
       }
