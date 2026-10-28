@@ -6,13 +6,59 @@
 //! installs that persist it on their own.
 
 use lsm_tree::config::FlushDurability;
-use lsm_tree::fs::{CountingFs, CrashFs, Fs, MemFs};
+use lsm_tree::fs::{CountingFs, CrashFs, Fault, FaultFs, FaultOp, FaultRule, Fs, MemFs};
 use lsm_tree::{AbstractTree, AnyTree, Config, KvSeparationOptions, SequenceNumberCounter};
 use std::path::Path;
 use std::sync::Arc;
 use test_log::test;
 
 const DB: &str = "/db";
+
+/// A disk a power loss can take, and the backend a tree runs on it through.
+struct Disk {
+    crash: CrashFs,
+    fs: Arc<FaultFs<CrashFs>>,
+}
+
+impl Disk {
+    fn new() -> Self {
+        let crash = CrashFs::new(MemFs::new());
+        Self {
+            fs: Arc::new(FaultFs::new(crash.clone())),
+            crash,
+        }
+    }
+
+    /// The backend a tree runs on.
+    fn fs(&self) -> Arc<dyn Fs> {
+        self.fs.clone()
+    }
+
+    /// Cuts the power under `tree` and returns the disk as it comes back. The
+    /// process goes down with the power: the tree, dropped after it, changes
+    /// nothing on the disk on its way out, and what was never synced is gone.
+    fn power_loss(self, tree: AnyTree) -> CrashFs {
+        for op in [
+            FaultOp::Open,
+            FaultOp::RemoveFile,
+            FaultOp::Rename,
+            FaultOp::CreateDir,
+            FaultOp::CreateDirAll,
+            FaultOp::SyncDirectory,
+            FaultOp::HardLink,
+            FaultOp::RemoveDir,
+            FaultOp::RemoveDirAll,
+        ] {
+            self.fs.injector().arm(FaultRule::new(
+                op,
+                Fault::Error(lsm_tree::io::ErrorKind::Other),
+            ));
+        }
+        self.crash.crash();
+        drop(tree);
+        self.crash
+    }
+}
 
 /// A tree at [`DB`] on `fs` whose flushes are deferred.
 fn deferred(fs: Arc<dyn Fs>) -> Config {
@@ -117,8 +163,8 @@ fn a_deferred_flush_syncs_nothing_until_the_barrier() -> lsm_tree::Result<()> {
 /// loss, and against a lost table left on disk.
 #[test]
 fn a_power_loss_before_the_barrier_reopens_at_the_last_barrier() -> lsm_tree::Result<()> {
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(deferred(Arc::new(crash.clone())));
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
     tree.insert("kept", "1", 0);
     tree.flush_active_memtable(0)?;
     tree.persist_flushes()?;
@@ -126,11 +172,7 @@ fn a_power_loss_before_the_barrier_reopens_at_the_last_barrier() -> lsm_tree::Re
     tree.flush_active_memtable(0)?;
     assert_eq!(value(&tree, "lost").as_deref(), Some("2"));
 
-    crash.crash();
-    // The dropped tree's own persist finds its unsynced table gone and fails,
-    // which it only logs.
-    drop(tree);
-
+    let crash = disk.power_loss(tree);
     let tree = open(deferred(Arc::new(crash.clone())));
     assert_eq!(
         value(&tree, "kept").as_deref(),
@@ -152,15 +194,14 @@ fn a_power_loss_before_the_barrier_reopens_at_the_last_barrier() -> lsm_tree::Re
 /// that writes the manifest without syncing the tables it names.
 #[test]
 fn a_power_loss_after_the_barrier_keeps_every_flush_before_it() -> lsm_tree::Result<()> {
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(deferred(Arc::new(crash.clone())).table_file_pool(0));
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()).table_file_pool(0));
     for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
         tree.insert(key, "v", seqno);
         tree.flush_active_memtable(0)?;
     }
     tree.persist_flushes()?;
-    crash.crash();
-    drop(tree);
+    let crash = disk.power_loss(tree);
 
     let tree = open(deferred(Arc::new(crash.clone())));
     for key in ["a", "b", "c"] {
@@ -191,16 +232,15 @@ fn the_persisted_seqno_waits_for_the_barrier() -> lsm_tree::Result<()> {
 /// against the inputs being needed after it.
 #[test]
 fn a_compaction_over_deferred_flushes_survives_a_power_loss() -> lsm_tree::Result<()> {
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(deferred(Arc::new(crash.clone())));
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
     for (seqno, key) in [(0, "a"), (1, "b"), (2, "c")] {
         tree.insert(key, "v", seqno);
         tree.flush_active_memtable(0)?;
     }
     tree.major_compact(u64::MAX, 0)?;
     assert_eq!(tree.table_count(), 1);
-    crash.crash();
-    drop(tree);
+    let crash = disk.power_loss(tree);
 
     let tree = open(deferred(Arc::new(crash.clone())));
     for key in ["a", "b", "c"] {
@@ -221,8 +261,8 @@ fn a_compaction_over_deferred_flushes_survives_a_power_loss() -> lsm_tree::Resul
 /// of the deferred files a compaction did not consume.
 #[test]
 fn a_compaction_persists_the_flushes_it_did_not_consume() -> lsm_tree::Result<()> {
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(deferred(Arc::new(crash.clone())));
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
     for (seqno, key) in [(0, "a"), (1, "b")] {
         tree.insert(key, "v", seqno);
         tree.flush_active_memtable(0)?;
@@ -230,8 +270,7 @@ fn a_compaction_persists_the_flushes_it_did_not_consume() -> lsm_tree::Result<()
     tree.major_compact(u64::MAX, 0)?;
     tree.insert("after", "v", 2);
     tree.flush_active_memtable(0)?;
-    crash.crash();
-    drop(tree);
+    let crash = disk.power_loss(tree);
 
     let tree = open(deferred(Arc::new(crash.clone())));
     assert_eq!(value(&tree, "a").as_deref(), Some("v"));
@@ -262,13 +301,12 @@ fn a_dropped_tree_persists_its_deferred_flushes() -> lsm_tree::Result<()> {
 /// linking table files whose bytes nothing synced.
 #[test]
 fn a_checkpoint_persists_the_deferred_flushes_first() -> lsm_tree::Result<()> {
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(deferred(Arc::new(crash.clone())));
+    let disk = Disk::new();
+    let tree = open(deferred(disk.fs()));
     tree.insert("a", "1", 0);
     tree.flush_active_memtable(0)?;
     tree.create_checkpoint(Path::new("/checkpoint"))?;
-    crash.crash();
-    drop(tree);
+    let crash = disk.power_loss(tree);
 
     let restored = open(
         Config::new(
@@ -288,23 +326,22 @@ fn a_checkpoint_persists_the_deferred_flushes_first() -> lsm_tree::Result<()> {
 /// pointing at values that are gone.
 #[test]
 fn a_blob_trees_deferred_flush_persists_its_blob_files() -> lsm_tree::Result<()> {
-    let blob_config = |crash: &CrashFs| {
-        deferred(Arc::new(crash.clone()))
+    let blob_config = |fs: Arc<dyn Fs>| {
+        deferred(fs)
             .with_kv_separation(Some(KvSeparationOptions::default().separation_threshold(1)))
     };
     let big = "x".repeat(4_096);
 
-    let crash = CrashFs::new(MemFs::new());
-    let tree = open(blob_config(&crash));
+    let disk = Disk::new();
+    let tree = open(blob_config(disk.fs()));
     tree.insert("kept", &big, 0);
     tree.flush_active_memtable(0)?;
     tree.persist_flushes()?;
     tree.insert("lost", &big, 1);
     tree.flush_active_memtable(0)?;
-    crash.crash();
-    drop(tree);
+    let crash = disk.power_loss(tree);
 
-    let tree = open(blob_config(&crash));
+    let tree = open(blob_config(Arc::new(crash.clone())));
     assert_eq!(value(&tree, "kept").as_deref(), Some(big.as_str()));
     assert_eq!(value(&tree, "lost"), None);
     assert_eq!(tree.blob_file_count(), 1, "the barrier's blob file alone");
