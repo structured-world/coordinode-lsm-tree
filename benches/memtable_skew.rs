@@ -13,6 +13,7 @@
 //! | key order | `append` (each key above the last), `uniform`, `zipf` (s = 0.99), `hot` (one key) |
 //! | key shape | 16 bytes, or 16 bytes behind a common prefix of 8, 32 or 64 bytes |
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
+//! | route | `tree` (`Tree::insert`, under the version-history read lock) or `direct` (the active memtable itself) |
 //!
 //! Per configuration it prints the median over the rounds of the time per
 //! insert seen by a writer, the inserts per second over all of them, and the
@@ -31,7 +32,10 @@
     reason = "benchmark setup favors concise panic messages"
 )]
 
-use lsm_tree::{AbstractTree, AnyTree, Config, Memtable, SequenceNumberCounter, UserComparator};
+use lsm_tree::{
+    AbstractTree, AnyTree, Config, InternalValue, Memtable, SequenceNumberCounter, UserComparator,
+    ValueType,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -161,6 +165,26 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> AnyTree {
     config.open().expect("open")
 }
 
+/// How a write reaches the memtable.
+#[derive(Clone, Copy)]
+enum Route {
+    /// `Tree::insert`: the version-history read lock, then the memtable.
+    Tree,
+    /// The active memtable directly: its own cost alone.
+    Memtable,
+}
+
+impl Route {
+    const ALL: [Self; 2] = [Self::Tree, Self::Memtable];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::Memtable => "direct",
+        }
+    }
+}
+
 /// One configuration's workload: the keys of every write, in write order.
 struct Writes {
     keys: Vec<Vec<u8>>,
@@ -178,26 +202,41 @@ impl Writes {
         }
     }
 
-    /// Writes every key into `tree` from `writers` threads, each its own
-    /// contiguous share, every insert taking the next seqno; returns the
-    /// time from the start barrier to the last writer's end.
-    fn run(&self, tree: &AnyTree, writers: usize) -> Duration {
-        let seqno = AtomicU64::new(0);
+    /// Writes every key into `tree` through `route` from `writers` threads,
+    /// each its own contiguous share; returns the time from the start barrier
+    /// to the last writer's end.
+    ///
+    /// A key's seqno is its position in the write order, so seqnos stay unique
+    /// without the writers sharing a counter: the cost measured is the
+    /// memtable's, not a caller's seqno allocation.
+    fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> Duration {
         let share = self.keys.len().div_ceil(writers);
         // Fewer shares than writers when the share rounds up: the barrier
         // holds the threads that exist.
         let start = Barrier::new(self.keys.len().div_ceil(share) + 1);
+        let memtable = tree.active_memtable();
         std::thread::scope(|scope| {
-            let handles: Vec<_> = self
-                .keys
-                .chunks(share)
-                .map(|chunk| {
-                    let (seqno, start) = (&seqno, &start);
+            let handles: Vec<_> = (0u64..)
+                .step_by(share)
+                .zip(self.keys.chunks(share))
+                .map(|(first, chunk)| {
+                    let (start, memtable) = (&start, &memtable);
                     scope.spawn(move || {
                         start.wait();
-                        for key in chunk {
-                            let s = seqno.fetch_add(1, Ordering::Relaxed);
-                            tree.insert(key.as_slice(), self.value.as_slice(), s);
+                        for (s, key) in (first..).zip(chunk) {
+                            match route {
+                                Route::Tree => {
+                                    tree.insert(key.as_slice(), self.value.as_slice(), s);
+                                }
+                                Route::Memtable => {
+                                    memtable.insert(InternalValue::from_components(
+                                        key.as_slice(),
+                                        self.value.as_slice(),
+                                        s,
+                                        ValueType::Value,
+                                    ));
+                                }
+                            }
                         }
                     })
                 })
@@ -250,36 +289,39 @@ fn main() {
     for order in KeyOrder::ALL {
         for prefix in PREFIXES {
             let writes = Writes::new(order, prefix, versions, keys);
-            for writers in WRITERS {
-                let mut per_insert = Vec::with_capacity(rounds);
-                let mut per_second = Vec::with_capacity(rounds);
-                let mut bytes = 0.0;
-                let mut retries = Vec::with_capacity(rounds);
-                for _ in 0..rounds {
-                    let tree = open(None);
-                    let elapsed = writes.run(&tree, writers);
-                    let secs = elapsed.as_secs_f64();
-                    per_insert.push(secs * 1e9 * writers as f64 / versions as f64);
-                    per_second.push(versions as f64 / secs);
-                    let memtable = tree.active_memtable();
-                    bytes = memtable.size() as f64 / versions as f64;
-                    retries.extend(cas_retries(&memtable));
+            for route in Route::ALL {
+                for writers in WRITERS {
+                    let mut per_insert = Vec::with_capacity(rounds);
+                    let mut per_second = Vec::with_capacity(rounds);
+                    let mut bytes = 0.0;
+                    let mut retries = Vec::with_capacity(rounds);
+                    for _ in 0..rounds {
+                        let tree = open(None);
+                        let elapsed = writes.run(&tree, writers, route);
+                        let secs = elapsed.as_secs_f64();
+                        per_insert.push(secs * 1e9 * writers as f64 / versions as f64);
+                        per_second.push(versions as f64 / secs);
+                        let memtable = tree.active_memtable();
+                        bytes = memtable.size() as f64 / versions as f64;
+                        retries.extend(cas_retries(&memtable));
+                    }
+                    let retried = if retries.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {:.0} links retried", median(retries))
+                    };
+                    println!(
+                        "memtable/{}/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {bytes:.1} B/version{retried}",
+                        route.label(),
+                        order.label(),
+                        median(per_insert),
+                        median(per_second),
+                    );
                 }
-                let retried = if retries.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {:.0} links retried", median(retries))
-                };
-                println!(
-                    "memtable/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {bytes:.1} B/version{retried}",
-                    order.label(),
-                    median(per_insert),
-                    median(per_second),
-                );
             }
             let counter = Arc::new(CountingComparator(AtomicU64::new(0)));
             let tree = open(Some(Arc::clone(&counter)));
-            writes.run(&tree, 1);
+            writes.run(&tree, 1, Route::Tree);
             println!(
                 "memtable/{}/prefix{prefix}/compares: {:.2} per insert",
                 order.label(),
