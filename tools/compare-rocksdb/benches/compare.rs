@@ -1964,6 +1964,63 @@ fn read_while(stop: &AtomicBool, keys: &[[u8; 16]], mut get: impl FnMut(&[u8])) 
 /// waits at [`Sustained::L0_STOP`] L0 runs, a thread runs the leveled strategy
 /// whenever it has work, another reads. Returns the writer's time and the
 /// rest of the sample.
+/// The engine's read counters at one moment of the sustained scenario.
+#[cfg(feature = "metrics")]
+struct Diagnosis {
+    filter_queries: u64,
+    filter_skips: u64,
+    loads_cached: u64,
+    loads_io: u64,
+    data_loads: u64,
+    index_loads: u64,
+    filter_loads: u64,
+}
+
+#[cfg(feature = "metrics")]
+impl Diagnosis {
+    fn take(tree: &lsm_tree::AnyTree) -> Self {
+        let m = tree.metrics();
+        Self {
+            filter_queries: m.filter_queries() as u64,
+            filter_skips: m.io_skipped_by_filter() as u64,
+            loads_cached: m.block_load_cached_count() as u64,
+            loads_io: m.block_load_io_count() as u64,
+            data_loads: m.data_block_load_count() as u64,
+            index_loads: m.index_block_load_count() as u64,
+            filter_loads: m.filter_block_load_count() as u64,
+        }
+    }
+
+    /// Prints what each read cost the engine since `before`, how many L0 runs
+    /// the reads saw on average, and how long the writer waited on the L0 stop.
+    fn report(
+        &self,
+        before: &Self,
+        reads: u64,
+        l0_seen: u64,
+        stalled: Duration,
+        elapsed: Duration,
+        tables: usize,
+    ) {
+        let per = |now: u64, then: u64| (now - then) as f64 / reads.max(1) as f64;
+        eprintln!(
+            "sustained diagnosis: {reads} reads, l0 runs seen {:.1}, per read: \
+             filter queries {:.2}, filter skips {:.2}, block loads cached {:.2} io {:.2} \
+             (data {:.2}, index {:.2}, filter {:.2}); writer stalled {:.1}% of {elapsed:?}; \
+             {tables} tables at the end",
+            l0_seen as f64 / reads.max(1) as f64,
+            per(self.filter_queries, before.filter_queries),
+            per(self.filter_skips, before.filter_skips),
+            per(self.loads_cached, before.loads_cached),
+            per(self.loads_io, before.loads_io),
+            per(self.data_loads, before.data_loads),
+            per(self.index_loads, before.index_loads),
+            per(self.filter_loads, before.filter_loads),
+            100.0 * stalled.as_secs_f64() / elapsed.as_secs_f64(),
+        );
+    }
+}
+
 fn sustained_ours(
     shape: Sustained,
     compression: Compression,
@@ -2010,6 +2067,13 @@ fn sustained_ours(
         .expect("ours sustained: seed flush");
     drain(&tree, shape.keys);
 
+    #[cfg(feature = "metrics")]
+    let before = Diagnosis::take(&tree);
+    #[cfg(feature = "metrics")]
+    let l0_seen = AtomicU64::new(0);
+    #[cfg(feature = "metrics")]
+    let stalled = AtomicU64::new(0);
+
     let stop = AtomicBool::new(false);
     let watermark = AtomicU64::new(shape.keys);
     let (elapsed, disk, compacted, mut reads) = std::thread::scope(|scope| {
@@ -2031,14 +2095,23 @@ fn sustained_ours(
         });
         let reader = scope.spawn(|| {
             read_while(&stop, keys, |key| {
+                #[cfg(feature = "metrics")]
+                l0_seen.fetch_add(tree.l0_run_count() as u64, Ordering::Relaxed);
                 std::hint::black_box(tree.get(key, MAX_SEQNO).expect("ours sustained: get"));
             })
         });
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
+            #[cfg(feature = "metrics")]
+            let stalled_at = std::time::Instant::now();
             while tree.l0_run_count() >= Sustained::L0_STOP {
                 std::thread::yield_now();
             }
+            #[cfg(feature = "metrics")]
+            stalled.fetch_add(
+                u64::try_from(stalled_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             let seqno = shape.keys + write;
             let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
             tree.insert(key, pool.value(seqno), seqno);
@@ -2054,6 +2127,15 @@ fn sustained_ours(
         let compacted = compactor.join().expect("ours sustained: compactor");
         (elapsed, disk, compacted, reads)
     });
+    #[cfg(feature = "metrics")]
+    Diagnosis::take(&tree).report(
+        &before,
+        reads.len() as u64,
+        l0_seen.load(Ordering::Relaxed),
+        Duration::from_nanos(stalled.load(Ordering::Relaxed)),
+        elapsed,
+        tree.table_count(),
+    );
     (
         elapsed,
         SustainedSample::new(shape, compacted, disk, &mut reads),
