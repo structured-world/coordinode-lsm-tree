@@ -6876,7 +6876,14 @@ impl Table {
     /// table: pages carry no per-KV footer and no inner-frame layout, so those
     /// gates have nothing further to check in a group) together with the
     /// decoded batch.
-    #[cfg(all(feature = "columnar", feature = "std"))]
+    #[cfg(feature = "columnar")]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "reached from the gate-only walk; the verify/scrub consumers are std-gated"
+        )
+    )]
     fn load_row_group_from_disk(
         &self,
         group: &BlockHandle,

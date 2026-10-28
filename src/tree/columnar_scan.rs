@@ -87,7 +87,7 @@
 
 use core::ops::{Bound, RangeBounds};
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 use alloc::borrow::Cow;
 
