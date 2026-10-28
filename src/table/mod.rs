@@ -2548,7 +2548,13 @@ impl Table {
     /// When the directory cannot be read or does not fill the group exactly.
     /// Without it the pages cannot be located, so the whole entry is reported
     /// rather than guessed at.
-    #[cfg(feature = "std")]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "the scrub, heal and reconcile walks that call it are std-gated"
+        )
+    )]
     pub(crate) fn data_unit_blocks(
         &self,
         entry: &BlockHandle,
@@ -2568,7 +2574,14 @@ impl Table {
 
     /// The handles of a row group's directory and pages, read from disk.
     /// See [`Self::data_unit_blocks`].
-    #[cfg(all(feature = "std", feature = "columnar"))]
+    #[cfg(feature = "columnar")]
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            dead_code,
+            reason = "reached only from `data_unit_blocks`, whose callers are std-gated"
+        )
+    )]
     fn row_group_block_handles(
         &self,
         group: &BlockHandle,
