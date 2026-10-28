@@ -125,7 +125,7 @@ impl Arena {
                 // for typical node sizes.  See #119.
                 //
                 // Ensure the block exists BEFORE publishing the offset via
-                // CAS — otherwise another thread could read the cursor,
+                // CAS: otherwise another thread could read the cursor,
                 // compute the same block_idx, and call decode() before the
                 // block pointer is set.
                 self.ensure_block(block_idx as usize);
