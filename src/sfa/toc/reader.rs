@@ -27,14 +27,14 @@ struct ChecksummedReader<R: crate::io::Read> {
 }
 
 impl<R: crate::io::Read> ChecksummedReader<R> {
-    pub fn new(reader: R) -> Self {
+    fn new(reader: R) -> Self {
         Self {
             inner: reader,
             hasher: xxhash_rust::xxh3::Xxh3Default::new(),
         }
     }
 
-    pub fn checksum(&self) -> Checksum {
+    fn checksum(&self) -> Checksum {
         Checksum::from_raw(self.hasher.digest128())
     }
 }
@@ -126,10 +126,13 @@ impl<R: crate::io::Read> crate::io::Read for ChunkedReader<R> {
     }
 }
 
-pub struct TocReader;
+pub(crate) struct TocReader;
 
 impl TocReader {
-    pub fn from_reader<R: Read + Seek>(reader: &mut R, trailer: &ParsedTrailer) -> Result<Toc> {
+    pub(crate) fn from_reader<R: Read + Seek>(
+        reader: &mut R,
+        trailer: &ParsedTrailer,
+    ) -> Result<Toc> {
         use crate::io::LE;
 
         log::trace!("Reading ToC");
