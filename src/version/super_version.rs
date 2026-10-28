@@ -748,9 +748,9 @@ impl SuperVersions {
     /// deferred table's folder is synced by the persist, with the folders of
     /// every table it adds (`sync_new_table_directories`).
     pub(crate) fn sync_files(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
+        Self::sync_each(files, sync_mode)?;
         let mut blob_folders: Vec<(&Arc<dyn Fs>, &Path)> = Vec::new();
         for file in files {
-            file.sync(sync_mode)?;
             let (file_fs, path) = file.location();
             if matches!(file, UnsyncedFile::Blob(_))
                 && let Some(folder) = path.parent()
@@ -772,6 +772,49 @@ impl SuperVersions {
     /// deferred flushes installed versions after it in memory only.
     pub(crate) fn persisted_version(&self) -> &Version {
         &self.persisted
+    }
+
+    /// Syncs every file of `files`, concurrently: syncs of separate files on
+    /// one file system are committed together (a journaling file system
+    /// folds them into one journal commit), so a barrier over many deferred
+    /// flushes waits about as long as for one, where one after another each
+    /// would wait its own commit out.
+    #[cfg(feature = "std")]
+    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
+        /// Syncs in flight at once: enough for a journal commit to fold a
+        /// barrier's worth of them, few enough to stay a handful of threads.
+        const IN_FLIGHT: usize = 16;
+
+        if let [file] = files {
+            return file.sync(sync_mode);
+        }
+        let next = core::sync::atomic::AtomicUsize::new(0);
+        let failed: parking_lot::Mutex<Option<crate::Error>> = parking_lot::Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..files.len().min(IN_FLIGHT) {
+                scope.spawn(|| {
+                    while let Some(file) =
+                        files.get(next.fetch_add(1, core::sync::atomic::Ordering::Relaxed))
+                    {
+                        if let Err(e) = file.sync(sync_mode) {
+                            failed.lock().get_or_insert(e);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        failed.into_inner().map_or(Ok(()), Err)
+    }
+
+    /// Syncs every file of `files`, one after another: no threads without
+    /// `std`.
+    #[cfg(not(feature = "std"))]
+    fn sync_each(files: &[UnsyncedFile], sync_mode: SyncMode) -> crate::Result<()> {
+        for file in files {
+            file.sync(sync_mode)?;
+        }
+        Ok(())
     }
 
     /// The files deferred flushes left unsynced, for a caller to sync before
