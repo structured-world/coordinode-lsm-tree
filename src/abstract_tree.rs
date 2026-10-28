@@ -15,9 +15,9 @@ use alloc::sync::Arc;
 use alloc::{boxed::Box, vec::Vec};
 use core::ops::RangeBounds;
 
-pub type RangeItem = crate::Result<KvPair>;
+pub(crate) type RangeItem = crate::Result<KvPair>;
 
-pub type FlushToTablesResult = (
+pub(crate) type FlushToTablesResult = (
     Vec<Table>,
     Option<Vec<BlobFile>>,
     crate::runtime_config::WritePin,
@@ -81,11 +81,10 @@ pub struct CheckpointInfo {
 // the supported extension surface. Internal flush/version hooks keep evolving
 // with crate-owned tree types and must not create downstream semver traps.
 //
-// `sealed` stays `pub` only so sibling modules in this crate can write
-// `crate::abstract_tree::sealed::Sealed` in their impls. The parent module
-// `abstract_tree` is not publicly exported from the crate root, so downstream
-// crates still cannot name or implement this trait.
-pub mod sealed {
+// `sealed` is crate-visible so sibling modules in this crate can write
+// `crate::abstract_tree::sealed::Sealed` in their impls; downstream crates
+// cannot name or implement this trait.
+pub(crate) mod sealed {
     pub trait Sealed {}
 }
 

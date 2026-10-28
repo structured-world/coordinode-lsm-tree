@@ -3,16 +3,16 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 #[cfg(feature = "columnar")]
-pub mod columnar_scan;
+pub(crate) mod columnar_scan;
 mod data_stage;
-pub mod ingest;
-pub mod inner;
+pub(crate) mod ingest;
+pub(crate) mod inner;
 mod level_resolve;
 mod level_stages;
 mod multi_get_read;
-pub mod read_job;
+pub(crate) mod read_job;
 pub mod resumable;
-pub mod sealed;
+pub(crate) mod sealed;
 mod tables_read;
 
 use crate::path::Path;
@@ -54,7 +54,7 @@ use crate::metrics::Metrics;
 /// [`Tree::compute_write_admission`]). Even with an empty active memtable the
 /// gate keeps at least this much room below the budget so the next writes and a
 /// space-reclaiming compaction have somewhere to land. 1 MiB.
-pub const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+pub(crate) const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
 
 /// How long a cached disk-free sample stays valid before the admission gate
 /// re-probes. Bounds how stale the physical free-space figure can be when the
@@ -491,10 +491,6 @@ fn standard_guard(item: crate::Result<InternalValue>) -> IterGuardImpl {
 /// when it fails before it can open a snapshot (no row, no version to bind a
 /// blob guard to), so the failure reaches the consumer through the same
 /// `Result` it already handles per row.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree as crate::tree::error_guard"
-)]
 pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
     IterGuardImpl::Standard(Guard(Err(e)))
 }
@@ -508,10 +504,6 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
 /// Read before the install publishes the files, recorded once it has
 /// ([`Self::charge`]): an install that fails keeps nothing.
 #[derive(Default)]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree and compaction as crate::tree::InstalledCharge"
-)]
 pub(crate) struct InstalledCharge(Vec<(Arc<crate::fs::WriteIoStats>, crate::fs::WriteOrigin, u64)>);
 
 impl InstalledCharge {
@@ -565,10 +557,6 @@ impl InstalledCharge {
 }
 
 /// Extract owned user-key bounds from any range.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree as crate::tree::range_to_user_bounds"
-)]
 pub(crate) fn range_to_user_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
     range: &R,
 ) -> (Bound<UserKey>, Bound<UserKey>) {
@@ -7134,7 +7122,7 @@ impl Tree {
 /// Who syncs the folders that gain an entry when an open makes a tree's
 /// folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NewFolderNames {
+pub(crate) enum NewFolderNames {
     /// The open, before the tree's first snapshot.
     Synced,
     /// The open's caller, once for a batch of trees after every one of them
@@ -7145,7 +7133,7 @@ pub enum NewFolderNames {
 /// A tree an open made, and what takes it back: its folder on its backend,
 /// the folders that gained an entry making that folder, what the folder held
 /// before the open when it existed, and who syncs those folders.
-pub struct Creation {
+pub(crate) struct Creation {
     path: crate::path::PathBuf,
     fs: Arc<dyn Fs>,
     /// Nearest first; none when the tree folder existed already.
@@ -7162,7 +7150,7 @@ impl Creation {
     /// while its lock is still held, then the folders the open made, once
     /// empty, and the folders that held their names are synced where the open
     /// synced them, so the tree does not come back after a power loss.
-    pub fn take_back(self, tree: Tree) {
+    pub(crate) fn take_back(self, tree: Tree) {
         #[cfg(feature = "std")]
         let lock = tree.0.directory_lock.clone();
         drop(tree);
@@ -7216,7 +7204,9 @@ struct BatchMade {
 /// Opens a tree for each config, making the missing ones, and syncs each
 /// folder that gained a new tree's name once, after all of them: see
 /// [`Config::open_many`].
-pub fn open_batch(configs: impl IntoIterator<Item = Config>) -> crate::Result<Vec<crate::AnyTree>> {
+pub(crate) fn open_batch(
+    configs: impl IntoIterator<Item = Config>,
+) -> crate::Result<Vec<crate::AnyTree>> {
     let mut trees = Vec::new();
     let mut made: Vec<BatchMade> = Vec::new();
     for config in configs {

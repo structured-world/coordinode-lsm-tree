@@ -3,12 +3,13 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 mod accessor;
-pub mod blob_file;
+pub(crate) mod blob_file;
 mod handle;
 
-pub use {
+pub use blob_file::BlobFile;
+
+pub(crate) use {
     accessor::{Accessor, PrefetchInto, Prefetched},
-    blob_file::BlobFile,
     blob_file::merge::MergeScanner as BlobFileMergeScanner,
     blob_file::multi_writer::MultiWriter as BlobFileWriter,
     blob_file::scanner::Scanner as BlobFileScanner,
@@ -137,7 +138,7 @@ fn dedupe_blob_sightings(
     Ok(())
 }
 
-pub fn recover_blob_files(
+pub(crate) fn recover_blob_files(
     folder: &Path,
     ids: &[(BlobFileId, Checksum, u64)],
     tree_id: TreeId,
@@ -322,7 +323,7 @@ pub fn recover_blob_files(
         reason = "single-file blob recovery for the std-gated repair surface; the no_std open path uses recover_blob_files"
     )
 )]
-pub fn recover_blob_file(
+pub(crate) fn recover_blob_file(
     path: &Path,
     id: BlobFileId,
     checksum: Checksum,
@@ -351,7 +352,7 @@ pub fn recover_blob_file(
 /// # Errors
 ///
 /// Propagates any error from opening or parsing the blob file.
-pub fn recover_blob_file_from(
+pub(crate) fn recover_blob_file_from(
     path: &Path,
     id: BlobFileId,
     checksum: Checksum,
@@ -394,7 +395,7 @@ pub fn recover_blob_file_from(
         reason = "the single-file recovery's inputs plus where its descriptor is kept"
     )
 )]
-pub fn recover_blob_file_cached(
+pub(crate) fn recover_blob_file_cached(
     path: &Path,
     id: BlobFileId,
     checksum: Checksum,
@@ -463,7 +464,7 @@ pub fn recover_blob_file_cached(
 }
 
 /// The unique identifier for a value log blob file.
-pub type BlobFileId = u64;
+pub(crate) type BlobFileId = u64;
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test code")]

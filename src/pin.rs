@@ -357,7 +357,7 @@ impl Drop for PinnedVersion {
 /// Builds the tree at `config.path` from a pin's files, its
 /// [`layout`](PinnedVersion::layout) and its memtable contents; see
 /// [`Config::restore_pinned`](crate::Config::restore_pinned).
-pub fn restore(
+pub(crate) fn restore(
     config: crate::Config,
     layout: &[u8],
     entries: impl IntoIterator<Item = PinnedEntry>,

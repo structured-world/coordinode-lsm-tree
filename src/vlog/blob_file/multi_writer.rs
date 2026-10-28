@@ -23,7 +23,7 @@ use core::sync::atomic::AtomicBool;
 mod tests;
 
 /// Blob file writer, may write multiple blob files
-pub struct MultiWriter {
+pub(crate) struct MultiWriter {
     fs: Arc<dyn Fs>,
 
     folder: PathBuf,
@@ -115,7 +115,7 @@ impl MultiWriter {
     ///
     /// Will return `Err` if an IO error occurs.
     #[cfg(test)]
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn new<P: AsRef<Path>>(
         id_generator: SequenceNumberCounter,
         folder: P,
         tree_id: TreeId,
@@ -250,7 +250,7 @@ impl MultiWriter {
     /// Wires the tree's `Config::sync_mode` through to every blob file this
     /// writer finalizes (active + rotated).
     #[must_use]
-    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+    pub(crate) fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.active_writer.sync_mode = sync_mode;
         self
@@ -278,7 +278,7 @@ impl MultiWriter {
     /// Wires the tree's `Config::writeback_bytes` through to every blob file
     /// this writer writes (active + rotated).
     #[must_use]
-    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self.active_writer = self.active_writer.use_writeback_bytes(bytes);
         self
@@ -286,7 +286,7 @@ impl MultiWriter {
 
     /// Sets the blob file target size.
     #[must_use]
-    pub fn use_target_size(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_target_size(mut self, bytes: u64) -> Self {
         self.target_size = bytes;
         self
     }
@@ -417,7 +417,7 @@ impl MultiWriter {
     /// Sets the compression method.
     #[must_use]
     #[doc(hidden)]
-    pub fn use_compression(mut self, compression: CompressionType) -> Self {
+    pub(crate) fn use_compression(mut self, compression: CompressionType) -> Self {
         self.compression.clone_from(&compression);
         self.active_writer.compression = compression;
         self
@@ -429,7 +429,7 @@ impl MultiWriter {
     /// files produced by this `MultiWriter` use the same dictionary.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionary(
+    pub(crate) fn use_zstd_dictionary(
         mut self,
         dict: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
@@ -445,7 +445,7 @@ impl MultiWriter {
     /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+    pub(crate) fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
         self.active_writer = self.active_writer.use_zstd_two_pass_seed(enabled);
         self.zstd_two_pass_seed = enabled;
         self
@@ -459,7 +459,10 @@ impl MultiWriter {
     /// through: the handle a reader gets must carry its own dictionary.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionaries(mut self, dicts: crate::compression::ZstdDictionaries) -> Self {
+    pub(crate) fn use_zstd_dictionaries(
+        mut self,
+        dicts: crate::compression::ZstdDictionaries,
+    ) -> Self {
         self.zstd_dictionaries = dicts;
         self
     }
@@ -628,7 +631,12 @@ impl MultiWriter {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
-    pub fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<ValueHandle> {
+    pub(crate) fn write(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+    ) -> crate::Result<ValueHandle> {
         self.enter_key(key)?;
         let target_size = self.target_size;
 

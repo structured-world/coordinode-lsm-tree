@@ -140,7 +140,7 @@ use crate::path::Path;
 /// until that install, which is also the one that drops a file a compaction
 /// consumed, so holding it keeps no file on disk longer.
 #[derive(Clone)]
-pub enum UnsyncedFile {
+pub(crate) enum UnsyncedFile {
     /// A table.
     Table(crate::Table),
     /// A blob file.
@@ -220,7 +220,7 @@ pub struct SuperVersion {
 /// caller suspends for as long as it likes. The mirror needs `arc-swap`, so
 /// under no-std a read always clones the current version out of the locked
 /// history.
-pub enum SnapshotRef {
+pub(crate) enum SnapshotRef {
     /// The current snapshot, pinned by the mirror's load guard.
     #[cfg(feature = "std")]
     Latest(arc_swap::Guard<Arc<SuperVersion>>),
@@ -249,7 +249,7 @@ impl core::ops::Deref for SnapshotRef {
 /// loses what an older snapshot read has to raise it, or that snapshot would be
 /// answered from data that is gone.
 #[derive(Clone, Copy, Debug)]
-pub enum RetentionEffect {
+pub(crate) enum RetentionEffect {
     /// Every snapshot the prior version served stays servable after a
     /// reopen: the install only adds or moves data (flush, ingest, trivial
     /// move, checksum refresh, blob relocation).

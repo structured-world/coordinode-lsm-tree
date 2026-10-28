@@ -179,10 +179,6 @@ pub trait SeekableGuardIter: DoubleEndedIterator<Item = IterGuardImpl> + Send {
 /// seeks are accepted and ignored, since there is no pipeline to reposition.
 /// [`peek_key`](SeekableGuardIter::peek_key) consumes the error, as it does
 /// on the live iterator (`crate::Error` is not `Clone`).
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from tree / blob_tree as crate::iter_guard::FailedSeekable"
-)]
 pub(crate) struct FailedSeekable {
     err: Option<crate::Error>,
 }

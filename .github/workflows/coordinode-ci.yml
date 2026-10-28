@@ -176,7 +176,7 @@ jobs:
           # source code — skipping the real validation on a PR that
           # touches only those files would defeat the purpose of the
           # required-check gate.
-          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|fuzz/|\.github/workflows/coordinode-ci\.yml$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
+          CODE_RE='^(src/|tests/|benches/|examples/|test_fixture/|build\.rs$|Cargo\.toml$|Cargo\.lock$|tools/|fuzz/|\.github/workflows/coordinode-ci\.yml$|\.github/scripts/unreachable-pub-ratchet\.sh$|\.github/unreachable-pub-baseline$|rust-toolchain(\.toml)?$|\.cargo/|\.config/nextest\.toml$|\.rustfmt\.toml$|clippy\.toml$)'
           if printf '%s\n' "$CHANGED" | grep -qE "$CODE_RE"; then
             emit_and_exit "true" "code paths affected — running real CI"
           else
@@ -197,6 +197,10 @@ jobs:
     if: ${{ always() && !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    # The visibility ratchet below reads the PR's file list; nothing is written.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       # Pinning policy: first-party actions (actions/*, dependabot/*) track a
       # MAJOR tag; third-party actions stay pinned to a commit digest with a
@@ -264,6 +268,27 @@ jobs:
         # unnoticed until its tests stopped compiling altogether. Lint both, or
         # the one nobody builds is the one that breaks.
         run: cargo clippy --all-targets -- -D warnings
+      - name: Visibility ratchet
+        # rustc's `unreachable_pub`: an item no other crate can reach is
+        # written `pub(crate)`. The crate gets there file by file: a file a PR
+        # touches carries no warning, and the count over the crate matches
+        # `.github/unreachable-pub-baseline`, which only goes down.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          files=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Read into a variable first: a failed call then fails the step
+            # instead of leaving the touched-file check with nothing to check.
+            list=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+              --jq '.[] | select(.status != "removed") | .filename')
+            mapfile -t files <<<"$list"
+          fi
+          .github/scripts/unreachable-pub-ratchet.sh "${files[@]}"
       - name: Clippy (db_bench)
         # The workspace gates above cover MEMBERS only, and the tool crates
         # carry their own `[workspace]`, so nothing was linting this one. Its

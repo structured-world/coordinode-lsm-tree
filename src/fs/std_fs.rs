@@ -746,12 +746,7 @@ impl Fs for StdFs {
 /// misconfigurations. Operators hitting that edge case on Windows can
 /// fix it explicitly (move the target volume, adjust ACLs); the
 /// fall-back is opt-out by design.
-// `pub(crate)`, surfaced crate-wide via the `pub(crate) use` re-export in
-// `fs/mod.rs` so `checkpoint::link_or_copy_cross_fs` can detect cross-device
-// errors. The crate-scoped visibility (not `pub`) keeps this off any public
-// surface even if `std_fs` is ever exported. clippy's `redundant_pub_crate`
-// fires only because the enclosing module is currently private; the re-export
-// genuinely needs crate visibility, so the lint is a false positive here.
+///
 /// Cross-device detection on a raw `std::io::Error`, where the errno is still
 /// available. Used by [`StdFs::hard_link`] to NORMALISE a cross-device link
 /// failure into [`crate::io::ErrorKind::CrossesDevices`] before the error
@@ -781,10 +776,6 @@ fn is_std_cross_device(err: &std::io::Error) -> bool {
 /// Cross-device detection on a [`crate::io::Error`] (post-`Fs`-boundary, no
 /// errno). [`StdFs::hard_link`] normalises the raw errno case to the
 /// `CrossesDevices` kind, so a kind check is authoritative here.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "re-exported crate-wide via fs::mod; pub(crate) communicates the intended scope"
-)]
 pub(crate) fn is_cross_device(err: &io::Error) -> bool {
     matches!(
         err.kind(),

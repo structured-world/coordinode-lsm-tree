@@ -68,7 +68,11 @@ fn blob_link_name(id: crate::vlog::BlobFileId) -> String {
 /// `AlreadyExists` and contradict the "partial cleanup" contract.
 ///
 /// The caller's parent path must exist; this function does not recurse.
-pub fn prepare_target(target: &Path, include_blobs: bool, target_fs: &dyn Fs) -> crate::Result<()> {
+pub(crate) fn prepare_target(
+    target: &Path,
+    include_blobs: bool,
+    target_fs: &dyn Fs,
+) -> crate::Result<()> {
     // Atomic claim — fails with AlreadyExists if any other process /
     // thread / prior checkpoint already created the directory.
     target_fs.create_dir(target).map_err(|e| {
@@ -152,7 +156,7 @@ impl Drop for RootCleanup<'_> {
 /// destination could let the kernel resolve `src` against the host
 /// filesystem and silently link an unrelated file). `Fs::backend_id`
 /// is the explicit capability check that catches both cases safely.
-pub fn link_or_copy_cross_fs(
+pub(crate) fn link_or_copy_cross_fs(
     src_fs: &Arc<dyn Fs>,
     src: &Path,
     dst_fs: &Arc<dyn Fs>,
@@ -338,7 +342,7 @@ pub fn link_or_copy_cross_fs(
 /// Returns `(count, total_bytes)`. Tables on routed tiers
 /// (`level_routes`) keep their original storage backend on the source
 /// side; the destination is always the checkpoint's primary [`Fs`].
-pub fn link_tables(
+pub(crate) fn link_tables(
     version: &Version,
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
@@ -408,7 +412,7 @@ pub fn link_tables(
 /// Returns `(count, total_bytes)`. Blob files always live under the
 /// tree's primary path (no per-level routing today), so the source `Fs`
 /// is `target_fs`'s counterpart on the source tree.
-pub fn link_blob_files(
+pub(crate) fn link_blob_files(
     blob_files: impl IntoIterator<Item = BlobFile>,
     target_root: &Path,
     target_fs: &Arc<dyn Fs>,
@@ -513,7 +517,7 @@ fn link_dictionaries(
 /// the captured `version.id()` (NOT the source's newest), so a concurrent
 /// install of `v<N+1>` on the source can never leave the checkpoint naming
 /// a version whose tables it did not link.
-pub fn copy_metadata(
+pub(crate) fn copy_metadata(
     target_fs: &dyn Fs,
     target_root: &Path,
     version: &crate::version::Version,
@@ -558,7 +562,7 @@ pub fn copy_metadata(
 
 /// Inputs to [`run_checkpoint`] bundled together to keep the function
 /// signature within clippy's `too_many_arguments` budget.
-pub struct CheckpointParams<'a> {
+pub(crate) struct CheckpointParams<'a> {
     /// Destination root directory for the checkpoint.
     pub target_root: &'a Path,
     /// `Fs` backend that owns `target_root`.
@@ -637,7 +641,7 @@ impl Drop for PartialCheckpointGuard<'_> {
 /// Common driver shared by [`Tree`](crate::Tree) and
 /// [`BlobTree`](crate::BlobTree). Performs the flush + link + metadata
 /// copy under a held [`Pause`](crate::deletion_pause::Pause) guard.
-pub fn run_checkpoint<T: AbstractTree>(
+pub(crate) fn run_checkpoint<T: AbstractTree>(
     tree: &T,
     params: &CheckpointParams<'_>,
 ) -> crate::Result<CheckpointInfo> {

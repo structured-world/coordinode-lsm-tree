@@ -31,7 +31,7 @@
 /// was `old` to `new_payload`, keeping the place the block is bound to: that
 /// binding is what the stored checksum differs from the old payload's by, so
 /// a forge re-stamps a block without knowing its table or offset.
-pub fn restamp(
+pub(crate) fn restamp(
     header: crate::table::block::Header,
     old: u128,
     new_payload: &[u8],
@@ -47,7 +47,7 @@ pub fn restamp(
 /// offset)` `from` to `to`, to its new place. Models a forger who relocates a
 /// block and recomputes its unkeyed checksum, so the test reaches the check
 /// behind it.
-pub fn rebind_moved_frame(
+pub(crate) fn rebind_moved_frame(
     frame: &mut [u8],
     (from_table, from): (crate::TableId, u64),
     (to_table, to): (crate::TableId, u64),
@@ -63,7 +63,7 @@ pub fn rebind_moved_frame(
 /// [`rebind_moved_frame`] for every frame of a run of parity-less blocks (a
 /// row group: directory, pages, zone block) moved within table `table_id`
 /// from `from` to `to`.
-pub fn rebind_moved_extent(
+pub(crate) fn rebind_moved_extent(
     extent: &mut [u8],
     table_id: crate::TableId,
     from: u64,
@@ -96,10 +96,7 @@ fn payload_hash(bytes: &[u8], range: core::ops::Range<usize>) -> u128 {
 ///
 /// The SST must be uncompressed (the payload is patched in place) and
 /// footer-bearing (written under `KvChecksumPolicy::AllLevels`).
-// `pub` (not `pub(crate)`): the module itself is `pub(crate)`, so the item
-// stays crate-internal either way and clippy::redundant_pub_crate fires on
-// the doubled restriction.
-pub fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
+pub(crate) fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
     use crate::table::block::kv_checksum::FOOTER_TAIL_LEN;
     // The LAST byte of the digest array, just before the fixed algo+count
     // tail — the footer stays structurally intact.
@@ -111,7 +108,7 @@ pub fn forge_stale_kv_footer(path: &std::path::Path) -> crate::Result<()> {
 /// no longer match what the manifest digest was computed over. For an
 /// uncompressed, footer-less SST this models an in-band alteration only the
 /// manifest-level digest can catch.
-pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
+pub(crate) fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
     flip_and_restamp_first_data_block(path, 1)
 }
 
@@ -127,7 +124,7 @@ pub fn forge_restamped_data_block(path: &std::path::Path) -> crate::Result<()> {
 /// the only remaining trace is the duplicate name. `from` and `to` may
 /// differ in length (the TOC is rebuilt). The payload is untouched, so its
 /// parity trailer still verifies.
-pub fn forge_duplicate_section_name(
+pub(crate) fn forge_duplicate_section_name(
     path: &std::path::Path,
     from: &[u8],
     to: &[u8],
@@ -273,7 +270,11 @@ pub fn forge_duplicate_section_name(
 /// A `len` change does not move the entry, so the TOC and every later section
 /// stay byte-for-byte in place; only the eight length bytes and the trailer
 /// digest change.
-pub fn forge_section_len(path: &std::path::Path, name: &[u8], new_len: u64) -> crate::Result<()> {
+pub(crate) fn forge_section_len(
+    path: &std::path::Path,
+    name: &[u8],
+    new_len: u64,
+) -> crate::Result<()> {
     let mut bytes = std::fs::read(path)?;
     const TRAILER_SIZE: usize = 4 + 1 + 1 + 16 + 8 + 8;
     let trailer_start = bytes.len() - TRAILER_SIZE;
@@ -344,7 +345,11 @@ pub fn forge_section_len(path: &std::path::Path, name: &[u8], new_len: u64) -> c
 /// verifier knows disappears behind an unrecognized name — the shape only a
 /// fail-closed unknown-section check can catch (every block inside still
 /// passes its own byte-level checks).
-pub fn forge_section_name(path: &std::path::Path, from: &[u8], to: &[u8]) -> crate::Result<()> {
+pub(crate) fn forge_section_name(
+    path: &std::path::Path,
+    from: &[u8],
+    to: &[u8],
+) -> crate::Result<()> {
     assert_eq!(from.len(), to.len(), "the rename must keep the name length");
 
     let mut bytes = std::fs::read(path)?;
@@ -424,7 +429,7 @@ pub fn forge_section_name(path: &std::path::Path, from: &[u8], to: &[u8]) -> cra
 /// vanishes from every reader's sight (its bytes are still in the file, but
 /// nothing references them) — the shape only a TOC coverage check can catch,
 /// since every remaining block still passes its own byte-level checks.
-pub fn forge_section_omitted(path: &std::path::Path, name: &[u8]) -> crate::Result<()> {
+pub(crate) fn forge_section_omitted(path: &std::path::Path, name: &[u8]) -> crate::Result<()> {
     let bytes = std::fs::read(path)?;
     // SFA trailer layout (fixed size, at the very end of the file):
     // magic "SFA!" | version u8 | checksum_type u8 | toc_checksum u128 LE |
@@ -508,7 +513,7 @@ pub fn forge_section_omitted(path: &std::path::Path, name: &[u8]) -> crate::Resu
 /// a full mirror comparison can catch. The key must be present verbatim
 /// (meta blocks use restart interval 1) with a one-byte length prefix
 /// matching `forged_value.len()`.
-pub fn forge_tail_meta_value(
+pub(crate) fn forge_tail_meta_value(
     path: &std::path::Path,
     key: &[u8],
     forged_value: &[u8],
@@ -519,7 +524,7 @@ pub fn forge_tail_meta_value(
 /// As [`forge_tail_meta_value`], but on the EARLY `meta_mid` mirror. Lets a
 /// test give the two mirrors DIFFERENT forged values, which is what arbitration
 /// between them is judged on.
-pub fn forge_mid_meta_value(
+pub(crate) fn forge_mid_meta_value(
     path: &std::path::Path,
     key: &[u8],
     forged_value: &[u8],
@@ -531,7 +536,7 @@ pub fn forge_mid_meta_value(
 /// and `meta_mid`) so the copies stay CONSISTENT with each other: the mirror
 /// comparison passes and only a cross-check of the decoded field against the
 /// table's actual data can catch the forge.
-pub fn forge_meta_value_both_mirrors(
+pub(crate) fn forge_meta_value_both_mirrors(
     path: &std::path::Path,
     key: &[u8],
     forged_value: &[u8],
@@ -647,7 +652,7 @@ fn forge_meta_value_in_section(
 /// NO parity trailer: this helper re-stamps only the header checksum (unlike
 /// [`forge_tail_meta_value`]), so a parity-bearing block would additionally
 /// read as parity rot rather than as a clean-but-under-decoding block.
-pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
+pub(crate) fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
 
@@ -708,7 +713,7 @@ pub fn forge_inflated_item_count(path: &std::path::Path) -> crate::Result<()> {
 /// forge that only a section-vs-role cross-check can catch. The forged
 /// type must have the same header length as the original (all SST block
 /// types without `block_flags` do).
-pub fn forge_section_block_role(
+pub(crate) fn forge_section_block_role(
     path: &std::path::Path,
     section: &[u8],
     forged: crate::table::block::BlockType,
@@ -762,7 +767,7 @@ pub fn forge_section_block_role(
 /// `zone_map` section the last payload byte is the last byte of the final
 /// block's `max` value, so this narrows/changes a recorded key range.
 /// `shards` is the SST's descriptor scheme (`None` for a parity-less table).
-pub fn forge_flip_section_last_payload_byte(
+pub(crate) fn forge_flip_section_last_payload_byte(
     path: &std::path::Path,
     section: &[u8],
     shards: Option<(u8, u8)>,
@@ -852,7 +857,7 @@ pub fn forge_flip_section_last_payload_byte(
 /// byte-level check reads clean while the decoded content disagrees with the
 /// blocks it describes. `shards` is the SST's descriptor scheme (`None` for a
 /// parity-less table).
-pub fn forge_replace_section_payload(
+pub(crate) fn forge_replace_section_payload(
     path: &std::path::Path,
     section: &[u8],
     new_payload: &[u8],
@@ -939,7 +944,7 @@ pub fn forge_replace_section_payload(
 /// — the manifest digest is the only remaining record of the original value
 /// bytes. `shards` is the SST's descriptor scheme (`None` for a parity-less
 /// table).
-pub fn forge_value_byte_in_first_data_block(
+pub(crate) fn forge_value_byte_in_first_data_block(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,
 ) -> crate::Result<()> {
@@ -1065,7 +1070,7 @@ pub fn forge_value_byte_in_first_data_block(
 /// real inner-block layout — the shape only a decode-derived cross-check
 /// can catch. `shards` is the SST's descriptor scheme (`None` for a
 /// parity-less table).
-pub fn forge_block_layout_shift_middle_end(
+pub(crate) fn forge_block_layout_shift_middle_end(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,
 ) -> crate::Result<()> {
@@ -1144,7 +1149,7 @@ pub fn forge_block_layout_shift_middle_end(
 /// re-parsed with `has_kv_footer = true` unconditionally, so a footer-less
 /// block would misread its trailer. `shards` is the SST's descriptor
 /// scheme (`None` for a parity-less table).
-pub fn forge_hash_index_all_free(
+pub(crate) fn forge_hash_index_all_free(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,
 ) -> crate::Result<()> {
@@ -1160,7 +1165,7 @@ pub fn forge_hash_index_all_free(
 /// Every logical entry and the per-KV footer stay valid; only a
 /// newest-version cross-check of the point-read result can catch it. Same
 /// preconditions as [`forge_hash_index_all_free`].
-pub fn forge_hash_index_bucket(
+pub(crate) fn forge_hash_index_bucket(
     path: &std::path::Path,
     key: &[u8],
     binary_index_pos: u8,
@@ -1296,7 +1301,7 @@ fn patch_first_data_block_hash_index(
 /// table's first key). The table must be unencrypted (the payload is probed
 /// as plaintext). `shards` is the SST's descriptor scheme (`None` for a
 /// parity-less table).
-pub fn forge_filter_false_negative(
+pub(crate) fn forge_filter_false_negative(
     path: &std::path::Path,
     target_hash: u64,
     shards: Option<(u8, u8)>,
@@ -1404,7 +1409,7 @@ pub fn forge_filter_false_negative(
 /// block for any window above zero — the shape only a cross-check against
 /// the block's actually-decoded entries can catch. `shards` is the SST's
 /// descriptor scheme (`None` for a parity-less table).
-pub fn forge_seqno_bounds_zeroed_entry(
+pub(crate) fn forge_seqno_bounds_zeroed_entry(
     path: &std::path::Path,
     shards: Option<(u8, u8)>,
 ) -> crate::Result<()> {
@@ -1503,7 +1508,7 @@ pub fn forge_seqno_bounds_zeroed_entry(
 /// clean, yet the map records bounds for zero blocks even though the table
 /// still holds data blocks. The SST must be PLAIN (no compression / encryption
 /// / parity on the section) so the forged frame matches the reader's transform.
-pub fn forge_seqno_bounds_empty(
+pub(crate) fn forge_seqno_bounds_empty(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -1536,7 +1541,7 @@ pub fn forge_seqno_bounds_empty(
 /// table's encryption provider for a keyed SST (the forged block is AEAD-sealed
 /// under the `block_layout` block type so the verifier decodes it), or `None`
 /// for a plaintext SST; the section carries no compression / parity either way.
-pub fn forge_block_layout_empty(
+pub(crate) fn forge_block_layout_empty(
     path: &std::path::Path,
     table_id: crate::TableId,
     encryption: Option<&dyn crate::encryption::EncryptionProvider>,
@@ -1589,7 +1594,7 @@ pub fn forge_block_layout_empty(
 /// section does not decode, or when its first entry has fewer than three
 /// boundaries (no interior end to move).
 #[cfg(feature = "zstd")]
-pub fn forge_block_layout_shifted_end(
+pub(crate) fn forge_block_layout_shifted_end(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -1674,7 +1679,10 @@ pub fn forge_block_layout_shifted_end(
 /// byte-level check reads clean, yet the map records stats for zero blocks even
 /// though the table carries data. The SST must be PLAIN (no compression /
 /// encryption / parity on the section block).
-pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) -> crate::Result<()> {
+pub(crate) fn forge_zone_map_empty(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
     use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
 
     let mut payload = Vec::new();
@@ -1703,7 +1711,7 @@ pub fn forge_zone_map_empty(path: &std::path::Path, table_id: crate::TableId) ->
 /// section visible (so the concealment guards stay exempt) while carrying no
 /// positions, which would let a masked salvage re-emit every deleted row live.
 /// The SST must be PLAIN (no encryption / parity on the section block).
-pub fn forge_delete_bitmap_empty(
+pub(crate) fn forge_delete_bitmap_empty(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -1733,7 +1741,7 @@ pub fn forge_delete_bitmap_empty(
 /// encoded length (and cardinality) identical — passing the count-only
 /// cross-check — while its CONTENTS differ, modelling an equal-cardinality
 /// substitution that resurrects different rows. The SST must be PLAIN.
-pub fn forge_delete_bitmap_substitute(
+pub(crate) fn forge_delete_bitmap_substitute(
     path: &std::path::Path,
     table_id: crate::TableId,
     positions: &[u32],
@@ -1768,7 +1776,10 @@ pub fn forge_delete_bitmap_substitute(
 /// full `filter`: the read-path probe reports `Ok(true)` for every key on an
 /// empty payload, so the relabel would launder the deletion metadata unnoticed.
 /// The SST must be PLAIN (no encryption / parity on the section block).
-pub fn forge_filter_empty(path: &std::path::Path, table_id: crate::TableId) -> crate::Result<()> {
+pub(crate) fn forge_filter_empty(
+    path: &std::path::Path,
+    table_id: crate::TableId,
+) -> crate::Result<()> {
     use crate::table::block::{Block, BlockIdentity, BlockTransform, BlockType};
 
     let identity = BlockIdentity {
@@ -1796,7 +1807,7 @@ pub fn forge_filter_empty(path: &std::path::Path, table_id: crate::TableId) -> c
 /// addresses an empty partition (a relabeled `delete_bitmap`): the read-path probe
 /// answers `Ok(true)` for every key it covers. The SST must be PLAIN and
 /// parity-less (the partition block carries no compression / encryption / ECC).
-pub fn forge_filter_first_partition_empty(path: &std::path::Path) -> crate::Result<()> {
+pub(crate) fn forge_filter_first_partition_empty(path: &std::path::Path) -> crate::Result<()> {
     use crate::coding::{Decode, Encode};
     use crate::table::block::Header;
 
@@ -1854,7 +1865,7 @@ pub fn forge_filter_first_partition_empty(path: &std::path::Path) -> crate::Resu
 /// advanced by the framed size (before loading) would skip every block up to
 /// `forged_end_off`. The SST must be unencrypted with a parity-less data
 /// section (the span is computed as `header_len + data_length`).
-pub fn forge_data_block_oversized_header(
+pub(crate) fn forge_data_block_oversized_header(
     path: &std::path::Path,
     block_off: u64,
     forged_end_off: u64,
@@ -1901,7 +1912,7 @@ pub fn forge_data_block_oversized_header(
 /// unencrypted and its index uncompressed; `ecc` is the table's descriptor
 /// scheme (`None` for a parity-less SST) so the forged block carries valid
 /// parity where the original did.
-pub fn forge_tli_tail_truncated(
+pub(crate) fn forge_tli_tail_truncated(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -1914,7 +1925,7 @@ pub fn forge_tli_tail_truncated(
 /// `tli_tail`) so the copies stay CONSISTENT with each other: the decoded
 /// mirror comparison passes and only a structural check of the handle list
 /// against the physical data section can catch the dropped handle.
-pub fn forge_tli_mirrors_truncated(
+pub(crate) fn forge_tli_mirrors_truncated(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -1934,7 +1945,7 @@ pub fn forge_tli_mirrors_truncated(
 /// existing keys. Only a cross-check of each separator against the
 /// addressed block's decoded final key can catch it. The SST must be
 /// unencrypted, its index uncompressed, and carry >= 2 data blocks.
-pub fn forge_tli_mirrors_lower_first_separator(
+pub(crate) fn forge_tli_mirrors_lower_first_separator(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -1966,7 +1977,7 @@ pub fn forge_tli_mirrors_lower_first_separator(
 /// on seeks after reopen. Only a comparison of each pointer against the
 /// sequentially derived restart heads can catch it. The SST must be
 /// unencrypted, its index uncompressed, and carry >= 2 data blocks.
-pub fn forge_tli_binary_index_pointer(
+pub(crate) fn forge_tli_binary_index_pointer(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -2022,7 +2033,7 @@ pub fn forge_tli_binary_index_pointer(
 /// the source's precision byte, so forging an `Entry` / `Block`-precision
 /// SST would silently change its slot semantics. `table_id` is the SST's
 /// id (0 for a standalone Writer fixture).
-pub fn forge_locator_slots(
+pub(crate) fn forge_locator_slots(
     path: &std::path::Path,
     table_id: crate::TableId,
     entries: &[(u64, u64, u64)],
@@ -2062,7 +2073,7 @@ pub fn forge_locator_slots(
 /// index-driven check and only a physical data-section walk can find it.
 /// The SST must be unencrypted, non-ECC, and carry a zone map with >= 2
 /// entries.
-pub fn forge_zone_map_drop_last_entry(
+pub(crate) fn forge_zone_map_drop_last_entry(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -2145,7 +2156,7 @@ pub fn forge_zone_map_drop_last_entry(
 /// still passes, but `ColumnRangePredicate::can_skip_block` would then read
 /// those key bounds as value-column stats and skip blocks holding matching
 /// rows. The SST must be uncompressed and unencrypted.
-pub fn forge_zone_map_column_id(
+pub(crate) fn forge_zone_map_column_id(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -2299,7 +2310,7 @@ fn tli_forge_frame(
 /// equal and every remaining handle is intact — only a physical tiling
 /// cross-check can notice the interior gap. The SST must be unencrypted,
 /// its index uncompressed, and carry >= 3 data blocks.
-pub fn forge_tli_mirrors_drop_interior(
+pub(crate) fn forge_tli_mirrors_drop_interior(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -2325,7 +2336,7 @@ pub fn forge_tli_mirrors_drop_interior(
 /// per-handle comparison against the physical block frame can catch it.
 /// The SST must be unencrypted, non-ECC, its index uncompressed, and
 /// carry >= 2 data blocks.
-pub fn forge_tli_mirrors_span_single_handle(
+pub(crate) fn forge_tli_mirrors_span_single_handle(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -2360,7 +2371,7 @@ pub fn forge_tli_mirrors_span_single_handle(
 /// would scan the whole space between the section and that offset (an unbounded
 /// hang, and later SST sections read as candidate data frames). The SST must be
 /// unencrypted and its index uncompressed, and carry >= 2 data blocks.
-pub fn forge_tli_mirrors_offset_beyond_section(
+pub(crate) fn forge_tli_mirrors_offset_beyond_section(
     path: &std::path::Path,
     table_id: crate::TableId,
 ) -> crate::Result<()> {
@@ -2391,7 +2402,7 @@ pub fn forge_tli_mirrors_offset_beyond_section(
 /// probe, once via the handle) unless it re-sorts and skips covered spans.
 /// The SST must be unencrypted, its index uncompressed, and carry >= 2
 /// data blocks.
-pub fn forge_tli_mirrors_swap_first_two(
+pub(crate) fn forge_tli_mirrors_swap_first_two(
     path: &std::path::Path,
     table_id: crate::TableId,
     ecc: Option<crate::table::block::EccParams>,
@@ -2642,7 +2653,7 @@ fn replace_section_frame(
 /// A block-format `new_payload` is written unbound and bound where it lands;
 /// every block the splice moves is re-bound in table `table_id`, whose blocks
 /// carry the `ecc` scheme.
-pub fn forge_rename_and_replace_section(
+pub(crate) fn forge_rename_and_replace_section(
     path: &std::path::Path,
     (from, to): (&[u8], &[u8]),
     new_payload: &[u8],
@@ -2886,7 +2897,7 @@ fn flip_and_restamp_first_data_block(
 /// helper edits the raw payload and re-stamps only the block-header checksum, so
 /// it neither decrypts/re-encrypts the payload nor regenerates any Page-ECC
 /// parity trailer.
-pub fn forge_raise_data_block_first_seqno(
+pub(crate) fn forge_raise_data_block_first_seqno(
     path: &std::path::Path,
     block_off: usize,
     new_seqno: u8,

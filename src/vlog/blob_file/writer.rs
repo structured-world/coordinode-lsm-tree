@@ -117,13 +117,13 @@ pub(super) fn encode_value<'v>(
 /// supports exactly one on-disk format (see [`crate::FormatVersion`]) — a
 /// frame under any other magic (including the retired pre-V5 `b"BLOB"`
 /// layout without a header CRC) is corruption, not a compat case.
-pub const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
+pub(crate) const BLOB_HEADER_MAGIC: &[u8] = b"BLO4";
 
 /// Blob frame header length: 42 bytes, `header_crc` included. The fields sum to
 /// 42: 4 (magic), 16 (u128 checksum), 8 (seqno), 2 (key len), 4 (real val len),
 /// 4 (on-disk val len), 4 (header crc). Pinned by the reader tests
 /// (`assert_eq!(BLOB_HEADER_LEN, 42)`).
-pub const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
+pub(crate) const BLOB_HEADER_LEN: usize = BLOB_HEADER_MAGIC.len()
     + core::mem::size_of::<u128>() // Checksum
     + core::mem::size_of::<u64>() // SeqNo
     + core::mem::size_of::<u16>() // Key length
@@ -173,7 +173,7 @@ pub(super) fn validate_header_crc(
 }
 
 /// Blob file writer
-pub struct Writer {
+pub(crate) struct Writer {
     pub(crate) tree_id: TreeId,
     pub path: PathBuf,
     pub(crate) blob_file_id: BlobFileId,
@@ -246,7 +246,7 @@ impl Writer {
     ///
     /// Will return `Err` if an IO error occurs.
     #[cfg(test)]
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn new<P: AsRef<Path>>(
         path: P,
         blob_file_id: BlobFileId,
         tree_id: TreeId,
@@ -332,14 +332,14 @@ impl Writer {
         })
     }
 
-    pub fn use_compression(mut self, compressor: CompressionType) -> Self {
+    pub(crate) fn use_compression(mut self, compressor: CompressionType) -> Self {
         self.compression = compressor;
         self
     }
 
     /// Wires the tree's `Config::sync_mode` into the final blob-file fsync.
     #[must_use]
-    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+    pub(crate) fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self
     }
@@ -355,7 +355,7 @@ impl Writer {
     /// ([`FsFile::start_writeback`]), so its final sync is short; `0` starts
     /// none.
     #[must_use]
-    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self
     }
@@ -413,7 +413,7 @@ impl Writer {
     /// effect below level 19, where another strategy applies.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+    pub(crate) fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
         self.zstd_two_pass_seed = enabled;
         self
     }
@@ -424,7 +424,7 @@ impl Writer {
     /// `ZstdDict`.  Passing `None` clears a previously set dictionary.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionary(
+    pub(crate) fn use_zstd_dictionary(
         mut self,
         dict: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
@@ -613,7 +613,7 @@ impl Writer {
     /// # Panics
     ///
     /// Panics if the key length is empty or greater than 2^16, or the value length is greater than 2^32.
-    pub fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<u32> {
+    pub(crate) fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<u32> {
         #[expect(clippy::cast_possible_truncation, reason = "values are u32 max")]
         self.write_raw(key, seqno, value, value.len() as u32)
     }

@@ -120,6 +120,13 @@
 // would obscure the scenario. The lint is only reached under
 // `--all-targets`, which lints test bodies.
 #![allow(clippy::too_many_lines)]
+// An item no other crate can reach is written `pub(crate)`, so its visibility
+// holds even if the module around it is ever made public. That is rustc's
+// `unreachable_pub`, which `redundant_pub_crate` contradicts item for item.
+// CI holds the count of `unreachable_pub` warnings to a baseline that only
+// goes down (`.github/scripts/unreachable-pub-ratchet.sh`); at zero the lint
+// is denied here.
+#![allow(clippy::redundant_pub_crate)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 // `alloc` is the minimal hard dependency — the crate uses `Arc`, `Vec`,

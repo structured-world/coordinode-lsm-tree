@@ -4,8 +4,8 @@
 
 mod blob_file_list;
 mod diff;
-pub mod edit;
-pub mod edit_log;
+pub(crate) mod edit;
+pub(crate) mod edit_log;
 // `framing` uses `std::io::{Read, Write}`. The whole `version`
 // module (recovery, persist, super_version, this file's
 // `Version::encode_into`) is also std-bound today and consumes
@@ -24,18 +24,18 @@ pub mod edit_log;
 mod framing;
 mod optimize;
 mod persist;
-pub mod recovery;
-pub mod run;
+pub(crate) mod recovery;
+pub(crate) mod run;
 mod super_version;
 #[cfg(test)]
 mod tests;
 
-pub use blob_file_list::BlobFileList;
-pub use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
-pub use run::Run;
-pub use super_version::RetentionEffect;
-pub use super_version::SnapshotRef;
-pub use super_version::{SuperVersion, SuperVersions, UnsyncedFile};
+pub(crate) use blob_file_list::BlobFileList;
+pub(crate) use persist::{SNAPSHOT_TEMPORARY_SUFFIX, persist_version};
+pub(crate) use run::Run;
+pub(crate) use super_version::RetentionEffect;
+pub(crate) use super_version::SnapshotRef;
+pub(crate) use super_version::{SuperVersion, SuperVersions, UnsyncedFile};
 
 use crate::TreeType;
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};
@@ -144,15 +144,15 @@ impl<'a> TransformContext<'a> {
     }
 }
 
-pub const DEFAULT_LEVEL_COUNT: u8 = 7;
+pub(crate) const DEFAULT_LEVEL_COUNT: u8 = 7;
 
 /// ID of a version: each install takes the one above the last, and an open
 /// of a tree whose id reached [`RENUMBER_FROM`] starts the count again at `0`.
-pub type VersionId = u64;
+pub(crate) type VersionId = u64;
 
 /// The version id from which an open reinstalls the tree under id `0`: half
 /// the range, so the installs of one session can never reach the top.
-pub const RENUMBER_FROM: VersionId = 1 << 63;
+pub(crate) const RENUMBER_FROM: VersionId = 1 << 63;
 
 impl Ranged for Table {
     fn key_range(&self) -> &KeyRange {
@@ -345,7 +345,7 @@ pub struct VersionInner {
 /// stripes a cache line apart, so readers on different cores do not take one
 /// line from each other on every lookup.
 #[derive(Default, Debug)]
-pub struct ReadMix {
+pub(crate) struct ReadMix {
     stripes: [ReadMixStripe; READ_MIX_STRIPES],
 }
 
