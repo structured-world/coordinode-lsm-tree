@@ -25,8 +25,10 @@ fn encode_set(members: &[u64]) -> Vec<u8> {
 
 fn decode_set(bytes: &[u8]) -> Vec<u64> {
     bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_be_bytes(c.try_into().expect("chunks_exact(8)")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&c| u64::from_be_bytes(c))
         .collect()
 }
 

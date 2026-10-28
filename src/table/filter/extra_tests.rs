@@ -81,7 +81,7 @@ fn build_burr_filter_bytes_invalid_policy_returns_empty() {
         .map(|i: u64| crate::hash::hash64(&i.to_le_bytes()))
         .collect();
     let bytes = build_burr_filter_bytes(policy, hashes).unwrap();
-    assert!(bytes.is_empty());
+    assert_eq!(bytes, Vec::<u8>::new());
 }
 
 /// The expected size follows the layers a build makes: exact where every key

@@ -1398,12 +1398,17 @@ fn plain_bytes_cells(data: &[u8], n: u32) -> impl Iterator<Item = &[u8]> {
     let table = (n as usize + 1) * 4;
     let (offsets, payload) = data.split_at_checked(table).unwrap_or_default();
     let mut start = 0usize;
-    offsets.chunks_exact(4).skip(1).map_while(move |end| {
-        let end = u32::from_le_bytes(end.try_into().ok()?) as usize;
-        let value = payload.get(start..end)?;
-        start = end;
-        Some(value)
-    })
+    offsets
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .skip(1)
+        .map_while(move |end| {
+            let end = u32::from_le_bytes(*end) as usize;
+            let value = payload.get(start..end)?;
+            start = end;
+            Some(value)
+        })
 }
 
 /// The rows of a plain layout that `bounds` keeps, tested in one pass over
@@ -1614,7 +1619,7 @@ fn cheapest(trials: Vec<Trial>) -> Option<Trial> {
 /// The bits `value` needs.
 #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
 const fn bits(value: u64) -> u8 {
-    (u64::BITS - value.leading_zeros()) as u8
+    value.bit_width() as u8
 }
 
 /// The bytes `value` takes as a varint.

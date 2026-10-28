@@ -309,6 +309,10 @@ where
     /// hold no live entry. A small→main migration returns `true` (progress) even
     /// though it frees no bytes: it shrinks the small queue, so a bounded number
     /// of further calls reach a real eviction.
+    #[expect(
+        clippy::if_same_then_else,
+        reason = "the branches differ in which queue `||` tries first; the lint reads them as equal"
+    )]
     fn evict_one(&mut self) -> bool {
         let prefer_small = self.main_bytes == 0 || self.small_bytes >= self.small_target;
         if prefer_small {

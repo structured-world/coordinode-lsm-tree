@@ -1546,7 +1546,7 @@ mod merge_operator_tests {
         // DroppedKvCallback fires for entries DRAINED after base is found.
         // In this case there are no entries after the base, so callback
         // should have no items.
-        assert!(callback.items.is_empty());
+        assert_eq!(callback.items, Vec::new());
 
         Ok(())
     }

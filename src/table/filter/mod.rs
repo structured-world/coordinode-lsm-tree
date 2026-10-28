@@ -213,6 +213,11 @@ impl ExpectedSize {
         };
         // A layer of `m` slots, built with chance `built`: its header and
         // threshold bytes, and one bit-sliced word per segment and bit.
+        #[expect(
+            clippy::suboptimal_flops,
+            reason = "`f64::mul_add` needs std, and `libm::fma` is a software routine \
+                      where the target has no FMA"
+        )]
         let mut add = |m: usize, built: f64| {
             shape.fixed += built * as_f64(wire::LAYER_HEADER_LEN + m / b);
             shape.per_bit += built * as_f64(packed::segments_for(m) * 8);

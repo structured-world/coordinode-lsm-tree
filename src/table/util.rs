@@ -827,14 +827,13 @@ pub(crate) fn maybe_record_persistent_heal(
             .fetch_add(decoded as u64, core::sync::atomic::Ordering::Relaxed);
     }
     match reread {
-        Ok(corrected) => {
-            if !corrected {
-                log::debug!(
-                    "Transient ECC correction on table {table_id:?} block {handle:?}; \
-                     re-read clean, not scheduling"
-                );
-                return false;
-            }
+        Ok(false) => {
+            log::debug!(
+                "Transient ECC correction on table {table_id:?} block {handle:?}; \
+                 re-read clean, not scheduling"
+            );
+        }
+        Ok(true) => {
             if hints.record(table_id) {
                 #[cfg(feature = "metrics")]
                 metrics
@@ -846,15 +845,14 @@ pub(crate) fn maybe_record_persistent_heal(
                 );
                 return true;
             }
-            false
         }
         Err(e) => {
             log::debug!(
                 "ECC re-read confirmation for table {table_id:?} block {handle:?} failed: {e:?}"
             );
-            false
         }
     }
+    false
 }
 
 /// Whose read a block read belongs to, which decides whether it is charged to

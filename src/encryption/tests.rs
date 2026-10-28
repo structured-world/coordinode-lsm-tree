@@ -313,7 +313,7 @@ mod aes256gcm {
 
         let ciphertext = provider.encrypt_vec(vec![])?;
         let decrypted = provider.decrypt_vec(ciphertext)?;
-        assert!(decrypted.is_empty());
+        assert_eq!(decrypted, Vec::<u8>::new());
         Ok(())
     }
 

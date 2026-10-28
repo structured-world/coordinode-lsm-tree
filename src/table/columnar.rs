@@ -176,10 +176,7 @@ fn check_bytes_framing(data: &[u8], row_count: u32) -> Result<()> {
     };
     let payload_len = data.len() - off_bytes;
     let mut prev = 0usize;
-    for (i, chunk) in table.chunks_exact(4).enumerate() {
-        let Some(chunk) = chunk.first_chunk::<4>() else {
-            return Err(Error::InvalidHeader("columnar: short bytes offset"));
-        };
+    for (i, chunk) in table.as_chunks::<4>().0.iter().enumerate() {
         let off = u32::from_le_bytes(*chunk) as usize;
         if i == 0 && off != 0 {
             return Err(Error::InvalidHeader(
@@ -1625,11 +1622,11 @@ where
     #[expect(unsafe_code, reason = "see safety")]
     let mut out = unsafe { Slice::builder_unzeroed(len) };
     let (offsets, payload) = out.split_at_mut(table);
-    let mut slots = offsets.chunks_exact_mut(4);
+    let mut slots = offsets.as_chunks_mut::<4>().0.iter_mut();
     let mut written = 0usize;
     let mut filled = 0usize;
     if let Some(first) = slots.next() {
-        first.copy_from_slice(&0u32.to_le_bytes());
+        *first = 0u32.to_le_bytes();
     }
     for cell in cells() {
         let end = written + cell.len();
@@ -1639,7 +1636,7 @@ where
         dst.copy_from_slice(cell);
         written = end;
         let offset = u32::try_from(written).map_err(|_| mismatch())?;
-        slot.copy_from_slice(&offset.to_le_bytes());
+        *slot = offset.to_le_bytes();
         filled += 1;
     }
     if filled != count || written != total as usize {

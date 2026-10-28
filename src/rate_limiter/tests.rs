@@ -775,10 +775,6 @@ fn a_zero_latency_sample_climbs_by_a_bounded_step() {
 /// Out-of-range settings are clamped, and a value that is not a number keeps
 /// the default.
 #[test]
-#[expect(
-    clippy::float_cmp,
-    reason = "clamping returns the bound itself, exactly"
-)]
 fn latency_backoff_settings_are_clamped() {
     let backoff = LatencyBackoff::new(ms(10))
         .with_floor(0.0)

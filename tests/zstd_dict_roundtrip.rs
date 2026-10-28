@@ -291,7 +291,9 @@ mod zstd_dict {
         let stored = std::fs::read(dir.path().join("dicts").join(dict_id.to_string()))?;
         // Probes spread across the whole dictionary, not just its head.
         let leaked = raw
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .step_by(16)
             .any(|probe| stored.windows(probe.len()).any(|w| w == probe));
         assert!(

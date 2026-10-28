@@ -50,7 +50,7 @@ fn new_zeroed_zero_capacity_returns_dangling() {
     let buf = AlignedBuf::new_zeroed(0, 4096).unwrap();
     assert_eq!(buf.capacity(), 0);
     assert_eq!(buf.as_ptr().addr() % 4096, 0);
-    assert!(buf.as_slice().is_empty());
+    assert_eq!(buf.as_slice(), b"");
 }
 
 #[test]

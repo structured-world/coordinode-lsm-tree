@@ -283,7 +283,7 @@ fn verify_integrity_display_and_error_trait() -> lsm_tree::Result<()> {
     let report = verify::verify_integrity(&tree);
     assert!(!report.errors.is_empty());
 
-    let msg = format!("{}", &report.errors[0]);
+    let msg = format!("{}", report.errors[0]);
     assert!(msg.contains("SST table"), "SstFileCorrupted Display: {msg}");
     assert!(
         msg.contains("corrupted at"),
@@ -366,7 +366,7 @@ fn verify_integrity_display_and_error_trait() -> lsm_tree::Result<()> {
     let report3 = verify::verify_integrity(&tree3);
     assert!(!report3.errors.is_empty());
 
-    let msg = format!("{}", &report3.errors[0]);
+    let msg = format!("{}", report3.errors[0]);
     assert!(msg.contains("I/O error reading"), "IoError Display: {msg}");
 
     // Error::source for IoError should return the underlying io::Error

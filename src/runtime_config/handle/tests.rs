@@ -281,7 +281,7 @@ fn concurrent_reads_during_single_update_observe_consistent_snapshot() {
                     let initial =
                         a == ChecksumAlgorithm::Xxh3_64 && b == ChecksumAlgorithm::Xxh3_64;
                     let updated = a == ChecksumAlgorithm::Crc32c && b == ChecksumAlgorithm::Crc32c;
-                    assert!(initial || updated, "torn read: block={a:?}, kv={b:?}",);
+                    assert!(initial || updated, "torn read: block={a:?}, kv={b:?}");
                 }
             })
         })

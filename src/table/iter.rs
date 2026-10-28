@@ -52,8 +52,7 @@ fn partial_decode_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("LSM_PARTIAL_DECODE")
-            .ok()
-            .is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
+            .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes"))
     })
 }
 

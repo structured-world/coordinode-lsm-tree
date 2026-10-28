@@ -428,11 +428,11 @@ impl Header {
 }
 
 impl Encode for Header {
-    fn encode_into<W: Write>(&self, mut writer: &mut W) -> Result<(), crate::Error> {
+    fn encode_into<W: Write>(&self, writer: &mut W) -> Result<(), crate::Error> {
         use crate::io::LE;
 
         let checksum = {
-            let mut writer = ChecksummedWriter::new(&mut writer);
+            let mut writer = ChecksummedWriter::new(&mut *writer);
 
             // Write header
             writer.write_all(&MAGIC_BYTES)?;

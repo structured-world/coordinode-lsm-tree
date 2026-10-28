@@ -196,17 +196,16 @@ fn insert_node(
         return (Box::new(Node::new(tombstone)), true);
     };
 
-    let was_new;
-    match tombstone.cmp_with_comparator(&node.tombstone, comparator) {
+    let was_new = match tombstone.cmp_with_comparator(&node.tombstone, comparator) {
         Ordering::Less => {
             let (child, new) = insert_node(node.left.take(), tombstone, comparator);
             node.left = Some(child);
-            was_new = new;
+            new
         }
         Ordering::Greater => {
             let (child, new) = insert_node(node.right.take(), tombstone, comparator);
             node.right = Some(child);
-            was_new = new;
+            new
         }
         Ordering::Equal => {
             // Duplicate — replace (shouldn't normally happen)
@@ -214,7 +213,7 @@ fn insert_node(
             node.update_augmentation(comparator);
             return (node, false);
         }
-    }
+    };
 
     (balance(node, comparator), was_new)
 }

@@ -298,7 +298,7 @@ mod merge_sorted_cmp {
     #[test]
     fn empty_input() {
         let result = KeyRange::merge_sorted_cmp(vec![], &DefaultUserComparator);
-        assert!(result.is_empty());
+        assert_eq!(result, Vec::new());
     }
 
     #[test]

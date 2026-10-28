@@ -563,7 +563,7 @@ impl ReadQueue for DescriptorQueue<'_> {
             && self
                 .fs
                 .keeping_waits
-                .fetch_update(
+                .try_update(
                     core::sync::atomic::Ordering::Relaxed,
                     core::sync::atomic::Ordering::Relaxed,
                     |left| left.checked_sub(1),

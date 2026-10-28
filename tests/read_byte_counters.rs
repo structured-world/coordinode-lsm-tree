@@ -1278,7 +1278,7 @@ fn a_scan_of_one_ingested_segment_counts_the_seqno_column_it_globalizes() -> lsm
             .find(|c| c.column_id == COL_SEQNO)
             .expect("seqno column");
         assert!(
-            seqnos.data.chunks_exact(8).all(|s| s != [0; 8]),
+            seqnos.data.as_chunks::<8>().0.iter().all(|s| *s != [0; 8]),
             "the returned seqnos are the segment's effective ones, not its local zeros",
         );
         rows += u64::from(batch.row_count);

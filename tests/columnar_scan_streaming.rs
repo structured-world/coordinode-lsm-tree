@@ -510,7 +510,7 @@ fn a_merge_over_large_row_pages_cuts_its_output_at_the_target_row_count() {
     let (_folder, tree) = columnar_tree_cut_at(1 << 20);
     for parity in 0..2 {
         for i in (parity..ROWS).step_by(2) {
-            tree.insert(key(i), [b'v'], u64::from(i));
+            tree.insert(key(i), b"v", u64::from(i));
         }
         tree.flush_active_memtable(0).expect("flush");
     }
@@ -671,8 +671,8 @@ fn a_merge_reports_the_batches_it_read_past_even_when_it_kept_none_of_them() {
     // in holds narrow rows only.
     const WIDE: usize = 8_000;
     let (_folder, tree) = columnar_tree_cut_at(4 * 1_024);
-    tree.insert(key(0), [b'a'], 2);
-    tree.insert(key(100), [b'a'], 3);
+    tree.insert(key(0), b"a", 2);
+    tree.insert(key(100), b"a", 3);
     tree.flush_active_memtable(0).expect("flush");
     for i in 1..20 {
         tree.insert(key(i), vec![b'w'; WIDE], 1_000 + u64::from(i));
@@ -680,7 +680,7 @@ fn a_merge_reports_the_batches_it_read_past_even_when_it_kept_none_of_them() {
     for i in 20..99 {
         tree.insert(key(i), vec![b'n'; 100], 1_000 + u64::from(i));
     }
-    tree.insert(key(99), [b'n'], 1);
+    tree.insert(key(99), b"n", 1);
     tree.flush_active_memtable(0).expect("flush");
 
     let mut scan = tree

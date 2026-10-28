@@ -1322,7 +1322,14 @@ impl FilterSizing {
     fn estimated_keys(&self, bounds: (Bound<&[u8]>, Bound<&[u8]>)) -> crate::Result<u64> {
         let mut keys = 0.0;
         for (input, &distinct) in self.inputs.iter().zip(&self.input_distinct) {
-            keys += as_f64(distinct) * self.share_of(input, bounds)?;
+            #[expect(
+                clippy::suboptimal_flops,
+                reason = "`f64::mul_add` needs std, and `libm::fma` is a software routine \
+                          where the target has no FMA"
+            )]
+            {
+                keys += as_f64(distinct) * self.share_of(input, bounds)?;
+            }
         }
         #[expect(
             clippy::cast_possible_truncation,
@@ -1806,6 +1813,11 @@ fn shrunk_densities(counts: &[(f64, usize)]) -> Vec<f64> {
     } else {
         0.0
     };
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "`f64::mul_add` needs std, and `libm::fma` is a software routine \
+                  where the target has no FMA"
+    )]
     counts
         .iter()
         .map(|entry| mean + keep * (density(entry) - mean))

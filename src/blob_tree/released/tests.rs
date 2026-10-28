@@ -106,7 +106,7 @@ fn records_go_with_the_last_read_older_than_them() {
         registry.records.lock().objects.iter().collect::<Vec<_>>(),
         [(&handle(1, 10), &5)]
     );
-    assert!(registry.records.lock().tables.is_empty());
+    assert_eq!(registry.records.lock().tables, Vec::new());
     drop(newer);
     assert!(registry.records.lock().objects.is_empty());
     assert!(registry.records.lock().readers.is_empty());

@@ -138,7 +138,7 @@ pub fn in_recency_order<T: Ranged + Aged>(runs: &[&Run<T>], cmp: &dyn UserCompar
             .unwrap_or_else(|at| at)
     };
 
-    placed.sort_by(|(_, a), (_, b)| b.age().cmp(&a.age()));
+    placed.sort_by_key(|(_, table)| core::cmp::Reverse(table.age()));
     // One past the furthest-back run of a newer table, per key point.
     let mut newer_runs = RangeMax::new(points.len());
     placed.iter().all(|(run, table)| {

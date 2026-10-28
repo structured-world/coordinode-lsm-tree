@@ -740,7 +740,7 @@ fn the_endurance_budget_is_the_allowance_rate_less_the_writes() -> crate::Result
     let budget = Arc::new(WriteBudget::new_at(
         Arc::new(WriteIoStats::default()),
         // 100 bytes a second.
-        Allowance::new(8_640_000, core::time::Duration::from_secs(86_400)),
+        Allowance::new(8_640_000, core::time::Duration::from_hours(24)),
         core::time::Duration::ZERO,
     ));
     let fs = Arc::new(CountingFs::with_budget(Arc::new(MemFs::new()), budget));
@@ -783,7 +783,7 @@ fn flushes_on_another_medium_spend_nothing_of_the_last_levels_budget() -> crate:
     let budget = Arc::new(WriteBudget::new_at(
         Arc::new(WriteIoStats::default()),
         // 100 bytes a second.
-        Allowance::new(8_640_000, core::time::Duration::from_secs(86_400)),
+        Allowance::new(8_640_000, core::time::Duration::from_hours(24)),
         core::time::Duration::ZERO,
     ));
     let cold = Arc::new(CountingFs::with_budget(Arc::new(MemFs::new()), budget));

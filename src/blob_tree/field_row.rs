@@ -453,9 +453,9 @@ pub(crate) fn decode_row(row: &[u8]) -> crate::Result<Vec<RowField<'_>>> {
     let mut pos = descriptors_at + count * DESCRIPTOR_LEN;
     let mut fields = Vec::with_capacity(count);
     let mut previous = None;
-    for (i, descriptor) in descriptors.chunks_exact(DESCRIPTOR_LEN).enumerate() {
-        let [c0, c1, tag, width] =
-            <[u8; DESCRIPTOR_LEN]>::try_from(descriptor).map_err(|_| CORRUPT)?;
+    // `descriptors` is exactly `count` descriptors long, so no remainder.
+    let (descriptors, _) = descriptors.as_chunks::<DESCRIPTOR_LEN>();
+    for (i, &[c0, c1, tag, width]) in descriptors.iter().enumerate() {
         let column = u16::from_le_bytes([c0, c1]);
         // A written row holds field ids in ascending order; anything else is
         // damage, not a layout to read.

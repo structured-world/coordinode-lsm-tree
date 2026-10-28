@@ -38,8 +38,11 @@ fn mixed_value_framing_round_trips() {
 #[test]
 fn empty_value_framing_round_trips() {
     let blob = frame_value_cells(&[]).expect("frame");
-    assert!(blob.is_empty());
-    assert!(unframe_value_cells(&blob, &[]).expect("unframe").is_empty());
+    assert_eq!(blob, Vec::<u8>::new());
+    assert_eq!(
+        unframe_value_cells(&blob, &[]).expect("unframe"),
+        Vec::<&[u8]>::new()
+    );
 }
 
 #[test]

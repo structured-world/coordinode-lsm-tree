@@ -112,51 +112,48 @@ impl Arena {
             // Cannot overflow: offset < BLOCK_SIZE (2^22), align < BLOCK_SIZE.
             let aligned = (offset + align - 1) & !(align - 1);
 
-            if let Some(new_end) = aligned.checked_add(size) {
-                if new_end < BLOCK_SIZE {
-                    // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
-                    // on the next line would set bit BLOCK_SHIFT in new_end,
-                    // colliding with the block_idx bits and wrapping the
-                    // cursor back to offset 0 of the *current* block.
-                    // Falling through to the next-block path abandons any
-                    // remaining bytes in the current block (at most
-                    // `BLOCK_SIZE - offset`, including a would-have-fit
-                    // allocation at the end).  This waste is acceptable
-                    // for typical node sizes.  See #119.
-                    //
-                    // Ensure the block exists BEFORE publishing the offset via
-                    // CAS — otherwise another thread could read the cursor,
-                    // compute the same block_idx, and call decode() before the
-                    // block pointer is set.
-                    self.ensure_block(block_idx as usize);
+            let new_end = aligned.checked_add(size)?;
+            if new_end < BLOCK_SIZE {
+                // Strict `<`: when new_end == BLOCK_SIZE the bitwise OR
+                // on the next line would set bit BLOCK_SHIFT in new_end,
+                // colliding with the block_idx bits and wrapping the
+                // cursor back to offset 0 of the *current* block.
+                // Falling through to the next-block path abandons any
+                // remaining bytes in the current block (at most
+                // `BLOCK_SIZE - offset`, including a would-have-fit
+                // allocation at the end).  This waste is acceptable
+                // for typical node sizes.  See #119.
+                //
+                // Ensure the block exists BEFORE publishing the offset via
+                // CAS — otherwise another thread could read the cursor,
+                // compute the same block_idx, and call decode() before the
+                // block pointer is set.
+                self.ensure_block(block_idx as usize);
 
-                    let new_cursor = (block_idx << BLOCK_SHIFT) | new_end;
-                    if self
-                        .cursor
-                        .compare_exchange_weak(cur, new_cursor, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        return Some((block_idx << BLOCK_SHIFT) | aligned);
-                    }
-                } else {
-                    // Advance to the next block.  Ensure it exists BEFORE
-                    // publishing the new cursor, so that any thread reading
-                    // the cursor will find a valid block pointer.
-                    let new_block = block_idx + 1;
-                    if new_block as usize >= MAX_BLOCKS {
-                        return None;
-                    }
-                    self.ensure_block(new_block as usize);
-                    let new_cursor = new_block << BLOCK_SHIFT;
-                    let _ = self.cursor.compare_exchange_weak(
-                        cur,
-                        new_cursor,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                let new_cursor = (block_idx << BLOCK_SHIFT) | new_end;
+                if self
+                    .cursor
+                    .compare_exchange_weak(cur, new_cursor, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Some((block_idx << BLOCK_SHIFT) | aligned);
                 }
             } else {
-                return None;
+                // Advance to the next block.  Ensure it exists BEFORE
+                // publishing the new cursor, so that any thread reading
+                // the cursor will find a valid block pointer.
+                let new_block = block_idx + 1;
+                if new_block as usize >= MAX_BLOCKS {
+                    return None;
+                }
+                self.ensure_block(new_block as usize);
+                let new_cursor = new_block << BLOCK_SHIFT;
+                let _ = self.cursor.compare_exchange_weak(
+                    cur,
+                    new_cursor,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
             }
         }
     }

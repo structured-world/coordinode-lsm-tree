@@ -40,7 +40,7 @@ fn no_separator() {
     let extractor = ColonSeparatedPrefix;
     let key = b"noseparator";
     let prefixes: Vec<&[u8]> = extractor.prefixes(key).collect();
-    assert!(prefixes.is_empty());
+    assert_eq!(prefixes, Vec::<&[u8]>::new());
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn single_separator_at_end() {
 fn empty_key() {
     let extractor = ColonSeparatedPrefix;
     let prefixes: Vec<&[u8]> = extractor.prefixes(b"").collect();
-    assert!(prefixes.is_empty());
+    assert_eq!(prefixes, Vec::<&[u8]>::new());
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn fixed_length_prefixes() {
 
     // Key shorter than 4 bytes yields nothing
     let prefixes: Vec<&[u8]> = extractor.prefixes(b"ab").collect();
-    assert!(prefixes.is_empty());
+    assert_eq!(prefixes, Vec::<&[u8]>::new());
 
     // Key exactly 4 bytes yields itself
     let prefixes: Vec<&[u8]> = extractor.prefixes(b"abcd").collect();

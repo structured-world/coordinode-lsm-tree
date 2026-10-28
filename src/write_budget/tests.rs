@@ -2,7 +2,7 @@ use super::*;
 use crate::fs::{CountingFs, Fs, FsOpenOptions, MemFs};
 use crate::path::Path;
 
-const DAY: Duration = Duration::from_secs(86_400);
+const DAY: Duration = Duration::from_hours(24);
 
 /// A medium whose ledger the tests write through.
 struct Medium {

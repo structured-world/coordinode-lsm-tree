@@ -1056,7 +1056,7 @@ fn build_from_hashes_with_values_rejects_length_mismatch() {
     let err = builder
         .build_from_hashes_with_values(&hashes, &locators)
         .expect_err("length mismatch must reject");
-    assert!(format!("{err}").contains("equal length"), "got: {err}",);
+    assert!(format!("{err}").contains("equal length"), "got: {err}");
 }
 
 #[test]

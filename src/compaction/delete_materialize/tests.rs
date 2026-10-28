@@ -23,7 +23,7 @@ fn marked(rows: &[(&[u8], SeqNo)], tombstones: &[RangeTombstone], watermark: Seq
 #[test]
 fn no_tombstones_marks_nothing() {
     let rows: &[(&[u8], SeqNo)] = &[(b"a", 5), (b"b", 5), (b"c", 5)];
-    assert!(marked(rows, &[], 100).is_empty());
+    assert_eq!(marked(rows, &[], 100), Vec::<u32>::new());
 }
 
 #[test]
@@ -39,9 +39,9 @@ fn at_or_above_watermark_tombstone_marks_nothing() {
     // Tombstone seqno == watermark is invisible to the oldest live snapshot
     // (which reads AT the watermark), so it must not materialize.
     let rows: &[(&[u8], SeqNo)] = &[(b"b", 5), (b"c", 5)];
-    assert!(marked(rows, &[rt(b"a", b"z", 20)], 20).is_empty());
+    assert_eq!(marked(rows, &[rt(b"a", b"z", 20)], 20), Vec::<u32>::new());
     // Strictly above: also not materialized.
-    assert!(marked(rows, &[rt(b"a", b"z", 25)], 20).is_empty());
+    assert_eq!(marked(rows, &[rt(b"a", b"z", 25)], 20), Vec::<u32>::new());
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn entry_newer_than_tombstone_survives() {
     // Entry seqno 15 >= tombstone seqno 10: the delete does not outrank it,
     // so the row is not marked even though the key is in range.
     let rows: &[(&[u8], SeqNo)] = &[(b"b", 15)];
-    assert!(marked(rows, &[rt(b"a", b"z", 10)], 100).is_empty());
+    assert_eq!(marked(rows, &[rt(b"a", b"z", 10)], 100), Vec::<u32>::new());
 }
 
 #[test]
