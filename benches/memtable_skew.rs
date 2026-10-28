@@ -203,26 +203,29 @@ impl Writes {
     }
 
     /// Writes every key into `tree` through `route` from `writers` threads,
-    /// each its own contiguous share; returns the time from the start barrier
-    /// to the last writer's end.
+    /// each its own contiguous share; returns the time from the release of
+    /// the writers to the last writer's end.
     ///
     /// A key's seqno is its position in the write order, so seqnos stay unique
     /// without the writers sharing a counter: the cost measured is the
     /// memtable's, not a caller's seqno allocation.
     fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> Duration {
         let share = self.keys.len().div_ceil(writers);
-        // Fewer shares than writers when the share rounds up: the barrier
-        // holds the threads that exist.
-        let start = Barrier::new(self.keys.len().div_ceil(share) + 1);
+        // Fewer shares than writers when the share rounds up: the barriers
+        // hold the threads that exist. The clock starts once every writer is
+        // ready and before any is released, so no insert runs before it.
+        let threads = self.keys.len().div_ceil(share) + 1;
+        let (ready, go) = (Barrier::new(threads), Barrier::new(threads));
         let memtable = tree.active_memtable();
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0u64..)
                 .step_by(share)
                 .zip(self.keys.chunks(share))
                 .map(|(first, chunk)| {
-                    let (start, memtable) = (&start, &memtable);
+                    let (ready, go, memtable) = (&ready, &go, &memtable);
                     scope.spawn(move || {
-                        start.wait();
+                        ready.wait();
+                        go.wait();
                         for (s, key) in (first..).zip(chunk) {
                             match route {
                                 Route::Tree => {
@@ -241,8 +244,9 @@ impl Writes {
                     })
                 })
                 .collect();
-            start.wait();
+            ready.wait();
             let at = Instant::now();
+            go.wait();
             for handle in handles {
                 handle.join().expect("writer");
             }

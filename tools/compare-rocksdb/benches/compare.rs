@@ -2137,7 +2137,12 @@ fn sustained_ours(
                         tree.persist_flushes().expect("ours sustained: persist");
                     }
                 } else if writing_done.load(Ordering::Acquire) {
-                    break;
+                    // The writer seals its last memtable before it says it is
+                    // done, so a flush that found nothing may have run just
+                    // before that seal: go round once more unless none waits.
+                    if tree.sealed_memtable_count() == 0 {
+                        break;
+                    }
                 } else {
                     std::thread::sleep(Duration::from_micros(100));
                 }
