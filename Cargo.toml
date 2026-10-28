@@ -523,6 +523,12 @@ path = "benches/overwrite.rs"
 required-features = ["std"]
 
 [[bench]]
+name = "memtable_skew"
+harness = false
+path = "benches/memtable_skew.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "flush_split"
 harness = false
 path = "benches/flush_split.rs"

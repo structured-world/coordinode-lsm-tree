@@ -2,10 +2,10 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-pub mod arena;
-pub mod interval_tree;
-pub mod skiplist;
-pub mod value_store;
+pub(crate) mod arena;
+pub(crate) mod interval_tree;
+pub(crate) mod skiplist;
+pub(crate) mod value_store;
 
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
@@ -37,7 +37,7 @@ pub use crate::tree::inner::MemtableId;
 /// Counted over all of `keys` at once: a flush rotating into several tables
 /// hashes a prefix spanning two of them in each, so the count runs short by
 /// at most one prefix per rotation.
-pub fn filter_count(
+pub(crate) fn filter_count(
     keys: impl Iterator<Item = crate::UserKey>,
     prefixes: Option<&dyn crate::PrefixExtractor>,
 ) -> crate::filter_budget::FilterCount {
@@ -291,6 +291,15 @@ impl Memtable {
     /// Counts the number of items in the memtable.
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// How often an insert had to retry linking an item because a concurrent
+    /// insert changed its neighbour first: the contention writers meet in
+    /// this memtable, counted once per retried level of the skiplist.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn insert_cas_retries(&self) -> usize {
+        self.items.cas_retries()
     }
 
     /// Returns `true` if the memtable has no KV items and no range tombstones.
