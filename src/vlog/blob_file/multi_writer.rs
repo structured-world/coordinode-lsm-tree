@@ -23,7 +23,7 @@ use core::sync::atomic::AtomicBool;
 mod tests;
 
 /// Blob file writer, may write multiple blob files
-pub struct MultiWriter {
+pub(crate) struct MultiWriter {
     fs: Arc<dyn Fs>,
 
     folder: PathBuf,
@@ -59,6 +59,10 @@ pub struct MultiWriter {
     /// Durability level wired from `Config::sync_mode`, stamped on every
     /// rotated blob writer.
     sync_mode: SyncMode,
+
+    /// Whether the files and their folder are synced at finish, stamped on
+    /// every rotated blob writer.
+    durability: crate::config::FlushDurability,
 
     /// `Config::writeback_bytes`, stamped on every rotated blob writer.
     writeback_bytes: u64,
@@ -111,7 +115,7 @@ impl MultiWriter {
     ///
     /// Will return `Err` if an IO error occurs.
     #[cfg(test)]
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn new<P: AsRef<Path>>(
         id_generator: SequenceNumberCounter,
         folder: P,
         tree_id: TreeId,
@@ -174,6 +178,7 @@ impl MultiWriter {
             compression: CompressionType::None,
             passthrough_compression: CompressionType::None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
 
             #[cfg(zstd_any)]
@@ -245,9 +250,20 @@ impl MultiWriter {
     /// Wires the tree's `Config::sync_mode` through to every blob file this
     /// writer finalizes (active + rotated).
     #[must_use]
-    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+    pub(crate) fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.active_writer.sync_mode = sync_mode;
+        self
+    }
+
+    /// Leaves every blob file this writer finishes, and their folder,
+    /// unsynced under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred),
+    /// for the install that persists them to sync.
+    #[must_use]
+    pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
+        self.durability = durability;
+        self.active_writer.durability = durability;
         self
     }
 
@@ -262,7 +278,7 @@ impl MultiWriter {
     /// Wires the tree's `Config::writeback_bytes` through to every blob file
     /// this writer writes (active + rotated).
     #[must_use]
-    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self.active_writer = self.active_writer.use_writeback_bytes(bytes);
         self
@@ -270,7 +286,7 @@ impl MultiWriter {
 
     /// Sets the blob file target size.
     #[must_use]
-    pub fn use_target_size(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_target_size(mut self, bytes: u64) -> Self {
         self.target_size = bytes;
         self
     }
@@ -384,6 +400,7 @@ impl MultiWriter {
             .use_sync_mode(self.sync_mode)
             .use_writeback_bytes(self.writeback_bytes)
             .use_clock(self.clock.clone());
+        w.durability = self.durability;
         // Carry the passthrough metadata codec onto the new writer so every
         // file in a relocation records the real compression.
         if passthrough != CompressionType::None {
@@ -400,7 +417,7 @@ impl MultiWriter {
     /// Sets the compression method.
     #[must_use]
     #[doc(hidden)]
-    pub fn use_compression(mut self, compression: CompressionType) -> Self {
+    pub(crate) fn use_compression(mut self, compression: CompressionType) -> Self {
         self.compression.clone_from(&compression);
         self.active_writer.compression = compression;
         self
@@ -412,7 +429,7 @@ impl MultiWriter {
     /// files produced by this `MultiWriter` use the same dictionary.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionary(
+    pub(crate) fn use_zstd_dictionary(
         mut self,
         dict: Option<alloc::sync::Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
@@ -428,7 +445,7 @@ impl MultiWriter {
     /// See [`crate::runtime_config::RuntimeConfig::zstd_two_pass_seed`].
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+    pub(crate) fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
         self.active_writer = self.active_writer.use_zstd_two_pass_seed(enabled);
         self.zstd_two_pass_seed = enabled;
         self
@@ -442,7 +459,10 @@ impl MultiWriter {
     /// through: the handle a reader gets must carry its own dictionary.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionaries(mut self, dicts: crate::compression::ZstdDictionaries) -> Self {
+    pub(crate) fn use_zstd_dictionaries(
+        mut self,
+        dicts: crate::compression::ZstdDictionaries,
+    ) -> Self {
         self.zstd_dictionaries = dicts;
         self
     }
@@ -611,7 +631,12 @@ impl MultiWriter {
     /// # Errors
     ///
     /// Will return `Err` if an IO error occurs.
-    pub fn write(&mut self, key: &[u8], seqno: SeqNo, value: &[u8]) -> crate::Result<ValueHandle> {
+    pub(crate) fn write(
+        &mut self,
+        key: &[u8],
+        seqno: SeqNo,
+        value: &[u8],
+    ) -> crate::Result<ValueHandle> {
         self.enter_key(key)?;
         let target_size = self.target_size;
 
@@ -757,8 +782,10 @@ impl MultiWriter {
         // files follows: synced once here for every file the write made. The
         // manifest is in the folder above; on another device (a nested mount)
         // a barrier would not order this sync before it, so that is in full.
+        // A deferred write leaves this to the install that persists it.
         let mode = crate::file::folder_sync_mode(&*self.fs, &self.folder, self.sync_mode);
         if !self.results.is_empty()
+            && self.durability == crate::config::FlushDurability::Synced
             && let Err(e) = crate::file::fsync_directory(&self.folder, &*self.fs, mode)
         {
             // Not durable, so no version may name them.

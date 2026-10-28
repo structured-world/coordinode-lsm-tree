@@ -357,7 +357,7 @@ impl Drop for PinnedVersion {
 /// Builds the tree at `config.path` from a pin's files, its
 /// [`layout`](PinnedVersion::layout) and its memtable contents; see
 /// [`Config::restore_pinned`](crate::Config::restore_pinned).
-pub fn restore(
+pub(crate) fn restore(
     config: crate::Config,
     layout: &[u8],
     entries: impl IntoIterator<Item = PinnedEntry>,
@@ -537,6 +537,9 @@ pub fn restore(
     drop(memtable);
     // Collect nothing: the restored tree serves every snapshot the source did.
     tree.flush_active_memtable(0)?;
+    // Under deferred durability the flush is installed in memory only; the
+    // marker below may go only once it is on disk.
+    tree.persist_flushes()?;
 
     // A write on the restored tree must land above every restored version, and
     // reads see what the pin served. The tables may hold a write at or above

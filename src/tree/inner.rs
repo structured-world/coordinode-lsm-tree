@@ -27,24 +27,24 @@ use spin::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 /// Write guard over the tree's version history. Backend-specific guard type
 /// (`parking_lot` under std, `spin` under `no_std`), aliased so
 /// [`crate::AbstractTree`] and its impls share one signature.
-pub type VersionsWriteGuard<'a> = RwLockWriteGuard<'a, SuperVersions>;
+pub(crate) type VersionsWriteGuard<'a> = RwLockWriteGuard<'a, SuperVersions>;
 /// Read guard over the tree's version history. See [`VersionsWriteGuard`].
-pub type VersionsReadGuard<'a> = RwLockReadGuard<'a, SuperVersions>;
+pub(crate) type VersionsReadGuard<'a> = RwLockReadGuard<'a, SuperVersions>;
 
 // spin's `MutexGuard` (unlike its RwLock guards) has no default relax-strategy
 // param, so the Mutex-based aliases name the backend guard explicitly.
 /// Guard over the tree's compaction state. See [`VersionsWriteGuard`].
 #[cfg(feature = "std")]
-pub type CompactionGuard<'a> = parking_lot::MutexGuard<'a, CompactionState>;
+pub(crate) type CompactionGuard<'a> = parking_lot::MutexGuard<'a, CompactionState>;
 /// Guard over the tree's compaction state. See [`VersionsWriteGuard`].
 #[cfg(not(feature = "std"))]
-pub type CompactionGuard<'a> = spin::MutexGuard<'a, CompactionState, spin::Spin>;
+pub(crate) type CompactionGuard<'a> = spin::MutexGuard<'a, CompactionState, spin::Spin>;
 /// Guard over the tree's flush-serialization mutex. See [`VersionsWriteGuard`].
 #[cfg(feature = "std")]
-pub type FlushGuard<'a> = parking_lot::MutexGuard<'a, ()>;
+pub(crate) type FlushGuard<'a> = parking_lot::MutexGuard<'a, ()>;
 /// Guard over the tree's flush-serialization mutex. See [`VersionsWriteGuard`].
 #[cfg(not(feature = "std"))]
-pub type FlushGuard<'a> = spin::MutexGuard<'a, (), spin::Spin>;
+pub(crate) type FlushGuard<'a> = spin::MutexGuard<'a, (), spin::Spin>;
 
 #[cfg(feature = "metrics")]
 use crate::metrics::Metrics;
@@ -60,14 +60,14 @@ pub type TreeId = u64;
 pub type MemtableId = u64;
 
 /// Hands out a unique (monotonically increasing) tree ID.
-pub fn get_next_tree_id() -> TreeId {
+pub(crate) fn get_next_tree_id() -> TreeId {
     static TREE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
     TREE_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
 /// A test seam: a callback fired at a coordination point inside the tree.
 #[cfg(test)]
-pub type TestHook = Box<dyn Fn() + Send>;
+pub(crate) type TestHook = Box<dyn Fn() + Send>;
 
 /// Per-tree test seams, fired at lock-coordination points so a test can prove
 /// a lock-scope invariant deterministically instead of racing it. They are
@@ -76,7 +76,7 @@ pub type TestHook = Box<dyn Fn() + Send>;
 /// global hook fires inside unrelated tests.
 #[cfg(test)]
 #[derive(Default)]
-pub struct TestHooks {
+pub(crate) struct TestHooks {
     /// Fired while the CDC scan holds the version-history write guard, so a
     /// test can prove a writer is excluded for that window.
     pub(crate) scan_freeze: std::sync::Mutex<Option<TestHook>>,
@@ -321,6 +321,41 @@ pub struct TreeInner {
 }
 
 impl TreeInner {
+    /// Makes every flush installed so far durable (see
+    /// [`AbstractTree::persist_flushes`](crate::AbstractTree::persist_flushes)).
+    ///
+    /// The files the deferred flushes wrote are synced without the version
+    /// lock, so flushes and reads go on meanwhile; under the lock only the
+    /// files flushed in between are synced before the manifest is written.
+    pub(crate) fn persist_flushes(&self) -> crate::Result<()> {
+        let pending = self.version_history.read().unsynced_files();
+        if !pending.is_empty() {
+            SuperVersions::sync_files(&pending, self.config.sync_mode)?;
+        }
+        let mut versions = self.version_history.write();
+        versions.forget_synced(&pending);
+        versions.persist_current(
+            &self.config.path,
+            &*self.config.fs,
+            self.runtime_config.load_full(),
+            self.config.encryption.clone(),
+        )
+    }
+
+    /// The current version and the files deferred flushes left unsynced that
+    /// it names, read under one lock: a flush installed between two reads
+    /// would be named by the version and missing from the files.
+    #[cfg(feature = "std")]
+    pub(crate) fn current_version_and_unsynced(
+        &self,
+    ) -> (Version, Vec<crate::version::UnsyncedFile>) {
+        let versions = self.version_history.read();
+        let version = versions.latest_version_ref().version.clone();
+        let unsynced = versions.unsynced_named_by(&version);
+        drop(versions);
+        (version, unsynced)
+    }
+
     pub(crate) fn create_new(
         mut config: Config,
         // The cross-process directory lock acquired by `Tree::open` before the
@@ -452,7 +487,7 @@ impl TreeInner {
 /// (`KvChecksumComputePoint::AtBlockCompile`, or checksums `Off`),
 /// otherwise the configured algorithm's `wire_tag() + 1`. Decode with
 /// [`kv_digest_algo_from_gate`].
-pub fn kv_digest_at_insert_gate(rc: &crate::runtime_config::RuntimeConfig) -> u8 {
+pub(crate) fn kv_digest_at_insert_gate(rc: &crate::runtime_config::RuntimeConfig) -> u8 {
     use crate::runtime_config::{KvChecksumComputePoint, KvChecksumPolicy};
     if matches!(
         rc.kv_checksum_compute_point,
@@ -468,7 +503,9 @@ pub fn kv_digest_at_insert_gate(rc: &crate::runtime_config::RuntimeConfig) -> u8
 /// Inverse of [`kv_digest_at_insert_gate`]: the algorithm an insert must
 /// digest with, or `None` when inserts carry no digest.
 #[inline]
-pub fn kv_digest_algo_from_gate(gate: u8) -> Option<crate::runtime_config::ChecksumAlgorithm> {
+pub(crate) fn kv_digest_algo_from_gate(
+    gate: u8,
+) -> Option<crate::runtime_config::ChecksumAlgorithm> {
     // `gate - 1` is a wire tag this process wrote itself, so the decode
     // cannot fail; a `None` here would only mean a corrupt byte.
     gate.checked_sub(1)
@@ -481,6 +518,15 @@ impl Drop for TreeInner {
 
         log::trace!("Sending stop signal to compactors");
         self.stop_signal.send();
+
+        // A tree closing persists its deferred flushes, so a reopen needs no
+        // replay of them. A failure loses nothing a caller still needs: what
+        // was not persisted is still in the caller's log.
+        if self.config.flush_durability == crate::config::FlushDurability::Deferred
+            && let Err(e) = self.persist_flushes()
+        {
+            log::warn!("closing tree: could not persist its deferred flushes: {e}");
+        }
 
         // A pool shared by trees that come and go would keep every one's
         // account otherwise.

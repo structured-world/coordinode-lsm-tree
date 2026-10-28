@@ -523,6 +523,12 @@ path = "benches/flush_split.rs"
 required-features = ["zstd"]
 
 [[bench]]
+name = "deferred_flush"
+harness = false
+path = "benches/deferred_flush.rs"
+required-features = ["std"]
+
+[[bench]]
 name = "partial_decode"
 harness = false
 path = "benches/partial_decode.rs"

@@ -3,16 +3,16 @@
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
 #[cfg(feature = "columnar")]
-pub mod columnar_scan;
+pub(crate) mod columnar_scan;
 mod data_stage;
-pub mod ingest;
-pub mod inner;
+pub(crate) mod ingest;
+pub(crate) mod inner;
 mod level_resolve;
 mod level_stages;
 mod multi_get_read;
-pub mod read_job;
+pub(crate) mod read_job;
 pub mod resumable;
-pub mod sealed;
+pub(crate) mod sealed;
 mod tables_read;
 
 use crate::path::Path;
@@ -54,7 +54,7 @@ use crate::metrics::Metrics;
 /// [`Tree::compute_write_admission`]). Even with an empty active memtable the
 /// gate keeps at least this much room below the budget so the next writes and a
 /// space-reclaiming compaction have somewhere to land. 1 MiB.
-pub const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
+pub(crate) const MIN_RESERVED_HEADROOM: u64 = 1024 * 1024;
 
 /// How long a cached disk-free sample stays valid before the admission gate
 /// re-probes. Bounds how stale the physical free-space figure can be when the
@@ -491,10 +491,6 @@ fn standard_guard(item: crate::Result<InternalValue>) -> IterGuardImpl {
 /// when it fails before it can open a snapshot (no row, no version to bind a
 /// blob guard to), so the failure reaches the consumer through the same
 /// `Result` it already handles per row.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree as crate::tree::error_guard"
-)]
 pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
     IterGuardImpl::Standard(Guard(Err(e)))
 }
@@ -508,10 +504,6 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
 /// Read before the install publishes the files, recorded once it has
 /// ([`Self::charge`]): an install that fails keeps nothing.
 #[derive(Default)]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree and compaction as crate::tree::InstalledCharge"
-)]
 pub(crate) struct InstalledCharge(Vec<(Arc<crate::fs::WriteIoStats>, crate::fs::WriteOrigin, u64)>);
 
 impl InstalledCharge {
@@ -564,11 +556,18 @@ impl InstalledCharge {
     }
 }
 
+/// The highest seqno the memtables of `snapshot` hold, active and sealed.
+fn highest_memtable_seqno(snapshot: &SuperVersion) -> Option<SeqNo> {
+    let sealed = snapshot
+        .sealed_memtables
+        .iter()
+        .map(|mt| mt.get_highest_seqno())
+        .max()
+        .flatten();
+    snapshot.active_memtable.get_highest_seqno().max(sealed)
+}
+
 /// Extract owned user-key bounds from any range.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "reached from blob_tree as crate::tree::range_to_user_bounds"
-)]
 pub(crate) fn range_to_user_bounds<K: AsRef<[u8]>, R: RangeBounds<K>>(
     range: &R,
 ) -> (Bound<UserKey>, Bound<UserKey>) {
@@ -632,6 +631,10 @@ impl AbstractTree for Tree {
         self.version_history.write()
     }
 
+    fn persist_flushes(&self) -> crate::Result<()> {
+        self.0.persist_flushes()
+    }
+
     fn next_table_id(&self) -> TableId {
         self.0.table_id_counter.get()
     }
@@ -661,6 +664,7 @@ impl AbstractTree for Tree {
                 include_blobs: false,
                 runtime_config: self.0.runtime_config.load_full(),
                 encryption: self.0.config.encryption.clone(),
+                source: &self.0,
             },
         )
     }
@@ -1277,6 +1281,7 @@ impl AbstractTree for Tree {
         table_writer = table_writer.use_page_ecc(self.config.page_ecc, rc.ecc_scheme);
         table_writer = table_writer
             .use_sync_mode(self.config.sync_mode)
+            .use_durability(self.config.flush_durability)
             .use_writeback_bytes(self.config.writeback_bytes);
 
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
@@ -1453,7 +1458,24 @@ impl AbstractTree for Tree {
             return Ok(());
         }
 
-        version_lock.upgrade_version(
+        // A deferred flush wrote its files unsynced: installed in memory only,
+        // they are synced and written to the manifest by the next persist.
+        let deferred = (self.config.flush_durability == crate::config::FlushDurability::Deferred)
+            .then(|| {
+                tables
+                    .iter()
+                    .cloned()
+                    .map(crate::version::UnsyncedFile::Table)
+                    .chain(
+                        blob_files
+                            .unwrap_or(&[])
+                            .iter()
+                            .cloned()
+                            .map(crate::version::UnsyncedFile::Blob),
+                    )
+                    .collect()
+            });
+        version_lock.upgrade_version_deferring(
             &self.config.path,
             |current| {
                 let mut copy = current.clone();
@@ -1489,6 +1511,7 @@ impl AbstractTree for Tree {
             // `false` for the filter: the flush stream carries no user
             // compaction filter, so `DropsData` is unreachable here.
             crate::version::RetentionEffect::of_run(false, collected_below_watermark, gc_watermark),
+            deferred,
         )?;
         installed.charge();
 
@@ -1960,22 +1983,30 @@ impl AbstractTree for Tree {
     }
 
     fn get_highest_memtable_seqno(&self) -> Option<SeqNo> {
-        let version = self.version_history.read().latest_version();
+        highest_memtable_seqno(&self.version_history.read().latest_version())
+    }
 
-        let active = version.active_memtable.get_highest_seqno();
-
-        let sealed = version
-            .sealed_memtables
-            .iter()
-            .map(|mt| mt.get_highest_seqno())
-            .max()
-            .flatten();
-
-        active.max(sealed)
+    fn get_highest_seqno(&self) -> Option<SeqNo> {
+        // One snapshot for the tables and the memtables: a flush installed
+        // between two reads would leave its writes in neither. Its current
+        // version, not the one on disk: a deferred flush moves its writes out
+        // of the memtable before any persist names them.
+        let snapshot = self.version_history.read().latest_version();
+        let tables = snapshot
+            .version
+            .iter_tables()
+            .map(Table::get_highest_seqno)
+            .max();
+        highest_memtable_seqno(&snapshot).max(tables)
     }
 
     fn get_highest_persisted_seqno(&self) -> Option<SeqNo> {
-        self.current_version()
+        // The version on disk, not the current one: a deferred flush is not
+        // persisted until a persist writes it, and a caller trimming its log
+        // by this seqno must keep what such a flush holds.
+        self.version_history
+            .read()
+            .persisted_version()
             .iter_tables()
             .map(Table::get_highest_seqno)
             .max()
@@ -7094,7 +7125,7 @@ impl Tree {
 /// Who syncs the folders that gain an entry when an open makes a tree's
 /// folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NewFolderNames {
+pub(crate) enum NewFolderNames {
     /// The open, before the tree's first snapshot.
     Synced,
     /// The open's caller, once for a batch of trees after every one of them
@@ -7105,7 +7136,7 @@ pub enum NewFolderNames {
 /// A tree an open made, and what takes it back: its folder on its backend,
 /// the folders that gained an entry making that folder, what the folder held
 /// before the open when it existed, and who syncs those folders.
-pub struct Creation {
+pub(crate) struct Creation {
     path: crate::path::PathBuf,
     fs: Arc<dyn Fs>,
     /// Nearest first; none when the tree folder existed already.
@@ -7122,7 +7153,7 @@ impl Creation {
     /// while its lock is still held, then the folders the open made, once
     /// empty, and the folders that held their names are synced where the open
     /// synced them, so the tree does not come back after a power loss.
-    pub fn take_back(self, tree: Tree) {
+    pub(crate) fn take_back(self, tree: Tree) {
         #[cfg(feature = "std")]
         let lock = tree.0.directory_lock.clone();
         drop(tree);
@@ -7176,7 +7207,9 @@ struct BatchMade {
 /// Opens a tree for each config, making the missing ones, and syncs each
 /// folder that gained a new tree's name once, after all of them: see
 /// [`Config::open_many`].
-pub fn open_batch(configs: impl IntoIterator<Item = Config>) -> crate::Result<Vec<crate::AnyTree>> {
+pub(crate) fn open_batch(
+    configs: impl IntoIterator<Item = Config>,
+) -> crate::Result<Vec<crate::AnyTree>> {
     let mut trees = Vec::new();
     let mut made: Vec<BatchMade> = Vec::new();
     for config in configs {

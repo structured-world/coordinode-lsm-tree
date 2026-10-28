@@ -107,6 +107,33 @@ Note `get_highest_persisted_seqno` is the *persisted* watermark, distinct from
 `get_highest_seqno` (the max over memtable + SSTs, including not-yet-durable
 writes). Trim against the persisted one only.
 
+### Deferring a flush's syncs to a barrier
+
+With your own WAL, the syncs a flush issues (its table, the table's folder, the
+manifest edit naming it) buy nothing on the write path: the WAL already made the
+write durable. For a small flush they are nearly its whole cost. Under
+`Config::flush_durability(FlushDurability::Deferred)` a flush writes its tables
+without syncing them and installs them in memory only, readable at once;
+`persist_flushes` is the barrier that syncs every flush installed before it and
+writes them to the manifest:
+
+```rust,ignore
+fn persist_flushes(&self) -> crate::Result<()>;
+```
+
+`get_highest_persisted_seqno` counts only what a barrier persisted, so the
+recipe above stays correct unchanged: a flush advances the watermark only once
+it is persisted, and you trim against that. Call `persist_flushes` when you
+want to trim, not after every flush; one barrier covers every flush before it.
+Every other install (a compaction, an ingestion, a drop) persists the pending
+flushes with it, and so do `create_checkpoint` and dropping the tree.
+
+After a power loss the tree opens at the last persisted state: the tables of
+flushes after it are named by no manifest and are removed on open, as if those
+flushes never ran. Their records are above your trim watermark, so the replay of
+section 3 restores them. The on-disk format is the same in both modes, and a
+tree written under either opens under either.
+
 ## 3. Recovery replay
 
 On `Config::open` the engine recovers its state from the persisted SSTs alone (it

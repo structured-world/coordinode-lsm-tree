@@ -1496,6 +1496,7 @@ impl AbstractTree for BlobTree {
                 include_blobs: true,
                 runtime_config: self.index.0.runtime_config.load_full(),
                 encryption: self.index.0.config.encryption.clone(),
+                source: &self.index.0,
             },
         )
     }
@@ -1520,6 +1521,10 @@ impl AbstractTree for BlobTree {
 
     fn get_version_history_lock(&self) -> VersionsWriteGuard<'_> {
         self.index.get_version_history_lock()
+    }
+
+    fn persist_flushes(&self) -> crate::Result<()> {
+        self.index.persist_flushes()
     }
 
     fn next_table_id(&self) -> TableId {
@@ -2099,6 +2104,7 @@ impl AbstractTree for BlobTree {
         table_writer = table_writer.use_page_ecc(self.index.config.page_ecc, rc.ecc_scheme);
         table_writer = table_writer
             .use_sync_mode(self.index.config.sync_mode)
+            .use_durability(self.index.config.flush_durability)
             .use_writeback_bytes(self.index.config.writeback_bytes);
         table_writer = table_writer.use_seqno_in_index(rc.seqno_in_index);
         table_writer = table_writer.use_zone_map(rc.zone_map);
@@ -2160,6 +2166,7 @@ impl AbstractTree for BlobTree {
             .use_target_size(kv_opts.file_target_size)
             .use_compression(rc.blob_compression)
             .use_sync_mode(self.index.config.sync_mode)
+            .use_durability(self.index.config.flush_durability)
             .use_writeback_bytes(self.index.config.writeback_bytes)
             .use_lifetime_groups(kv_opts.lifetime_groups)
             .use_clock(self.index.config.clock.clone())

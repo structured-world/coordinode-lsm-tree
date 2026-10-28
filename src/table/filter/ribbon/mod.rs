@@ -57,7 +57,6 @@
     clippy::doc_markdown,
     clippy::unreadable_literal,
     clippy::too_many_lines,
-    clippy::redundant_pub_crate,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     clippy::module_name_repetitions,

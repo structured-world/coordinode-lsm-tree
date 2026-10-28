@@ -5,7 +5,7 @@
 mod cut_alignment;
 mod tombstone_share;
 
-pub use cut_alignment::Boundary;
+pub(crate) use cut_alignment::Boundary;
 
 use super::{filter::BloomConstructionPolicy, writer::Writer};
 use crate::{
@@ -34,7 +34,7 @@ use crate::path::PathBuf;
               across table rotations (partitioned filter, range-tombstone clip, \
               seqno-in-index, disable-CoW); enums would obscure the per-feature wiring"
 )]
-pub struct MultiWriter {
+pub(crate) struct MultiWriter {
     pub(crate) fs: Arc<dyn Fs>,
 
     pub(crate) base_path: PathBuf,
@@ -162,6 +162,9 @@ pub struct MultiWriter {
     /// `Config::sync_mode` — preserved so every successor [`Writer`]
     /// finishes its SST with the same durability level.
     sync_mode: SyncMode,
+
+    /// Whether every successor [`Writer`] syncs its file at finish.
+    durability: crate::config::FlushDurability,
 
     /// `Config::writeback_bytes`, preserved for every successor [`Writer`].
     writeback_bytes: u64,
@@ -321,7 +324,7 @@ fn partly_carried_bound(raw_len: usize, rows: &[InternalValue]) -> u64 {
 /// compaction writes no key. Where its inputs held every covered key, that is
 /// safe; where a table outside the compaction holds one, the piece is all
 /// that keeps it deleted, so the writer answering for that span keeps it.
-pub struct TombstonesOutside {
+pub(crate) struct TombstonesOutside {
     /// Ordered by start.
     pub tombstones: Vec<RangeTombstone>,
     /// The least key the writer answers for; `None` from the start of the key
@@ -399,7 +402,7 @@ impl MultiWriter {
     /// A `MultiWriter` whose outputs take their ids from `table_id_generator`
     /// and their files as they start, with no pool.
     #[cfg(test)]
-    pub fn new(
+    pub(crate) fn new(
         base_path: PathBuf,
         table_id_generator: crate::SequenceNumberCounter,
         target_size: u64,
@@ -501,6 +504,7 @@ impl MultiWriter {
 
             ecc: None,
             sync_mode: SyncMode::Normal,
+            durability: crate::config::FlushDurability::Synced,
             writeback_bytes: 0,
 
             kv_checksum: None,
@@ -652,7 +656,7 @@ impl MultiWriter {
     /// rotated successor table. No-op when `parallel` is `None`.
     #[cfg(feature = "std")]
     #[must_use]
-    pub fn use_parallel_compression(
+    pub(crate) fn use_parallel_compression(
         mut self,
         parallel: Option<crate::table::writer::ParallelCompression>,
     ) -> Self {
@@ -666,7 +670,7 @@ impl MultiWriter {
     /// Enables RT clipping: each tombstone is intersected with the output
     /// Sets the user comparator used for output ordering and RT clipping.
     #[must_use]
-    pub fn set_comparator(mut self, comparator: crate::SharedComparator) -> Self {
+    pub(crate) fn set_comparator(mut self, comparator: crate::SharedComparator) -> Self {
         self.comparator = comparator;
         self
     }
@@ -678,7 +682,7 @@ impl MultiWriter {
     /// tables are consumed; do NOT use for flush where RTs must cover older
     /// SSTs.
     #[must_use]
-    pub fn use_clip_range_tombstones(mut self) -> Self {
+    pub(crate) fn use_clip_range_tombstones(mut self) -> Self {
         self.clip_range_tombstones = true;
         self
     }
@@ -695,7 +699,7 @@ impl MultiWriter {
     }
 
     /// Sets range tombstones to be distributed across output tables.
-    pub fn set_range_tombstones(&mut self, mut tombstones: Vec<RangeTombstone>) {
+    pub(crate) fn set_range_tombstones(&mut self, mut tombstones: Vec<RangeTombstone>) {
         let comparator = self.comparator.as_ref();
         tombstones.sort_by(|a, b| comparator.compare(&a.start, &b.start));
         self.tombstone_share = tombstone_share::TombstoneShare::new();
@@ -919,7 +923,7 @@ impl MultiWriter {
     /// # Panics
     ///
     /// In debug builds, if no entry has been written yet.
-    pub fn register_blob(&mut self, indirection: BlobIndirection) {
+    pub(crate) fn register_blob(&mut self, indirection: BlobIndirection) {
         debug_assert!(
             self.current_key.is_some(),
             "a blob is registered after the entry that points into it"
@@ -986,7 +990,7 @@ impl MultiWriter {
     /// # Errors
     ///
     /// Returns an error if `row` is not a well-formed cell row.
-    pub fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
+    pub(crate) fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
         debug_assert!(
             self.current_key.is_some(),
             "a cell row is registered after it is written"
@@ -1011,35 +1015,35 @@ impl MultiWriter {
     }
 
     #[must_use]
-    pub fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
+    pub(crate) fn use_adaptive_index(mut self, spill_threshold: u64) -> Self {
         self.index_spill_threshold = Some(spill_threshold);
         self.writer = self.writer.use_adaptive_index(spill_threshold);
         self
     }
 
     #[must_use]
-    pub fn use_partitioned_filter(mut self) -> Self {
+    pub(crate) fn use_partitioned_filter(mut self) -> Self {
         self.use_partitioned_filter = true;
         self.writer = self.writer.use_partitioned_filter();
         self
     }
 
     #[must_use]
-    pub fn use_data_block_restart_interval(mut self, interval: u8) -> Self {
+    pub(crate) fn use_data_block_restart_interval(mut self, interval: u8) -> Self {
         self.data_block_restart_interval = interval;
         self.writer = self.writer.use_data_block_restart_interval(interval);
         self
     }
 
     #[must_use]
-    pub fn use_index_block_restart_interval(mut self, interval: u8) -> Self {
+    pub(crate) fn use_index_block_restart_interval(mut self, interval: u8) -> Self {
         self.index_block_restart_interval = interval;
         self.writer = self.writer.use_index_block_restart_interval(interval);
         self
     }
 
     #[must_use]
-    pub fn use_data_block_hash_ratio(mut self, ratio: f32) -> Self {
+    pub(crate) fn use_data_block_hash_ratio(mut self, ratio: f32) -> Self {
         self.data_block_hash_ratio = ratio;
         self.writer = self.writer.use_data_block_hash_ratio(ratio);
         self
@@ -1101,21 +1105,21 @@ impl MultiWriter {
     }
 
     #[must_use]
-    pub fn use_data_block_compression(mut self, compression: CompressionType) -> Self {
+    pub(crate) fn use_data_block_compression(mut self, compression: CompressionType) -> Self {
         self.data_block_compression = compression;
         self.writer = self.writer.use_data_block_compression(compression);
         self
     }
 
     #[must_use]
-    pub fn use_index_block_compression(mut self, compression: CompressionType) -> Self {
+    pub(crate) fn use_index_block_compression(mut self, compression: CompressionType) -> Self {
         self.index_block_compression = compression;
         self.writer = self.writer.use_index_block_compression(compression);
         self
     }
 
     #[must_use]
-    pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
+    pub(crate) fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
         self.writer = self.writer.use_bloom_policy(bloom_policy);
         self
@@ -1148,14 +1152,20 @@ impl MultiWriter {
     }
 
     #[must_use]
-    pub fn use_prefix_extractor(mut self, extractor: Option<Arc<dyn PrefixExtractor>>) -> Self {
+    pub(crate) fn use_prefix_extractor(
+        mut self,
+        extractor: Option<Arc<dyn PrefixExtractor>>,
+    ) -> Self {
         self.prefix_extractor.clone_from(&extractor);
         self.writer = self.writer.use_prefix_extractor(extractor);
         self
     }
 
     #[must_use]
-    pub fn use_encryption(mut self, encryption: Option<Arc<dyn EncryptionProvider>>) -> Self {
+    pub(crate) fn use_encryption(
+        mut self,
+        encryption: Option<Arc<dyn EncryptionProvider>>,
+    ) -> Self {
         self.encryption.clone_from(&encryption);
         self.writer = self.writer.use_encryption(encryption);
         self
@@ -1174,7 +1184,7 @@ impl MultiWriter {
     /// inner [`Writer`] and preserves it across rotations so every
     /// successor writer stamps the same setting on its blocks.
     #[must_use]
-    pub fn use_ecc(mut self, ecc: Option<crate::table::block::EccParams>) -> Self {
+    pub(crate) fn use_ecc(mut self, ecc: Option<crate::table::block::EccParams>) -> Self {
         self.ecc = ecc;
         self.writer = self.writer.use_ecc(ecc);
         self
@@ -1184,7 +1194,11 @@ impl MultiWriter {
     /// scheme and applies it via [`Self::use_ecc`]. Mirrors
     /// [`crate::table::writer::Writer::use_page_ecc`].
     #[must_use]
-    pub fn use_page_ecc(self, page_ecc: bool, scheme: crate::runtime_config::EccScheme) -> Self {
+    pub(crate) fn use_page_ecc(
+        self,
+        page_ecc: bool,
+        scheme: crate::runtime_config::EccScheme,
+    ) -> Self {
         self.use_ecc(crate::table::writer::resolve_ecc(page_ecc, scheme))
     }
 
@@ -1192,16 +1206,26 @@ impl MultiWriter {
     /// and preserves it across rotations so every successor SST is finished
     /// at the same durability level.
     #[must_use]
-    pub fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
+    pub(crate) fn use_sync_mode(mut self, sync_mode: SyncMode) -> Self {
         self.sync_mode = sync_mode;
         self.writer = self.writer.use_sync_mode(sync_mode);
+        self
+    }
+
+    /// Leaves every table this writer finishes unsynced under
+    /// [`FlushDurability::Deferred`](crate::config::FlushDurability::Deferred),
+    /// for the install that persists them to sync.
+    #[must_use]
+    pub(crate) fn use_durability(mut self, durability: crate::config::FlushDurability) -> Self {
+        self.durability = durability;
+        self.writer = self.writer.use_durability(durability);
         self
     }
 
     /// Wires the tree's `Config::writeback_bytes` through to the inner
     /// [`Writer`] and every successor.
     #[must_use]
-    pub fn use_writeback_bytes(mut self, bytes: u64) -> Self {
+    pub(crate) fn use_writeback_bytes(mut self, bytes: u64) -> Self {
         self.writeback_bytes = bytes;
         self.writer = self.writer.use_writeback_bytes(bytes);
         self
@@ -1214,7 +1238,7 @@ impl MultiWriter {
     /// (the data-block payload encoding is unchanged; the V5 header/meta
     /// layout still differs from pre-V5 regardless).
     #[must_use]
-    pub fn use_kv_checksums(
+    pub(crate) fn use_kv_checksums(
         mut self,
         policy: crate::runtime_config::KvChecksumPolicy,
         algo: crate::runtime_config::ChecksumAlgorithm,
@@ -1232,7 +1256,7 @@ impl MultiWriter {
     /// [`Writer`] and preserves it across rotations so every successor
     /// writer emits a matching `seqno_bounds` section.
     #[must_use]
-    pub fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
+    pub(crate) fn use_seqno_in_index(mut self, seqno_in_index: bool) -> Self {
         self.use_seqno_in_index = seqno_in_index;
         self.writer = self.writer.use_seqno_in_index(seqno_in_index);
         self
@@ -1243,7 +1267,7 @@ impl MultiWriter {
     /// or compaction is written under the same strategy.
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
+    pub(crate) fn use_zstd_two_pass_seed(mut self, enabled: bool) -> Self {
         self.use_zstd_two_pass_seed = enabled;
         self.writer = self.writer.use_zstd_two_pass_seed(enabled);
         self
@@ -1252,7 +1276,7 @@ impl MultiWriter {
     /// Enables the `zone_map` section on this writer and every successor it
     /// rotates to, so all SSTs of one flush / compaction emit it.
     #[must_use]
-    pub fn use_zone_map(mut self, zone_map: bool) -> Self {
+    pub(crate) fn use_zone_map(mut self, zone_map: bool) -> Self {
         self.use_zone_map = zone_map;
         self.writer = self.writer.use_zone_map(zone_map);
         self
@@ -1272,7 +1296,7 @@ impl MultiWriter {
     }
 
     #[must_use]
-    pub fn use_columnar(mut self, columnar: bool) -> Self {
+    pub(crate) fn use_columnar(mut self, columnar: bool) -> Self {
         self.use_columnar = columnar;
         self.writer = self.writer.use_columnar(columnar);
         self
@@ -1391,7 +1415,7 @@ impl MultiWriter {
 
     /// Sets the delete strategy for this and every rotated successor writer.
     #[must_use]
-    pub fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
+    pub(crate) fn delete_strategy(mut self, strategy: crate::config::DeleteStrategy) -> Self {
         self.delete_strategy = strategy;
         self.writer = self.writer.delete_strategy(strategy);
         self
@@ -1402,7 +1426,7 @@ impl MultiWriter {
     /// table in the run emits its own per-SST locator section (or none, when
     /// disabled). Block ordinals reset per table.
     #[must_use]
-    pub fn use_locator(mut self, entry: crate::config::LocatorPolicyEntry) -> Self {
+    pub(crate) fn use_locator(mut self, entry: crate::config::LocatorPolicyEntry) -> Self {
         self.locator_entry = entry;
         self.writer = self.writer.use_locator(entry);
         self
@@ -1413,7 +1437,7 @@ impl MultiWriter {
     /// preserves it across rotations so every successor SST is flagged the same
     /// way. A no-op on non-CoW filesystems.
     #[must_use]
-    pub fn use_disable_cow_on_sst(mut self, disable_cow: bool) -> Self {
+    pub(crate) fn use_disable_cow_on_sst(mut self, disable_cow: bool) -> Self {
         self.disable_cow_on_sst = disable_cow;
         self.writer = self.writer.use_disable_cow(disable_cow);
         self
@@ -1421,7 +1445,7 @@ impl MultiWriter {
 
     #[cfg(zstd_any)]
     #[must_use]
-    pub fn use_zstd_dictionary(
+    pub(crate) fn use_zstd_dictionary(
         mut self,
         dictionary: Option<Arc<crate::compression::ZstdDictionary>>,
     ) -> Self {
@@ -1658,6 +1682,7 @@ impl MultiWriter {
         new_writer = new_writer.use_ecc(self.ecc);
         new_writer = new_writer
             .use_sync_mode(self.sync_mode)
+            .use_durability(self.durability)
             .use_writeback_bytes(self.writeback_bytes);
         if let Some((policy, algo)) = self.kv_checksum {
             new_writer = new_writer.use_kv_checksums(policy, algo);
@@ -1951,7 +1976,7 @@ impl MultiWriter {
     }
 
     /// Writes an item
-    pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+    pub(crate) fn write(&mut self, item: InternalValue) -> crate::Result<()> {
         // A new user key is a change of byte IDENTITY, never of byte order:
         // the stream arrives in comparator order, and a comparator whose order
         // is not the byte order (reversed, numeric) makes `<` false for keys
@@ -2595,7 +2620,7 @@ impl MultiWriter {
     /// Returns the created tables and whether their directory entries are
     /// durable: the outputs opened here, for tombstones past the last key,
     /// count as much as those opened before.
-    pub fn finish(mut self) -> crate::Result<Written> {
+    pub(crate) fn finish(mut self) -> crate::Result<Written> {
         self.split_tombstones_past_the_last_key()?;
 
         // Same judgment as `rotate` for the LAST output's window — by the
@@ -2694,7 +2719,7 @@ impl MultiWriter {
 }
 
 /// The tables a [`MultiWriter`] wrote.
-pub struct Written {
+pub(crate) struct Written {
     pub tables: Vec<(TableId, Checksum)>,
     /// Whether every table's directory entry was durable before its table was
     /// written, so the install naming them syncs no folder for them (see
