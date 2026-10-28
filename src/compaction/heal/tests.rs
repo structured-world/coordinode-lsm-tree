@@ -208,6 +208,9 @@ impl crate::fs::FsFile for FlipFile {
     fn lock_exclusive(&self) -> crate::io::Result<()> {
         self.inner.lock_exclusive()
     }
+    fn try_lock_exclusive(&self) -> crate::io::Result<bool> {
+        self.inner.try_lock_exclusive()
+    }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
         let n = self.inner.read_at(buf, offset)?;
         let hit = self
