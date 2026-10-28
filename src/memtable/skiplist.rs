@@ -328,8 +328,14 @@ impl SkipMap {
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
         let value_idx = self.values.reserve();
+        // The slot is written before anything that can panic: the store
+        // drops every slot below its count as a value, so a reserved slot
+        // left unwritten by a panic in the node's allocation would be dropped
+        // as one it never held.
+        // SAFETY: `value_idx` was reserved by this insert and is written once.
+        unsafe { self.values.write(value_idx, value) };
         let height = node_height(self.height_seed, value_idx);
-        let node = self.alloc_node(key, value, value_idx, height, kv_digest);
+        let node = self.alloc_node(key, value_idx, height, kv_digest);
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -571,7 +577,6 @@ impl SkipMap {
     fn alloc_node(
         &self,
         key: &InternalKey,
-        value: UserValue,
         value_idx: u32,
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
@@ -603,10 +608,6 @@ impl SkipMap {
                     .copy_from_slice(key_bytes);
             }
         }
-
-        // Store value in the lock-free segmented store.
-        // SAFETY: `value_idx` was reserved by this insert and is written once.
-        unsafe { self.values.write(value_idx, value) };
 
         // Write immutable metadata using direct byte offsets matching the
         // node layout comment above.  The arena guarantees 24+ bytes at `node`.
