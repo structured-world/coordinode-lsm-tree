@@ -5579,15 +5579,28 @@ impl Tree {
         self.accept(&value);
         let kv_digest = self.insert_digest(&value);
 
-        // The `.read()` guard is a temporary that lives until the end of this
-        // statement, so the insert runs under the version-history read lock:
-        // `value` + its digest land in the current active memtable atomically,
-        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
-        self.version_history
-            .read()
-            .latest_version_ref()
-            .active_memtable
-            .insert_with_kv_digest(value, kv_digest)
+        // The insert holds its thread's shard of the insert gate, which a
+        // version replacing the active memtable closes before it publishes:
+        // `value` and its digest land in the active memtable the mirror names,
+        // and no rotation seals it mid-insert. Unlike the history read lock,
+        // the shard is a line no other writer thread touches.
+        #[cfg(feature = "std")]
+        {
+            let _entered = self.insert_gate.enter();
+            self.latest_super_version
+                .load()
+                .active_memtable
+                .insert_with_kv_digest(value, kv_digest)
+        }
+        // no-std: the history read lock, with the same guarantee.
+        #[cfg(not(feature = "std"))]
+        {
+            self.version_history
+                .read()
+                .latest_version_ref()
+                .active_memtable
+                .insert_with_kv_digest(value, kv_digest)
+        }
     }
 
     /// Adds a cell row whose references are `refs` to the active memtable,
@@ -5908,6 +5921,8 @@ impl Tree {
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
+        let insert_gate = super_versions.insert_gate_handle();
+        #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
         }
@@ -5922,6 +5937,8 @@ impl Tree {
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
             latest_super_version,
+            #[cfg(feature = "std")]
+            insert_gate,
             stop_signal,
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
@@ -7743,6 +7760,10 @@ mod open_batch_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod clear_race_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
+mod insert_rotation_tests;
 
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]

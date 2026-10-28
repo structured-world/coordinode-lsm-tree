@@ -394,6 +394,12 @@ pub struct SuperVersions {
     #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
 
+    /// What inserts hold instead of the history lock: they read the active
+    /// memtable from [`Self::latest`], and a version that replaces it closes
+    /// the gate first, so no insert lands in a memtable once it is sealed.
+    #[cfg(feature = "std")]
+    insert_gate: Arc<super::insert_gate::InsertGate>,
+
     /// The tree's filter budget, when it allocates filter memory by probe
     /// load: every version this history publishes updates the filter bytes
     /// it holds.
@@ -433,6 +439,8 @@ impl SuperVersions {
         Self {
             #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
+            #[cfg(feature = "std")]
+            insert_gate: Arc::new(super::insert_gate::InsertGate::new()),
             current: initial,
             persisted: version,
             unsynced: Vec::new(),
@@ -992,6 +1000,12 @@ impl SuperVersions {
         if let Some(budget) = &self.filter_budget {
             budget.publish(&version.version);
         }
+        // A new active memtable is published with the insert gate closed: the
+        // inserts that read the old one from the mirror finish into it first,
+        // and the ones after see the new one.
+        #[cfg(feature = "std")]
+        let _closed = (!Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable))
+            .then(|| self.insert_gate.close());
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
         #[cfg(feature = "std")]
@@ -1024,6 +1038,14 @@ impl SuperVersions {
     #[must_use]
     pub(crate) fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
         Arc::clone(&self.latest)
+    }
+
+    /// Returns the gate inserts pass instead of taking the history lock (see
+    /// `insert_gate`).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn insert_gate_handle(&self) -> Arc<super::insert_gate::InsertGate> {
+        Arc::clone(&self.insert_gate)
     }
 
     pub fn latest_version(&self) -> SuperVersion {

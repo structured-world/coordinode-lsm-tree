@@ -22,6 +22,10 @@ pub(crate) mod edit_log;
 // gating `framing` only pays off once its callers no longer need
 // `std::io` either.
 mod framing;
+// std-only: a shard per thread needs `thread_local!`.
+// no-std: inserts keep the version-history read lock (`Tree::append_entry`).
+#[cfg(feature = "std")]
+pub(crate) mod insert_gate;
 mod optimize;
 mod persist;
 pub(crate) mod recovery;

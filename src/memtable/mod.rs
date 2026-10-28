@@ -4,7 +4,7 @@
 
 pub(crate) mod arena;
 pub(crate) mod interval_tree;
-mod own_line;
+pub(crate) mod own_line;
 use own_line::OwnLine;
 pub(crate) mod skiplist;
 pub(crate) mod value_store;

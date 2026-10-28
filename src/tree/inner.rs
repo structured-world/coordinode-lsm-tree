@@ -145,6 +145,12 @@ pub struct TreeInner {
     #[cfg(feature = "std")]
     pub(crate) latest_super_version: Arc<arc_swap::ArcSwap<crate::version::SuperVersion>>,
 
+    /// The gate inserts pass instead of the history lock (shared with
+    /// [`version_history`](Self::version_history) via
+    /// [`SuperVersions::insert_gate_handle`]).
+    #[cfg(feature = "std")]
+    pub(crate) insert_gate: Arc<crate::version::insert_gate::InsertGate>,
+
     pub(crate) compaction_state: Arc<Mutex<CompactionState>>,
 
     /// Tree configuration
@@ -428,6 +434,8 @@ impl TreeInner {
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
+        let insert_gate = super_versions.insert_gate_handle();
+        #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
         }
@@ -450,6 +458,8 @@ impl TreeInner {
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
             latest_super_version,
+            #[cfg(feature = "std")]
+            insert_gate,
             stop_signal,
             major_compaction_lock: RwLock::default(),
             flush_lock: Mutex::default(),
