@@ -377,8 +377,11 @@ impl Strategy {
     /// # let folder = tempfile::tempdir()?;
     /// # let tree = Config::new(folder.path(), SequenceNumberCounter::default(), SequenceNumberCounter::default()).open()?;
     /// let strategy = Planned::default();
-    /// // A fresh tree has a single level, and no plan.
-    /// assert!(strategy.plan_for(&tree.current_version(), tree.tree_config()).is_none());
+    /// let view = strategy
+    ///     .plan_for(&tree.current_version(), tree.tree_config())
+    ///     .expect("a tree has a main level apart from the last");
+    /// // Nothing has come down yet: the round is at its start.
+    /// assert_eq!(view.units, 0);
     /// # Ok::<(), lsm_tree::Error>(())
     /// ```
     #[must_use]

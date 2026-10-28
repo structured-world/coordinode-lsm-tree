@@ -380,15 +380,17 @@ impl ArmRun {
         )
     }
 
-    /// The key a read goes to: any of `keys` alike, or under a skewed mix
-    /// mostly the few that a power of a uniform draw picks, scattered over
-    /// the key space so the hot set is not one range.
+    /// The key a read goes to: any of `keys` alike, or under a skewed mix by
+    /// a Zipfian heat, scattered over the key space so the hot set is not one
+    /// range.
     fn lookup_key(&mut self, keys: u64, mix: ReadMix) -> u64 {
         if !mix.skewed {
             return self.lookups.random_range(0..keys);
         }
+        // A rank drawn log-uniformly from `1..=keys` falls on `x` with a
+        // density of `1/x`: the heat of a Zipf law of exponent one.
         let draw: f64 = self.lookups.random();
-        let rank = ((draw.powi(4) * keys as f64) as u64).min(keys - 1);
+        let rank = ((keys as f64).powf(draw) as u64).clamp(1, keys) - 1;
         // A large odd multiplier spreads neighbouring ranks over the key
         // space; two ranks landing on one key only make it hotter.
         rank.wrapping_mul(0x9E37_79B9_7F4A_7C15) % keys

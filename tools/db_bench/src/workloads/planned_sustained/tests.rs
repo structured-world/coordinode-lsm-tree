@@ -96,34 +96,39 @@ fn the_trees_are_built_beneath_the_run_directory() -> lsm_tree::Result<()> {
     Ok(())
 }
 
-/// A skewed mix reads keys within the key space, and fewer distinct ones than
-/// an even mix does from the same number of draws.
+/// A skewed mix reads keys within the key space, its ten hottest taking a
+/// share of the reads a Zipf law of exponent one gives them, about a quarter
+/// over ten thousand keys, where an even mix gives them a fraction of a
+/// percent. Guards against a skew too weak to tell a hot set from the rest.
 #[test]
 fn a_skewed_mix_reads_a_hot_set_within_the_key_space() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
     let rate = super::COMPACTION_RATES[0];
-    let keys = 10_000;
+    let (keys, draws) = (10_000, 20_000);
     let skewed = super::MIXES
         .into_iter()
         .find(|mix| mix.skewed)
         .expect("a skewed mix");
-    let mut distinct = Vec::new();
+    let mut hottest_share = Vec::new();
     for mix in [EVEN, skewed] {
         let mut arm =
             super::ArmRun::open(base.path(), &config(1_000), super::Kind::Planned, mix, rate)?;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..5_000 {
+        let mut hits = std::collections::HashMap::<u64, u64>::new();
+        for _ in 0..draws {
             let key = arm.lookup_key(keys, mix);
             assert!(key < keys, "{key} out of {keys}");
-            seen.insert(key);
+            *hits.entry(key).or_default() += 1;
         }
-        distinct.push(seen.len());
+        let mut counts: Vec<u64> = hits.into_values().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u64 = counts.iter().take(10).sum();
+        hottest_share.push(top as f64 / draws as f64);
     }
+    let (even, skewed) = (hottest_share[0], hottest_share[1]);
+    assert!(even < 0.01, "even reads gave the ten hottest {even}");
     assert!(
-        distinct[1] * 2 < distinct[0],
-        "skewed reads met {} keys, even ones {}",
-        distinct[1],
-        distinct[0]
+        (0.18..0.35).contains(&skewed),
+        "skewed reads gave the ten hottest {skewed}"
     );
     Ok(())
 }
