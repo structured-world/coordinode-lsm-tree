@@ -27,8 +27,7 @@
 //!
 //! Under [`Backpressure::Slowdown`] a tree with a write rate limit (see
 //! [`Config::write_rate_limit`](crate::Config::write_rate_limit)) paces by bytes:
-//! [`AbstractTree::write_backpressure_for`](crate::AbstractTree::write_backpressure_for)
-//! debits a write's bytes from the tree's write limiter and returns what they
+//! [`AbstractTree::write_backpressure_for`] debits a write's bytes from the tree's write limiter and returns what they
 //! owe, so throughput under slowdown is bounded by the rate whatever the write
 //! sizes.
 
