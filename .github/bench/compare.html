@@ -74,7 +74,7 @@
     "ours-deferred-wal": "#a5d6ff",
   };
   const KIND = {
-    write_throughput: "write", overwrite: "write",
+    write_throughput: "write", overwrite: "write", overwrite_sustained: "write",
     point_read: "read", multi_get: "read", range_scan: "read", seek_random: "read",
     major_compact_zstd3: "compaction", subcompaction_zstd3: "compaction",
   };
@@ -185,6 +185,43 @@
         card.appendChild(h3);
         card.appendChild(p);
         card.appendChild(wrap);
+        // What a group reports besides its time: one row per engine and size,
+        // one column per metric, each a median over the rounds.
+        const metricNames = [];
+        Object.keys(engines).forEach(function (e) {
+          Object.keys(engines[e]).forEach(function (n) {
+            (engines[e][n].metrics || []).forEach(function (m) {
+              if (metricNames.indexOf(m.name) < 0) { metricNames.push(m.name); }
+            });
+          });
+        });
+        if (metricNames.length) {
+          const table = document.createElement("table");
+          const head = document.createElement("tr");
+          ["engine", "keys"].concat(metricNames).forEach(function (name) {
+            const th = document.createElement("th");
+            th.textContent = name.replace(/_/g, " ");
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          Object.keys(engines).forEach(function (e) {
+            sizes.forEach(function (n) {
+              const r = engines[e][n];
+              if (!r || !r.metrics) { return; }
+              const row = document.createElement("tr");
+              [e, n.toLocaleString("en")].concat(metricNames.map(function (name) {
+                const m = r.metrics.find(function (x) { return x.name === name; });
+                return m ? m.median.toPrecision(3) : "";
+              })).forEach(function (text) {
+                const td = document.createElement("td");
+                td.textContent = text;
+                row.appendChild(td);
+              });
+              table.appendChild(row);
+            });
+          });
+          card.appendChild(table);
+        }
         grids[kind].appendChild(card);
         charts.push(new Chart(canvas, {
           type: "bar",

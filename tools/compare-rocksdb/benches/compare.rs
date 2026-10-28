@@ -114,6 +114,10 @@
 //!   `ours-deferred-wal` series runs our engine with a caller-kept log and a
 //!   deferred flush: one sync per batch, the durability SurrealKV's commit
 //!   gives.
+//! - `overwrite_sustained` — rounds of rewrites of a hot key set over a tree
+//!   several memtables large, compaction running behind the writes and a
+//!   reader alongside. Time per write, with write and space amplification and
+//!   the read percentiles reported beside it (see [`Sustained`]).
 //!
 //! Each of the above also has a `_zstd22` sibling. The read siblings run 70k
 //! only, the one size whose working set overflows the block cache so a read
@@ -130,8 +134,12 @@
 
 mod paired;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 // `Guard` is a trait, used (not dead) for its `.value()` method on the
@@ -1810,6 +1818,367 @@ fn overwrite_variant(
     }
 }
 
+/// The sustained overwrite: rounds of rewrites of a hot key set over a tree
+/// several memtables large, with compaction running behind the writes.
+#[derive(Clone, Copy)]
+struct Sustained {
+    /// Keys the tree holds before the rewrites.
+    keys: u64,
+    /// The hot set: the first `hot` of those keys, which the key derivation
+    /// spreads over the whole key space.
+    hot: u64,
+    /// Rewrites of the hot set.
+    passes: u64,
+}
+
+impl Sustained {
+    /// Memtable bytes at which a writer flushes, on both engines.
+    const MEMTABLE_BYTES: u64 = 4 << 20;
+    /// Target size of a table, on both engines.
+    const TABLE_TARGET: u64 = 2 << 20;
+    /// L0 runs that start a compaction into L1, on both engines; L1 holds this
+    /// many tables' worth, as ours sizes its first level.
+    const L0_TRIGGER: u8 = 4;
+    /// L0 runs at which a write waits for compaction: RocksDB's default
+    /// `level0_stop_writes_trigger`, applied to ours by the writer.
+    const L0_STOP: usize = 36;
+
+    fn new(measuring: bool) -> Self {
+        if measuring {
+            Self {
+                keys: 100_000,
+                hot: 20_000,
+                passes: 15,
+            }
+        } else {
+            Self {
+                keys: 5_000,
+                hot: 1_000,
+                passes: 3,
+            }
+        }
+    }
+
+    fn writes(self) -> u64 {
+        self.hot * self.passes
+    }
+
+    /// Bytes of a key and its value.
+    fn entry_bytes() -> u64 {
+        u64::try_from(16 + VALUE_SIZE).expect("an entry's size fits u64")
+    }
+}
+
+/// What one sustained run measured besides the writer's time.
+#[derive(Clone, Copy, Default)]
+struct SustainedSample {
+    /// Bytes compaction wrote per byte the rewrites wrote, until compaction
+    /// had nothing left to do after them.
+    write_amplification: f64,
+    /// Bytes on disk over the live data's bytes when the last write landed.
+    space_amplification: f64,
+    read_p50_us: f64,
+    read_p99_us: f64,
+}
+
+impl SustainedSample {
+    /// The sample of a run of `shape` whose compaction wrote `compacted`
+    /// bytes, whose folder held `disk` bytes when the last write landed and
+    /// whose reads took `reads` nanoseconds each.
+    fn new(shape: Sustained, compacted: u64, disk: u64, reads: &mut [u64]) -> Self {
+        Self {
+            write_amplification: ratio(compacted, shape.writes() * Sustained::entry_bytes()),
+            space_amplification: ratio(disk, shape.keys * Sustained::entry_bytes()),
+            read_p50_us: quantile_us(reads, 500),
+            read_p99_us: quantile_us(reads, 990),
+        }
+    }
+
+    fn metrics(self) -> Vec<(&'static str, f64)> {
+        vec![
+            ("write_amplification", self.write_amplification),
+            ("space_amplification", self.space_amplification),
+            ("read_p50_us", self.read_p50_us),
+            ("read_p99_us", self.read_p99_us),
+        ]
+    }
+}
+
+/// Bytes of the files under `dir`.
+fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
+                    Ok(_) => entry.metadata().map_or(0, |m| m.len()),
+                    Err(_) => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// `a / b` for counts of bytes or nanoseconds. Both stay far below 2^53, where
+/// an `f64` holds every integer, so the conversions are exact.
+fn ratio(a: u64, b: u64) -> f64 {
+    let exact = |x: u64| {
+        f64::from(u32::try_from(x >> 21).expect("below 2^53")) * 2_097_152.0
+            + f64::from(u32::try_from(x & 0x1F_FFFF).expect("21 bits"))
+    };
+    exact(a) / exact(b)
+}
+
+/// The quantile `per_mille / 1000` of `nanos`, in microseconds.
+fn quantile_us(nanos: &mut [u64], per_mille: usize) -> f64 {
+    if nanos.is_empty() {
+        return 0.0;
+    }
+    nanos.sort_unstable();
+    let at = (nanos.len() - 1) * per_mille / 1_000;
+    ratio(nanos[at], 1_000)
+}
+
+/// Point reads of random keys until `stop` is set, timed one by one.
+fn read_while(stop: &AtomicBool, keys: &[[u8; 16]], mut get: impl FnMut(&[u8])) -> Vec<u64> {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut nanos = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // Below the key count, which fits usize.
+        let key = &keys[usize::try_from(state % keys.len() as u64).expect("an index fits usize")];
+        let at = std::time::Instant::now();
+        get(key);
+        nanos.push(u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    nanos
+}
+
+/// Our engine's sustained run: the writer flushes at the memtable size and
+/// waits at [`Sustained::L0_STOP`] L0 runs, a thread runs the leveled strategy
+/// whenever it has work, another reads. Returns the writer's time and the
+/// rest of the sample.
+fn sustained_ours(
+    shape: Sustained,
+    compression: Compression,
+    keys: &[[u8; 16]],
+    pool: &ValuePool,
+) -> (Duration, SustainedSample) {
+    let dir = tempfile::tempdir().expect("ours sustained dir");
+    let tree = ours_config(dir.path(), compression, false, IndexStrategy::Binary, false)
+        .open()
+        .expect("ours sustained: open");
+    let strategy: Arc<dyn lsm_tree::compaction::CompactionStrategy> = Arc::new(
+        lsm_tree::compaction::Leveled::default()
+            .with_table_target_size(Sustained::TABLE_TARGET)
+            .with_l0_threshold(Sustained::L0_TRIGGER)
+            .with_dynamic_level_bytes(true),
+    );
+    let flush_at = |tree: &lsm_tree::AnyTree| {
+        if tree.active_memtable().size() >= Sustained::MEMTABLE_BYTES {
+            tree.flush_active_memtable(0)
+                .expect("ours sustained: flush");
+        }
+    };
+    let drain = |tree: &lsm_tree::AnyTree, watermark: u64| -> u64 {
+        let mut written = 0;
+        loop {
+            let result = tree
+                .compact(Arc::clone(&strategy), watermark)
+                .expect("ours sustained: compact");
+            written += result.work.measured.written;
+            if matches!(
+                result.action,
+                lsm_tree::compaction::CompactionAction::Nothing
+            ) {
+                return written;
+            }
+        }
+    };
+    // The tree the rewrites start from, compacted until the strategy rests.
+    for (seqno, key) in (0..).zip(keys) {
+        tree.insert(key, pool.value(seqno), seqno);
+        flush_at(&tree);
+    }
+    tree.flush_active_memtable(0)
+        .expect("ours sustained: seed flush");
+    drain(&tree, shape.keys);
+
+    let stop = AtomicBool::new(false);
+    let watermark = AtomicU64::new(shape.keys);
+    let (elapsed, disk, compacted, mut reads) = std::thread::scope(|scope| {
+        let compactor = scope.spawn(|| {
+            let mut written = 0;
+            while !stop.load(Ordering::Acquire) {
+                let result = tree
+                    .compact(Arc::clone(&strategy), watermark.load(Ordering::Acquire))
+                    .expect("ours sustained: compact");
+                written += result.work.measured.written;
+                if matches!(
+                    result.action,
+                    lsm_tree::compaction::CompactionAction::Nothing
+                ) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            written + drain(&tree, watermark.load(Ordering::Acquire))
+        });
+        let reader = scope.spawn(|| {
+            read_while(&stop, keys, |key| {
+                std::hint::black_box(tree.get(key, MAX_SEQNO).expect("ours sustained: get"));
+            })
+        });
+        let start = std::time::Instant::now();
+        for write in 0..shape.writes() {
+            while tree.l0_run_count() >= Sustained::L0_STOP {
+                std::thread::yield_now();
+            }
+            let seqno = shape.keys + write;
+            let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
+            tree.insert(key, pool.value(seqno), seqno);
+            watermark.store(seqno + 1, Ordering::Release);
+            flush_at(&tree);
+        }
+        tree.flush_active_memtable(0)
+            .expect("ours sustained: last flush");
+        let elapsed = start.elapsed();
+        let disk = dir_bytes(dir.path());
+        stop.store(true, Ordering::Release);
+        let reads = reader.join().expect("ours sustained: reader");
+        let compacted = compactor.join().expect("ours sustained: compactor");
+        (elapsed, disk, compacted, reads)
+    });
+    (
+        elapsed,
+        SustainedSample::new(shape, compacted, disk, &mut reads),
+    )
+}
+
+/// RocksDB's options for the sustained run: the matched ones every group uses,
+/// with the memtable, table and level sizes [`Sustained`] sets for both
+/// engines, and statistics on to count compaction bytes.
+fn rocksdb_sustained_options(compression: Compression) -> rocksdb::Options {
+    let mut opts = rocksdb_options(compression, false);
+    opts.set_write_buffer_size(
+        usize::try_from(Sustained::MEMTABLE_BYTES).expect("the memtable size fits usize"),
+    );
+    opts.set_target_file_size_base(Sustained::TABLE_TARGET);
+    opts.set_max_bytes_for_level_base(Sustained::TABLE_TARGET * u64::from(Sustained::L0_TRIGGER));
+    opts.set_level_zero_file_num_compaction_trigger(i32::from(Sustained::L0_TRIGGER));
+    opts.set_level_zero_stop_writes_trigger(
+        i32::try_from(Sustained::L0_STOP).expect("the stop trigger fits i32"),
+    );
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    opts.enable_statistics();
+    opts
+}
+
+/// Waits until RocksDB runs and plans no compaction.
+fn rocksdb_quiesce(db: &rocksdb::DB) {
+    let busy = |property: &str| {
+        db.property_int_value(property)
+            .expect("rocksdb: property")
+            .unwrap_or(0)
+            > 0
+    };
+    while busy("rocksdb.compaction-pending") || busy("rocksdb.num-running-compactions") {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// RocksDB's sustained run, its background jobs flushing and compacting as
+/// configured; the same writes, reads and measures as [`sustained_ours`].
+fn sustained_rocksdb(
+    shape: Sustained,
+    compression: Compression,
+    keys: &[[u8; 16]],
+    pool: &ValuePool,
+) -> (Duration, SustainedSample) {
+    let dir = tempfile::tempdir().expect("rocksdb sustained dir");
+    let opts = rocksdb_sustained_options(compression);
+    let db = rocksdb::DB::open(&opts, dir.path()).expect("rocksdb sustained: open");
+    let mut write_opts = rocksdb::WriteOptions::default();
+    write_opts.disable_wal(true);
+    for (seqno, key) in (0..).zip(keys) {
+        db.put_opt(key, pool.value(seqno), &write_opts)
+            .expect("rocksdb sustained: seed put");
+    }
+    db.flush().expect("rocksdb sustained: seed flush");
+    rocksdb_quiesce(&db);
+    let compacted_before = opts.get_ticker_count(rocksdb::statistics::Ticker::CompactWriteBytes);
+
+    let stop = AtomicBool::new(false);
+    let (elapsed, disk, mut reads) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            read_while(&stop, keys, |key| {
+                std::hint::black_box(db.get_pinned(key).expect("rocksdb sustained: get"));
+            })
+        });
+        let start = std::time::Instant::now();
+        for write in 0..shape.writes() {
+            let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
+            db.put_opt(key, pool.value(shape.keys + write), &write_opts)
+                .expect("rocksdb sustained: put");
+        }
+        db.flush().expect("rocksdb sustained: last flush");
+        let elapsed = start.elapsed();
+        let disk = dir_bytes(dir.path());
+        stop.store(true, Ordering::Release);
+        let reads = reader.join().expect("rocksdb sustained: reader");
+        (elapsed, disk, reads)
+    });
+    rocksdb_quiesce(&db);
+    let compacted =
+        opts.get_ticker_count(rocksdb::statistics::Ticker::CompactWriteBytes) - compacted_before;
+    (
+        elapsed,
+        SustainedSample::new(shape, compacted, disk, &mut reads),
+    )
+}
+
+/// The sustained overwrite groups, uncompressed and at zstd 22: our engine
+/// against RocksDB, the writer's time per write timed, write and space
+/// amplification and the read percentiles reported beside it.
+fn bench_overwrite_sustained(run: &mut Run) {
+    let shape = Sustained::new(run.measuring);
+    let keys: Vec<[u8; 16]> = (0..shape.keys).map(key_for).collect();
+    let pool = ValuePool::new();
+    for (group, compression) in [
+        ("overwrite_sustained", Compression::None),
+        ("overwrite_sustained_zstd22", Compression::Zstd22),
+    ] {
+        if !run.wants(group) {
+            continue;
+        }
+        let arms = [Engine::Ours, Engine::RocksDb]
+            .into_iter()
+            .map(|engine| {
+                let last = Rc::new(Cell::new(SustainedSample::default()));
+                let (keys, pool, sample) = (&keys, &pool, Rc::clone(&last));
+                paired::Arm::new(engine.label(), move |iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let (elapsed, measured) = match engine {
+                            Engine::RocksDb => sustained_rocksdb(shape, compression, keys, pool),
+                            Engine::Ours | Engine::BlobTree | Engine::SurrealKv => {
+                                sustained_ours(shape, compression, keys, pool)
+                            }
+                        };
+                        total += elapsed;
+                        sample.set(measured);
+                    }
+                    total
+                })
+                .with_metrics(move || last.get().metrics())
+            })
+            .collect();
+        run.measure(group, shape.writes(), arms);
+    }
+}
+
 /// L0 tables built before timing the compaction. Their key ranges overlap
 /// (the golden-ratio key scatter spreads consecutive indices across the
 /// keyspace), so neither engine can "trivially move" them to the next level
@@ -2143,6 +2512,10 @@ const GROUP_NOTES: &[(&str, &str)] = &[
         "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the log written and synced once and the flush deferred, one sync per batch as in SurrealKV's commit.",
     ),
     (
+        "overwrite_sustained",
+        "100,000 keys, then 15 rewrites of a hot set of 20,000 of them, with compaction behind the writes and a reader alongside. 4 MiB memtables, 2 MiB tables, 4 L0 runs per compaction; ours runs leveled compaction on a thread of its own and stops writes at 36 L0 runs, RocksDB's stop trigger. Time per write; beside it the compaction bytes per written byte until compaction rests, the disk bytes over live bytes when the last write lands, and the reader's p50 and p99.",
+    ),
+    (
         "point_read",
         "One get per stored key on a warm engine. Also our hash index, ribbon locator and row cache, and RocksDB's hash index, on the same chart.",
     ),
@@ -2303,6 +2676,12 @@ fn write_summary(run: &Run) -> std::io::Result<PathBuf> {
                 "rounds": r.rounds,
                 "ns_per_op": estimate_json(r.ns_per_op),
                 "vs_baseline": r.vs_baseline.map(estimate_json),
+                "metrics": r.metrics.iter().map(|(name, e)| serde_json::json!({
+                    "name": name,
+                    "median": e.median,
+                    "lower": e.lower,
+                    "upper": e.upper,
+                })).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -2341,6 +2720,7 @@ fn main() {
     eprintln!("compare-rocksdb: {mode}, {:?}", run.settings);
     bench_write_throughput(&mut run);
     bench_seeded(&mut run);
+    bench_overwrite_sustained(&mut run);
     bench_compaction(&mut run);
     bench_subcompaction(&mut run);
     if !run.measuring {
