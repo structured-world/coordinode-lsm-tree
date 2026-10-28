@@ -861,6 +861,41 @@ fn publish(
     }
 }
 
+/// One line on stderr per arm as each run ends, so a long run shows what it
+/// measured so far, whatever happens to the report printed at the end.
+fn progress(kind: Kind, arm: &Arm, mix: ReadMix, compaction_rate: u64) {
+    let queries = arm.points.len() + arm.scans.len();
+    let qps = if arm.query_nanos == 0 {
+        0.0
+    } else {
+        queries as f64 * 1e9 / arm.query_nanos as f64
+    };
+    let error = |check: &ModelCheck| {
+        calibration::held_out_error(&check.pairs)
+            .map_or_else(|| "-".to_owned(), |e| format!("{e:.3}"))
+    };
+    eprintln!(
+        "planned-sustained: {} at {}x / {}: {qps:.0} q/s, point p99 {} us, scan p99 {} us, \
+         runs {:.1}, compaction {:.1} s; model error default {} calibrated {}, plan changes \
+         {} / {}; calibrated encode {} MiB/s, merge share {:.3}, scan weight {:.3}, fpr {:.4}",
+        mix.name,
+        compaction_rate / WRITE_RATE,
+        kind.name(),
+        arm.points.value_at_quantile(0.99) / 1_000,
+        arm.scans.value_at_quantile(0.99) / 1_000,
+        arm.runs_sum as f64 / arm.steps.max(1) as f64,
+        arm.compaction_nanos as f64 / 1e9,
+        error(&arm.default_check),
+        error(&arm.calibrated_check),
+        arm.default_check.plan_changes,
+        arm.calibrated_check.plan_changes,
+        arm.calibrated.model.encode_rate >> 20,
+        arm.calibrated.model.merge_query_share,
+        arm.calibrated.scan_weight,
+        arm.calibrated.model.false_positive_rate,
+    );
+}
+
 impl Workload for PlannedSustained {
     fn check_config(&self, config: &BenchConfig) -> Result<(), String> {
         if config.threads != 1 {
@@ -898,6 +933,7 @@ impl Workload for PlannedSustained {
                 )?;
                 for (kind, arm) in Kind::ALL.into_iter().zip(&arms) {
                     publish(reporter, kind, arm, mix, config, compaction_rate);
+                    progress(kind, arm, mix, compaction_rate);
                 }
                 run += 1;
             }
