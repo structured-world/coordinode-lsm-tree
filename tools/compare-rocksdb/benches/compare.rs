@@ -110,7 +110,10 @@
 //! - `overwrite/{1k,10k,70k}` — rewrite the whole keyspace into an engine
 //!   that already holds one copy (the first copy is written outside the
 //!   timed window). Overwrite cost (memtable churn over existing keys +
-//!   a superseding flush), distinct from cold first-insert.
+//!   a superseding flush), distinct from cold first-insert. An
+//!   `ours-deferred-wal` series runs our engine with a caller-kept log and a
+//!   deferred flush: one sync per batch, the durability SurrealKV's commit
+//!   gives.
 //!
 //! Each of the above also has a `_zstd22` sibling. The read siblings run 70k
 //! only, the one size whose working set overflows the block cache so a read
@@ -139,8 +142,8 @@ use std::time::Duration;
 use lsm_tree::{
     AbstractTree, CompressionType, Config, Guard, MAX_SEQNO, SequenceNumberCounter,
     config::{
-        CompressionPolicy, HashRatioPolicy, KvSeparationOptions, LocatorPolicy, LocatorPolicyEntry,
-        LocatorPrecision, PinningPolicy,
+        CompressionPolicy, FlushDurability, HashRatioPolicy, KvSeparationOptions, LocatorPolicy,
+        LocatorPolicyEntry, LocatorPrecision, PinningPolicy,
     },
     runtime_config::{KvChecksumPolicy, RuntimeConfig},
 };
@@ -612,8 +615,19 @@ fn rocksdb_options(compression: Compression, hash_index: bool) -> rocksdb::Optio
 /// keeps those cores busy.
 const COMPRESSION_THREADS: usize = 4;
 
-/// Opens our engine at `dir` with the block-compression policy for the
-/// given `compression` variant. Both arms set the policy EXPLICITLY:
+/// Opens our engine at `dir` as [`ours_config`] configures it.
+fn open_ours(
+    dir: &std::path::Path,
+    compression: Compression,
+    kv_separated: bool,
+    strategy: IndexStrategy,
+    row_cache: bool,
+) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
+    Ok(ours_config(dir, compression, kv_separated, strategy, row_cache).open()?)
+}
+
+/// Our engine's configuration at `dir` with the block-compression policy for
+/// the given `compression` variant. Both arms set the policy EXPLICITLY:
 /// `None` pins `CompressionPolicy::all(None)` rather than relying on the
 /// `Config` default (which becomes `[None, Lz4]` if the `lz4` feature is
 /// ever enabled on this bench crate, silently compressing the supposed
@@ -624,13 +638,13 @@ const COMPRESSION_THREADS: usize = 4;
 /// When `kv_separated` is set, values at or above [`BLOB_SEPARATION_THRESHOLD`]
 /// are stored out-of-line (the `blob_tree` arm); the blob files inherit the
 /// `None`-compression baseline so the separated path stays codec-neutral too.
-fn open_ours(
+fn ours_config(
     dir: &std::path::Path,
     compression: Compression,
     kv_separated: bool,
     strategy: IndexStrategy,
     row_cache: bool,
-) -> Result<lsm_tree::AnyTree, Box<dyn std::error::Error>> {
+) -> Config {
     let config = Config::new(
         dir,
         SequenceNumberCounter::default(),
@@ -685,7 +699,7 @@ fn open_ours(
             CompressionType::Zstd(Compression::ZSTD_MAX_LEVEL),
         )),
     };
-    let config = if kv_separated {
+    if kv_separated {
         // Blobs stay `None`-compressed (the bench crate has no `lz4` feature, so
         // the default blob compression is already `None`; set it explicitly so a
         // future feature flip cannot silently compress blobs).
@@ -696,8 +710,7 @@ fn open_ours(
             .blob_compression(CompressionType::None)
     } else {
         config
-    };
-    Ok(config.open()?)
+    }
 }
 
 /// Workload: bulk-insert `inputs.keys.len()` (key, value) pairs
@@ -1620,6 +1633,37 @@ fn seek_random_routine<'a>(
     }
 }
 
+/// The write-ahead log a caller of our engine keeps itself: one
+/// length-prefixed record per write, made durable by one `sync_data` per
+/// commit. Under [`lsm_tree::config::FlushDurability::Deferred`] the log is
+/// what makes an acknowledged write durable, and a flush syncs nothing.
+struct CallerWal {
+    file: std::io::BufWriter<std::fs::File>,
+}
+
+impl CallerWal {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            file: std::io::BufWriter::new(std::fs::File::create(path)?),
+        })
+    }
+
+    /// Appends every write of `inputs` and syncs the log once.
+    fn commit(&mut self, inputs: &WorkloadInputs) -> std::io::Result<()> {
+        use std::io::Write;
+        for (key, value) in inputs.keys.iter().zip(inputs.values.iter()) {
+            for field in [key.as_slice(), value.as_slice()] {
+                let len = u32::try_from(field.len())
+                    .map_err(|_| std::io::Error::other("a field over 4 GiB"))?;
+                self.file.write_all(&len.to_le_bytes())?;
+                self.file.write_all(field)?;
+            }
+        }
+        self.file.flush()?;
+        self.file.get_ref().sync_data()
+    }
+}
+
 /// Workload: rewrite the entire keyspace into an engine that already
 /// holds one copy of it. The first copy is the seed state ([`SeedStates`]),
 /// written OUTSIDE the timed window; the timed body writes every key a
@@ -1627,6 +1671,14 @@ fn seek_random_routine<'a>(
 /// churn over existing keys + a flush that supersedes prior versions) rather
 /// than cold first-insert cost. Every timed iteration opens a fresh copy of
 /// the seed, so each measurement starts from the same one-copy state.
+///
+/// The `ours-deferred-wal` series runs our engine the way a caller with its
+/// own write-ahead log does: the log is written and synced, then the keys go
+/// into the memtable and a deferred flush writes the table without a sync. One
+/// sync makes the batch durable, as one does in SurrealKV's commit. The barrier
+/// that later makes the deferred tables durable is not timed: a caller runs one
+/// per many flushes, as SurrealKV's commit leaves its own memtable flush for
+/// later.
 fn overwrite_variant(
     run: &mut Run,
     group_name: &str,
@@ -1651,7 +1703,11 @@ fn overwrite_variant(
                 (engine, seed)
             })
             .collect();
-        let arms = seeded
+        let ours_seed = seeded
+            .iter()
+            .find_map(|(engine, seed)| (*engine == Engine::Ours).then(|| seed.clone()))
+            .flatten();
+        let mut arms: Vec<_> = seeded
             .into_iter()
             .map(|(engine, seed)| {
                 let inputs = &inputs;
@@ -1720,6 +1776,36 @@ fn overwrite_variant(
                 })
             })
             .collect();
+        if let Some(seed) = ours_seed {
+            let inputs = &inputs;
+            arms.push(paired::Arm::new("ours-deferred-wal", move |iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let dir = copy_of(&seed);
+                    let tree =
+                        ours_config(dir.path(), compression, false, IndexStrategy::Binary, false)
+                            .flush_durability(FlushDurability::Deferred)
+                            .open()
+                            .expect("ours-deferred-wal: open");
+                    // Beside the tree's folder, not in it: the engine owns
+                    // what its folder holds.
+                    let wal_dir = tempfile::tempdir().expect("caller wal dir");
+                    let mut wal =
+                        CallerWal::create(&wal_dir.path().join("caller.wal")).expect("caller wal");
+                    let start = std::time::Instant::now();
+                    wal.commit(inputs).expect("ours-deferred-wal: log commit");
+                    for ((key, value), seqno) in
+                        inputs.keys.iter().zip(inputs.values.iter()).zip(n..)
+                    {
+                        tree.insert(key, value, seqno);
+                    }
+                    tree.flush_active_memtable(0)
+                        .expect("ours-deferred-wal: overwrite flush");
+                    total += start.elapsed();
+                }
+                total
+            }));
+        }
         run.measure(group_name, n, arms);
     }
 }
@@ -2054,7 +2140,7 @@ const GROUP_NOTES: &[(&str, &str)] = &[
     ),
     (
         "overwrite",
-        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads.",
+        "Every key written a second time into an engine that already holds one copy, then one flush. Memtable churn over existing keys and a superseding flush. Both engines compress blocks on 4 threads. ours-deferred-wal: our engine with a caller-kept log, the log written and synced once and the flush deferred, one sync per batch as in SurrealKV's commit.",
     ),
     (
         "point_read",
