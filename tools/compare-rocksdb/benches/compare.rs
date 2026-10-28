@@ -2133,7 +2133,7 @@ fn sustained_ours(
                 drop(lock);
                 if flushed.is_some() {
                     flushes += 1;
-                    if flushes % Sustained::PERSIST_EVERY == 0 {
+                    if flushes.is_multiple_of(Sustained::PERSIST_EVERY) {
                         tree.persist_flushes().expect("ours sustained: persist");
                     }
                 } else if writing_done.load(Ordering::Acquire) {
