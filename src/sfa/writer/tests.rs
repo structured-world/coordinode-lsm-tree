@@ -99,6 +99,83 @@ fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
     Ok(())
 }
 
+/// A file of `len` bytes that stores only its head and its trailer; the bytes
+/// between read as zeros. Counts the bytes it hands out.
+struct Sparse {
+    head: Vec<u8>,
+    trailer: Vec<u8>,
+    len: u64,
+    pos: u64,
+    served: u64,
+}
+
+impl Read for Sparse {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let trailer_pos = self.len - self.trailer.len() as u64;
+        let (source, start, end): (&[u8], u64, u64) = if self.pos < self.head.len() as u64 {
+            (&self.head, 0, self.head.len() as u64)
+        } else if self.pos >= trailer_pos {
+            (&self.trailer, trailer_pos, self.len)
+        } else {
+            (&[], self.pos, trailer_pos)
+        };
+        let n = buf
+            .len()
+            .min(usize::try_from(end - self.pos).unwrap_or(usize::MAX));
+        let (out, _) = buf.split_at_mut(n);
+        if source.is_empty() {
+            out.fill(0);
+        } else {
+            let from = usize::try_from(self.pos - start).map_err(std::io::Error::other)?;
+            out.copy_from_slice(&source[from..from + n]);
+        }
+        self.pos += n as u64;
+        self.served += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Sparse {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(back) => self.len.checked_add_signed(back),
+            SeekFrom::Current(by) => self.pos.checked_add_signed(by),
+        }
+        .ok_or_else(|| std::io::Error::other("a seek before the start"))?;
+        Ok(self.pos)
+    }
+}
+
+/// A trailer whose TOC length runs to the end of a huge file costs a read of
+/// the TOC, not a buffer of the claimed length. Guards against a damaged
+/// length aborting the open on an allocation the size of the file.
+#[test]
+fn a_toc_length_claiming_most_of_a_huge_file_reads_only_the_toc() -> crate::sfa::Result<()> {
+    let bytes = archive(3)?.file.into_inner();
+    let (head, trailer) = bytes.split_at(bytes.len() - crate::sfa::trailer::TRAILER_LEN);
+    let mut trailer = trailer.to_vec();
+    // The trailer ends in the TOC's position and length.
+    let (_, fields) = trailer.split_at_mut(crate::sfa::trailer::TRAILER_LEN - 16);
+    let (toc_pos, toc_len) = fields.split_at_mut(8);
+    let toc_pos = u64::from_le_bytes(toc_pos.try_into().map_err(std::io::Error::other)?);
+    let len: u64 = 1 << 44;
+    toc_len
+        .copy_from_slice(&(len - crate::sfa::trailer::TRAILER_LEN as u64 - toc_pos).to_le_bytes());
+
+    let mut file = Sparse {
+        head: head.to_vec(),
+        trailer,
+        len,
+        pos: 0,
+        served: 0,
+    };
+    let reader = crate::sfa::Reader::from_reader(&mut file)?;
+    assert_eq!(reader.toc().len(), 3);
+    assert!(file.served <= 8_192, "read {} bytes", file.served);
+    Ok(())
+}
+
 /// The length a table budgets for an archive's table of contents and trailer
 /// is exactly what the writer appends after the sections.
 #[test]

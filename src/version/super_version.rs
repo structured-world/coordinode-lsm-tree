@@ -409,6 +409,11 @@ pub struct SuperVersions {
     /// out before them. Reads register under this history's read lock and
     /// installs record under its write lock.
     released: Arc<crate::blob_tree::released::ReleasedObjects>,
+
+    /// Fired by an install after its seqno is taken and before the version is
+    /// persisted, so a test can act inside that window.
+    #[cfg(test)]
+    pub(crate) before_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SuperVersions {
@@ -455,6 +460,8 @@ impl SuperVersions {
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
+            #[cfg(test)]
+            before_persist: None,
         }
     }
 
@@ -535,15 +542,16 @@ impl SuperVersions {
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         retention: RetentionEffect,
     ) -> crate::Result<()> {
-        self.upgrade_version_with_seqno(
+        self.install(
             tree_path,
             f,
-            seqno.next(),
+            || seqno.next(),
             visible_seqno,
             fs,
             runtime,
             encryption,
             retention,
+            None,
         )
     }
 
@@ -573,7 +581,7 @@ impl SuperVersions {
         self.install(
             tree_path,
             f,
-            seqno,
+            || seqno,
             visible_seqno,
             fs,
             runtime,
@@ -610,7 +618,7 @@ impl SuperVersions {
         self.install(
             tree_path,
             f,
-            seqno.next(),
+            || seqno.next(),
             visible_seqno,
             fs,
             runtime,
@@ -628,7 +636,8 @@ impl SuperVersions {
         &mut self,
         tree_path: &Path,
         f: F,
-        seqno: SeqNo,
+        // Taken only once the next version is known: see the insert gate below.
+        seqno: impl FnOnce() -> SeqNo,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
@@ -637,14 +646,26 @@ impl SuperVersions {
         deferred: Option<Vec<UnsyncedFile>>,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
+        let mut next_version = f(&prior)?;
+        // A version that replaces the active memtable takes its seqno with the
+        // insert gate closed, and keeps it closed until it is published: an
+        // insert either took its seqno before (it is in the replaced memtable,
+        // covered by this install) or waits and lands in the new one. Open,
+        // an insert with a later seqno could land in the replaced memtable
+        // and be dropped with it, above the floor a clear raises. The `Arc`
+        // clone lets the guard outlive the `&mut self` persist below.
+        #[cfg(feature = "std")]
+        let gate = Arc::clone(&self.insert_gate);
+        #[cfg(feature = "std")]
+        let closed = (!Arc::ptr_eq(&prior.active_memtable, &next_version.active_memtable))
+            .then(|| gate.close());
         // Install seqnos are non-decreasing. The counter is caller-owned, and a
         // deployment that reopens with it reset would otherwise install below
         // the current version: a drop or a filtering compaction there raises
         // the floor only to that smaller seqno, leaving snapshots above it
         // answered by the current version without the rows it removed. Under
         // the seqno contract (monotone counter) this clamp is a no-op.
-        let seqno = seqno.max(prior.seqno);
-        let mut next_version = f(&prior)?;
+        let seqno = seqno().max(prior.seqno);
         // Every install is a transition to a new id. A rotation persists the
         // installed version as a fresh `v{id}` snapshot, created exclusively,
         // so one under the prior id would fail on the snapshot that id names.
@@ -691,6 +712,10 @@ impl SuperVersions {
             next_version.version.set_retention_floor(floor);
         }
 
+        #[cfg(test)]
+        if let Some(hook) = &self.before_persist {
+            hook();
+        }
         match deferred {
             // The floor rides in the version too: lost with it in a crash,
             // together with the flush whose collection raised it.
@@ -699,7 +724,13 @@ impl SuperVersions {
                 self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
             }
         }
-        self.append_version(next_version);
+        #[cfg(feature = "std")]
+        let gate_closed = closed.is_some();
+        #[cfg(not(feature = "std"))]
+        let gate_closed = false;
+        self.publish(next_version, gate_closed);
+        #[cfg(feature = "std")]
+        drop(closed);
 
         // Clamp to stay below the reserved MSB range.
         let next_visible = seqno.saturating_add(1).min(MAX_SEQNO);
@@ -997,6 +1028,16 @@ impl SuperVersions {
     /// Makes `version` the current one. The replaced version stays alive only
     /// in the readers that already hold it.
     pub fn append_version(&mut self, version: SuperVersion) {
+        self.publish(version, false);
+    }
+
+    /// [`Self::append_version`], told whether the caller already holds the
+    /// insert gate closed.
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(unused_variables, reason = "no insert gate without std")
+    )]
+    fn publish(&mut self, version: SuperVersion, gate_closed: bool) {
         if let Some(budget) = &self.filter_budget {
             budget.publish(&version.version);
         }
@@ -1004,8 +1045,9 @@ impl SuperVersions {
         // inserts that read the old one from the mirror finish into it first,
         // and the ones after see the new one.
         #[cfg(feature = "std")]
-        let _closed = (!Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable))
-            .then(|| self.insert_gate.close());
+        let _closed = (!gate_closed
+            && !Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable))
+        .then(|| self.insert_gate.close());
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
         #[cfg(feature = "std")]
