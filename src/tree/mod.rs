@@ -7762,7 +7762,7 @@ mod open_batch_tests;
 mod clear_race_tests;
 
 #[cfg(all(test, feature = "std"))]
-#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
+#[expect(clippy::expect_used, reason = "test code")]
 mod insert_rotation_tests;
 
 #[cfg(all(test, feature = "std"))]

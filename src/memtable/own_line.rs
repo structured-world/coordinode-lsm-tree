@@ -16,7 +16,7 @@ pub(crate) struct OwnLine<T>(pub(crate) T);
 impl<T> Deref for OwnLine<T> {
     type Target = T;
 
-    #[inline(always)]
+    #[inline]
     fn deref(&self) -> &T {
         &self.0
     }

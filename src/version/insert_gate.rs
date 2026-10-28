@@ -70,4 +70,5 @@ impl InsertGate {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests;
