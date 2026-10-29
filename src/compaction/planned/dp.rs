@@ -46,8 +46,29 @@ pub struct Inputs {
     reason = "`mul_add` needs std, and the plan is solved without it too"
 )]
 impl Inputs {
-    /// The speed of queries with `runs` runs in the main level.
-    fn speed(&self, runs: u32) -> f64 {
+    /// The speed the model gives queries with `runs` runs in the main level,
+    /// in queries per unit of read work: what a plan is scored by, and what an
+    /// observed query rate is compared with to check the model.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsm_tree::compaction::planned::dp::Inputs;
+    ///
+    /// let inputs = Inputs {
+    ///     round: 10,
+    ///     size_ratio: 3,
+    ///     arrival_secs: 1.0,
+    ///     merge_secs: 0.1,
+    ///     merge_query_share: 0.5,
+    ///     scan_share: 0.5,
+    ///     false_positive_rate: 0.01,
+    /// };
+    /// // Every run more slows the scans that read it.
+    /// assert!(inputs.speed(1) > inputs.speed(8));
+    /// ```
+    #[must_use]
+    pub fn speed(&self, runs: u32) -> f64 {
         let r = self.scan_share;
         1.0 / ((f64::from(runs) + 2.0) * r + (1.0 - r) * (1.0 + self.false_positive_rate))
     }

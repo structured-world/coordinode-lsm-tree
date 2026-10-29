@@ -1,33 +1,47 @@
-//! Sustained random overwrites with mixed point reads and range scans into two
-//! trees side by side, given the same key stream and the same compaction
-//! budget: one under the planner for query throughput, one under leveled
-//! compaction.
+//! Sustained random overwrites with mixed point reads and range scans into
+//! three trees side by side, given the same key stream and the same compaction
+//! budget: one under the planner for query throughput with its default model,
+//! one under the planner with a model calibrated from what it observes as it
+//! runs, and one under leveled compaction.
 //!
 //! Compaction runs as it does in a deployment: in the background, on threads
 //! of its own, throttled by the tree's compaction rate limit, while the writer
-//! goes on and queries are served. Both trees get the same limit, a multiple
+//! goes on and queries are served. Every tree gets the same limit, a multiple
 //! of the paced write rate, so a gain bought by spending more of the shared
 //! budget does not show as one; the reads they serve contend with their
 //! compactions for the machine. The series are taken during the stream, not
 //! after it drains: the queries served per second of read time, the time of
 //! point reads and of scans, the sorted runs a read meets and the debt each
 //! strategy reports at every flush, the time of each flush, and the bytes and
-//! thread time compaction spent. The two trees take each step in turn, which
-//! goes first alternating, so a machine warming or slowing over the run weighs
-//! on both alike.
+//! thread time compaction spent. The trees take each step in turn, which goes
+//! first rotating, so a machine warming or slowing over the run weighs on all
+//! alike.
+//!
+//! Each run reads the trees with one of several mixes: point reads and scans
+//! of a hundred keys spread evenly, point reads skewed to a hot set with short
+//! scans, long scans, and runs piling up in L0 before they go down. Beside the
+//! throughput, both planned trees check the planner's model step by step: what
+//! it predicts a query costs with the runs the main level holds, scaled to the
+//! observed cost on the first half of the steps and judged on the second, for
+//! the default model and the calibrated one alike, and how often each model's
+//! plan changes.
+
+mod calibration;
 
 use crate::config::BenchConfig;
 use crate::db::make_sequential_key;
 use crate::reporter::{Reporter, Suite};
 use crate::workloads::Workload;
+use calibration::{Calibrated, CallLog, Observed, QuerySpan, StepSample, Timing};
 use hdrhistogram::Histogram;
+use lsm_tree::compaction::planned::{Model, PlanView, dp::Plan};
 use lsm_tree::compaction::{CompactionAction, CompactionStrategy, Leveled, Planned};
 use lsm_tree::{AbstractTree, AnyTree, Guard, UserKey, UserValue};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -36,7 +50,7 @@ pub struct PlannedSustained;
 #[cfg(test)]
 mod tests;
 
-/// The key stream's seed: both arms write the same keys in the same order.
+/// The key stream's seed: every arm writes the same keys in the same order.
 const SEED: u64 = 0x5EED_0692;
 
 /// The memtable bytes written between two flushes.
@@ -46,20 +60,13 @@ const FLUSH_BYTES: u64 = 1 << 20;
 /// writes to fill several levels.
 const TABLE_TARGET: u64 = 256 << 10;
 
-/// Point reads, and scans, taken after each flush.
-const POINTS_PER_FLUSH: u64 = 100;
-const SCANS_PER_FLUSH: u64 = 100;
-
-/// The keys a scan reads.
-const SCAN_LENGTH: usize = 100;
-
 /// Bytes per second the writer is paced to, into each tree.
 const WRITE_RATE: u64 = 8 << 20;
 
 /// Bytes per second each tree's compactions may write, the same budget for
-/// both, as multiples of the write rate. At 8 either keeps up, and what tells
-/// them apart is what their compactions take from the reads meanwhile; at 2
-/// neither does, and what tells them apart is how they fall behind.
+/// all, as multiples of the write rate. At 8 every strategy keeps up, and what
+/// tells them apart is what their compactions take from the reads meanwhile;
+/// at 2 none does, and what tells them apart is how they fall behind.
 const COMPACTION_RATES: [u64; 2] = [8 * WRITE_RATE, 2 * WRITE_RATE];
 
 /// Compactions each tree may run at once.
@@ -67,6 +74,124 @@ const COMPACTION_THREADS: usize = 2;
 
 /// How long a compaction thread with nothing to do waits before asking again.
 const IDLE_WAIT: Duration = Duration::from_millis(2);
+
+/// How the reads taken after each flush are mixed.
+#[derive(Clone, Copy, Debug)]
+struct ReadMix {
+    name: &'static str,
+    /// Point reads, and scans, taken after each flush.
+    points: u64,
+    scans: u64,
+    /// The keys a scan reads.
+    scan_length: usize,
+    /// Whether reads go to a hot set of keys rather than evenly to all.
+    skewed: bool,
+    /// The L0 table count that sends the top level down, `None` for the
+    /// strategies' default.
+    l0_tables: Option<u16>,
+}
+
+impl ReadMix {
+    /// The share of reads that are scans.
+    fn scan_share(self) -> f64 {
+        self.scans as f64 / (self.points + self.scans).max(1) as f64
+    }
+}
+
+/// The mixes a run reads with. The first is the one the bench published
+/// before the others were added.
+const MIXES: [ReadMix; 4] = [
+    ReadMix {
+        name: "even",
+        points: 100,
+        scans: 100,
+        scan_length: 100,
+        skewed: false,
+        l0_tables: None,
+    },
+    ReadMix {
+        name: "hot points",
+        points: 180,
+        scans: 20,
+        scan_length: 16,
+        skewed: true,
+        l0_tables: None,
+    },
+    ReadMix {
+        name: "long scans",
+        points: 150,
+        scans: 50,
+        scan_length: 1_000,
+        skewed: false,
+        l0_tables: None,
+    },
+    ReadMix {
+        name: "32 L0 runs",
+        points: 100,
+        scans: 100,
+        scan_length: 100,
+        skewed: false,
+        l0_tables: Some(32),
+    },
+];
+
+/// Which strategy a tree compacts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The planner with its default model.
+    Planned,
+    /// The planner with a model calibrated as the tree runs.
+    Calibrated,
+    Leveled,
+}
+
+impl Kind {
+    const ALL: [Self; 3] = [Self::Planned, Self::Calibrated, Self::Leveled];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Calibrated => "calibrated",
+            Self::Leveled => "leveled",
+        }
+    }
+}
+
+/// How well a model predicted the queries of one tree.
+#[derive(Default)]
+struct ModelCheck {
+    /// The predicted and the observed mean query time of each step.
+    pairs: Vec<(f64, f64)>,
+    /// Steps whose plan differed from the step before.
+    plan_changes: u64,
+    last_plan: Option<Arc<Plan>>,
+}
+
+impl ModelCheck {
+    /// Records what `view` predicts a query costs with `main_runs` runs in the
+    /// main level, in point reads at `point_reads_per_unit` of them to its
+    /// unit, beside the `observed` cost, and whether its plan changed.
+    fn record(
+        &mut self,
+        view: &PlanView,
+        main_runs: u32,
+        point_reads_per_unit: f64,
+        observed: f64,
+    ) {
+        self.pairs.push((
+            point_reads_per_unit / view.inputs.speed(main_runs),
+            observed,
+        ));
+        if self
+            .last_plan
+            .as_ref()
+            .is_some_and(|last| **last != *view.plan)
+        {
+            self.plan_changes += 1;
+        }
+        self.last_plan = Some(Arc::clone(&view.plan));
+    }
+}
 
 /// What one arm measured.
 struct Arm {
@@ -92,6 +217,13 @@ struct Arm {
     query_nanos: u64,
     /// Time of each flush, in nanoseconds: the time the writer is held.
     flushes: Histogram<u64>,
+    /// What the tree observed, and the model calibrated from it; for a
+    /// planned tree under the default model a shadow nothing runs by.
+    observed: Observed,
+    calibrated: Calibrated,
+    /// The default and the calibrated model judged on this tree's queries.
+    default_check: ModelCheck,
+    calibrated_check: ModelCheck,
 }
 
 impl Arm {
@@ -112,12 +244,15 @@ impl Arm {
             scans: Histogram::new_with_max(10_000_000_000, 3).expect("valid histogram params"),
             query_nanos: 0,
             flushes: Histogram::new_with_max(1_000_000_000_000, 3).expect("valid histogram params"),
+            observed: Observed::default(),
+            calibrated: Calibrated::new(Model::default()),
+            default_check: ModelCheck::default(),
+            calibrated_check: ModelCheck::default(),
         }
     }
 }
 
 /// What a tree's compaction threads share with the writer.
-#[derive(Default)]
 struct Background {
     stop: AtomicBool,
     /// The sequence number below which every version may go: no snapshot is
@@ -125,26 +260,123 @@ struct Background {
     watermark: AtomicU64,
     merges: AtomicU64,
     nanos: AtomicU64,
+    /// The merges done and the calls in progress, so a query learns whether a
+    /// merge ran beside it once every call beside it has ended.
+    calls: Mutex<CallLog>,
+    /// Bytes the merges wrote and the thread time they took.
+    merge_bytes: AtomicU64,
+    merge_nanos: AtomicU64,
 }
 
-/// One of the two trees and what it measured so far.
+impl Background {
+    /// Nothing done yet, by [`COMPACTION_THREADS`] threads.
+    fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            watermark: AtomicU64::new(0),
+            merges: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+            calls: Mutex::new(CallLog::new(COMPACTION_THREADS)),
+            merge_bytes: AtomicU64::new(0),
+            merge_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// The call log, whichever thread panicked holding it.
+    fn calls(&self) -> std::sync::MutexGuard<'_, CallLog> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The planner under each model a step is judged by, the calibrated one as
+/// the step's observations moved it, and what the step's queries took.
+struct Models {
+    default: Planned,
+    /// The calibrated model as it was before the step: what is judged on the
+    /// step's queries, which it was not fitted to.
+    judged: Planned,
+    /// Point reads a unit of each judged model's query cost stands for.
+    default_unit: f64,
+    judged_unit: f64,
+    /// The calibrated model the step's observations moved it to, which the
+    /// calibrated tree compacts by from here on.
+    calibrated: Planned,
+    /// Whether the calibrated model moved in the step.
+    moved: bool,
+    /// The step's mean query time.
+    query_nanos: f64,
+}
+
+/// The strategy a tree's compaction threads take for each compaction: the
+/// calibrated tree swaps in a new one as its model moves.
+type StrategySlot = Arc<RwLock<Arc<dyn CompactionStrategy>>>;
+
+/// One of the trees and what it measured so far.
 struct ArmRun {
+    kind: Kind,
     tree: AnyTree,
-    strategy: Arc<dyn CompactionStrategy>,
+    strategy: StrategySlot,
     arm: Arm,
-    /// The keys read after each step: the same stream for both trees.
+    /// The keys read after each step: the same stream for every tree.
     lookups: StdRng,
     background: Arc<Background>,
     workers: Vec<JoinHandle<lsm_tree::Result<()>>>,
+    /// Queries waiting for a call in progress beside them to tell whether it
+    /// was a merge.
+    pending: Vec<QuerySpan>,
     /// Removed when the run ends.
     _folder: tempfile::TempDir,
+}
+
+/// The planner told the tables' size, the L0 table count of `mix` and the
+/// rates it runs at; with `calibrated`, that model and the scan share it gives
+/// `mix`.
+fn planned(compaction_rate: u64, mix: ReadMix, calibrated: Option<&Calibrated>) -> Planned {
+    let strategy = Planned::default().with_table_target_size(TABLE_TARGET);
+    let strategy = match mix.l0_tables {
+        Some(tables) => strategy.with_l0_file_threshold(tables),
+        None => strategy,
+    };
+    let prior = Model {
+        write_rate: WRITE_RATE,
+        encode_rate: compaction_rate,
+        ..Model::default()
+    };
+    match calibrated {
+        None => strategy.with_model(prior),
+        Some(calibrated) => strategy
+            .with_model(calibrated.model)
+            .with_scan_share(Some(calibrated.scan_share(mix.scan_share()))),
+    }
+}
+
+/// Leveled compaction told the tables' size and the L0 table count of `mix`.
+fn leveled(mix: ReadMix) -> Leveled {
+    let strategy = Leveled::default().with_table_target_size(TABLE_TARGET);
+    match mix.l0_tables {
+        Some(tables) => strategy.with_l0_threshold(u8::try_from(tables).unwrap_or(u8::MAX)),
+        None => strategy,
+    }
+}
+
+/// The prior every planned tree's calibration starts from: the model the
+/// default planner is given.
+fn prior(compaction_rate: u64) -> Model {
+    Model {
+        write_rate: WRITE_RATE,
+        encode_rate: compaction_rate,
+        ..Model::default()
+    }
 }
 
 impl ArmRun {
     fn open(
         base: &Path,
         config: &BenchConfig,
-        strategy: Arc<dyn CompactionStrategy>,
+        kind: Kind,
+        mix: ReadMix,
         compaction_rate: u64,
     ) -> lsm_tree::Result<Self> {
         let folder = tempfile::Builder::new()
@@ -154,29 +386,72 @@ impl ArmRun {
             .table_target_size(TABLE_TARGET)
             .compaction_rate_limit(compaction_rate)
             .open()?;
-        let arm = Arm::new();
-        let background = Arc::new(Background::default());
+        let strategy: Arc<dyn CompactionStrategy> = match kind {
+            Kind::Planned | Kind::Calibrated => Arc::new(planned(compaction_rate, mix, None)),
+            Kind::Leveled => Arc::new(leveled(mix)),
+        };
+        let strategy: StrategySlot = Arc::new(RwLock::new(strategy));
+        let mut arm = Arm::new();
+        arm.calibrated = Calibrated::new(prior(compaction_rate));
+        let background = Arc::new(Background::new());
         let workers = (0..COMPACTION_THREADS)
-            .map(|_| {
+            .map(|slot| {
                 let (tree, strategy, background) =
                     (tree.clone(), Arc::clone(&strategy), Arc::clone(&background));
-                std::thread::spawn(move || compact_in_background(&tree, &strategy, &background))
+                std::thread::spawn(move || {
+                    compact_in_background(&tree, &strategy, &background, slot)
+                })
             })
             .collect();
         Ok(Self {
+            kind,
             tree,
             strategy,
             arm,
             lookups: StdRng::seed_from_u64(SEED ^ 1),
             background,
             workers,
+            pending: Vec::new(),
             _folder: folder,
         })
     }
 
+    /// The strategy the tree compacts with now.
+    fn current_strategy(&self) -> Arc<dyn CompactionStrategy> {
+        Arc::clone(
+            &self
+                .strategy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The key a read goes to: any of `keys` alike, or under a skewed mix by
+    /// a Zipfian heat, scattered over the key space so the hot set is not one
+    /// range.
+    fn lookup_key(&mut self, keys: u64, mix: ReadMix) -> u64 {
+        if !mix.skewed {
+            return self.lookups.random_range(0..keys);
+        }
+        // A rank drawn log-uniformly from `1..=keys` falls on `x` with a
+        // density of `1/x`: the heat of a Zipf law of exponent one.
+        let draw: f64 = self.lookups.random();
+        let rank = ((keys as f64).powf(draw) as u64).clamp(1, keys) - 1;
+        // A large odd multiplier spreads neighbouring ranks over the key
+        // space; two ranks landing on one key only make it hotter.
+        rank.wrapping_mul(0x9E37_79B9_7F4A_7C15) % keys
+    }
+
     /// Flushes what was written since the last step, then samples runs, debt
-    /// and queries while compaction goes on in the background.
-    fn step(&mut self, seqno: u64, config: &BenchConfig) -> lsm_tree::Result<()> {
+    /// and queries while compaction goes on in the background, and for a
+    /// planned tree checks the models against what the queries took.
+    fn step(
+        &mut self,
+        seqno: u64,
+        config: &BenchConfig,
+        mix: ReadMix,
+        compaction_rate: u64,
+    ) -> lsm_tree::Result<()> {
         let keys = key_space(config);
         self.background.watermark.store(seqno, Ordering::Relaxed);
         let flush = Instant::now();
@@ -189,48 +464,159 @@ impl ArmRun {
             .iter_levels()
             .map(|level| level.run_count() as u64)
             .sum::<u64>();
+        let main_runs = version.level(1).map_or(0, |main| {
+            u32::try_from(main.run_count()).unwrap_or(u32::MAX)
+        });
         self.arm.runs_peak = self.arm.runs_peak.max(runs);
         self.arm.runs_sum += runs;
-        let debt = self.strategy.pending_compaction_bytes(&version);
+        let debt = self.current_strategy().pending_compaction_bytes(&version);
         self.arm.debt_peak = self.arm.debt_peak.max(debt);
         self.arm.debt_sum += debt;
         self.arm.steps += 1;
+        let (mut step_points, mut step_scans) = (Timing::default(), Timing::default());
         // Point reads and scans interleaved, so neither meets a tree the
         // other has warmed alone.
-        for _ in 0..POINTS_PER_FLUSH.max(SCANS_PER_FLUSH) {
+        for _ in 0..mix.points.max(mix.scans) {
             for scan in [false, true] {
                 let (taken, wanted) = if scan {
-                    (self.arm.scans.len(), SCANS_PER_FLUSH)
+                    (self.arm.scans.len(), mix.scans)
                 } else {
-                    (self.arm.points.len(), POINTS_PER_FLUSH)
+                    (self.arm.points.len(), mix.points)
                 };
                 if taken >= wanted * self.arm.steps {
                     continue;
                 }
-                let key = make_sequential_key(self.lookups.random_range(0..keys), config.key_size);
+                let key = make_sequential_key(self.lookup_key(keys, mix), config.key_size);
                 let at = Instant::now();
                 if scan {
                     for item in self
                         .tree
                         .range(key.as_slice().., seqno, None)
-                        .take(SCAN_LENGTH)
+                        .take(mix.scan_length)
                     {
                         item.value()?;
                     }
                 } else {
                     self.tree.get(&key, seqno)?;
                 }
-                let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let end = Instant::now();
+                let nanos = u64::try_from((end - at).as_nanos()).unwrap_or(u64::MAX);
                 self.arm.query_nanos += nanos;
                 // Above the histogram's range a read is recorded at its top.
                 if scan {
                     self.arm.scans.saturating_record(nanos);
+                    step_scans.record(nanos);
                 } else {
                     self.arm.points.saturating_record(nanos);
+                    step_points.record(nanos);
                 }
+                self.pending.push(QuerySpan {
+                    start: at,
+                    end,
+                    nanos,
+                    scan,
+                });
             }
         }
+        // A query is known to have run beside a merge, or beside none, once
+        // every compaction call beside it has ended: one in progress may yet
+        // be a merge, or choose nothing and move tables.
+        self.pending = calibration::classify(
+            std::mem::take(&mut self.pending),
+            &mut self.background.calls(),
+            &mut self.arm.observed,
+            Instant::now(),
+        );
+        if self.kind != Kind::Leveled {
+            let models = self.observe(main_runs, step_points, step_scans, mix, compaction_rate);
+            let config = self.tree.tree_config();
+            let views = (
+                models.default.plan_for(&version, config),
+                models.judged.plan_for(&version, config),
+            );
+            self.judge(models, views, main_runs);
+        }
         Ok(())
+    }
+
+    /// Records what the step observed and moves the calibrated model toward
+    /// it, returning the strategies to judge the step by, both as they were
+    /// before it, and the calibrated one it moved to.
+    fn observe(
+        &mut self,
+        main_runs: u32,
+        points: Timing,
+        scans: Timing,
+        mix: ReadMix,
+        compaction_rate: u64,
+    ) -> Models {
+        let observed = &mut self.arm.observed;
+        observed.merge_bytes = self.background.merge_bytes.load(Ordering::Relaxed);
+        observed.merge_nanos = self.background.merge_nanos.load(Ordering::Relaxed);
+        observed.merges = self.background.merges.load(Ordering::Relaxed);
+        // Point reads ask the filters; a scan reads every run it meets, and a
+        // compaction reads its inputs whole. The engine counts filter queries
+        // only under its `metrics` feature, which the `counters` build this
+        // workload exists in turns on, so the counts here are live.
+        let metrics = self.tree.metrics();
+        observed.filter_queries = metrics.filter_queries() as u64;
+        observed.filter_skips = metrics.io_skipped_by_filter() as u64;
+        let mean = |timing: Timing| timing.nanos as f64 / timing.count.max(1) as f64;
+        if points.count > 0 && scans.count > 0 {
+            observed.steps.push(StepSample {
+                main_runs,
+                scan_nanos: mean(scans),
+                point_nanos: mean(points),
+            });
+        }
+        let counted = mix.scan_share();
+        let fitted = calibration::fit(observed, counted);
+        // The model the step is judged by is the one from before it: fitted
+        // to the steps before, so the step's queries are held out from it.
+        let before = self.arm.calibrated;
+        self.arm.calibrated.update(&fitted);
+        Models {
+            default: planned(compaction_rate, mix, None),
+            judged: planned(compaction_rate, mix, Some(&before)),
+            default_unit: Calibrated::new(prior(compaction_rate)).point_reads_per_unit(counted),
+            judged_unit: before.point_reads_per_unit(counted),
+            calibrated: planned(compaction_rate, mix, Some(&self.arm.calibrated)),
+            moved: self.arm.calibrated != before,
+            query_nanos: (points.nanos + scans.nanos) as f64
+                / (points.count + scans.count).max(1) as f64,
+        }
+    }
+
+    /// Judges both models' plans of the step against the queries it took, and
+    /// under the calibrated strategy compacts by the model as it now is.
+    fn judge(
+        &mut self,
+        models: Models,
+        (default, judged): (Option<PlanView>, Option<PlanView>),
+        main_runs: u32,
+    ) {
+        if let Some(view) = default {
+            self.arm.default_check.record(
+                &view,
+                main_runs,
+                models.default_unit,
+                models.query_nanos,
+            );
+        }
+        if let Some(view) = judged {
+            self.arm.calibrated_check.record(
+                &view,
+                main_runs,
+                models.judged_unit,
+                models.query_nanos,
+            );
+        }
+        if self.kind == Kind::Calibrated && models.moved {
+            *self
+                .strategy
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(models.calibrated);
+        }
     }
 
     /// Stops the compaction threads and waits for them.
@@ -245,14 +631,15 @@ impl ArmRun {
     }
 
     /// Drains what the stream left without a limit, once every tree's
-    /// compaction threads are stopped, so both trees end at one their strategy
+    /// compaction threads are stopped, so all trees end at one their strategy
     /// has nothing more to do for and their compaction bytes compare.
     fn finish(mut self, seqno: u64) -> lsm_tree::Result<Arm> {
         self.stop_workers()?;
         self.tree.compaction_rate_limiter().set_rate(0);
+        let strategy = self.current_strategy();
         let draining = Instant::now();
         loop {
-            let result = self.tree.compact(Arc::clone(&self.strategy), seqno)?;
+            let result = self.tree.compact(Arc::clone(&strategy), seqno)?;
             match result.action {
                 CompactionAction::Nothing => break,
                 CompactionAction::Merged => self.arm.merges += 1,
@@ -280,30 +667,54 @@ impl Drop for ArmRun {
     }
 }
 
-/// One compaction thread: compacts while there is work, waits a moment when
-/// there is none, until told to stop.
+/// One compaction thread, the `slot`-th of the tree's: compacts with the tree's
+/// current strategy while there is work, waits a moment when there is none,
+/// until told to stop. It logs each call while it runs and each merge once
+/// done, for the queries to learn which of them ran beside one.
 fn compact_in_background(
     tree: &AnyTree,
-    strategy: &Arc<dyn CompactionStrategy>,
+    strategy: &StrategySlot,
     background: &Background,
+    slot: usize,
 ) -> lsm_tree::Result<()> {
     while !background.stop.load(Ordering::Relaxed) {
+        let current = Arc::clone(
+            &strategy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let at = Instant::now();
-        let result = tree.compact(
-            Arc::clone(strategy),
-            background.watermark.load(Ordering::Relaxed),
-        )?;
+        if let Some(running) = background.calls().running.get_mut(slot) {
+            *running = Some(at);
+        }
+        let result = tree.compact(current, background.watermark.load(Ordering::Relaxed));
+        let end = Instant::now();
+        {
+            let mut calls = background.calls();
+            if let Some(running) = calls.running.get_mut(slot) {
+                *running = None;
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|result| result.action == CompactionAction::Merged)
+            {
+                calls.merges.push((at, end));
+            }
+        }
+        let nanos = u64::try_from((end - at).as_nanos()).unwrap_or(u64::MAX);
+        let result = result?;
         // Every call counts, one that finds nothing to do as well: choosing
         // is compaction work, and the planner's choice is its plan. The wait
         // after an idle one does not.
-        background.nanos.fetch_add(
-            u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        background.nanos.fetch_add(nanos, Ordering::Relaxed);
         match result.action {
             CompactionAction::Nothing => std::thread::sleep(IDLE_WAIT),
             CompactionAction::Merged => {
                 background.merges.fetch_add(1, Ordering::Relaxed);
+                background
+                    .merge_bytes
+                    .fetch_add(result.work.measured.written, Ordering::Relaxed);
+                background.merge_nanos.fetch_add(nanos, Ordering::Relaxed);
             }
             CompactionAction::Moved | CompactionAction::Dropped => {}
         }
@@ -317,39 +728,27 @@ fn key_space(config: &BenchConfig) -> u64 {
     (config.num / 2).max(1)
 }
 
-/// The planner at its default round, told the tables' size and the rates it
-/// runs at.
-fn planned(compaction_rate: u64) -> Arc<dyn CompactionStrategy> {
-    Arc::new(
-        Planned::default()
-            .with_table_target_size(TABLE_TARGET)
-            .with_model(lsm_tree::compaction::planned::Model {
-                write_rate: WRITE_RATE,
-                encode_rate: compaction_rate,
-                ..lsm_tree::compaction::planned::Model::default()
-            }),
-    )
-}
+/// What a run measured, one arm per [`Kind`] in its order.
+type Arms = [Arm; 3];
 
-/// Writes the key stream into a planned and a leveled tree beneath `base` at
-/// [`WRITE_RATE`], each compacting at `compaction_rate`, a step every
-/// [`FLUSH_BYTES`] and one for what is left at the end, the two trees taking
-/// each step in turn with the first alternating.
+/// Writes the key stream into a tree of each [`Kind`] beneath `base` at
+/// [`WRITE_RATE`], each compacting at `compaction_rate` and read with `mix`, a
+/// step every [`FLUSH_BYTES`] and one for what is left at the end, the trees
+/// taking each step in turn with the first rotating. The drains go in turn
+/// too, starting with the tree at `first_drain`.
 fn run_arms(
     base: &Path,
     config: &BenchConfig,
+    mix: ReadMix,
     compaction_rate: u64,
-    planned_drains_first: bool,
-) -> lsm_tree::Result<(Arm, Arm)> {
-    let mut arms = [
-        ArmRun::open(base, config, planned(compaction_rate), compaction_rate)?,
-        ArmRun::open(
-            base,
-            config,
-            Arc::new(Leveled::default().with_table_target_size(TABLE_TARGET)),
-            compaction_rate,
-        )?,
-    ];
+    first_drain: usize,
+) -> lsm_tree::Result<Arms> {
+    // An arm that fails to open fails the run; those opened before it stop
+    // their threads as they drop.
+    let mut arms = Kind::ALL
+        .into_iter()
+        .map(|kind| ArmRun::open(base, config, kind, mix, compaction_rate))
+        .collect::<lsm_tree::Result<Vec<_>>>()?;
     let keys = key_space(config);
     let entry = (config.key_size + config.value_size) as u64;
     let value = UserValue::from(vec![b'v'; config.value_size]);
@@ -357,24 +756,20 @@ fn run_arms(
     let mut seqno = 1u64;
     let mut pending = 0u64;
     let mut streamed = 0u64;
-    let mut steps = 0u64;
+    let mut steps = 0usize;
     let started = Instant::now();
-    let mut step = |arms: &mut [ArmRun; 2], seqno| -> lsm_tree::Result<()> {
-        let order = if steps.is_multiple_of(2) {
-            [0, 1]
-        } else {
-            [1, 0]
-        };
-        steps += 1;
-        for index in order {
-            if let Some(arm) = arms.get_mut(index) {
-                arm.step(seqno, config)?;
+    let mut step = |arms: &mut [ArmRun], seqno| -> lsm_tree::Result<()> {
+        let count = arms.len();
+        for offset in 0..count {
+            if let Some(arm) = arms.get_mut((steps + offset) % count) {
+                arm.step(seqno, config, mix, compaction_rate)?;
             }
         }
+        steps += 1;
         Ok(())
     };
     for _ in 0..config.num {
-        // Shared by both trees: a clone is a reference count, not a copy.
+        // Shared by every tree: a clone is a reference count, not a copy.
         let key = UserKey::from(make_sequential_key(
             stream.random_range(0..keys),
             config.key_size,
@@ -401,41 +796,65 @@ fn run_arms(
     if pending > 0 {
         step(&mut arms, seqno)?;
     }
-    // Both trees' threads stop before either drains: a drain runs with no
-    // compaction of the other tree beside it, whichever drains first.
+    // Every tree's threads stop before any drains: a drain runs with no
+    // compaction of another tree beside it, whichever drains first.
     for arm in &mut arms {
         arm.stop_workers()?;
     }
     // The drains take turns going first across the runs, as the steps do
-    // within one: the second drains on a warmer cache.
-    let [planned, leveled] = arms;
-    if planned_drains_first {
-        let planned = planned.finish(seqno)?;
-        Ok((planned, leveled.finish(seqno)?))
-    } else {
-        let leveled = leveled.finish(seqno)?;
-        Ok((planned.finish(seqno)?, leveled))
+    // within one: a later one drains on a warmer cache.
+    let mut runs: Vec<Option<ArmRun>> = arms.into_iter().map(Some).collect();
+    let mut finished: [Option<Arm>; 3] = [None, None, None];
+    for offset in 0..runs.len() {
+        let index = (first_drain + offset) % runs.len();
+        if let (Some(run), Some(slot)) = (
+            runs.get_mut(index).and_then(Option::take),
+            finished.get_mut(index),
+        ) {
+            *slot = Some(run.finish(seqno)?);
+        }
+    }
+    match finished {
+        [Some(planned), Some(calibrated), Some(leveled)] => Ok([planned, calibrated, leveled]),
+        // One arm per kind was opened and every one drained.
+        _ => unreachable!("every arm drains"),
     }
 }
 
-/// Publishes `arm`'s series, compacted at `compaction_rate`, under `name`.
+/// Publishes `arm`'s series, a tree of `kind` read with `mix` and compacted
+/// at `compaction_rate`.
 fn publish(
     reporter: &mut Reporter,
-    name: &str,
+    kind: Kind,
     arm: &Arm,
+    mix: ReadMix,
     config: &BenchConfig,
     compaction_rate: u64,
 ) {
-    let name = format!("{name} at {}x", compaction_rate / WRITE_RATE);
+    let name = format!(
+        "{} / {} at {}x",
+        mix.name,
+        kind.name(),
+        compaction_rate / WRITE_RATE
+    );
+    let calibrated = &arm.calibrated;
     let extra = format!(
-        "num: {} | value_size: {} | steps: {} | merges: {} | scan length: {SCAN_LENGTH} | write \
-         rate: {} MiB/s | compaction rate: {} MiB/s",
+        "num: {} | value_size: {} | steps: {} | merges: {} | points: {} | scans: {} of {} | \
+         skewed: {} | write rate: {} MiB/s | compaction rate: {} MiB/s | calibrated encode \
+         rate: {} MiB/s | calibrated merge query share: {:.3} | calibrated scan weight: {:.3}",
         config.num,
         config.value_size,
         arm.steps,
         arm.merges,
+        mix.points,
+        mix.scans,
+        mix.scan_length,
+        mix.skewed,
         WRITE_RATE >> 20,
         compaction_rate >> 20,
+        calibrated.model.encode_rate >> 20,
+        calibrated.model.merge_query_share,
+        calibrated.scan_weight,
     );
     let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
     let queries = arm.points.len() + arm.scans.len();
@@ -496,6 +915,29 @@ fn publish(
         ),
         ("peak debt", arm.debt_peak as f64, "bytes", Suite::Costs),
     ];
+    if kind != Kind::Leveled {
+        for (model, check) in [
+            ("default", &arm.default_check),
+            ("calibrated", &arm.calibrated_check),
+        ] {
+            if let Some(error) = calibration::held_out_error(&check.pairs) {
+                reporter.publish_series(
+                    format!("{name} / {model} model held-out query time error"),
+                    error,
+                    "x",
+                    extra.clone(),
+                    Suite::Costs,
+                );
+            }
+            reporter.publish_series(
+                format!("{name} / {model} model plan changes"),
+                check.plan_changes as f64,
+                "steps",
+                extra.clone(),
+                Suite::Costs,
+            );
+        }
+    }
     for (label, value, unit, suite) in series {
         reporter.publish_series(
             format!("{name} / {label}"),
@@ -505,6 +947,41 @@ fn publish(
             suite,
         );
     }
+}
+
+/// One line on stderr per arm as each run ends, so a long run shows what it
+/// measured so far, whatever happens to the report printed at the end.
+fn progress(kind: Kind, arm: &Arm, mix: ReadMix, compaction_rate: u64) {
+    let queries = arm.points.len() + arm.scans.len();
+    let qps = if arm.query_nanos == 0 {
+        0.0
+    } else {
+        queries as f64 * 1e9 / arm.query_nanos as f64
+    };
+    let error = |check: &ModelCheck| {
+        calibration::held_out_error(&check.pairs)
+            .map_or_else(|| "-".to_owned(), |e| format!("{e:.3}"))
+    };
+    eprintln!(
+        "planned-sustained: {} at {}x / {}: {qps:.0} q/s, point p99 {} us, scan p99 {} us, \
+         runs {:.1}, compaction {:.1} s; model error default {} calibrated {}, plan changes \
+         {} / {}; calibrated encode {} MiB/s, merge share {:.3}, scan weight {:.3}, fpr {:.4}",
+        mix.name,
+        compaction_rate / WRITE_RATE,
+        kind.name(),
+        arm.points.value_at_quantile(0.99) / 1_000,
+        arm.scans.value_at_quantile(0.99) / 1_000,
+        arm.runs_sum as f64 / arm.steps.max(1) as f64,
+        arm.compaction_nanos as f64 / 1e9,
+        error(&arm.default_check),
+        error(&arm.calibrated_check),
+        arm.default_check.plan_changes,
+        arm.calibrated_check.plan_changes,
+        arm.calibrated.model.encode_rate >> 20,
+        arm.calibrated.model.merge_query_share,
+        arm.calibrated.scan_weight,
+        arm.calibrated.model.false_positive_rate,
+    );
 }
 
 impl Workload for PlannedSustained {
@@ -530,17 +1007,24 @@ impl Workload for PlannedSustained {
         reporter: &mut Reporter,
     ) -> lsm_tree::Result<()> {
         // The harness's tree holds no data; its directory is where `--db` put
-        // the run, so both trees are built beneath it, on the device asked for.
+        // the run, so every tree is built beneath it, on the device asked for.
         reporter.start();
-        for (run, compaction_rate) in COMPACTION_RATES.into_iter().enumerate() {
-            let (planned, leveled) = run_arms(
-                &tree.tree_config().path,
-                config,
-                compaction_rate,
-                run.is_multiple_of(2),
-            )?;
-            publish(reporter, "planned", &planned, config, compaction_rate);
-            publish(reporter, "leveled", &leveled, config, compaction_rate);
+        let mut run = 0usize;
+        for mix in MIXES {
+            for compaction_rate in COMPACTION_RATES {
+                let arms = run_arms(
+                    &tree.tree_config().path,
+                    config,
+                    mix,
+                    compaction_rate,
+                    run % Kind::ALL.len(),
+                )?;
+                for (kind, arm) in Kind::ALL.into_iter().zip(&arms) {
+                    publish(reporter, kind, arm, mix, config, compaction_rate);
+                    progress(kind, arm, mix, compaction_rate);
+                }
+                run += 1;
+            }
         }
         reporter.stop();
         Ok(())

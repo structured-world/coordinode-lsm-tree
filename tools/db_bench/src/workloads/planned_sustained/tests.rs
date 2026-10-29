@@ -21,68 +21,194 @@ fn config(num: u64) -> BenchConfig {
     }
 }
 
+const EVEN: super::ReadMix = super::MIXES[0];
+
 /// A stream shorter than one flush is still one measured step for each tree:
 /// it reaches the tables, and its runs, debt and queries are sampled as any
 /// step's.
 #[test]
 fn a_stream_shorter_than_one_flush_is_one_measured_step() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
-    let (planned, leveled) = super::run_arms(
+    let arms = super::run_arms(
         base.path(),
         &config(1_000),
+        EVEN,
         super::COMPACTION_RATES[0],
-        true,
+        0,
     )?;
-    for arm in [&planned, &leveled] {
+    for arm in &arms {
         assert!(arm.written > 0);
         assert_eq!(arm.steps, 1, "the writes are one step");
-        assert_eq!(arm.points.len(), super::POINTS_PER_FLUSH);
-        assert_eq!(arm.scans.len(), super::SCANS_PER_FLUSH);
+        assert_eq!(arm.points.len(), EVEN.points);
+        assert_eq!(arm.scans.len(), EVEN.scans);
         assert!(arm.runs_peak >= 1, "the flush left a run");
     }
     Ok(())
 }
 
-/// Several steps keep sampling the queries each step asks for, not more, at
-/// every compaction budget the workload runs, whichever tree drains first.
+/// Several steps keep sampling the queries each step of the mix asks for, not
+/// more, for every mix and compaction budget the workload runs, whichever tree
+/// drains first.
 #[test]
 fn every_step_takes_its_share_of_queries() -> lsm_tree::Result<()> {
-    for (run, compaction_rate) in super::COMPACTION_RATES.into_iter().enumerate() {
-        let base = tempfile::tempdir()?;
-        let (planned, leveled) = super::run_arms(
-            base.path(),
-            &config(30_000),
-            compaction_rate,
-            run.is_multiple_of(2),
-        )?;
-        for arm in [&planned, &leveled] {
-            assert!(arm.steps > 1, "{} steps", arm.steps);
-            assert_eq!(arm.points.len(), super::POINTS_PER_FLUSH * arm.steps);
-            assert_eq!(arm.scans.len(), super::SCANS_PER_FLUSH * arm.steps);
+    let mut run = 0;
+    for mix in super::MIXES {
+        for compaction_rate in super::COMPACTION_RATES {
+            let base = tempfile::tempdir()?;
+            let arms = super::run_arms(
+                base.path(),
+                &config(30_000),
+                mix,
+                compaction_rate,
+                run % super::Kind::ALL.len(),
+            )?;
+            run += 1;
+            for arm in &arms {
+                assert!(arm.steps > 1, "{}: {} steps", mix.name, arm.steps);
+                assert_eq!(arm.points.len(), mix.points * arm.steps, "{}", mix.name);
+                assert_eq!(arm.scans.len(), mix.scans * arm.steps, "{}", mix.name);
+            }
         }
     }
     Ok(())
 }
 
-/// Both trees are built beneath the directory the run was given, the device
+/// Every tree is built beneath the directory the run was given, the device
 /// `--db` asked for, and removed with the run.
 #[test]
 fn the_trees_are_built_beneath_the_run_directory() -> lsm_tree::Result<()> {
     let base = tempfile::tempdir()?;
     let rate = super::COMPACTION_RATES[0];
-    let arm = super::ArmRun::open(base.path(), &config(1_000), super::planned(rate), rate)?;
-    assert!(
-        arm.tree.tree_config().path.starts_with(base.path()),
-        "built at {}",
-        arm.tree.tree_config().path.display()
-    );
-    drop(arm);
+    for kind in super::Kind::ALL {
+        let arm = super::ArmRun::open(base.path(), &config(1_000), kind, EVEN, rate)?;
+        assert!(
+            arm.tree.tree_config().path.starts_with(base.path()),
+            "built at {}",
+            arm.tree.tree_config().path.display()
+        );
+        drop(arm);
+    }
     assert_eq!(
         std::fs::read_dir(base.path())?.count(),
         0,
         "removed with the run"
     );
     Ok(())
+}
+
+/// A skewed mix reads keys within the key space, its ten hottest taking a
+/// share of the reads a Zipf law of exponent one gives them, about a quarter
+/// over ten thousand keys, where an even mix gives them a fraction of a
+/// percent. Guards against a skew too weak to tell a hot set from the rest.
+#[test]
+fn a_skewed_mix_reads_a_hot_set_within_the_key_space() -> lsm_tree::Result<()> {
+    let base = tempfile::tempdir()?;
+    let rate = super::COMPACTION_RATES[0];
+    let (keys, draws) = (10_000, 20_000);
+    let skewed = super::MIXES
+        .into_iter()
+        .find(|mix| mix.skewed)
+        .expect("a skewed mix");
+    let mut hottest_share = Vec::new();
+    for mix in [EVEN, skewed] {
+        let mut arm =
+            super::ArmRun::open(base.path(), &config(1_000), super::Kind::Planned, mix, rate)?;
+        let mut hits = std::collections::HashMap::<u64, u64>::new();
+        for _ in 0..draws {
+            let key = arm.lookup_key(keys, mix);
+            assert!(key < keys, "{key} out of {keys}");
+            *hits.entry(key).or_default() += 1;
+        }
+        let mut counts: Vec<u64> = hits.into_values().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u64 = counts.iter().take(10).sum();
+        hottest_share.push(top as f64 / draws as f64);
+    }
+    let (even, skewed) = (hottest_share[0], hottest_share[1]);
+    assert!(even < 0.01, "even reads gave the ten hottest {even}");
+    assert!(
+        (0.18..0.35).contains(&skewed),
+        "skewed reads gave the ten hottest {skewed}"
+    );
+    Ok(())
+}
+
+/// A run of one step observes no merge and too few steps for a scan's cost
+/// per run: the calibrated model keeps the prior's merge rate, the share
+/// queries keep beside a merge, and the prior's scan weight.
+#[test]
+fn a_short_run_calibrates_nothing_it_did_not_see() -> lsm_tree::Result<()> {
+    let base = tempfile::tempdir()?;
+    let rate = super::COMPACTION_RATES[0];
+    let prior = super::prior(rate);
+    let [planned, calibrated, _] = super::run_arms(base.path(), &config(1_000), EVEN, rate, 0)?;
+    for arm in [&planned, &calibrated] {
+        assert_eq!(arm.calibrated.model.encode_rate, prior.encode_rate);
+        assert_eq!(
+            arm.calibrated.model.merge_query_share,
+            prior.merge_query_share
+        );
+        assert_eq!(
+            arm.calibrated.scan_weight,
+            super::Calibrated::new(prior).scan_weight
+        );
+        assert_eq!(arm.default_check.plan_changes, 0);
+    }
+    Ok(())
+}
+
+/// The plan a calibrated model gives a mix with `counted` scans, under the
+/// prior of the first compaction rate with its scan weight set to `weight`.
+fn calibrated_view(
+    weight: f64,
+    counted: f64,
+) -> (super::Calibrated, lsm_tree::compaction::planned::PlanView) {
+    use lsm_tree::compaction::planned::dp::{Inputs, Plan};
+    let mut calibrated = super::Calibrated::new(super::prior(super::COMPACTION_RATES[0]));
+    calibrated.scan_weight = weight;
+    let inputs = Inputs {
+        round: 10,
+        size_ratio: 3,
+        arrival_secs: 1.0,
+        merge_secs: 0.1,
+        merge_query_share: 0.5,
+        scan_share: calibrated.scan_share(counted),
+        false_positive_rate: calibrated.model.false_positive_rate,
+    };
+    let view = lsm_tree::compaction::planned::PlanView {
+        inputs,
+        plan: std::sync::Arc::new(Plan::solve(&inputs)),
+        units: 0,
+    };
+    (calibrated, view)
+}
+
+/// A calibrated model whose cost curve matches the queries at every weight
+/// predicts them with no error, however its weight moves between the steps
+/// the scale is fitted on and those it is judged on: the observed cost of a
+/// query in point reads is `(e + 2)·c·w + (1 − c)`. Guards against recording
+/// the model's own cost, whose unit shifts with the weight and shows on the
+/// held-out steps as an error the model did not make.
+#[test]
+fn a_calibrated_prediction_keeps_its_unit_as_the_weight_moves() {
+    let counted = 0.5;
+    let mut check = super::ModelCheck::default();
+    for (step, weight) in [1.0, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0, 4.0]
+        .into_iter()
+        .enumerate()
+    {
+        let (calibrated, view) = calibrated_view(weight, counted);
+        let runs = u32::try_from(step % 3).expect("few runs");
+        let observed = (f64::from(runs) + 2.0) * counted * weight + (1.0 - counted);
+        check.record(
+            &view,
+            runs,
+            calibrated.point_reads_per_unit(counted),
+            observed,
+        );
+    }
+    let error = super::calibration::held_out_error(&check.pairs).expect("enough steps");
+    assert!(error < 1e-9, "held-out error {error}");
 }
 
 /// A blob tree is refused by name: compaction bytes are counted in tables.
