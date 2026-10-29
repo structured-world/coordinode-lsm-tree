@@ -1,8 +1,9 @@
 use super::{
-    BOUND, Calibrated, Fitted, MIN_MERGES, MIN_QUERIES, MIN_STEPS, Observed, StepSample, Timing,
-    WEIGHT, fit, held_out_error,
+    BOUND, Calibrated, CallLog, Fitted, MIN_MERGES, MIN_QUERIES, MIN_STEPS, Observed, QuerySpan,
+    StepSample, Timing, WEIGHT, classify, fit, held_out_error,
 };
 use lsm_tree::compaction::planned::Model;
+use std::time::{Duration, Instant};
 
 fn timing(nanos_each: u64, count: u64) -> Timing {
     Timing {
@@ -211,6 +212,93 @@ fn a_flat_prediction_errs_on_a_change() {
         .collect();
     let error = held_out_error(&pairs).expect("enough pairs");
     assert!((error - 0.5).abs() < 1e-12, "{error}");
+}
+
+/// The model's cost in point reads is the observed cost of a query at every
+/// weight and run count: `(e + 2)·c·w + (1 − c)`, for scans of any share.
+#[test]
+fn a_unit_of_model_cost_is_the_observed_cost_in_point_reads() {
+    let prior = Model::default();
+    let f = prior.false_positive_rate;
+    for weight in [0.25, 1.0, 4.0] {
+        let mut calibrated = Calibrated::new(prior);
+        calibrated.scan_weight = weight;
+        for counted in [0.0, 0.1, 0.5, 0.9, 1.0] {
+            let r = calibrated.scan_share(counted);
+            let unit = calibrated.point_reads_per_unit(counted);
+            for runs in 0..8_u32 {
+                let e = f64::from(runs) + 2.0;
+                let model = e * r + (1.0 - r) * (1.0 + f);
+                let observed = e * counted * weight + (1.0 - counted);
+                assert!(
+                    (unit * model - observed).abs() < 1e-9,
+                    "weight {weight} counted {counted} runs {runs}: {} vs {observed}",
+                    unit * model
+                );
+            }
+        }
+    }
+}
+
+/// `count` instants a millisecond apart, the first now.
+fn instants(count: u32) -> Vec<Instant> {
+    let base = Instant::now();
+    (0..count)
+        .map(|at| base + Duration::from_millis(u64::from(at)))
+        .collect()
+}
+
+/// A query beside a merge counts as one during a merge; a query beside a
+/// call that merged nothing (it chose nothing, or moved tables) counts as
+/// idle. Guards against taking every compaction call for a merge, which
+/// fits the share queries keep beside a merge from calls that are none.
+#[test]
+fn only_a_merge_makes_a_query_one_beside_a_merge() {
+    let t = instants(8);
+    let mut log = CallLog::new(2);
+    log.merges.push((t[1], t[3]));
+    let mut observed = Observed::default();
+    let beside = QuerySpan {
+        start: t[2],
+        end: t[4],
+        nanos: 10,
+    };
+    let after = QuerySpan {
+        start: t[5],
+        end: t[6],
+        nanos: 20,
+    };
+    let waiting = classify(vec![beside, after], &mut log, &mut observed, t[7]);
+    assert!(waiting.is_empty());
+    assert_eq!(observed.during.count, 1);
+    assert_eq!(observed.during.nanos, 10);
+    assert_eq!(observed.idle.count, 1);
+    assert_eq!(observed.idle.nanos, 20);
+}
+
+/// A query overlapped by a call still in progress waits: the call may yet be
+/// a merge. Once it ends without one the query counts as idle, and a merge
+/// no query can reach any more is forgotten.
+#[test]
+fn a_query_beside_a_call_in_progress_waits_for_it() {
+    let t = instants(8);
+    let mut log = CallLog::new(2);
+    log.merges.push((t[0], t[1]));
+    log.running[1] = Some(t[2]);
+    let mut observed = Observed::default();
+    let query = QuerySpan {
+        start: t[3],
+        end: t[4],
+        nanos: 30,
+    };
+    let waiting = classify(vec![query], &mut log, &mut observed, t[5]);
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(observed.during.count + observed.idle.count, 0);
+    log.running[1] = None;
+    let waiting = classify(waiting, &mut log, &mut observed, t[6]);
+    assert!(waiting.is_empty());
+    assert_eq!(observed.idle.count, 1);
+    assert!(log.merges.is_empty(), "{:?}", log.merges);
 }
 
 /// Too few steps, or nothing to scale, give no error rather than a made-up

@@ -8,6 +8,7 @@
 //! the model stays as it was.
 
 use lsm_tree::compaction::planned::Model;
+use std::time::Instant;
 
 /// Merges observed before their rate is believed.
 pub(super) const MIN_MERGES: u64 = 4;
@@ -200,6 +201,84 @@ impl Calibrated {
         let total = s + 1.0 - counted;
         if total == 0.0 { 0.0 } else { s / total }
     }
+
+    /// The point reads one unit of the model's query cost stands for, when
+    /// `counted` of the reads are scans: the model's cost times this is the
+    /// observed `(e + 2)·counted·w + (1 − counted)`. It moves with the scan
+    /// weight, so a prediction recorded in point reads keeps one unit while
+    /// the weight does not.
+    pub(super) fn point_reads_per_unit(&self, counted: f64) -> f64 {
+        let counted = counted.clamp(0.0, 1.0);
+        let share = self.scan_share(counted);
+        if share > 0.0 {
+            // The slopes agree: `share·k = counted·w`.
+            counted * self.scan_weight / share
+        } else {
+            // No scans: the constants agree, `(1 + f)·k = 1`.
+            1.0 / (1.0 + self.model.false_positive_rate)
+        }
+    }
+}
+
+/// A query's span, kept until it is known whether a merge ran beside it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct QuerySpan {
+    pub(super) start: Instant,
+    pub(super) end: Instant,
+    pub(super) nanos: u64,
+}
+
+/// What a tree's compaction threads did: the spans of the merges they
+/// finished, and the start of the call each of them is in now.
+#[derive(Debug)]
+pub(super) struct CallLog {
+    pub(super) merges: Vec<(Instant, Instant)>,
+    pub(super) running: Vec<Option<Instant>>,
+}
+
+impl CallLog {
+    /// Nothing done yet by `threads` compaction threads.
+    pub(super) fn new(threads: usize) -> Self {
+        Self {
+            merges: Vec::new(),
+            running: vec![None; threads],
+        }
+    }
+}
+
+/// Records each of `pending` that no call in progress overlaps into
+/// `observed`, as beside a merge when one of `log`'s merges overlaps it and as
+/// idle otherwise; returns those a call in progress may still turn out a merge
+/// beside. A call that chose nothing, or moved tables, is no merge: the queries
+/// beside it are idle. The merges every query left has passed are forgotten.
+pub(super) fn classify(
+    pending: Vec<QuerySpan>,
+    log: &mut CallLog,
+    observed: &mut Observed,
+    now: Instant,
+) -> Vec<QuerySpan> {
+    let mut waiting = Vec::new();
+    for query in pending {
+        // A call in progress ends after now, so after the query: it overlaps
+        // the query when it started before the query ended.
+        if log.running.iter().flatten().any(|&start| start < query.end) {
+            waiting.push(query);
+            continue;
+        }
+        let beside_merge = log
+            .merges
+            .iter()
+            .any(|&(start, end)| start < query.end && end > query.start);
+        if beside_merge {
+            observed.during.record(query.nanos);
+        } else {
+            observed.idle.record(query.nanos);
+        }
+    }
+    // A later query starts after the waiting ones, or after now.
+    let horizon = waiting.iter().map(|query| query.start).min().unwrap_or(now);
+    log.merges.retain(|&(_, end)| end > horizon);
+    waiting
 }
 
 /// The mean relative error of predictions scaled to observations: the scale

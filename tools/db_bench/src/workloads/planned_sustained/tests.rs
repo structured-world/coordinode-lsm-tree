@@ -157,6 +157,60 @@ fn a_short_run_calibrates_nothing_it_did_not_see() -> lsm_tree::Result<()> {
     Ok(())
 }
 
+/// The plan a calibrated model gives a mix with `counted` scans, under the
+/// prior of the first compaction rate with its scan weight set to `weight`.
+fn calibrated_view(
+    weight: f64,
+    counted: f64,
+) -> (super::Calibrated, lsm_tree::compaction::planned::PlanView) {
+    use lsm_tree::compaction::planned::dp::{Inputs, Plan};
+    let mut calibrated = super::Calibrated::new(super::prior(super::COMPACTION_RATES[0]));
+    calibrated.scan_weight = weight;
+    let inputs = Inputs {
+        round: 10,
+        size_ratio: 3,
+        arrival_secs: 1.0,
+        merge_secs: 0.1,
+        merge_query_share: 0.5,
+        scan_share: calibrated.scan_share(counted),
+        false_positive_rate: calibrated.model.false_positive_rate,
+    };
+    let view = lsm_tree::compaction::planned::PlanView {
+        inputs,
+        plan: std::sync::Arc::new(Plan::solve(&inputs)),
+        units: 0,
+    };
+    (calibrated, view)
+}
+
+/// A calibrated model whose cost curve matches the queries at every weight
+/// predicts them with no error, however its weight moves between the steps
+/// the scale is fitted on and those it is judged on: the observed cost of a
+/// query in point reads is `(e + 2)·c·w + (1 − c)`. Guards against recording
+/// the model's own cost, whose unit shifts with the weight and shows on the
+/// held-out steps as an error the model did not make.
+#[test]
+fn a_calibrated_prediction_keeps_its_unit_as_the_weight_moves() {
+    let counted = 0.5;
+    let mut check = super::ModelCheck::default();
+    for (step, weight) in [1.0, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0, 4.0]
+        .into_iter()
+        .enumerate()
+    {
+        let (calibrated, view) = calibrated_view(weight, counted);
+        let runs = u32::try_from(step % 3).expect("few runs");
+        let observed = (f64::from(runs) + 2.0) * counted * weight + (1.0 - counted);
+        check.record(
+            &view,
+            runs,
+            calibrated.point_reads_per_unit(counted),
+            observed,
+        );
+    }
+    let error = super::calibration::held_out_error(&check.pairs).expect("enough steps");
+    assert!(error < 1e-9, "held-out error {error}");
+}
+
 /// A blob tree is refused by name: compaction bytes are counted in tables.
 #[test]
 fn a_blob_tree_is_refused() {

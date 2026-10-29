@@ -32,7 +32,7 @@ use crate::config::BenchConfig;
 use crate::db::make_sequential_key;
 use crate::reporter::{Reporter, Suite};
 use crate::workloads::Workload;
-use calibration::{Calibrated, Observed, StepSample, Timing};
+use calibration::{Calibrated, CallLog, Observed, QuerySpan, StepSample, Timing};
 use hdrhistogram::Histogram;
 use lsm_tree::compaction::planned::{Model, PlanView, dp::Plan};
 use lsm_tree::compaction::{CompactionAction, CompactionStrategy, Leveled, Planned};
@@ -41,7 +41,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -169,10 +169,19 @@ struct ModelCheck {
 
 impl ModelCheck {
     /// Records what `view` predicts a query costs with `main_runs` runs in the
-    /// main level beside the `observed` cost, and whether its plan changed.
-    fn record(&mut self, view: &PlanView, main_runs: u32, observed: f64) {
-        self.pairs
-            .push((1.0 / view.inputs.speed(main_runs), observed));
+    /// main level, in point reads at `point_reads_per_unit` of them to its
+    /// unit, beside the `observed` cost, and whether its plan changed.
+    fn record(
+        &mut self,
+        view: &PlanView,
+        main_runs: u32,
+        point_reads_per_unit: f64,
+        observed: f64,
+    ) {
+        self.pairs.push((
+            point_reads_per_unit / view.inputs.speed(main_runs),
+            observed,
+        ));
         if self
             .last_plan
             .as_ref()
@@ -244,7 +253,6 @@ impl Arm {
 }
 
 /// What a tree's compaction threads share with the writer.
-#[derive(Default)]
 struct Background {
     stop: AtomicBool,
     /// The sequence number below which every version may go: no snapshot is
@@ -252,16 +260,48 @@ struct Background {
     watermark: AtomicU64,
     merges: AtomicU64,
     nanos: AtomicU64,
-    /// Compactions running now, so a query knows whether one ran beside it.
-    running: AtomicU64,
+    /// The merges done and the calls in progress, so a query learns whether a
+    /// merge ran beside it once every call beside it has ended.
+    calls: Mutex<CallLog>,
     /// Bytes the merges wrote and the thread time they took.
     merge_bytes: AtomicU64,
     merge_nanos: AtomicU64,
 }
 
-/// The planner under each model after a step, and what the step's queries took.
+impl Background {
+    /// Nothing done yet, by [`COMPACTION_THREADS`] threads.
+    fn new() -> Self {
+        Self {
+            stop: AtomicBool::new(false),
+            watermark: AtomicU64::new(0),
+            merges: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+            calls: Mutex::new(CallLog::new(COMPACTION_THREADS)),
+            merge_bytes: AtomicU64::new(0),
+            merge_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// The call log, whichever thread panicked holding it.
+    fn calls(&self) -> std::sync::MutexGuard<'_, CallLog> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The planner under each model a step is judged by, the calibrated one as
+/// the step's observations moved it, and what the step's queries took.
 struct Models {
     default: Planned,
+    /// The calibrated model as it was before the step: what is judged on the
+    /// step's queries, which it was not fitted to.
+    judged: Planned,
+    /// Point reads a unit of each judged model's query cost stands for.
+    default_unit: f64,
+    judged_unit: f64,
+    /// The calibrated model the step's observations moved it to, which the
+    /// calibrated tree compacts by from here on.
     calibrated: Planned,
     /// Whether the calibrated model moved in the step.
     moved: bool,
@@ -283,6 +323,9 @@ struct ArmRun {
     lookups: StdRng,
     background: Arc<Background>,
     workers: Vec<JoinHandle<lsm_tree::Result<()>>>,
+    /// Queries waiting for a call in progress beside them to tell whether it
+    /// was a merge.
+    pending: Vec<QuerySpan>,
     /// Removed when the run ends.
     _folder: tempfile::TempDir,
 }
@@ -350,12 +393,14 @@ impl ArmRun {
         let strategy: StrategySlot = Arc::new(RwLock::new(strategy));
         let mut arm = Arm::new();
         arm.calibrated = Calibrated::new(prior(compaction_rate));
-        let background = Arc::new(Background::default());
+        let background = Arc::new(Background::new());
         let workers = (0..COMPACTION_THREADS)
-            .map(|_| {
+            .map(|slot| {
                 let (tree, strategy, background) =
                     (tree.clone(), Arc::clone(&strategy), Arc::clone(&background));
-                std::thread::spawn(move || compact_in_background(&tree, &strategy, &background))
+                std::thread::spawn(move || {
+                    compact_in_background(&tree, &strategy, &background, slot)
+                })
             })
             .collect();
         Ok(Self {
@@ -366,6 +411,7 @@ impl ArmRun {
             lookups: StdRng::seed_from_u64(SEED ^ 1),
             background,
             workers,
+            pending: Vec::new(),
             _folder: folder,
         })
     }
@@ -441,7 +487,6 @@ impl ArmRun {
                     continue;
                 }
                 let key = make_sequential_key(self.lookup_key(keys, mix), config.key_size);
-                let beside_merge = self.background.running.load(Ordering::Relaxed) > 0;
                 let at = Instant::now();
                 if scan {
                     for item in self
@@ -454,7 +499,8 @@ impl ArmRun {
                 } else {
                     self.tree.get(&key, seqno)?;
                 }
-                let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let end = Instant::now();
+                let nanos = u64::try_from((end - at).as_nanos()).unwrap_or(u64::MAX);
                 self.arm.query_nanos += nanos;
                 // Above the histogram's range a read is recorded at its top.
                 if scan {
@@ -464,19 +510,28 @@ impl ArmRun {
                     self.arm.points.saturating_record(nanos);
                     step_points.record(nanos);
                 }
-                if beside_merge {
-                    self.arm.observed.during.record(nanos);
-                } else {
-                    self.arm.observed.idle.record(nanos);
-                }
+                self.pending.push(QuerySpan {
+                    start: at,
+                    end,
+                    nanos,
+                });
             }
         }
+        // A query is known to have run beside a merge, or beside none, once
+        // every compaction call beside it has ended: one in progress may yet
+        // be a merge, or choose nothing and move tables.
+        self.pending = calibration::classify(
+            std::mem::take(&mut self.pending),
+            &mut self.background.calls(),
+            &mut self.arm.observed,
+            Instant::now(),
+        );
         if self.kind != Kind::Leveled {
             let models = self.observe(main_runs, step_points, step_scans, mix, compaction_rate);
             let config = self.tree.tree_config();
             let views = (
                 models.default.plan_for(&version, config),
-                models.calibrated.plan_for(&version, config),
+                models.judged.plan_for(&version, config),
             );
             self.judge(models, views, main_runs);
         }
@@ -484,7 +539,8 @@ impl ArmRun {
     }
 
     /// Records what the step observed and moves the calibrated model toward
-    /// it, returning the strategies of both models as they now are.
+    /// it, returning the strategies to judge the step by, both as they were
+    /// before it, and the calibrated one it moved to.
     fn observe(
         &mut self,
         main_runs: u32,
@@ -511,10 +567,16 @@ impl ArmRun {
             });
         }
         let fitted = calibration::fit(observed);
+        // The model the step is judged by is the one from before it: fitted
+        // to the steps before, so the step's queries are held out from it.
         let before = self.arm.calibrated;
         self.arm.calibrated.update(&fitted);
+        let counted = mix.scan_share();
         Models {
             default: planned(compaction_rate, mix, None),
+            judged: planned(compaction_rate, mix, Some(&before)),
+            default_unit: Calibrated::new(prior(compaction_rate)).point_reads_per_unit(counted),
+            judged_unit: before.point_reads_per_unit(counted),
             calibrated: planned(compaction_rate, mix, Some(&self.arm.calibrated)),
             moved: self.arm.calibrated != before,
             query_nanos: (points.nanos + scans.nanos) as f64
@@ -527,18 +589,24 @@ impl ArmRun {
     fn judge(
         &mut self,
         models: Models,
-        (default, calibrated): (Option<PlanView>, Option<PlanView>),
+        (default, judged): (Option<PlanView>, Option<PlanView>),
         main_runs: u32,
     ) {
         if let Some(view) = default {
-            self.arm
-                .default_check
-                .record(&view, main_runs, models.query_nanos);
+            self.arm.default_check.record(
+                &view,
+                main_runs,
+                models.default_unit,
+                models.query_nanos,
+            );
         }
-        if let Some(view) = calibrated {
-            self.arm
-                .calibrated_check
-                .record(&view, main_runs, models.query_nanos);
+        if let Some(view) = judged {
+            self.arm.calibrated_check.record(
+                &view,
+                main_runs,
+                models.judged_unit,
+                models.query_nanos,
+            );
         }
         if self.kind == Kind::Calibrated && models.moved {
             *self
@@ -596,12 +664,15 @@ impl Drop for ArmRun {
     }
 }
 
-/// One compaction thread: compacts with the tree's current strategy while
-/// there is work, waits a moment when there is none, until told to stop.
+/// One compaction thread, the `slot`-th of the tree's: compacts with the tree's
+/// current strategy while there is work, waits a moment when there is none,
+/// until told to stop. It logs each call while it runs and each merge once
+/// done, for the queries to learn which of them ran beside one.
 fn compact_in_background(
     tree: &AnyTree,
     strategy: &StrategySlot,
     background: &Background,
+    slot: usize,
 ) -> lsm_tree::Result<()> {
     while !background.stop.load(Ordering::Relaxed) {
         let current = Arc::clone(
@@ -609,11 +680,25 @@ fn compact_in_background(
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        background.running.fetch_add(1, Ordering::Relaxed);
         let at = Instant::now();
+        if let Some(running) = background.calls().running.get_mut(slot) {
+            *running = Some(at);
+        }
         let result = tree.compact(current, background.watermark.load(Ordering::Relaxed));
-        let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        background.running.fetch_sub(1, Ordering::Relaxed);
+        let end = Instant::now();
+        {
+            let mut calls = background.calls();
+            if let Some(running) = calls.running.get_mut(slot) {
+                *running = None;
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|result| result.action == CompactionAction::Merged)
+            {
+                calls.merges.push((at, end));
+            }
+        }
+        let nanos = u64::try_from((end - at).as_nanos()).unwrap_or(u64::MAX);
         let result = result?;
         // Every call counts, one that finds nothing to do as well: choosing
         // is compaction work, and the planner's choice is its plan. The wait
