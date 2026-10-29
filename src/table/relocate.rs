@@ -35,19 +35,19 @@ const COPY_CHUNK: usize = 256 * 1024;
 
 /// A relocated segment's file, as written.
 #[derive(Debug)]
-pub struct Relocated {
+pub(crate) struct Relocated {
     /// The new table's id.
-    pub id: TableId,
+    pub(crate) id: TableId,
     /// The new table's file.
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Whether the file's directory entry was durable before the table was
     /// written into it (see [`Table::mark_entry_durable`]).
-    pub entry_durable: bool,
+    pub(crate) entry_durable: bool,
     /// The file's checksum, for [`Table::recover`].
-    pub checksum: Checksum,
+    pub(crate) checksum: Checksum,
     /// The bytes copied from the source as they lay: every section but the
     /// two meta blocks, encoded again, and the delete bitmap.
-    pub copied: u64,
+    pub(crate) copied: u64,
 }
 
 impl Table {
