@@ -2107,6 +2107,9 @@ fn sustained_ours(
     let writing_done = AtomicBool::new(false);
     let watermark = AtomicU64::new(shape.keys);
     let (elapsed, disk, compacted, mut reads) = std::thread::scope(|scope| {
+        // Before the first spawn: a panic spawning a later helper releases
+        // those already running too.
+        let (_writing_done, _stop) = (RaiseOnDrop(&writing_done), RaiseOnDrop(&stop));
         let compactor = spawn_named(scope, "ours-compactor", || {
             let mut written = 0;
             while !stop.load(Ordering::Acquire) {
@@ -2159,7 +2162,6 @@ fn sustained_ours(
                 }
             }
         });
-        let (_writing_done, _stop) = (RaiseOnDrop(&writing_done), RaiseOnDrop(&stop));
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
             #[cfg(feature = "metrics")]
