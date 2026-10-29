@@ -497,7 +497,7 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
 
 /// The bytes an install keeps, for each counter set they go to: the set of
 /// the backend each file was written through (see
-/// [`Fs::write_io_stats`](crate::fs::Fs::write_io_stats)), so a route on
+/// [`Fs::write_io_stats`]), so a route on
 /// another medium is charged to that medium's set. Files on a backend that
 /// counts nothing are not looked at.
 ///

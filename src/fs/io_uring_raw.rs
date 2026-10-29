@@ -11,7 +11,7 @@
 //!
 //! The core sets up a ring, submits a batch of SQEs (as many in flight as the
 //! rings hold) and reaps their CQEs; one operation is a batch of one. The
-//! [`Fs`](crate::fs::Fs) / [`FsFile`] impls build on it: single reads, writes
+//! [`Fs`] / [`FsFile`] impls build on it: single reads, writes
 //! and syncs, and batched reads across files.
 //!
 //! Linux-only by construction (`io_uring` is a Linux kernel API); the module is
@@ -590,7 +590,7 @@ struct Statx {
     _spare3: [u64; 12],
 }
 
-/// File type + size, the subset of `statx` the [`Fs`](crate::fs::Fs) metadata
+/// File type + size, the subset of `statx` the [`Fs`] metadata
 /// surface needs.
 pub struct RawMetadata {
     /// File length in bytes (`stx_size`).
@@ -1683,7 +1683,7 @@ unsafe impl Send for IoUringRaw {}
 ///
 /// The hot read / write / fsync path goes through a shared ring (serialized by a
 /// `Mutex`), while cold operations (size, truncate, lock) use plain blocking
-/// syscalls. It slots into the [`Fs`](crate::fs::Fs) abstraction like the
+/// syscalls. It slots into the [`Fs`] abstraction like the
 /// std-bound backends.
 pub struct IoUringRawFile {
     /// Shared submission/completion ring. `Mutex` because the ring ops take
