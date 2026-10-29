@@ -82,14 +82,16 @@
 //! queries keep beside a merge, a scan's cost per run against a point read's)
 //! was measured against it with `db_bench planned-sustained`: 1M rows, four
 //! read mixes (even points and 100-key scans, Zipf-hot points with short
-//! scans, 1000-key scans, 32 runs in L0), both budgets, three runs. It won
-//! every run on three mixes (even 8×, long scans 8×, 32 L0 runs 2×) and lost
-//! every run on three (Zipf-hot 8× by 24% to 63%, long scans 2×, 32 L0 runs
-//! 8×), its plan changed several times a run where the set model's never did,
-//! and neither model's query cost tracked the observed one within 50%: the
-//! main level's run count does not explain what a query costs. The set model
-//! is kept. With 32 runs in L0 at 8× the write rate, leveled served the most
-//! queries of the three.
+//! scans, 1000-key scans, 32 runs in L0), both budgets, three runs, each
+//! model judged on steps it was not fitted to. It won every run on two
+//! (Zipf-hot 2× by 12% to 129%, 32 L0 runs 8× by 13% to 80%), lost every run
+//! on one (Zipf-hot 8× by 24% to 46%), and went either way on the other five.
+//! Its plan changed 4 to 27 times a run where the set model's never did, and
+//! both models' predicted query cost erred by 40% to 110% on the held-out
+//! steps: the main level's run count does not explain what a query costs.
+//! Queries beside a merge kept their speed, so the share they keep fitted to
+//! its bound of one. The set model is kept. With 32 runs in L0, leveled
+//! served the most queries in two runs of three at either budget.
 
 pub mod dp;
 
