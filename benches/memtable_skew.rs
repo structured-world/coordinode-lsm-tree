@@ -11,7 +11,7 @@
 //! | axis | values |
 //! |---|---|
 //! | key order | `append` (each key above the last), `uniform`, `zipf` (s = 0.99), `hot` (one key) |
-//! | key shape | 16 bytes, or 16 bytes behind a common prefix of 8, 32 or 64 bytes |
+//! | key shape | 16 bytes, or 16 bytes behind a common prefix of 8, 32, 64, 128 or 256 bytes |
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
@@ -80,8 +80,9 @@ impl KeyOrder {
     }
 }
 
-/// Bytes of the common prefix in front of every key.
-const PREFIXES: [usize; 4] = [0, 8, 32, 64];
+/// Bytes of the common prefix in front of every key: up to keys long enough
+/// that the comparison is a scan over the shared bytes rather than a few words.
+const PREFIXES: [usize; 6] = [0, 8, 32, 64, 128, 256];
 const WRITERS: [usize; 4] = [1, 4, 16, 32];
 
 /// xorshift64: the same stream on every run and host.
