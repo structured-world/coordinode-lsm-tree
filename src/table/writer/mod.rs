@@ -1154,13 +1154,6 @@ fn row_group_ref(
 /// The header of a block among bytes copied from another table. A frame too
 /// short to hold one is a malformed copy, refused as one: the short read is of
 /// bytes in memory, not a failure of the file being written.
-#[cfg_attr(
-    not(any(feature = "std", feature = "columnar")),
-    expect(
-        dead_code,
-        reason = "only the verbatim copies of salvage and compaction read carried bytes"
-    )
-)]
 fn carried_header(frame: &[u8]) -> crate::Result<crate::table::block::Header> {
     use crate::coding::Decode;
     crate::table::block::Header::decode_from(&mut &*frame).map_err(|e| match e {
@@ -2442,10 +2435,10 @@ impl Writer {
         #[cfg(feature = "std")]
         use std::io::Write;
         // The range is in the buffer until it is flushed to the file.
-        let buffered = self.file_writer.get_mut().inner_mut();
-        buffered.flush()?;
+        let checksummed = self.file_writer.get_mut();
+        checksummed.flush()?;
         crate::fs::hint_writeback(
-            &**buffered.get_ref(),
+            &**checksummed.get_ref().get_ref(),
             self.written_back,
             pending,
             &mut self.writeback_bytes,
@@ -5431,9 +5424,9 @@ impl Writer {
         // are all a read of it needs (POSIX synchronized I/O data integrity
         // completion), so `sync_data`; its name is the directory sync's. A
         // deferred table is synced by the install that persists it.
-        let mut checksum = self.file_writer.into_inner()?;
+        let checksum = self.file_writer.into_inner()?;
         {
-            let file = checksum.inner_mut().get_mut();
+            let file = checksum.get_ref().get_ref();
             if self.durability == crate::config::FlushDurability::Synced {
                 FsFile::sync_data_with(&**file, self.sync_mode)?;
             }
@@ -5488,18 +5481,18 @@ fn write_back_tail(
 ) -> crate::Result<()> {
     if *writeback_bytes > 0 {
         #[cfg(not(feature = "std"))]
-        use crate::io::Seek;
+        use crate::io::Write;
         #[cfg(feature = "std")]
-        use std::io::Seek;
-        let buffered = file_writer.get_mut().inner_mut();
-        // Flushes the buffer, as the section start every call precedes does
-        // anyway.
-        let position = buffered.stream_position()?;
+        use std::io::Write;
+        let checksummed = file_writer.get_mut();
+        let position = checksummed.position();
         // `written_back` is a position the file already reached.
         let pending = position - *written_back;
         if pending >= *writeback_bytes {
+            // The range is in the buffer until it is flushed to the file.
+            checksummed.flush()?;
             crate::fs::hint_writeback(
-                &**buffered.get_ref(),
+                &**checksummed.get_ref().get_ref(),
                 *written_back,
                 pending,
                 writeback_bytes,

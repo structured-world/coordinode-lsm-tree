@@ -11,7 +11,7 @@
 //!
 //! The core sets up a ring, submits a batch of SQEs (as many in flight as the
 //! rings hold) and reaps their CQEs; one operation is a batch of one. The
-//! [`Fs`](crate::fs::Fs) / [`FsFile`] impls build on it: single reads, writes
+//! [`Fs`] / [`FsFile`] impls build on it: single reads, writes
 //! and syncs, and batched reads across files.
 //!
 //! Linux-only by construction (`io_uring` is a Linux kernel API); the module is
@@ -590,19 +590,19 @@ struct Statx {
     _spare3: [u64; 12],
 }
 
-/// File type + size, the subset of `statx` the [`Fs`](crate::fs::Fs) metadata
+/// File type + size, the subset of `statx` the [`Fs`] metadata
 /// surface needs.
-pub struct RawMetadata {
+pub(crate) struct RawMetadata {
     /// File length in bytes (`stx_size`).
-    pub size: u64,
+    pub(crate) size: u64,
     /// Number of hard links to the underlying inode (`stx_nlink`). A count above
     /// 1 means another name shares the same bytes, so in-place mutation would
     /// rewrite that snapshot too.
-    pub nlink: u64,
+    pub(crate) nlink: u64,
     /// Whether the entry is a directory (`S_IFDIR`).
-    pub is_dir: bool,
+    pub(crate) is_dir: bool,
     /// Whether the entry is a regular file (`S_IFREG`).
-    pub is_file: bool,
+    pub(crate) is_file: bool,
 }
 
 /// `statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &buf)` — stats an open
@@ -610,7 +610,7 @@ pub struct RawMetadata {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `statx` syscall fails.
-pub fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
+pub(crate) fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
     let mut buf = Statx::default();
     // Empty path + AT_EMPTY_PATH makes statx operate on `fd` directly.
     let empty: &core::ffi::CStr = c"";
@@ -640,7 +640,7 @@ pub fn fstat_raw(fd: i32) -> Result<RawMetadata, Error> {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `ftruncate` syscall fails.
-pub fn ftruncate_raw(fd: i32, length: u64) -> Result<(), Error> {
+pub(crate) fn ftruncate_raw(fd: i32, length: u64) -> Result<(), Error> {
     // SAFETY: `fd` is an owned writable descriptor; `length` is a plain value.
     #[cfg(target_pointer_width = "64")]
     let ret = unsafe { syscall2(Sysno::ftruncate, fd as usize, length as usize) };
@@ -692,7 +692,7 @@ fn reg_pair(v: u64) -> (usize, usize) {
 /// # Errors
 /// Returns an [`Error`] if the `sync_file_range` syscall fails.
 #[cfg(target_pointer_width = "64")]
-pub fn start_writeback_raw(fd: i32, offset: u64, len: u64) -> Result<(), Error> {
+pub(crate) fn start_writeback_raw(fd: i32, offset: u64, len: u64) -> Result<(), Error> {
     /// `SYNC_FILE_RANGE_WRITE` from `<linux/fs.h>`.
     const SYNC_FILE_RANGE_WRITE: usize = 2;
     // SAFETY: `fd` is an owned descriptor; offset, length and flags are plain
@@ -716,7 +716,7 @@ pub fn start_writeback_raw(fd: i32, offset: u64, len: u64) -> Result<(), Error> 
 ///
 /// # Errors
 /// Returns an [`Error`] if the `fcntl` syscall fails.
-pub fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result<(), Error> {
+pub(crate) fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result<(), Error> {
     /// `F_LINUX_SPECIFIC_BASE + 12`.
     const F_SET_RW_HINT: usize = 1024 + 12;
     let hint: u64 = match lifetime {
@@ -744,7 +744,7 @@ pub fn set_write_lifetime_raw(fd: i32, lifetime: super::WriteLifetime) -> Result
 ///
 /// # Errors
 /// Returns an [`Error`] if an `fcntl` syscall fails.
-pub fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
+pub(crate) fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
     /// `F_GETFL`, the same on every Linux architecture.
     const F_GETFL: usize = 3;
     /// `F_SETFL`, the same on every Linux architecture.
@@ -764,7 +764,7 @@ pub fn clear_nonblock_raw(fd: i32) -> Result<(), Error> {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `lseek` syscall fails.
-pub fn lseek_raw(fd: i32, offset: i64, whence: i32) -> Result<u64, Error> {
+pub(crate) fn lseek_raw(fd: i32, offset: i64, whence: i32) -> Result<u64, Error> {
     lseek_errno(fd, offset, whence).map_err(|e| err("lseek", e))
 }
 
@@ -808,7 +808,7 @@ fn lseek_errno(fd: i32, offset: i64, whence: i32) -> Result<u64, Errno> {
 /// # Errors
 /// Returns an [`Error`] if the `flock` syscall fails for a reason other than the
 /// non-blocking contention case.
-pub fn flock_exclusive_raw(fd: i32, non_blocking: bool) -> Result<bool, Error> {
+pub(crate) fn flock_exclusive_raw(fd: i32, non_blocking: bool) -> Result<bool, Error> {
     let op = if non_blocking {
         LOCK_EX | LOCK_NB
     } else {
@@ -832,7 +832,7 @@ pub fn flock_exclusive_raw(fd: i32, non_blocking: bool) -> Result<bool, Error> {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `lseek` syscall fails.
-pub fn file_size_raw(fd: i32) -> Result<u64, Error> {
+pub(crate) fn file_size_raw(fd: i32) -> Result<u64, Error> {
     lseek_raw(fd, 0, SEEK_END)
 }
 
@@ -981,7 +981,7 @@ const DT_DIR: u8 = 4;
 ///
 /// # Errors
 /// Returns an [`Error`] if the `mkdirat` syscall fails.
-pub fn mkdirat_raw(path: &core::ffi::CStr, mode: u32) -> Result<(), Error> {
+pub(crate) fn mkdirat_raw(path: &core::ffi::CStr, mode: u32) -> Result<(), Error> {
     // SAFETY: `path` is a valid NUL-terminated C string the kernel only reads.
     unsafe {
         syscall3(
@@ -1000,7 +1000,7 @@ pub fn mkdirat_raw(path: &core::ffi::CStr, mode: u32) -> Result<(), Error> {
 ///
 /// # Errors
 /// Returns an [`Error`] if the `unlinkat` syscall fails.
-pub fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Error> {
+pub(crate) fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Error> {
     let flags = if remove_dir { AT_REMOVEDIR } else { 0 };
     // SAFETY: `path` is a valid NUL-terminated C string the kernel only reads.
     unsafe {
@@ -1020,7 +1020,7 @@ pub fn unlinkat_raw(path: &core::ffi::CStr, remove_dir: bool) -> Result<(), Erro
 ///
 /// # Errors
 /// Returns an [`Error`] if the `symlinkat` syscall fails.
-pub fn symlinkat_raw(target: &core::ffi::CStr, link: &core::ffi::CStr) -> Result<(), Error> {
+pub(crate) fn symlinkat_raw(target: &core::ffi::CStr, link: &core::ffi::CStr) -> Result<(), Error> {
     // SAFETY: both paths are valid NUL-terminated C strings the kernel reads.
     unsafe {
         syscall3(
@@ -1039,7 +1039,7 @@ pub fn symlinkat_raw(target: &core::ffi::CStr, link: &core::ffi::CStr) -> Result
 ///
 /// # Errors
 /// Returns an [`Error`] if the `renameat2` syscall fails.
-pub fn renameat2_raw(from: &core::ffi::CStr, to: &core::ffi::CStr) -> Result<(), Error> {
+pub(crate) fn renameat2_raw(from: &core::ffi::CStr, to: &core::ffi::CStr) -> Result<(), Error> {
     // SAFETY: both paths are valid NUL-terminated C strings the kernel reads.
     unsafe {
         syscall5(
@@ -1060,7 +1060,7 @@ pub fn renameat2_raw(from: &core::ffi::CStr, to: &core::ffi::CStr) -> Result<(),
 ///
 /// # Errors
 /// Returns an [`Error`] if `statx` fails for a reason other than `ENOENT`.
-pub fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Error> {
+pub(crate) fn statx_path_raw(path: &core::ffi::CStr) -> Result<Option<RawMetadata>, Error> {
     Ok(statx_at(path)?.map(|buf| {
         let kind = buf.stx_mode & S_IFMT;
         RawMetadata {
@@ -1105,7 +1105,7 @@ fn statx_at(path: &core::ffi::CStr) -> Result<Option<Statx>, Error> {
 /// # Errors
 /// Returns an [`Error`] if `statx` fails, `ENOENT` included: a name that does
 /// not exist has no identity to compare.
-pub fn statx_identity_raw(path: &core::ffi::CStr) -> Result<(u32, u32, u64), Error> {
+pub(crate) fn statx_identity_raw(path: &core::ffi::CStr) -> Result<(u32, u32, u64), Error> {
     let mut buf = Statx::default();
     // SAFETY: `path` is a valid NUL-terminated C string; `buf` is a valid,
     // writable Statx the kernel fills.
@@ -1141,7 +1141,7 @@ const PATH_MAX: usize = 4096;
 /// # Errors
 /// Returns an [`Error`] if `readlinkat` fails for another reason, or the
 /// target fills the whole buffer (`ENAMETOOLONG`: it may have been cut).
-pub fn readlinkat_raw(path: &core::ffi::CStr) -> Result<Option<Vec<u8>>, Error> {
+pub(crate) fn readlinkat_raw(path: &core::ffi::CStr) -> Result<Option<Vec<u8>>, Error> {
     let mut buf = alloc::vec![0u8; PATH_MAX];
     // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
     // `buf` is a valid, writable buffer of `buf.len()` bytes.
@@ -1213,7 +1213,7 @@ struct Statfs {
 /// # Errors
 /// Returns an [`Error`] if the `statfs` syscall fails.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
+pub(crate) fn statfs_available_raw(path: &core::ffi::CStr) -> Result<u64, Error> {
     let mut buf = Statfs::default();
     // SAFETY: `path` is a valid NUL-terminated C string the kernel reads;
     // `buf` is a valid, writable Statfs the kernel fills on success.
@@ -1683,7 +1683,7 @@ unsafe impl Send for IoUringRaw {}
 ///
 /// The hot read / write / fsync path goes through a shared ring (serialized by a
 /// `Mutex`), while cold operations (size, truncate, lock) use plain blocking
-/// syscalls. It slots into the [`Fs`](crate::fs::Fs) abstraction like the
+/// syscalls. It slots into the [`Fs`] abstraction like the
 /// std-bound backends.
 pub struct IoUringRawFile {
     /// Shared submission/completion ring. `Mutex` because the ring ops take

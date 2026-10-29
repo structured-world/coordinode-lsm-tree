@@ -650,7 +650,7 @@ impl Scanner {
         if let Some(head) = directory.head_zone_block() {
             Self::check_zone_block(reader, table_id, encryption, ecc, &directory, head)?;
         }
-        let mut pages = Vec::with_capacity(directory.entries().len());
+        let mut pages = alloc::vec::Vec::with_capacity(directory.entries().len());
         for entry in directory.entries() {
             let page = Self::read_block(
                 reader,

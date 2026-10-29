@@ -2,6 +2,8 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
 use bytes::Bytes;
 
 pub use bytes::BytesMut as Builder;
@@ -44,7 +46,7 @@ impl Slice {
 
     #[doc(hidden)]
     #[must_use]
-    pub fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {
+    pub fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {
         Self(self.0.slice(range))
     }
 
@@ -57,25 +59,9 @@ impl Slice {
     #[doc(hidden)]
     #[must_use]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {
-        use std::io::Write;
-
-        let len = left.len() + right.len();
-        let mut builder = unsafe { Self::builder_unzeroed(len) };
-        {
-            let mut writer = &mut builder[..];
-
-            #[expect(
-                clippy::expect_used,
-                reason = "writing into a pre-allocated buffer of exact size cannot fail"
-            )]
-            writer.write_all(left).expect("should write");
-            #[expect(
-                clippy::expect_used,
-                reason = "writing into a pre-allocated buffer of exact size cannot fail"
-            )]
-            writer.write_all(right).expect("should write");
-        }
-
+        let mut builder = Builder::with_capacity(left.len() + right.len());
+        builder.extend_from_slice(left);
+        builder.extend_from_slice(right);
         Self(builder.freeze())
     }
 
@@ -83,6 +69,7 @@ impl Slice {
     ///
     /// The reader may not read the existing buffer.
     #[doc(hidden)]
+    #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {
         let mut builder = unsafe { Self::builder_unzeroed(len) };
 
@@ -91,6 +78,23 @@ impl Slice {
         // so it's safe
         //
         // The safe API is unstable: https://github.com/rust-lang/rust/issues/78485
+        reader.read_exact(&mut builder)?;
+
+        Ok(Self(builder.freeze()))
+    }
+
+    /// `no_std` mirror of [`Slice::from_reader`] over [`crate::io::Read`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an I/O error occurred.
+    #[doc(hidden)]
+    #[cfg(not(feature = "std"))]
+    pub fn from_reader<R: crate::io::Read>(reader: &mut R, len: usize) -> crate::io::Result<Self> {
+        let mut builder = unsafe { Self::builder_unzeroed(len) };
+
+        // SAFETY: as for the std reader above: only I/O readers and cursors
+        // over byte buffers fill the buffer, and none reads it first.
         reader.read_exact(&mut builder)?;
 
         Ok(Self(builder.freeze()))

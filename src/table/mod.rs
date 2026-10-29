@@ -1325,15 +1325,6 @@ impl Table {
     /// verification reads must not evict the live working set either).
     /// Decodes under the table's data-block codec context, so
     /// it fits every gate that walks `block_index` (Data or Columnar role).
-    // Compiled under no_std alongside its `verify_kv_checksums` consumer,
-    // which is itself dead there (the verify/scrub caller is std-gated).
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "gate-only loader; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn load_block_from_disk(
         &self,
         handle: &BlockHandle,
@@ -2548,7 +2539,14 @@ impl Table {
     /// When the directory cannot be read or does not fill the group exactly.
     /// Without it the pages cannot be located, so the whole entry is reported
     /// rather than guessed at.
-    #[cfg(feature = "std")]
+    #[cfg_attr(
+        all(not(feature = "std"), not(feature = "columnar")),
+        expect(
+            dead_code,
+            reason = "the scrub, heal and reconcile walks that call it are std-gated; \
+                      with `columnar` the row group loader of the gate-only walk calls it"
+        )
+    )]
     pub(crate) fn data_unit_blocks(
         &self,
         entry: &BlockHandle,
@@ -2568,7 +2566,7 @@ impl Table {
 
     /// The handles of a row group's directory and pages, read from disk.
     /// See [`Self::data_unit_blocks`].
-    #[cfg(all(feature = "std", feature = "columnar"))]
+    #[cfg(feature = "columnar")]
     fn row_group_block_handles(
         &self,
         group: &BlockHandle,
@@ -4108,13 +4106,6 @@ impl Table {
     ///   disagrees with the stored value (corruption of the entry bytes or
     ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
-    #[cfg_attr(
-        not(feature = "std"),
-        allow(
-            dead_code,
-            reason = "core+alloc per-KV scrub over the table; the verify/scrub consumer is std-gated, so unused under no_std"
-        )
-    )]
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
         // Footer presence is a per-SST property recorded in the descriptor
         // (`kv_checksum_algo`); data blocks omit the block_flags byte, so the
@@ -4146,13 +4137,6 @@ impl Table {
     /// it — the second decode reads no additional bytes off the disk. Taking no
     /// comparator is what keeps it that way: decoding a data block needs one,
     /// so this cannot re-decode even by mistake.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "per-KV gate half; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn check_block_kv_checksums(
         expected_algo: crate::runtime_config::types::ChecksumAlgorithm,
         block: &DecodedBlock,
@@ -6794,13 +6778,6 @@ impl Table {
     ///
     /// Propagates the index walk, the punch-offset lookup, the block read and
     /// the decode, plus whatever `check` returns.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "gate-only walk; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn for_each_live_block<F>(&self, mut check: F) -> crate::Result<()>
     where
         F: FnMut(&DecodedBlock) -> crate::Result<()>,
@@ -6876,7 +6853,7 @@ impl Table {
     /// table: pages carry no per-KV footer and no inner-frame layout, so those
     /// gates have nothing further to check in a group) together with the
     /// decoded batch.
-    #[cfg(all(feature = "columnar", feature = "std"))]
+    #[cfg(feature = "columnar")]
     fn load_row_group_from_disk(
         &self,
         group: &BlockHandle,

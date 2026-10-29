@@ -183,20 +183,26 @@ fn a_merge_failing_to_write_an_output_leaves_none_of_its_tables() -> lsm_tree::R
 /// finished outputs of its own.
 #[test]
 fn a_merge_failing_to_read_an_input_leaves_none_of_its_tables() -> lsm_tree::Result<()> {
+    // Past two of the 2 MiB chunks a merge reads its input in, so the second
+    // read from the tables folder is the input's, mid-merge: the outputs are
+    // reopened only once the input is read through.
+    fn large(i: u64) -> Vec<u8> {
+        let mut v = value(i, 0);
+        v.resize(2_600, b'v');
+        v
+    }
+
     let f = open(|c| c)?;
     for i in 0..KEYS {
-        f.tree.insert(key(i), value(i, 0), i);
+        f.tree.insert(key(i), large(i), i);
     }
     f.tree.flush_active_memtable(0)?;
 
     assert_fails_cleanly(
         &f,
-        [
-            io_error(FaultOp::ReadAt, "tables", 300),
-            io_error(FaultOp::Read, "tables", 300),
-        ],
-        16 * 1024,
-        |i| value(i, 0),
+        [io_error(FaultOp::Read, "tables", 1)],
+        256 * 1024,
+        large,
     )
 }
 
@@ -285,9 +291,15 @@ fn a_failed_sub_compaction_leaves_none_of_the_compactions_tables() -> lsm_tree::
     }
     f.tree.flush_active_memtable(0)?;
 
-    assert_fails_cleanly(&f, [io_error(FaultOp::Write, "tables", 4)], u64::MAX, |i| {
-        value(i, 1)
-    })
+    // A finished output is synced last, so the third sync fails one
+    // sub-compaction after two outputs are complete on disk, however many
+    // writes each took.
+    assert_fails_cleanly(
+        &f,
+        [io_error(FaultOp::SyncData, "tables", 2)],
+        u64::MAX,
+        |i| value(i, 1),
+    )
 }
 
 /// A merge that relocates the live frames of a stale blob file stops part-way

@@ -709,6 +709,41 @@ fn insert_during_next_seek(map: &SkipMap, user_key: &'static [u8], seqno: SeqNo)
     }));
 }
 
+/// An insert whose predecessor gains another node between the splice search
+/// and the link re-searches and retries, and the retry is counted; both keys
+/// end up in order. Guards against a counter that misses the contended path,
+/// which would report a skewed writer load as free of contention.
+#[cfg(feature = "metrics")]
+#[test]
+fn an_insert_raced_at_its_splice_counts_a_cas_retry() {
+    let map = new_map();
+    map.insert(&make_key(b"a", 1), make_value(b"a"));
+    map.insert(&make_key(b"c", 1), make_value(b"c"));
+    assert_eq!(map.cas_retries(), 0, "no contention yet");
+    map.set_link_hook(alloc::boxed::Box::new(|map: &SkipMap| {
+        map.insert(&make_key(b"b", 1), make_value(b"concurrent"));
+    }));
+    map.insert(&make_key(b"bb", 1), make_value(b"bb"));
+    assert!(map.cas_retries() >= 1, "the raced link was retried");
+    let keys: Vec<Vec<u8>> = map.iter().map(|e| e.key().user_key.to_vec()).collect();
+    assert_eq!(keys, [&b"a"[..], b"b", b"bb", b"c"]);
+}
+
+/// Inserts no other writer races leave the retry count at zero, whatever the
+/// order: the sequential tail append and the full splice search alike.
+#[cfg(feature = "metrics")]
+#[test]
+fn uncontended_inserts_count_no_cas_retry() {
+    let map = new_map();
+    for i in 0..64u8 {
+        map.insert(&make_key(&[i], 1), make_value(b"v"));
+    }
+    for i in (0..64u8).rev() {
+        map.insert(&make_key(&[i], 2), make_value(b"v"));
+    }
+    assert_eq!(map.cas_retries(), 0);
+}
+
 /// `(user key, seqno)` of every entry a range yields.
 fn yielded(range: Range<'_>) -> Vec<(Vec<u8>, SeqNo)> {
     range

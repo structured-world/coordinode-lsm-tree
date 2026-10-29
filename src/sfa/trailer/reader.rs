@@ -21,32 +21,33 @@ use std::io::{Read, Seek, SeekFrom};
 const TRAILER_SIZE: i64 = super::TRAILER_LEN as i64;
 
 #[derive(Debug, Eq, PartialEq)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "all three fields describe TOC metadata recorded in the trailer; \
-              the `toc_` prefix is part of the upstream sfa format wording \
-              and keeps the diff vs vendored upstream mechanical"
-)]
-pub struct ParsedTrailer {
-    pub toc_checksum: Checksum,
-    pub toc_pos: u64,
+pub(crate) struct ParsedTrailer {
+    pub(crate) toc_checksum: Checksum,
+    pub(crate) toc_pos: u64,
     /// On-disk byte length of the TOC region, copied from the
-    /// trailer. The `TocReader` uses this to bound its own reads
-    /// via `Read::take(toc_len)` so a forged TOC `len` prefix
-    /// can't force unbounded work / memory before the checksum
-    /// catches it.
-    pub toc_len: u64,
+    /// trailer. The `TocReader` reads no more than this many bytes, so a
+    /// forged TOC `len` prefix can't force unbounded work / memory
+    /// before the checksum catches it.
+    pub(crate) toc_len: u64,
+    /// Where the trailer starts: the end of everything before it, the TOC
+    /// included.
+    pub(crate) trailer_pos: u64,
 }
 
-pub struct TrailerReader;
+pub(crate) struct TrailerReader;
 
 impl TrailerReader {
-    pub fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<ParsedTrailer> {
+    pub(crate) fn from_reader<R: Read + Seek>(reader: &mut R) -> Result<ParsedTrailer> {
         use crate::io::LE;
 
         log::trace!("Reading trailer");
 
-        reader.seek(SeekFrom::End(-TRAILER_SIZE))?;
+        let trailer_pos = reader.seek(SeekFrom::End(-TRAILER_SIZE))?;
+        // One read for the whole trailer, parsed from memory: a read per
+        // field is a system call per field on an unbuffered file.
+        let mut trailer = [0u8; super::TRAILER_LEN];
+        reader.read_exact(&mut trailer)?;
+        let reader = &mut &trailer[..];
 
         {
             let mut buf = [0u8; TRAILER_MAGIC.len()];
@@ -82,6 +83,7 @@ impl TrailerReader {
             toc_checksum,
             toc_pos,
             toc_len,
+            trailer_pos,
         })
     }
 }

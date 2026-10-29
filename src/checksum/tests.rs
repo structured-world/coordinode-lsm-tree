@@ -26,7 +26,7 @@ impl Write for OneByteAtATime {
 fn a_short_write_is_hashed_and_counted_once() -> std::io::Result<()> {
     let mut writer = ChecksummedWriter::new(OneByteAtATime(Vec::new()));
     writer.write_all(b"context")?;
-    assert_eq!(writer.inner_mut().0, b"context");
+    assert_eq!(writer.get_ref().0, b"context");
     assert_eq!(
         writer.checksum(),
         Checksum::from_raw(crate::hash::hash128(b"context")),

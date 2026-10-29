@@ -15,10 +15,15 @@ use std::time::Duration;
 /// inside, outside the clock.
 pub type Routine<'a> = Box<dyn FnMut(u64) -> Duration + 'a>;
 
+/// What the last run of an arm's routine measured besides its time, by name,
+/// in the order the arm reports them.
+pub type Metrics<'a> = Box<dyn FnMut() -> Vec<(&'static str, f64)> + 'a>;
+
 /// One engine or configuration of a group.
 pub struct Arm<'a> {
     pub label: &'static str,
     pub routine: Routine<'a>,
+    pub metrics: Option<Metrics<'a>>,
 }
 
 impl<'a> Arm<'a> {
@@ -26,7 +31,15 @@ impl<'a> Arm<'a> {
         Self {
             label,
             routine: Box::new(routine),
+            metrics: None,
         }
+    }
+
+    /// Reads `metrics` after every timed sample of this arm; the result
+    /// reports the median of each over the rounds.
+    pub fn with_metrics(mut self, metrics: impl FnMut() -> Vec<(&'static str, f64)> + 'a) -> Self {
+        self.metrics = Some(Box::new(metrics));
+        self
     }
 }
 
@@ -67,6 +80,8 @@ pub struct ArmResult {
     /// This arm's time over the baseline arm's in the same round; `None` for
     /// the baseline itself and for a group without one.
     pub vs_baseline: Option<Estimate>,
+    /// Each metric the arm reports besides its time, over the rounds.
+    pub metrics: Vec<(&'static str, Estimate)>,
 }
 
 /// Runs the arms of `group` at key count `n` in paired rounds and returns one
@@ -140,18 +155,30 @@ pub fn run(
     // few hundred thousand at most, exact in f64 through u32.
     let ops = f64::from(u32::try_from(n).expect("a group's key count fits u32"));
     let mut samples = vec![Vec::with_capacity(rounds); arms.len()];
+    // metric_samples[arm]: each metric's values over the rounds, in the order
+    // the arm first named them.
+    let mut metric_samples: Vec<Vec<(&'static str, Vec<f64>)>> = vec![Vec::new(); arms.len()];
     for round in 0..rounds {
         for i in 0..arms.len() {
             let a = (round + i) % arms.len();
             let elapsed = (arms[a].routine)(u64::from(iters[a]));
             samples[a].push(elapsed.as_secs_f64() * 1e9 / (f64::from(iters[a]) * ops));
+            if let Some(metrics) = arms[a].metrics.as_mut() {
+                for (name, value) in metrics() {
+                    match metric_samples[a].iter_mut().find(|(seen, _)| *seen == name) {
+                        Some((_, values)) => values.push(value),
+                        None => metric_samples[a].push((name, vec![value])),
+                    }
+                }
+            }
         }
     }
 
     let base = arms.iter().position(|arm| arm.label == baseline);
     arms.iter()
+        .zip(metric_samples)
         .enumerate()
-        .map(|(a, arm)| {
+        .map(|(a, (arm, metric_samples))| {
             let vs_baseline = base.filter(|&b| b != a).map(|b| {
                 let ratios: Vec<f64> = samples[a]
                     .iter()
@@ -167,6 +194,10 @@ pub fn run(
                 rounds,
                 ns_per_op: estimate(samples[a].clone()),
                 vs_baseline,
+                metrics: metric_samples
+                    .into_iter()
+                    .map(|(name, values)| (name, estimate(values)))
+                    .collect(),
             };
             report(&result);
             result
@@ -186,6 +217,12 @@ fn report(r: &ArmResult) {
         "{}/{}/{}: {:.1} ns/op [{:.1} .. {:.1}], {} rounds{ratio}",
         r.group, r.label, r.n, r.ns_per_op.median, r.ns_per_op.lower, r.ns_per_op.upper, r.rounds,
     );
+    for (name, e) in &r.metrics {
+        eprintln!(
+            "{}/{}/{}: {name} {:.3} [{:.3} .. {:.3}]",
+            r.group, r.label, r.n, e.median, e.lower, e.upper
+        );
+    }
 }
 
 /// The median of `values` and a distribution-free 95% confidence interval for

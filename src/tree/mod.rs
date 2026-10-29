@@ -497,7 +497,7 @@ pub(crate) fn error_guard(e: crate::Error) -> IterGuardImpl {
 
 /// The bytes an install keeps, for each counter set they go to: the set of
 /// the backend each file was written through (see
-/// [`Fs::write_io_stats`](crate::fs::Fs::write_io_stats)), so a route on
+/// [`Fs::write_io_stats`]), so a route on
 /// another medium is charged to that medium's set. Files on a backend that
 /// counts nothing are not looked at.
 ///
@@ -2734,11 +2734,13 @@ impl Tree {
         // even splitting one batch. A consumer that advanced past the returned
         // watermark would lose the change for good.
         //
-        // So freeze it: writers hold the version-history READ guard for their
-        // whole insert (that is what keeps `rotate_memtable` from sealing
-        // mid-batch), so taking the WRITE guard excludes them. The cap and the
-        // active memtable's raw entries are captured under it; everything else —
-        // sealed memtables, tables — is immutable and needs no coordination.
+        // So freeze it: a batch or range write holds the version-history READ
+        // guard for its whole insert, and a single-entry insert holds its shard
+        // of the insert gate instead, so taking the WRITE guard and closing the
+        // gate excludes both, in the order a version change takes them. The cap
+        // and the active memtable's raw entries are captured under them;
+        // everything else (sealed memtables, tables) is immutable and needs
+        // no coordination.
         //
         // Mapping runs AFTER the guard drops: it resolves blob indirections,
         // which reads a blob file, and no I/O may happen with writers blocked.
@@ -2750,6 +2752,8 @@ impl Tree {
         );
         let (super_version, end_seqno, active_entries, active_range_tombstones) = {
             let guard = self.version_history.write();
+            #[cfg(feature = "std")]
+            let gate = self.insert_gate.close();
             let super_version = guard.latest_version();
             #[cfg(test)]
             inner::TestHooks::fire(&self.test_hooks.scan_freeze);
@@ -2776,8 +2780,10 @@ impl Tree {
                     .collect()
             });
             let rts = super_version.active_memtable.range_tombstones_sorted();
-            // Explicit: the guard must outlive the capture above, and writers
-            // resume the moment it goes.
+            // Explicit: the gate and the guard must outlive the capture above,
+            // and writers resume the moment they go.
+            #[cfg(feature = "std")]
+            drop(gate);
             drop(guard);
             (super_version, end_seqno, entries, rts)
         };
@@ -5579,15 +5585,28 @@ impl Tree {
         self.accept(&value);
         let kv_digest = self.insert_digest(&value);
 
-        // The `.read()` guard is a temporary that lives until the end of this
-        // statement, so the insert runs under the version-history read lock:
-        // `value` + its digest land in the current active memtable atomically,
-        // and a concurrent `rotate_memtable()` cannot seal it mid-insert.
-        self.version_history
-            .read()
-            .latest_version_ref()
-            .active_memtable
-            .insert_with_kv_digest(value, kv_digest)
+        // The insert holds its thread's shard of the insert gate, which a
+        // version replacing the active memtable closes before it publishes:
+        // `value` and its digest land in the active memtable the mirror names,
+        // and no rotation seals it mid-insert. Unlike the history read lock,
+        // the shard is a line no other writer thread touches.
+        #[cfg(feature = "std")]
+        {
+            let _entered = self.insert_gate.enter();
+            self.latest_super_version
+                .load()
+                .active_memtable
+                .insert_with_kv_digest(value, kv_digest)
+        }
+        // no-std: the history read lock, with the same guarantee.
+        #[cfg(not(feature = "std"))]
+        {
+            self.version_history
+                .read()
+                .latest_version_ref()
+                .active_memtable
+                .insert_with_kv_digest(value, kv_digest)
+        }
     }
 
     /// Adds a cell row whose references are `refs` to the active memtable,
@@ -5908,6 +5927,8 @@ impl Tree {
         #[cfg(feature = "std")]
         let latest_super_version = super_versions.latest_handle();
         #[cfg(feature = "std")]
+        let insert_gate = super_versions.insert_gate_handle();
+        #[cfg(feature = "std")]
         if let Some(budget) = &config.write_buffer_budget {
             budget.register(Arc::downgrade(&latest_super_version));
         }
@@ -5922,6 +5943,8 @@ impl Tree {
             version_history: Arc::new(RwLock::new(super_versions)),
             #[cfg(feature = "std")]
             latest_super_version,
+            #[cfg(feature = "std")]
+            insert_gate,
             stop_signal,
             config: Arc::new(config),
             major_compaction_lock: RwLock::default(),
@@ -7743,6 +7766,10 @@ mod open_batch_tests;
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]
 mod clear_race_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[expect(clippy::expect_used, reason = "test code")]
+mod insert_rotation_tests;
 
 #[cfg(all(test, feature = "std"))]
 #[expect(clippy::expect_used, reason = "test code")]

@@ -129,6 +129,38 @@ fn run_rounds_are_a_multiple_of_the_arm_count() {
     assert_eq!(run("g", 1, "x", cheap, &s)[0].rounds, 39);
 }
 
+/// An arm's metrics are read after each of its timed samples and reported as a
+/// median over the rounds, in the order the hook names them; the warm-up's run
+/// is not one of them. An arm without the hook reports none.
+#[test]
+fn run_reports_each_metric_over_the_timed_samples_only() {
+    use std::cell::Cell;
+    let runs = Cell::new(0_u32);
+    let measured = Arm::new("a", |iters| {
+        runs.set(runs.get() + 1);
+        Duration::from_micros(10) * u32::try_from(iters).expect("iters fit u32")
+    })
+    // The first run is the warm-up: were the hook read after it, an
+    // eleventh value of 1000 would move the median off 6.5.
+    .with_metrics(|| {
+        let run = f64::from(runs.get());
+        let first = if run == 1.0 { 1000.0 } else { run };
+        vec![("first", first), ("double", 2.0 * run)]
+    });
+    let plain = Arm::new("b", fixed(Duration::from_micros(10)));
+    let mut s = settings(10, 10);
+    s.sample_target = Duration::from_nanos(1);
+    let results = run("g", 1, "b", vec![measured, plain], &s);
+
+    let metrics = &results[0].metrics;
+    let names: Vec<&str> = metrics.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["first", "double"]);
+    // Runs 2..=11 are the ten rounds: their median is 6.5.
+    assert_eq!(metrics[0].1.median, 6.5);
+    assert_eq!(metrics[1].1.median, 13.0);
+    assert!(results[1].metrics.is_empty());
+}
+
 /// The arms take turns at going first: over as many rounds as arms, each arm
 /// runs first exactly once, so no arm always measures right after another.
 #[test]

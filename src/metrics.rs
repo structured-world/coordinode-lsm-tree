@@ -2,8 +2,11 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::Relaxed;
-use core::sync::atomic::{AtomicU64, AtomicUsize};
+// `core` has no 64-bit atomics on targets without them (thumbv7em); the
+// portable one falls back to a lock there and is the native one elsewhere.
+use portable_atomic::AtomicU64;
 
 /// Runtime metrics
 ///

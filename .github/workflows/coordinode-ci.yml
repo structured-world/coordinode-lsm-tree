@@ -571,6 +571,19 @@ jobs:
           prefix-key: ubuntu-cargo-no-std
       - name: Check (no_std + alloc)
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: Check (no_std + alloc, each feature that keeps it)
+        # The features that do not bring `std`, each alone and all together:
+        # one that builds only beside another, or only with `std`, fails here
+        # rather than in a consumer's no-std build.
+        run: |
+          set -euo pipefail
+          for feature in metrics columnar bytes_1 ribbon-serde io-uring-raw; do
+            echo "::group::alloc,$feature"
+            cargo check --target thumbv7em-none-eabihf --no-default-features --features "alloc,$feature"
+            echo "::endgroup::"
+          done
+          cargo check --target thumbv7em-none-eabihf --no-default-features \
+            --features alloc,metrics,columnar,bytes_1,ribbon-serde,io-uring-raw
 
   # Generates the cross-compile target matrix. The full 5-target
   # sweep runs in either of two cases:

@@ -2,8 +2,203 @@ use super::*;
 use crate::sfa::toc::reader::TocReader;
 use crate::sfa::trailer::reader::TrailerReader;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use test_log::test;
+
+/// An in-memory file that counts the calls a reader or writer makes on it:
+/// each is a system call on a real, unbuffered file.
+#[derive(Default)]
+struct Counting {
+    file: Cursor<Vec<u8>>,
+    reads: usize,
+    seeks: usize,
+}
+
+impl Read for Counting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reads += 1;
+        self.file.read(buf)
+    }
+}
+
+impl Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Seek for Counting {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.seeks += 1;
+        self.file.seek(pos)
+    }
+}
+
+/// An archive of `sections` sections, written as a table writes one: through
+/// a checksumming writer.
+fn archive(sections: usize) -> crate::sfa::Result<Counting> {
+    let mut writer =
+        Writer::from_writer(crate::checksum::ChecksummedWriter::new(Counting::default()));
+    for i in 0..sections {
+        writer.start(format!("section{i}").as_str())?;
+        writer.write_all(b"payload")?;
+    }
+    let mut file = writer.into_inner()?.into_inner();
+    file.reads = 0;
+    file.seeks = 0;
+    Ok(file)
+}
+
+/// Writing an archive asks the file for no position: the writer counts the
+/// bytes it wrote. Guards against a seek per section, which on a buffered
+/// file is also a flush.
+#[test]
+fn writing_an_archive_seeks_nothing() -> crate::sfa::Result<()> {
+    let mut writer =
+        Writer::from_writer(crate::checksum::ChecksummedWriter::new(Counting::default()));
+    for i in 0..50 {
+        writer.start(format!("section{i}").as_str())?;
+        writer.write_all(b"payload")?;
+    }
+    let file = writer.into_inner()?.into_inner();
+    assert_eq!(file.seeks, 0);
+    Ok(())
+}
+
+/// Opening an archive reads its trailer and its table of contents in one read
+/// each, however many sections it holds. Guards against a read per field,
+/// which costs a system call per section on every table open.
+#[test]
+fn opening_an_archive_reads_its_trailer_and_toc_once_each() -> crate::sfa::Result<()> {
+    for sections in [5, 50] {
+        let mut file = archive(sections)?;
+        let reader = crate::sfa::Reader::from_reader(&mut file)?;
+        assert_eq!(reader.toc().len(), sections);
+        assert_eq!(file.reads, 2, "{sections} sections");
+        assert_eq!(file.seeks, 2, "{sections} sections");
+    }
+    Ok(())
+}
+
+/// Opens `file` with the TOC length its trailer ends in set by `toc_len` from
+/// the stored one, and asserts the open is refused as a TOC running past the
+/// trailer.
+fn assert_toc_length_refused(
+    mut file: Counting,
+    toc_len: impl FnOnce(u64) -> u64,
+) -> crate::sfa::Result<()> {
+    let bytes = file.file.get_mut();
+    // The trailer ends in the TOC's length.
+    let at = bytes.len() - 8;
+    let (_, field) = bytes.split_at_mut(at);
+    let stored = u64::from_le_bytes((&*field).try_into().map_err(std::io::Error::other)?);
+    field.copy_from_slice(&toc_len(stored).to_le_bytes());
+    let error = crate::sfa::Reader::from_reader(&mut file).err();
+    assert!(
+        matches!(
+            &error,
+            Some(crate::sfa::Error::Io(e)) if e.kind() == crate::io::ErrorKind::UnexpectedEof
+        ),
+        "{error:?}",
+    );
+    Ok(())
+}
+
+/// A trailer whose table of contents runs past the end of the file is
+/// refused before anything of that length is read. Guards against a forged
+/// length overflowing the TOC's end.
+#[test]
+fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
+    assert_toc_length_refused(archive(3)?, |_| u64::MAX)
+}
+
+/// A TOC one byte longer than the room before the trailer is refused, though
+/// its end does not overflow. Guards the bound against the trailer itself.
+#[test]
+fn a_toc_one_byte_into_the_trailer_is_refused() -> crate::sfa::Result<()> {
+    assert_toc_length_refused(archive(3)?, |stored| stored + 1)
+}
+
+/// A file of `len` bytes that stores only its head and its trailer; the bytes
+/// between read as zeros. Counts the bytes it hands out.
+struct Sparse {
+    head: Vec<u8>,
+    trailer: Vec<u8>,
+    len: u64,
+    pos: u64,
+    served: u64,
+}
+
+impl Read for Sparse {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let trailer_pos = self.len - self.trailer.len() as u64;
+        let (source, start, end): (&[u8], u64, u64) = if self.pos < self.head.len() as u64 {
+            (&self.head, 0, self.head.len() as u64)
+        } else if self.pos >= trailer_pos {
+            (&self.trailer, trailer_pos, self.len)
+        } else {
+            (&[], self.pos, trailer_pos)
+        };
+        let n = buf
+            .len()
+            .min(usize::try_from(end - self.pos).unwrap_or(usize::MAX));
+        let (out, _) = buf.split_at_mut(n);
+        if source.is_empty() {
+            out.fill(0);
+        } else {
+            let from = usize::try_from(self.pos - start).map_err(std::io::Error::other)?;
+            out.copy_from_slice(&source[from..from + n]);
+        }
+        self.pos += n as u64;
+        self.served += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Sparse {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.pos = match pos {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(back) => self.len.checked_add_signed(back),
+            SeekFrom::Current(by) => self.pos.checked_add_signed(by),
+        }
+        .ok_or_else(|| std::io::Error::other("a seek before the start"))?;
+        Ok(self.pos)
+    }
+}
+
+/// A trailer whose TOC length runs to the end of a huge file costs a read of
+/// the TOC, not a buffer of the claimed length. Guards against a damaged
+/// length aborting the open on an allocation the size of the file.
+#[test]
+fn a_toc_length_claiming_most_of_a_huge_file_reads_only_the_toc() -> crate::sfa::Result<()> {
+    let bytes = archive(3)?.file.into_inner();
+    let (head, trailer) = bytes.split_at(bytes.len() - crate::sfa::trailer::TRAILER_LEN);
+    let mut trailer = trailer.to_vec();
+    // The trailer ends in the TOC's position and length.
+    let (_, fields) = trailer.split_at_mut(crate::sfa::trailer::TRAILER_LEN - 16);
+    let (toc_pos, toc_len) = fields.split_at_mut(8);
+    let toc_pos = u64::from_le_bytes(toc_pos.try_into().map_err(std::io::Error::other)?);
+    let len: u64 = 1 << 44;
+    toc_len
+        .copy_from_slice(&(len - crate::sfa::trailer::TRAILER_LEN as u64 - toc_pos).to_le_bytes());
+
+    let mut file = Sparse {
+        head: head.to_vec(),
+        trailer,
+        len,
+        pos: 0,
+        served: 0,
+    };
+    let reader = crate::sfa::Reader::from_reader(&mut file)?;
+    assert_eq!(reader.toc().len(), 3);
+    assert!(file.served <= 8_192, "read {} bytes", file.served);
+    Ok(())
+}
 
 /// The length a table budgets for an archive's table of contents and trailer
 /// is exactly what the writer appends after the sections.
@@ -48,12 +243,7 @@ fn writer_empty() -> crate::sfa::Result<()> {
     let trailer = TrailerReader::from_reader(&mut reader)?;
     assert_eq!(0, trailer.toc_pos);
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(0, toc.len());
     assert!(toc.is_empty());
     assert!(toc.section(b"hello").is_none());
@@ -79,12 +269,7 @@ fn writer_simple() -> crate::sfa::Result<()> {
     let trailer = TrailerReader::from_reader(&mut reader)?;
     assert_eq!(data.len() as u64, trailer.toc_pos);
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(1, toc.len());
     assert!(toc.section(b"hello").is_none());
     assert!(toc.section(b"").is_some());
@@ -123,12 +308,7 @@ fn writer_multiple_sections() -> crate::sfa::Result<()> {
         trailer.toc_pos,
     );
 
-    let toc = TocReader::from_reader(
-        &mut reader,
-        trailer.toc_pos,
-        trailer.toc_len,
-        trailer.toc_checksum,
-    )?;
+    let toc = TocReader::from_reader(&mut reader, &trailer)?;
     assert_eq!(3, toc.len());
     assert!(toc.section(b"hello").is_none());
     assert!(toc.section(b"").is_some());
