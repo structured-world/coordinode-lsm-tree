@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793226733045,
+  "lastUpdate": 1793276697056,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65632,6 +65632,90 @@ window.BENCHMARK_DATA = {
             "value": 365491.9870550998,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 12.0us | P99.9: 80.3us\nthreads: 1 | elapsed: 0.55s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b1c5875b7a8e8b2d2532b909e513c4f445e3719e",
+          "message": "bench(planned): check the planner's model against observation (#1022)\n\n## Summary\n\n- `planned-sustained` checks the planner's model against what a tree\nobserves: four read mixes, a planner tree on a model calibrated online\nbeside the one on the set model and leveled, and both models shadowed\nevery step.\n- Measured result: the calibrated model gains on some mixes and loses on\nothers, Zipf-hot points at 8× every run, so the set model is kept; the\nmeasurement is recorded in the `planned` module docs.\n\n## Changes\n\n- `Planned::plan_for` works out the plan a strategy would follow for a\nversion without choosing anything, so two models can be compared on one\ntree; `dp::Inputs::speed` is public, the query speed a plan is scored\nby.\n- Bench read mixes: even points and 100-key scans, Zipf-hot points with\nshort scans, 1000-key scans, 32 runs in L0; each at 8× and 2× the write\nrate.\n- Calibration from observation with a bounded moving average and sample\nthresholds: merge rate, the filters' false positive rate from the\nengine's counts, the query speed kept beside a merge, a scan's cost per\nrun against a point read's. With too little observed, the set model\nstays. A query counts as beside a merge only once a merge is confirmed\nto have run beside it: the compaction threads log each call while it\nruns and each merge when done.\n- Each step both models predict the query cost in point reads, the\ncalibrated one as it was before the step; the bench publishes the error\non the second half of the steps with the scale fitted on the first, and\nhow often each model's plan changed. Every arm's line goes to stderr as\nits run ends.\n\n## Testing\n\nUnit tests of the calibration and of the bench, doc tests of the new\nAPI, fmt and clippy on the crate and on `db_bench` with and without its\nfeatures.\n\nCloses #964",
+          "timestamp": "2026-10-29T14:10:52+02:00",
+          "tree_id": "502ac88757896fe198726d080a593911a945d510",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b1c5875b7a8e8b2d2532b909e513c4f445e3719e"
+        },
+        "date": 1793276695939,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 120352.2602907415,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.9us | P99.9: 45.4us\nthreads: 1 | elapsed: 4.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2615771.3591922037,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.8us | P99.9: 1.0us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 554419.6912931282,
+            "unit": "ops/sec",
+            "extra": "P50: 1.6us | P99: 3.9us | P99.9: 13.8us\nthreads: 1 | elapsed: 0.36s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 402931.1979446512,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 7.4us | P99.9: 25.2us\nthreads: 1 | elapsed: 0.50s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3106789.6978170127,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.8us | P99.9: 6.8us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 295844.73685978196,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 7.6us | P99.9: 19.8us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 162369.99966739316,
+            "unit": "ops/sec",
+            "extra": "P50: 4.8us | P99: 26.5us | P99.9: 51.2us\nthreads: 1 | elapsed: 1.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 615758.7977962177,
+            "unit": "ops/sec",
+            "extra": "P50: 1.4us | P99: 3.6us | P99.9: 14.9us\nthreads: 1 | elapsed: 0.32s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 720571.8622589271,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 0.7us | P99.9: 10.4us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 320746.43494507263,
+            "unit": "ops/sec",
+            "extra": "P50: 2.6us | P99: 12.7us | P99.9: 86.1us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
           }
         ]
       }
