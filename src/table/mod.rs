@@ -2549,10 +2549,11 @@ impl Table {
     /// Without it the pages cannot be located, so the whole entry is reported
     /// rather than guessed at.
     #[cfg_attr(
-        not(feature = "std"),
+        all(not(feature = "std"), not(feature = "columnar")),
         expect(
             dead_code,
-            reason = "the scrub, heal and reconcile walks that call it are std-gated"
+            reason = "the scrub, heal and reconcile walks that call it are std-gated; \
+                      with `columnar` the row group loader of the gate-only walk calls it"
         )
     )]
     pub(crate) fn data_unit_blocks(
@@ -2575,13 +2576,6 @@ impl Table {
     /// The handles of a row group's directory and pages, read from disk.
     /// See [`Self::data_unit_blocks`].
     #[cfg(feature = "columnar")]
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "reached only from `data_unit_blocks`, whose callers are std-gated"
-        )
-    )]
     fn row_group_block_handles(
         &self,
         group: &BlockHandle,
@@ -6890,13 +6884,6 @@ impl Table {
     /// gates have nothing further to check in a group) together with the
     /// decoded batch.
     #[cfg(feature = "columnar")]
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "reached from the gate-only walk; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn load_row_group_from_disk(
         &self,
         group: &BlockHandle,
