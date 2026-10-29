@@ -168,7 +168,7 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> AnyTree {
 /// How a write reaches the memtable.
 #[derive(Clone, Copy)]
 enum Route {
-    /// `Tree::insert`: the version-history read lock, then the memtable.
+    /// `Tree::insert`: the thread's insert gate shard, then the memtable.
     Tree,
     /// The active memtable directly: its own cost alone.
     Memtable,
@@ -266,6 +266,15 @@ fn cas_retries(_: &Memtable) -> Option<f64> {
     None
 }
 
+/// One route's rounds at one writer count.
+#[derive(Default)]
+struct Samples {
+    per_insert: Vec<f64>,
+    per_second: Vec<f64>,
+    bytes: f64,
+    retries: Vec<f64>,
+}
+
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
@@ -293,33 +302,38 @@ fn main() {
     for order in KeyOrder::ALL {
         for prefix in PREFIXES {
             let writes = Writes::new(order, prefix, versions, keys);
-            for route in Route::ALL {
-                for writers in WRITERS {
-                    let mut per_insert = Vec::with_capacity(rounds);
-                    let mut per_second = Vec::with_capacity(rounds);
-                    let mut bytes = 0.0;
-                    let mut retries = Vec::with_capacity(rounds);
-                    for _ in 0..rounds {
+            for writers in WRITERS {
+                let mut samples: [Samples; Route::ALL.len()] = Default::default();
+                for round in 0..rounds {
+                    // Each round starts with the next route, so neither always
+                    // runs on the cache and clock state the other left.
+                    for i in 0..Route::ALL.len() {
+                        let at = (round + i) % Route::ALL.len();
+                        let (route, s) = (Route::ALL[at], &mut samples[at]);
                         let tree = open(None);
                         let elapsed = writes.run(&tree, writers, route);
                         let secs = elapsed.as_secs_f64();
-                        per_insert.push(secs * 1e9 * writers as f64 / versions as f64);
-                        per_second.push(versions as f64 / secs);
+                        s.per_insert
+                            .push(secs * 1e9 * writers as f64 / versions as f64);
+                        s.per_second.push(versions as f64 / secs);
                         let memtable = tree.active_memtable();
-                        bytes = memtable.size() as f64 / versions as f64;
-                        retries.extend(cas_retries(&memtable));
+                        s.bytes = memtable.size() as f64 / versions as f64;
+                        s.retries.extend(cas_retries(&memtable));
                     }
-                    let retried = if retries.is_empty() {
+                }
+                for (route, s) in Route::ALL.into_iter().zip(samples) {
+                    let retried = if s.retries.is_empty() {
                         String::new()
                     } else {
-                        format!(", {:.0} links retried", median(retries))
+                        format!(", {:.0} links retried", median(s.retries))
                     };
                     println!(
-                        "memtable/{}/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {bytes:.1} B/version{retried}",
+                        "memtable/{}/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {:.1} B/version{retried}",
                         route.label(),
                         order.label(),
-                        median(per_insert),
-                        median(per_second),
+                        median(s.per_insert),
+                        median(s.per_second),
+                        s.bytes,
                     );
                 }
             }

@@ -379,7 +379,7 @@ impl SkipMap {
         self.run_link_hook();
 
         for level in 0..height {
-            loop {
+            'link: loop {
                 // SAFETY: `node` was allocated with `height` levels and
                 // `level < height`, so `tower_atomic(node, level)` is within
                 // the node's arena allocation.
@@ -394,11 +394,20 @@ impl SkipMap {
                 // or a previously inserted node with height > level.
                 // CAS pred.next[level] from succs[level] to new_node
                 let pred_next = unsafe { self.tower_atomic(preds[level], level) };
-                if pred_next
-                    .compare_exchange_weak(succs[level], node, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
+                loop {
+                    match pred_next.compare_exchange_weak(
+                        succs[level],
+                        node,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break 'link,
+                        // A weak CAS may fail with the expected value still in
+                        // place (LL/SC targets): the splice holds, so retry it
+                        // as is rather than search again.
+                        Err(seen) if seen == succs[level] => {}
+                        Err(_) => break,
+                    }
                 }
                 #[cfg(feature = "metrics")]
                 self.cas_retries.fetch_add(1, Ordering::Relaxed);

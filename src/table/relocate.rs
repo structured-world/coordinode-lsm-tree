@@ -210,9 +210,9 @@ impl Table {
                 at,
             )?;
 
-            let mut checksummed = writer.into_inner()?;
+            let checksummed = writer.into_inner()?;
             let checksum = checksummed.checksum();
-            let file = checksummed.inner_mut().get_mut();
+            let file = checksummed.get_ref().get_ref();
             FsFile::sync_all_with(&**file, sync_mode)?;
             Ok((checksum, copied))
         })();

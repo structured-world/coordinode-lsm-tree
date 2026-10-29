@@ -150,6 +150,9 @@
           grids[kind] = grid;
         }
         const engines = groups[group];
+        // A group's size counts keys, but the sustained scenario's counts the
+        // rewrites of its hot set.
+        const unit = base(group) === "overwrite_sustained" ? "writes" : "keys";
         const sizes = [];
         Object.keys(engines).forEach(function (e) {
           Object.keys(engines[e]).forEach(function (n) { if (sizes.indexOf(Number(n)) < 0) { sizes.push(Number(n)); } });
@@ -198,7 +201,7 @@
         if (metricNames.length) {
           const table = document.createElement("table");
           const head = document.createElement("tr");
-          ["engine", "keys"].concat(metricNames).forEach(function (name) {
+          ["engine", unit].concat(metricNames).forEach(function (name) {
             const th = document.createElement("th");
             th.textContent = name.replace(/_/g, " ");
             head.appendChild(th);
@@ -225,7 +228,7 @@
         grids[kind].appendChild(card);
         charts.push(new Chart(canvas, {
           type: "bar",
-          data: { labels: sizes.map(function (n) { return n.toLocaleString("en") + " keys"; }), datasets: datasets },
+          data: { labels: sizes.map(function (n) { return n.toLocaleString("en") + " " + unit; }), datasets: datasets },
           options: {
             responsive: true, maintainAspectRatio: false, animation: false,
             scales: {

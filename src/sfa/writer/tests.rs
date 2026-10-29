@@ -47,7 +47,7 @@ fn archive(sections: usize) -> crate::sfa::Result<Counting> {
         writer.start(format!("section{i}").as_str())?;
         writer.write_all(b"payload")?;
     }
-    let mut file = std::mem::take(writer.into_inner()?.inner_mut());
+    let mut file = writer.into_inner()?.into_inner();
     file.reads = 0;
     file.seeks = 0;
     Ok(file)
@@ -64,7 +64,7 @@ fn writing_an_archive_seeks_nothing() -> crate::sfa::Result<()> {
         writer.start(format!("section{i}").as_str())?;
         writer.write_all(b"payload")?;
     }
-    let file = std::mem::take(writer.into_inner()?.inner_mut());
+    let file = writer.into_inner()?.into_inner();
     assert_eq!(file.seeks, 0);
     Ok(())
 }
@@ -84,19 +84,43 @@ fn opening_an_archive_reads_its_trailer_and_toc_once_each() -> crate::sfa::Resul
     Ok(())
 }
 
-/// A trailer whose table of contents runs past the end of the file is
-/// refused before a buffer that long is allocated. Guards against a forged
-/// length forcing an allocation of up to 16 EiB.
-#[test]
-fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
-    let mut file = archive(3)?;
+/// Opens `file` with the TOC length its trailer ends in set by `toc_len` from
+/// the stored one, and asserts the open is refused as a TOC running past the
+/// trailer.
+fn assert_toc_length_refused(
+    mut file: Counting,
+    toc_len: impl FnOnce(u64) -> u64,
+) -> crate::sfa::Result<()> {
     let bytes = file.file.get_mut();
     // The trailer ends in the TOC's length.
     let at = bytes.len() - 8;
-    let (_, toc_len) = bytes.split_at_mut(at);
-    toc_len.copy_from_slice(&u64::MAX.to_le_bytes());
-    assert!(crate::sfa::Reader::from_reader(&mut file).is_err());
+    let (_, field) = bytes.split_at_mut(at);
+    let stored = u64::from_le_bytes((&*field).try_into().map_err(std::io::Error::other)?);
+    field.copy_from_slice(&toc_len(stored).to_le_bytes());
+    let error = crate::sfa::Reader::from_reader(&mut file).err();
+    assert!(
+        matches!(
+            &error,
+            Some(crate::sfa::Error::Io(e)) if e.kind() == crate::io::ErrorKind::UnexpectedEof
+        ),
+        "{error:?}",
+    );
     Ok(())
+}
+
+/// A trailer whose table of contents runs past the end of the file is
+/// refused before anything of that length is read. Guards against a forged
+/// length overflowing the TOC's end.
+#[test]
+fn a_toc_past_the_end_of_the_file_is_refused() -> crate::sfa::Result<()> {
+    assert_toc_length_refused(archive(3)?, |_| u64::MAX)
+}
+
+/// A TOC one byte longer than the room before the trailer is refused, though
+/// its end does not overflow. Guards the bound against the trailer itself.
+#[test]
+fn a_toc_one_byte_into_the_trailer_is_refused() -> crate::sfa::Result<()> {
+    assert_toc_length_refused(archive(3)?, |stored| stored + 1)
 }
 
 /// A file of `len` bytes that stores only its head and its trailer; the bytes

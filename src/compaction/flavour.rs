@@ -1719,6 +1719,8 @@ impl StandardCompaction {
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
         let written = self.table_writer.finish()?;
         let entries_durable = written.entries_durable;
+        #[cfg(all(test, feature = "std"))]
+        opts.config.fire_while_outputs_finish();
 
         written
             .tables

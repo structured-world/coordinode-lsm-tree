@@ -1964,10 +1964,6 @@ fn read_while(stop: &AtomicBool, keys: &[[u8; 16]], mut get: impl FnMut(&[u8])) 
     nanos
 }
 
-/// Our engine's sustained run: the writer flushes at the memtable size and
-/// waits at [`Sustained::L0_STOP`] L0 runs, a thread runs the leveled strategy
-/// whenever it has work, another reads. Returns the writer's time and the
-/// rest of the sample.
 /// The engine's read counters at one moment of the sustained scenario.
 #[cfg(feature = "metrics")]
 struct Diagnosis {
@@ -2038,6 +2034,10 @@ fn spawn_named<'scope, 'env, T: Send + 'scope>(
         .expect("spawn a named bench thread")
 }
 
+/// Our engine's sustained run: the writer seals a memtable at its size and
+/// waits at [`Sustained::L0_STOP`] L0 runs, one thread flushes, one runs the
+/// leveled strategy whenever it has work, another reads. Returns the writer's
+/// time and the rest of the sample.
 fn sustained_ours(
     shape: Sustained,
     compression: Compression,
@@ -2153,6 +2153,12 @@ fn sustained_ours(
             #[cfg(feature = "metrics")]
             let stalled_at = std::time::Instant::now();
             while tree.l0_run_count() >= Sustained::L0_STOP {
+                // The compactor runs until `stop`: finished now, it panicked,
+                // and L0 would never drain.
+                assert!(
+                    !compactor.is_finished(),
+                    "ours sustained: the compactor stopped early"
+                );
                 std::thread::yield_now();
             }
             #[cfg(feature = "metrics")]
@@ -2168,6 +2174,12 @@ fn sustained_ours(
                 // One sealed memtable at a time, as RocksDB's two write
                 // buffers allow: the writer waits for the flusher to take it.
                 while tree.sealed_memtable_count() > 0 {
+                    // The flusher runs until `writing_done`: finished now, it
+                    // panicked, and the sealed memtable would never go.
+                    assert!(
+                        !flusher.is_finished(),
+                        "ours sustained: the flusher stopped early"
+                    );
                     std::thread::yield_now();
                 }
                 tree.rotate_memtable();

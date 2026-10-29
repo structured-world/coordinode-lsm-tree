@@ -6754,9 +6754,9 @@ mod locality_relocation {
 }
 
 /// A compaction finishes and reopens its outputs without the version lock:
-/// once they are produced and before they install, a reader can still take
-/// the version. Guards against finishing the outputs under the write lock,
-/// which held every read and every write of the tree for that table I/O.
+/// while they finish, a reader can still take the version. Guards against
+/// finishing the outputs under the write lock, which held every read and every
+/// write of the tree for that table I/O.
 #[test]
 fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -6781,7 +6781,7 @@ fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()
     {
         let probe = tree.clone();
         let readable = Arc::clone(&readable);
-        tree.config.arm_before_output_install(move || {
+        tree.config.arm_while_outputs_finish(move || {
             *readable.lock() = Some(probe.version_history.try_read().is_some());
         });
     }
@@ -6790,7 +6790,7 @@ fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()
     assert_eq!(
         *readable.lock(),
         Some(true),
-        "the version is readable while the outputs wait for their install"
+        "the version is readable while the outputs finish"
     );
     Ok(())
 }

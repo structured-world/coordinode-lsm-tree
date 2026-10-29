@@ -2442,10 +2442,10 @@ impl Writer {
         #[cfg(feature = "std")]
         use std::io::Write;
         // The range is in the buffer until it is flushed to the file.
-        let buffered = self.file_writer.get_mut().inner_mut();
-        buffered.flush()?;
+        let checksummed = self.file_writer.get_mut();
+        checksummed.flush()?;
         crate::fs::hint_writeback(
-            &**buffered.get_ref(),
+            &**checksummed.get_ref().get_ref(),
             self.written_back,
             pending,
             &mut self.writeback_bytes,
@@ -5431,9 +5431,9 @@ impl Writer {
         // are all a read of it needs (POSIX synchronized I/O data integrity
         // completion), so `sync_data`; its name is the directory sync's. A
         // deferred table is synced by the install that persists it.
-        let mut checksum = self.file_writer.into_inner()?;
+        let checksum = self.file_writer.into_inner()?;
         {
-            let file = checksum.inner_mut().get_mut();
+            let file = checksum.get_ref().get_ref();
             if self.durability == crate::config::FlushDurability::Synced {
                 FsFile::sync_data_with(&**file, self.sync_mode)?;
             }
@@ -5497,10 +5497,9 @@ fn write_back_tail(
         let pending = position - *written_back;
         if pending >= *writeback_bytes {
             // The range is in the buffer until it is flushed to the file.
-            let buffered = checksummed.inner_mut();
-            buffered.flush()?;
+            checksummed.flush()?;
             crate::fs::hint_writeback(
-                &**buffered.get_ref(),
+                &**checksummed.get_ref().get_ref(),
                 *written_back,
                 pending,
                 writeback_bytes,

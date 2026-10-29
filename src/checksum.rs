@@ -116,8 +116,16 @@ impl<W: crate::io::Write> ChecksummedWriter<W> {
         self.position
     }
 
-    pub fn inner_mut(&mut self) -> &mut W {
-        &mut self.inner
+    /// The wrapped writer, to look at: a write or seek through it would leave
+    /// the counted [`Self::position`] and the checksum behind, so none is
+    /// handed out.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Unwraps the writer.
+    pub fn into_inner(self) -> W {
+        self.inner
     }
 }
 
