@@ -1,6 +1,6 @@
 use super::{
-    BOUND, Calibrated, CallLog, Fitted, MIN_MERGES, MIN_QUERIES, MIN_STEPS, Observed, QuerySpan,
-    StepSample, Timing, WEIGHT, classify, fit, held_out_error,
+    BOUND, Calibrated, CallLog, Fitted, Kinds, MIN_MERGES, MIN_QUERIES, MIN_STEPS, Observed,
+    QuerySpan, StepSample, Timing, WEIGHT, classify, fit, held_out_error,
 };
 use lsm_tree::compaction::planned::Model;
 use std::time::{Duration, Instant};
@@ -9,6 +9,14 @@ fn timing(nanos_each: u64, count: u64) -> Timing {
     Timing {
         nanos: nanos_each * count,
         count,
+    }
+}
+
+/// `count` point reads of `nanos_each`, and no scans.
+fn points(nanos_each: u64, count: u64) -> Kinds {
+    Kinds {
+        points: timing(nanos_each, count),
+        scans: Timing::default(),
     }
 }
 
@@ -32,7 +40,7 @@ fn steps(count: usize, fixed: f64, per_run: f64, point: f64) -> Vec<StepSample> 
 /// moving before anything was measured.
 #[test]
 fn nothing_observed_leaves_the_prior() {
-    let fitted = fit(&Observed::default());
+    let fitted = fit(&Observed::default(), 0.5);
     assert_eq!(fitted, Fitted::default());
     let prior = Model::default();
     let mut calibrated = Calibrated::new(prior);
@@ -54,13 +62,33 @@ fn too_few_samples_are_not_fitted() {
         merge_bytes: 1 << 30,
         merge_nanos: 1_000_000_000,
         merges: MIN_MERGES - 1,
-        idle: timing(100, MIN_QUERIES),
-        during: timing(200, MIN_QUERIES - 1),
+        idle: points(100, MIN_QUERIES),
+        during: points(200, MIN_QUERIES - 1),
         steps: steps(MIN_STEPS - 1, 0.0, 500.0, 1_000.0),
         filter_queries: MIN_QUERIES - 1,
         filter_skips: 0,
     };
-    assert_eq!(fit(&observed), Fitted::default());
+    assert_eq!(fit(&observed, 0.0), Fitted::default());
+}
+
+/// A mix that reads scans needs enough scans on both sides too: plenty of
+/// point reads do not stand in for a kind barely timed beside a merge.
+#[test]
+fn too_few_of_one_kind_fit_no_share() {
+    let observed = Observed {
+        idle: Kinds {
+            points: timing(100, MIN_QUERIES),
+            scans: timing(1_000, MIN_QUERIES),
+        },
+        during: Kinds {
+            points: timing(100, MIN_QUERIES * 10),
+            scans: timing(1_000, MIN_QUERIES - 1),
+        },
+        ..Observed::default()
+    };
+    assert_eq!(fit(&observed, 0.5).merge_query_share, None);
+    // A mix of point reads alone weighs no scans.
+    assert_eq!(fit(&observed, 0.0).merge_query_share, Some(1.0));
 }
 
 /// With enough of each, the fit reads the merges' rate, the share queries kept
@@ -71,13 +99,13 @@ fn enough_samples_fit_each_value() {
         merge_bytes: 512 << 20,
         merge_nanos: 4_000_000_000,
         merges: MIN_MERGES,
-        idle: timing(100, MIN_QUERIES),
-        during: timing(400, MIN_QUERIES),
+        idle: points(100, MIN_QUERIES),
+        during: points(400, MIN_QUERIES),
         steps: steps(MIN_STEPS, 3_000.0, 500.0, 1_000.0),
         filter_queries: MIN_QUERIES * 10,
         filter_skips: MIN_QUERIES * 10 - MIN_QUERIES / 10,
     };
-    let fitted = fit(&observed);
+    let fitted = fit(&observed, 0.0);
     assert_eq!(fitted.encode_rate, Some(128 << 20));
     assert_eq!(fitted.merge_query_share, Some(0.25));
     assert_eq!(fitted.false_positive_rate, Some(0.01));
@@ -90,11 +118,44 @@ fn enough_samples_fit_each_value() {
 #[test]
 fn a_share_above_one_is_capped() {
     let observed = Observed {
-        idle: timing(400, MIN_QUERIES),
-        during: timing(100, MIN_QUERIES),
+        idle: points(400, MIN_QUERIES),
+        during: points(100, MIN_QUERIES),
         ..Observed::default()
     };
-    assert_eq!(fit(&observed).merge_query_share, Some(1.0));
+    assert_eq!(fit(&observed, 0.0).merge_query_share, Some(1.0));
+}
+
+/// Point reads and scans each as fast beside a merge as without one keep all
+/// their speed, however differently the two kinds fall beside merges. Guards
+/// against fitting the share from pooled times, where long scans landing
+/// beside merges more often than point reads read as a slowdown.
+#[test]
+fn a_merge_that_slows_no_kind_keeps_the_share_at_one() {
+    let kinds = |points: u64, scans: u64| Kinds {
+        points: timing(100, points),
+        scans: timing(1_000, scans),
+    };
+    let observed = Observed {
+        idle: kinds(MIN_QUERIES * 9, MIN_QUERIES),
+        during: kinds(MIN_QUERIES, MIN_QUERIES * 9),
+        ..Observed::default()
+    };
+    for scan_share in [0.1, 0.5, 0.9] {
+        let share = fit(&observed, scan_share)
+            .merge_query_share
+            .expect("enough queries");
+        assert!((share - 1.0).abs() < 1e-12, "{scan_share}: {share}");
+    }
+    // Each kind twice as slow beside a merge keeps half, at any mix.
+    let slowed = Observed {
+        during: Kinds {
+            points: timing(200, MIN_QUERIES),
+            scans: timing(2_000, MIN_QUERIES * 9),
+        },
+        ..observed
+    };
+    let share = fit(&slowed, 0.3).merge_query_share.expect("enough queries");
+    assert!((share - 0.5).abs() < 1e-12, "{share}");
 }
 
 /// Runs that never changed, or scans that got cheaper with more runs, say
@@ -114,7 +175,7 @@ fn flat_or_falling_scans_fit_no_weight() {
             steps: samples,
             ..Observed::default()
         };
-        assert_eq!(fit(&observed).scan_weight, None);
+        assert_eq!(fit(&observed, 0.5).scan_weight, None);
     }
 }
 
@@ -165,14 +226,16 @@ fn the_false_positive_rate_is_what_the_filters_let_through() {
         filter_skips: 980,
         ..Observed::default()
     };
-    let rate = fit(&observed).false_positive_rate.expect("enough queries");
+    let rate = fit(&observed, 0.5)
+        .false_positive_rate
+        .expect("enough queries");
     assert!((rate - 0.02).abs() < 1e-12, "{rate}");
     let few = Observed {
         filter_queries: MIN_QUERIES - 1,
         filter_skips: 0,
         ..Observed::default()
     };
-    assert_eq!(fit(&few).false_positive_rate, None);
+    assert_eq!(fit(&few, 0.5).false_positive_rate, None);
 }
 
 /// A scan dearer per run than the model assumes raises the share planned
@@ -262,18 +325,23 @@ fn only_a_merge_makes_a_query_one_beside_a_merge() {
         start: t[2],
         end: t[4],
         nanos: 10,
+        scan: true,
     };
     let after = QuerySpan {
         start: t[5],
         end: t[6],
         nanos: 20,
+        scan: false,
     };
     let waiting = classify(vec![beside, after], &mut log, &mut observed, t[7]);
     assert!(waiting.is_empty());
-    assert_eq!(observed.during.count, 1);
-    assert_eq!(observed.during.nanos, 10);
-    assert_eq!(observed.idle.count, 1);
-    assert_eq!(observed.idle.nanos, 20);
+    // Each counted under its own kind.
+    assert_eq!(observed.during.scans.count, 1);
+    assert_eq!(observed.during.scans.nanos, 10);
+    assert_eq!(observed.during.points.count, 0);
+    assert_eq!(observed.idle.points.count, 1);
+    assert_eq!(observed.idle.points.nanos, 20);
+    assert_eq!(observed.idle.scans.count, 0);
 }
 
 /// A query overlapped by a call still in progress waits: the call may yet be
@@ -290,14 +358,15 @@ fn a_query_beside_a_call_in_progress_waits_for_it() {
         start: t[3],
         end: t[4],
         nanos: 30,
+        scan: false,
     };
     let waiting = classify(vec![query], &mut log, &mut observed, t[5]);
     assert_eq!(waiting.len(), 1);
-    assert_eq!(observed.during.count + observed.idle.count, 0);
+    assert_eq!(observed.during.points.count + observed.idle.points.count, 0);
     log.running[1] = None;
     let waiting = classify(waiting, &mut log, &mut observed, t[6]);
     assert!(waiting.is_empty());
-    assert_eq!(observed.idle.count, 1);
+    assert_eq!(observed.idle.points.count, 1);
     assert!(log.merges.is_empty(), "{:?}", log.merges);
 }
 

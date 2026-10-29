@@ -13,8 +13,9 @@ use std::time::Instant;
 /// Merges observed before their rate is believed.
 pub(super) const MIN_MERGES: u64 = 4;
 
-/// Queries observed, both while a merge ran and while none did, before the
-/// share they keep is believed.
+/// Queries of each kind a mix reads observed, both while a merge ran and
+/// while none did, before the share they keep is believed; also the filter
+/// queries before their false positive rate is.
 pub(super) const MIN_QUERIES: u64 = 200;
 
 /// Steps observed before the cost of a scan per run is believed.
@@ -44,6 +45,43 @@ impl Timing {
     }
 }
 
+/// Query times of point reads and of scans, apart: a scan takes longer and
+/// is likelier to fall beside a merge, so pooled they would read the mix of
+/// kinds that fell beside one as a change of speed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Kinds {
+    pub(super) points: Timing,
+    pub(super) scans: Timing,
+}
+
+impl Kinds {
+    pub(super) fn record(&mut self, scan: bool, nanos: u64) {
+        if scan {
+            self.scans.record(nanos);
+        } else {
+            self.points.record(nanos);
+        }
+    }
+
+    /// The mean time of a query when `scan_share` of the queries are scans,
+    /// each kind at its own mean: `None` unless every kind the share weighs
+    /// has [`MIN_QUERIES`] behind its mean.
+    fn mixed_mean(self, scan_share: f64) -> Option<f64> {
+        let scan_share = scan_share.clamp(0.0, 1.0);
+        let mut mean = 0.0;
+        for (timing, weight) in [(self.points, 1.0 - scan_share), (self.scans, scan_share)] {
+            if weight == 0.0 {
+                continue;
+            }
+            if timing.count < MIN_QUERIES {
+                return None;
+            }
+            mean += weight * timing.mean()?;
+        }
+        Some(mean)
+    }
+}
+
 /// What one step's queries took, with the runs of the main level they met.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StepSample {
@@ -60,8 +98,8 @@ pub(super) struct Observed {
     pub(super) merge_nanos: u64,
     pub(super) merges: u64,
     /// Query times while no merge ran, and while one did.
-    pub(super) idle: Timing,
-    pub(super) during: Timing,
+    pub(super) idle: Kinds,
+    pub(super) during: Kinds,
     pub(super) steps: Vec<StepSample>,
     /// Filter queries for keys a table did not hold, as the engine counts
     /// them, and those the filter turned away; the rest it let through by
@@ -80,23 +118,31 @@ pub(super) struct Fitted {
     pub(super) false_positive_rate: Option<f64>,
 }
 
-/// Fits what `observed` holds enough of.
-pub(super) fn fit(observed: &Observed) -> Fitted {
+/// Fits what `observed` holds enough of, for a workload whose queries are
+/// `scan_share` scans: the speed queries keep beside a merge weighs each kind
+/// by that share both beside a merge and away from one.
+pub(super) fn fit(observed: &Observed, scan_share: f64) -> Fitted {
     let encode_rate = (observed.merges >= MIN_MERGES && observed.merge_nanos > 0).then(|| {
         let rate = observed.merge_bytes as f64 * 1e9 / observed.merge_nanos as f64;
         rate as u64
     });
-    let merge_query_share = (observed.idle.count >= MIN_QUERIES
-        && observed.during.count >= MIN_QUERIES)
-        .then(|| Some(observed.idle.mean()? / observed.during.mean()?))
-        .flatten()
-        .map(|share| share.clamp(0.0, 1.0));
     Fitted {
         encode_rate,
-        merge_query_share,
+        merge_query_share: merge_query_share(observed, scan_share),
         scan_weight: scan_weight(&observed.steps),
         false_positive_rate: false_positive_rate(observed),
     }
+}
+
+/// The speed a query of the workload keeps beside a merge, each kind weighed
+/// alike beside a merge and away from one: `None` with too few of a kind.
+fn merge_query_share(observed: &Observed, scan_share: f64) -> Option<f64> {
+    let during = observed.during.mixed_mean(scan_share)?;
+    // A clock too coarse to time any query says nothing of a slowdown.
+    if during <= 0.0 {
+        return None;
+    }
+    Some((observed.idle.mixed_mean(scan_share)? / during).clamp(0.0, 1.0))
 }
 
 /// The share of filter queries for a key a table does not hold that the
@@ -226,6 +272,8 @@ pub(super) struct QuerySpan {
     pub(super) start: Instant,
     pub(super) end: Instant,
     pub(super) nanos: u64,
+    /// Whether it was a scan rather than a point read.
+    pub(super) scan: bool,
 }
 
 /// What a tree's compaction threads did: the spans of the merges they
@@ -270,9 +318,9 @@ pub(super) fn classify(
             .iter()
             .any(|&(start, end)| start < query.end && end > query.start);
         if beside_merge {
-            observed.during.record(query.nanos);
+            observed.during.record(query.scan, query.nanos);
         } else {
-            observed.idle.record(query.nanos);
+            observed.idle.record(query.scan, query.nanos);
         }
     }
     // A later query starts after the waiting ones, or after now.

@@ -514,6 +514,7 @@ impl ArmRun {
                     start: at,
                     end,
                     nanos,
+                    scan,
                 });
             }
         }
@@ -554,7 +555,9 @@ impl ArmRun {
         observed.merge_nanos = self.background.merge_nanos.load(Ordering::Relaxed);
         observed.merges = self.background.merges.load(Ordering::Relaxed);
         // Point reads ask the filters; a scan reads every run it meets, and a
-        // compaction reads its inputs whole.
+        // compaction reads its inputs whole. The engine counts filter queries
+        // only under its `metrics` feature, which the `counters` build this
+        // workload exists in turns on, so the counts here are live.
         let metrics = self.tree.metrics();
         observed.filter_queries = metrics.filter_queries() as u64;
         observed.filter_skips = metrics.io_skipped_by_filter() as u64;
@@ -566,12 +569,12 @@ impl ArmRun {
                 point_nanos: mean(points),
             });
         }
-        let fitted = calibration::fit(observed);
+        let counted = mix.scan_share();
+        let fitted = calibration::fit(observed, counted);
         // The model the step is judged by is the one from before it: fitted
         // to the steps before, so the step's queries are held out from it.
         let before = self.arm.calibrated;
         self.arm.calibrated.update(&fitted);
-        let counted = mix.scan_share();
         Models {
             default: planned(compaction_rate, mix, None),
             judged: planned(compaction_rate, mix, Some(&before)),
