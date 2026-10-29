@@ -114,8 +114,9 @@ impl ValueStore {
         //
         // The assert is therefore a real one, not a `debug_assert`: the bound
         // above holds only for inserts that complete, and when it is broken
-        // the failure mode must be loud rather than an out-of-bounds write. It costs one compare against a constant on a
-        // perfectly predicted branch, touches no memory, and keeps the
+        // the failure mode must be loud rather than an out-of-bounds write. It
+        // costs one compare against a constant on a perfectly predicted
+        // branch, touches no memory, and keeps the
         // single-RMW reservation; a CAS loop would charge the hot path for a
         // path that cannot be taken. A refused index is never written, and
         // `Drop` skips it: it lies past every segment.
