@@ -10,7 +10,7 @@
 //!
 //! | axis | values |
 //! |---|---|
-//! | key order | `append` (each key above the last), `uniform`, `zipf` (s = 0.99), `hot` (one key) |
+//! | key order | `append` (each writer's keys above its last; with several writers each takes a contiguous share, so keys rise per writer, not across them), `uniform`, `zipf` (s = 0.99), `hot` (one key) |
 //! | key shape | 16 bytes, or 16 bytes behind a common prefix of 8, 32, 64, 128 or 256 bytes |
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
@@ -167,7 +167,7 @@ impl UserComparator for CountingComparator {
     }
 }
 
-fn open(comparator: Option<Arc<CountingComparator>>) -> AnyTree {
+fn open(comparator: Option<Arc<CountingComparator>>) -> lsm_tree::Result<AnyTree> {
     let config = Config::new(
         Path::new("/bench"),
         SequenceNumberCounter::default(),
@@ -178,7 +178,7 @@ fn open(comparator: Option<Arc<CountingComparator>>) -> AnyTree {
         Some(comparator) => config.comparator(comparator),
         None => config,
     };
-    config.open().expect("open")
+    config.open()
 }
 
 /// How a write reaches the memtable.
@@ -341,7 +341,7 @@ fn picked(name: &str, item: &str) -> bool {
     }
 }
 
-fn main() {
+fn main() -> lsm_tree::Result<()> {
     let measuring = std::env::args().any(|a| a == "--bench");
     // `cargo test` runs a bench target too: one small round then.
     let (versions, keys, rounds) = if measuring {
@@ -373,7 +373,7 @@ fn main() {
                     for i in 0..Route::ALL.len() {
                         let at = (round + i) % Route::ALL.len();
                         let (route, s) = (Route::ALL[at], &mut samples[at]);
-                        let tree = open(None);
+                        let tree = open(None)?;
                         let (elapsed, ran, latencies) = writes.run(&tree, writers, route);
                         let secs = elapsed.as_secs_f64();
                         s.per_insert.push(secs * 1e9 * ran as f64 / versions as f64);
@@ -405,7 +405,7 @@ fn main() {
                 }
             }
             let counter = Arc::new(CountingComparator(AtomicU64::new(0)));
-            let tree = open(Some(Arc::clone(&counter)));
+            let tree = open(Some(Arc::clone(&counter)))?;
             writes.run(&tree, 1, Route::Tree);
             println!(
                 "memtable/{}/prefix{prefix}/compares: {:.2} per insert",
@@ -414,4 +414,5 @@ fn main() {
             );
         }
     }
+    Ok(())
 }

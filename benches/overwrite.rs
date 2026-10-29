@@ -30,7 +30,7 @@
 
 #![expect(
     clippy::expect_used,
-    reason = "benchmark setup favors concise panic messages"
+    reason = "only for invariants of the harness itself; setup I/O is propagated"
 )]
 
 use lsm_tree::config::{CompressionPolicy, FilterPolicy, LocatorPolicy, PinningPolicy};
@@ -40,6 +40,14 @@ use lsm_tree::{AbstractTree, AnyTree, CompressionType, Config, SequenceNumberCou
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// A setup failure, with the step that hit it.
+type Error = Box<dyn std::error::Error>;
+
+/// Tags an error with the step it came from.
+fn at<E: std::fmt::Display>(step: &'static str) -> impl FnOnce(E) -> Error {
+    move |e| format!("{step}: {e}").into()
+}
 
 /// Bytes per value, as in the head-to-head harness.
 const VALUE_SIZE: usize = 256;
@@ -202,23 +210,25 @@ impl Inputs {
 
 /// One copy of the key set written and flushed, then closed: the state every
 /// rewrite starts from.
-fn seed(dir: &Path, codec: Codec, arm: Arm, inputs: &Inputs) {
-    let tree = config(dir, codec, arm).open().expect("seed: open");
+fn seed(dir: &Path, codec: Codec, arm: Arm, inputs: &Inputs) -> Result<(), Error> {
+    let tree = config(dir, codec, arm).open().map_err(at("seed: open"))?;
     inputs.write(&tree, 0);
-    tree.flush_active_memtable(0).expect("seed: flush");
+    tree.flush_active_memtable(0).map_err(at("seed: flush"))?;
+    Ok(())
 }
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create copy");
-    for entry in std::fs::read_dir(from).expect("read seed") {
-        let entry = entry.expect("seed entry");
+fn copy_dir(from: &Path, to: &Path) -> Result<(), Error> {
+    std::fs::create_dir_all(to).map_err(at("create copy"))?;
+    for entry in std::fs::read_dir(from).map_err(at("read seed"))? {
+        let entry = entry.map_err(at("seed entry"))?;
         let target = to.join(entry.file_name());
-        if entry.file_type().expect("seed entry type").is_dir() {
-            copy_dir(&entry.path(), &target);
+        if entry.file_type().map_err(at("seed entry type"))?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
         } else {
-            std::fs::copy(entry.path(), &target).expect("copy seed file");
+            std::fs::copy(entry.path(), &target).map_err(at("copy seed file"))?;
         }
     }
+    Ok(())
 }
 
 /// An arm's state: the seed on disk it copies, or none for `memfs`, which
@@ -229,43 +239,47 @@ struct ArmState {
 }
 
 impl ArmState {
-    fn new(arm: Arm, codec: Codec, inputs: &Inputs) -> Self {
-        let seed = (arm != Arm::MemFs).then(|| {
-            let dir = tempfile::tempdir().expect("seed dir");
-            seed(dir.path(), codec, arm, inputs);
-            dir
-        });
-        Self { arm, seed }
+    fn new(arm: Arm, codec: Codec, inputs: &Inputs) -> Result<Self, Error> {
+        let seed = if arm == Arm::MemFs {
+            None
+        } else {
+            let dir = tempfile::tempdir().map_err(at("seed dir"))?;
+            seed(dir.path(), codec, arm, inputs)?;
+            Some(dir)
+        };
+        Ok(Self { arm, seed })
     }
 
     /// One rewrite of the key set; the time of its body alone.
-    fn rewrite(&self, codec: Codec, inputs: &Inputs) -> Duration {
+    fn rewrite(&self, codec: Codec, inputs: &Inputs) -> Result<Duration, Error> {
         let (tree, _dir) = match &self.seed {
             Some(seed) => {
-                let dir = tempfile::tempdir().expect("arm dir");
-                copy_dir(seed.path(), dir.path());
+                let dir = tempfile::tempdir().map_err(at("arm dir"))?;
+                copy_dir(seed.path(), dir.path())?;
                 let tree = config(dir.path(), codec, self.arm)
                     .open()
-                    .expect("arm: open");
+                    .map_err(at("arm: open"))?;
                 (tree, Some(dir))
             }
             None => {
                 let tree = config(Path::new("/bench"), codec, self.arm)
                     .open()
-                    .expect("memfs: open");
+                    .map_err(at("memfs: open"))?;
                 inputs.write(&tree, 0);
-                tree.flush_active_memtable(0).expect("memfs: seed flush");
+                tree.flush_active_memtable(0)
+                    .map_err(at("memfs: seed flush"))?;
                 (tree, None)
             }
         };
         let start = Instant::now();
         inputs.write(&tree, inputs.n());
         if self.arm != Arm::Insert {
-            tree.flush_active_memtable(0).expect("rewrite: flush");
+            tree.flush_active_memtable(0)
+                .map_err(at("rewrite: flush"))?;
         }
         let elapsed = start.elapsed();
         std::hint::black_box(&tree);
-        elapsed
+        Ok(elapsed)
     }
 }
 
@@ -283,12 +297,12 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// Runs the arms for one size and codec and prints each arm's median in
 /// nanoseconds per key, then the parts as differences to `full`.
-fn measure(codec: Codec, n: usize, rounds: usize, keys_per_sample: usize) {
+fn measure(codec: Codec, n: usize, rounds: usize, keys_per_sample: usize) -> Result<(), Error> {
     let inputs = Inputs::new(n);
-    let states: Vec<ArmState> = Arm::ALL
+    let states = Arm::ALL
         .iter()
         .map(|&arm| ArmState::new(arm, codec, &inputs))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     // Enough rewrites of the key set to cover `keys_per_sample`, so a size
     // that does not divide it is rewritten past it rather than short of it.
     let rewrites = keys_per_sample.div_ceil(n).max(1);
@@ -297,51 +311,61 @@ fn measure(codec: Codec, n: usize, rounds: usize, keys_per_sample: usize) {
         for offset in 0..states.len() {
             let index = (round + offset) % states.len();
             let state = &states[index];
-            let total: Duration = (0..rewrites).map(|_| state.rewrite(codec, &inputs)).sum();
+            let mut total = Duration::ZERO;
+            for _ in 0..rewrites {
+                total += state.rewrite(codec, &inputs)?;
+            }
             samples[index].push(total.as_nanos() as f64 / (rewrites * n) as f64);
         }
     }
-    let medians: Vec<f64> = samples.into_iter().map(median).collect();
-    let of = |arm: Arm| {
-        medians[Arm::ALL
+    let index = |arm: Arm| {
+        Arm::ALL
             .iter()
             .position(|&a| a == arm)
-            .expect("every arm is measured")]
+            .expect("every arm is measured")
     };
-    for (arm, ns) in Arm::ALL.iter().zip(&medians) {
+    for (arm, arm_samples) in Arm::ALL.iter().zip(&samples) {
         println!(
-            "overwrite/{}/{n}/{}: {ns:.1} ns/key",
+            "overwrite/{}/{n}/{}: {:.1} ns/key",
             codec.label(),
-            arm.label()
+            arm.label(),
+            median(arm_samples.clone())
         );
     }
-    let full = of(Arm::Full);
+    // A part is the median over rounds of `minuend - subtrahend` within one
+    // round: every round runs every arm, so what the round shares (host load,
+    // page cache) cancels, where a difference of two medians would keep it.
+    let part = |minuend: Arm, subtrahend: Arm| {
+        let (a, b) = (&samples[index(minuend)], &samples[index(subtrahend)]);
+        median(a.iter().zip(b).map(|(a, b)| a - b).collect())
+    };
     println!(
         "overwrite/{}/{n}/parts: insert {:.1}, flush {:.1}, of which fs {:.1}, filter {:.1}; pool saves {:.1} ns/key",
         codec.label(),
-        of(Arm::Insert),
-        full - of(Arm::Insert),
-        full - of(Arm::MemFs),
-        full - of(Arm::NoFilter),
-        of(Arm::NoPool) - full,
+        median(samples[index(Arm::Insert)].clone()),
+        part(Arm::Full, Arm::Insert),
+        part(Arm::Full, Arm::MemFs),
+        part(Arm::Full, Arm::NoFilter),
+        part(Arm::NoPool, Arm::Full),
     );
+    Ok(())
 }
 
 /// What one flush of the rewrite writes, counted on a counting file system.
-fn count(codec: Codec, n: usize) {
+fn count(codec: Codec, n: usize) -> Result<(), Error> {
     let inputs = Inputs::new(n);
-    let seed_dir = tempfile::tempdir().expect("count seed dir");
-    seed(seed_dir.path(), codec, Arm::Full, &inputs);
-    let dir = tempfile::tempdir().expect("count dir");
-    copy_dir(seed_dir.path(), dir.path());
+    let seed_dir = tempfile::tempdir().map_err(at("count seed dir"))?;
+    seed(seed_dir.path(), codec, Arm::Full, &inputs)?;
+    let dir = tempfile::tempdir().map_err(at("count dir"))?;
+    copy_dir(seed_dir.path(), dir.path())?;
     let stats = Arc::new(WriteIoStats::default());
     let tree = config(dir.path(), codec, Arm::Full)
         .with_fs(CountingFs::with_stats(Arc::new(StdFs), Arc::clone(&stats)))
         .open()
-        .expect("count: open");
+        .map_err(at("count: open"))?;
     inputs.write(&tree, inputs.n());
     let before = stats.snapshot();
-    tree.flush_active_memtable(0).expect("count: flush");
+    tree.flush_active_memtable(0).map_err(at("count: flush"))?;
     let flush = stats
         .snapshot()
         .since(&before)
@@ -372,9 +396,10 @@ fn count(codec: Codec, n: usize) {
             );
         }
     }
+    Ok(())
 }
 
-fn main() {
+fn main() -> Result<(), Error> {
     let sizes: Vec<usize> = std::env::var("OVERWRITE_SIZES")
         .unwrap_or_else(|_| "1000,10000,70000".to_owned())
         .split(',')
@@ -403,8 +428,9 @@ fn main() {
     ];
     for codec in codecs {
         for &n in &sizes {
-            measure(codec, n, rounds, keys_per_sample);
-            count(codec, n);
+            measure(codec, n, rounds, keys_per_sample)?;
+            count(codec, n)?;
         }
     }
+    Ok(())
 }

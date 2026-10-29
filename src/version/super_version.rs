@@ -394,9 +394,10 @@ pub struct SuperVersions {
     #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
 
-    /// What inserts hold instead of the history lock: they read the active
-    /// memtable from [`Self::latest`], and a version that replaces it closes
-    /// the gate first, so no insert lands in a memtable once it is sealed.
+    /// What inserts hold instead of the history lock, and where they get the
+    /// active memtable from: the gate's own copy, not [`Self::latest`]. Only
+    /// [`Self::publish`] replaces it, through a closed gate, so no insert lands
+    /// in a memtable once it is sealed; `latest` is the readers' mirror.
     #[cfg(feature = "std")]
     insert_gate: Arc<super::insert_gate::InsertGate>,
 
