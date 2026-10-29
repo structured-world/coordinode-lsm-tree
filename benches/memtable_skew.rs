@@ -33,6 +33,9 @@
 //! `MEMTABLE_SKEW_VERSIONS` (default 400000) sets the versions per
 //! configuration, `MEMTABLE_SKEW_KEYS` (default 100000) the key space of the
 //! skewed orders, `MEMTABLE_SKEW_ROUNDS` (default 5) the rounds.
+//! `MEMTABLE_SKEW_ORDERS`, `MEMTABLE_SKEW_PREFIXES` and `MEMTABLE_SKEW_WRITERS`
+//! (comma-separated, e.g. `uniform`, `0`, `1`) run only the configurations they
+//! name, so one can be profiled alone; unset, each axis runs in full.
 
 #![expect(
     clippy::expect_used,
@@ -328,6 +331,12 @@ fn env_or(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Whether the comma-separated list in `name` names `item`; every item when
+/// the variable is unset, so a run can profile one configuration alone.
+fn picked(name: &str, item: &str) -> bool {
+    std::env::var(name).map_or(true, |list| list.split(',').any(|v| v.trim() == item))
+}
+
 fn main() {
     let measuring = std::env::args().any(|a| a == "--bench");
     // `cargo test` runs a bench target too: one small round then.
@@ -341,9 +350,18 @@ fn main() {
         (2_000, 500, 1)
     };
     for order in KeyOrder::ALL {
+        if !picked("MEMTABLE_SKEW_ORDERS", order.label()) {
+            continue;
+        }
         for prefix in PREFIXES {
+            if !picked("MEMTABLE_SKEW_PREFIXES", &prefix.to_string()) {
+                continue;
+            }
             let writes = Writes::new(order, prefix, versions, keys);
             for writers in WRITERS {
+                if !picked("MEMTABLE_SKEW_WRITERS", &writers.to_string()) {
+                    continue;
+                }
                 let mut samples: [Samples; Route::ALL.len()] = Default::default();
                 for round in 0..rounds {
                     // Each round starts with the next route, so neither always
