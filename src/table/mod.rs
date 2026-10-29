@@ -1325,8 +1325,6 @@ impl Table {
     /// verification reads must not evict the live working set either).
     /// Decodes under the table's data-block codec context, so
     /// it fits every gate that walks `block_index` (Data or Columnar role).
-    // Compiled under no_std alongside its `verify_kv_checksums` consumer,
-    // whose own dead-code expectation there keeps this loader live.
     fn load_block_from_disk(
         &self,
         handle: &BlockHandle,
@@ -4108,13 +4106,6 @@ impl Table {
     ///   disagrees with the stored value (corruption of the entry bytes or
     ///   the stored digest).
     /// - Any I/O / decode error encountered while loading a block.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "core+alloc per-KV scrub over the table; the verify/scrub consumer is std-gated, so unused under no_std"
-        )
-    )]
     pub(crate) fn verify_kv_checksums(&self) -> crate::Result<()> {
         // Footer presence is a per-SST property recorded in the descriptor
         // (`kv_checksum_algo`); data blocks omit the block_flags byte, so the
