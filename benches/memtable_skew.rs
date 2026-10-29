@@ -334,7 +334,10 @@ fn env_or(name: &str, default: usize) -> usize {
 /// Whether the comma-separated list in `name` names `item`; every item when
 /// the variable is unset, so a run can profile one configuration alone.
 fn picked(name: &str, item: &str) -> bool {
-    std::env::var(name).map_or(true, |list| list.split(',').any(|v| v.trim() == item))
+    match std::env::var(name) {
+        Ok(list) => list.split(',').any(|v| v.trim() == item),
+        Err(_) => true,
+    }
 }
 
 fn main() {
