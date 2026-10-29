@@ -16,9 +16,16 @@
 //! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
 //! Per configuration it prints the median over the rounds of the time per
-//! insert seen by a writer, the inserts per second over all of them, and the
-//! memtable bytes per version. Built with the `metrics` feature it also prints
-//! the links retried because a concurrent insert changed a neighbour first.
+//! insert seen by a writer, the inserts per second over all of them, the
+//! memtable bytes per version, and the P50/P99/P999 latency of one insert,
+//! taken over every 64th insert of each writer in all rounds. Built with the
+//! `metrics` feature it also prints the links retried because a concurrent
+//! insert changed a neighbour first.
+//!
+//! The harness prints its own lines rather than run under criterion: what it
+//! reports besides time (bytes per version, retried links) criterion has no
+//! place for, and criterion's summary is a mean over batches, not a
+//! percentile of single inserts.
 //! A last single-writer pass counts the key comparisons per insert through a
 //! counting comparator; that pass is not timed, since a comparator other than
 //! the built-in byte order takes the skiplist off its inlined comparison.
@@ -43,6 +50,11 @@ use std::time::{Duration, Instant};
 
 /// Bytes per value, as in the head-to-head harness.
 const VALUE_SIZE: usize = 256;
+
+/// Every this many inserts of a writer one is timed alone, for the latency
+/// percentiles: timing every insert would add two clock reads to each and
+/// move the throughput measured beside them.
+const SAMPLE_EVERY: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 enum KeyOrder {
@@ -205,20 +217,21 @@ impl Writes {
     /// Writes every key into `tree` through `route` from `writers` threads,
     /// each its own contiguous share, the shares differing by one key at
     /// most; returns the time from the release of the writers to the last
-    /// writer's end, and the writers that ran: fewer than asked only when
-    /// there are fewer keys.
+    /// writer's end, the writers that ran (fewer than asked only when there
+    /// are fewer keys), and the time of every [`SAMPLE_EVERY`]-th insert of
+    /// each writer in nanoseconds.
     ///
     /// A key's seqno is its position in the write order, so seqnos stay unique
     /// without the writers sharing a counter: the cost measured is the
     /// memtable's, not a caller's seqno allocation.
-    fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> (Duration, usize) {
+    fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> (Duration, usize, Vec<u64>) {
         let len = self.keys.len();
         let writers = writers.clamp(1, len.max(1));
         // The clock starts once every writer is ready and before any is
         // released, so no insert runs before it.
         let (ready, go) = (Barrier::new(writers + 1), Barrier::new(writers + 1));
         let memtable = tree.active_memtable();
-        let elapsed = std::thread::scope(|scope| {
+        let (elapsed, latencies) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..writers)
                 .map(|w| {
                     let (start, end) = (len * w / writers, len * (w + 1) / writers);
@@ -227,35 +240,47 @@ impl Writes {
                 .map(|(first, chunk)| {
                     let (ready, go, memtable) = (&ready, &go, &memtable);
                     scope.spawn(move || {
+                        let insert = |s: u64, key: &[u8]| match route {
+                            Route::Tree => {
+                                tree.insert(key, self.value.as_slice(), s);
+                            }
+                            Route::Memtable => {
+                                memtable.insert(InternalValue::from_components(
+                                    key,
+                                    self.value.as_slice(),
+                                    s,
+                                    ValueType::Value,
+                                ));
+                            }
+                        };
+                        let mut latencies = Vec::with_capacity(chunk.len() / SAMPLE_EVERY + 1);
                         ready.wait();
                         go.wait();
-                        for (s, key) in (first..).zip(chunk) {
-                            match route {
-                                Route::Tree => {
-                                    tree.insert(key.as_slice(), self.value.as_slice(), s);
-                                }
-                                Route::Memtable => {
-                                    memtable.insert(InternalValue::from_components(
-                                        key.as_slice(),
-                                        self.value.as_slice(),
-                                        s,
-                                        ValueType::Value,
-                                    ));
-                                }
+                        for (at, (s, key)) in (first..).zip(chunk).enumerate() {
+                            if at % SAMPLE_EVERY == 0 {
+                                let started = Instant::now();
+                                insert(s, key);
+                                latencies.push(
+                                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                );
+                            } else {
+                                insert(s, key);
                             }
                         }
+                        latencies
                     })
                 })
                 .collect();
             ready.wait();
             let at = Instant::now();
             go.wait();
+            let mut latencies = Vec::new();
             for handle in handles {
-                handle.join().expect("writer");
+                latencies.extend(handle.join().expect("writer"));
             }
-            at.elapsed()
+            (at.elapsed(), latencies)
         });
-        (elapsed, writers)
+        (elapsed, writers, latencies)
     }
 }
 
@@ -277,11 +302,22 @@ struct Samples {
     per_second: Vec<f64>,
     bytes: f64,
     retries: Vec<f64>,
+    /// The sampled inserts of every round, in nanoseconds.
+    latencies: Vec<u64>,
 }
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
+}
+
+/// The `q` quantile of `sorted`, nearest rank; zero when it is empty.
+fn quantile(sorted: &[u64], q: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted.len() - 1) as f64 * q).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
 }
 
 fn env_or(name: &str, default: usize) -> usize {
@@ -315,28 +351,33 @@ fn main() {
                         let at = (round + i) % Route::ALL.len();
                         let (route, s) = (Route::ALL[at], &mut samples[at]);
                         let tree = open(None);
-                        let (elapsed, ran) = writes.run(&tree, writers, route);
+                        let (elapsed, ran, latencies) = writes.run(&tree, writers, route);
                         let secs = elapsed.as_secs_f64();
                         s.per_insert.push(secs * 1e9 * ran as f64 / versions as f64);
                         s.per_second.push(versions as f64 / secs);
+                        s.latencies.extend(latencies);
                         let memtable = tree.active_memtable();
                         s.bytes = memtable.size() as f64 / versions as f64;
                         s.retries.extend(cas_retries(&memtable));
                     }
                 }
-                for (route, s) in Route::ALL.into_iter().zip(samples) {
+                for (route, mut s) in Route::ALL.into_iter().zip(samples) {
                     let retried = if s.retries.is_empty() {
                         String::new()
                     } else {
                         format!(", {:.0} links retried", median(s.retries))
                     };
+                    s.latencies.sort_unstable();
                     println!(
-                        "memtable/{}/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {:.1} B/version{retried}",
+                        "memtable/{}/{}/prefix{prefix}/t{writers}: {:.1} ns/insert, {:.0} inserts/s, {:.1} B/version{retried}, insert p50 {} ns p99 {} ns p999 {} ns",
                         route.label(),
                         order.label(),
                         median(s.per_insert),
                         median(s.per_second),
                         s.bytes,
+                        quantile(&s.latencies, 0.50),
+                        quantile(&s.latencies, 0.99),
+                        quantile(&s.latencies, 0.999),
                     );
                 }
             }
