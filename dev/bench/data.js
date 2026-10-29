@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793276702742,
+  "lastUpdate": 1793276706807,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -86220,6 +86220,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.540475364,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b1c5875b7a8e8b2d2532b909e513c4f445e3719e",
+          "message": "bench(planned): check the planner's model against observation (#1022)\n\n## Summary\n\n- `planned-sustained` checks the planner's model against what a tree\nobserves: four read mixes, a planner tree on a model calibrated online\nbeside the one on the set model and leveled, and both models shadowed\nevery step.\n- Measured result: the calibrated model gains on some mixes and loses on\nothers, Zipf-hot points at 8× every run, so the set model is kept; the\nmeasurement is recorded in the `planned` module docs.\n\n## Changes\n\n- `Planned::plan_for` works out the plan a strategy would follow for a\nversion without choosing anything, so two models can be compared on one\ntree; `dp::Inputs::speed` is public, the query speed a plan is scored\nby.\n- Bench read mixes: even points and 100-key scans, Zipf-hot points with\nshort scans, 1000-key scans, 32 runs in L0; each at 8× and 2× the write\nrate.\n- Calibration from observation with a bounded moving average and sample\nthresholds: merge rate, the filters' false positive rate from the\nengine's counts, the query speed kept beside a merge, a scan's cost per\nrun against a point read's. With too little observed, the set model\nstays. A query counts as beside a merge only once a merge is confirmed\nto have run beside it: the compaction threads log each call while it\nruns and each merge when done.\n- Each step both models predict the query cost in point reads, the\ncalibrated one as it was before the step; the bench publishes the error\non the second half of the steps with the scale fitted on the first, and\nhow often each model's plan changed. Every arm's line goes to stderr as\nits run ends.\n\n## Testing\n\nUnit tests of the calibration and of the bench, doc tests of the new\nAPI, fmt and clippy on the crate and on `db_bench` with and without its\nfeatures.\n\nCloses #964",
+          "timestamp": "2026-10-29T14:10:52+02:00",
+          "tree_id": "502ac88757896fe198726d080a593911a945d510",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b1c5875b7a8e8b2d2532b909e513c4f445e3719e"
+        },
+        "date": 1793276705530,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 525.211,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 83.983548ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 180.539,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 51.531481ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 462.44800000000004,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 101.216259ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4183.028,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9902.722,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 25.279,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 91.619327,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.589387298,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 26.511,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 84.738047,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.618251908,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
