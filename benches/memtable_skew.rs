@@ -13,7 +13,7 @@
 //! | key order | `append` (each key above the last), `uniform`, `zipf` (s = 0.99), `hot` (one key) |
 //! | key shape | 16 bytes, or 16 bytes behind a common prefix of 8, 32 or 64 bytes |
 //! | writers | 1, 4, 16, 32 threads, each taking its share of the versions |
-//! | route | `tree` (`Tree::insert`, under the version-history read lock) or `direct` (the active memtable itself) |
+//! | route | `tree` (`Tree::insert`, through the thread's insert gate shard) or `direct` (the active memtable itself) |
 //!
 //! Per configuration it prints the median over the rounds of the time per
 //! insert seen by a writer, the inserts per second over all of them, and the
@@ -203,24 +203,27 @@ impl Writes {
     }
 
     /// Writes every key into `tree` through `route` from `writers` threads,
-    /// each its own contiguous share; returns the time from the release of
-    /// the writers to the last writer's end.
+    /// each its own contiguous share, the shares differing by one key at
+    /// most; returns the time from the release of the writers to the last
+    /// writer's end, and the writers that ran: fewer than asked only when
+    /// there are fewer keys.
     ///
     /// A key's seqno is its position in the write order, so seqnos stay unique
     /// without the writers sharing a counter: the cost measured is the
     /// memtable's, not a caller's seqno allocation.
-    fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> Duration {
-        let share = self.keys.len().div_ceil(writers);
-        // Fewer shares than writers when the share rounds up: the barriers
-        // hold the threads that exist. The clock starts once every writer is
-        // ready and before any is released, so no insert runs before it.
-        let threads = self.keys.len().div_ceil(share) + 1;
-        let (ready, go) = (Barrier::new(threads), Barrier::new(threads));
+    fn run(&self, tree: &AnyTree, writers: usize, route: Route) -> (Duration, usize) {
+        let len = self.keys.len();
+        let writers = writers.clamp(1, len.max(1));
+        // The clock starts once every writer is ready and before any is
+        // released, so no insert runs before it.
+        let (ready, go) = (Barrier::new(writers + 1), Barrier::new(writers + 1));
         let memtable = tree.active_memtable();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0u64..)
-                .step_by(share)
-                .zip(self.keys.chunks(share))
+        let elapsed = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|w| {
+                    let (start, end) = (len * w / writers, len * (w + 1) / writers);
+                    (start as u64, &self.keys[start..end])
+                })
                 .map(|(first, chunk)| {
                     let (ready, go, memtable) = (&ready, &go, &memtable);
                     scope.spawn(move || {
@@ -251,7 +254,8 @@ impl Writes {
                 handle.join().expect("writer");
             }
             at.elapsed()
-        })
+        });
+        (elapsed, writers)
     }
 }
 
@@ -311,10 +315,9 @@ fn main() {
                         let at = (round + i) % Route::ALL.len();
                         let (route, s) = (Route::ALL[at], &mut samples[at]);
                         let tree = open(None);
-                        let elapsed = writes.run(&tree, writers, route);
+                        let (elapsed, ran) = writes.run(&tree, writers, route);
                         let secs = elapsed.as_secs_f64();
-                        s.per_insert
-                            .push(secs * 1e9 * writers as f64 / versions as f64);
+                        s.per_insert.push(secs * 1e9 * ran as f64 / versions as f64);
                         s.per_second.push(versions as f64 / secs);
                         let memtable = tree.active_memtable();
                         s.bytes = memtable.size() as f64 / versions as f64;

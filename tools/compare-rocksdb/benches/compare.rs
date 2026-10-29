@@ -1964,6 +1964,17 @@ fn read_while(stop: &AtomicBool, keys: &[[u8; 16]], mut get: impl FnMut(&[u8])) 
     nanos
 }
 
+/// Raises its flag as it drops: a writer that panics still releases the
+/// threads that run until the flag, so the scope unwinds into a failed bench
+/// instead of waiting for them forever.
+struct RaiseOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for RaiseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// The engine's read counters at one moment of the sustained scenario.
 #[cfg(feature = "metrics")]
 struct Diagnosis {
@@ -2148,6 +2159,7 @@ fn sustained_ours(
                 }
             }
         });
+        let (_writing_done, _stop) = (RaiseOnDrop(&writing_done), RaiseOnDrop(&stop));
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
             #[cfg(feature = "metrics")]
@@ -2272,6 +2284,7 @@ fn sustained_rocksdb(
                 std::hint::black_box(db.get_pinned(key).expect("rocksdb sustained: get"));
             })
         });
+        let _stop = RaiseOnDrop(&stop);
         let start = std::time::Instant::now();
         for write in 0..shape.writes() {
             let key = &keys[usize::try_from(write % shape.hot).expect("an index fits usize")];
