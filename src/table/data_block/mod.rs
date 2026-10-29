@@ -1492,13 +1492,6 @@ impl DataBlock {
 /// entries a caller has ALREADY decoded (the reconcile walk, which materializes
 /// each block once for every gate). Both feed the same rule, so the gate does
 /// not pay a second decode of a block the walk just decoded.
-#[cfg_attr(
-    not(feature = "std"),
-    expect(
-        dead_code,
-        reason = "core+alloc per-KV scrub; the verify/scrub consumers are std-gated"
-    )
-)]
 pub(crate) struct KvDigestProbe<'a> {
     /// The split footer: the digest array, borrowed rather than expanded.
     split: super::block::kv_checksum::SplitFull<'a>,

@@ -1326,14 +1326,7 @@ impl Table {
     /// Decodes under the table's data-block codec context, so
     /// it fits every gate that walks `block_index` (Data or Columnar role).
     // Compiled under no_std alongside its `verify_kv_checksums` consumer,
-    // which is itself dead there (the verify/scrub caller is std-gated).
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "gate-only loader; the verify/scrub consumers are std-gated"
-        )
-    )]
+    // whose own dead-code expectation there keeps this loader live.
     fn load_block_from_disk(
         &self,
         handle: &BlockHandle,
@@ -4117,7 +4110,7 @@ impl Table {
     /// - Any I/O / decode error encountered while loading a block.
     #[cfg_attr(
         not(feature = "std"),
-        allow(
+        expect(
             dead_code,
             reason = "core+alloc per-KV scrub over the table; the verify/scrub consumer is std-gated, so unused under no_std"
         )
@@ -4153,13 +4146,6 @@ impl Table {
     /// it — the second decode reads no additional bytes off the disk. Taking no
     /// comparator is what keeps it that way: decoding a data block needs one,
     /// so this cannot re-decode even by mistake.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "per-KV gate half; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn check_block_kv_checksums(
         expected_algo: crate::runtime_config::types::ChecksumAlgorithm,
         block: &DecodedBlock,
@@ -6801,13 +6787,6 @@ impl Table {
     ///
     /// Propagates the index walk, the punch-offset lookup, the block read and
     /// the decode, plus whatever `check` returns.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(
-            dead_code,
-            reason = "gate-only walk; the verify/scrub consumers are std-gated"
-        )
-    )]
     fn for_each_live_block<F>(&self, mut check: F) -> crate::Result<()>
     where
         F: FnMut(&DecodedBlock) -> crate::Result<()>,
