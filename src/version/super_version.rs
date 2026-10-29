@@ -1052,16 +1052,15 @@ impl SuperVersions {
         // ones after land in the new one. The gate is closed here unless the
         // caller holds it closed already.
         #[cfg(feature = "std")]
-        let gate = Arc::clone(&self.insert_gate);
-        #[cfg(feature = "std")]
         let own_closed = if Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable) {
             None
+        } else if let Some(closed) = closed {
+            closed.set_active(Arc::clone(&version.active_memtable));
+            None
         } else {
-            let own = closed.is_none().then(|| gate.close());
-            if let Some(closed) = closed.or(own.as_ref()) {
-                closed.set_active(Arc::clone(&version.active_memtable));
-            }
-            own
+            let own = self.insert_gate.close();
+            own.set_active(Arc::clone(&version.active_memtable));
+            Some(own)
         };
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
