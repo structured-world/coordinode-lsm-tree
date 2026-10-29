@@ -445,7 +445,9 @@ impl SuperVersions {
             #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
             #[cfg(feature = "std")]
-            insert_gate: Arc::new(super::insert_gate::InsertGate::new()),
+            insert_gate: Arc::new(super::insert_gate::InsertGate::new(Arc::clone(
+                &initial.active_memtable,
+            ))),
             current: initial,
             persisted: version,
             unsynced: Vec::new(),
@@ -724,11 +726,11 @@ impl SuperVersions {
                 self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
             }
         }
-        #[cfg(feature = "std")]
-        let gate_closed = closed.is_some();
-        #[cfg(not(feature = "std"))]
-        let gate_closed = false;
-        self.publish(next_version, gate_closed);
+        self.publish(
+            next_version,
+            #[cfg(feature = "std")]
+            closed.as_ref(),
+        );
         #[cfg(feature = "std")]
         drop(closed);
 
@@ -1028,31 +1030,46 @@ impl SuperVersions {
     /// Makes `version` the current one. The replaced version stays alive only
     /// in the readers that already hold it.
     pub fn append_version(&mut self, version: SuperVersion) {
-        self.publish(version, false);
+        self.publish(
+            version,
+            #[cfg(feature = "std")]
+            None,
+        );
     }
 
-    /// [`Self::append_version`], told whether the caller already holds the
-    /// insert gate closed.
-    #[cfg_attr(
-        not(feature = "std"),
-        expect(unused_variables, reason = "no insert gate without std")
-    )]
-    fn publish(&mut self, version: SuperVersion, gate_closed: bool) {
+    /// [`Self::append_version`], given the insert gate when the caller
+    /// already holds it closed.
+    fn publish(
+        &mut self,
+        version: SuperVersion,
+        #[cfg(feature = "std")] closed: Option<&super::insert_gate::Closed<'_>>,
+    ) {
         if let Some(budget) = &self.filter_budget {
             budget.publish(&version.version);
         }
-        // A new active memtable is published with the insert gate closed: the
-        // inserts that read the old one from the mirror finish into it first,
-        // and the ones after see the new one.
+        // A new active memtable is handed to inserts with the insert gate
+        // closed: the inserts already into the old one finish first, and the
+        // ones after land in the new one. The gate is closed here unless the
+        // caller holds it closed already.
         #[cfg(feature = "std")]
-        let _closed = (!gate_closed
-            && !Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable))
-        .then(|| self.insert_gate.close());
+        let gate = Arc::clone(&self.insert_gate);
+        #[cfg(feature = "std")]
+        let own_closed = if Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable) {
+            None
+        } else {
+            let own = closed.is_none().then(|| gate.close());
+            if let Some(closed) = closed.or(own.as_ref()) {
+                closed.set_active(Arc::clone(&version.active_memtable));
+            }
+            own
+        };
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
         #[cfg(feature = "std")]
         self.latest.store(Arc::new(version.clone()));
         self.current = version;
+        #[cfg(feature = "std")]
+        drop(own_closed);
     }
 
     /// Replaces the current version with one that changes only its memtables

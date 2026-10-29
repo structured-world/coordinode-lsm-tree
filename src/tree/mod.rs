@@ -5587,15 +5587,14 @@ impl Tree {
 
         // The insert holds its thread's shard of the insert gate, which a
         // version replacing the active memtable closes before it publishes:
-        // `value` and its digest land in the active memtable the mirror names,
-        // and no rotation seals it mid-insert. Unlike the history read lock,
-        // the shard is a line no other writer thread touches.
+        // `value` and its digest land in the active memtable the gate hands
+        // out, and no rotation seals it mid-insert. Unlike the history read
+        // lock, the shard is a line no other writer thread touches.
         #[cfg(feature = "std")]
         {
-            let _entered = self.insert_gate.enter();
-            self.latest_super_version
-                .load()
-                .active_memtable
+            self.insert_gate
+                .enter()
+                .memtable()
                 .insert_with_kv_digest(value, kv_digest)
         }
         // no-std: the history read lock, with the same guarantee.
