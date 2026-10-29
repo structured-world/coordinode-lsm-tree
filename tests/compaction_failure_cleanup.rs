@@ -332,26 +332,31 @@ fn a_failed_relocation_leaves_none_of_its_blob_files() -> lsm_tree::Result<()> {
     })
 }
 
+/// Rewrites every value to one above the separation threshold, so a
+/// compaction writes it to the value log.
+struct Grow;
+
+impl CompactionFilter for Grow {
+    fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> lsm_tree::Result<Verdict> {
+        Ok(Verdict::ReplaceValue(vec![b'r'; 300].into()))
+    }
+}
+
+struct GrowFactory;
+
+impl Factory for GrowFactory {
+    fn name(&self) -> &str {
+        "grow"
+    }
+    fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
+        Box::new(Grow)
+    }
+}
+
 /// A compaction filter that rewrites values into the value log fails part-way
 /// through: the blob files it wrote go.
 #[test]
 fn a_failed_filter_rewrite_leaves_none_of_its_blob_files() -> lsm_tree::Result<()> {
-    struct Grow;
-    impl CompactionFilter for Grow {
-        fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> lsm_tree::Result<Verdict> {
-            Ok(Verdict::ReplaceValue(vec![b'r'; 300].into()))
-        }
-    }
-    struct GrowFactory;
-    impl Factory for GrowFactory {
-        fn name(&self) -> &str {
-            "grow"
-        }
-        fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
-            Box::new(Grow)
-        }
-    }
-
     let f = open(|c| {
         c.with_kv_separation(Some(
             KvSeparationOptions::default()
@@ -368,6 +373,35 @@ fn a_failed_filter_rewrite_leaves_none_of_its_blob_files() -> lsm_tree::Result<(
     assert_fails_cleanly(&f, [io_error(FaultOp::Write, "blobs", 4)], u64::MAX, |i| {
         format!("small-{i}").into_bytes()
     })
+}
+
+/// The same filter, its rewrites written whole but the value log file holding
+/// them failing to sync as it is finished: the compaction fails before it
+/// produces its tables, and neither the blob file nor a table stays.
+#[test]
+fn a_filter_rewrite_failing_to_finish_its_blob_file_leaves_none_of_its_files()
+-> lsm_tree::Result<()> {
+    // One blob file holds every rewrite, so the only sync in the blobs folder
+    // is the one that finishes it.
+    let f = open(|c| {
+        c.with_kv_separation(Some(
+            KvSeparationOptions::default()
+                .separation_threshold(100)
+                .file_target_size(64 << 20),
+        ))
+        .with_compaction_filter_factory(Some(Arc::new(GrowFactory)))
+    })?;
+    for i in 0..KEYS {
+        f.tree.insert(key(i), format!("small-{i}"), i);
+    }
+    f.tree.flush_active_memtable(0)?;
+
+    assert_fails_cleanly(
+        &f,
+        [io_error(FaultOp::SyncData, "blobs", 0)],
+        u64::MAX,
+        |i| format!("small-{i}").into_bytes(),
+    )
 }
 
 struct Concat;

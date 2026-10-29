@@ -8,6 +8,44 @@ fn new_memtable(id: MemtableId) -> Memtable {
     Memtable::new(id, default_comparator())
 }
 
+/// The memtable reports the link retries its skiplist counted: none for
+/// inserts no writer races, at least one once a concurrent insert changes a
+/// neighbour between the splice search and the link. Guards against the
+/// public count reading something other than the skiplist's.
+#[cfg(feature = "metrics")]
+#[test]
+fn the_memtable_reports_its_skiplists_link_retries() {
+    let mt = new_memtable(0);
+    mt.insert(InternalValue::from_components(
+        b"a",
+        b"a",
+        1,
+        ValueType::Value,
+    ));
+    mt.insert(InternalValue::from_components(
+        b"c",
+        b"c",
+        1,
+        ValueType::Value,
+    ));
+    assert_eq!(mt.insert_cas_retries(), 0, "no contention yet");
+    mt.items
+        .set_link_hook(alloc::boxed::Box::new(|map: &skiplist::SkipMap| {
+            map.insert(
+                &InternalKey::new(b"b".to_vec(), 1, ValueType::Value),
+                crate::UserValue::from(b"concurrent".as_slice()),
+            );
+        }));
+    mt.insert(InternalValue::from_components(
+        b"bb",
+        b"bb",
+        1,
+        ValueType::Value,
+    ));
+    assert!(mt.insert_cas_retries() >= 1, "the raced link was retried");
+    assert_eq!(mt.insert_cas_retries(), mt.items.cas_retries());
+}
+
 /// Low-32 logical digest of an entry under `algo`.
 fn at_insert_digest(item: &InternalValue, algo: crate::runtime_config::ChecksumAlgorithm) -> u32 {
     #[expect(

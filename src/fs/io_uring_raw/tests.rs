@@ -882,6 +882,51 @@ fn raw_files_accept_every_access_hint() {
     assert!(raw_pipe.hint(FileHint::Sequential).is_err());
 }
 
+/// Starting writeback and setting a write lifetime reach the kernel through
+/// the raw backend's file and answer as through `StdFs` on the same file:
+/// writeback starts on a written file and is refused on a pipe, and each
+/// lifetime is accepted or refused as the file system decides for both.
+#[cfg(all(feature = "std", target_pointer_width = "64"))]
+#[test]
+fn raw_writeback_and_write_lifetime_answer_as_the_std_backend() {
+    use crate::fs::WriteLifetime;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fs = IoUringRawFs::new(8).expect("fs setup");
+    let path = tmp.path().join("written");
+    write_raw_file(&fs, &path, 5, 8_192);
+    let opts = FsOpenOptions::new().read(true).write(true);
+    let raw = fs.open(&path, &opts).expect("open");
+    let std = crate::fs::StdFs.open(&path, &opts).expect("open");
+    raw.start_writeback(0, 8_192).expect("raw writeback");
+    std.start_writeback(0, 8_192).expect("std writeback");
+    for lifetime in [
+        WriteLifetime::Short,
+        WriteLifetime::Medium,
+        WriteLifetime::Long,
+        WriteLifetime::Extreme,
+    ] {
+        assert_eq!(
+            raw.set_write_lifetime(lifetime).is_ok(),
+            std.set_write_lifetime(lifetime).is_ok(),
+            "{lifetime:?}"
+        );
+    }
+
+    // A pipe has no file range to write back: the kernel refuses it, and the
+    // refusal reaches the caller as through `StdFs`.
+    let pipe = tmp.path().join("pipe");
+    let name = std::ffi::CString::new(pipe.to_str().expect("utf8")).expect("no NUL");
+    // SAFETY: `name` is a NUL-terminated path the call only reads.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+    let pipe_opts = FsOpenOptions::new().read(true).no_wait(true);
+    let raw_pipe = fs.open(&pipe, &pipe_opts).expect("open the pipe");
+    let std_pipe = crate::fs::StdFs
+        .open(&pipe, &pipe_opts)
+        .expect("open the pipe");
+    assert!(std_pipe.start_writeback(0, 1).is_err());
+    assert!(raw_pipe.start_writeback(0, 1).is_err());
+}
+
 /// A range no file extent can have (past `i64::MAX`, or ending past
 /// `u64::MAX`) is refused before any syscall, and a file that does not exist
 /// is not found, for the punch and both hole probes, as through `StdFs`.
