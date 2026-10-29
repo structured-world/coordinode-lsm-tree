@@ -851,8 +851,9 @@ impl SkipMap {
 
     /// Reads the value for `node` from the lock-free value store (wait-free).
     fn node_value(&self, node: u32) -> UserValue {
-        // SAFETY: node_value_idx was set during alloc_node→ValueStore::append,
-        // and this node is only reachable after the skiplist CAS that published
+        // SAFETY: node_value_idx is the index the insert reserved and wrote
+        // (`ValueStore::reserve` then `write`) before allocating this node,
+        // and the node is only reachable after the skiplist CAS that published
         // it (establishing happens-before for the value write).
         unsafe { self.values.get(self.node_value_idx(node)) }
     }

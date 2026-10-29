@@ -25,6 +25,11 @@
   .card h3 { font-size: .95rem; margin: 0 0 .2rem; }
   .card p { color: var(--muted); font-size: .82rem; margin: 0 0 .5rem; line-height: 1.4; }
   .chart { position: relative; height: 240px; }
+  /* A wide metrics table scrolls inside its card rather than past it. */
+  .metrics { overflow-x: auto; margin-top: .5rem; }
+  .metrics table { border-collapse: collapse; font-size: .8rem; white-space: nowrap; }
+  .metrics th, .metrics td { padding: .15rem .5rem; text-align: right; border-bottom: 1px solid var(--line); }
+  .metrics th:first-child, .metrics td:first-child { text-align: left; }
   #empty { display: none; }
 </style>
 </head>
@@ -39,7 +44,8 @@
     median. The tooltip gives the 95% confidence interval of either, which covers the noise within a run; two runs of
     one commit on one host agreed on the ratio to within 2% on the median arm and 7% on nine arms in ten, so a ratio
     within a few percent of 1 is parity. Both engines get the same block size, bloom filter, block cache, values and
-    four block-compression threads, no WAL, and every lsm-tree protection RocksDB has no equivalent for is off.
+    four block-compression threads, no WAL (except the <code>ours-deferred-wal</code> arm, which writes and syncs a
+    caller-kept log once per batch), and every lsm-tree protection RocksDB has no equivalent for is off.
     &middot; <a href="../bench/">single-engine trend &rarr;</a>
   </p>
   <p class="meta" id="meta"></p>
@@ -223,7 +229,10 @@
               table.appendChild(row);
             });
           });
-          card.appendChild(table);
+          const scroller = document.createElement("div");
+          scroller.className = "metrics";
+          scroller.appendChild(table);
+          card.appendChild(scroller);
         }
         grids[kind].appendChild(card);
         charts.push(new Chart(canvas, {

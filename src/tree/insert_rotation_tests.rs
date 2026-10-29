@@ -32,7 +32,18 @@ fn inserts_racing_flushes_all_read_back() -> crate::Result<()> {
     .open()?;
     let done = AtomicBool::new(false);
 
+    /// Raises the flag as it drops, so the flusher stops on every way out of
+    /// the scope, a panicking writer's included, and the test fails rather
+    /// than hangs.
+    struct RaiseOnDrop<'a>(&'a AtomicBool);
+    impl Drop for RaiseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     std::thread::scope(|scope| -> crate::Result<()> {
+        let stop = RaiseOnDrop(&done);
         let flusher = scope.spawn(|| -> crate::Result<u32> {
             let mut flushes = 0;
             while !done.load(Ordering::Acquire) {
@@ -55,7 +66,7 @@ fn inserts_racing_flushes_all_read_back() -> crate::Result<()> {
         for writer in writers {
             writer.join().expect("writer");
         }
-        done.store(true, Ordering::Release);
+        drop(stop);
         let flushes = flusher.join().expect("flusher")?;
         assert!(flushes > 1, "the flushes ran while the writers wrote");
         Ok(())

@@ -311,13 +311,14 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-/// The `q` quantile of `sorted`, nearest rank; zero when it is empty.
-fn quantile(sorted: &[u64], q: f64) -> u64 {
-    if sorted.is_empty() {
+/// The quantile of `sorted` at `per_mille` thousandths, nearest rank; zero
+/// when it is empty. In integers, so the rank needs no cast from a float.
+fn quantile(sorted: &[u64], per_mille: usize) -> u64 {
+    let Some(last) = sorted.len().checked_sub(1) else {
         return 0;
-    }
-    let rank = ((sorted.len() - 1) as f64 * q).round() as usize;
-    sorted[rank.min(sorted.len() - 1)]
+    };
+    let rank = (last * per_mille.min(1000) + 500) / 1000;
+    sorted[rank]
 }
 
 fn env_or(name: &str, default: usize) -> usize {
@@ -375,9 +376,9 @@ fn main() {
                         median(s.per_insert),
                         median(s.per_second),
                         s.bytes,
-                        quantile(&s.latencies, 0.50),
-                        quantile(&s.latencies, 0.99),
-                        quantile(&s.latencies, 0.999),
+                        quantile(&s.latencies, 500),
+                        quantile(&s.latencies, 990),
+                        quantile(&s.latencies, 999),
                     );
                 }
             }

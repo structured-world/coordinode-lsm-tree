@@ -67,8 +67,10 @@ fn values(n: usize) -> Vec<Vec<u8>> {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            // `state % 95` is below 95, so the cast cannot truncate.
-            *byte = b' ' + (state % 95) as u8;
+            let Ok(offset) = u8::try_from(state % 95) else {
+                unreachable!("state % 95 is below 95");
+            };
+            *byte = b' ' + offset;
         }
         pool.extend_from_slice(&half);
         pool.extend_from_slice(&half);
