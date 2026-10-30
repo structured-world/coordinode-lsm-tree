@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793345161163,
+  "lastUpdate": 1793345165622,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -89280,6 +89280,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.525697792,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "199aa80fb649010ec7fdeda9a95f905b8e749a50",
+          "message": "ci(bench): give the head-to-head step room for the sustained groups (#1026)\n\n## Summary\n\n- The head-to-head step of the `Benchmark` workflow gets a 25-minute\nlimit and the job a 40-minute one, so the sustained overwrite groups fit\nand the comparison page is published again.\n\n## Changes\n\n- `.github/workflows/benchmark.yml`: step limit 15 → 25 minutes, job\nlimit 30 → 40 minutes; the step's comment states its real duration\n(about 16 minutes on an idle host, half of it the sustained overwrite at\nzstd 22).\n\n## Testing\n\nCI configuration only; the `Benchmark` workflow on `main` after the\nmerge is the check.\n\nCloses #1025",
+          "timestamp": "2026-10-30T07:08:48Z",
+          "tree_id": "7b7478d51501fc560ea66b0c56541fb54667b240",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/199aa80fb649010ec7fdeda9a95f905b8e749a50"
+        },
+        "date": 1793345164330,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 503.13699999999994,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 79.856962ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 147.98,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.47952ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 452.704,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 101.231552ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 3908.456,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 11169.610999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 21.791,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 60.391423,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.499165941,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 21.631,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 65.077247,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.505720468,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
