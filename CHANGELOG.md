@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.0...v7.4.1) - 2026-10-30
+
+### Performance
+
+- *(write)* take shared state off the concurrent insert path ([#1024](https://github.com/structured-world/coordinode-lsm-tree/pull/1024))
+
+### Bench
+
+- *(planned)* check the planner's model against observation ([#1022](https://github.com/structured-world/coordinode-lsm-tree/pull/1022))
+
 ## [7.4.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.3.1...v7.4.0) - 2026-10-28
 
 ### Added
