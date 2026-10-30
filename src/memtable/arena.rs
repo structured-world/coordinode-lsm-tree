@@ -270,24 +270,35 @@ impl Arena {
         let block_idx = (offset >> BLOCK_SHIFT) as usize;
         let off = (offset & BLOCK_MASK) as usize;
 
-        let mut ptr = self.blocks[block_idx].load(Ordering::Acquire);
+        let ptr = self.blocks[block_idx].load(Ordering::Acquire);
         if ptr.is_null() {
-            // The block is being allocated by another thread's ensure_block.
-            // Spin briefly — ensure_block uses CAS with AcqRel, so the
-            // pointer will become visible after a few iterations.
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-                ptr = self.blocks[block_idx].load(Ordering::Acquire);
-                if !ptr.is_null() {
-                    return (ptr, off);
-                }
-            }
-            // If still null after spinning, allocate the block ourselves.
-            self.ensure_block(block_idx);
-            ptr = self.blocks[block_idx].load(Ordering::Acquire);
+            return (self.wait_for_block(block_idx), off);
         }
-
         (ptr, off)
+    }
+
+    /// The pointer of block `block_idx`, which another thread's `ensure_block`
+    /// is still publishing. Out of line, so the search steps that decode an
+    /// offset carry only the load and the branch.
+    #[cold]
+    #[inline(never)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "block_idx < MAX_BLOCKS by construction (alloc enforces this)"
+    )]
+    fn wait_for_block(&self, block_idx: usize) -> *mut u8 {
+        // Spin briefly: ensure_block uses CAS with AcqRel, so the pointer
+        // becomes visible after a few iterations.
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+            let ptr = self.blocks[block_idx].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        // Still null after spinning: allocate the block ourselves.
+        self.ensure_block(block_idx);
+        self.blocks[block_idx].load(Ordering::Acquire)
     }
 
     /// Ensures that the block at `idx` is allocated.  Uses CAS to avoid

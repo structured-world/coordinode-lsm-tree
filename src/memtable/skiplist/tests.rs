@@ -5,6 +5,64 @@ fn new_map() -> SkipMap {
     SkipMap::new(crate::comparator::default_comparator())
 }
 
+/// The word-at-a-time comparison orders every pair of keys as `<[u8]>::cmp`
+/// does: every length up to past the longest key compared in words, a
+/// difference at each position on either side of a word boundary, a key that
+/// is a prefix of the other, a short key against a long one, and
+/// pseudo-random pairs on both sides of the length limit. Guards against a
+/// word compare that reads the bytes in the wrong order, lets the length
+/// decide too early, or picks the path by the wrong key's length.
+#[test]
+fn the_word_comparison_orders_keys_as_the_byte_comparison() {
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for len in 0..=WORD_COMPARE_MAX + 12 {
+        let base: Vec<u8> = (0..len)
+            .map(|i| u8::try_from((i * 37 + 11) % 256).expect("below 256"))
+            .collect();
+        pairs.push((base.clone(), base.clone()));
+        for at in 0..len {
+            for delta in [1u8, 0x80, 0xFF] {
+                let mut other = base.clone();
+                other[at] = other[at].wrapping_add(delta);
+                pairs.push((base.clone(), other.clone()));
+                pairs.push((other, base.clone()));
+            }
+        }
+        for shorter in 0..len {
+            pairs.push((base[..shorter].to_vec(), base.clone()));
+            pairs.push((base.clone(), base[..shorter].to_vec()));
+        }
+    }
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..10_000 {
+        let mut below = |n: u64| next() % n;
+        let (la, lb) = (below(160), below(160));
+        // A small alphabet makes long common prefixes likely; every other
+        // pair also shares a prefix longer than the word-compare limit.
+        let mut a: Vec<u8> = (0..la)
+            .map(|_| u8::try_from(below(3)).expect("below 3"))
+            .collect();
+        let mut b: Vec<u8> = (0..lb)
+            .map(|_| u8::try_from(below(3)).expect("below 3"))
+            .collect();
+        if round % 2 == 0 {
+            let shared = [7u8; WORD_COMPARE_MAX + 4];
+            a = [&shared[..], &a].concat();
+            b = [&shared[..], &b].concat();
+        }
+        pairs.push((a, b));
+    }
+    for (a, b) in pairs {
+        assert_eq!(lexicographic(&a, &b), a.cmp(&b), "{a:?} vs {b:?}");
+    }
+}
+
 fn make_key(user_key: &[u8], seqno: SeqNo) -> InternalKey {
     InternalKey::new(user_key.to_vec(), seqno, ValueType::Value)
 }

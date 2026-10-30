@@ -915,6 +915,11 @@ impl SkipMap {
         clippy::expect_used,
         reason = "infallible: fixed-width slices always convert to arrays"
     )]
+    #[expect(
+        clippy::inline_always,
+        reason = "every search step; out of line it costs a call per step"
+    )]
+    #[inline(always)]
     fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
         // One metadata read serves key offset, key length AND (on the equal
         // branch) the seqno: every field split into its own accessor would
@@ -930,12 +935,12 @@ impl SkipMap {
         let node_uk = unsafe { self.arena.get_bytes(key_off, key_len) };
 
         // Hot path: for the default byte-ordering comparator, compare the user
-        // keys with a direct `slice::cmp` (inlines to `memcmp`) instead of the
-        // `dyn` vtable call. This search visits O(log n) nodes per insert/lookup
-        // and is the dominant memtable-write cost, so removing the indirect call
-        // per visit matters. Custom comparators still go through the trait.
+        // keys inline (see `lexicographic`) instead of the `dyn` vtable call.
+        // This search visits O(log n) nodes per insert/lookup and is the
+        // dominant memtable-write cost, so the call per visit matters. Custom
+        // comparators still go through the trait.
         let uk_ord = if self.is_lexicographic {
-            node_uk.cmp(target_uk)
+            lexicographic(node_uk, target_uk)
         } else {
             self.comparator.compare(node_uk, target_uk)
         };
@@ -981,10 +986,10 @@ impl SkipMap {
                 self.arena.get_bytes(b_off, b_len),
             )
         };
-        // Same direct-`slice::cmp` fast path as `compare_key` for the default
-        // comparator (avoids the `dyn` vtable call per comparison).
+        // Same inline comparison as `compare_key` for the default comparator
+        // (avoids the `dyn` vtable call per comparison).
         let uk_ord = if self.is_lexicographic {
-            a_uk.cmp(b_uk)
+            lexicographic(a_uk, b_uk)
         } else {
             self.comparator.compare(a_uk, b_uk)
         };
@@ -1299,6 +1304,47 @@ fn node_height(seed: u64, value_idx: u32) -> usize {
     // Each pair of trailing zero bits adds one level.
     let tz = z.trailing_zeros() as usize;
     (1 + tz / 2).min(MAX_HEIGHT)
+}
+
+/// Longest key [`lexicographic`] compares in words: past it two keys may share
+/// a run of bytes long enough that `memcmp`'s vector loop costs less than a
+/// word per eight bytes. Measured on 80-byte keys the two cost the same.
+const WORD_COMPARE_MAX: usize = 64;
+
+/// The byte-lexicographic order of `a` and `b`, as `<[u8]>::cmp` gives it.
+///
+/// When either key is at most [`WORD_COMPARE_MAX`] bytes the keys are compared
+/// eight bytes at a time as big-endian words: `<[u8]>::cmp` calls `memcmp` on
+/// every search step, which costs more than the few word compares it replaces.
+/// Two longer keys go to `<[u8]>::cmp` from the start.
+#[expect(
+    clippy::inline_always,
+    reason = "runs at every search step of every insert and lookup"
+)]
+#[inline(always)]
+fn lexicographic(a: &[u8], b: &[u8]) -> CmpOrdering {
+    // The compare walks at most the shorter key, so only two long keys can
+    // share a long run.
+    if a.len() > WORD_COMPARE_MAX && b.len() > WORD_COMPARE_MAX {
+        return a.cmp(b);
+    }
+    let (a_words, _) = a.as_chunks::<8>();
+    let (b_words, _) = b.as_chunks::<8>();
+    let mut at = 0;
+    for (x, y) in a_words.iter().zip(b_words) {
+        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+        if x != y {
+            return x.cmp(&y);
+        }
+        at += 8;
+    }
+    // Fewer than eight bytes of the shorter key are left.
+    for (x, y) in a.iter().skip(at).zip(b.iter().skip(at)) {
+        if x != y {
+            return x.cmp(y);
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 // ---------------------------------------------------------------------------
