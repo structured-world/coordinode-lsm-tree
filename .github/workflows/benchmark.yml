@@ -178,7 +178,7 @@ jobs:
     runs-on:
       group: Bench
       labels: [self-hosted, bench, Linux]
-    # The whole job, every bench in it, fits in 30 minutes on a warm cache:
+    # The whole job, every bench in it, fits in 40 minutes on a warm cache:
     # the three builds side by side, the db_bench pass, the head-to-head
     # matrix and the publishing. Each bench step has its own limit below, so
     # an overrun fails at the bench that caused it.
@@ -188,7 +188,7 @@ jobs:
     # of the budget for the benches, so that run fails at its limit. The
     # build is saved to the cache as soon as it finishes, before any bench,
     # so the next run is warm again whatever happens to this one.
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         # Every step below is written in POSIX shell. Windows would otherwise
@@ -421,8 +421,10 @@ jobs:
         # Runs whatever the db_bench pass did, so a host that cannot build
         # RocksDB still reaches the db_bench publishing below.
         if: ${{ !cancelled() }}
-        # ~4 min on an idle host; the limit leaves room for a loaded one.
-        timeout-minutes: 15
+        # ~16 min on an idle host, about half of it the sustained overwrite at
+        # zstd 22 (compaction run to rest every round); the limit leaves room
+        # for a loaded one.
+        timeout-minutes: 25
         # Pin the published dashboard to the RocksDbParity preset (the apples-to-
         # apples comparison): every lsm-tree-only on-disk opt-in is OFF so the
         # numbers are not paying for protection RocksDB has no equivalent for.
