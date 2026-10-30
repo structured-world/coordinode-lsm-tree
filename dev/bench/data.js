@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793339622078,
+  "lastUpdate": 1793339631633,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -87240,6 +87240,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.618251908,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7b6b62f10e749f3446fbdac43e877b8ac430a896",
+          "message": "perf(write): take shared state off the concurrent insert path (#1024)\n\n## Summary\n\n- Concurrent inserts no longer serialize on shared state: no shared lock\nword on the insert path, no counters shared across writers, the\nmemtable's hot fields on cache lines of their own.\n- An insert gets the active memtable from its insert-gate shard with one\nplain load, instead of an `arc-swap` guard on the version mirror.\n- Compaction finishes its outputs before it takes the version lock, so a\nwriter rotating a memtable does not wait for an output's index, filter\nand sync.\n- Opening a table reads the archive trailer in one read and the table of\ncontents in 4 KiB chunks, one read for a usual table.\n- The comparison benches measure the overwrite path against RocksDB and\nSurrealKV, including a sustained overwrite with compaction and a reader\nrunning alongside, with our engine configured as an embedder would run\nit (background flush, deferred durability, one sync barrier per batch of\nflushes).\n\nReplaces #1020.\n\n## Measured\n\n`memtable_skew`, `Tree::insert`, keys without a common prefix, `main`\nand this branch built and run on the same 8-core benchmark host:\n\n| Scenario | `main` | this branch |\n|---|---|---|\n| 32 writers, append order | 1.55 M/s | 4.48 M/s (x2.9) |\n| 32 writers, uniform | 1.51 M/s | 3.91 M/s (x2.6) |\n| 32 writers, zipf | 1.54 M/s | 4.27 M/s (x2.8) |\n| 32 writers, hot set | 1.62 M/s | 5.38 M/s (x3.3) |\n| 1 writer, uniform: user cycles for the same inserts (lower is faster)\n| 5.96 G | 5.36 G (10% fewer) |\n\nSingle-writer throughput is within the run-to-run spread of the host\n(about 12-15% between runs of the same build); the hardware counters\nshow the branch does the same single-writer work in fewer cycles and\ninstructions.\n\nSustained overwrite against RocksDB (time per write, ours over theirs)\nis the same on `main` and on this branch with the same bench: about 1.0\nwithout compression and about 0.67 with zstd 22. Write-side parity there\ncomes from running our engine as an embedder would (background flush,\ndeferred durability), not from this change. Still open under #943: the\nreader's latency in the uncompressed sustained scenario (p50 about 210\nus against RocksDB's 10 us) and `overwrite` at n=1000 against SurrealKV.\n\n## Changes\n\n- `InsertGate`: inserts take a per-thread shard of a sharded lock, and\nthe gate hands them the active memtable it holds. A version that\nreplaces the active memtable closes every shard before it takes its\nseqno, sets the new memtable in the closed gate and keeps it closed\nuntil the version is published, so an insert either lands in the old\nmemtable under an earlier seqno or waits for the new one; the CDC scan\ncloses the gate too while it captures the active memtable.\n- Memtable: the skiplist derives a node's height from its value index\ninstead of a shared RNG state, its length from the value store; the\narena cursor, value-store index, tail hint, size and highest seqno each\nsit on a 128-byte line of their own.\n- Memtable search: the default byte order compares keys of up to 64\nbytes eight bytes at a time as big-endian words, inlined into the\nsearch, instead of a `memcmp` call per step; two longer keys still go to\n`memcmp`. Against the head before it, in user cycles for the same\ninserts: one writer 7% fewer on keys of 16-48 bytes, unchanged within\nrun-to-run spread on keys of 80-144 bytes and with 32 writers.\n- Compaction: the serial path produces its outputs before the\nversion-history lock, as the parallel path already did.\n- SFA archive reader: one read for the trailer; the table of contents is\nread in chunks bounded by the trailer's TOC length and position, so a\ndamaged length allocates nothing of its size.\n- Benches: per-part overwrite split (each part the median of\nwithin-round differences; setup errors returned, not panicked); memtable\nskew and writer-count bench (tree route and direct memtable route,\ncommon prefixes up to 256 bytes, each axis selectable by environment\nvariable); sustained overwrite against RocksDB with an optional metrics\ndiagnosis; SurrealKV arms; an overwrite arm with a caller-kept log.\n- The metrics-only and no_std feature builds compile again; items no\nother crate reaches in the files touched are `pub(crate)`.\n\n## Testing\n\nfmt, clippy in every CI configuration, tools (including the comparison\nbench) and fuzz clippy, `cargo doc -D warnings`, the no-std check, the\nunreachable-pub ratchet, nextest and doctests run on the current stable.\n\n## Related\n\n- #1023: readers and `Fs` implementations are handed uninitialized\nbuffers; fixed crate-wide there, by measurement.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added sustained-overwrite benchmark results and additional performance\nmetrics to benchmark comparisons.\n* Expanded support for using selected features in `no_std`\nconfigurations.\n* **Bug Fixes**\n* Improved reliability of inserts during tree clearing, scanning, and\nmemtable rotations.\n* Improved compaction cleanup after output failures and strengthened\nvalidation of table metadata before reading.\n  * Ensured pending data is flushed before writeback hints are issued.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-30T07:27:45+02:00",
+          "tree_id": "8cfd64869c64fead8cff8f6954471daf2260c056",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7b6b62f10e749f3446fbdac43e877b8ac430a896"
+        },
+        "date": 1793339628672,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 490.78000000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 107.955226ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 146.50199999999998,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.925694ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 439.697,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.234466ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4035.6200000000003,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 17824.688000000002,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.911,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 65.175551,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.556680802,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 23.327,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 65.142783,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.520696459,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
