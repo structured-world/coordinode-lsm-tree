@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793276706807,
+  "lastUpdate": 1793339610234,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65716,6 +65716,90 @@ window.BENCHMARK_DATA = {
             "value": 320746.43494507263,
             "unit": "ops/sec",
             "extra": "P50: 2.6us | P99: 12.7us | P99.9: 86.1us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7b6b62f10e749f3446fbdac43e877b8ac430a896",
+          "message": "perf(write): take shared state off the concurrent insert path (#1024)\n\n## Summary\n\n- Concurrent inserts no longer serialize on shared state: no shared lock\nword on the insert path, no counters shared across writers, the\nmemtable's hot fields on cache lines of their own.\n- An insert gets the active memtable from its insert-gate shard with one\nplain load, instead of an `arc-swap` guard on the version mirror.\n- Compaction finishes its outputs before it takes the version lock, so a\nwriter rotating a memtable does not wait for an output's index, filter\nand sync.\n- Opening a table reads the archive trailer in one read and the table of\ncontents in 4 KiB chunks, one read for a usual table.\n- The comparison benches measure the overwrite path against RocksDB and\nSurrealKV, including a sustained overwrite with compaction and a reader\nrunning alongside, with our engine configured as an embedder would run\nit (background flush, deferred durability, one sync barrier per batch of\nflushes).\n\nReplaces #1020.\n\n## Measured\n\n`memtable_skew`, `Tree::insert`, keys without a common prefix, `main`\nand this branch built and run on the same 8-core benchmark host:\n\n| Scenario | `main` | this branch |\n|---|---|---|\n| 32 writers, append order | 1.55 M/s | 4.48 M/s (x2.9) |\n| 32 writers, uniform | 1.51 M/s | 3.91 M/s (x2.6) |\n| 32 writers, zipf | 1.54 M/s | 4.27 M/s (x2.8) |\n| 32 writers, hot set | 1.62 M/s | 5.38 M/s (x3.3) |\n| 1 writer, uniform: user cycles for the same inserts (lower is faster)\n| 5.96 G | 5.36 G (10% fewer) |\n\nSingle-writer throughput is within the run-to-run spread of the host\n(about 12-15% between runs of the same build); the hardware counters\nshow the branch does the same single-writer work in fewer cycles and\ninstructions.\n\nSustained overwrite against RocksDB (time per write, ours over theirs)\nis the same on `main` and on this branch with the same bench: about 1.0\nwithout compression and about 0.67 with zstd 22. Write-side parity there\ncomes from running our engine as an embedder would (background flush,\ndeferred durability), not from this change. Still open under #943: the\nreader's latency in the uncompressed sustained scenario (p50 about 210\nus against RocksDB's 10 us) and `overwrite` at n=1000 against SurrealKV.\n\n## Changes\n\n- `InsertGate`: inserts take a per-thread shard of a sharded lock, and\nthe gate hands them the active memtable it holds. A version that\nreplaces the active memtable closes every shard before it takes its\nseqno, sets the new memtable in the closed gate and keeps it closed\nuntil the version is published, so an insert either lands in the old\nmemtable under an earlier seqno or waits for the new one; the CDC scan\ncloses the gate too while it captures the active memtable.\n- Memtable: the skiplist derives a node's height from its value index\ninstead of a shared RNG state, its length from the value store; the\narena cursor, value-store index, tail hint, size and highest seqno each\nsit on a 128-byte line of their own.\n- Memtable search: the default byte order compares keys of up to 64\nbytes eight bytes at a time as big-endian words, inlined into the\nsearch, instead of a `memcmp` call per step; two longer keys still go to\n`memcmp`. Against the head before it, in user cycles for the same\ninserts: one writer 7% fewer on keys of 16-48 bytes, unchanged within\nrun-to-run spread on keys of 80-144 bytes and with 32 writers.\n- Compaction: the serial path produces its outputs before the\nversion-history lock, as the parallel path already did.\n- SFA archive reader: one read for the trailer; the table of contents is\nread in chunks bounded by the trailer's TOC length and position, so a\ndamaged length allocates nothing of its size.\n- Benches: per-part overwrite split (each part the median of\nwithin-round differences; setup errors returned, not panicked); memtable\nskew and writer-count bench (tree route and direct memtable route,\ncommon prefixes up to 256 bytes, each axis selectable by environment\nvariable); sustained overwrite against RocksDB with an optional metrics\ndiagnosis; SurrealKV arms; an overwrite arm with a caller-kept log.\n- The metrics-only and no_std feature builds compile again; items no\nother crate reaches in the files touched are `pub(crate)`.\n\n## Testing\n\nfmt, clippy in every CI configuration, tools (including the comparison\nbench) and fuzz clippy, `cargo doc -D warnings`, the no-std check, the\nunreachable-pub ratchet, nextest and doctests run on the current stable.\n\n## Related\n\n- #1023: readers and `Fs` implementations are handed uninitialized\nbuffers; fixed crate-wide there, by measurement.\n\nPart of #943\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **New Features**\n* Added sustained-overwrite benchmark results and additional performance\nmetrics to benchmark comparisons.\n* Expanded support for using selected features in `no_std`\nconfigurations.\n* **Bug Fixes**\n* Improved reliability of inserts during tree clearing, scanning, and\nmemtable rotations.\n* Improved compaction cleanup after output failures and strengthened\nvalidation of table metadata before reading.\n  * Ensured pending data is flushed before writeback hints are issued.\n\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-30T07:27:45+02:00",
+          "tree_id": "8cfd64869c64fead8cff8f6954471daf2260c056",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/7b6b62f10e749f3446fbdac43e877b8ac430a896"
+        },
+        "date": 1793339607280,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 84909.53752165749,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 19.5us | P99.9: 37.1us\nthreads: 1 | elapsed: 6.30s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2946266.752988354,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 815489.1530646066,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.6us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 465400.6182833252,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 7.0us | P99.9: 24.3us\nthreads: 1 | elapsed: 0.43s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3017485.0282199727,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 294810.6497823655,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 10.8us | P99.9: 20.1us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 163981.69112934056,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.6us | P99.9: 22.5us\nthreads: 1 | elapsed: 1.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 747052.1890248375,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.7us | P99.9: 12.6us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 778438.0415727249,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 1.7us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 292773.64938549366,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 17.3us | P99.9: 99.5us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
           }
         ]
       }
