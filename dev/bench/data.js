@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793342458312,
+  "lastUpdate": 1793345156915,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65884,6 +65884,90 @@ window.BENCHMARK_DATA = {
             "value": 349948.7023320328,
             "unit": "ops/sec",
             "extra": "P50: 2.1us | P99: 13.1us | P99.9: 91.6us\nthreads: 1 | elapsed: 0.57s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "199aa80fb649010ec7fdeda9a95f905b8e749a50",
+          "message": "ci(bench): give the head-to-head step room for the sustained groups (#1026)\n\n## Summary\n\n- The head-to-head step of the `Benchmark` workflow gets a 25-minute\nlimit and the job a 40-minute one, so the sustained overwrite groups fit\nand the comparison page is published again.\n\n## Changes\n\n- `.github/workflows/benchmark.yml`: step limit 15 → 25 minutes, job\nlimit 30 → 40 minutes; the step's comment states its real duration\n(about 16 minutes on an idle host, half of it the sustained overwrite at\nzstd 22).\n\n## Testing\n\nCI configuration only; the `Benchmark` workflow on `main` after the\nmerge is the check.\n\nCloses #1025",
+          "timestamp": "2026-10-30T07:08:48Z",
+          "tree_id": "7b7478d51501fc560ea66b0c56541fb54667b240",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/199aa80fb649010ec7fdeda9a95f905b8e749a50"
+        },
+        "date": 1793345155660,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 83841.8553695695,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.2us | P99.9: 22.7us\nthreads: 1 | elapsed: 6.38s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2491766.766544154,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 781023.8051330611,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.6us | P99.9: 12.3us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 481872.6612460972,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.8us | P99.9: 29.3us\nthreads: 1 | elapsed: 0.42s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3166733.23931619,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 6.3us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 298222.97443798324,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 7.7us | P99.9: 18.6us\nthreads: 1 | elapsed: 0.67s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 184994.67903504585,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 12.0us | P99.9: 44.5us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 814448.5087551647,
+            "unit": "ops/sec",
+            "extra": "P50: 0.9us | P99: 2.0us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 856323.3972445448,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 338111.80549320445,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 12.2us | P99.9: 92.2us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
           }
         ]
       }
