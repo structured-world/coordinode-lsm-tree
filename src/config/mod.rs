@@ -1112,6 +1112,11 @@ pub struct Config {
     #[cfg(all(test, feature = "std"))]
     pub(crate) before_output_install: Arc<std::sync::Mutex<Option<OutputInstallHook>>>,
 
+    /// Test-only failpoint: run once, then disarmed, while a compaction
+    /// finishes its outputs, after their last write and before their reopen.
+    #[cfg(all(test, feature = "std"))]
+    pub(crate) while_outputs_finish: Arc<std::sync::Mutex<Option<OutputInstallHook>>>,
+
     /// A dictionary supplied for the data block policy to name. The open
     /// registers it with the tree, so it survives the reopen without being
     /// supplied again.
@@ -1293,6 +1298,8 @@ impl Default for Config {
             fail_tight_blob_reopen: Arc::new(core::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(test, feature = "std"))]
             before_output_install: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(all(test, feature = "std"))]
+            while_outputs_finish: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -1316,6 +1323,24 @@ impl Config {
     pub(crate) fn fire_before_output_install(&self) {
         #[expect(clippy::unwrap_used, reason = "test-only seam")]
         let hook = self.before_output_install.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Arms the [`Self::while_outputs_finish`] failpoint with `hook`.
+    pub(crate) fn arm_while_outputs_finish(&self, hook: impl FnOnce() + Send + 'static) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        self.while_outputs_finish
+            .lock()
+            .unwrap()
+            .replace(Box::new(hook));
+    }
+
+    /// Runs the [`Self::while_outputs_finish`] failpoint once, if armed.
+    pub(crate) fn fire_while_outputs_finish(&self) {
+        #[expect(clippy::unwrap_used, reason = "test-only seam")]
+        let hook = self.while_outputs_finish.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
         }

@@ -125,7 +125,8 @@ bytes_1 = ["dep:bytes"]
 # per-KV checksums. Without this feature the `Xxh3_64` (default) and
 # `Xxh3Low32` algorithms still work; selecting `ChecksumAlgorithm::Crc32c`
 # at runtime returns "not compiled in" so callers can fall back or error.
-crc32c = ["dep:crc32c"]
+# The `crc32c` crate needs `std`, so the feature brings it.
+crc32c = ["dep:crc32c", "std"]
 metrics = []
 # Columnar (PAX / rowgroup) SST block type: per-column codecs + transpose on
 # compaction. The decode read-path is core + alloc (runtime-SIMD with a scalar
@@ -152,7 +153,9 @@ ribbon-serde = ["dep:serde"]
 #     cd tools/compare-rocksdb && cargo bench
 
 [dependencies]
-bytes = { version = "1.11.1", optional = true }
+# No `std`: `Bytes` and `BytesMut` need only `alloc`, so `bytes_1` stays
+# available to a no-std build.
+bytes = { version = "1.11.1", optional = true, default-features = false }
 # Lockless atomic snapshot for RuntimeConfig (see src/runtime_config/).
 # Lock-free atomic Arc swap. `arc-swap` 1.x is NOT `#![no_std]` (it requires
 # `std`), so it stays an optional dependency enabled only by the `std`
@@ -232,8 +235,9 @@ libm = { version = "0.2", default-features = false }
 self_cell = "1.2.0"
 # Optional — only pulled in by the vendored Ribbon filter under the
 # `ribbon-serde` feature flag (off by default). No `derive`: the impls are
-# written out, so the crate builds no proc-macro (`syn`, `quote`).
-serde = { version = "1", optional = true }
+# written out, so the crate builds no proc-macro (`syn`, `quote`). No `std`
+# either: the impls need `alloc` only, so `ribbon-serde` builds without it.
+serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
 # sfa is vendored under src/sfa/ (upstream does not accept PRs; pinning
 # the format to in-tree code lets us evolve it locally without waiting
 # for a release we cannot influence). License files preserved alongside.
@@ -515,6 +519,18 @@ name = "flush"
 harness = false
 path = "benches/flush.rs"
 required-features = ["zstd"]
+
+[[bench]]
+name = "overwrite"
+harness = false
+path = "benches/overwrite.rs"
+required-features = ["std"]
+
+[[bench]]
+name = "memtable_skew"
+harness = false
+path = "benches/memtable_skew.rs"
+required-features = ["std"]
 
 [[bench]]
 name = "flush_split"

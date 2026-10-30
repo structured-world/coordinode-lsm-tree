@@ -15,6 +15,7 @@
 //! `InternalKey` ordering (`user_key` ASC, seqno DESC).
 
 use super::arena::Arena;
+use super::own_line::OwnLine;
 use super::value_store::ValueStore;
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
@@ -25,7 +26,6 @@ use crate::{UserKey, ValueType};
 use core::cmp::Ordering as CmpOrdering;
 use core::ops::{Bound, RangeBounds};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use portable_atomic::AtomicU64;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -126,7 +126,7 @@ enum NodeKvDigest {
 /// time.  Values are stored in a lock-free segmented [`ValueStore`] so large
 /// blobs do not bloat the arena; value reads are wait-free.  Keys are
 /// [`InternalKey`] (ordered by `user_key` ascending, then seqno descending).
-pub struct SkipMap {
+pub(crate) struct SkipMap {
     arena: Arena,
     /// Lock-free segmented storage for values.  Keys live in the arena for
     /// cache locality during comparisons; values live here so large blobs
@@ -143,33 +143,43 @@ pub struct SkipMap {
     head: u32,
     /// Current maximum height of any inserted node.
     height: AtomicUsize,
-    /// Number of entries (not counting the head sentinel).
-    len: AtomicUsize,
-    /// PRNG counter for height generation (splitmix64-based).
-    rng_state: AtomicU64,
+    /// Seed of the node heights, mixed with each node's value index: the
+    /// index reservation is already one per insert, so the heights need no
+    /// counter of their own for the writers to share.
+    height_seed: u64,
     /// The most recently appended TAIL node (`UNSET` until one exists), a
     /// hint for the sequential-insert fast path in
     /// [`Self::insert_with_kv_digest`]. Purely advisory: the fast path
     /// re-validates it and the level-0 CAS is what makes the link correct,
     /// so a stale hint costs one comparison and falls back to the full
     /// splice search. Nodes are never freed while the map lives, so the
-    /// offset stays dereferenceable.
-    tail_hint: AtomicU32,
+    /// offset stays dereferenceable. Each append moves it, so it keeps off
+    /// the fields every search reads.
+    tail_hint: OwnLine<AtomicU32>,
+    /// Links an insert retried because another writer changed its predecessor
+    /// between the splice search and the link: the contention concurrent
+    /// writers meet. Counted on the failed path only.
+    #[cfg(feature = "metrics")]
+    cas_retries: AtomicUsize,
     /// Test-only: runs once inside a seek, between its level-0 comparison and
     /// its return, so a test can link a node into that window deterministically.
     #[cfg(test)]
     seek_hook: std::sync::Mutex<Option<SeekHook>>,
+    /// Test-only: runs once inside an insert, between its splice search and
+    /// its first link, so a test can race that link deterministically.
+    #[cfg(all(test, feature = "metrics"))]
+    link_hook: std::sync::Mutex<Option<SeekHook>>,
 }
 
 /// What [`SkipMap::seek_hook`] runs.
 #[cfg(test)]
-pub type SeekHook = alloc::boxed::Box<dyn FnOnce(&SkipMap) + Send>;
+pub(crate) type SeekHook = alloc::boxed::Box<dyn FnOnce(&SkipMap) + Send>;
 
 impl SkipMap {
     /// Creates a new empty skiplist with the given user key comparator.
     ///
     /// The arena grows lazily in 4 MiB blocks — no large upfront allocation.
-    pub fn new(comparator: SharedComparator) -> Self {
+    pub(crate) fn new(comparator: SharedComparator) -> Self {
         let arena = Arena::new();
 
         // Allocate the head sentinel with MAX_HEIGHT.
@@ -221,11 +231,44 @@ impl SkipMap {
             is_lexicographic,
             head,
             height: AtomicUsize::new(1),
-            len: AtomicUsize::new(0),
-            rng_state: AtomicU64::new(seed),
-            tail_hint: AtomicU32::new(UNSET),
+            height_seed: seed,
+            tail_hint: OwnLine(AtomicU32::new(UNSET)),
+            #[cfg(feature = "metrics")]
+            cas_retries: AtomicUsize::new(0),
             #[cfg(test)]
             seek_hook: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "metrics"))]
+            link_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Inserts whose link was retried because another writer changed the
+    /// predecessor first, counted once per retried level.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn cas_retries(&self) -> usize {
+        self.cas_retries.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: arms `hook` to run once inside the next insert, between its
+    /// splice search and its first link.
+    #[cfg(all(test, feature = "metrics"))]
+    pub(crate) fn set_link_hook(&self, hook: SeekHook) {
+        *self
+            .link_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Test-only: runs the armed link hook, if any, once.
+    #[cfg(all(test, feature = "metrics"))]
+    fn run_link_hook(&self) {
+        let hook = self
+            .link_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook(self);
         }
     }
 
@@ -260,7 +303,7 @@ impl SkipMap {
     ///
     /// Multiple entries with the same `user_key` but different `seqno` are
     /// expected (MVCC).  No deduplication is performed.
-    pub fn insert(&self, key: &InternalKey, value: UserValue) {
+    pub(crate) fn insert(&self, key: &InternalKey, value: UserValue) {
         self.insert_with_kv_digest(key, value, None);
     }
 
@@ -278,14 +321,21 @@ impl SkipMap {
         clippy::indexing_slicing,
         reason = "preds/succs are [u32; MAX_HEIGHT]; level < height <= MAX_HEIGHT"
     )]
-    pub fn insert_with_kv_digest(
+    pub(crate) fn insert_with_kv_digest(
         &self,
         key: &InternalKey,
         value: UserValue,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) {
-        let height = self.random_height();
-        let node = self.alloc_node(key, value, height, kv_digest);
+        let value_idx = self.values.reserve();
+        // The slot is written before anything that can panic: the store
+        // drops every slot below its count as a value, so a reserved slot
+        // left unwritten by a panic in the node's allocation would be dropped
+        // as one it never held.
+        // SAFETY: `value_idx` was reserved by this insert and is written once.
+        unsafe { self.values.write(value_idx, value) };
+        let height = node_height(self.height_seed, value_idx);
+        let node = self.alloc_node(key, value_idx, height, kv_digest);
 
         // Raise the list height if needed.
         let mut list_h = self.height.load(Ordering::Relaxed);
@@ -325,9 +375,11 @@ impl SkipMap {
         } else {
             self.find_splice(key, &mut preds, &mut succs);
         }
+        #[cfg(all(test, feature = "metrics"))]
+        self.run_link_hook();
 
         for level in 0..height {
-            loop {
+            'link: loop {
                 // SAFETY: `node` was allocated with `height` levels and
                 // `level < height`, so `tower_atomic(node, level)` is within
                 // the node's arena allocation.
@@ -342,18 +394,25 @@ impl SkipMap {
                 // or a previously inserted node with height > level.
                 // CAS pred.next[level] from succs[level] to new_node
                 let pred_next = unsafe { self.tower_atomic(preds[level], level) };
-                match pred_next.compare_exchange_weak(
-                    succs[level],
-                    node,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(_) => {
-                        // Predecessor changed — re-search at this level.
-                        self.find_splice_for_level(key, &mut preds, &mut succs, level);
+                loop {
+                    match pred_next.compare_exchange_weak(
+                        succs[level],
+                        node,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break 'link,
+                        // A weak CAS may fail with the expected value still in
+                        // place (LL/SC targets): the splice holds, so retry it
+                        // as is rather than search again.
+                        Err(seen) if seen == succs[level] => {}
+                        Err(_) => break,
                     }
                 }
+                #[cfg(feature = "metrics")]
+                self.cas_retries.fetch_add(1, Ordering::Relaxed);
+                // Predecessor changed: re-search at this level.
+                self.find_splice_for_level(key, &mut preds, &mut succs, level);
             }
         }
 
@@ -363,13 +422,12 @@ impl SkipMap {
         if succs[0] == UNSET {
             self.tail_hint.store(node, Ordering::Relaxed);
         }
-
-        self.len.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns the number of entries.
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+    /// Returns the number of entries, an insert in progress included: each
+    /// holds one value index from before its node is linked.
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
     }
 
     /// Test-only: flips a bit in the first node's user-key bytes, simulating a
@@ -409,7 +467,7 @@ impl SkipMap {
     }
 
     /// Returns `true` if the skiplist is empty.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -432,7 +490,7 @@ impl SkipMap {
     /// - [`crate::Error::FeatureUnsupported`] when a node's algorithm is not
     ///   compiled into this build (cannot recompute). Config validation rejects
     ///   selecting an uncompiled algorithm, so this is a defensive guard.
-    pub fn verify_kv_digests(&self) -> crate::Result<()> {
+    pub(crate) fn verify_kv_digests(&self) -> crate::Result<()> {
         let mut node = self.first_node();
         while node != UNSET {
             match self.node_kv_digest(node) {
@@ -477,7 +535,7 @@ impl SkipMap {
     }
 
     /// Returns an iterator over all entries in order.
-    pub fn iter(&self) -> Iter<'_> {
+    pub(crate) fn iter(&self) -> Iter<'_> {
         Iter {
             map: self,
             front: self.first_node(),
@@ -489,7 +547,7 @@ impl SkipMap {
     }
 
     /// Returns an iterator over entries within the given range.
-    pub fn range<R: RangeBounds<InternalKey>>(&self, range: R) -> Range<'_> {
+    pub(crate) fn range<R: RangeBounds<InternalKey>>(&self, range: R) -> Range<'_> {
         let front = match range.start_bound() {
             Bound::Included(k) => self.seek_ge(k),
             Bound::Excluded(k) => self.seek_gt(k),
@@ -528,7 +586,7 @@ impl SkipMap {
     fn alloc_node(
         &self,
         key: &InternalKey,
-        value: UserValue,
+        value_idx: u32,
         height: usize,
         kv_digest: Option<(u32, ChecksumAlgorithm)>,
     ) -> u32 {
@@ -559,9 +617,6 @@ impl SkipMap {
                     .copy_from_slice(key_bytes);
             }
         }
-
-        // Store value in the lock-free segmented store.
-        let value_idx = self.values.append(value);
 
         // Write immutable metadata using direct byte offsets matching the
         // node layout comment above.  The arena guarantees 24+ bytes at `node`.
@@ -796,8 +851,9 @@ impl SkipMap {
 
     /// Reads the value for `node` from the lock-free value store (wait-free).
     fn node_value(&self, node: u32) -> UserValue {
-        // SAFETY: node_value_idx was set during alloc_node→ValueStore::append,
-        // and this node is only reachable after the skiplist CAS that published
+        // SAFETY: node_value_idx is the index the insert reserved and wrote
+        // (`ValueStore::reserve` then `write`) before allocating this node,
+        // and the node is only reachable after the skiplist CAS that published
         // it (establishing happens-before for the value write).
         unsafe { self.values.get(self.node_value_idx(node)) }
     }
@@ -859,6 +915,11 @@ impl SkipMap {
         clippy::expect_used,
         reason = "infallible: fixed-width slices always convert to arrays"
     )]
+    #[expect(
+        clippy::inline_always,
+        reason = "every search step; out of line it costs a call per step"
+    )]
+    #[inline(always)]
     fn compare_key_parts(&self, node: u32, target_uk: &[u8], target_seqno: SeqNo) -> CmpOrdering {
         // One metadata read serves key offset, key length AND (on the equal
         // branch) the seqno: every field split into its own accessor would
@@ -874,12 +935,12 @@ impl SkipMap {
         let node_uk = unsafe { self.arena.get_bytes(key_off, key_len) };
 
         // Hot path: for the default byte-ordering comparator, compare the user
-        // keys with a direct `slice::cmp` (inlines to `memcmp`) instead of the
-        // `dyn` vtable call. This search visits O(log n) nodes per insert/lookup
-        // and is the dominant memtable-write cost, so removing the indirect call
-        // per visit matters. Custom comparators still go through the trait.
+        // keys inline (see `lexicographic`) instead of the `dyn` vtable call.
+        // This search visits O(log n) nodes per insert/lookup and is the
+        // dominant memtable-write cost, so the call per visit matters. Custom
+        // comparators still go through the trait.
         let uk_ord = if self.is_lexicographic {
-            node_uk.cmp(target_uk)
+            lexicographic(node_uk, target_uk)
         } else {
             self.comparator.compare(node_uk, target_uk)
         };
@@ -925,10 +986,10 @@ impl SkipMap {
                 self.arena.get_bytes(b_off, b_len),
             )
         };
-        // Same direct-`slice::cmp` fast path as `compare_key` for the default
-        // comparator (avoids the `dyn` vtable call per comparison).
+        // Same inline comparison as `compare_key` for the default comparator
+        // (avoids the `dyn` vtable call per comparison).
         let uk_ord = if self.is_lexicographic {
-            a_uk.cmp(b_uk)
+            lexicographic(a_uk, b_uk)
         } else {
             self.comparator.compare(a_uk, b_uk)
         };
@@ -1056,7 +1117,7 @@ impl SkipMap {
     /// materialized, so the probe key is never copied and nothing allocates.
     /// The found entry's key IS materialized, as a zero-copy view on the slice
     /// backend (see [`Self::node_internal_key`]).
-    pub fn point_get(&self, key: &[u8], max_seqno: SeqNo) -> Option<InternalValue> {
+    pub(crate) fn point_get(&self, key: &[u8], max_seqno: SeqNo) -> Option<InternalValue> {
         let node = self.seek_ge_parts(key, max_seqno);
         if node == UNSET {
             return None;
@@ -1226,27 +1287,64 @@ impl SkipMap {
             next = self.next_at(next, 0);
         }
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Internal: random height
-    // -----------------------------------------------------------------------
+/// The tower height of the node holding value `value_idx`: geometric with
+/// P = 1/4, from the splitmix64 finaliser over `seed + value_idx`. The index
+/// is unique per insert, so the heights are as independent as a shared counter
+/// would make them, without one.
+fn node_height(seed: u64, value_idx: u32) -> usize {
+    let mut z = seed
+        .wrapping_add(u64::from(value_idx))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
 
-    /// Generates a random tower height using a geometric distribution (P = 1/4).
-    fn random_height(&self) -> usize {
-        // Each thread gets a unique seed from fetch_add, then we hash it.
-        let state = self.rng_state.fetch_add(1, Ordering::Relaxed);
+    // Each pair of trailing zero bits adds one level.
+    let tz = z.trailing_zeros() as usize;
+    (1 + tz / 2).min(MAX_HEIGHT)
+}
 
-        // splitmix64 finaliser for good bit mixing
-        let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
+/// Longest key [`lexicographic`] compares in words: past it two keys may share
+/// a run of bytes long enough that `memcmp`'s vector loop costs less than a
+/// word per eight bytes. Measured on 80-byte keys the two cost the same.
+const WORD_COMPARE_MAX: usize = 64;
 
-        // Count pairs of trailing zero bits → geometric(P=1/4)
-        let tz = z.trailing_zeros() as usize;
-        // Each pair of trailing zero bits adds one level
-        (1 + tz / 2).min(MAX_HEIGHT)
+/// The byte-lexicographic order of `a` and `b`, as `<[u8]>::cmp` gives it.
+///
+/// When either key is at most [`WORD_COMPARE_MAX`] bytes the keys are compared
+/// eight bytes at a time as big-endian words: `<[u8]>::cmp` calls `memcmp` on
+/// every search step, which costs more than the few word compares it replaces.
+/// Two longer keys go to `<[u8]>::cmp` from the start.
+#[expect(
+    clippy::inline_always,
+    reason = "runs at every search step of every insert and lookup"
+)]
+#[inline(always)]
+fn lexicographic(a: &[u8], b: &[u8]) -> CmpOrdering {
+    // The compare walks at most the shorter key, so only two long keys can
+    // share a long run.
+    if a.len() > WORD_COMPARE_MAX && b.len() > WORD_COMPARE_MAX {
+        return a.cmp(b);
     }
+    let (a_words, _) = a.as_chunks::<8>();
+    let (b_words, _) = b.as_chunks::<8>();
+    let mut at = 0;
+    for (x, y) in a_words.iter().zip(b_words) {
+        let (x, y) = (u64::from_be_bytes(*x), u64::from_be_bytes(*y));
+        if x != y {
+            return x.cmp(&y);
+        }
+        at += 8;
+    }
+    // Fewer than eight bytes of the shorter key are left.
+    for (x, y) in a.iter().skip(at).zip(b.iter().skip(at)) {
+        if x != y {
+            return x.cmp(y);
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,19 +1352,19 @@ impl SkipMap {
 // ---------------------------------------------------------------------------
 
 /// A reference to a key-value pair stored in the skiplist arena.
-pub struct Entry<'a> {
+pub(crate) struct Entry<'a> {
     map: &'a SkipMap,
     node: u32,
 }
 
 impl Entry<'_> {
     /// Reconstructs the [`InternalKey`] (allocates a new `Slice` for `user_key`).
-    pub fn key(&self) -> InternalKey {
+    pub(crate) fn key(&self) -> InternalKey {
         self.map.node_internal_key(self.node)
     }
 
     /// Reconstructs the value (allocates a new `Slice`).
-    pub fn value(&self) -> UserValue {
+    pub(crate) fn value(&self) -> UserValue {
         self.map.node_value(self.node)
     }
 }
@@ -1360,7 +1458,7 @@ impl SkipMap {
 // ---------------------------------------------------------------------------
 
 /// Forward + backward iterator over all entries in a [`SkipMap`].
-pub struct Iter<'a> {
+pub(crate) struct Iter<'a> {
     map: &'a SkipMap,
     front: u32,
     /// The node the next backward step hands out.
@@ -1441,7 +1539,7 @@ impl DoubleEndedIterator for Iter<'_> {
 // ---------------------------------------------------------------------------
 
 /// Forward + backward iterator over a range of entries in a [`SkipMap`].
-pub struct Range<'a> {
+pub(crate) struct Range<'a> {
     map: &'a SkipMap,
     end_bound: Bound<InternalKey>,
     front: u32,
@@ -1467,7 +1565,7 @@ impl Range<'_> {
     /// search from the top of the list, rather than node by node. The front
     /// holds no node of an earlier key (the caller resolved `user_key` from
     /// the merge), so the search lands at or after it, never back.
-    pub fn skip_front_past(&mut self, user_key: &[u8]) {
+    pub(crate) fn skip_front_past(&mut self, user_key: &[u8]) {
         if self.done || self.front == UNSET {
             return;
         }
@@ -1490,7 +1588,7 @@ impl Range<'_> {
     /// with one search from the top of the list; whether the next backward
     /// step yields it. Only a back standing on an older version moves, and
     /// never past the front.
-    pub fn skip_back_to_newest(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
+    pub(crate) fn skip_back_to_newest(&mut self, user_key: &[u8], seqno: SeqNo) -> bool {
         if self.done || !self.back_init || self.back == UNSET {
             return false;
         }

@@ -24,6 +24,7 @@
 //! creation. This removes the per-flush zeroing cost (a fresh memtable no
 //! longer eagerly zeroes its arena block).
 
+use super::own_line::OwnLine;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 use core::ptr;
@@ -69,7 +70,9 @@ pub(crate) struct Arena {
 
     /// Allocation cursor.  High 10 bits = block index, low 22 bits = offset
     /// within that block.  Starts at 1 (offset 0 is the UNSET sentinel).
-    cursor: AtomicU32,
+    /// Every insert moves it; every search step reads `blocks`, so the two
+    /// keep apart.
+    cursor: OwnLine<AtomicU32>,
 }
 
 // Send+Sync derived automatically: all fields (Box<[AtomicPtr<_>]>, AtomicU32)
@@ -87,7 +90,7 @@ impl Arena {
         Self {
             blocks: blocks.into_boxed_slice(),
             // Offset 0 is reserved as the UNSET sentinel.
-            cursor: AtomicU32::new(1),
+            cursor: OwnLine(AtomicU32::new(1)),
         }
     }
 
@@ -267,24 +270,35 @@ impl Arena {
         let block_idx = (offset >> BLOCK_SHIFT) as usize;
         let off = (offset & BLOCK_MASK) as usize;
 
-        let mut ptr = self.blocks[block_idx].load(Ordering::Acquire);
+        let ptr = self.blocks[block_idx].load(Ordering::Acquire);
         if ptr.is_null() {
-            // The block is being allocated by another thread's ensure_block.
-            // Spin briefly — ensure_block uses CAS with AcqRel, so the
-            // pointer will become visible after a few iterations.
-            for _ in 0..1000 {
-                core::hint::spin_loop();
-                ptr = self.blocks[block_idx].load(Ordering::Acquire);
-                if !ptr.is_null() {
-                    return (ptr, off);
-                }
-            }
-            // If still null after spinning, allocate the block ourselves.
-            self.ensure_block(block_idx);
-            ptr = self.blocks[block_idx].load(Ordering::Acquire);
+            return (self.wait_for_block(block_idx), off);
         }
-
         (ptr, off)
+    }
+
+    /// The pointer of block `block_idx`, which another thread's `ensure_block`
+    /// is still publishing. Out of line, so the search steps that decode an
+    /// offset carry only the load and the branch.
+    #[cold]
+    #[inline(never)]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "block_idx < MAX_BLOCKS by construction (alloc enforces this)"
+    )]
+    fn wait_for_block(&self, block_idx: usize) -> *mut u8 {
+        // Spin briefly: ensure_block uses CAS with AcqRel, so the pointer
+        // becomes visible after a few iterations.
+        for _ in 0..1000 {
+            core::hint::spin_loop();
+            let ptr = self.blocks[block_idx].load(Ordering::Acquire);
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        // Still null after spinning: allocate the block ourselves.
+        self.ensure_block(block_idx);
+        self.blocks[block_idx].load(Ordering::Acquire)
     }
 
     /// Ensures that the block at `idx` is allocated.  Uses CAS to avoid

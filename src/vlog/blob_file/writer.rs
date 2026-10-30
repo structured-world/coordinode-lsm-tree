@@ -372,7 +372,7 @@ impl Writer {
     ) {
         self.lifetime_class = class;
         if let Some(lifetime) = lifetime {
-            let file = self.writer.get_mut().inner_mut().get_ref();
+            let file = self.writer.get_mut().get_ref().get_ref();
             if let Err(error) = file.set_write_lifetime(lifetime) {
                 log::debug!(
                     "write lifetime hint refused for {}: {error}",
@@ -395,10 +395,10 @@ impl Writer {
         #[cfg(feature = "std")]
         use std::io::Write;
         // The range is in the buffer until it is flushed to the file.
-        let buffered = self.writer.get_mut().inner_mut();
-        buffered.flush()?;
+        let checksummed = self.writer.get_mut();
+        checksummed.flush()?;
         crate::fs::hint_writeback(
-            &**buffered.get_ref(),
+            &**checksummed.get_ref().get_ref(),
             self.written_back,
             pending,
             &mut self.writeback_bytes,
@@ -650,11 +650,11 @@ impl Writer {
         };
         metadata.encode_into(&mut self.writer)?;
 
-        let mut checksum = self.writer.into_inner()?;
+        let checksum = self.writer.into_inner()?;
         // Data and size are all a read of the file needs, so `sync_data`. A
         // deferred file is synced by the install that persists it.
         if self.durability == crate::config::FlushDurability::Synced {
-            FsFile::sync_data_with(&**checksum.inner_mut().get_mut(), self.sync_mode)?;
+            FsFile::sync_data_with(&**checksum.get_ref().get_ref(), self.sync_mode)?;
         }
         let checksum = checksum.checksum();
 

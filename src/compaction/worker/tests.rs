@@ -6752,3 +6752,45 @@ mod locality_relocation {
         Ok(())
     }
 }
+
+/// A compaction finishes and reopens its outputs without the version lock:
+/// while they finish, a reader can still take the version. Guards against
+/// finishing the outputs under the write lock, which held every read and every
+/// write of the tree for that table I/O.
+#[test]
+fn produced_compaction_outputs_leave_the_version_lock_free() -> crate::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let tree = match Config::new(
+        dir.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?
+    {
+        crate::AnyTree::Standard(t) => t,
+        crate::AnyTree::Blob(_) => panic!("expected Standard tree"),
+    };
+    for seqno in 0..2 {
+        for i in 0..100u64 {
+            tree.insert(i.to_be_bytes(), b"value", seqno * 100 + i);
+        }
+        tree.flush_active_memtable(0)?;
+    }
+
+    let readable: Arc<parking_lot::Mutex<Option<bool>>> = Arc::default();
+    {
+        let probe = tree.clone();
+        let readable = Arc::clone(&readable);
+        tree.config.arm_while_outputs_finish(move || {
+            *readable.lock() = Some(probe.version_history.try_read().is_some());
+        });
+    }
+    tree.major_compact(64 * 1024 * 1024, 200)?;
+
+    assert_eq!(
+        *readable.lock(),
+        Some(true),
+        "the version is readable while the outputs finish"
+    );
+    Ok(())
+}

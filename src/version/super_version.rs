@@ -394,6 +394,13 @@ pub struct SuperVersions {
     #[cfg(feature = "std")]
     latest: Arc<ArcSwap<SuperVersion>>,
 
+    /// What inserts hold instead of the history lock, and where they get the
+    /// active memtable from: the gate's own copy, not [`Self::latest`]. Only
+    /// [`Self::publish`] replaces it, through a closed gate, so no insert lands
+    /// in a memtable once it is sealed; `latest` is the readers' mirror.
+    #[cfg(feature = "std")]
+    insert_gate: Arc<super::insert_gate::InsertGate>,
+
     /// The tree's filter budget, when it allocates filter memory by probe
     /// load: every version this history publishes updates the filter bytes
     /// it holds.
@@ -403,6 +410,11 @@ pub struct SuperVersions {
     /// out before them. Reads register under this history's read lock and
     /// installs record under its write lock.
     released: Arc<crate::blob_tree::released::ReleasedObjects>,
+
+    /// Fired by an install after its seqno is taken and before the version is
+    /// persisted, so a test can act inside that window.
+    #[cfg(test)]
+    pub(crate) before_persist: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl SuperVersions {
@@ -433,6 +445,10 @@ impl SuperVersions {
         Self {
             #[cfg(feature = "std")]
             latest: Arc::new(ArcSwap::from_pointee(initial.clone())),
+            #[cfg(feature = "std")]
+            insert_gate: Arc::new(super::insert_gate::InsertGate::new(Arc::clone(
+                &initial.active_memtable,
+            ))),
             current: initial,
             persisted: version,
             unsynced: Vec::new(),
@@ -447,6 +463,8 @@ impl SuperVersions {
             edit_scratch: Vec::new(),
             filter_budget: None,
             released: Arc::default(),
+            #[cfg(test)]
+            before_persist: None,
         }
     }
 
@@ -527,15 +545,16 @@ impl SuperVersions {
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         retention: RetentionEffect,
     ) -> crate::Result<()> {
-        self.upgrade_version_with_seqno(
+        self.install(
             tree_path,
             f,
-            seqno.next(),
+            || seqno.next(),
             visible_seqno,
             fs,
             runtime,
             encryption,
             retention,
+            None,
         )
     }
 
@@ -565,7 +584,7 @@ impl SuperVersions {
         self.install(
             tree_path,
             f,
-            seqno,
+            || seqno,
             visible_seqno,
             fs,
             runtime,
@@ -602,7 +621,7 @@ impl SuperVersions {
         self.install(
             tree_path,
             f,
-            seqno.next(),
+            || seqno.next(),
             visible_seqno,
             fs,
             runtime,
@@ -620,7 +639,8 @@ impl SuperVersions {
         &mut self,
         tree_path: &Path,
         f: F,
-        seqno: SeqNo,
+        // Taken only once the next version is known: see the insert gate below.
+        seqno: impl FnOnce() -> SeqNo,
         visible_seqno: &SharedSequenceNumberGenerator,
         fs: &dyn Fs,
         runtime: Arc<crate::runtime_config::RuntimeConfig>,
@@ -629,14 +649,26 @@ impl SuperVersions {
         deferred: Option<Vec<UnsyncedFile>>,
     ) -> crate::Result<()> {
         let prior = self.latest_version();
+        let mut next_version = f(&prior)?;
+        // A version that replaces the active memtable takes its seqno with the
+        // insert gate closed, and keeps it closed until it is published: an
+        // insert either took its seqno before (it is in the replaced memtable,
+        // covered by this install) or waits and lands in the new one. Open,
+        // an insert with a later seqno could land in the replaced memtable
+        // and be dropped with it, above the floor a clear raises. The `Arc`
+        // clone lets the guard outlive the `&mut self` persist below.
+        #[cfg(feature = "std")]
+        let gate = (!Arc::ptr_eq(&prior.active_memtable, &next_version.active_memtable))
+            .then(|| Arc::clone(&self.insert_gate));
+        #[cfg(feature = "std")]
+        let closed = gate.as_deref().map(super::insert_gate::InsertGate::close);
         // Install seqnos are non-decreasing. The counter is caller-owned, and a
         // deployment that reopens with it reset would otherwise install below
         // the current version: a drop or a filtering compaction there raises
         // the floor only to that smaller seqno, leaving snapshots above it
         // answered by the current version without the rows it removed. Under
         // the seqno contract (monotone counter) this clamp is a no-op.
-        let seqno = seqno.max(prior.seqno);
-        let mut next_version = f(&prior)?;
+        let seqno = seqno().max(prior.seqno);
         // Every install is a transition to a new id. A rotation persists the
         // installed version as a fresh `v{id}` snapshot, created exclusively,
         // so one under the prior id would fail on the snapshot that id names.
@@ -683,6 +715,10 @@ impl SuperVersions {
             next_version.version.set_retention_floor(floor);
         }
 
+        #[cfg(test)]
+        if let Some(hook) = &self.before_persist {
+            hook();
+        }
         match deferred {
             // The floor rides in the version too: lost with it in a crash,
             // together with the flush whose collection raised it.
@@ -691,7 +727,13 @@ impl SuperVersions {
                 self.persist_version(tree_path, &next_version.version, fs, runtime, encryption)?;
             }
         }
-        self.append_version(next_version);
+        self.publish(
+            next_version,
+            #[cfg(feature = "std")]
+            closed.as_ref(),
+        );
+        #[cfg(feature = "std")]
+        drop(closed);
 
         // Clamp to stay below the reserved MSB range.
         let next_visible = seqno.saturating_add(1).min(MAX_SEQNO);
@@ -989,14 +1031,45 @@ impl SuperVersions {
     /// Makes `version` the current one. The replaced version stays alive only
     /// in the readers that already hold it.
     pub fn append_version(&mut self, version: SuperVersion) {
+        self.publish(
+            version,
+            #[cfg(feature = "std")]
+            None,
+        );
+    }
+
+    /// [`Self::append_version`], given the insert gate when the caller
+    /// already holds it closed.
+    fn publish(
+        &mut self,
+        version: SuperVersion,
+        #[cfg(feature = "std")] closed: Option<&super::insert_gate::Closed<'_>>,
+    ) {
         if let Some(budget) = &self.filter_budget {
             budget.publish(&version.version);
         }
+        // A new active memtable is handed to inserts with the insert gate
+        // closed: the inserts already into the old one finish first, and the
+        // ones after land in the new one. The gate is closed here unless the
+        // caller holds it closed already.
+        #[cfg(feature = "std")]
+        let own_closed = if Arc::ptr_eq(&self.current.active_memtable, &version.active_memtable) {
+            None
+        } else if let Some(closed) = closed {
+            closed.set_active(Arc::clone(&version.active_memtable));
+            None
+        } else {
+            let own = self.insert_gate.close();
+            own.set_active(Arc::clone(&version.active_memtable));
+            Some(own)
+        };
         // Mirror it into the lock-free pointer so reads see it without taking
         // the history lock.
         #[cfg(feature = "std")]
         self.latest.store(Arc::new(version.clone()));
         self.current = version;
+        #[cfg(feature = "std")]
+        drop(own_closed);
     }
 
     /// Replaces the current version with one that changes only its memtables
@@ -1024,6 +1097,14 @@ impl SuperVersions {
     #[must_use]
     pub(crate) fn latest_handle(&self) -> Arc<ArcSwap<SuperVersion>> {
         Arc::clone(&self.latest)
+    }
+
+    /// Returns the gate inserts pass instead of taking the history lock (see
+    /// `insert_gate`).
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub(crate) fn insert_gate_handle(&self) -> Arc<super::insert_gate::InsertGate> {
+        Arc::clone(&self.insert_gate)
     }
 
     pub fn latest_version(&self) -> SuperVersion {

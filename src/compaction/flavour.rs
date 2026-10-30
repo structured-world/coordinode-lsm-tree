@@ -1129,7 +1129,7 @@ pub(super) fn referenced_blob_files(
 }
 
 /// Compaction worker that will relocate blobs that sit in blob files that are being rewritten
-pub struct RelocatingCompaction {
+pub(crate) struct RelocatingCompaction {
     inner: StandardCompaction,
     blob_scanner: Peekable<BlobFileMergeScanner>,
     blob_writer: BlobFileWriter,
@@ -1189,9 +1189,9 @@ pub struct RelocatingCompaction {
 
 /// What a relocating pass separates new values under: the tree's separation
 /// options and the blob codec of the compaction's runtime snapshot.
-pub struct FreshValues {
-    pub options: crate::KvSeparationOptions,
-    pub compression: crate::CompressionType,
+pub(crate) struct FreshValues {
+    pub(crate) options: crate::KvSeparationOptions,
+    pub(crate) compression: crate::CompressionType,
 }
 
 impl RelocatingCompaction {
@@ -1199,7 +1199,7 @@ impl RelocatingCompaction {
         clippy::too_many_arguments,
         reason = "each argument is an independent input of the pass; a struct would only rename them"
     )]
-    pub fn new(
+    pub(crate) fn new(
         inner: StandardCompaction,
         blob_scanner: Peekable<BlobFileMergeScanner>,
         blob_writer: BlobFileWriter,
@@ -1241,7 +1241,7 @@ impl RelocatingCompaction {
     /// Separates values at or above `fresh`'s threshold that reach this pass
     /// inline into the pass's own blob output (see the `fresh` field).
     #[must_use]
-    pub fn with_fresh_values(mut self, fresh: FreshValues) -> Self {
+    pub(crate) fn with_fresh_values(mut self, fresh: FreshValues) -> Self {
         self.fresh = Some(fresh);
         self
     }
@@ -1407,7 +1407,7 @@ impl RelocatingCompaction {
     /// Marks this as a tight-space slice ending (exclusively) at `bound`; see
     /// the `drain_below` field.
     #[must_use]
-    pub fn with_drain_below(mut self, bound: Option<crate::UserKey>) -> Self {
+    pub(crate) fn with_drain_below(mut self, bound: Option<crate::UserKey>) -> Self {
         self.drain_below = bound;
         self
     }
@@ -1689,14 +1689,14 @@ impl CompactionFlavour for RelocatingCompaction {
 }
 
 /// Standard compaction worker that just passes through all its data
-pub struct StandardCompaction {
+pub(crate) struct StandardCompaction {
     start: Instant,
     table_writer: MultiWriter,
     tables_to_rewrite: Vec<Table>,
 }
 
 impl StandardCompaction {
-    pub fn new(table_writer: MultiWriter, tables_to_rewrite: Vec<Table>) -> Self {
+    pub(crate) fn new(table_writer: MultiWriter, tables_to_rewrite: Vec<Table>) -> Self {
         Self {
             start: Instant::now(),
             table_writer,
@@ -1719,6 +1719,8 @@ impl StandardCompaction {
         let pin_index = opts.config.index_block_pinning_policy.get(dst_lvl);
         let written = self.table_writer.finish()?;
         let entries_durable = written.entries_durable;
+        #[cfg(all(test, feature = "std"))]
+        opts.config.fire_while_outputs_finish();
 
         written
             .tables

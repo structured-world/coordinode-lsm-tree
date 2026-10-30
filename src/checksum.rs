@@ -75,6 +75,12 @@ impl<W: crate::io::Write + crate::io::Seek> std::io::Seek for ChecksummedWriter<
         self.position = position;
         Ok(position)
     }
+
+    // The counted position: the default seeks, which flushes a buffered
+    // writer and costs a system call.
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.position)
+    }
 }
 
 #[cfg(not(feature = "std"))]
@@ -83,6 +89,11 @@ impl<W: crate::io::Write + crate::io::Seek> crate::io::Seek for ChecksummedWrite
         let position = self.inner.seek(pos)?;
         self.position = position;
         Ok(position)
+    }
+
+    // As the std impl: the counted position, without a seek.
+    fn stream_position(&mut self) -> crate::io::Result<u64> {
+        Ok(self.position)
     }
 }
 
@@ -105,8 +116,16 @@ impl<W: crate::io::Write> ChecksummedWriter<W> {
         self.position
     }
 
-    pub fn inner_mut(&mut self) -> &mut W {
-        &mut self.inner
+    /// The wrapped writer, to look at: a write or seek through it would leave
+    /// the counted [`Self::position`] and the checksum behind, so none is
+    /// handed out.
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    /// Unwraps the writer.
+    pub fn into_inner(self) -> W {
+        self.inner
     }
 }
 

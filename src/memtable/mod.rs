@@ -2,10 +2,12 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-pub mod arena;
-pub mod interval_tree;
-pub mod skiplist;
-pub mod value_store;
+pub(crate) mod arena;
+pub(crate) mod interval_tree;
+pub(crate) mod own_line;
+use own_line::OwnLine;
+pub(crate) mod skiplist;
+pub(crate) mod value_store;
 
 use crate::comparator::SharedComparator;
 use crate::key::InternalKey;
@@ -37,7 +39,7 @@ pub use crate::tree::inner::MemtableId;
 /// Counted over all of `keys` at once: a flush rotating into several tables
 /// hashes a prefix spanning two of them in each, so the count runs short by
 /// at most one prefix per rotation.
-pub fn filter_count(
+pub(crate) fn filter_count(
     keys: impl Iterator<Item = crate::UserKey>,
     prefixes: Option<&dyn crate::PrefixExtractor>,
 ) -> crate::filter_budget::FilterCount {
@@ -129,12 +131,15 @@ pub struct Memtable {
     /// of other memory from it (entry visibility comes from the skiplist's
     /// release/acquire tower stores; `highest_seqno` keeps `AcqRel` so a
     /// reader that observes a seqno also observes its entry).
-    pub(crate) approximate_size: AtomicU64,
+    ///
+    /// Each counter every insert writes sits on a line of its own, apart from
+    /// the fields reads and inserts only load.
+    pub(crate) approximate_size: OwnLine<AtomicU64>,
 
     /// Highest encountered sequence number.
     ///
     /// This is used so that `get_highest_seqno` has O(1) complexity.
-    pub(crate) highest_seqno: AtomicU64,
+    pub(crate) highest_seqno: OwnLine<AtomicU64>,
 
     pub(crate) requested_rotation: AtomicBool,
 
@@ -188,8 +193,8 @@ impl Memtable {
             range_tombstones: RwLock::new(interval_tree::IntervalTree::new_with_comparator(
                 comparator.clone(),
             )),
-            approximate_size: AtomicU64::default(),
-            highest_seqno: AtomicU64::default(),
+            approximate_size: OwnLine(AtomicU64::default()),
+            highest_seqno: OwnLine(AtomicU64::default()),
             requested_rotation: AtomicBool::default(),
             has_at_insert_digests: AtomicBool::default(),
             blob_refs: RwLock::new(crate::HashSet::default()),
@@ -291,6 +296,15 @@ impl Memtable {
     /// Counts the number of items in the memtable.
     pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// How often an insert had to retry linking an item because a concurrent
+    /// insert changed its neighbour first: the contention writers meet in
+    /// this memtable, counted once per retried level of the skiplist.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn insert_cas_retries(&self) -> usize {
+        self.items.cas_retries()
     }
 
     /// Returns `true` if the memtable has no KV items and no range tombstones.
