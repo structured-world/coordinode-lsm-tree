@@ -930,6 +930,14 @@ impl FsFile for CountingFile {
         self.inner.read_many(regions)
     }
 
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        self.inner.read_at_buf(buf, offset)
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> io::Result<()> {
+        self.inner.read_many_buf(regions)
+    }
+
     fn backing_fd(&self) -> Option<i32> {
         self.inner.backing_fd()
     }

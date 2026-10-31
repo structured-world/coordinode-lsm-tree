@@ -1575,6 +1575,17 @@ impl FsFile for FaultFile {
         self.inner.read_at(buf, offset)
     }
 
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        if let Some(error) = self.injector.screen_read(Some(&self.path), offset) {
+            return Err(error);
+        }
+        self.inner.read_at_buf(buf, offset)
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> io::Result<()> {
+        super::read_buf::read_each(self, regions)
+    }
+
     // Shown only inside a batch or a queue wait of the wrapper this handle
     // was opened through, which screens each read by it with its rules
     // before its inner backend reads it, layer by layer through a wrapper

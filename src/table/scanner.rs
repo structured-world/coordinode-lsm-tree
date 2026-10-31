@@ -10,7 +10,7 @@ use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
-    fs::{FileHint, Fs, FsOpenOptions},
+    fs::{FileHint, Fs, FsOpenOptions, ReadBuf},
     table::{block::BlockType, iter::OwnedDataBlockIter, util::TimedFile},
 };
 
@@ -47,7 +47,9 @@ struct BlockStream {
     mark: Option<usize>,
     /// The file offset the block being read starts at.
     mark_position: u64,
-    /// The bytes of the file not read into a chunk yet.
+    /// The file's length.
+    end: u64,
+    /// The bytes of the file not read into a chunk yet, the last of it.
     unread: u64,
     /// The length a chunk is read at, unless less of the file is left or a
     /// block needs more.
@@ -64,6 +66,7 @@ impl BlockStream {
             at: 0,
             mark: None,
             mark_position: start,
+            end: len,
             // A start past the end leaves nothing to read: the first block
             // read then fails as a truncated file.
             unread: len.saturating_sub(start),
@@ -106,13 +109,25 @@ impl BlockStream {
             .max(need);
         // `need` exceeds what is pending, so the chunk reads past it.
         let read = len - pending_len;
-        let chunk = crate::Slice::from_reader(
-            &mut PendingThenFile {
-                pending: kept,
-                file: &mut self.file,
-            },
-            taken + len,
-        )?;
+        let size = taken + len;
+        // SAFETY: the builder is frozen only once `ReadBuf` counts all of it
+        // filled, which safe code can only claim of bytes it was given
+        // initialized.
+        #[expect(unsafe_code, reason = "see safety")]
+        let mut builder = unsafe { crate::Slice::builder_unzeroed(size) };
+        // SAFETY: as above.
+        #[expect(unsafe_code, reason = "see safety")]
+        let mut target = unsafe { ReadBuf::unwritten(&mut builder) };
+        target.append(kept);
+        self.file.read_rest(&mut target, self.end - self.unread)?;
+        if target.filled() != size {
+            return Err(crate::io::Error::new(
+                crate::io::ErrorKind::UnexpectedEof,
+                "scanner: the file ends inside a block",
+            )
+            .into());
+        }
+        let chunk = builder.freeze().into();
         self.unread = self.unread.saturating_sub(read as u64);
         self.chunk = chunk;
         self.mark = self.mark.map(|_| 0);
@@ -159,45 +174,6 @@ impl std::io::Read for BlockStream {
 impl crate::io::Read for BlockStream {
     fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
         self.read_pending(buf)
-    }
-}
-
-/// The bytes a chunk takes over from the last one, then the file.
-struct PendingThenFile<'a> {
-    pending: &'a [u8],
-    file: &'a mut TimedFile,
-}
-
-impl PendingThenFile<'_> {
-    fn read_next(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        #[cfg(not(feature = "std"))]
-        use crate::io::Read;
-        #[cfg(feature = "std")]
-        use std::io::Read;
-
-        if self.pending.is_empty() {
-            return self.file.read(buf);
-        }
-        let n = self.pending.len().min(buf.len());
-        let (out, _) = buf.split_at_mut(n);
-        let (bytes, rest) = self.pending.split_at(n);
-        out.copy_from_slice(bytes);
-        self.pending = rest;
-        Ok(n)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::io::Read for PendingThenFile<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.read_next(buf)
-    }
-}
-
-#[cfg(not(feature = "std"))]
-impl crate::io::Read for PendingThenFile<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> crate::io::Result<usize> {
-        self.read_next(buf)
     }
 }
 
@@ -292,7 +268,7 @@ impl Scanner {
         groups: alloc::vec::Vec<super::BlockHandle>,
         pace: Option<crate::table::util::Pacer>,
     ) -> crate::Result<Self> {
-        let mut file = fs.open(path, &FsOpenOptions::new().read(true))?;
+        let file = fs.open(path, &FsOpenOptions::new().read(true))?;
         let len = file.metadata()?.len;
         // The scanner walks every block in order — tell the kernel so
         // it can ramp readahead aggressively and evict already-read
@@ -301,16 +277,10 @@ impl Scanner {
         // on the default heuristic, so drop the error rather than
         // failing the open.
         let _ = file.hint(FileHint::Sequential);
-        // A tight-space restricted view starts at its first LIVE block: the
-        // blocks below it are hole-punched (they read as zeros and cannot
-        // decode). `block_count` was reduced by the caller to match.
-        if start_offset > 0 {
-            #[cfg(not(feature = "std"))]
-            use crate::io::{Seek, SeekFrom};
-            #[cfg(feature = "std")]
-            use std::io::{Seek, SeekFrom};
-            file.seek(SeekFrom::Start(start_offset))?;
-        }
+        // A tight-space restricted view starts at its first LIVE block
+        // (`start_offset`): the blocks below it are hole-punched (they read
+        // as zeros and cannot decode). `block_count` was reduced by the
+        // caller to match.
         let mut timed = TimedFile::new(file);
         if let Some(pace) = pace {
             timed.set_pace(pace);

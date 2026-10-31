@@ -2,7 +2,7 @@
 // Copyright (c) 2024-present, fjall-rs
 // Copyright (c) 2026-present, Dmitry Prudnikov
 
-use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, SyncMode};
+use super::{FileHint, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, ReadBuf, SyncMode};
 use crate::io;
 use crate::path::{Path, PathBuf};
 #[cfg(not(feature = "std"))]
@@ -237,6 +237,19 @@ impl FsFile for File {
         }
 
         Ok(filled)
+    }
+
+    fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        // SAFETY: `read_at` only hands the slice to the kernel to write, and
+        // returns how much of it was.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+        }
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, ReadBuf<'_>)]) -> io::Result<()> {
+        super::read_buf::read_each(self, regions)
     }
 
     fn lock_exclusive(&self) -> io::Result<()> {

@@ -1504,6 +1504,14 @@ impl FsFile for CrashFile {
         self.inner.read_at(buf, offset)
     }
 
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        self.inner.read_at_buf(buf, offset)
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> io::Result<()> {
+        super::read_buf::read_each(self, regions)
+    }
+
     fn lock_exclusive(&self) -> io::Result<()> {
         self.inner.lock_exclusive()
     }

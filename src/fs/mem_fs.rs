@@ -13,7 +13,7 @@
 //!   bypass the `Fs` trait. Write + flush + point-read works; compaction
 //!   may fail with `ENOENT` on virtual paths.
 
-use super::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions};
+use super::{Fs, FsCapabilities, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, ReadBuf};
 use crate::io::{self, SeekFrom};
 // Trait names referenced only by the no_std trait impls below (the std impls
 // target `std::io::*` directly, so these would be unused under `std`).
@@ -563,6 +563,18 @@ impl FsFile for MemFile {
         })?;
         let data = lock(&self.data)?;
         Ok(copy_from_data(buf, &data, offset))
+    }
+
+    fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        // SAFETY: `read_at` only copies into the slice, and returns how much.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+        }
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, ReadBuf<'_>)]) -> io::Result<()> {
+        super::read_buf::read_each(self, regions)
     }
 
     /// No-op: in-memory files are not shared across processes. `MemFs` is a

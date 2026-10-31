@@ -1858,6 +1858,24 @@ impl FsFile for IoUringRawFile {
             .try_for_each(|(read, res)| read_verdict(res, read.len))
     }
 
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
+        // SAFETY: the ring only has the kernel write the slice, and `read_at`
+        // returns how much of it was.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+        }
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> crate::io::Result<()> {
+        // SAFETY: as in `read_at_buf`; `read_many` fails unless every region
+        // was filled.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            super::read_buf::fill_regions_with(regions, |bytes| FsFile::read_many(self, bytes))
+        }
+    }
+
     // Exposes the descriptor so `IoUringRawFs::read_blocks_batched` can read
     // several files through one ring batch.
     fn backing_fd(&self) -> Option<i32> {
