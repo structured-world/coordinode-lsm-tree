@@ -96,6 +96,8 @@ impl Drop for ByteView {
 
         let heap_region = self.get_heap_region();
 
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::REFS_DOWN, 1);
         if heap_region.ref_count.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
@@ -313,6 +315,11 @@ impl ByteView {
     #[inline]
     pub fn fused(left: &[u8], right: &[u8]) -> Self {
         let len = left.len() + right.len();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::diagnostics::add(&crate::diagnostics::FUSED, 1);
+            crate::diagnostics::add(&crate::diagnostics::KEY_BYTES, len);
+        }
         // A key rebuilt from its restart head's prefix and its own suffix is
         // short as a rule: written straight into the inline form, it skips
         // the builder and its prefix bookkeeping, which only the heap form has.
@@ -485,6 +492,8 @@ impl ByteView {
     #[must_use]
     pub fn new(slice: &[u8]) -> Self {
         let slice_len = slice.len();
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::NEW_BYTES, slice_len);
 
         let mut view = unsafe { Self::with_size_unzeroed(slice_len) };
 
@@ -580,6 +589,8 @@ impl ByteView {
         let heap_ptr = unsafe { data_base.sub(HEADER_SIZE) };
         let heap_region = unsafe { &*heap_ptr.cast::<HeapAllocationHeader>() };
 
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::REFS_DOWN, 1);
         if heap_region.ref_count.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
@@ -638,6 +649,8 @@ impl ByteView {
         let heap_ptr = unsafe { data_base.sub(HEADER_SIZE) };
         let heap_region = unsafe { &*heap_ptr.cast::<HeapAllocationHeader>() };
         heap_region.ref_count.fetch_add(1, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::REFS_UP, 1);
 
         let mut prefix = [0u8; PREFIX_SIZE];
         #[expect(clippy::indexing_slicing, reason = "len > INLINE_SIZE >= PREFIX_SIZE")]
@@ -737,6 +750,9 @@ impl ByteView {
     pub fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {
         use core::ops::Bound;
 
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::SLICES, 1);
+
         // Credits: This is essentially taken from
         // https://github.com/tokio-rs/bytes/blob/291df5acc94b82a48765e67eeb1c1a2074539e68/src/bytes.rs#L264
 
@@ -793,6 +809,8 @@ impl ByteView {
             // IMPORTANT: Increase ref count
             let heap_region = self.get_heap_region();
             heap_region.ref_count.fetch_add(1, Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::add(&crate::diagnostics::REFS_UP, 1);
 
             let mut child = Self {
                 // SAFETY: self.data must be defined

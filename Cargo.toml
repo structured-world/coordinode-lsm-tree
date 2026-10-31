@@ -128,6 +128,10 @@ bytes_1 = ["dep:bytes"]
 # The `crc32c` crate needs `std`, so the feature brings it.
 crc32c = ["dep:crc32c", "std"]
 metrics = []
+# Process-wide counts of key copies and reference count operations, for benches
+# to price a change. Not `metrics`: these sit on every key clone and drop, so no
+# deployment should pay for them. No stability promise.
+diagnostics = []
 # Columnar (PAX / rowgroup) SST block type: per-column codecs + transpose on
 # compaction. The decode read-path is core + alloc (runtime-SIMD with a scalar
 # fallback), so this feature does NOT pull `std`; the selection + transpose

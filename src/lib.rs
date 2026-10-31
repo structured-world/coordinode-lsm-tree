@@ -255,6 +255,10 @@ mod byteview;
 
 mod comparator;
 
+#[cfg(feature = "diagnostics")]
+#[doc(hidden)]
+pub mod diagnostics;
+
 #[doc(hidden)]
 mod cache;
 
