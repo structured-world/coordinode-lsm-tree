@@ -145,14 +145,17 @@ fn round(tree: &AnyTree, threads: u64, skew: bool, seconds: u64) -> lsm_tree::Re
                 })
             })
             .collect();
-        start.wait();
+        // The window takes in every read: from before the first to after the
+        // last worker has stopped.
         let began = Instant::now();
+        start.wait();
         std::thread::sleep(Duration::from_secs(seconds));
         stop.store(true, Ordering::Relaxed);
-        elapsed = began.elapsed();
-        workers
+        let joined = workers
             .into_iter()
-            .try_for_each(|worker| worker.join().expect("no thread panics"))
+            .try_for_each(|worker| worker.join().expect("no thread panics"));
+        elapsed = began.elapsed();
+        joined
     });
     workers?;
     let totals = totals.into_inner().expect("no thread panics");
