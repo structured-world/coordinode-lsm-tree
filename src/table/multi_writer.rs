@@ -96,7 +96,11 @@ pub(crate) struct MultiWriter {
     /// Sizes every output's filters against the tree's filter budget.
     filter_sizing: Option<crate::filter_budget::FilterPlan>,
 
-    current_key: Option<UserKey>,
+    /// The current key while the writer does not hold it: a row's on its way
+    /// to the output past a rotation, or a key set for the output that follows.
+    /// Otherwise the writer's last key is the current one, so a row pays no
+    /// handle clone. Read through [`Self::current_key`].
+    pinned_key: Option<UserKey>,
     comparator: crate::SharedComparator,
 
     linked_blobs: LinkedBlobFiles,
@@ -482,7 +486,7 @@ impl MultiWriter {
             bloom_policy: BloomConstructionPolicy::default(),
             filter_sizing: None,
 
-            current_key: None,
+            pinned_key: None,
             comparator: crate::comparator::default_comparator(),
 
             linked_blobs: LinkedBlobFiles::default(),
@@ -569,7 +573,23 @@ impl MultiWriter {
     /// once the output it goes into is known. Without boundaries the output
     /// ends at the target size.
     fn decide_cut(&self, key: &[u8]) -> (bool, Option<cut_alignment::Crossing>) {
+        if self.plainly_below_target() {
+            return (false, None);
+        }
         self.decide_cut_at(key, self.output_load())
+    }
+
+    /// Whether the output is short of its target on what the writer alone
+    /// holds: with no tombstone, blob link, owned object or boundary to weigh,
+    /// [`Self::load_with_tombstones`] adds nothing to it, and no size or memory
+    /// threshold lies below the target. The common new key stops here.
+    fn plainly_below_target(&self) -> bool {
+        self.alignment.is_none()
+            && self.range_tombstones.is_empty()
+            && self.linked_blobs.len() == 0
+            && self.owned_objects.capacity() == 0
+            && self.writer.output_size_hint() < self.target_size
+            && self.writer.held_state_bytes() < self.target_size
     }
 
     /// [`Self::decide_cut`] for an output weighing `load`, measured once for
@@ -925,10 +945,11 @@ impl MultiWriter {
     /// In debug builds, if no entry has been written yet.
     pub(crate) fn register_blob(&mut self, indirection: BlobIndirection) {
         debug_assert!(
-            self.current_key.is_some(),
+            self.current_key().is_some(),
             "a blob is registered after the entry that points into it"
         );
-        let Some(key) = self.current_key.as_ref() else {
+        // Spelled out: `linked_blobs` is borrowed beside the key.
+        let Some(key) = self.pinned_key.as_ref().or_else(|| self.writer.last_key()) else {
             return;
         };
         self.linked_blobs.register(
@@ -992,10 +1013,11 @@ impl MultiWriter {
     /// Returns an error if `row` is not a well-formed cell row.
     pub(crate) fn register_cell_row(&mut self, row: &[u8]) -> crate::Result<()> {
         debug_assert!(
-            self.current_key.is_some(),
+            self.current_key().is_some(),
             "a cell row is registered after it is written"
         );
-        let Some(key) = self.current_key.as_ref() else {
+        // Spelled out: `linked_blobs` is borrowed beside the key.
+        let Some(key) = self.pinned_key.as_ref().or_else(|| self.writer.last_key()) else {
             return Ok(());
         };
         for (indirection, owned) in crate::blob_tree::field_row::row_refs(row)? {
@@ -1389,9 +1411,13 @@ impl MultiWriter {
 
     /// Whether `key` is the user key of the last row written or copied in.
     pub(crate) fn continues_last(&self, key: &[u8]) -> bool {
-        self.current_key
-            .as_ref()
+        self.current_key()
             .is_some_and(|last| crate::comparator::same_user_key(last, key))
+    }
+
+    /// The key of the last row written or copied in, or the one being placed.
+    fn current_key(&self) -> Option<&UserKey> {
+        self.pinned_key.as_ref().or_else(|| self.writer.last_key())
     }
 
     /// The transform counter's value now; without a counter, the milestone
@@ -1532,9 +1558,10 @@ impl MultiWriter {
     /// key there. The gaps come in key order, so only the tombstones a gap
     /// meets are visited.
     fn tombstones_up_to_the_next_output(&mut self, start: &UserKey) -> Vec<RangeTombstone> {
-        let Some(next) = self.current_key.as_ref() else {
+        let Some(next) = self.current_key().cloned() else {
             return Vec::new();
         };
+        let next = &next;
         let tombstones = if self.clip_range_tombstones {
             self.outside
                 .as_ref()
@@ -1754,11 +1781,13 @@ impl MultiWriter {
                 self.clip_range_tombstones,
                 &mut old_writer,
                 self.output_lower.as_ref(),
-                upper.or(self.current_key.as_ref()),
+                upper.or(self.pinned_key.as_ref()),
                 self.comparator.as_ref(),
             );
         }
-        self.output_lower.clone_from(&self.current_key);
+        // Past the swap the writer is the next output's, and every rotation
+        // pinned the key that output starts at.
+        self.output_lower.clone_from(&self.pinned_key);
 
         for linked in self.linked_blobs.take() {
             old_writer.link_blob_file(linked);
@@ -1819,8 +1848,11 @@ impl MultiWriter {
     /// its encoded bytes, its entries and its longest bound, counting the
     /// tombstones starting at the key, which go where the key goes.
     fn tombstones_at_key(&self) -> (u64, u64, u64) {
-        match &self.current_key {
-            Some(key) if !self.range_tombstones.is_empty() => {
+        if self.range_tombstones.is_empty() {
+            return (0, self.tombstone_share.pieces(), 0);
+        }
+        match self.current_key() {
+            Some(key) => {
                 let group = self.tombstone_share.group(
                     &self.range_tombstones,
                     key,
@@ -1982,16 +2014,26 @@ impl MultiWriter {
         // is not the byte order (reversed, numeric) makes `<` false for keys
         // that are new, which silently disabled rotation. Same-key versions
         // stay in one output because identity does not change between them.
-        let is_next_key = !self
-            .current_key
-            .as_ref()
-            .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key));
+        let is_next_key = !self.continues_last(&item.key.user_key);
 
+        self.write_keyed(item, is_next_key)
+    }
+
+    /// [`Self::write`] of a row its caller knows to carry a user key no
+    /// earlier row carries.
+    pub(crate) fn write_key_start(&mut self, item: InternalValue) -> crate::Result<()> {
+        debug_assert!(
+            !self.continues_last(&item.key.user_key),
+            "a row said to start a key continues the last one",
+        );
+        self.write_keyed(item, true)
+    }
+
+    fn write_keyed(&mut self, item: InternalValue, is_next_key: bool) -> crate::Result<()> {
         if is_next_key {
-            let first_key = self.current_key.is_none();
-            self.current_key = Some(item.key.user_key.clone());
-
             if !self.range_tombstones.is_empty() {
+                let first_key = self.current_key().is_none();
+                self.pinned_key = Some(item.key.user_key.clone());
                 self.tombstone_share.advance(
                     &self.range_tombstones,
                     &item.key.user_key,
@@ -2010,6 +2052,7 @@ impl MultiWriter {
             let crossed = self.crossed_domain_end(&item.key.user_key);
             let rotates = layout_changes || cut || crossed.is_some();
             if rotates {
+                self.pinned_key = Some(item.key.user_key.clone());
                 self.rotate_at(crossed.as_ref())?;
                 self.tombstone_share.open_output(&item.key.user_key);
             }
@@ -2017,7 +2060,10 @@ impl MultiWriter {
             self.enter_domain(&item.key.user_key, crossed.is_some());
         }
 
-        self.writer.write(item)?;
+        self.writer.write_keyed(item, !is_next_key)?;
+        if self.pinned_key.is_some() {
+            self.pinned_key = None;
+        }
         if self.use_columnar {
             self.value_layout = Some(if self.cell_rows {
                 crate::table::meta::ValueLayout::Cells
@@ -2223,14 +2269,11 @@ impl MultiWriter {
         }
         // A key's versions stay in one output, and a group that continues the
         // key written last would split them across the copy's boundary.
-        if self
-            .current_key
-            .as_ref()
-            .is_some_and(|c| crate::comparator::same_user_key(c, &first.key.user_key))
-        {
+        if self.continues_last(&first.key.user_key) {
             return Ok(false);
         }
-        let previous_key = self.current_key.replace(first.key.user_key.clone());
+        let previous_key = self.current_key().cloned();
+        self.pinned_key = Some(first.key.user_key.clone());
         if !self.range_tombstones.is_empty() {
             self.tombstone_share.advance(
                 &self.range_tombstones,
@@ -2246,7 +2289,7 @@ impl MultiWriter {
                 (&first.key.user_key, &last.key.user_key),
                 self.comparator.as_ref(),
             ) {
-                self.current_key = previous_key;
+                self.pinned_key = previous_key;
                 return Ok(false);
             }
             if previous_key.is_none() && self.clip_range_tombstones {
@@ -2262,7 +2305,7 @@ impl MultiWriter {
                 self.comparator.as_ref(),
             )
         }) {
-            self.current_key = previous_key;
+            self.pinned_key = previous_key;
             return Ok(false);
         }
         // A table records one value layout: a group stored the other way
@@ -2275,7 +2318,7 @@ impl MultiWriter {
         let crossed = self.crossed_domain_end(&first.key.user_key);
         let cut = cut || crossed.is_some();
         if self.writes_group_by_rows(load, layout_changes || cut, crossing, last, bytes) {
-            self.current_key = previous_key;
+            self.pinned_key = previous_key;
             return Ok(false);
         }
         if layout_changes || cut {
@@ -2293,7 +2336,7 @@ impl MultiWriter {
             // [`Self::write`] as a new key, so it rotates for their layout as
             // it would without this attempt. Advancing the tombstone share to
             // that key and opening an output there do the same again.
-            self.current_key = previous_key;
+            self.pinned_key = previous_key;
             return Ok(false);
         }
         // The group's later keys move the tombstone share and the boundaries
@@ -2316,7 +2359,11 @@ impl MultiWriter {
         if let Some(alignment) = &mut self.alignment {
             alignment.pass_through(&last.key.user_key, past_half, self.comparator.as_ref());
         }
-        self.current_key = Some(last.key.user_key.clone());
+        self.pinned_key = None;
+        debug_assert!(
+            self.continues_last(&last.key.user_key),
+            "the writer records the copied group's last key",
+        );
         if layout.is_some() {
             self.value_layout = layout;
         }
@@ -2385,6 +2432,8 @@ impl MultiWriter {
         &mut self,
         batch: &crate::table::columnar::ColumnBatch,
     ) -> crate::Result<Option<crate::UserKey>> {
+        // A batch does not move the current key: it stays the last row's.
+        self.pinned_key = self.current_key().cloned();
         let crossed = match batch.first_user_key()? {
             Some(first) => self.crossed_domain_end(first),
             None => None,
@@ -2527,7 +2576,7 @@ impl MultiWriter {
                 // The output after this one holds tombstones alone.
                 && self.rotation_sheds(&point, alone_overhead)
             {
-                self.current_key = Some(point.clone());
+                self.pinned_key = Some(point.clone());
                 // Past the output's key domain, its share stops at the
                 // domain's end. An output of tombstones alone holds no key and
                 // so no domain: the domain the cursor still names is the last

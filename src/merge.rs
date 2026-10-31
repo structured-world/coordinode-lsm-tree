@@ -45,6 +45,15 @@ impl<I: Iterator<Item = IterItem>> Merger<I> {
         }
     }
 
+    /// Declares that every key the sources hold starts with the same `len`
+    /// bytes, under a comparator that orders keys by their bytes, or is
+    /// ignored under any other.
+    #[must_use]
+    pub fn with_common_prefix(mut self, len: usize) -> Self {
+        self.heap.use_common_prefix(len);
+        self
+    }
+
     fn initialize_lo(&mut self) -> crate::Result<()> {
         for (idx, it) in self.iterators.iter_mut().enumerate() {
             if let Some(item) = it.next() {

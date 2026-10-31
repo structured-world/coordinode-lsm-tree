@@ -1,9 +1,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use super::super::filter::RibbonFilter;
 use super::super::hashing::standard_equation_from_hash;
 use super::super::params::{Mode, Params};
+use super::packed::{BandWalk, SEGMENT_ROWS, walk_band};
 use super::params::BurrParams;
 use super::threshold::is_bumped;
 
@@ -22,15 +22,16 @@ pub(crate) struct BurrLayer {
     /// to the next layer at probe time (same decision the builder made).
     /// Length = `m.div_ceil(b)`.
     pub(crate) thresholds: Vec<u8>,
-    /// The vendored Ribbon filter holding this layer's KEPT keys.
-    pub(crate) ribbon: RibbonFilter,
+    /// The bit-sliced solution holding this layer's KEPT keys, as the wire
+    /// format stores it (see [`super::packed`]).
+    pub(crate) z: Vec<u8>,
 }
 
 impl core::fmt::Debug for BurrLayer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("BurrLayer")
             .field("m", &self.m)
-            .field("ribbon", &"<RibbonFilter>")
+            .field("z_bytes", &self.z.len())
             .finish()
     }
 }
@@ -151,18 +152,6 @@ impl BurrFilter {
     /// `crate::hash::hash64` on both build and probe), so the two stay
     /// consistent.
     #[inline]
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "All indexing in this function is bounds-safe by construction. \
-                  `fingerprint_buf[0]` is a fixed-size [u64; 1] array — index 0 \
-                  is always in bounds. `z_words[equation.start + offset]` in the \
-                  probe loop is gated by the algorithmic invariant `start ∈ [0, m-w]` \
-                  and `offset ∈ [0, w-1]` (set-bit position in coeff_lo, which has \
-                  at most w bits), so the sum is `< m = z_words.len()`. The inline \
-                  GF(2) XOR-reduce block has a `// start ∈ [0, m-w] ...` comment \
-                  restating this invariant near the access. Per-row `.get()` would \
-                  add a branch on the probe hot path and dominate per-iter cost."
-    )]
     pub fn contains_hash(&self, hash: u64) -> bool {
         // BurrParams::with_fp_rate / with_bpk both clamp r to 1..=64, so a
         // solution row is one word and the fingerprint is a scalar. The
@@ -185,35 +174,34 @@ impl BurrFilter {
             let equation = standard_equation_from_hash(hash, layer.seed, &layer_params);
             let fingerprint = equation.fingerprint;
 
-            let z_words = layer.ribbon.z_raw_words();
-            // Prefetch the [start, start+w) coefficient window before the
-            // threshold check so the hash-random cold miss on z_words[start]
-            // overlaps the is_bumped work. A hint only: the result is unchanged.
+            // Prefetch the band's column words before the threshold check so
+            // the hash-random cold miss on them overlaps the is_bumped work. A
+            // hint only: the result is unchanged.
+            let columns = equation.start / SEGMENT_ROWS * usize::from(self.params.r) * 8;
             super::prefetch::prefetch_span(
-                z_words.as_ptr().wrapping_add(equation.start).cast::<u8>(),
-                usize::from(self.params.w) * 8,
+                layer.z.as_ptr().wrapping_add(columns),
+                usize::from(self.params.r) * 16,
             );
 
             if is_bumped(&equation, &layer.thresholds, self.params.b) {
                 continue;
             }
 
-            // GF(2) XOR-reduce. start ∈ [0, m-w] and every set bit offset
-            // ∈ [0, w-1], so row_index ∈ [0, m-1] is always in-bounds
-            // (proven; no per-row bounds check in the inner loop).
-            let mut acc: u64 = 0;
-            let mut lo = equation.coeff_lo;
-            while lo != 0 {
-                let offset = lo.trailing_zeros() as usize;
-                acc ^= z_words[equation.start + offset];
-                lo &= lo - 1;
-            }
             debug_assert_eq!(
                 equation.coeff_hi, 0,
                 "BuRR builds with w <= 64; coeff_hi must be 0",
             );
 
-            return acc == fingerprint;
+            return match walk_band::<true>(
+                &layer.z,
+                self.params.r,
+                equation.start,
+                equation.coeff_lo,
+                fingerprint,
+            ) {
+                BandWalk::Reduced(_) | BandWalk::Truncated => true,
+                BandWalk::Mismatch => false,
+            };
         }
         false
     }
@@ -231,19 +219,8 @@ impl BurrFilter {
     /// [`BurrBuilder::build_from_hashes_with_values`]: super::builder::BurrBuilder::build_from_hashes_with_values
     #[inline]
     #[must_use]
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "Same bounds invariant as `contains_hash`: start ∈ [0, m-w] and every set-bit \
-                  offset ∈ [0, w-1], so `z_words[start + offset]` is `< m = z_words.len()`. A \
-                  per-row `.get()` would add a branch on the locate hot path."
-    )]
     pub fn recover_value(&self, hash: u64) -> Option<u64> {
         debug_assert!(self.params.r <= 64, "BuRR params pin r <= 64");
-        let value_mask = if self.params.r == 64 {
-            u64::MAX
-        } else {
-            (1u64 << self.params.r) - 1
-        };
         for layer in &self.layers {
             let layer_params = match Params::new(
                 layer.m,
@@ -261,32 +238,34 @@ impl BurrFilter {
             // The first layer that does NOT bump this key is the layer that
             // holds it (the builder kept it at exactly that layer). Same
             // routing as `contains_hash`.
-            let z_words = layer.ribbon.z_raw_words();
-            // Prefetch the [start, start+w) window before the threshold check so
-            // the cold miss on z_words[start] overlaps the is_bumped work.
+            // Prefetch the band's column words before the threshold check so
+            // the cold miss on them overlaps the is_bumped work.
+            let columns = equation.start / SEGMENT_ROWS * usize::from(self.params.r) * 8;
             super::prefetch::prefetch_span(
-                z_words.as_ptr().wrapping_add(equation.start).cast::<u8>(),
-                usize::from(self.params.w) * 8,
+                layer.z.as_ptr().wrapping_add(columns),
+                usize::from(self.params.r) * 16,
             );
 
             if is_bumped(&equation, &layer.thresholds, self.params.b) {
                 continue;
             }
 
-            // GF(2) XOR-reduce recovers the stored RHS = the locator.
-            let mut acc: u64 = 0;
-            let mut lo = equation.coeff_lo;
-            while lo != 0 {
-                let offset = lo.trailing_zeros() as usize;
-                acc ^= z_words[equation.start + offset];
-                lo &= lo - 1;
-            }
             debug_assert_eq!(
                 equation.coeff_hi, 0,
                 "BuRR builds with w <= 64; coeff_hi must be 0",
             );
 
-            return Some(acc & value_mask);
+            // Reducing the band recovers the stored RHS = the locator.
+            return match walk_band::<false>(
+                &layer.z,
+                self.params.r,
+                equation.start,
+                equation.coeff_lo,
+                0,
+            ) {
+                BandWalk::Reduced(value) => Some(value),
+                BandWalk::Mismatch | BandWalk::Truncated => None,
+            };
         }
         None
     }

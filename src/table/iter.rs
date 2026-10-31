@@ -151,6 +151,14 @@ impl OwnedDataBlockIter {
     fn trim_back_above(&mut self, key: &[u8], seqno: SeqNo) -> bool {
         self.with_dependent_mut(|_, m| m.trim_back_above(key, seqno))
     }
+
+    /// The next row, its key rebuilt in `keys` when it has to be rebuilt.
+    pub(crate) fn next_in(&mut self, keys: &mut crate::slice::KeyChunks) -> Option<InternalValue> {
+        self.with_dependent_mut(|block, iter| {
+            iter.next()
+                .map(|item| item.materialize_in(&block.inner.data, keys))
+        })
+    }
 }
 
 impl Iterator for OwnedDataBlockIter {

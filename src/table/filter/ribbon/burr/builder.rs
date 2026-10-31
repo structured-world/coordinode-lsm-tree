@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 
 use super::super::builder::{RibbonBuilder, SolveScratch};
 use super::super::error::{BuildError, ConstructionFailure};
-use super::super::filter::RibbonFilter;
 use super::super::hashing::{StandardEquation, standard_equation_from_hash};
 use super::super::params::{Mode, Params};
 use super::error::BurrBuildError;
@@ -309,7 +308,7 @@ impl BurrBuilder {
                 self.params.b,
                 &mut bumped,
             );
-            let kept_ribbon = build_layer_ribbon(
+            let z = build_layer_ribbon(
                 &Layer {
                     index: usize::from(layer_idx),
                     builder: &ribbon_builder,
@@ -330,7 +329,7 @@ impl BurrBuilder {
                 m,
                 seed: layer_seed,
                 thresholds,
-                ribbon: kept_ribbon,
+                z,
             });
 
             remaining = bumped.hashes;
@@ -401,18 +400,17 @@ fn build_layer_ribbon(
     kept: &mut Kept<'_>,
     bumped: &mut Bumped,
     scratch: &mut SolveScratch,
-) -> Result<RibbonFilter, BurrBuildError> {
+) -> Result<Vec<u8>, BurrBuildError> {
     let (layer_index, b) = (layer.index, layer.b);
-    let (layer_seed, m) = (layer.params.seed, layer.params.m);
+    let m = layer.params.m;
     loop {
-        let ribbon_error = match layer.builder.build_from_equations(
+        let ribbon_error = match layer.builder.build_payload_from_equations(
             kept.equations,
             kept.values,
             m,
-            layer_seed,
             scratch,
         ) {
-            Ok(ribbon) => return Ok(ribbon),
+            Ok(payload) => return Ok(payload),
             Err(e) => e,
         };
         let BuildError::ConstructionFailed {

@@ -117,9 +117,11 @@ mod parallel {
                     .use_ecc(self.ecc)
                     .use_encryption(self.encryption.clone())
                     .use_parallel(parallel);
+            let mut last_key = None;
             for i in 0..self.keys {
                 let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
                 writer.register_key(&key, crate::hash::hash64(&key))?;
+                last_key = Some(key);
             }
             before_finish();
             let mut file = crate::sfa::Writer::from_writer(
@@ -127,7 +129,7 @@ mod parallel {
             );
             file.start("data")?;
             file.write_all(&[0; 64])?;
-            let output = writer.finish(&mut file)?;
+            let output = writer.finish(&mut file, last_key.as_ref())?;
             assert_eq!(output.hashes, u64::from(self.keys), "one hash per key");
             Ok((file.get_mut().get_ref().get_ref().clone(), output.blocks))
         }
@@ -271,6 +273,23 @@ mod parallel {
             matches!(parallel, Err(crate::Error::Unrecoverable)),
             "{parallel:?}"
         );
+    }
+
+    /// A partition spills at the first hash count whose estimate reaches its
+    /// size, the count an estimate per key would have stopped at.
+    #[test]
+    fn the_spill_threshold_is_the_first_count_the_estimate_reaches() {
+        let policy = BloomConstructionPolicy::default();
+        for size in [64_u32, 256, 4_096, 64 * 1_024] {
+            let mut writer = PartitionedFilterWriter::new(policy);
+            writer.partition_size = size;
+            let first = (1..1_000_000).find(|&n| policy.estimated_filter_size(n) >= size as usize);
+            assert_eq!(
+                Some(writer.spill_threshold()),
+                first,
+                "partition size {size}"
+            );
+        }
     }
 
     /// Partitions on workers hold their hashes until they are published: the

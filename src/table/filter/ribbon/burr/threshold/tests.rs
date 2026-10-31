@@ -131,6 +131,23 @@ fn is_bumped_predicate_matches_partition() {
     }
 }
 
+/// The shift a power of two takes and the division any other block size takes
+/// must place a key alike: in block `start / b`, at offset `start % b`.
+#[test]
+fn is_bumped_places_a_key_by_division_for_any_block_size() {
+    for b in [1_u8, 16, 100, 255] {
+        let thresholds = [b / 2, b, 0];
+        let width = usize::from(b);
+        for start in 0..thresholds.len() * width {
+            assert_eq!(
+                is_bumped(&eq_at(start), &thresholds, b),
+                start % width >= usize::from(thresholds[start / width]),
+                "b {b}, start {start}",
+            );
+        }
+    }
+}
+
 /// The widest block, 255 rows, walks every offset `u8` holds: an underloaded
 /// one keeps everything, and an overloaded one gets its `cap`-th offset, with
 /// no offset counter running past 255.

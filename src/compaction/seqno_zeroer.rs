@@ -119,6 +119,9 @@ impl<I> BottommostSeqnoZeroer<I> {
     /// monotonically. The lazy sort lives here (not in `next`) so streams whose
     /// entries are all ineligible for zeroing never pay for it.
     fn covered(&mut self, key: &[u8]) -> bool {
+        if self.idx == self.tombstones.len() && self.active.is_empty() {
+            return false;
+        }
         if !self.tombstones_sorted {
             let comparator = self.comparator.as_ref();
             self.tombstones
@@ -137,6 +140,18 @@ impl<I> BottommostSeqnoZeroer<I> {
         }
         self.active.expire_until(key);
         self.active.max_active_seqno().is_some()
+    }
+}
+
+impl<'a, I, F> BottommostSeqnoZeroer<super::stream::CompactionStream<'a, I, F>>
+where
+    I: Iterator<Item = crate::Result<InternalValue>>,
+    F: super::stream::StreamFilter + 'a,
+{
+    /// See [`super::stream::CompactionStream::next_starts_key`]: zeroing moves
+    /// no key.
+    pub(super) fn next_starts_key(&self) -> bool {
+        self.inner.next_starts_key()
     }
 }
 

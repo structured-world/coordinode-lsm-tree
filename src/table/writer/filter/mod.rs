@@ -5,8 +5,8 @@
 mod full;
 mod partitioned;
 
-pub use full::FullFilterWriter;
-pub use partitioned::PartitionedFilterWriter;
+pub(crate) use full::FullFilterWriter;
+pub(crate) use partitioned::PartitionedFilterWriter;
 
 use crate::{
     CompressionType, UserKey, checksum::ChecksummedWriter, config::BloomConstructionPolicy,
@@ -18,7 +18,7 @@ use alloc::{boxed::Box, vec::Vec};
 
 /// What a filter writer wrote into its table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FilterOutput {
+pub(crate) struct FilterOutput {
     /// Filter blocks written: one for a full filter, one per partition.
     pub blocks: usize,
     /// Hashes the filters hold: a key's, and under a prefix extractor each
@@ -31,7 +31,7 @@ pub struct FilterOutput {
 
 // All methods are required (no defaults) by design so that implementations must
 // explicitly handle configuration changes (e.g., filter policies, prefix extractors).
-pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
+pub(crate) trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     // NOTE: We purposefully use a UserKey instead of &[u8]
     // so we can clone it without heap allocation, if needed
     /// Registers a key in the filter, and returns the hashes it buffered for
@@ -52,10 +52,12 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// estimated from what is held now.
     fn finish_output_bytes(&self) -> u64;
 
-    /// Writes the filter to a file, and returns what it wrote.
+    /// Writes the filter to a file, and returns what it wrote. `last_key` is
+    /// the last key registered, `None` when none was.
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+        last_key: Option<&UserKey>,
     ) -> crate::Result<FilterOutput>;
 
     fn set_filter_policy(

@@ -221,6 +221,7 @@ All optional. The default build (`std` + `parallel`) is the minimal core: no com
 | `bytes_1` | [`bytes`](https://github.com/tokio-rs/bytes) | Consumer already speaks `bytes::Bytes` (tokio/hyper/tonic stack) and wants zero-copy interop with engine slices. |
 | `parallel` (default-on) | [`rayon`](https://github.com/rayon-rs/rayon) | Built-in rayon-backed parallel block-compression executor. `std`-only; the `CompactionSpawner` trait lets a caller inject a custom executor without this flag. |
 | `metrics` | (none) | Production observability or profiling. Compiles in atomic counters around block I/O, filter probes, compaction, and cache hit rates (`tree.metrics()`), and the payload a tree took in (`accepted_writes()`). Small but non-zero hot-path cost. |
+| `diagnostics` | (none) | Benches only. Process-wide counts of key copies and reference count operations, on every key clone and drop, so not for a deployment. No stability promise. |
 | `ribbon-serde` | `serde` | Snapshotting the internal `RibbonFilterRepr` for debugging or out-of-band transport. Not used by the on-disk format. |
 
 ## Benchmarks

@@ -531,6 +531,19 @@ pub struct Writer {
 
     data_block_hash_ratio: f32,
 
+    /// Whether the data blocks carry a hash index. Follows
+    /// `data_block_hash_ratio`, for the row path.
+    hash_indexed: bool,
+
+    /// Whether keys are registered in a filter built here. Follows
+    /// `bloom_policy` and `prebuilt_filter`, for the row path.
+    filtered: bool,
+
+    /// Whether something keys by a key's hash: the filter, the locator or the
+    /// hash index. All three flags are kept by [`Self::refresh_key_hashing`],
+    /// which every setter of a field they follow calls.
+    hashes_keys: bool,
+
     /// Compression to use for data blocks
     data_block_compression: CompressionType,
 
@@ -569,10 +582,13 @@ pub struct Writer {
     /// Stores the previous block position (used for creating back links)
     prev_pos: (BlockOffset, BlockOffset),
 
-    current_key: Option<UserKey>,
+    /// The last user key written, kept only for when `chunk` no longer holds
+    /// it: set when a block leaves the chunk, so a row pays no handle clone.
+    /// Read through [`Self::last_key_in`].
+    spilled_key: Option<UserKey>,
 
     /// Seqno of the LAST entry written (any path — row `write()` or a direct
-    /// block), tracked alongside `current_key` so a direct block that begins
+    /// block), tracked alongside the last key so a direct block that begins
     /// with the SAME user key can be validated against the internal order
     /// `(user_key asc, seqno desc)` across the block boundary
     /// ([`Self::validate_direct_block_order`]). `None` only before the first
@@ -1257,6 +1273,9 @@ impl Writer {
             index_block_restart_interval: 1,
 
             data_block_hash_ratio: 0.0,
+            hash_indexed: false,
+            filtered: BloomConstructionPolicy::default().is_active(),
+            hashes_keys: BloomConstructionPolicy::default().is_active(),
 
             index_partition_size: 4_096,
             filter_partition_size: 4_096,
@@ -1321,7 +1340,7 @@ impl Writer {
 
             chunk_size: 0,
 
-            current_key: None,
+            spilled_key: None,
             current_key_seqno: None,
 
             bloom_policy: BloomConstructionPolicy::default(),
@@ -1502,7 +1521,8 @@ impl Writer {
         let (Some(base), Some(first), Some(last)) = (
             self.meta_base_len,
             &self.meta.first_key,
-            self.current_key.as_ref().or(self.meta.last_key.as_ref()),
+            Self::last_key_in(&self.chunk, self.spilled_key.as_ref())
+                .or(self.meta.last_key.as_ref()),
         ) else {
             return (0, 0);
         };
@@ -1570,6 +1590,7 @@ impl Writer {
             log::debug!("locator section dropped at block {max_block}: explicit widths too narrow");
             self.locator = None;
             self.locators = Vec::new();
+            self.refresh_key_hashing();
         }
         // A direct block registers before its slots are folded in here, so the
         // estimates it left count neither a wider slot nor a dropped locator.
@@ -1689,7 +1710,7 @@ impl Writer {
         // entries are counted as if it were, under fixed-width counts. A
         // partitioned one records its partitions and names no extractor, a
         // full one the reverse; a writer that builds none writes none of them.
-        if self.bloom_policy.is_active() && self.prebuilt_filter.is_none() {
+        if self.filtered {
             params.filter_hashes = params.filter_hashes.max(1);
             if self.partitioned_filter {
                 params.filter_partition_hashes = params.filter_partition_hashes.max(1);
@@ -1813,7 +1834,8 @@ impl Writer {
         if let (Some(base), Some(first), Some(last)) = (
             self.meta_base_len,
             &self.meta.first_key,
-            self.current_key.as_ref().or(self.meta.last_key.as_ref()),
+            Self::last_key_in(&self.chunk, self.spilled_key.as_ref())
+                .or(self.meta.last_key.as_ref()),
         ) {
             meta_payload = base + (first.len() + last.len()) as u64 + 4;
             let ecc = self.ecc.map(|_| crate::table::block::EccParams::RS_4_2);
@@ -2080,6 +2102,7 @@ impl Writer {
     pub fn use_data_block_hash_ratio(mut self, ratio: f32) -> Self {
         self.assert_not_started("data block hash ratio");
         self.data_block_hash_ratio = ratio;
+        self.refresh_key_hashing();
         self
     }
 
@@ -2707,7 +2730,15 @@ impl Writer {
                 slot_bits,
             }),
         };
+        self.refresh_key_hashing();
         self
+    }
+
+    /// Derives the row path's flags from the settings they follow.
+    fn refresh_key_hashing(&mut self) {
+        self.hash_indexed = self.data_block_hash_ratio > 0.0;
+        self.filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
+        self.hashes_keys = self.filtered || self.locator.is_some() || self.hash_indexed;
     }
 
     /// Writes `filter`, built elsewhere for exactly the keys this table will
@@ -2718,6 +2749,7 @@ impl Writer {
         self.assert_not_started("use_prebuilt_filter");
         self.prebuilt_filter = Some(filter);
         self.carries_filter = true;
+        self.refresh_key_hashing();
         self
     }
 
@@ -2729,6 +2761,7 @@ impl Writer {
         self.assert_not_started("use_prebuilt_locator");
         self.locator = None;
         self.prebuilt_locator = Some(section);
+        self.refresh_key_hashing();
         self
     }
 
@@ -2756,6 +2789,7 @@ impl Writer {
     pub fn use_bloom_policy(mut self, bloom_policy: BloomConstructionPolicy) -> Self {
         self.bloom_policy = bloom_policy;
         self.filter_writer = self.filter_writer.set_filter_policy(bloom_policy);
+        self.refresh_key_hashing();
         self
     }
 
@@ -2816,6 +2850,19 @@ impl Writer {
     /// sorted as described by the [`UserKey`], otherwise the block layout will
     /// be non-sense.
     pub fn write(&mut self, item: InternalValue) -> crate::Result<()> {
+        let continues = Self::last_key_in(&self.chunk, self.spilled_key.as_ref())
+            .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key));
+        self.write_keyed(item, continues)
+    }
+
+    /// [`Self::write`] of a row whose caller has compared its key with the
+    /// last row it wrote: `continues` says they are the same. This table may
+    /// hold no row of that key yet, when it was rotated to between versions.
+    pub(crate) fn write_keyed(
+        &mut self,
+        item: InternalValue,
+        continues: bool,
+    ) -> crate::Result<()> {
         // A prebuilt partitioned filter counts the keys each partition covers,
         // which needs the comparator; an entry written here would escape that.
         if matches!(self.prebuilt_filter, Some(PrebuiltFilter::Partitioned(_))) {
@@ -2823,7 +2870,9 @@ impl Writer {
                 "a table with a prebuilt partitioned filter takes its entries with a comparator",
             ));
         }
-        self.write_entry(item)
+        let new_key =
+            !continues || Self::last_key_in(&self.chunk, self.spilled_key.as_ref()).is_none();
+        self.write_entry(item, new_key)
     }
 
     /// [`Self::write`] into a table with a prebuilt filter of any shape: a new
@@ -2832,29 +2881,45 @@ impl Writer {
     ///
     /// # Errors
     ///
+    /// The last user key written. Takes the two fields rather than `&self` so a
+    /// caller can hold another field mutably.
+    #[inline]
+    fn last_key_in<'a>(
+        chunk: &'a [InternalValue],
+        spilled_key: Option<&'a UserKey>,
+    ) -> Option<&'a UserKey> {
+        chunk
+            .last()
+            .map(|entry| &entry.key.user_key)
+            .or(spilled_key)
+    }
+
+    /// The last user key written, by any path.
+    pub(crate) fn last_key(&self) -> Option<&UserKey> {
+        Self::last_key_in(&self.chunk, self.spilled_key.as_ref())
+    }
+
     /// As [`Self::write`], plus the refusal of an uncovered key.
     pub(crate) fn write_counted(
         &mut self,
         item: InternalValue,
         comparator: &crate::SharedComparator,
     ) -> crate::Result<()> {
-        if let Some(prebuilt) = self.prebuilt_filter.as_mut()
-            && !self
-                .current_key
-                .as_deref()
-                .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key))
-        {
+        let new_key = !Self::last_key_in(&self.chunk, self.spilled_key.as_ref())
+            .is_some_and(|c| crate::comparator::same_user_key(c, &item.key.user_key));
+        if new_key && let Some(prebuilt) = self.prebuilt_filter.as_mut() {
             prebuilt.count_key(
                 &item.key.user_key,
                 &mut self.prebuilt_partition,
                 comparator.as_ref(),
             )?;
         }
-        self.write_entry(item)
+        self.write_entry(item, new_key)
     }
 
-    /// The body of [`Self::write`], past the prebuilt-filter guard.
-    fn write_entry(&mut self, item: InternalValue) -> crate::Result<()> {
+    /// The body of [`Self::write`], past the prebuilt-filter guard. `new_key`
+    /// is whether the table holds no row of this key yet.
+    fn write_entry(&mut self, item: InternalValue, new_key: bool) -> crate::Result<()> {
         let value_type = item.key.value_type;
         let seqno = item.key.seqno;
         // Borrow the key for the bookkeeping below; `item` moves into the
@@ -2886,13 +2951,8 @@ impl Writer {
         // NOTE: Check if we visit a new key. Identity is the engine's one
         // relation — see `same_user_key`; the filter registered just below hashes
         // these same raw bytes, which is why it can be nothing else.
-        if !self
-            .current_key
-            .as_ref()
-            .is_some_and(|c| crate::comparator::same_user_key(c, user_key))
-        {
+        if new_key {
             self.meta.key_count += 1;
-            self.current_key = Some(user_key.clone());
 
             // The tail is sized from the first key on, so a table that closes
             // before its first block is written still counts it.
@@ -2905,13 +2965,12 @@ impl Writer {
             // because there may be multiple versions
             // of the same key
 
-            let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
-            if filtered || self.locator.is_some() || self.data_block_hash_ratio > 0.0 {
+            if self.hashes_keys {
                 // The filter, the locator and the hash index key the same
                 // bytes: one hash.
                 let key_hash = crate::hash::hash64(user_key);
                 self.current_key_hash = key_hash;
-                if filtered {
+                if self.filtered {
                     self.filter_hashes +=
                         self.filter_writer.register_key(user_key, key_hash)? as u64;
                 }
@@ -2939,15 +2998,6 @@ impl Writer {
                     self.locators.push((key_hash, self.locator_block_id, slot));
                 }
             }
-
-            // The per-key state grows between blocks too; see
-            // `REFRESH_KEY_STEP`. A prefix extractor grows the filter by many
-            // hashes a key, so its state paces the refresh as well.
-            if self.meta.key_count as u64 >= self.next_refresh_keys
-                || self.filter_hashes >= self.next_refresh_hashes
-            {
-                self.refresh_state_estimates();
-            }
         }
 
         // Only a weak tombstone's key is retained (for the reclaimable check
@@ -2956,13 +3006,23 @@ impl Writer {
 
         self.chunk_size += self.entry_size(user_key_len, value_len);
         self.chunk.push(item);
-        if self.data_block_hash_ratio > 0.0 {
+        if self.hash_indexed {
             // Every version of a key shares its hash.
             self.chunk_key_hashes.push(self.current_key_hash);
         }
         self.previous_type = Some(value_type);
         self.previous_weak_tombstone_key = weak_tombstone_key;
         self.current_key_seqno = Some(seqno);
+
+        // The per-key state grows between blocks too; see `REFRESH_KEY_STEP`. A
+        // prefix extractor grows the filter by many hashes a key, so its state
+        // paces the refresh as well. After the push: the estimates size the
+        // table's last key from the chunk.
+        if self.meta.key_count as u64 >= self.next_refresh_keys
+            || self.filter_hashes >= self.next_refresh_hashes
+        {
+            self.refresh_state_estimates();
+        }
 
         let cut_at = if self.use_columnar {
             self.row_group_size
@@ -3017,10 +3077,14 @@ impl Writer {
 
         // Order-independent index-handle data, captured before the chunk is
         // consumed. The parallel path needs it owned because the chunk is
-        // cleared at submit time, before a worker has produced the block.
-        let last_key = last.key.user_key.clone();
+        // cleared at submit time, before a worker has produced the block. It
+        // stays with the index until the table ends, so it holds its own bytes
+        // rather than whatever block or key chunk the row's key is a view of.
+        let last_key = UserKey::new(&last.key.user_key);
         let last_seqno = last.key.seqno;
         let item_count = self.chunk.len();
+        // The chunk stops holding the last key once this block leaves it.
+        self.spilled_key = Some(last_key.clone());
 
         // This spill flushes the block whose keys were recorded with the current
         // `locator_block_id`, so the next block's keys belong to the next
@@ -3075,7 +3139,7 @@ impl Writer {
         #[cfg(feature = "std")]
         if self.parallel_settings.is_some() {
             self.ensure_parallel();
-            let mut encoded = Vec::new();
+            let mut encoded = Vec::with_capacity(self.chunk_size);
             let kv_flags = Self::encode_chunk_into(
                 &self.chunk,
                 Self::key_hashes_of(&self.chunk, &self.chunk_key_hashes),
@@ -3730,7 +3794,7 @@ impl Writer {
         // index. Check within the batch and against the writer's prior key before
         // any state mutation.
         if require_zero_seqno {
-            let mut prev = self.current_key.as_ref();
+            let mut prev = Self::last_key_in(&self.chunk, self.spilled_key.as_ref());
             for e in &entries {
                 if let Some(p) = prev
                     && comparator.compare(p.as_ref(), e.key.user_key.as_ref())
@@ -4040,7 +4104,9 @@ impl Writer {
         let Some(last) = entries.last() else {
             return Ok(None);
         };
-        let last_key = last.key.user_key.clone();
+        // Owned bytes for the same reason as in `spill_block`: the index keeps
+        // this key until the table ends.
+        let last_key = UserKey::new(&last.key.user_key);
         let last_seqno = last.key.seqno;
         let item_count = entries.len();
         let seqno_bounds = self.use_seqno_in_index.then(|| {
@@ -4061,6 +4127,7 @@ impl Writer {
         // chunk push (the direct block holds all rows already). The locator
         // records each new key's position within this single block, the same as
         // the flush path does for a transposed columnar block.
+        let mut current_key = self.spilled_key.as_ref();
         for (row, e) in entries.iter().enumerate() {
             let user_key = &e.key.user_key;
             self.meta.sum_user_key_bytes += user_key.len() as u64;
@@ -4077,21 +4144,15 @@ impl Writer {
             {
                 self.meta.weak_tombstone_reclaimable_count += 1;
             }
-            if !self
-                .current_key
-                .as_ref()
-                .is_some_and(|c| crate::comparator::same_user_key(c, user_key))
-            {
+            if !current_key.is_some_and(|c| crate::comparator::same_user_key(c, user_key)) {
                 self.meta.key_count += 1;
-                self.current_key = Some(user_key.clone());
-                let filtered = self.bloom_policy.is_active() && self.prebuilt_filter.is_none();
-                if filtered || self.locator.is_some() || self.data_block_hash_ratio > 0.0 {
+                if self.hashes_keys {
                     // The filter and the locator key the same bytes: one hash.
                     // It is the current key's for the hash index too, which a
                     // later row write of another version of this key buckets by.
                     let key_hash = crate::hash::hash64(user_key);
                     self.current_key_hash = key_hash;
-                    if filtered {
+                    if self.filtered {
                         self.filter_hashes +=
                             self.filter_writer.register_key(user_key, key_hash)? as u64;
                     }
@@ -4110,6 +4171,7 @@ impl Writer {
                     }
                 }
             }
+            current_key = Some(user_key);
             if self.meta.first_key.is_none() {
                 self.meta.first_key = Some(user_key.clone());
             }
@@ -4121,6 +4183,8 @@ impl Writer {
             self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
             self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
         }
+        // The block's own rows are the current key until it ends.
+        self.spilled_key = Some(last_key.clone());
 
         Ok(Some(DirectBlockInputs {
             last_key,
@@ -4209,7 +4273,8 @@ impl Writer {
         comparator: &crate::SharedComparator,
     ) -> crate::Result<()> {
         if let Some(prebuilt) = self.prebuilt_filter.as_mut() {
-            let mut previous = self.current_key.as_deref();
+            let mut previous =
+                Self::last_key_in(&self.chunk, self.spilled_key.as_ref()).map(|k| &**k);
             for entry in entries {
                 let key = &*entry.key.user_key;
                 if previous.is_some_and(|p| crate::comparator::same_user_key(p, key)) {
@@ -4590,7 +4655,10 @@ impl Writer {
             a.key.value_type == crate::ValueType::MergeOperand
                 && b.key.value_type == crate::ValueType::MergeOperand
         };
-        if let (Some(prev), Some(first)) = (self.current_key.as_ref(), entries.first()) {
+        if let (Some(prev), Some(first)) = (
+            Self::last_key_in(&self.chunk, self.spilled_key.as_ref()),
+            entries.first(),
+        ) {
             match comparator.compare(prev.as_ref(), first.key.user_key.as_ref()) {
                 core::cmp::Ordering::Greater => return Err(err()),
                 // The same user key spans the block boundary: its versions must
@@ -4855,7 +4923,7 @@ impl Writer {
         if let (Some(first), Some(last)) = (&self.meta.first_key, &self.meta.last_key) {
             filter_writer.set_key_range(first, last);
         }
-        let filter = filter_writer.finish(&mut self.file_writer)?;
+        let filter = filter_writer.finish(&mut self.file_writer, self.spilled_key.as_ref())?;
         let filter_block_count = filter.blocks;
         self.meta.filter_hashes = filter.hashes;
         self.meta.filter_partition_hashes = filter.partition_hashes;

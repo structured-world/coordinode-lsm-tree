@@ -70,13 +70,16 @@ const TABLES: usize = 2_000;
 
 #[test]
 fn a_level_too_large_for_one_edit_record_compacts_and_reopens() -> lsm_tree::Result<()> {
-    let dir = tempfile::tempdir()?;
+    // In memory: the point is the edit's size, and two thousand tables synced to
+    // a busy disk take the test past its time limit.
+    let fs = std::sync::Arc::new(lsm_tree::fs::MemFs::new());
     let open = || {
         Config::new(
-            dir.path(),
+            std::path::Path::new("/many-runs"),
             SequenceNumberCounter::default(),
             SequenceNumberCounter::default(),
         )
+        .with_shared_fs(fs.clone())
         .open()
     };
 

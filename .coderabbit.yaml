@@ -53,6 +53,11 @@ reviews:
         the module doc of `benches/dict_ratio.rs`). Review its methodology
         instead: the fixtures, the round-trip validation, and what each timing
         column bills. Do not ask it to move to criterion.
+        The same holds for a harness that times one whole operation and counts
+        what that operation does, allocations and peak memory included, as
+        `benches/compaction_merge.rs` does: a counter reads one operation, not
+        a batch of iterations. Such a harness prints its percentiles itself,
+        over a sample count it takes as a setting.
     - path: "src/compaction/**"
       instructions: |
         Compaction is crash-safety critical. Every state mutation must be atomic.

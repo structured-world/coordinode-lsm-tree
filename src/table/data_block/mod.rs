@@ -502,7 +502,30 @@ impl ParsedItem<InternalValue> for DataBlockParsedItem {
         } else {
             bytes.slice(self.key.0..self.key.1)
         };
+        self.with_key(key, bytes)
+    }
+}
 
+impl DataBlockParsedItem {
+    /// [`ParsedItem::materialize`] for a reader taking a whole block, row
+    /// after row: a key rebuilt from its prefix lands in `keys` rather than in
+    /// an allocation of its own.
+    pub(crate) fn materialize_in(
+        &self,
+        bytes: &Slice,
+        keys: &mut crate::slice::KeyChunks,
+    ) -> InternalValue {
+        // NOTE: We consider the prefix and key slice indexes to be trustworthy
+        #[expect(clippy::indexing_slicing)]
+        let key = if let Some(prefix) = &self.prefix {
+            keys.fuse(&bytes[prefix.0..prefix.1], &bytes[self.key.0..self.key.1])
+        } else {
+            bytes.slice(self.key.0..self.key.1)
+        };
+        self.with_key(key, bytes)
+    }
+
+    fn with_key(&self, key: Slice, bytes: &Slice) -> InternalValue {
         let key = InternalKey::new(key, self.seqno, self.value_type);
 
         let value = self
