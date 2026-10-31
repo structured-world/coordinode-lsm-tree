@@ -313,8 +313,9 @@ impl Writer {
         // error — an open failure above created nothing, so caller-side
         // cleanup would race a concurrent creator and delete a file it does
         // not own.
-        let mut writer =
-            crate::sfa::Writer::from_writer(ChecksummedWriter::new(BufWriter::new(file)));
+        let mut writer = crate::sfa::Writer::from_writer(ChecksummedWriter::new(
+            BufWriter::with_capacity(u16::MAX.into(), file),
+        ));
         if let Err(e) = writer.start("data") {
             drop(writer);
             // Best-effort cleanup of the partial file we own, but do not swallow
