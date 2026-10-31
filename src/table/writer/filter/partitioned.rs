@@ -778,7 +778,10 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             self.spill_hashes = self.spill_threshold();
         }
         if self.bloom_hash_buffer.len() >= self.spill_hashes {
-            self.last_key = Some(key.clone());
+            // Owned bytes: the partition index keeps this key until the table
+            // ends, so it must not hold the key chunk a row's key is a view of.
+            let end = UserKey::new(key);
+            self.last_key = Some(end.clone());
             // mem::replace (rather than mem::take) preserves the buffer's
             // grown capacity for the next partition. `take` leaves a
             // capacity-0 Vec behind, which would force a reallocation on
@@ -789,7 +792,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
             let old_cap = self.bloom_hash_buffer.capacity();
             let hashes =
                 core::mem::replace(&mut self.bloom_hash_buffer, Vec::with_capacity(old_cap));
-            self.spill_filter_partition(key, hashes)?;
+            self.spill_filter_partition(&end, hashes)?;
         }
 
         Ok(1)
