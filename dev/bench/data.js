@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793445604819,
+  "lastUpdate": 1793453016102,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66052,6 +66052,90 @@ window.BENCHMARK_DATA = {
             "value": 308491.5961290092,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 14.8us | P99.9: 94.1us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f7e4cff0e7efdcb67a09c79fd654059ae6e85fdd",
+          "message": "fix(fs): never show uninitialized memory to safe code (#1029)\n\n## Summary\n- No safe public API hands uninitialized bytes to a reader or file\nimplementation outside the crate any more, which was undefined behaviour\nreachable from safe code.\n- Buffers are zeroed only where the code doing the read is unknown; the\ncrate's backends, and any other backend whose read only writes, skip it.\n\n## Changes\n- `FsFile::read_at_buf` and `read_many_buf` take a `ReadBuf`. The\ndefault zeroes and calls `read_at`; `StdFs`, both io_uring backends and\n`MemFs` override them without zeroing, and the wrappers forward them.\n- `ReadBuf::fill_with` lets an implementation outside the crate skip the\nzeroing under its own `unsafe` promise.\n- Only the crate constructs a `ReadBuf`, and callers trust its filled\ncount, so a safe implementation can neither swap the buffer nor claim a\nread it did not make; such a read is `UnexpectedEof`.\n- `read_exact`, `read_exact_many`, scanner chunks and encrypted blocks\nread through `ReadBuf`. The scanner reads by offset instead of the file\ncursor.\n- Public `Slice::from_reader` and `ByteView::from_reader`, which take\nany reader, zero.\n\n## For consumers\nExisting `FsFile` implementations, CoordiNode's included, keep compiling\nand stay sound, but each read now pays for zeroing its buffer. An\nimplementation whose read only writes the buffer overrides `read_at_buf`\nwith `ReadBuf::fill_with`, and `read_many_buf` too if it has a batched\nread, to skip the zeroing. A wrapper forwards both to its inner file, or\nit zeroes on behalf of a backend that would not.\n\n## Testing\nLints, tests in both feature sets, doc tests, the doc build, the no-std\ncheck and the visibility ratchet pass on Linux. Miri is clean on the\n`from_reader`, block read, scanner and `ReadBuf` tests. The before and\nafter measurement is in the issue.\n\nCloses #1023",
+          "timestamp": "2026-10-31T12:59:27Z",
+          "tree_id": "d2e4ca9488245ab0becfbc3a3fb217abdd145dc8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f7e4cff0e7efdcb67a09c79fd654059ae6e85fdd"
+        },
+        "date": 1793453014668,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 102640.6935441251,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.7us | P99.9: 47.2us\nthreads: 1 | elapsed: 5.21s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2795267.7291358174,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 2.2us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 805388.7790029863,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.6us | P99.9: 12.9us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 448446.2612875998,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 7.5us | P99.9: 36.4us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 2963858.048093487,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 7.2us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 278885.89680266916,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 10.4us | P99.9: 34.3us\nthreads: 1 | elapsed: 0.72s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 176539.2085064076,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 20.2us | P99.9: 44.4us\nthreads: 1 | elapsed: 1.13s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 844537.8308103245,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 11.7us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1006444.0347043038,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 312237.8104954259,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 16.7us | P99.9: 108.6us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
           }
         ]
       }
