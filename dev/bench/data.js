@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793445600604,
+  "lastUpdate": 1793445604819,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -90300,6 +90300,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.505720468,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b446d2bd2974151119a3ee0d1b9d2c0e9d3d837e",
+          "message": "perf(compaction): cut per-row merge and write costs (#1027)\n\n## Summary\n- Takes the per-row allocations, copies and repeated work out of the\ncompaction path, from block iteration through the merge to the table\nwriter and filter build.\n- Key allocations per merged row fall from about one to 0.02-0.43 for\nkeys above the inline size, and full compaction gets 12-49% faster\nwithout compression and on zstd level 1.\n- At zstd level 22 the encoder dominates and the gain is 2.4%; the\niterator API stays as it is.\n\n## Changes\n- `KeyChunks`: a scan writes rebuilt keys side by side into shared 4 KiB\nchunks. Carried blocks do the same, and the block and filter partition\nindexes keep their own copies of their keys so they hold no chunk until\nthe table ends. Keys at or below the inline size and keys above a chunk\nkeep their existing path; the `bytes_1` backend keeps one allocation per\nkey.\n- `ByteView::clone` takes a reference and copies the view rather than\ngoing through `slice`.\n- Merge heap: entries are ordered by slot number and binary searched,\nand lexicographic keys compare a word past the common prefix. Custom\ncomparators use the plain comparison.\n- Compaction stream and writers: a row's key is compared with its\nneighbour once, range tombstone coverage is asked once per row, and\nper-row tests are computed once.\n- Filters: keys register without a clone or an estimate, a BuRR layer's\nkeys split in one pass, and a layer solves straight into its stored\npayload.\n- `parking_lot` 0.13 and `parking_lot_core` 0.10.\n- `diagnostics`, a new feature off by default with no stability promise:\nprocess-wide counts of key copies and reference count operations for\nbenches.\n- New benches: `compaction_merge` (key length, prefix shape, fan-in,\noverlap, versions, block size, comparator, codec) and\n`block_cache_contention`.\n- `manifest_many_runs` keeps its oversized edit test on `MemFs`, and\n`idle_wakeups` waits out compaction's tail before it measures.\n\nThe on-disk format is unchanged: the output encoder still computes\nshared lengths against its own restart head.\n\n## Testing\nFormatting, clippy in both feature configurations, the no-std check and\nthe Linux test suite in default and all-features configurations pass.\nTimed results come from paired runs on a benchmark host against a\ncontrol built from `main` with the same bench.\n\nCloses #967\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved key handling during reads and compaction to reduce copying,\nand streamlined merge operations, filter construction, and table\nwriting.\n* **Diagnostics**\n* Added an optional, bench-focused feature for tracking key-copy and\nreference-count activity.\n* **Benchmarks**\n* Added benchmarks for block-cache contention and compaction\nperformance, with configurable workloads and latency or memory\nmeasurements.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-31T13:00:32+02:00",
+          "tree_id": "25f73331199e130ad4b7fc1b5f528da93609b289",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b446d2bd2974151119a3ee0d1b9d2c0e9d3d837e"
+        },
+        "date": 1793445603566,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 484.029,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 78.478638ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 154.19000000000003,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 53.428494ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 448.977,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 99.288349ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4201.558,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9757.446,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 25.503,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 51.478527,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.431633331,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 25.503,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 52.035583,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.418413939,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
