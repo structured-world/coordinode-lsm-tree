@@ -46,6 +46,11 @@ mod chunks {
             if total <= INLINE_SIZE || total > CHUNK_BYTES as usize {
                 return Slice::fused(left, right);
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::diagnostics::add(&crate::diagnostics::CHUNK_KEYS, 1);
+                crate::diagnostics::add(&crate::diagnostics::KEY_BYTES, total);
+            }
             // Below `CHUNK_BYTES`, checked above.
             #[expect(clippy::cast_possible_truncation, reason = "total <= CHUNK_BYTES")]
             let len = total as u32;

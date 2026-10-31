@@ -37,6 +37,11 @@
 //! `COMPACTION_MERGE_REVERSE`, when set, orders keys by a custom comparator, the
 //! path that cannot compare keys as words.
 //!
+//! Built with the `diagnostics` feature it also prints, per entry of the last
+//! round, the keys fused and written into chunks, the bytes they copied, the
+//! views taken and the reference count operations. Those counters cost time, so
+//! they answer what happens, not how long it takes.
+//!
 //! `COMPACTION_MERGE_PERF_CTL=<ctl>,<ack>` names the fifos of a
 //! `perf record --control fifo:<ctl>,<ack> -D -1`: the bench enables recording
 //! around each compaction, so the profile leaves the fixture out.
@@ -381,6 +386,8 @@ fn main() -> lsm_tree::Result<()> {
                         let mut allocs = Vec::with_capacity(rounds);
                         let mut bytes = Vec::with_capacity(rounds);
                         let mut peaks = Vec::with_capacity(rounds);
+                        #[cfg(feature = "diagnostics")]
+                        let mut counts = lsm_tree::diagnostics::Counts::default();
                         for _ in 0..rounds {
                             let tree = fixture(shape, len, fanin, placement, codec, n)?;
                             let input_tables = tree.table_count();
@@ -388,6 +395,8 @@ fn main() -> lsm_tree::Result<()> {
                                 ALLOCS.load(Ordering::Relaxed),
                                 BYTES.load(Ordering::Relaxed),
                             );
+                            #[cfg(feature = "diagnostics")]
+                            let counts_before = lsm_tree::diagnostics::Counts::now();
                             let live_before = LIVE.load(Ordering::Relaxed);
                             PEAK.store(live_before, Ordering::Relaxed);
                             if let Some(perf) = &mut perf {
@@ -396,6 +405,10 @@ fn main() -> lsm_tree::Result<()> {
                             let start = Instant::now();
                             let result = tree.major_compact(u64::MAX, 0)?;
                             let elapsed = start.elapsed();
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                counts = lsm_tree::diagnostics::Counts::now().since(counts_before);
+                            }
                             if let Some(perf) = &mut perf {
                                 perf.send("disable\n")?;
                             }
@@ -419,6 +432,20 @@ fn main() -> lsm_tree::Result<()> {
                             median(bytes) as f64 / n as f64,
                             median(peaks) as f64 / 1024.0,
                         );
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            let per_entry = |count: u64| count as f64 / n as f64;
+                            println!(
+                                "  {:.3} fused, {:.3} chunk keys, {:.1} key bytes, {:.1} new bytes, {:.2} slices, {:.2} refs up, {:.2} refs down /entry",
+                                per_entry(counts.fused),
+                                per_entry(counts.chunk_keys),
+                                per_entry(counts.key_bytes),
+                                per_entry(counts.new_bytes),
+                                per_entry(counts.slices),
+                                per_entry(counts.refs_up),
+                                per_entry(counts.refs_down),
+                            );
+                        }
                     }
                 }
             }
