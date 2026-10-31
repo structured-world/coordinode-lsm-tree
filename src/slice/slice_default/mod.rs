@@ -8,6 +8,32 @@ use alloc::{string::String, vec::Vec};
 
 pub use crate::byteview::Builder;
 
+/// A [`Slice`] allocated and not written yet, for a read to fill.
+pub(crate) struct UnfilledSlice(ByteView);
+
+impl UnfilledSlice {
+    pub(crate) fn new(len: usize) -> Self {
+        // SAFETY: the bytes are reached only as `MaybeUninit` until
+        // `assume_filled`, whose caller promises they were written.
+        Self(unsafe { ByteView::with_size_unzeroed(len) })
+    }
+
+    /// The whole allocation as a read target.
+    pub(crate) fn target(&mut self) -> crate::fs::ReadBuf<'_> {
+        crate::fs::ReadBuf::uninit(self.0.unfilled_mut())
+    }
+
+    /// The slice.
+    ///
+    /// # Safety
+    ///
+    /// Every byte must have been written.
+    pub(crate) unsafe fn assume_filled(mut self) -> Slice {
+        self.0.update_prefix();
+        Slice(self.0)
+    }
+}
+
 /// An immutable byte slice that can be cloned without additional heap allocation
 ///
 /// There is no guarantee of any sort of alignment for zero-copy (de)serialization.

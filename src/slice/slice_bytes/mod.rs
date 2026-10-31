@@ -8,6 +8,41 @@ use bytes::Bytes;
 
 pub use bytes::BytesMut as Builder;
 
+/// A [`Slice`] allocated and not written yet, for a read to fill.
+pub(crate) struct UnfilledSlice {
+    builder: Builder,
+    len: usize,
+}
+
+impl UnfilledSlice {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            builder: Builder::with_capacity(len),
+            len,
+        }
+    }
+
+    /// The whole allocation as a read target.
+    pub(crate) fn target(&mut self) -> crate::fs::ReadBuf<'_> {
+        let (target, _) = self.builder.spare_capacity_mut().split_at_mut(self.len);
+        crate::fs::ReadBuf::uninit(target)
+    }
+
+    /// The slice.
+    ///
+    /// # Safety
+    ///
+    /// Every byte must have been written.
+    pub(crate) unsafe fn assume_filled(mut self) -> Slice {
+        // SAFETY: the caller promises the first `len` bytes were written.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            self.builder.set_len(self.len);
+        }
+        Slice(self.builder.freeze())
+    }
+}
+
 /// An immutable byte slice that can be cloned without additional heap allocation
 ///
 /// There is no guarantee of any sort of alignment for zero-copy (de)serialization.

@@ -712,6 +712,21 @@ impl ByteView {
         }
     }
 
+    /// The bytes of a view from [`Self::with_size_unzeroed`], as memory that
+    /// may be uninitialized.
+    pub(crate) fn unfilled_mut(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
+        let len = self.len();
+        let data = if self.is_inline() {
+            self.get_mut_slice().as_mut_ptr()
+        } else {
+            // SAFETY: the view is not inline, so its heap variant is active.
+            unsafe { self.data_ptr_mut() }
+        };
+        // SAFETY: `data` points at the view's `len` bytes, borrowed through
+        // `self`, and `MaybeUninit<u8>` has the layout of `u8`.
+        unsafe { core::slice::from_raw_parts_mut(data.cast(), len) }
+    }
+
     fn get_heap_region(&self) -> &HeapAllocationHeader {
         debug_assert!(
             !self.is_inline(),

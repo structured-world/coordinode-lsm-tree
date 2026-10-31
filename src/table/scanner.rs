@@ -10,7 +10,7 @@ use crate::{
     CompressionType, InternalValue, SeqNo,
     comparator::SharedComparator,
     encryption::EncryptionProvider,
-    fs::{FileHint, Fs, FsOpenOptions, ReadBuf},
+    fs::{FileHint, Fs, FsOpenOptions},
     table::{block::BlockType, iter::OwnedDataBlockIter, util::TimedFile},
 };
 
@@ -110,14 +110,8 @@ impl BlockStream {
         // `need` exceeds what is pending, so the chunk reads past it.
         let read = len - pending_len;
         let size = taken + len;
-        // SAFETY: the builder is frozen only once `ReadBuf` counts all of it
-        // filled, which safe code can only claim of bytes it was given
-        // initialized.
-        #[expect(unsafe_code, reason = "see safety")]
-        let mut builder = unsafe { crate::Slice::builder_unzeroed(size) };
-        // SAFETY: as above.
-        #[expect(unsafe_code, reason = "see safety")]
-        let mut target = unsafe { ReadBuf::unwritten(&mut builder) };
+        let mut slice = crate::slice::UnfilledSlice::new(size);
+        let mut target = slice.target();
         target.append(kept);
         self.file.read_rest(&mut target, self.end - self.unread)?;
         if target.filled() != size {
@@ -127,7 +121,10 @@ impl BlockStream {
             )
             .into());
         }
-        let chunk = builder.freeze().into();
+        // SAFETY: `ReadBuf` counts every byte filled, which safe code can only
+        // claim of bytes it was given initialized.
+        #[expect(unsafe_code, reason = "see safety")]
+        let chunk = unsafe { slice.assume_filled() };
         self.unread = self.unread.saturating_sub(read as u64);
         self.chunk = chunk;
         self.mark = self.mark.map(|_| 0);

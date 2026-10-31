@@ -8,6 +8,7 @@ use crate::path::Path;
 use crate::{
     Slice,
     fs::{Fs, FsFile, ReadBuf, SyncMode},
+    slice::UnfilledSlice,
 };
 #[cfg(feature = "std")]
 use std::io::Write;
@@ -386,14 +387,8 @@ pub(crate) fn read_exact_paced(
     size: usize,
     pace: Option<&dyn crate::table::util::ReadPacer>,
 ) -> crate::io::Result<Slice> {
-    // SAFETY: the builder is not frozen unless `ReadBuf` counts all of it
-    // filled, which safe code can only claim of bytes it was given initialized.
-    #[expect(unsafe_code, reason = "see safety")]
-    let mut builder = unsafe { Slice::builder_unzeroed(size) };
-
-    // SAFETY: as above.
-    #[expect(unsafe_code, reason = "see safety")]
-    let mut target = unsafe { ReadBuf::unwritten(&mut builder) };
+    let mut slice = UnfilledSlice::new(size);
+    let mut target = slice.target();
     read_at_paced(file, &mut target, offset, pace)?;
     let bytes_read = target.filled();
 
@@ -407,7 +402,10 @@ pub(crate) fn read_exact_paced(
         ));
     }
 
-    Ok(builder.freeze().into())
+    // SAFETY: `ReadBuf` counts every byte filled, which safe code can only
+    // claim of bytes it was given initialized.
+    #[expect(unsafe_code, reason = "see safety")]
+    Ok(unsafe { slice.assume_filled() })
 }
 
 /// Reads `buf` from `file` at `offset`, filling it, less only at the file's
@@ -479,20 +477,14 @@ pub fn read_exact_many(
     file: &dyn FsFile,
     regions: &[(u64, usize)],
 ) -> crate::io::Result<alloc::vec::Vec<Slice>> {
-    // SAFETY: each builder starts uninitialized, with its region's length, and
-    // is frozen only once its `ReadBuf` counts it filled; on anything less
-    // every builder is dropped unread.
-    #[expect(unsafe_code, reason = "see safety")]
-    let mut builders: alloc::vec::Vec<_> = regions
+    let mut slices: alloc::vec::Vec<_> = regions
         .iter()
-        .map(|&(_, size)| unsafe { Slice::builder_unzeroed(size) })
+        .map(|&(_, size)| UnfilledSlice::new(size))
         .collect();
-    // SAFETY: as above.
-    #[expect(unsafe_code, reason = "see safety")]
     let mut targets: alloc::vec::Vec<(u64, ReadBuf<'_>)> = regions
         .iter()
-        .zip(builders.iter_mut())
-        .map(|(&(offset, _), builder)| (offset, unsafe { ReadBuf::unwritten(builder) }))
+        .zip(slices.iter_mut())
+        .map(|(&(offset, _), slice)| (offset, slice.target()))
         .collect();
     file.read_many_buf(&mut targets)?;
     // The trait's safe implementations can return `Ok` having filled less.
@@ -506,9 +498,16 @@ pub fn read_exact_many(
         ));
     }
     drop(targets);
-    Ok(builders
+    Ok(slices
         .into_iter()
-        .map(|builder| builder.freeze().into())
+        // SAFETY: every `ReadBuf` counted its slice filled just above, which
+        // safe code can only claim of bytes it was given initialized.
+        .map(|slice| {
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                slice.assume_filled()
+            }
+        })
         .collect())
 }
 

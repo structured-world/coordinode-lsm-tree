@@ -61,21 +61,6 @@ impl<'a> ReadBuf<'a> {
         }
     }
 
-    /// A buffer over bytes allocated but not written.
-    ///
-    /// # Safety
-    ///
-    /// The caller must not read `buf` until it has checked that the read
-    /// filled it.
-    pub(crate) unsafe fn unwritten(buf: &'a mut [u8]) -> Self {
-        // SAFETY: `MaybeUninit<u8>` has the layout of `u8`.
-        #[expect(unsafe_code, reason = "see safety")]
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<MaybeUninit<u8>>(), buf.len())
-        };
-        Self::uninit(buf)
-    }
-
     /// The bytes the buffer can take.
     #[must_use]
     pub fn capacity(&self) -> usize {
@@ -103,12 +88,19 @@ impl<'a> ReadBuf<'a> {
 
     /// Marks the first `filled` bytes as filled.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `filled` exceeds what is initialized.
-    pub fn set_filled(&mut self, filled: usize) {
-        assert!(filled <= self.init, "filled past the initialized bytes");
+    /// `filled` exceeds what is initialized, as a read reporting more bytes
+    /// than its buffer holds does.
+    pub fn set_filled(&mut self, filled: usize) -> io::Result<()> {
+        if filled > self.init {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "read reported more bytes than its buffer holds",
+            ));
+        }
         self.filled = filled;
+        Ok(())
     }
 
     /// The whole buffer as bytes, whether initialized or not.
@@ -284,6 +276,7 @@ pub(crate) unsafe fn assume_regions_filled(regions: &mut [(u64, ReadBuf<'_>)]) {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test code")]
 mod tests;
 
 #[cfg(all(test, feature = "std"))]

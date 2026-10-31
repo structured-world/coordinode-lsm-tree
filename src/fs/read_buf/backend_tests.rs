@@ -8,6 +8,8 @@ struct Foreign {
     inner: Box<dyn FsFile>,
     /// Whether `read_at_buf` claims success without filling anything.
     lies: bool,
+    /// How many bytes `read_at` reports past what it read.
+    overclaim: usize,
     /// Nonzero bytes `read_at` found in the buffers it was handed.
     nonzero_seen: AtomicUsize,
 }
@@ -22,6 +24,7 @@ impl Foreign {
         Ok(Self {
             inner: fs.open(path, &FsOpenOptions::new().read(true))?,
             lies,
+            overclaim: 0,
             nonzero_seen: AtomicUsize::new(0),
         })
     }
@@ -65,15 +68,15 @@ impl FsFile for Foreign {
         // Safe code may look at what it was given: that must be initialized.
         let nonzero = buf.iter().filter(|byte| **byte != 0).count();
         self.nonzero_seen.fetch_add(nonzero, Ordering::Relaxed);
-        self.inner.read_at(buf, offset)
+        let read = self.inner.read_at(buf, offset)?;
+        Ok(read + self.overclaim)
     }
     fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
         if self.lies {
             return Ok(());
         }
         let filled = self.read_at(buf.init_mut(), offset)?;
-        buf.set_filled(filled);
-        Ok(())
+        buf.set_filled(filled)
     }
     fn read_many_buf(&self, regions: &mut [(u64, ReadBuf<'_>)]) -> crate::io::Result<()> {
         if self.lies {
@@ -119,6 +122,17 @@ fn read_exact_many_refuses_a_read_that_filled_nothing() -> crate::Result<()> {
     let error =
         crate::file::read_exact_many(&file, &[(0, 64), (64, 64)]).expect_err("nothing was filled");
     assert_eq!(error.kind(), crate::io::ErrorKind::UnexpectedEof);
+    Ok(())
+}
+
+/// A backend reporting more bytes than its buffer holds breaks the contract of
+/// `read_at`; that is an I/O error, not a panic on a read path.
+#[test]
+fn read_exact_refuses_a_read_past_its_buffer() -> crate::Result<()> {
+    let mut file = Foreign::over(&[7; 128], false)?;
+    file.overclaim = 1;
+    let error = crate::file::read_exact(&file, 0, 128).expect_err("one byte too many");
+    assert_eq!(error.kind(), crate::io::ErrorKind::InvalidData);
     Ok(())
 }
 

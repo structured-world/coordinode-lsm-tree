@@ -1587,7 +1587,10 @@ impl Block {
 
             let mut buf = alloc::vec::Vec::with_capacity(block_size);
             on_issue();
-            let mut target = crate::fs::ReadBuf::uninit(buf.spare_capacity_mut());
+            // `with_capacity` may give more than asked, and past `block_size`
+            // lies the next block.
+            let (spare, _) = buf.spare_capacity_mut().split_at_mut(block_size);
+            let mut target = crate::fs::ReadBuf::uninit(spare);
             crate::file::read_at_paced(file, &mut target, *handle.offset(), pace)?;
             let n = target.filled();
             if n != block_size {

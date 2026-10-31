@@ -21,8 +21,12 @@ use alloc::{string::String, vec::Vec};
 use crate::path::{Path, PathBuf};
 
 #[cfg(not(feature = "bytes_1"))]
+pub(crate) use slice_default::UnfilledSlice;
+#[cfg(not(feature = "bytes_1"))]
 pub use slice_default::{Builder, Slice};
 
+#[cfg(feature = "bytes_1")]
+pub(crate) use slice_bytes::UnfilledSlice;
 #[cfg(feature = "bytes_1")]
 pub use slice_bytes::{Builder, Slice};
 

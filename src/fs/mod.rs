@@ -644,8 +644,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
     /// Returns an I/O error if the read fails.
     fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
         let filled = self.read_at(buf.init_mut(), offset)?;
-        buf.set_filled(filled);
-        Ok(())
+        buf.set_filled(filled)
     }
 
     /// [`read_many`](Self::read_many) into buffers that may be uninitialized;
@@ -662,7 +661,7 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
         self.read_many(&mut bytes)?;
         drop(bytes);
         for (_, buf) in regions {
-            buf.set_filled(buf.capacity());
+            buf.set_filled(buf.capacity())?;
         }
         Ok(())
     }
