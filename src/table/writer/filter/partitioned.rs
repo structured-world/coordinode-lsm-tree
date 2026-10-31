@@ -33,7 +33,14 @@ pub struct PartitionedFilterWriter {
 
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
-    approx_filter_size: usize,
+
+    /// Hashes at which the open partition spills, worked out from
+    /// `partition_size` and `bloom_policy` when the first key arrives; 0 until
+    /// then.
+    spill_hashes: usize,
+
+    /// Length of the key registered last, which ends the open partition.
+    open_key_len: usize,
 
     partition_size: u32,
 
@@ -41,6 +48,8 @@ pub struct PartitionedFilterWriter {
 
     relative_file_pos: u64,
 
+    /// The last key of the partition spilled last. The open partition's own
+    /// last key is not kept: `finish` is handed it.
     last_key: Option<UserKey>,
 
     compression: CompressionType,
@@ -101,7 +110,8 @@ impl PartitionedFilterWriter {
             final_filter_buffer: Vec::new(),
 
             bloom_hash_buffer: Vec::new(),
-            approx_filter_size: 0,
+            spill_hashes: 0,
+            open_key_len: 0,
 
             tli_handles: Vec::new(),
             tli_bytes: 0,
@@ -177,11 +187,45 @@ impl PartitionedFilterWriter {
         let pending: usize = self.pending.iter().map(|p| entry(&p.key)).sum();
         #[cfg(not(feature = "std"))]
         let pending = 0;
-        let open = match &self.last_key {
-            Some(last) if !self.bloom_hash_buffer.is_empty() => entry(last),
-            _ => 0,
+        let open = if self.bloom_hash_buffer.is_empty() {
+            0
+        } else {
+            core::mem::size_of::<KeyedBlockHandle>() + self.open_key_len
         };
         self.tli_bytes + pending + open
+    }
+
+    /// The hash count at which the policy's estimate first reaches
+    /// `partition_size`, found once so a key costs a comparison rather than
+    /// an estimate. The estimate grows with the count. `usize::MAX` when it
+    /// never does, as for a policy that builds no filter.
+    fn spill_threshold(&self) -> usize {
+        const NEVER_PAST: usize = 1
+            << if usize::BITS > 40 {
+                40
+            } else {
+                usize::BITS - 2
+            };
+        let reaches =
+            |n| self.bloom_policy.estimated_filter_size(n) >= self.partition_size as usize;
+        let mut high = 1_usize;
+        while !reaches(high) {
+            if high >= NEVER_PAST {
+                return usize::MAX;
+            }
+            high *= 2;
+        }
+        // `high / 2` is below the threshold, or `high` is 1 and nothing is.
+        let mut low = high / 2;
+        while low + 1 < high {
+            let middle = usize::midpoint(low, high);
+            if reaches(middle) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        high
     }
 
     /// The open partition's filter bytes, bounded from above: what `finish`
@@ -221,7 +265,6 @@ impl PartitionedFilterWriter {
     /// `bloom_hash_buffer` by the caller, on a worker when the writer has
     /// any and here otherwise.
     fn spill_filter_partition(&mut self, key: &UserKey, hashes: Vec<u64>) -> crate::Result<()> {
-        self.approx_filter_size = 0;
         let partition_index = self.tli_handles.len() + self.pending_count();
         let range = self.partition_range(key);
         self.table_hashes += hashes.len();
@@ -681,6 +724,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
     fn use_partition_size(mut self: Box<Self>, size: u32) -> Box<dyn FilterWriter<W>> {
         self.partition_size = size;
+        self.spill_hashes = 0;
         self
     }
 
@@ -703,6 +747,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         policy: BloomConstructionPolicy,
     ) -> Box<dyn FilterWriter<W>> {
         self.bloom_policy = policy;
+        self.spill_hashes = 0;
         self
     }
 
@@ -724,16 +769,16 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         // so prefix hashes would only increase CPU and filter size with no
         // read-side benefit.
 
-        self.approx_filter_size = self
-            .bloom_policy
-            .estimated_filter_size(self.bloom_hash_buffer.len());
-
         if self.sizing.is_some() && self.first_key.is_none() {
             self.first_key = Some(key.clone());
         }
-        self.last_key = Some(key.clone());
+        self.open_key_len = key.len();
 
-        if self.approx_filter_size >= self.partition_size as usize {
+        if self.spill_hashes == 0 {
+            self.spill_hashes = self.spill_threshold();
+        }
+        if self.bloom_hash_buffer.len() >= self.spill_hashes {
+            self.last_key = Some(key.clone());
             // mem::replace (rather than mem::take) preserves the buffer's
             // grown capacity for the next partition. `take` leaves a
             // capacity-0 Vec behind, which would force a reallocation on
@@ -822,7 +867,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
 
     fn finish_output_bytes(&self) -> u64 {
         use crate::table::block::{BlockType, framed_len_bound};
-        if self.last_key.is_none() {
+        if self.last_key.is_none() && self.bloom_hash_buffer.is_empty() {
             return 0;
         }
         let encryption = self.encryption.as_deref();
@@ -857,8 +902,9 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
     fn finish(
         mut self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+        last_key: Option<&UserKey>,
     ) -> crate::Result<super::FilterOutput> {
-        if self.last_key.is_none() {
+        if self.last_key.is_none() && self.bloom_hash_buffer.is_empty() {
             log::trace!("Filter writer has not seen any writes - not building filter");
             return Ok(super::FilterOutput::default());
         }
@@ -866,12 +912,12 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for PartitionedFilte
         if !self.bloom_hash_buffer.is_empty() {
             #[expect(
                 clippy::expect_used,
-                reason = "last key must exist because of initial check"
+                reason = "a table that registered a key has a last key"
             )]
-            let last_key = self.last_key.take().expect("last key should exist");
+            let last_key = last_key.expect("the open partition has a last key");
             // No partition follows the last one, so the buffer goes whole.
             let hashes = core::mem::take(&mut self.bloom_hash_buffer);
-            self.spill_filter_partition(&last_key, hashes)?;
+            self.spill_filter_partition(last_key, hashes)?;
         }
         // Every partition is in the buffer, in spill order, before any of
         // them is bound to its place in the file.

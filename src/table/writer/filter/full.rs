@@ -273,6 +273,7 @@ impl<W: crate::io::Write + crate::io::Seek> FilterWriter<W> for FullFilterWriter
     fn finish(
         mut self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+        _last_key: Option<&UserKey>,
     ) -> crate::Result<super::FilterOutput> {
         if let Some(filter_bytes) = &self.prebuilt {
             file_writer.start("filter")?;

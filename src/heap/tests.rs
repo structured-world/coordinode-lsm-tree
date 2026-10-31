@@ -214,3 +214,94 @@ fn single_element() {
     assert_eq!(&*e.value.key.user_key, b"x");
     assert!(heap.is_empty());
 }
+
+/// The heap against a sorted list under a mix of every operation, equal keys
+/// included: the extremes agree after each step, whichever way a replacement
+/// lands (in place, one step, or a binary search away) and whichever slot a
+/// pop freed for the next push.
+#[test]
+fn every_operation_matches_a_sorted_list() {
+    matches_a_sorted_list("", 0);
+}
+
+/// The compared words start past a shared prefix, and keys may end before a
+/// word does or tie on it and differ only after it.
+#[test]
+fn every_operation_matches_a_sorted_list_past_a_common_prefix() {
+    matches_a_sorted_list("shared-prefix/", "shared-prefix/".len());
+}
+
+/// A prefix the keys share but the merge was not told of only costs words.
+#[test]
+fn every_operation_matches_a_sorted_list_with_an_undeclared_prefix() {
+    matches_a_sorted_list("shared-prefix/", 0);
+}
+
+fn matches_a_sorted_list(prefix: &str, common: usize) {
+    let cmp = comparator::default_comparator();
+    let mut heap = MergeHeap::with_capacity(8, cmp);
+    heap.use_common_prefix(common);
+    let mut model: Vec<(String, usize)> = Vec::new();
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+
+    for step in 0..20_000_usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let number = (state >> 8) % 24;
+        let key = match (state >> 32) % 3 {
+            0 => format!("{prefix}{number:02}"),
+            1 => format!("{prefix}12345678{number:02}"),
+            _ => format!("{prefix}1234567"),
+        };
+        let src = ((state >> 16) % 5) as usize;
+        let item = (key.clone(), src);
+
+        match state % 6 {
+            0 | 1 if model.len() < 40 => {
+                heap.push(entry_src(&key, 0, src));
+                model.push(item);
+                model.sort();
+            }
+            2 if !model.is_empty() => {
+                let old = heap.replace_min(entry_src(&key, 0, src));
+                assert_eq!(old.index(), model.remove(0).1, "step {step}");
+                model.push(item);
+                model.sort();
+            }
+            3 if !model.is_empty() => {
+                let old = heap.replace_max(entry_src(&key, 0, src));
+                assert_eq!(old.index(), model.pop().unwrap().1, "step {step}");
+                model.push(item);
+                model.sort();
+            }
+            4 => {
+                assert_eq!(
+                    heap.pop_min().map(|e| e.index()),
+                    (!model.is_empty()).then(|| model.remove(0).1),
+                    "step {step}",
+                );
+            }
+            5 => {
+                assert_eq!(
+                    heap.pop_max().map(|e| e.index()),
+                    model.pop().map(|item| item.1),
+                    "step {step}",
+                );
+            }
+            _ => {}
+        }
+
+        let key_of = |e: &HeapEntry| String::from_utf8_lossy(&e.value.key.user_key).to_string();
+        assert_eq!(
+            heap.peek_min().map(|e| (key_of(e), e.index())),
+            model.first().cloned(),
+            "step {step}",
+        );
+        assert_eq!(
+            heap.peek_max().map(|e| (key_of(e), e.index())),
+            model.last().cloned(),
+            "step {step}",
+        );
+    }
+}

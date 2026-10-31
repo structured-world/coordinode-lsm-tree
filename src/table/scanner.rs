@@ -205,6 +205,8 @@ impl crate::io::Read for PendingThenFile<'_> {
 pub struct Scanner {
     reader: BlockStream,
     iter: OwnedDataBlockIter,
+    /// Where the rows' rebuilt keys land.
+    keys: crate::slice::KeyChunks,
 
     compression: CompressionType,
     block_count: usize,
@@ -337,6 +339,7 @@ impl Scanner {
         Ok(Self {
             reader,
             iter,
+            keys: crate::slice::KeyChunks::new(),
 
             compression,
             block_count,
@@ -399,7 +402,8 @@ impl Scanner {
             Some((block, frame)) => (Some(block), Some(frame)),
             None => (self.current_group, None),
         };
-        carry.start(group, frame, self.iter.by_ref());
+        let (iter, keys) = (&mut self.iter, &mut self.keys);
+        carry.start(group, frame, core::iter::from_fn(|| iter.next_in(keys)));
         self.carry = Some(carry);
         self
     }
@@ -409,7 +413,7 @@ impl Scanner {
     /// carry's list, each group's or block's taken at once so the candidate
     /// holds them all before the first goes; unrecorded, they come straight
     /// from the block, as a scan that records nothing reads them.
-    fn start_carried(&mut self, group: Option<super::BlockHandle>, rows: OwnedDataBlockIter) {
+    fn start_carried(&mut self, group: Option<super::BlockHandle>, mut rows: OwnedDataBlockIter) {
         let (group, frame) = match Self::row_block_frame(&mut self.reader, self.columnar) {
             Some((block, frame)) => (Some(block), Some(frame)),
             None => (group, None),
@@ -422,7 +426,8 @@ impl Scanner {
             self.filtering_below_bound = carry.filters_passed_rows();
             self.iter = rows;
         } else {
-            carry.start(group, frame, rows);
+            let keys = &mut self.keys;
+            carry.start(group, frame, core::iter::from_fn(|| rows.next_in(keys)));
         }
     }
 
@@ -761,7 +766,7 @@ impl Iterator for Scanner {
             // A scan that records what it reads hands out a recorded group's
             // rows from its carry, so the rows of the block come first only
             // where nothing is recorded: the path every other scan takes.
-            if let Some(mut item) = self.iter.next() {
+            if let Some(mut item) = self.iter.next_in(&mut self.keys) {
                 if self.filtering_below_bound && !self.hands_out(&item) {
                     continue;
                 }

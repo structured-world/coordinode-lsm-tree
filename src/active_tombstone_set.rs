@@ -174,10 +174,6 @@ impl ActiveTombstoneSet {
     }
 
     /// Returns `true` if there are no active tombstones.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "helper for callers to inspect active tombstones")
-    )]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.seqno_counts.is_empty()

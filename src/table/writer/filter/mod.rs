@@ -52,10 +52,12 @@ pub trait FilterWriter<W: crate::io::Write + crate::io::Seek> {
     /// estimated from what is held now.
     fn finish_output_bytes(&self) -> u64;
 
-    /// Writes the filter to a file, and returns what it wrote.
+    /// Writes the filter to a file, and returns what it wrote. `last_key` is
+    /// the last key registered, `None` when none was.
     fn finish(
         self: Box<Self>,
         file_writer: &mut crate::sfa::Writer<ChecksummedWriter<W>>,
+        last_key: Option<&UserKey>,
     ) -> crate::Result<FilterOutput>;
 
     fn set_filter_policy(

@@ -140,14 +140,6 @@ pub(crate) fn split_bumped(
     let value_count = values.as_deref().map(Vec::len);
     debug_assert!(value_count.is_none_or(|count| count == hashes.len()));
     debug_assert_eq!(values.is_some(), bumped.values.is_some());
-    let moving = equations
-        .iter()
-        .filter(|eq| is_bumped(eq, thresholds, b))
-        .count();
-    bumped.hashes.reserve_exact(moving);
-    if let Some(bumped_values) = &mut bumped.values {
-        bumped_values.reserve_exact(moving);
-    }
     let mut kept = 0;
     for at in 0..equations.len() {
         let eq = equations[at];
@@ -182,9 +174,18 @@ pub(crate) fn split_bumped(
 #[inline(always)]
 #[must_use]
 pub(crate) fn is_bumped(eq: &StandardEquation, thresholds: &[u8], b: u8) -> bool {
-    let b_usize = usize::from(b);
-    let block_idx = eq.start / b_usize;
-    let offset = (eq.start % b_usize) as u8;
+    // The default `b` is a power of two: a shift and a mask spare a division
+    // per key, and the branch never changes within a filter.
+    let (block_idx, offset) = if b.is_power_of_two() {
+        (
+            eq.start >> b.trailing_zeros(),
+            eq.start & usize::from(b - 1),
+        )
+    } else {
+        let b_usize = usize::from(b);
+        (eq.start / b_usize, eq.start % b_usize)
+    };
+    let offset = offset as u8;
     let threshold = thresholds.get(block_idx).copied().unwrap_or(0);
     offset >= threshold
 }

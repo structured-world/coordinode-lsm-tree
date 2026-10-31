@@ -740,6 +740,41 @@ mod merge_operator_tests {
         Arc::new(ConcatMerge)
     }
 
+    /// A writer skips its key comparison for a row the stream says starts a
+    /// key, so such a row must share its key with no earlier one, a chain the
+    /// stream declined to fold and re-emits from `pending` included: the input
+    /// behind that chain has already moved on to the next key.
+    #[test]
+    fn a_row_said_to_start_a_key_shares_it_with_no_earlier_row() -> crate::Result<()> {
+        for watermark in [0, 1_000] {
+            let vec = stream![
+                "a", "1", "M", "a", "2", "M", "a", "3", "M", "b", "1", "V", "c", "1", "V", "c",
+                "2", "V", "d", "1", "V",
+            ];
+            let mut iter = CompactionStream::new(vec.iter().cloned().map(Ok), watermark)
+                .with_merge_operator(Some(merge_op()));
+            let mut rows: Vec<InternalValue> = Vec::new();
+            let mut starts_key = false;
+            let mut starts = 0;
+            while let Some(row) = iter.next() {
+                let row = row?;
+                if starts_key {
+                    starts += 1;
+                    assert!(
+                        rows.iter().all(|r| r.key.user_key != row.key.user_key),
+                        "{row:?} repeats a key at watermark {watermark}",
+                    );
+                }
+                rows.push(row);
+                starts_key = iter.next_starts_key();
+            }
+            let chain = rows.iter().filter(|r| &*r.key.user_key == b"a").count();
+            assert_eq!(chain, 3, "the chain comes out unfolded");
+            assert_eq!(starts, 3, "each later key is known to start at {watermark}");
+        }
+        Ok(())
+    }
+
     /// The same concatenation, declaring that its operands compose, so a
     /// compaction without a proven base folds them instead of keeping them.
     struct ComposingConcat;

@@ -46,7 +46,7 @@ fn run_with(
     for event in events {
         match event {
             Ok(kept) => ledger
-                .admit(kept, &mut |row| {
+                .admit(kept, false, &mut |row, _| {
                     written.push(row);
                     Ok(())
                 })
@@ -55,7 +55,7 @@ fn run_with(
         }
     }
     let (frag, _) = ledger
-        .finish(&mut |row| {
+        .finish(&mut |row, _| {
             written.push(row);
             Ok(())
         })

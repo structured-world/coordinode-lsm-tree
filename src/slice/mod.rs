@@ -10,6 +10,10 @@ mod slice_bytes;
 #[cfg(not(feature = "bytes_1"))]
 mod slice_default;
 
+mod key_chunks;
+
+pub(crate) use key_chunks::KeyChunks;
+
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};

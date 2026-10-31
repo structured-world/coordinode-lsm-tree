@@ -115,27 +115,32 @@ pub(crate) fn encoded_len(filter: &BurrFilter) -> usize {
             .sum::<usize>()
 }
 
+/// A layer's solution as [`encode_layers`] takes it.
+#[derive(Clone, Copy)]
+pub(crate) enum LayerSolution<'a> {
+    /// Rows, row-major, each row's result in its low `r` bits, as an imported
+    /// solution comes.
+    Rows(&'a [u64]),
+    /// The bit-sliced payload itself, as a build solves it.
+    Packed(&'a [u8]),
+}
+
 /// One layer of a solution as [`encode_layers`] writes it: its slot count,
-/// its per-block thresholds and its rows, row-major, each row's result in
-/// its low `r` bits.
+/// its per-block thresholds and its solution.
 #[derive(Clone, Copy)]
 pub(crate) struct LayerParts<'a> {
     pub(crate) m: usize,
     pub(crate) thresholds: &'a [u8],
-    pub(crate) rows: &'a [u64],
+    pub(crate) solution: LayerSolution<'a>,
 }
 
 /// Appends a built [`BurrFilter`] in the wire format to `buf`.
 pub(crate) fn encode_into(filter: &BurrFilter, buf: &mut Vec<u8>) {
     let params = filter.params();
-    let layers = filter.layers_inner().iter().map(|layer| {
-        let rows = layer.ribbon.z_raw_words();
-        debug_assert_eq!(rows.len(), layer.m, "one solver row per slot");
-        LayerParts {
-            m: layer.m,
-            thresholds: &layer.thresholds,
-            rows,
-        }
+    let layers = filter.layers_inner().iter().map(|layer| LayerParts {
+        m: layer.m,
+        thresholds: &layer.thresholds,
+        solution: LayerSolution::Packed(&layer.z),
     });
     // Header. The filter_type tag distinguishes a membership payload
     // (probe → bool) from a retrieval payload (recover → locator); both
@@ -239,15 +244,21 @@ pub(crate) fn encode_layers<'a>(
                 .expect("vec write");
         }
         buf.extend_from_slice(layer.thresholds);
-        // The solver works row-major — back-substitution reads rows below the
-        // one it is finishing — so the transpose happens here, once per layer,
-        // on the way out. The builder's row-major buffer is transient; what is
-        // stored, cached and probed is the bit-sliced form, written straight
-        // into its place here.
-        let at = buf.len();
-        buf.resize(at + z_byte_len, 0);
-        if let Some(z) = buf.get_mut(at..) {
-            super::packed::transpose_into(layer.rows, r, z);
+        // What is stored, cached and probed is the bit-sliced form. A build
+        // solves straight into it; an imported solution is transposed here,
+        // into its place.
+        match layer.solution {
+            LayerSolution::Packed(payload) => {
+                debug_assert_eq!(payload.len(), z_byte_len, "a layer's payload size");
+                buf.extend_from_slice(payload);
+            }
+            LayerSolution::Rows(rows) => {
+                let at = buf.len();
+                buf.resize(at + z_byte_len, 0);
+                if let Some(payload) = buf.get_mut(at..) {
+                    super::packed::transpose_into(rows, r, payload);
+                }
+            }
         }
     }
 }

@@ -224,7 +224,7 @@ fn burr_bytes(image: &BurrImage) -> crate::Result<Vec<u8>> {
         layers.push(wire::LayerParts {
             m,
             thresholds: &layer.thresholds,
-            rows: &layer.rows,
+            solution: wire::LayerSolution::Rows(&layer.rows),
         });
     }
     let tag = match image.kind {

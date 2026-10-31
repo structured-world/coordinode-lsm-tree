@@ -60,7 +60,8 @@ impl OwnershipLedger {
 
     /// Hands `item`, a row the compaction keeps, on toward `write`, after the
     /// rows of earlier keys the ledger held, or holds it with the rest of its
-    /// key's group.
+    /// key's group. `write` is told whether its row is known to start a new
+    /// key, which `starts_key` says of `item` and held rows are not told.
     ///
     /// # Errors
     ///
@@ -74,13 +75,14 @@ impl OwnershipLedger {
     pub fn admit(
         &mut self,
         item: InternalValue,
-        write: &mut dyn FnMut(InternalValue) -> crate::Result<()>,
+        starts_key: bool,
+        write: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
     ) -> crate::Result<()> {
         if !self.is_open_for(&item.key.user_key) {
             self.close()?;
         }
         for row in self.ready.drain(..) {
-            write(row)?;
+            write(row, false)?;
         }
         // A key's rows are held from its first cell row on, so they still
         // reach the writer in the order the compaction emitted them.
@@ -91,7 +93,7 @@ impl OwnershipLedger {
             self.kept.push(item);
             return Ok(());
         }
-        write(item)
+        write(item, starts_key)
     }
 
     /// Records a dropped version: an indirection's object is charged now, a
@@ -143,11 +145,11 @@ impl OwnershipLedger {
     /// decode.
     pub fn finish(
         mut self,
-        write: &mut dyn FnMut(InternalValue) -> crate::Result<()>,
+        write: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
     ) -> crate::Result<(FragmentationMap, Vec<crate::vlog::ValueHandle>)> {
         self.close()?;
         for row in self.ready.drain(..) {
-            write(row)?;
+            write(row, false)?;
         }
         Ok((self.frag, self.released))
     }

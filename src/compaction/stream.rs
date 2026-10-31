@@ -14,6 +14,47 @@ use core::iter::Peekable;
 
 type Item = crate::Result<InternalValue>;
 
+/// Versions consumed from the input and not emitted, which answers the
+/// install's question that the transform counters cannot: did this run collect
+/// any history? A run that collected none must not raise the retention
+/// floor, or it refuses snapshots whose data is still there. An empty
+/// output is not that signal, since a watermark above every version
+/// collects the lot and writes no table.
+///
+/// It is a BALANCE rather than a list of drop sites: [`CountingPeek`] adds on
+/// every consumption and [`CompactionStream::settle_one`] subtracts on every
+/// emit, so any way of losing a version registers itself. The polarity is
+/// chosen so that an oversight over-reports (the floor rises, reads are
+/// refused) rather than under-reports (the floor stays put and a read is
+/// answered from data that is gone). Only the deliberately visibility-neutral
+/// drops excuse themselves, through [`CompactionStream::note_neutral_drop`].
+///
+/// The stream is its only writer and the install reads the result after the
+/// stream is gone, so both counts stay plain integers on the per-row path and
+/// the shared handle takes their difference once, when the stream drops, however
+/// the run ended.
+struct VersionBalance {
+    shared: Arc<portable_atomic::AtomicU64>,
+    taken: u64,
+    settled: u64,
+}
+
+impl Drop for VersionBalance {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.settled <= self.taken,
+            "a version was settled before it was consumed",
+        );
+        // Consumption precedes the matching settle, including for entries
+        // parked in `pending`, so this never underflows.
+        let open = self.taken - self.settled;
+        if open > 0 {
+            self.shared
+                .fetch_add(open, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// The peekable input, counting the versions that LEAVE it.
 ///
 /// It wraps the peekable rather than sitting under it, because `peek` pulls an
@@ -26,17 +67,21 @@ type Item = crate::Result<InternalValue>;
 /// call sites could not: every consumption goes through `next` or `next_if`,
 /// so the fold's drain, a merge resolution taking a base inline, a
 /// range-tombstone drop and an eviction all register themselves, including
-/// ways of consuming that do not exist yet (see `gc_balance`).
+/// ways of consuming that do not exist yet (see [`VersionBalance`]).
 struct CountingPeek<I: Iterator<Item = Item>> {
     inner: Peekable<I>,
-    balance: Arc<portable_atomic::AtomicU64>,
+    balance: VersionBalance,
 }
 
 impl<I: Iterator<Item = Item>> CountingPeek<I> {
-    fn new(iter: I, balance: Arc<portable_atomic::AtomicU64>) -> Self {
+    fn new(iter: I) -> Self {
         Self {
             inner: iter.peekable(),
-            balance,
+            balance: VersionBalance {
+                shared: Arc::new(portable_atomic::AtomicU64::new(0)),
+                taken: 0,
+                settled: 0,
+            },
         }
     }
 
@@ -45,10 +90,9 @@ impl<I: Iterator<Item = Item>> CountingPeek<I> {
         self.inner.peek()
     }
 
-    fn count_taken(&self, taken: Option<&Item>) {
+    fn count_taken(&mut self, taken: Option<&Item>) {
         if matches!(taken, Some(Ok(_))) {
-            self.balance
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            self.balance.taken += 1;
         }
     }
 
@@ -168,6 +212,10 @@ impl StreamFilter for NoFilter {
 /// Consumes a stream of KVs and emits a new stream according to GC and tombstone rules
 ///
 /// This iterator is used during flushing & compaction.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is an independent setting or sweep state of the merge"
+)]
 pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFilter> {
     /// KV stream
     inner: CountingPeek<I>,
@@ -226,36 +274,16 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
     /// NOT tick: the newer version shadowing them lives in the output.
     transform_marker: Option<Arc<portable_atomic::AtomicU64>>,
 
-    /// Versions consumed from the input and not emitted, which answers the
-    /// install's question that neither counter above can: did this run collect
-    /// any history? A run that collected none must not raise the retention
-    /// floor, or it refuses snapshots whose data is still there. An empty
-    /// output is not that signal, since a watermark above every version
-    /// collects the lot and writes no table.
-    ///
-    /// It is a BALANCE rather than a list of drop sites: `Counting` adds on
-    /// every consumption and [`Self::settle_one`] subtracts on every emit, so
-    /// any way of losing a version registers itself. The polarity is chosen so
-    /// that an oversight over-reports (the floor rises, reads are refused)
-    /// rather than under-reports (the floor stays put and a read is answered
-    /// from data that is gone). Only the deliberately visibility-neutral drops
-    /// excuse themselves, through [`Self::note_neutral_drop`].
-    ///
-    /// Consumption always precedes the matching emit, including for entries
-    /// parked in `pending`, so this never underflows.
-    gc_balance: Arc<portable_atomic::AtomicU64>,
+    /// Whether the input past the last head taken is known to hold another key.
+    key_ended: bool,
 }
 
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
     /// Initializes a new merge iterator
     #[must_use]
     pub fn new(iter: I, gc_watermark: SeqNo) -> Self {
-        let gc_balance = Arc::new(portable_atomic::AtomicU64::new(0));
-        let iter = CountingPeek::new(iter, Arc::clone(&gc_balance));
-
         Self {
-            inner: iter,
-            gc_balance,
+            inner: CountingPeek::new(iter),
             gc_watermark,
             dropped_callback: None,
             filter: NoFilter,
@@ -271,6 +299,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
             rt_use: RangeTombstoneUse::Boundary,
             completeness: None,
             transform_marker: None,
+            key_ended: false,
         }
     }
 }
@@ -295,8 +324,18 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             rt_use: self.rt_use,
             completeness: self.completeness,
             transform_marker: self.transform_marker,
-            gc_balance: self.gc_balance,
+            key_ended: self.key_ended,
         }
+    }
+
+    /// Whether the row after the last one emitted is known to carry a user key
+    /// no earlier row carries, so its writer need not compare them: the merge
+    /// already did. `false` says nothing either way.
+    #[must_use]
+    pub fn next_starts_key(&self) -> bool {
+        // A declined fold parks later versions of the same key in `pending`,
+        // and they come out ahead of the input the head was compared with.
+        self.key_ended && self.pending.is_empty()
     }
 
     pub fn evict_tombstones(mut self, b: bool) -> Self {
@@ -312,13 +351,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         self
     }
 
-    /// Handle on the collected-history balance (see the `gc_balance` field),
-    /// which the install reads once the stream is drained to tell a run that
+    /// Handle on the collected-history balance (see [`VersionBalance`]), which
+    /// the install reads once the stream has DROPPED to tell a run that
     /// collected history from one that collected none. Non-zero means some
     /// version went in and did not come out.
     #[must_use]
     pub fn gc_balance(&self) -> Arc<portable_atomic::AtomicU64> {
-        Arc::clone(&self.gc_balance)
+        Arc::clone(&self.inner.balance.shared)
     }
 
     /// Installs a callback that receives all dropped KVs.
@@ -474,6 +513,9 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         else {
             return false;
         };
+        if self.rt_idx == self.rt_apply.len() && active.is_empty() {
+            return false;
+        }
         if !self.rt_sorted {
             self.rt_apply
                 .sort_by(|a, b| a.cmp_with_comparator(b, comparator.as_ref()));
@@ -892,19 +934,16 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
         }
     }
 
-    /// Settles one consumed version against the balance (see `gc_balance`),
-    /// either because it was emitted or because dropping it changed nothing an
-    /// enabled snapshot can observe.
-    fn settle_one(&self) {
+    /// Settles one consumed version against the balance (see
+    /// [`VersionBalance`]), either because it was emitted or because dropping
+    /// it changed nothing an enabled snapshot can observe.
+    fn settle_one(&mut self) {
         self.settle(1);
     }
 
     /// Settles `n` at once, for a caller that excuses a whole chain.
-    fn settle(&self, n: u64) {
-        if n > 0 {
-            self.gc_balance
-                .fetch_sub(n, core::sync::atomic::Ordering::Relaxed);
-        }
+    fn settle(&mut self, n: u64) {
+        self.inner.balance.settled += n;
     }
 
     /// A drop that no snapshot can tell from keeping it, so it is not
@@ -922,7 +961,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// gone, which is the direction this counter is built to fail in, and
     /// excusing it would mean deciding two entries are identical rather than
     /// merely adjacent. Do not "fix" it by adding an exemption here.
-    fn note_neutral_drop(&self) {
+    fn note_neutral_drop(&mut self) {
         self.settle_one();
     }
 
@@ -1000,14 +1039,15 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 .pop_front()
                 .map_or_else(|| self.inner.next(), |e| Some(Ok(e)));
             let mut head = fail_iter!(next?);
+            self.key_ended = false;
 
             // An entry an applicable tombstone deletes is dropped below
             // whatever the filter says, and no snapshot can read it; asking
             // the filter would only let a rewrite land in the value log as a
-            // blob no table references.
-            if !head.is_tombstone()
-                && !self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno)
-            {
+            // blob no table references. Nothing below changes the head's key
+            // or seqno, so the answer holds for the emit at the end too.
+            let covered = self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno);
+            if !head.is_tombstone() && !covered {
                 match fail_iter!(self.filter.filter_item(&head)) {
                     StreamFilterVerdict::Keep => { /* Do nothing */ }
                     StreamFilterVerdict::Replace((new_type, new_value)) => {
@@ -1057,6 +1097,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                 // WeakTombstone head then annihilated against the OTHER key's
                 // value). Byte equality is also cheaper (length short-circuit).
                 if !crate::comparator::same_user_key(&peeked.key.user_key, &head.key.user_key) {
+                    self.key_ended = true;
                     if head.is_tombstone() && self.evict_tombstones {
                         self.note_transform();
                         self.note_neutral_drop();
@@ -1170,6 +1211,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
                         // keeps everything such a snapshot reads.
                         if head.key.seqno < self.gc_watermark {
                             let drained = fail_iter!(self.drain_key(&head.key.user_key));
+                            self.key_ended = true;
                             // A tail that was all tombstones, under a head this
                             // fold emits, is observationally neutral ONLY at the
                             // bottom level. Every snapshot below the head read
@@ -1203,7 +1245,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             // surviving entry when an applicable (strictly-below-watermark)
             // tombstone outranks it, accounting it to the drop callback (blob GC)
             // instead of carrying it to the output to be suppressed at every read.
-            if self.covered_and_deletable(head.key.user_key.as_ref(), head.key.seqno) {
+            if covered {
                 if let Some(watcher) = &mut self.dropped_callback {
                     watcher.on_dropped(&head);
                 }

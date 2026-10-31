@@ -213,7 +213,7 @@ fn rotation_frees_the_linked_blob_map() -> crate::Result<()> {
     for blob_file_id in 0..1_000 {
         mw.linked_blobs.register(blob_file_id, 1, 1, &key, true);
     }
-    mw.current_key = Some(UserKey::from(b"b" as &[u8]));
+    mw.pinned_key = Some(UserKey::from(b"b" as &[u8]));
     mw.rotate_at(None)?;
     assert_eq!(mw.linked_blobs.capacity(), 0);
     Ok(())

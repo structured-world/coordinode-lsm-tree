@@ -971,9 +971,13 @@ fn create_compaction_stream<'a>(
     }
 
     Ok(if found == to_compact.len() {
+        let prefix = inputs_common_prefix(version, |id| to_compact.contains(id));
         Some(
-            CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
-                .with_merge_operator(merge_operator),
+            CompactionStream::new(
+                Merger::new(readers, comparator).with_common_prefix(prefix),
+                gc_watermark,
+            )
+            .with_merge_operator(merge_operator),
         )
     } else {
         None
@@ -1040,9 +1044,40 @@ fn create_bounded_compaction_stream<'a>(
     }
 
     Ok((found == to_compact.len()).then(|| {
-        CompactionStream::new(Merger::new(readers, comparator), gc_watermark)
-            .with_merge_operator(merge_operator)
+        let prefix = inputs_common_prefix(version, |id| to_compact.contains(id));
+        CompactionStream::new(
+            Merger::new(readers, comparator).with_common_prefix(prefix),
+            gc_watermark,
+        )
+        .with_merge_operator(merge_operator)
     }))
+}
+
+/// The bytes every key of the tables `is_input` names starts with. Their key
+/// ranges bound every key they hold, and under a byte order a key between two
+/// bounds starts with whatever both start with. A merge under another order
+/// ignores it.
+fn inputs_common_prefix(version: &Version, is_input: impl Fn(&TableId) -> bool) -> usize {
+    let mut bounds = version
+        .iter_levels()
+        .flat_map(|level| level.iter())
+        .flat_map(|run| run.iter())
+        .filter(|table| is_input(&table.metadata.id))
+        .flat_map(|table| {
+            let range = &table.metadata.key_range;
+            [range.min(), range.max()]
+        });
+    let Some(first) = bounds.next() else {
+        return 0;
+    };
+    bounds.fold(first.len(), |shared, bound| {
+        first
+            .iter()
+            .zip(bound.iter())
+            .take(shared)
+            .take_while(|(a, b)| a == b)
+            .count()
+    })
 }
 
 /// Sorts the destination-level max-keys, drops comparator-equal duplicates, and
@@ -3161,8 +3196,9 @@ fn run_subcompaction(
         merge_iter = merge_iter.with_drop_callback(&mut ledger_hook);
     }
 
-    // Versions that go in and do not come out: read after `produce` to tell a
-    // run that collected history from one that collected none.
+    // Versions that go in and do not come out: read after the stream drops, at
+    // the end of `produce`, to tell a run that collected history from one that
+    // collected none.
     let gc_balance = merge_iter.gc_balance();
 
     let mut filter_blob_writer = None;
@@ -3192,7 +3228,7 @@ fn run_subcompaction(
     // watermark and not covered by any range tombstone get seqno 0 (packs to
     // one byte). Tombstones are gathered from the whole version so coverage in
     // levels outside this compaction still blocks zeroing.
-    let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+    let mut merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
         merge_iter,
         holds_everything,
         version_tombstones,
@@ -3331,11 +3367,11 @@ fn run_subcompaction(
     // Chosen once, so a compaction that copies nothing pays no check per row.
     let mut carrying_emit;
     let mut plain_emit;
-    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+    let emit: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()> = if let Some(matcher) =
         matcher.as_mut()
         && let Some(flavour) = compactor.carrying()
     {
-        carrying_emit = move |row: InternalValue| {
+        carrying_emit = move |row: InternalValue, _starts_key: bool| {
             matcher.write(
                 row,
                 &mut FlavourSink {
@@ -3346,11 +3382,19 @@ fn run_subcompaction(
         };
         &mut carrying_emit
     } else {
-        plain_emit = |row: InternalValue| compactor.write(row);
+        plain_emit = |row: InternalValue, starts_key: bool| {
+            if starts_key {
+                compactor.write_key_start(row)
+            } else {
+                compactor.write(row)
+            }
+        };
         &mut plain_emit
     };
 
-    for (idx, item) in merge_iter.enumerate() {
+    let mut idx = 0_usize;
+    let mut starts_key = false;
+    while let Some(item) = merge_iter.next() {
         let item = item?;
 
         // One key + value length; the sum is far below u64::MAX → plain add.
@@ -3366,15 +3410,18 @@ fn run_subcompaction(
             return Err(cancelled_compaction());
         }
 
-        ledger.borrow_mut().admit(item, &mut *emit)?;
+        ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
         if let Some(e) = ledger_error.borrow_mut().take() {
             return Err(e);
         }
 
-        if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
+        if idx.is_multiple_of(1_000_000) && opts.stop_signal.is_stopped() {
             return Err(cancelled_compaction());
         }
+        idx += 1;
+        starts_key = merge_iter.next_starts_key();
     }
+    drop(merge_iter);
 
     if let Some(filter) = compaction_filter {
         filter.finish();
@@ -4526,8 +4573,9 @@ fn merge_tables(
         merge_iter = merge_iter.with_transform_marker(Arc::clone(marker));
     }
 
-    // Versions that go in and do not come out: read after `produce` to tell a
-    // run that collected history from one that collected none.
+    // Versions that go in and do not come out: read after the stream drops, at
+    // the end of `produce`, to tell a run that collected history from one that
+    // collected none.
     let gc_balance = merge_iter.gc_balance();
 
     // Where the compaction filter writes the new values it separates, when
@@ -4709,11 +4757,11 @@ fn merge_tables(
     // Chosen once, so a compaction that copies nothing pays no check per row.
     let mut carrying_emit;
     let mut plain_emit;
-    let emit: &mut dyn FnMut(InternalValue) -> crate::Result<()> = if let Some(matcher) =
+    let emit: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()> = if let Some(matcher) =
         matcher.as_mut()
         && let Some(flavour) = compactor.carrying()
     {
-        carrying_emit = move |row: InternalValue| {
+        carrying_emit = move |row: InternalValue, _starts_key: bool| {
             matcher.write(
                 row,
                 &mut FlavourSink {
@@ -4724,7 +4772,13 @@ fn merge_tables(
         };
         &mut carrying_emit
     } else {
-        plain_emit = |row: InternalValue| compactor.write(row);
+        plain_emit = |row: InternalValue, starts_key: bool| {
+            if starts_key {
+                compactor.write_key_start(row)
+            } else {
+                compactor.write(row)
+            }
+        };
         &mut plain_emit
     };
 
@@ -4733,7 +4787,7 @@ fn merge_tables(
         // watermark and not covered by any range tombstone get seqno 0. The
         // zeroer and the whole-version tombstone scan are `core` + `alloc`, so
         // this runs on the `no_std` serial path too.
-        let merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
+        let mut merge_iter = super::seqno_zeroer::BottommostSeqnoZeroer::new(
             merge_iter,
             holds_everything,
             zeroing_tombstones,
@@ -4742,7 +4796,9 @@ fn merge_tables(
             Arc::clone(&gc_balance),
         );
 
-        for (idx, item) in merge_iter.enumerate() {
+        let mut idx = 0_usize;
+        let mut starts_key = false;
+        while let Some(item) = merge_iter.next() {
             let item = item?;
 
             // Pace compaction I/O so it cannot saturate the device and
@@ -4772,10 +4828,11 @@ fn merge_tables(
                 return Err(cancelled_compaction());
             }
 
-            ledger.borrow_mut().admit(item, &mut *emit)?;
+            ledger.borrow_mut().admit(item, starts_key, &mut *emit)?;
             if let Some(e) = ledger_error.borrow_mut().take() {
                 return Err(e);
             }
+            starts_key = merge_iter.next_starts_key();
 
             // Test-only failpoint: raise the stop signal after the first written
             // item, so the interrupted-merge path below is reachable without
@@ -4794,10 +4851,11 @@ fn merge_tables(
             // read its input to the end drops the unread tail out of the tree
             // entirely. The parallel path refuses for the same reason; this one
             // used to commit and call the result `Merged`.
-            if idx % 1_000_000 == 0 && opts.stop_signal.is_stopped() {
+            if idx.is_multiple_of(1_000_000) && opts.stop_signal.is_stopped() {
                 log::debug!("Stopping amidst compaction because of stop signal");
                 return Err(cancelled_compaction());
             }
+            idx += 1;
         }
 
         Ok(())

@@ -28,10 +28,18 @@ pub struct RibbonFilterRepr {
 #[derive(Debug, Clone)]
 pub struct RibbonFilter {
     params: Params,
+    #[cfg_attr(
+        not(feature = "ribbon-serde"),
+        expect(
+            dead_code,
+            reason = "rows are read back only by a snapshot; a BuRR layer stores its payload"
+        )
+    )]
     z: Vec<u64>,
 }
 
 impl RibbonFilter {
+    #[cfg(test)]
     pub(crate) fn new(params: Params, z: Vec<u64>) -> Self {
         Self { params, z }
     }
@@ -45,6 +53,7 @@ impl RibbonFilter {
     /// Length is `m`: one u64 per row, holding that row's fingerprint bits
     /// in the low `r` positions. Used by the BuRR wire-format serializer to
     /// write the matrix as packed little-endian bytes.
+    #[cfg(all(test, feature = "ribbon-serde"))]
     pub(crate) fn z_raw_words(&self) -> &[u64] {
         &self.z
     }

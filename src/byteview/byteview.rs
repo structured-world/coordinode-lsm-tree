@@ -10,10 +10,10 @@ use portable_atomic::AtomicU64;
 pub use super::builder::Builder;
 
 #[cfg(target_pointer_width = "64")]
-const INLINE_SIZE: usize = 20;
+pub(crate) const INLINE_SIZE: usize = 20;
 
 #[cfg(target_pointer_width = "32")]
-const INLINE_SIZE: usize = 16;
+pub(crate) const INLINE_SIZE: usize = 16;
 
 const PREFIX_SIZE: usize = 4;
 

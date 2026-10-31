@@ -778,6 +778,12 @@ impl ProducedOutput {
 pub(super) trait CompactionFlavour {
     fn write(&mut self, item: InternalValue) -> crate::Result<()>;
 
+    /// [`Self::write`] of a row known to carry a user key no earlier row
+    /// carries, for a flavour that can spare its output the comparison.
+    fn write_key_start(&mut self, item: InternalValue) -> crate::Result<()> {
+        self.write(item)
+    }
+
     /// This compaction as the one that copies row groups into its output,
     /// `None` for a flavour that writes its rows another way: a carry plan is
     /// made only for a compaction that writes every row itself (see `carry`).
@@ -2034,6 +2040,13 @@ impl CompactionFlavour for StandardCompaction {
         }
 
         Ok(())
+    }
+
+    fn write_key_start(&mut self, item: InternalValue) -> crate::Result<()> {
+        if item.key.value_type.is_cell_row() || item.key.value_type.is_indirection() {
+            return self.write(item);
+        }
+        self.table_writer.write_key_start(item)
     }
 
     fn carrying(&mut self) -> Option<&mut StandardCompaction> {

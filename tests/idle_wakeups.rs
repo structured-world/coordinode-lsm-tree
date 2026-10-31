@@ -21,6 +21,21 @@ fn process_wakeups() -> libc::c_long {
     unsafe { usage.assume_init() }.ru_nvcsw
 }
 
+/// Waits out the work a compaction leaves behind it, which reaches the idle
+/// window on a loaded host: until a half second passes with no more than the
+/// sleep's own wakeup, or ten seconds do. A periodic timer never goes quiet, so
+/// it reaches the window whatever happens here.
+fn settle() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let before = process_wakeups();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if process_wakeups() - before <= 1 {
+            return;
+        }
+    }
+}
+
 /// A tree with every background thread the crate starts (the background
 /// deleter, the compaction pool, the io_uring ring thread where the backend
 /// is built in) wakes a handful of times at most while it sits idle for three
@@ -58,6 +73,7 @@ fn an_idle_tree_leaves_its_threads_asleep() -> lsm_tree::Result<()> {
     }
     tree.major_compact(64 * 1_024, 10_000)?;
 
+    settle();
     let before = process_wakeups();
     std::thread::sleep(std::time::Duration::from_secs(3));
     let woke = process_wakeups() - before;

@@ -80,6 +80,8 @@ mod byteview;
 mod strview;
 
 pub use byteview::ByteView;
+#[cfg(not(feature = "bytes_1"))]
+pub(crate) use byteview::INLINE_SIZE;
 pub use strview::StrView;
 
 #[doc(hidden)]
