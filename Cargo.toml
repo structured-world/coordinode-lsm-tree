@@ -64,7 +64,7 @@ path = "src/lib.rs"
 # stay no-std-friendly: prefer `core::*` / `alloc::*`, gate std-only primitives
 # behind `#[cfg(feature = "std")]`, and pick external crates that support
 # no-std.
-default = ["std", "parallel"]
+default = ["std", "parallel", "io-uring"]
 std = [
     "dep:arc-swap",
     "dep:parking_lot",

@@ -29,8 +29,6 @@ pub use restart_interval::RestartIntervalPolicy;
 /// Partitioning policy for indexes and filters
 pub type PartitioningPolicy = PinningPolicy;
 
-#[cfg(feature = "std")]
-use crate::fs::StdFs;
 use crate::path::PathBuf;
 use crate::{
     AnyTree, BlobTree, Cache, CompressionType, DescriptorTable, SharedSequenceNumberGenerator,
@@ -1157,7 +1155,7 @@ pub struct Config {
 }
 
 // TODO: remove default?
-// std-only: the default backend is `StdFs` and the default path is resolved
+// std-only: the default backends are std-bound and the default path is resolved
 // via std::path::absolute. no_std callers construct `Config` explicitly with a
 // caller-provided `Fs`.
 #[cfg(feature = "std")]
@@ -1165,7 +1163,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             path: absolute_path(Path::new(DEFAULT_FILE_FOLDER)),
-            fs: Arc::new(StdFs),
+            fs: crate::fs::default_fs(),
             level_routes: None,
             descriptor_table: Some(Arc::new(DescriptorTable::new(256))),
             seqno: SharedSequenceNumberGenerator::from(SequenceNumberCounter::default()),

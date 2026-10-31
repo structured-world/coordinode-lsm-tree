@@ -15,8 +15,9 @@
 //!
 //! # Platform-specific backends
 //!
-//! - **Linux 5.6+**: `IoUringFs` - batched SQE submission via `io_uring`
-//!   (feature-gated: `io-uring`)
+//! - **Linux 5.6+**: `IoUringFs` - batched SQE submission via `io_uring`, the
+//!   default backend where a ring can be created (feature-gated: `io-uring`,
+//!   on by default); [`StdFs`](crate::fs::StdFs) otherwise
 //! - **Windows**: IOCP (`IoCompletionPort`) could provide similar batched
 //!   completion semantics - not yet implemented, tracked for when Windows
 //!   becomes a production target
@@ -103,6 +104,25 @@ pub use io_uring_raw::{
     IoUringRaw, IoUringRawFile, IoUringRawFs, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     close_raw, open_raw,
 };
+
+/// The backend a [`Config`](crate::Config) starts with: `io_uring` where the
+/// kernel and the process limits allow a ring, [`StdFs`] everywhere else.
+///
+/// Every default config shares one ring and its thread, so a process with many
+/// trees still holds one. The probe runs once: a process that cannot create a
+/// ring stays on [`StdFs`] rather than failing to open a tree.
+#[cfg(feature = "std")]
+pub(crate) fn default_fs() -> alloc::sync::Arc<dyn Fs> {
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    {
+        static SHARED: std::sync::OnceLock<Option<alloc::sync::Arc<IoUringFs>>> =
+            std::sync::OnceLock::new();
+        if let Some(fs) = SHARED.get_or_init(|| IoUringFs::new().ok().map(alloc::sync::Arc::new)) {
+            return alloc::sync::Arc::clone(fs) as alloc::sync::Arc<dyn Fs>;
+        }
+    }
+    alloc::sync::Arc::new(StdFs)
+}
 
 // `Read` / `Write` / `Seek` come from `crate::io`, the local mirror
 // of `std::io` that compiles under `no_std + alloc`. Under `feature =
