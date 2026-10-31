@@ -351,11 +351,11 @@ pub struct FaultInjector {
 
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
-pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+pub(crate) type ReadHook = Arc<dyn Fn() + Send + Sync>;
 
 /// What a test runs before a removal, given the removal's kind and path.
 #[cfg(test)]
-pub type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
+pub(crate) type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
 
 std::thread_local! {
     /// The injectors whose batches and queue waits this thread is inside:

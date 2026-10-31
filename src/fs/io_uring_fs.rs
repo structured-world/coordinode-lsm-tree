@@ -534,7 +534,7 @@ impl Fs for IoUringFs {
 /// Wraps a [`std::fs::File`] for fd ownership and cold-path operations
 /// (metadata, truncate, lock), while routing reads, writes, and fsyncs
 /// through the shared `io_uring` ring.
-pub struct IoUringFile {
+pub(crate) struct IoUringFile {
     /// Underlying [`std::fs::File`] — owns the fd, used for metadata, `set_len`, lock.
     file: File,
 
