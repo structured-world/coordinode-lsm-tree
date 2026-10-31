@@ -16,8 +16,11 @@
 //! | layout | `interleaved` (key `i` in table `i % fan-in`, so the merge switches input at every key) or `disjoint` (each table a contiguous slice) |
 //! | codec | `none`, and `zstd1` when built with `zstd`; `zstd22` only when `COMPACTION_MERGE_CODECS` names it |
 //!
-//! Per configuration it prints the median over the rounds of the compaction
-//! time per entry, the heap allocations and allocated bytes per entry, and the
+//! Per configuration it prints the median, P99 and P999 over the rounds of the
+//! compaction time per entry, the last two meaningful from about 1000 rounds up:
+//! one sample is a whole compaction, and this harness stays outside criterion
+//! because the counts below are of one compaction, not of an iteration batch.
+//! It also prints the heap allocations and allocated bytes per entry, and the
 //! peak of bytes held at once above what the tree held before, all counted by a
 //! counting global allocator over the compaction alone (the fixture is built
 //! before the count starts). Compaction runs on one thread,
@@ -391,6 +394,7 @@ fn main() -> lsm_tree::Result<()> {
                         for _ in 0..rounds {
                             let tree = fixture(shape, len, fanin, placement, codec, n)?;
                             let input_tables = tree.table_count();
+                            assert_eq!(input_tables, fanin, "too few entries for this fan-in");
                             let (a0, b0) = (
                                 ALLOCS.load(Ordering::Relaxed),
                                 BYTES.load(Ordering::Relaxed),
@@ -421,13 +425,19 @@ fn main() -> lsm_tree::Result<()> {
                             assert_eq!(tree.table_count(), 1, "which replaced them");
                             std::hint::black_box(&tree);
                         }
-                        let time: Duration = median(times);
+                        times.sort_unstable();
+                        let ns_at = |num: usize, den: usize| {
+                            let time: Duration = times[(times.len() - 1) * num / den];
+                            time.as_nanos() as f64 / n as f64
+                        };
                         println!(
-                            "compaction_merge/{}/k{len}/{}/f{fanin}/{}: {:.1} ns/entry, {:.2} allocs/entry, {:.1} B allocated/entry, {:.1} KiB peak",
+                            "compaction_merge/{}/k{len}/{}/f{fanin}/{}: {:.1} ns/entry, p99 {:.1}, p999 {:.1}, {:.2} allocs/entry, {:.1} B allocated/entry, {:.1} KiB peak",
                             codec.label(),
                             shape.label(),
                             placement.label(),
-                            time.as_nanos() as f64 / n as f64,
+                            ns_at(1, 2),
+                            ns_at(99, 100),
+                            ns_at(999, 1_000),
                             median(allocs) as f64 / n as f64,
                             median(bytes) as f64 / n as f64,
                             median(peaks) as f64 / 1024.0,
