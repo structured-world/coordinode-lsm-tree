@@ -189,6 +189,45 @@ macro_rules! batched_read_conformance {
                 Ok(())
             }
 
+            /// A backend reads into memory nobody wrote: one read and a batch
+            /// bring back the file's bytes, an empty region included.
+            #[test_log::test]
+            fn reads_into_uninitialized_buffers_fill_them() -> $crate::io::Result<()> {
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let files = two_files(&fs, dir.path(), 4096)?;
+                let file = files[0].as_ref();
+
+                let one = $crate::file::read_exact(file, 16, 64)?;
+                assert_eq!(&one[..], &expected_bytes(0, 16, 64)[..]);
+
+                let many = $crate::file::read_exact_many(file, &[(8, 32), (0, 0), (1024, 16)])?;
+                assert_eq!(&many[0][..], &expected_bytes(0, 8, 32)[..]);
+                assert!(many[1].is_empty());
+                assert_eq!(&many[2][..], &expected_bytes(0, 1024, 16)[..]);
+                Ok(())
+            }
+
+            /// A batch into memory nobody wrote refuses a region past the end
+            /// of the file instead of handing it back.
+            #[test_log::test]
+            fn reads_into_uninitialized_buffers_refuse_a_short_region() -> $crate::io::Result<()> {
+                let Some(fs) = $make else {
+                    return Ok(());
+                };
+                let dir = tempfile::tempdir()?;
+                let files = two_files(&fs, dir.path(), 64)?;
+                let Err(error) =
+                    $crate::file::read_exact_many(files[0].as_ref(), &[(0, 32), (32, 64)])
+                else {
+                    panic!("a read past the end must fail");
+                };
+                assert_eq!(error.kind(), $crate::io::ErrorKind::UnexpectedEof);
+                Ok(())
+            }
+
             #[test_log::test]
             fn read_blocks_batched_across_files() -> $crate::io::Result<()> {
                 let Some(fs) = $make else {

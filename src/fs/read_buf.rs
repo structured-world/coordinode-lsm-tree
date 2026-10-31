@@ -280,5 +280,5 @@ pub(crate) unsafe fn assume_regions_filled(regions: &mut [(u64, ReadBuf<'_>)]) {
 mod tests;
 
 #[cfg(all(test, feature = "std"))]
-#[expect(clippy::expect_used, reason = "test code")]
+#[expect(clippy::expect_used, clippy::indexing_slicing, reason = "test code")]
 mod backend_tests;

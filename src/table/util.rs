@@ -134,12 +134,9 @@ impl TimedFile {
             };
             #[cfg(not(feature = "std"))]
             let len = size - filled;
-            let at = offset.checked_add((filled - start) as u64).ok_or_else(|| {
-                crate::io::Error::new(
-                    crate::io::ErrorKind::InvalidInput,
-                    "read_rest: offset past the largest file position",
-                )
-            })?;
+            // Past the first turn the bytes before `at` were read from the
+            // file, so it is a position in it.
+            let at = offset + (filled - start) as u64;
             let mut portion = buf.portion(filled, len);
             #[cfg(feature = "std")]
             let started = timed.map(|_| std::time::Instant::now());
