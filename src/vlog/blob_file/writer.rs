@@ -143,12 +143,42 @@ pub(super) fn compute_header_crc(
     real_val_len: u32,
     on_disk_val_len: u32,
 ) -> u32 {
+    let mut fields = [0_u8; 18];
+    fields[..8].copy_from_slice(&seqno.to_le_bytes());
+    fields[8..10].copy_from_slice(&key_len.to_le_bytes());
+    fields[10..14].copy_from_slice(&real_val_len.to_le_bytes());
+    fields[14..18].copy_from_slice(&on_disk_val_len.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&fields) as u32
+}
+
+/// Key, value and CRC bytes that hash in one call. A streaming hasher costs
+/// more to set up than this many bytes cost to copy.
+const ONE_CALL_HASH_BYTES: usize = 1024;
+
+/// The checksum of a record: its key, its stored value and its header CRC, in
+/// that order. Covering the CRC detects a header recomputed after tampering.
+pub(super) fn record_checksum(key: &[u8], value: &[u8], header_crc: u32) -> u128 {
+    let crc = header_crc.to_le_bytes();
+    let len = key.len() + value.len() + crc.len();
+    if len <= ONE_CALL_HASH_BYTES {
+        let mut buf = [core::mem::MaybeUninit::<u8>::uninit(); ONE_CALL_HASH_BYTES];
+        let dst = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: the three copies are disjoint, fill exactly the first `len`
+        // bytes, and `len` is within the buffer.
+        let bytes = unsafe {
+            core::ptr::copy_nonoverlapping(key.as_ptr(), dst, key.len());
+            let at = dst.add(key.len());
+            core::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+            core::ptr::copy_nonoverlapping(crc.as_ptr(), at.add(value.len()), crc.len());
+            core::slice::from_raw_parts(dst, len)
+        };
+        return xxhash_rust::xxh3::xxh3_128(bytes);
+    }
     let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-    hasher.update(&seqno.to_le_bytes());
-    hasher.update(&key_len.to_le_bytes());
-    hasher.update(&real_val_len.to_le_bytes());
-    hasher.update(&on_disk_val_len.to_le_bytes());
-    hasher.digest() as u32
+    hasher.update(key);
+    hasher.update(value);
+    hasher.update(&crc);
+    hasher.digest128()
 }
 
 /// Validate the frame header CRC: recompute from header fields and compare
@@ -552,13 +582,7 @@ impl Writer {
         // Data checksum includes header_crc bytes so that changes to header
         // fields without correspondingly updating the data checksum will be
         // detected as an inconsistency between header and data.
-        let checksum = {
-            let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-            hasher.update(key);
-            hasher.update(value);
-            hasher.update(&header_crc.to_le_bytes());
-            hasher.digest128()
-        };
+        let checksum = record_checksum(key, value, header_crc);
 
         // Write header
         self.writer.write_all(BLOB_HEADER_MAGIC)?;

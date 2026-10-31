@@ -238,13 +238,8 @@ impl<'a> Reader<'a> {
             // Checksum covers on-disk key + raw value data (upstream #277)
             // plus the header_crc bytes, so that recomputing header_crc
             // after tampering header fields is still detected.
-            let checksum = {
-                let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-                hasher.update(&on_disk_key);
-                hasher.update(&raw_data);
-                hasher.update(&stored_header_crc.to_le_bytes());
-                hasher.digest128()
-            };
+            let checksum =
+                super::writer::record_checksum(&on_disk_key, &raw_data, stored_header_crc);
 
             if expected_checksum != checksum {
                 log::error!(

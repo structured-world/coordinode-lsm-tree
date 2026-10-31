@@ -356,13 +356,7 @@ impl Iterator for Scanner {
         ));
 
         {
-            let checksum = {
-                let mut hasher = xxhash_rust::xxh3::Xxh3::default();
-                hasher.update(&key);
-                hasher.update(&value);
-                hasher.update(&stored_header_crc.to_le_bytes());
-                hasher.digest128()
-            };
+            let checksum = super::writer::record_checksum(&key, &value, stored_header_crc);
 
             if expected_checksum != checksum {
                 log::error!(
