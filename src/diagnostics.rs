@@ -5,6 +5,7 @@
 //!
 //! Unlike `metrics`, which a deployment reads per tree, these sit on every key
 //! clone and drop, so a build pays for them only when it asks for this feature.
+//! They count the default slice backend: `bytes_1` keys and values pass them by.
 //! They carry no stability promise.
 
 use core::sync::atomic::Ordering;
