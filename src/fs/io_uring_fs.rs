@@ -10,9 +10,9 @@
 //! submit I/O concurrently, their SQEs are combined into a single
 //! `io_uring_enter` syscall.
 //!
-//! Hot-path operations (read, write, fsync) go through the ring.
-//! Cold-path operations (mkdir, readdir, stat, rename, unlink) delegate
-//! to [`std::fs`] since they do not benefit from `io_uring`.
+//! Batched reads go through the ring. Everything else delegates to
+//! [`std::fs`] on the caller's thread: a lone read, write or sync has nothing
+//! to batch with, and a trip to the ring thread costs more than the syscall.
 
 use super::{
     BlockRead, Fs, FsDirEntry, FsFile, FsMetadata, FsOpenOptions, QueuedRead, ReadDone, ReadQueue,
@@ -48,9 +48,8 @@ pub fn is_io_uring_available() -> bool {
 
 /// `io_uring`-backed [`Fs`] implementation.
 ///
-/// Routes hot-path I/O operations (read, write, fsync) through a
-/// dedicated `io_uring` ring thread. Directory and metadata operations
-/// delegate to [`std::fs`] since they do not benefit from `io_uring`.
+/// Routes batched reads through a dedicated `io_uring` ring thread. Every
+/// other operation delegates to [`std::fs`] on the caller's thread.
 ///
 /// Multiple `IoUringFs` clones and all the file handles opened
 /// through them share the same ring thread.
@@ -469,8 +468,7 @@ impl Fs for IoUringFs {
                 "sync_directory: path is not a directory",
             ));
         }
-        self.inner.submit_fsync(dir.as_raw_fd(), false)?;
-        Ok(())
+        dir.sync_all().map_err(crate::io::Error::from)
     }
 
     fn exists(&self, path: &Path) -> crate::io::Result<bool> {
@@ -529,11 +527,11 @@ impl Fs for IoUringFs {
 // IoUringFile
 // ---------------------------------------------------------------------------
 
-/// File handle that routes I/O through an `io_uring` ring thread.
+/// File handle whose batched reads go through the shared `io_uring` ring.
 ///
-/// Wraps a [`std::fs::File`] for fd ownership and cold-path operations
-/// (metadata, truncate, lock), while routing reads, writes, and fsyncs
-/// through the shared `io_uring` ring.
+/// Wraps a [`std::fs::File`], which serves every operation that comes alone:
+/// a single read, a write, a sync. Only a read of several regions has anything
+/// for the ring to batch.
 pub(crate) struct IoUringFile {
     /// Underlying [`std::fs::File`] — owns the fd, used for metadata, `set_len`, lock.
     file: File,
@@ -556,13 +554,11 @@ pub(crate) struct IoUringFile {
 
 impl FsFile for IoUringFile {
     fn sync_all(&self) -> crate::io::Result<()> {
-        self.ring.submit_fsync(self.file.as_raw_fd(), false)?;
-        Ok(())
+        FsFile::sync_all(&self.file)
     }
 
     fn sync_data(&self) -> crate::io::Result<()> {
-        self.ring.submit_fsync(self.file.as_raw_fd(), true)?;
-        Ok(())
+        FsFile::sync_data(&self.file)
     }
 
     fn metadata(&self) -> crate::io::Result<FsMetadata> {
@@ -583,45 +579,20 @@ impl FsFile for IoUringFile {
         self.file.set_len(size).map_err(crate::io::Error::from)
     }
 
-    // Fill-or-EOF: loop until buf is full or we hit EOF (0-byte read).
-    // Retries on EINTR internally so callers can rely on short read = EOF.
+    // A lone operation stays on the caller's thread: the ring has nothing to
+    // batch it with, and a trip to its thread and back costs far more than the
+    // syscall.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> crate::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let fd = self.file.as_raw_fd();
-        let mut total_read: usize = 0;
-
-        while total_read < buf.len() {
-            let remaining = buf.get_mut(total_read..).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "read_at offset out of bounds")
-            })?;
-            let current_offset = offset.checked_add(total_read as u64).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "read_at offset overflow")
-            })?;
-
-            let n = loop {
-                match self.ring.submit_read(fd, remaining, current_offset) {
-                    Ok(n) => break n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e.into()),
-                }
-            };
-
-            if n == 0 {
-                break; // EOF
-            }
-            total_read += n as usize;
-        }
-
-        Ok(total_read)
+        FsFile::read_at(&self.file, buf, offset)
     }
 
     // Batched read: submit every region to the ring at once (one coalesced
     // submission, reads overlap in flight) instead of the trait's serial
     // read_at loop. This is the io_uring win for multi-block reads.
     fn read_many(&self, regions: &mut [(u64, &mut [u8])]) -> crate::io::Result<()> {
+        if regions.len() < 2 {
+            return FsFile::read_many(&self.file, regions);
+        }
         self.ring
             .submit_reads(self.file.as_raw_fd(), regions)
             .map_err(crate::io::Error::from)
@@ -637,6 +608,9 @@ impl FsFile for IoUringFile {
     }
 
     fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> crate::io::Result<()> {
+        if regions.len() < 2 {
+            return FsFile::read_many_buf(&self.file, regions);
+        }
         self.ring
             .submit_reads(self.file.as_raw_fd(), regions)
             .map_err(crate::io::Error::from)?;
@@ -686,9 +660,9 @@ impl Read for IoUringFile {
             return Ok(0);
         }
         let cursor = self.cursor.get_mut();
-        let n = self.ring.submit_read(self.file.as_raw_fd(), buf, *cursor)?;
-        *cursor += u64::from(n);
-        Ok(n as usize)
+        let n = std::os::unix::fs::FileExt::read_at(&self.file, buf, *cursor)?;
+        *cursor += n as u64;
+        Ok(n)
     }
 }
 
@@ -704,16 +678,14 @@ impl Write for IoUringFile {
         if self.is_append {
             *cursor = self.file.metadata()?.len();
         }
-        let n = self
-            .ring
-            .submit_write(self.file.as_raw_fd(), buf, *cursor)?;
-        *cursor += u64::from(n);
-        Ok(n as usize)
+        let n = std::os::unix::fs::FileExt::write_at(&self.file, buf, *cursor)?;
+        *cursor += n as u64;
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // No userspace buffer to flush — data goes directly to the kernel
-        // via io_uring. Use sync_data()/sync_all() for durable persistence.
+        // No userspace buffer to flush: the data is already in the kernel. Use
+        // sync_data()/sync_all() for durable persistence.
         Ok(())
     }
 }
@@ -765,45 +737,11 @@ impl Seek for IoUringFile {
 /// the CQE is received.
 struct UnsafeSendMutPtr(*mut u8);
 
-/// Newtype wrapper for sending a `*const u8` across threads.
-///
-/// See [`UnsafeSendMutPtr`] for safety contract.
-struct UnsafeSendConstPtr(*const u8);
-
-// SAFETY: see struct-level docs. The raw pointers are guaranteed valid
-// for the duration of the io_uring op because the caller blocks until
-// the CQE is received.
+// SAFETY: see struct-level docs. The raw pointer is guaranteed valid for the
+// duration of the io_uring op because the caller blocks until the CQE is
+// received.
 #[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
 unsafe impl Send for UnsafeSendMutPtr {}
-
-#[expect(unsafe_code, reason = "marking raw-pointer wrapper as Send")]
-unsafe impl Send for UnsafeSendConstPtr {}
-
-/// An I/O operation to submit to the ring.
-enum OpKind {
-    Read {
-        fd: i32,
-        buf: UnsafeSendMutPtr,
-        len: u32,
-        offset: u64,
-    },
-    Write {
-        fd: i32,
-        buf: UnsafeSendConstPtr,
-        len: u32,
-        offset: u64,
-    },
-    Fsync {
-        fd: i32,
-        datasync: bool,
-    },
-}
-
-/// A submitted operation with its result channel.
-struct Op {
-    kind: OpKind,
-    result_tx: mpsc::SyncSender<i32>,
-}
 
 /// One read of a batch. Its completion is reported with its position in the
 /// batch, so one channel serves the whole batch.
@@ -814,11 +752,10 @@ struct BatchRead {
     offset: u64,
 }
 
-/// What the ring thread is sent: a single operation, or a whole batch of
-/// reads handed over in one message, so the caller takes the submission lock
-/// and sends once per batch rather than once per read.
+/// What the ring thread is sent: a whole batch of reads handed over in one
+/// message, so the caller takes the submission lock and sends once per batch
+/// rather than once per read.
 enum Submission {
-    One(Op),
     Batch {
         reads: Vec<BatchRead>,
         /// Receives `(position, result)` for each read, in completion order.
@@ -868,7 +805,6 @@ impl QueueSink {
 
 /// Where the ring thread delivers one operation's result.
 enum Completion {
-    One(mpsc::SyncSender<i32>),
     InBatch {
         done: mpsc::SyncSender<(usize, i32)>,
         position: usize,
@@ -884,7 +820,6 @@ impl Completion {
     /// (only possible once it saw the ring fail) needs nothing more.
     fn deliver(self, result: i32) {
         match self {
-            Self::One(tx) => tx.send(result).ok(),
             Self::InBatch { done, position } => done.send((position, result)).ok(),
             Self::InQueue { sink, position } => {
                 sink.deliver(position, result);
@@ -1049,89 +984,43 @@ impl RingThread {
         submission: Submission,
     ) {
         match submission {
-            Submission::One(op) => {
-                Self::enqueue(
-                    ring,
-                    pending,
-                    next_id,
-                    op.kind,
-                    Completion::One(op.result_tx),
-                );
-            }
             Submission::Batch { reads, done } => {
                 for (position, read) in reads.into_iter().enumerate() {
-                    let kind = OpKind::Read {
-                        fd: read.fd,
-                        buf: read.buf,
-                        len: read.len,
-                        offset: read.offset,
-                    };
                     let completion = Completion::InBatch {
                         done: done.clone(),
                         position,
                     };
-                    Self::enqueue(ring, pending, next_id, kind, completion);
+                    Self::enqueue(ring, pending, next_id, read, completion);
                 }
             }
             Submission::Queued { reads, first, sink } => {
                 for (index, read) in reads.into_iter().enumerate() {
-                    let kind = OpKind::Read {
-                        fd: read.fd,
-                        buf: read.buf,
-                        len: read.len,
-                        offset: read.offset,
-                    };
                     let completion = Completion::InQueue {
                         sink: Arc::clone(&sink),
                         position: first + index,
                     };
-                    Self::enqueue(ring, pending, next_id, kind, completion);
+                    Self::enqueue(ring, pending, next_id, read, completion);
                 }
             }
         }
     }
 
-    /// Builds an SQE from `kind` and pushes it onto the submission queue.
+    /// Builds an SQE from `read` and pushes it onto the submission queue.
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn enqueue(
         ring: &mut IoUring,
         pending: &mut HashMap<u64, Completion>,
         next_id: &mut u64,
-        kind: OpKind,
+        read: BatchRead,
         completion: Completion,
     ) {
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
 
-        let sqe = match kind {
-            OpKind::Read {
-                fd,
-                buf,
-                len,
-                offset,
-            } => opcode::Read::new(types::Fd(fd), buf.0, len)
-                .offset(offset)
-                .build()
-                .user_data(id),
-
-            OpKind::Write {
-                fd,
-                buf,
-                len,
-                offset,
-            } => opcode::Write::new(types::Fd(fd), buf.0, len)
-                .offset(offset)
-                .build()
-                .user_data(id),
-
-            OpKind::Fsync { fd, datasync } => {
-                let mut entry = opcode::Fsync::new(types::Fd(fd));
-                if datasync {
-                    entry = entry.flags(types::FsyncFlags::DATASYNC);
-                }
-                entry.build().user_data(id)
-            }
-        };
+        let sqe = opcode::Read::new(types::Fd(read.fd), read.buf.0, read.len)
+            .offset(read.offset)
+            .build()
+            .user_data(id);
 
         // SAFETY: SQE references memory that the calling thread keeps alive
         // (blocked on the result channel — see UnsafeSend safety contract).
@@ -1255,27 +1144,6 @@ impl RingThread {
         self.send(Submission::Batch { reads, done })
             .map_err(|e| (0, e))?;
         drain_batch(expected, || results.recv().ok(), short_read, on_read)
-    }
-
-    /// Submits a pread to the ring and blocks until completion.
-    fn submit_read(&self, fd: i32, buf: &mut [u8], offset: u64) -> io::Result<u32> {
-        // SQE length is u32, but CQE result is i32 — cap at i32::MAX
-        // to ensure the byte count is always representable. In practice
-        // LSM block reads are 4-64 KB, so the cap is never reached.
-        let len: u32 = i32::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
-            .unsigned_abs();
-        let (tx, rx) = self.channel(1);
-        let op = Op {
-            kind: OpKind::Read {
-                fd,
-                buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
-                len,
-                offset,
-            },
-            result_tx: tx,
-        };
-        self.send_and_wait(op, &rx)
     }
 
     /// Submits every read in `regions` to the ring BEFORE waiting on any of
@@ -1493,57 +1361,6 @@ impl RingThread {
             count_filled(req);
         }
         Ok(())
-    }
-
-    /// Submits a pwrite to the ring and blocks until completion.
-    fn submit_write(&self, fd: i32, buf: &[u8], offset: u64) -> io::Result<u32> {
-        // SQE length is u32, but CQE result is i32 — cap at i32::MAX
-        // to ensure the byte count is always representable. In practice
-        // LSM block writes are 4-64 KB, so the cap is never reached.
-        let len: u32 = i32::try_from(buf.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "buffer exceeds i32::MAX"))?
-            .unsigned_abs();
-        let (tx, rx) = self.channel(1);
-        let op = Op {
-            kind: OpKind::Write {
-                fd,
-                buf: UnsafeSendConstPtr(buf.as_ptr()),
-                len,
-                offset,
-            },
-            result_tx: tx,
-        };
-        self.send_and_wait(op, &rx)
-    }
-
-    /// Submits an fsync or fdatasync and blocks until completion.
-    fn submit_fsync(&self, fd: i32, datasync: bool) -> io::Result<u32> {
-        let (tx, rx) = self.channel(1);
-        let op = Op {
-            kind: OpKind::Fsync { fd, datasync },
-            result_tx: tx,
-        };
-        self.send_and_wait(op, &rx)
-    }
-
-    /// Sends an operation to the ring thread and blocks on the result.
-    ///
-    /// Returns the non-negative CQE result as `u32`. Negative results
-    /// (kernel errors) are converted to [`io::Error`].
-    fn send_and_wait(&self, op: Op, rx: &mpsc::Receiver<i32>) -> io::Result<u32> {
-        self.send(Submission::One(op))?;
-
-        let result = rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "io_uring thread exited"))?;
-
-        if result >= 0 {
-            // CQE result is non-negative — `as u32` is lossless.
-            #[expect(clippy::cast_sign_loss, reason = "guarded by result >= 0 check above")]
-            Ok(result as u32)
-        } else {
-            Err(io::Error::from_raw_os_error(-result))
-        }
     }
 }
 
