@@ -185,6 +185,7 @@ pub(crate) fn is_bumped(eq: &StandardEquation, thresholds: &[u8], b: u8) -> bool
         let b_usize = usize::from(b);
         (eq.start / b_usize, eq.start % b_usize)
     };
+    #[expect(clippy::cast_possible_truncation, reason = "offset < b, and b is a u8")]
     let offset = offset as u8;
     let threshold = thresholds.get(block_idx).copied().unwrap_or(0);
     offset >= threshold

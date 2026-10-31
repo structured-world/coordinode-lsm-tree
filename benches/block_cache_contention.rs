@@ -66,7 +66,10 @@ fn fixture(dir: &std::path::Path, cache_bytes: u64) -> lsm_tree::Result<AnyTree>
         SequenceNumberCounter::default(),
         SequenceNumberCounter::default(),
     )
-    .use_cache(Arc::new(Cache::with_capacity_bytes(cache_bytes)))
+    // Without the row cache: its hits would answer before any block is read.
+    .use_cache(Arc::new(
+        Cache::with_capacity_bytes(cache_bytes).with_row_cache(false),
+    ))
     .open()?;
     let value = vec![b'v'; VALUE_SIZE];
     for i in 0..KEYS {
@@ -107,53 +110,60 @@ struct Round {
     latencies: Vec<u64>,
 }
 
-fn round(tree: &AnyTree, threads: u64, skew: bool, seconds: u64) -> Round {
+fn round(tree: &AnyTree, threads: u64, skew: bool, seconds: u64) -> lsm_tree::Result<Round> {
     let start = Barrier::new(threads as usize + 1);
     let stop = AtomicBool::new(false);
     let totals = Mutex::new(Vec::new());
     let latencies = Mutex::new(Vec::new());
     let mut elapsed = Duration::ZERO;
-    std::thread::scope(|scope| {
-        for thread in 0..threads {
-            let (start, stop, totals, latencies) = (&start, &stop, &totals, &latencies);
-            scope.spawn(move || {
-                let mut state = 0x2545_F491_4F6C_DD1D_u64 ^ (thread + 1).wrapping_mul(0x9E37);
-                let mut samples = Vec::with_capacity(1 << 20);
-                let mut reads = 0_u64;
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    let at = key(pick(next(&mut state), skew));
-                    if reads.is_multiple_of(SAMPLE_EVERY) {
-                        let before = Instant::now();
-                        std::hint::black_box(tree.get(at, SeqNo::MAX).expect("read"));
-                        samples.push(before.elapsed().as_nanos() as u64);
-                    } else {
-                        std::hint::black_box(tree.get(at, SeqNo::MAX).expect("read"));
+    let workers: lsm_tree::Result<()> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|thread| {
+                let (start, stop, totals, latencies) = (&start, &stop, &totals, &latencies);
+                scope.spawn(move || -> lsm_tree::Result<()> {
+                    let mut state = 0x2545_F491_4F6C_DD1D_u64 ^ (thread + 1).wrapping_mul(0x9E37);
+                    let mut samples = Vec::with_capacity(1 << 20);
+                    let mut reads = 0_u64;
+                    start.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        let at = key(pick(next(&mut state), skew));
+                        if reads.is_multiple_of(SAMPLE_EVERY) {
+                            let before = Instant::now();
+                            std::hint::black_box(tree.get(at, SeqNo::MAX)?);
+                            samples.push(before.elapsed().as_nanos() as u64);
+                        } else {
+                            std::hint::black_box(tree.get(at, SeqNo::MAX)?);
+                        }
+                        reads += 1;
                     }
-                    reads += 1;
-                }
-                totals.lock().expect("no thread panics").push(reads);
-                latencies
-                    .lock()
-                    .expect("no thread panics")
-                    .append(&mut samples);
-            });
-        }
+                    totals.lock().expect("no thread panics").push(reads);
+                    latencies
+                        .lock()
+                        .expect("no thread panics")
+                        .append(&mut samples);
+                    Ok(())
+                })
+            })
+            .collect();
         start.wait();
         let began = Instant::now();
         std::thread::sleep(Duration::from_secs(seconds));
         stop.store(true, Ordering::Relaxed);
         elapsed = began.elapsed();
+        workers
+            .into_iter()
+            .try_for_each(|worker| worker.join().expect("no thread panics"))
     });
+    workers?;
     let totals = totals.into_inner().expect("no thread panics");
     let mut latencies = latencies.into_inner().expect("no thread panics");
     latencies.sort_unstable();
-    Round {
+    Ok(Round {
         reads_per_second: totals.iter().sum::<u64>() as f64 / elapsed.as_secs_f64(),
         fewest: totals.iter().copied().min().unwrap_or(0),
         most: totals.iter().copied().max().unwrap_or(0),
         latencies,
-    }
+    })
 }
 
 /// The value `num / den` of the way through the sorted `samples`.
@@ -191,9 +201,9 @@ fn main() -> lsm_tree::Result<()> {
                 if !picked("CACHE_CONTENTION_THREADS", &threads.to_string()) {
                     continue;
                 }
-                let mut runs: Vec<Round> = (0..rounds)
+                let mut runs = (0..rounds)
                     .map(|_| round(&tree, threads, skew, seconds))
-                    .collect();
+                    .collect::<lsm_tree::Result<Vec<Round>>>()?;
                 runs.sort_unstable_by(|a, b| a.reads_per_second.total_cmp(&b.reads_per_second));
                 let run = &runs[runs.len() / 2];
                 println!(

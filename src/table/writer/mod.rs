@@ -4104,7 +4104,9 @@ impl Writer {
         let Some(last) = entries.last() else {
             return Ok(None);
         };
-        let last_key = last.key.user_key.clone();
+        // Owned bytes for the same reason as in `spill_block`: the index keeps
+        // this key until the table ends.
+        let last_key = UserKey::new(&last.key.user_key);
         let last_seqno = last.key.seqno;
         let item_count = entries.len();
         let seqno_bounds = self.use_seqno_in_index.then(|| {
@@ -4125,6 +4127,7 @@ impl Writer {
         // chunk push (the direct block holds all rows already). The locator
         // records each new key's position within this single block, the same as
         // the flush path does for a transposed columnar block.
+        let mut current_key = self.spilled_key.as_ref();
         for (row, e) in entries.iter().enumerate() {
             let user_key = &e.key.user_key;
             self.meta.sum_user_key_bytes += user_key.len() as u64;
@@ -4141,13 +4144,8 @@ impl Writer {
             {
                 self.meta.weak_tombstone_reclaimable_count += 1;
             }
-            if !self
-                .spilled_key
-                .as_ref()
-                .is_some_and(|c| crate::comparator::same_user_key(c, user_key))
-            {
+            if !current_key.is_some_and(|c| crate::comparator::same_user_key(c, user_key)) {
                 self.meta.key_count += 1;
-                self.spilled_key = Some(user_key.clone());
                 if self.hashes_keys {
                     // The filter and the locator key the same bytes: one hash.
                     // It is the current key's for the hash index too, which a
@@ -4173,6 +4171,7 @@ impl Writer {
                     }
                 }
             }
+            current_key = Some(user_key);
             if self.meta.first_key.is_none() {
                 self.meta.first_key = Some(user_key.clone());
             }
@@ -4184,6 +4183,8 @@ impl Writer {
             self.meta.highest_seqno = self.meta.highest_seqno.max(e.key.seqno);
             self.meta.highest_kv_seqno = self.meta.highest_kv_seqno.max(e.key.seqno);
         }
+        // The block's own rows are the current key until it ends.
+        self.spilled_key = Some(last_key.clone());
 
         Ok(Some(DirectBlockInputs {
             last_key,

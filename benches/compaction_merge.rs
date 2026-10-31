@@ -101,6 +101,8 @@ static GLOBAL: Counting = Counting;
 const VALUE_SIZE: usize = 32;
 const KEY_LENGTHS: [usize; 5] = [8, 16, 32, 64, 128];
 const FANINS: [usize; 4] = [1, 4, 16, 32];
+/// Multiplier that scatters a `random` key's index over the key space.
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Bytewise order backwards: a comparator the engine cannot treat as bytes.
 struct Reverse;
@@ -149,10 +151,15 @@ impl Placement {
     }
 
     /// The table key `i` of `n` goes to among `fanin`.
-    fn table(self, i: usize, n: usize, fanin: usize) -> usize {
-        match self {
-            Self::Interleaved => i % fanin,
-            Self::Disjoint => i * fanin / n,
+    fn table(self, shape: Shape, i: usize, n: usize, fanin: usize) -> usize {
+        match (self, shape) {
+            (Self::Interleaved, _) => i % fanin,
+            (Self::Disjoint, Shape::Shared) => i * fanin / n,
+            // The scatter leads the key, so its high bits are the key's range.
+            (Self::Disjoint, Shape::Random) => {
+                let scatter = u128::from((i as u64).wrapping_mul(GOLDEN));
+                usize::try_from((scatter * fanin as u128) >> 64).expect("below fanin")
+            }
         }
     }
 }
@@ -211,7 +218,6 @@ impl Codec {
 /// index that makes keys differ from their first byte (`random`). An 8-byte
 /// `random` key is the scatter alone, which stays unique: the multiplier is odd.
 fn key(shape: Shape, len: usize, i: u64) -> Vec<u8> {
-    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
     if len == 8 && matches!(shape, Shape::Random) {
         return i.wrapping_mul(GOLDEN).to_be_bytes().to_vec();
     }
@@ -258,7 +264,7 @@ fn fixture(
     let keys = (n / versions).max(1);
     let mut seqno = 0u64;
     for table in 0..fanin {
-        for i in (0..keys).filter(|&i| placement.table(i, keys, fanin) == table) {
+        for i in (0..keys).filter(|&i| placement.table(shape, i, keys, fanin) == table) {
             for _ in 0..versions {
                 tree.insert(key(shape, len, i as u64), value.as_slice(), seqno);
                 seqno += 1;
@@ -361,6 +367,7 @@ fn main() -> lsm_tree::Result<()> {
                         let mut bytes = Vec::with_capacity(rounds);
                         for _ in 0..rounds {
                             let tree = fixture(shape, len, fanin, placement, codec, n)?;
+                            let input_tables = tree.table_count();
                             let (a0, b0) = (
                                 ALLOCS.load(Ordering::Relaxed),
                                 BYTES.load(Ordering::Relaxed),
@@ -369,7 +376,7 @@ fn main() -> lsm_tree::Result<()> {
                                 perf.send("enable\n")?;
                             }
                             let start = Instant::now();
-                            tree.major_compact(u64::MAX, 0)?;
+                            let result = tree.major_compact(u64::MAX, 0)?;
                             let elapsed = start.elapsed();
                             if let Some(perf) = &mut perf {
                                 perf.send("disable\n")?;
@@ -377,6 +384,9 @@ fn main() -> lsm_tree::Result<()> {
                             allocs.push(ALLOCS.load(Ordering::Relaxed) - a0);
                             bytes.push(BYTES.load(Ordering::Relaxed) - b0);
                             times.push(elapsed);
+                            assert_eq!(result.tables_in, input_tables, "every table is merged");
+                            assert_eq!(result.tables_out, 1, "into one output table");
+                            assert_eq!(tree.table_count(), 1, "which replaced them");
                             std::hint::black_box(&tree);
                         }
                         let time: Duration = median(times);

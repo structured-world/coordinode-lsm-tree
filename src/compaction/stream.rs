@@ -805,8 +805,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
             && self.inputs_hold_the_chain(user_key.as_ref(), oldest_seqno, head_seqno);
         let crosses_barrier = composes
             && collected.last().is_some_and(|oldest| {
-                let (key, seqno) = (oldest.key.user_key.clone(), oldest.key.seqno);
-                self.covered_by_applied_tombstone(key.as_ref(), seqno)
+                self.covered_by_applied_tombstone(oldest.key.user_key.as_ref(), oldest.key.seqno)
             });
         let compose_only = no_proven_base && composes && !crosses_barrier;
         if no_proven_base && !compose_only {
