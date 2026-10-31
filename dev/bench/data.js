@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793453024624,
+  "lastUpdate": 1793454383091,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66136,6 +66136,90 @@ window.BENCHMARK_DATA = {
             "value": 312237.8104954259,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 16.7us | P99.9: 108.6us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "255865126+sw-release-bot[bot]@users.noreply.github.com",
+            "name": "sw-release-bot[bot]",
+            "username": "sw-release-bot[bot]"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1bc855bd9166b7741481c6819f4f8b75f463f4e0",
+          "message": "chore: release v7.4.2 (#1028)\n\n## 🤖 New release\n\n* `coordinode-lsm-tree`: 7.4.1 -> 7.4.2\n\n<details><summary><i><b>Changelog</b></i></summary><p>\n\n<blockquote>\n\n##\n[7.4.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.1...v7.4.2)\n- 2026-10-31\n\n### Fixed\n\n- *(fs)* never show uninitialized memory to safe code\n([#1029](https://github.com/structured-world/coordinode-lsm-tree/pull/1029))\n\n### Performance\n\n- *(compaction)* cut per-row merge and write costs\n([#1027](https://github.com/structured-world/coordinode-lsm-tree/pull/1027))\n</blockquote>\n\n\n</p></details>\n\n---\nThis PR was generated with\n[release-plz](https://github.com/release-plz/release-plz/).\n\nCo-authored-by: sw-release-bot[bot] <255865126+sw-release-bot[bot]@users.noreply.github.com>",
+          "timestamp": "2026-10-31T13:17:32Z",
+          "tree_id": "8a12be2961f355d3b8f111105fa2f69dd8a023a8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1bc855bd9166b7741481c6819f4f8b75f463f4e0"
+        },
+        "date": 1793454381393,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 125086.26158836784,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 17.0us | P99.9: 22.0us\nthreads: 1 | elapsed: 4.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2368247.886969307,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 1.1us | P99.9: 7.3us\nthreads: 1 | elapsed: 0.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 790307.1389996819,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.6us | P99.9: 13.9us\nthreads: 1 | elapsed: 0.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 444087.4277583553,
+            "unit": "ops/sec",
+            "extra": "P50: 2.0us | P99: 8.5us | P99.9: 33.3us\nthreads: 1 | elapsed: 0.45s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3004927.1941448753,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.6us | P99.9: 9.7us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 289206.78067624057,
+            "unit": "ops/sec",
+            "extra": "P50: 2.9us | P99: 9.5us | P99.9: 27.7us\nthreads: 1 | elapsed: 0.69s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 186718.38813319948,
+            "unit": "ops/sec",
+            "extra": "P50: 4.4us | P99: 17.2us | P99.9: 36.7us\nthreads: 1 | elapsed: 1.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 826118.045858077,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.4us | P99.9: 11.8us\nthreads: 1 | elapsed: 0.24s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1004151.135691169,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 329047.9824184398,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 16.6us | P99.9: 96.3us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
           }
         ]
       }
