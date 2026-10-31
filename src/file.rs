@@ -7,7 +7,8 @@ use crate::io::Write;
 use crate::path::Path;
 use crate::{
     Slice,
-    fs::{Fs, FsFile, SyncMode},
+    fs::{Fs, FsFile, ReadBuf, SyncMode},
+    slice::UnfilledSlice,
 };
 #[cfg(feature = "std")]
 use std::io::Write;
@@ -386,18 +387,10 @@ pub(crate) fn read_exact_paced(
     size: usize,
     pace: Option<&dyn crate::table::util::ReadPacer>,
 ) -> crate::io::Result<Slice> {
-    // SAFETY: This slice builder starts uninitialized, but we know its length
-    //
-    // We use FsFile::read_at which gives us the number of bytes read.
-    // If that number does not match the slice length, the function errors,
-    // so the (partially) uninitialized buffer is discarded.
-    //
-    // Additionally, generally, block loads furthermore do a checksum check which
-    // would likely catch the buffer being wrong somehow.
-    #[expect(unsafe_code, reason = "see safety")]
-    let mut builder = unsafe { Slice::builder_unzeroed(size) };
-
-    let bytes_read = read_at_paced(file, &mut builder, offset, pace)?;
+    let mut slice = UnfilledSlice::new(size);
+    let mut target = slice.target();
+    read_at_paced(file, &mut target, offset, pace)?;
+    let bytes_read = target.filled();
 
     if bytes_read != size {
         return Err(crate::io::Error::new(
@@ -409,11 +402,14 @@ pub(crate) fn read_exact_paced(
         ));
     }
 
-    Ok(builder.freeze().into())
+    // SAFETY: `ReadBuf` counts every byte filled, which safe code can only
+    // claim of bytes it was given initialized.
+    #[expect(unsafe_code, reason = "see safety")]
+    Ok(unsafe { slice.assume_filled() })
 }
 
-/// Reads `buf` from `file` at `offset` and returns the bytes read, fewer only
-/// at the file's end. Without `pace` this is one [`FsFile::read_at`], which has
+/// Reads `buf` from `file` at `offset`, filling it, less only at the file's
+/// end. Without `pace` this is one [`FsFile::read_at_buf`], which has
 /// fill-or-EOF semantics (implementations retry EINTR and short reads). With
 /// an active `pace`, the read is made a portion at a time, each portion's
 /// offset and length handed to `pace` just before it is read, so a rate
@@ -423,20 +419,22 @@ pub(crate) fn read_exact_paced(
 /// bytes each read returned.
 pub(crate) fn read_at_paced(
     file: &dyn FsFile,
-    buf: &mut [u8],
+    buf: &mut ReadBuf<'_>,
     offset: u64,
     pace: Option<&dyn crate::table::util::ReadPacer>,
-) -> crate::io::Result<usize> {
+) -> crate::io::Result<()> {
     let Some(pace) = pace else {
-        return file.read_at(buf, offset);
+        return file.read_at_buf(buf, offset);
     };
     if !pace.active() {
-        let read = file.read_at(buf, offset)?;
-        pace.read_bytes(read as u64);
-        return Ok(read);
+        file.read_at_buf(buf, offset)?;
+        pace.read_bytes(buf.filled() as u64);
+        return Ok(());
     }
-    let mut read = 0usize;
-    for portion in buf.chunks_mut(crate::table::util::PACE_PORTION) {
+    let size = buf.capacity();
+    while buf.filled() < size {
+        let read = buf.filled();
+        let len = (size - read).min(crate::table::util::PACE_PORTION);
         // A corrupt handle may name an offset this read would carry past
         // `u64::MAX`: that is no position in any file.
         let at = offset.checked_add(read as u64).ok_or_else(|| {
@@ -445,21 +443,23 @@ pub(crate) fn read_at_paced(
                 "read_at_paced: offset past the largest file position",
             )
         })?;
-        pace.pace(at, portion.len() as u64);
+        pace.pace(at, len as u64);
+        let mut portion = buf.portion(read, len);
         // no-std: a caller-provided monotonic clock to time the portion
         #[cfg(feature = "std")]
         let started = std::time::Instant::now();
-        let got = file.read_at(portion, at);
+        let result = file.read_at_buf(&mut portion, at);
         #[cfg(feature = "std")]
         pace.read_took(started.elapsed());
-        let got = got?;
+        result?;
+        let got = portion.filled();
         pace.read_bytes(got as u64);
-        read += got;
-        if got < portion.len() {
+        buf.extend_from_portion(got);
+        if got < len {
             break;
         }
     }
-    Ok(read)
+    Ok(())
 }
 
 /// Reads several `(offset, size)` regions of a file in one batched request
@@ -477,25 +477,37 @@ pub fn read_exact_many(
     file: &dyn FsFile,
     regions: &[(u64, usize)],
 ) -> crate::io::Result<alloc::vec::Vec<Slice>> {
-    // SAFETY: each builder starts uninitialized, with its region's length.
-    // `read_many` fills every region completely or fails, and on failure every
-    // builder is dropped unread, so no uninitialized byte is ever frozen into
-    // a slice.
-    #[expect(unsafe_code, reason = "see safety")]
-    let mut builders: alloc::vec::Vec<_> = regions
+    let mut slices: alloc::vec::Vec<_> = regions
         .iter()
-        .map(|&(_, size)| unsafe { Slice::builder_unzeroed(size) })
+        .map(|&(_, size)| UnfilledSlice::new(size))
         .collect();
-    let mut targets: alloc::vec::Vec<(u64, &mut [u8])> = regions
+    let mut targets: alloc::vec::Vec<(u64, ReadBuf<'_>)> = regions
         .iter()
-        .zip(builders.iter_mut())
-        .map(|(&(offset, _), builder)| (offset, &mut builder[..]))
+        .zip(slices.iter_mut())
+        .map(|(&(offset, _), slice)| (offset, slice.target()))
         .collect();
-    file.read_many(&mut targets)?;
+    file.read_many_buf(&mut targets)?;
+    // The trait's safe implementations can return `Ok` having filled less.
+    if targets
+        .iter()
+        .any(|(_, target)| target.filled() != target.capacity())
+    {
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::UnexpectedEof,
+            "read_exact_many: a region came back short",
+        ));
+    }
     drop(targets);
-    Ok(builders
+    Ok(slices
         .into_iter()
-        .map(|builder| builder.freeze().into())
+        // SAFETY: every `ReadBuf` counted its slice filled just above, which
+        // safe code can only claim of bytes it was given initialized.
+        .map(|slice| {
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                slice.assume_filled()
+            }
+        })
         .collect())
 }
 

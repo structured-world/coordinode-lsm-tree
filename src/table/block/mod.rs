@@ -1585,13 +1585,14 @@ impl Block {
                 return Err(crate::Error::InvalidHeader("Block"));
             }
 
-            // Zero-init is redundant (read_at overwrites all bytes) but avoids
-            // unsafe. The cost is negligible vs I/O + decryption. Unsafe
-            // uninitialized allocation (like Slice::builder_unzeroed) could be
-            // used here if profiling shows this as a bottleneck.
-            let mut buf = vec![0u8; block_size];
+            let mut buf = alloc::vec::Vec::with_capacity(block_size);
             on_issue();
-            let n = crate::file::read_at_paced(file, &mut buf, *handle.offset(), pace)?;
+            // `with_capacity` may give more than asked, and past `block_size`
+            // lies the next block.
+            let (spare, _) = buf.spare_capacity_mut().split_at_mut(block_size);
+            let mut target = crate::fs::ReadBuf::uninit(spare);
+            crate::file::read_at_paced(file, &mut target, *handle.offset(), pace)?;
+            let n = target.filled();
             if n != block_size {
                 return Err(crate::Error::Io(crate::io::Error::new(
                     crate::io::ErrorKind::UnexpectedEof,
@@ -1600,6 +1601,11 @@ impl Block {
                         *handle.offset(),
                     ),
                 )));
+            }
+            // SAFETY: `ReadBuf` counts all `block_size` bytes filled.
+            #[expect(unsafe_code, reason = "see safety")]
+            unsafe {
+                buf.set_len(block_size);
             }
 
             Self::verify_encrypted_frame(buf, handle, identity, transform, enc, enc_overhead)?

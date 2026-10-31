@@ -351,11 +351,11 @@ pub struct FaultInjector {
 
 /// What a test runs inside a positional read at one offset.
 #[cfg(test)]
-pub type ReadHook = Arc<dyn Fn() + Send + Sync>;
+pub(crate) type ReadHook = Arc<dyn Fn() + Send + Sync>;
 
 /// What a test runs before a removal, given the removal's kind and path.
 #[cfg(test)]
-pub type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
+pub(crate) type RemovalHook = Arc<dyn Fn(FaultOp, &Path) + Send + Sync>;
 
 std::thread_local! {
     /// The injectors whose batches and queue waits this thread is inside:
@@ -1573,6 +1573,17 @@ impl FsFile for FaultFile {
             return Err(error);
         }
         self.inner.read_at(buf, offset)
+    }
+
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        if let Some(error) = self.injector.screen_read(Some(&self.path), offset) {
+            return Err(error);
+        }
+        self.inner.read_at_buf(buf, offset)
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> io::Result<()> {
+        super::read_buf::read_each(self, regions)
     }
 
     // Shown only inside a batch or a queue wait of the wrapper this handle

@@ -296,10 +296,8 @@ impl ByteView {
     /// Returns an error if an I/O error occurred.
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {
-        // NOTE: We can use _unzeroed to skip zeroing of the heap allocated slice
-        // because we receive the `len` parameter
-        // If the reader does not give us exactly `len` bytes, `read_exact` fails anyway
-        let mut s = unsafe { Self::with_size_unzeroed(len) };
+        // Zeroed: `R` is any safe reader, free to look at the slice it gets.
+        let mut s = Self::with_size(len);
         {
             let mut builder = Mutator(&mut s);
             reader.read_exact(&mut builder)?;
@@ -314,7 +312,7 @@ impl ByteView {
     /// Returns an error if an I/O error occurred.
     #[cfg(not(feature = "std"))]
     pub fn from_reader<R: crate::io::Read>(reader: &mut R, len: usize) -> crate::io::Result<Self> {
-        let mut s = unsafe { Self::with_size_unzeroed(len) };
+        let mut s = Self::with_size(len);
         {
             let mut builder = Mutator(&mut s);
             reader.read_exact(&mut builder)?;
@@ -712,6 +710,21 @@ impl ByteView {
                 .add(self.trailer.long.offset as usize)
                 .cast_mut()
         }
+    }
+
+    /// The bytes of a view from [`Self::with_size_unzeroed`], as memory that
+    /// may be uninitialized.
+    pub(crate) fn unfilled_mut(&mut self) -> &mut [core::mem::MaybeUninit<u8>] {
+        let len = self.len();
+        let data = if self.is_inline() {
+            self.get_mut_slice().as_mut_ptr()
+        } else {
+            // SAFETY: the view is not inline, so its heap variant is active.
+            unsafe { self.data_ptr_mut() }
+        };
+        // SAFETY: `data` points at the view's `len` bytes, borrowed through
+        // `self`, and `MaybeUninit<u8>` has the layout of `u8`.
+        unsafe { core::slice::from_raw_parts_mut(data.cast(), len) }
     }
 
     fn get_heap_region(&self) -> &HeapAllocationHeader {

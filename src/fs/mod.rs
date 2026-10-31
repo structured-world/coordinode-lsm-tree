@@ -42,6 +42,7 @@ mod open_flags;
 // `crate::io` `Fs` trait): it stays unconditional so a `no_std` consumer has a
 // working `Fs` implementation to use and to copy for a real backend.
 mod mem_fs;
+mod read_buf;
 // Programmable fault-injection backend for crash / error-path testing.
 // std-gated test/dev surface: it wraps an inner Fs and implements the std
 // `io::{Read, Write, Seek}` traits on its file handle (which under `std` ARE
@@ -83,6 +84,7 @@ pub(crate) use fault_fs::ReadHook;
 #[cfg(feature = "std")]
 pub use fault_fs::{Fault, FaultFs, FaultInjector, FaultOp, FaultRule, SyncKind};
 pub use mem_fs::MemFs;
+pub use read_buf::{ReadBuf, ReadResult};
 #[cfg(feature = "std")]
 pub use std_fs::StdFs;
 #[cfg(feature = "std")]
@@ -626,6 +628,40 @@ pub trait FsFile: Read + Write + Seek + Send + Sync {
                     "read_many: short read on a fixed-size block region",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// [`read_at`](Self::read_at) into a buffer that may be uninitialized,
+    /// recording what it filled in `buf`.
+    ///
+    /// The default zeroes `buf` first, because `read_at` is free to read the
+    /// slice it gets. A backend whose read only writes overrides this with
+    /// [`ReadBuf::fill_with`] and spares that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the read fails.
+    fn read_at_buf(&self, buf: &mut ReadBuf<'_>, offset: u64) -> io::Result<()> {
+        let filled = self.read_at(buf.init_mut(), offset)?;
+        buf.set_filled(filled)
+    }
+
+    /// [`read_many`](Self::read_many) into buffers that may be uninitialized;
+    /// see [`read_at_buf`](Self::read_at_buf).
+    ///
+    /// # Errors
+    ///
+    /// As [`read_many`](Self::read_many).
+    fn read_many_buf(&self, regions: &mut [(u64, ReadBuf<'_>)]) -> io::Result<()> {
+        let mut bytes: alloc::vec::Vec<(u64, &mut [u8])> = regions
+            .iter_mut()
+            .map(|(offset, buf)| (*offset, buf.init_mut()))
+            .collect();
+        self.read_many(&mut bytes)?;
+        drop(bytes);
+        for (_, buf) in regions {
+            buf.set_filled(buf.capacity())?;
         }
         Ok(())
     }

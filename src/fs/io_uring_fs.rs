@@ -534,7 +534,7 @@ impl Fs for IoUringFs {
 /// Wraps a [`std::fs::File`] for fd ownership and cold-path operations
 /// (metadata, truncate, lock), while routing reads, writes, and fsyncs
 /// through the shared `io_uring` ring.
-pub struct IoUringFile {
+pub(crate) struct IoUringFile {
     /// Underlying [`std::fs::File`] — owns the fd, used for metadata, `set_len`, lock.
     file: File,
 
@@ -625,6 +625,28 @@ impl FsFile for IoUringFile {
         self.ring
             .submit_reads(self.file.as_raw_fd(), regions)
             .map_err(crate::io::Error::from)
+    }
+
+    fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
+        // SAFETY: the ring only has the kernel write the slice, and `read_at`
+        // returns how much of it was.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            buf.fill_with(|bytes| FsFile::read_at(self, bytes, offset))
+        }
+    }
+
+    fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> crate::io::Result<()> {
+        self.ring
+            .submit_reads(self.file.as_raw_fd(), regions)
+            .map_err(crate::io::Error::from)?;
+        // SAFETY: `submit_reads` fails unless every region was filled, and
+        // only the kernel wrote them.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            super::read_buf::assume_regions_filled(regions);
+        }
+        Ok(())
     }
 
     // Exposes the fd so `IoUringFs::read_blocks_batched` can submit reads across
@@ -1265,7 +1287,11 @@ impl RingThread {
     /// Fills each region completely; a short read on any region fails the whole
     /// batch (block reads are fixed-size, so the caller treats a failure as
     /// "could not batch-read" and falls back to per-block reads).
-    fn submit_reads(&self, fd: i32, regions: &mut [(u64, &mut [u8])]) -> io::Result<()> {
+    fn submit_reads<R: super::read_buf::ReadRegion>(
+        &self,
+        fd: i32,
+        regions: &mut [R],
+    ) -> io::Result<()> {
         // Every read holds a raw pointer into the caller's buffer; `regions` is
         // borrowed for the whole call and the wait below covers every read, so
         // every buffer outlives the kernel's access (the UnsafeSend safety
@@ -1277,7 +1303,10 @@ impl RingThread {
         // (SQE length is u32, CQE result i32 — block reads are KBs, never near
         // the cap, so this only fires on misuse of the general API.)
         let mut lens: Vec<u32> = Vec::with_capacity(regions.len());
-        for (_, buf) in regions.iter() {
+        for region in regions.iter_mut() {
+            // SAFETY: the bytes go only to the kernel, which only writes them.
+            #[expect(unsafe_code, reason = "see safety")]
+            let (_, buf) = unsafe { region.target() };
             let len = if buf.is_empty() {
                 0
             } else {
@@ -1294,7 +1323,10 @@ impl RingThread {
         // it, and a wait for every read (see `drain_batch`).
         let mut reads = Vec::with_capacity(regions.len());
         let mut expected = Vec::with_capacity(regions.len());
-        for ((offset, buf), &len) in regions.iter_mut().zip(&lens) {
+        for (region, &len) in regions.iter_mut().zip(&lens) {
+            // SAFETY: as above.
+            #[expect(unsafe_code, reason = "see safety")]
+            let (offset, buf) = unsafe { region.target() };
             if buf.is_empty() {
                 continue;
             }
@@ -1302,7 +1334,7 @@ impl RingThread {
                 fd,
                 buf: UnsafeSendMutPtr(buf.as_mut_ptr()),
                 len,
-                offset: *offset,
+                offset,
             });
             expected.push(buf.len());
         }

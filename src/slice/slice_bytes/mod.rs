@@ -8,6 +8,41 @@ use bytes::Bytes;
 
 pub use bytes::BytesMut as Builder;
 
+/// A [`Slice`] allocated and not written yet, for a read to fill.
+pub(crate) struct UnfilledSlice {
+    builder: Builder,
+    len: usize,
+}
+
+impl UnfilledSlice {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            builder: Builder::with_capacity(len),
+            len,
+        }
+    }
+
+    /// The whole allocation as a read target.
+    pub(crate) fn target(&mut self) -> crate::fs::ReadBuf<'_> {
+        let (target, _) = self.builder.spare_capacity_mut().split_at_mut(self.len);
+        crate::fs::ReadBuf::uninit(target)
+    }
+
+    /// The slice.
+    ///
+    /// # Safety
+    ///
+    /// Every byte must have been written.
+    pub(crate) unsafe fn assume_filled(mut self) -> Slice {
+        // SAFETY: the caller promises the first `len` bytes were written.
+        #[expect(unsafe_code, reason = "see safety")]
+        unsafe {
+            self.builder.set_len(self.len);
+        }
+        Slice(self.builder.freeze())
+    }
+}
+
 /// An immutable byte slice that can be cloned without additional heap allocation
 ///
 /// There is no guarantee of any sort of alignment for zero-copy (de)serialization.
@@ -67,19 +102,12 @@ impl Slice {
 
     /// Constructs a [`Slice`] from an I/O reader by pulling in `len` bytes.
     ///
-    /// The reader may not read the existing buffer.
+    /// The buffer is zeroed: `R` is any safe reader, free to look at it.
     #[doc(hidden)]
     #[cfg(feature = "std")]
     pub fn from_reader<R: std::io::Read>(reader: &mut R, len: usize) -> std::io::Result<Self> {
-        let mut builder = unsafe { Self::builder_unzeroed(len) };
-
-        // SAFETY: Normally, read_exact over an uninitialized buffer is UB,
-        // however we know that in lsm-tree etc. only I/O readers or cursors over Vecs are used
-        // so it's safe
-        //
-        // The safe API is unstable: https://github.com/rust-lang/rust/issues/78485
+        let mut builder = Builder::zeroed(len);
         reader.read_exact(&mut builder)?;
-
         Ok(Self(builder.freeze()))
     }
 
@@ -91,12 +119,8 @@ impl Slice {
     #[doc(hidden)]
     #[cfg(not(feature = "std"))]
     pub fn from_reader<R: crate::io::Read>(reader: &mut R, len: usize) -> crate::io::Result<Self> {
-        let mut builder = unsafe { Self::builder_unzeroed(len) };
-
-        // SAFETY: as for the std reader above: only I/O readers and cursors
-        // over byte buffers fill the buffer, and none reads it first.
+        let mut builder = Builder::zeroed(len);
         reader.read_exact(&mut builder)?;
-
         Ok(Self(builder.freeze()))
     }
 }

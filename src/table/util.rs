@@ -111,6 +111,52 @@ impl TimedFile {
         }
         read
     }
+
+    /// Reads what `buf` has not filled from `offset` on, less only at the
+    /// file's end.
+    pub(crate) fn read_rest(
+        &self,
+        buf: &mut crate::fs::ReadBuf<'_>,
+        offset: u64,
+    ) -> crate::io::Result<()> {
+        let start = buf.filled();
+        let size = buf.capacity();
+        while buf.filled() < size {
+            let filled = buf.filled();
+            // no-std: reads are timed only with std (see `ReadPacer::read_took`)
+            #[cfg(feature = "std")]
+            let timed = self.pace.as_ref().filter(|pace| pace.active());
+            #[cfg(feature = "std")]
+            let len = if timed.is_some() {
+                (size - filled).min(PACE_PORTION)
+            } else {
+                size - filled
+            };
+            #[cfg(not(feature = "std"))]
+            let len = size - filled;
+            // Past the first turn the bytes before `at` were read from the
+            // file, so it is a position in it.
+            let at = offset + (filled - start) as u64;
+            let mut portion = buf.portion(filled, len);
+            #[cfg(feature = "std")]
+            let started = timed.map(|_| std::time::Instant::now());
+            let read = self.file.read_at_buf(&mut portion, at);
+            #[cfg(feature = "std")]
+            if let (Some(pace), Some(started)) = (timed, started) {
+                pace.read_took(started.elapsed());
+            }
+            read?;
+            let got = portion.filled();
+            if let Some(pace) = &self.pace {
+                pace.read_bytes(got as u64);
+            }
+            buf.extend_from_portion(got);
+            if got < len {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "std")]
