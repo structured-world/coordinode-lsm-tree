@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
 
-pub struct FullFilterWriter {
+pub(crate) struct FullFilterWriter {
     /// Key hashes for AMQ filter
     pub bloom_hash_buffer: Vec<u64>,
 
@@ -50,7 +50,7 @@ pub struct FullFilterWriter {
 }
 
 impl FullFilterWriter {
-    pub fn new(bloom_policy: BloomConstructionPolicy) -> Self {
+    pub(crate) fn new(bloom_policy: BloomConstructionPolicy) -> Self {
         Self {
             bloom_hash_buffer: Vec::new(),
             bloom_policy,
@@ -70,7 +70,7 @@ impl FullFilterWriter {
     /// building one. How many hashes it holds is not known here: a prefix
     /// extractor may have added some, so the output reports none and the
     /// table records no count.
-    pub fn prebuilt(filter: Vec<u8>) -> Self {
+    pub(crate) fn prebuilt(filter: Vec<u8>) -> Self {
         Self {
             prebuilt: Some(filter),
             ..Self::new(BloomConstructionPolicy::default())

@@ -23,7 +23,7 @@ use crate::io::{Seek, Write};
 #[cfg(feature = "std")]
 use std::io::{Seek, Write};
 
-pub struct PartitionedFilterWriter {
+pub(crate) struct PartitionedFilterWriter {
     final_filter_buffer: Vec<u8>,
 
     tli_handles: Vec<KeyedBlockHandle>,
@@ -105,7 +105,7 @@ pub struct PartitionedFilterWriter {
 }
 
 impl PartitionedFilterWriter {
-    pub fn new(bloom_policy: BloomConstructionPolicy) -> Self {
+    pub(crate) fn new(bloom_policy: BloomConstructionPolicy) -> Self {
         Self {
             final_filter_buffer: Vec::new(),
 
@@ -152,7 +152,7 @@ impl PartitionedFilterWriter {
     /// # Errors
     ///
     /// Returns an error when framing a partition fails.
-    pub fn prebuilt(
+    pub(crate) fn prebuilt(
         partitions: Vec<(UserKey, Vec<u8>, u64)>,
         table_id: crate::TableId,
         encryption: Option<Arc<dyn EncryptionProvider>>,

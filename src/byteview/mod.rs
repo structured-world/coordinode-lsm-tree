@@ -66,6 +66,10 @@
 // vendored Ribbon filter uses, and what a standalone `structured-byteview`
 // crate would keep as its own lint config).
 #![allow(dead_code, unused_imports, unexpected_cfgs)]
+// `Slice` converts to and from `ByteView` on the default backend, which makes
+// this module's items public API there; only the `bytes_1` backend leaves them
+// crate-internal, so their `pub` stays.
+#![cfg_attr(feature = "bytes_1", allow(unreachable_pub))]
 #![allow(
     clippy::all,
     clippy::pedantic,

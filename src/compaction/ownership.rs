@@ -24,7 +24,7 @@ use crate::{InternalValue, UserKey, ValueType};
 
 /// One compaction's blob accounting together with the key group it holds.
 #[derive(Default)]
-pub struct OwnershipLedger {
+pub(crate) struct OwnershipLedger {
     frag: FragmentationMap,
     /// The key of the open group, if any.
     key: Option<UserKey>,
@@ -47,7 +47,7 @@ pub struct OwnershipLedger {
 
 impl OwnershipLedger {
     /// Marks `files` as relocated by this pass (see `relocating`).
-    pub fn relocating(&mut self, files: impl IntoIterator<Item = crate::vlog::BlobFileId>) {
+    pub(crate) fn relocating(&mut self, files: impl IntoIterator<Item = crate::vlog::BlobFileId>) {
         self.relocating.extend(files);
     }
 
@@ -72,7 +72,7 @@ impl OwnershipLedger {
         reason = "every row of a compaction passes here, from two merge loops"
     )]
     #[inline(always)]
-    pub fn admit(
+    pub(crate) fn admit(
         &mut self,
         item: InternalValue,
         starts_key: bool,
@@ -143,7 +143,7 @@ impl OwnershipLedger {
     ///
     /// Returns the error of `write`, or of a held cell row that does not
     /// decode.
-    pub fn finish(
+    pub(crate) fn finish(
         mut self,
         write: &mut dyn FnMut(InternalValue, bool) -> crate::Result<()>,
     ) -> crate::Result<(FragmentationMap, Vec<crate::vlog::ValueHandle>)> {
@@ -213,7 +213,7 @@ fn adopt(rows: &mut [InternalValue], orphan: &BlobIndirection) -> crate::Result<
 
 /// The dropped-version callback a compaction stream reports into, sharing
 /// the ledger with the loop that admits the kept rows.
-pub struct LedgerHook<'a> {
+pub(crate) struct LedgerHook<'a> {
     pub ledger: &'a RefCell<OwnershipLedger>,
     /// The first error a dropped row raised: the callback cannot return one,
     /// so the loop checks it after every row.

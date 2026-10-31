@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 ///
 /// Uses a sorted vector keyed by `(end desc, id asc)` in comparator order,
 /// with the expiring-soonest tombstone kept at the tail for cheap `last()`.
-pub struct ActiveTombstoneSet {
+pub(crate) struct ActiveTombstoneSet {
     comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
     // A comparator-ordered Vec keeps expiry deterministic for custom
@@ -44,13 +44,13 @@ impl ActiveTombstoneSet {
             reason = "backward-compatible default-comparator constructor"
         )
     )]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::new_with_comparator(crate::comparator::default_comparator())
     }
 
     /// Creates a new forward active tombstone set with the given comparator.
     #[must_use]
-    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
+    pub(crate) fn new_with_comparator(comparator: SharedComparator) -> Self {
         Self {
             comparator,
             seqno_counts: BTreeMap::new(),
@@ -64,7 +64,7 @@ impl ActiveTombstoneSet {
     /// fresh [`Self::new_with_comparator`] but allocation-preserving: a
     /// seek-then-iterate-then-reseek loop that activated tombstones keeps the
     /// node / buffer capacity for the next pass.
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.seqno_counts.clear();
         self.pending_expiry.clear();
         self.next_id = 0;
@@ -77,7 +77,7 @@ impl ActiveTombstoneSet {
     /// cutoff (e.g., ephemeral memtable uses its own `index_seqno`).
     /// Duplicate activations (same seqno from different sources) are handled
     /// correctly via multiset accounting.
-    pub fn activate(&mut self, rt: &RangeTombstone, cutoff_seqno: SeqNo) {
+    pub(crate) fn activate(&mut self, rt: &RangeTombstone, cutoff_seqno: SeqNo) {
         if !rt.visible_at(cutoff_seqno) {
             return;
         }
@@ -114,7 +114,7 @@ impl ActiveTombstoneSet {
     /// # Panics
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
-    pub fn expire_until(&mut self, current_key: &[u8]) {
+    pub(crate) fn expire_until(&mut self, current_key: &[u8]) {
         while let Some((end, _, seqno)) = self.pending_expiry.last() {
             if self.comparator.compare(end, current_key) == core::cmp::Ordering::Greater {
                 break;
@@ -139,7 +139,7 @@ impl ActiveTombstoneSet {
     /// Returns the highest seqno among all active tombstones, or `None` if
     /// no tombstones are active.
     #[must_use]
-    pub fn max_active_seqno(&self) -> Option<SeqNo> {
+    pub(crate) fn max_active_seqno(&self) -> Option<SeqNo> {
         self.seqno_counts.keys().next_back().copied()
     }
 
@@ -147,7 +147,7 @@ impl ActiveTombstoneSet {
     /// active tombstone (i.e., there exists an active tombstone with a
     /// higher seqno).
     #[must_use]
-    pub fn is_suppressed(&self, key_seqno: SeqNo) -> bool {
+    pub(crate) fn is_suppressed(&self, key_seqno: SeqNo) -> bool {
         self.max_active_seqno().is_some_and(|max| key_seqno < max)
     }
 
@@ -164,7 +164,7 @@ impl ActiveTombstoneSet {
         not(test),
         expect(dead_code, reason = "used by iterator initialization logic")
     )]
-    pub fn initialize_from(
+    pub(crate) fn initialize_from(
         &mut self,
         tombstones: impl IntoIterator<Item = (RangeTombstone, SeqNo)>,
     ) {
@@ -175,7 +175,7 @@ impl ActiveTombstoneSet {
 
     /// Returns `true` if there are no active tombstones.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.seqno_counts.is_empty()
     }
 }
@@ -188,7 +188,7 @@ impl ActiveTombstoneSet {
 ///
 /// Uses a sorted vector keyed by `(start asc, id asc)` in comparator order,
 /// with the expiring-soonest tombstone kept at the tail for cheap `last()`.
-pub struct ActiveTombstoneSetReverse {
+pub(crate) struct ActiveTombstoneSetReverse {
     comparator: SharedComparator,
     seqno_counts: BTreeMap<SeqNo, u32>,
     pending_expiry: Vec<(UserKey, u64, SeqNo)>,
@@ -205,13 +205,13 @@ impl ActiveTombstoneSetReverse {
             reason = "backward-compatible default-comparator constructor"
         )
     )]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::new_with_comparator(crate::comparator::default_comparator())
     }
 
     /// Creates a new reverse active tombstone set with the given comparator.
     #[must_use]
-    pub fn new_with_comparator(comparator: SharedComparator) -> Self {
+    pub(crate) fn new_with_comparator(comparator: SharedComparator) -> Self {
         Self {
             comparator,
             seqno_counts: BTreeMap::new(),
@@ -223,7 +223,7 @@ impl ActiveTombstoneSetReverse {
     /// Resets the set to empty in place, reusing the backing `BTreeMap` /
     /// `Vec` storage instead of dropping it (see
     /// [`ActiveTombstoneSet::clear`]).
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.seqno_counts.clear();
         self.pending_expiry.clear();
         self.next_id = 0;
@@ -240,7 +240,7 @@ impl ActiveTombstoneSetReverse {
     /// For reverse iteration, activation uses strict `>`: tombstones with
     /// `rt.end > current_key` are activated. `key == end` is NOT covered
     /// (half-open).
-    pub fn activate(&mut self, rt: &RangeTombstone, cutoff_seqno: SeqNo) {
+    pub(crate) fn activate(&mut self, rt: &RangeTombstone, cutoff_seqno: SeqNo) {
         if !rt.visible_at(cutoff_seqno) {
             return;
         }
@@ -268,7 +268,7 @@ impl ActiveTombstoneSetReverse {
     /// # Panics
     ///
     /// Panics if an expiry pop has no matching activation in the seqno multiset.
-    pub fn expire_until(&mut self, current_key: &[u8]) {
+    pub(crate) fn expire_until(&mut self, current_key: &[u8]) {
         while let Some((start, _, seqno)) = self.pending_expiry.last() {
             if self.comparator.compare(current_key, start) == core::cmp::Ordering::Less {
                 let seqno = *seqno;
@@ -294,7 +294,7 @@ impl ActiveTombstoneSetReverse {
     /// Returns the highest seqno among all active tombstones, or `None` if
     /// no tombstones are active.
     #[must_use]
-    pub fn max_active_seqno(&self) -> Option<SeqNo> {
+    pub(crate) fn max_active_seqno(&self) -> Option<SeqNo> {
         self.seqno_counts.keys().next_back().copied()
     }
 
@@ -302,7 +302,7 @@ impl ActiveTombstoneSetReverse {
     /// active tombstone (i.e., there exists an active tombstone with a
     /// higher seqno).
     #[must_use]
-    pub fn is_suppressed(&self, key_seqno: SeqNo) -> bool {
+    pub(crate) fn is_suppressed(&self, key_seqno: SeqNo) -> bool {
         self.max_active_seqno().is_some_and(|max| key_seqno < max)
     }
 
@@ -311,7 +311,7 @@ impl ActiveTombstoneSetReverse {
         not(test),
         expect(dead_code, reason = "used by iterator initialization logic")
     )]
-    pub fn initialize_from(
+    pub(crate) fn initialize_from(
         &mut self,
         tombstones: impl IntoIterator<Item = (RangeTombstone, SeqNo)>,
     ) {
@@ -326,7 +326,7 @@ impl ActiveTombstoneSetReverse {
         expect(dead_code, reason = "helper for callers to inspect active tombstones")
     )]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.seqno_counts.is_empty()
     }
 }

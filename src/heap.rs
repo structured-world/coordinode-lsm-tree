@@ -26,22 +26,22 @@ use core::cmp::Ordering;
 ///
 /// Comparator is stored once in the heap, not per entry — eliminating
 /// the per-item `Arc` clone that the old `HeapItem` required.
-pub struct HeapEntry {
+pub(crate) struct HeapEntry {
     index: usize,
     value: InternalValue,
 }
 
 impl HeapEntry {
-    pub fn new(index: usize, value: InternalValue) -> Self {
+    pub(crate) fn new(index: usize, value: InternalValue) -> Self {
         Self { index, value }
     }
 
     #[inline]
-    pub fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.index
     }
 
-    pub fn into_value(self) -> InternalValue {
+    pub(crate) fn into_value(self) -> InternalValue {
         self.value
     }
 }
@@ -56,7 +56,7 @@ impl HeapEntry {
 /// entry order, so `order[0]` is the minimum and `order[last]` the maximum.
 /// This makes both `pop_min` / `pop_max` and `replace_min` / `replace_max`
 /// straightforward, and an entry never moves while it is in the heap.
-pub struct MergeHeap {
+pub(crate) struct MergeHeap {
     slots: Vec<Option<HeapEntry>>,
     /// Slots a pop emptied, for the next push.
     free: Vec<u32>,
@@ -130,7 +130,7 @@ fn occupied(slots: &[Option<HeapEntry>], slot: u32) -> &HeapEntry {
 
 impl MergeHeap {
     /// Creates an empty heap pre-allocated for `cap` entries.
-    pub fn with_capacity(cap: usize, comparator: SharedComparator) -> Self {
+    pub(crate) fn with_capacity(cap: usize, comparator: SharedComparator) -> Self {
         let lexicographic = comparator.is_lexicographic();
         Self {
             slots: Vec::with_capacity(cap),
@@ -147,7 +147,7 @@ impl MergeHeap {
     /// `len` bytes, which the comparisons then skip.
     ///
     /// Must be set before the first push.
-    pub fn use_common_prefix(&mut self, len: usize) {
+    pub(crate) fn use_common_prefix(&mut self, len: usize) {
         debug_assert!(self.order.is_empty(), "set before the first push");
         self.common_prefix = len;
     }
@@ -166,20 +166,20 @@ impl MergeHeap {
 
     #[inline]
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
 
     /// Returns a reference to the minimum (first) entry.
     #[inline]
-    pub fn peek_min(&self) -> Option<&HeapEntry> {
+    pub(crate) fn peek_min(&self) -> Option<&HeapEntry> {
         let slot = *self.order.first()?;
         Some(occupied(&self.slots, slot))
     }
 
     /// Returns a reference to the maximum (last) entry.
     #[inline]
-    pub fn peek_max(&self) -> Option<&HeapEntry> {
+    pub(crate) fn peek_max(&self) -> Option<&HeapEntry> {
         let slot = *self.order.last()?;
         Some(occupied(&self.slots, slot))
     }
@@ -193,7 +193,7 @@ impl MergeHeap {
         clippy::cast_possible_truncation,
         reason = "the heap holds at most two entries per source"
     )]
-    pub fn push(&mut self, entry: HeapEntry) {
+    pub(crate) fn push(&mut self, entry: HeapEntry) {
         // A lone entry's word is not kept up: nothing compares it.
         if let [lone] = *self.order.as_slice() {
             self.words[lone as usize] = self.word_of(occupied(&self.slots, lone));
@@ -245,7 +245,7 @@ impl MergeHeap {
     }
 
     /// Removes and returns the minimum entry.
-    pub fn pop_min(&mut self) -> Option<HeapEntry> {
+    pub(crate) fn pop_min(&mut self) -> Option<HeapEntry> {
         if self.order.is_empty() {
             return None;
         }
@@ -254,7 +254,7 @@ impl MergeHeap {
     }
 
     /// Removes and returns the maximum entry.
-    pub fn pop_max(&mut self) -> Option<HeapEntry> {
+    pub(crate) fn pop_max(&mut self) -> Option<HeapEntry> {
         let slot = self.order.pop()?;
         self.release(slot)
     }
@@ -273,7 +273,7 @@ impl MergeHeap {
         reason = "an empty heap panics by contract; the rest is behind the length guard"
     )]
     #[expect(clippy::expect_used, reason = "`order` only holds occupied slots")]
-    pub fn replace_min(&mut self, entry: HeapEntry) -> HeapEntry {
+    pub(crate) fn replace_min(&mut self, entry: HeapEntry) -> HeapEntry {
         let slot = self.order[0];
         let held = self.slots[slot as usize]
             .as_mut()
@@ -313,7 +313,7 @@ impl MergeHeap {
         reason = "an empty heap panics by contract; the rest is behind the length guard"
     )]
     #[expect(clippy::expect_used, reason = "`order` only holds occupied slots")]
-    pub fn replace_max(&mut self, entry: HeapEntry) -> HeapEntry {
+    pub(crate) fn replace_max(&mut self, entry: HeapEntry) -> HeapEntry {
         let last = self.order.len() - 1;
         let slot = self.order[last];
         let held = self.slots[slot as usize]

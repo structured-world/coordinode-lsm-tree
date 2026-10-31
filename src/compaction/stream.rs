@@ -115,7 +115,7 @@ impl<I: Iterator<Item = Item>> CountingPeek<I> {
 ///
 /// Borrowed rather than owned so the stream carries no destructor that could
 /// observe the caller's borrows, and so declaring it costs no allocation.
-pub type InputCompleteness<'a> = &'a dyn Fn(&[u8], SeqNo, SeqNo) -> bool;
+pub(crate) type InputCompleteness<'a> = &'a dyn Fn(&[u8], SeqNo, SeqNo) -> bool;
 
 /// What a compaction may do with the range tombstones it was given.
 ///
@@ -124,7 +124,7 @@ pub type InputCompleteness<'a> = &'a dyn Fn(&[u8], SeqNo, SeqNo) -> bool;
 /// bottommost compaction may also delete what they cover: elsewhere the
 /// tombstone is still propagating and a lower level may hold versions it hides.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RangeTombstoneUse {
+pub(crate) enum RangeTombstoneUse {
     /// End merge chains only.
     Boundary,
 
@@ -136,13 +136,13 @@ pub enum RangeTombstoneUse {
 ///
 /// Used for counting blobs that are not referenced anymore because of
 /// vHandles that are being dropped through compaction.
-pub trait DroppedKvCallback {
+pub(crate) trait DroppedKvCallback {
     fn on_dropped(&mut self, kv: &InternalValue);
 }
 
 /// Verdict returned by [`StreamFilter`]
 #[derive(Debug)]
-pub enum StreamFilterVerdict {
+pub(crate) enum StreamFilterVerdict {
     /// Keep the item as is.
     Keep,
 
@@ -154,7 +154,7 @@ pub enum StreamFilterVerdict {
 }
 
 /// A callback for modifying KVs in the stream
-pub trait StreamFilter {
+pub(crate) trait StreamFilter {
     /// Handle an item, possibly modifying it.
     fn filter_item(&mut self, item: &InternalValue) -> crate::Result<StreamFilterVerdict>;
 
@@ -197,7 +197,7 @@ pub trait StreamFilter {
 }
 
 /// A [`StreamFilter`] that does not modify anything
-pub struct NoFilter;
+pub(crate) struct NoFilter;
 
 impl StreamFilter for NoFilter {
     fn filter_item(&mut self, _item: &InternalValue) -> crate::Result<StreamFilterVerdict> {
@@ -216,7 +216,7 @@ impl StreamFilter for NoFilter {
     clippy::struct_excessive_bools,
     reason = "each is an independent setting or sweep state of the merge"
 )]
-pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFilter> {
+pub(crate) struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFilter> {
     /// KV stream
     inner: CountingPeek<I>,
 
@@ -281,7 +281,7 @@ pub struct CompactionStream<'a, I: Iterator<Item = Item>, F: StreamFilter = NoFi
 impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
     /// Initializes a new merge iterator
     #[must_use]
-    pub fn new(iter: I, gc_watermark: SeqNo) -> Self {
+    pub(crate) fn new(iter: I, gc_watermark: SeqNo) -> Self {
         Self {
             inner: CountingPeek::new(iter),
             gc_watermark,
@@ -306,7 +306,7 @@ impl<I: Iterator<Item = Item>> CompactionStream<'_, I, NoFilter> {
 
 impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I, F> {
     /// Installs a filter into this stream.
-    pub fn with_filter<NF: StreamFilter>(self, filter: NF) -> CompactionStream<'a, I, NF> {
+    pub(crate) fn with_filter<NF: StreamFilter>(self, filter: NF) -> CompactionStream<'a, I, NF> {
         CompactionStream {
             inner: self.inner,
             gc_watermark: self.gc_watermark,
@@ -332,13 +332,13 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// no earlier row carries, so its writer need not compare them: the merge
     /// already did. `false` says nothing either way.
     #[must_use]
-    pub fn next_starts_key(&self) -> bool {
+    pub(crate) fn next_starts_key(&self) -> bool {
         // A declined fold parks later versions of the same key in `pending`,
         // and they come out ahead of the input the head was compared with.
         self.key_ended && self.pending.is_empty()
     }
 
-    pub fn evict_tombstones(mut self, b: bool) -> Self {
+    pub(crate) fn evict_tombstones(mut self, b: bool) -> Self {
         self.evict_tombstones = b;
         self
     }
@@ -346,7 +346,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// Wires the shared transform counter (see the `transform_marker` field);
     /// the same counter the filter adapter ticks on non-`Keep` verdicts.
     #[must_use]
-    pub fn with_transform_marker(mut self, marker: Arc<portable_atomic::AtomicU64>) -> Self {
+    pub(crate) fn with_transform_marker(mut self, marker: Arc<portable_atomic::AtomicU64>) -> Self {
         self.transform_marker = Some(marker);
         self
     }
@@ -356,19 +356,19 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// collected history from one that collected none. Non-zero means some
     /// version went in and did not come out.
     #[must_use]
-    pub fn gc_balance(&self) -> Arc<portable_atomic::AtomicU64> {
+    pub(crate) fn gc_balance(&self) -> Arc<portable_atomic::AtomicU64> {
         Arc::clone(&self.inner.balance.shared)
     }
 
     /// Installs a callback that receives all dropped KVs.
-    pub fn with_drop_callback(mut self, cb: &'a mut dyn DroppedKvCallback) -> Self {
+    pub(crate) fn with_drop_callback(mut self, cb: &'a mut dyn DroppedKvCallback) -> Self {
         self.dropped_callback = Some(cb);
         self
     }
 
     /// Installs a merge operator for collapsing merge operands during compaction.
     #[must_use]
-    pub fn with_merge_operator(mut self, op: Option<Arc<dyn MergeOperator>>) -> Self {
+    pub(crate) fn with_merge_operator(mut self, op: Option<Arc<dyn MergeOperator>>) -> Self {
         self.merge_operator = op;
         self
     }
@@ -376,7 +376,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// Sets sequence numbers to zero if they are below the snapshot watermark.
     ///
     /// This can save a lot of space, because "0" only takes 1 byte, and sequence numbers are monotonically increasing.
-    pub fn zero_seqnos(mut self, b: bool) -> Self {
+    pub(crate) fn zero_seqnos(mut self, b: bool) -> Self {
         self.zero_seqnos = b;
         self
     }
@@ -399,7 +399,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// a test that is specifically about deletion.
     #[cfg(test)]
     #[must_use]
-    pub fn with_range_tombstone_application(
+    pub(crate) fn with_range_tombstone_application(
         self,
         tombstones: Vec<RangeTombstone>,
         comparator: SharedComparator,
@@ -426,7 +426,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     /// readable form for a test that is specifically about boundaries.
     #[cfg(test)]
     #[must_use]
-    pub fn with_range_tombstone_barriers(
+    pub(crate) fn with_range_tombstone_barriers(
         self,
         tombstones: Vec<RangeTombstone>,
         comparator: SharedComparator,
@@ -436,7 +436,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
 
     /// Installs the tombstones for the use a caller has already decided on.
     #[must_use]
-    pub fn with_range_tombstones(
+    pub(crate) fn with_range_tombstones(
         mut self,
         tombstones: Vec<RangeTombstone>,
         comparator: SharedComparator,
@@ -480,7 +480,7 @@ impl<'a, I: Iterator<Item = Item>, F: StreamFilter + 'a> CompactionStream<'a, I,
     ///
     /// Without this declaration nothing is composed.
     #[must_use]
-    pub fn with_input_completeness(mut self, predicate: InputCompleteness<'a>) -> Self {
+    pub(crate) fn with_input_completeness(mut self, predicate: InputCompleteness<'a>) -> Self {
         self.completeness = Some(predicate);
         self
     }
