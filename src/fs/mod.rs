@@ -415,9 +415,9 @@ pub enum FileHint {
 
     /// File is being written and we won't need it cached afterwards -
     /// drop pages from the page cache when the write completes
-    /// (`POSIX_FADV_DONTNEED`). Use for compaction output and memtable
-    /// flush output to keep them from evicting hot pages of files we're
-    /// still reading from.
+    /// (`POSIX_FADV_DONTNEED`). Use only for a file no read will follow,
+    /// such as an export: a table holds live data, and dropping its pages
+    /// sends its reads to the device.
     WriteOnce,
 }
 
