@@ -1700,6 +1700,38 @@ pub struct IoUringRawFile {
 }
 
 impl IoUringRawFile {
+    /// Reads `regions` to the ring in one batch.
+    fn read_regions<R: super::read_buf::ReadRegion>(
+        &self,
+        regions: &mut [R],
+    ) -> crate::io::Result<()> {
+        let mut reads = Vec::with_capacity(regions.len());
+        for region in regions.iter_mut() {
+            // SAFETY: the bytes go only to the kernel, which only writes them.
+            #[expect(unsafe_code, reason = "see safety")]
+            let (offset, buf) = unsafe { region.target() };
+            if buf.is_empty() {
+                continue;
+            }
+            reads.push(RawRead {
+                fd: self.fd,
+                buf: buf.as_mut_ptr(),
+                len: batch_read_len(buf.len())?,
+                offset,
+            });
+        }
+        let mut results = alloc::vec![0i32; reads.len()];
+        // SAFETY: every pointer is into a region `regions` borrows for this
+        // whole call, and `read_batch` returns only once every read completed.
+        unsafe { self.ring.lock().read_batch(&reads, &mut results) };
+        // Every read has completed, so the first failure in region order
+        // decides, whatever order they finished in.
+        reads
+            .iter()
+            .zip(results)
+            .try_for_each(|(read, res)| read_verdict(res, read.len))
+    }
+
     /// Wraps an open descriptor `fd` (from [`open_raw`]) with the shared `ring`.
     /// `is_append` selects `O_APPEND`-style writes (always at EOF). Takes
     /// ownership of `fd` (closed on [`Drop`]).
@@ -1834,28 +1866,7 @@ impl FsFile for IoUringRawFile {
     // Every region goes to the ring in one batch instead of the trait's serial
     // `read_at` loop, so they overlap in flight.
     fn read_many(&self, regions: &mut [(u64, &mut [u8])]) -> crate::io::Result<()> {
-        let mut reads = Vec::with_capacity(regions.len());
-        for (offset, buf) in regions.iter_mut() {
-            if buf.is_empty() {
-                continue;
-            }
-            reads.push(RawRead {
-                fd: self.fd,
-                buf: buf.as_mut_ptr(),
-                len: batch_read_len(buf.len())?,
-                offset: *offset,
-            });
-        }
-        let mut results = alloc::vec![0i32; reads.len()];
-        // SAFETY: every pointer is into a region `regions` borrows for this
-        // whole call, and `read_batch` returns only once every read completed.
-        unsafe { self.ring.lock().read_batch(&reads, &mut results) };
-        // Every read has completed, so the first failure in region order
-        // decides, whatever order they finished in.
-        reads
-            .iter()
-            .zip(results)
-            .try_for_each(|(read, res)| read_verdict(res, read.len))
+        self.read_regions(regions)
     }
 
     fn read_at_buf(&self, buf: &mut super::ReadBuf<'_>, offset: u64) -> crate::io::Result<()> {
@@ -1868,12 +1879,14 @@ impl FsFile for IoUringRawFile {
     }
 
     fn read_many_buf(&self, regions: &mut [(u64, super::ReadBuf<'_>)]) -> crate::io::Result<()> {
-        // SAFETY: as in `read_at_buf`; `read_many` fails unless every region
-        // was filled.
+        self.read_regions(regions)?;
+        // SAFETY: `read_regions` fails unless every region was filled, and
+        // only the kernel wrote them.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
-            super::read_buf::fill_regions_with(regions, |bytes| FsFile::read_many(self, bytes))
+            super::read_buf::assume_regions_filled(regions);
         }
+        Ok(())
     }
 
     // Exposes the descriptor so `IoUringRawFs::read_blocks_batched` can read

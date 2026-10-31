@@ -226,40 +226,61 @@ pub(crate) fn read_each(
     Ok(())
 }
 
-/// Runs `read` over `regions` as bytes, marking every region filled once it
-/// returns, without zeroing them.
-///
-/// # Safety
-///
-/// `read` must only write the regions, and must have filled each of them when
-/// it returns `Ok`.
+/// One region of a batched read, so a ring backend takes initialized and
+/// uninitialized regions alike without gathering them into another list.
 #[cfg(all(
     target_os = "linux",
     any(feature = "io-uring", feature = "io-uring-raw")
 ))]
-pub(crate) unsafe fn fill_regions_with(
-    regions: &mut [(u64, ReadBuf<'_>)],
-    read: impl FnOnce(&mut [(u64, &mut [u8])]) -> io::Result<()>,
-) -> io::Result<()> {
-    let mut bytes: alloc::vec::Vec<(u64, &mut [u8])> = regions
-        .iter_mut()
-        // SAFETY: the caller promises `read` only writes.
-        .map(|(offset, buf)| {
-            #[expect(unsafe_code, reason = "see safety")]
-            let bytes = unsafe { buf.bytes_mut_unchecked() };
-            (*offset, bytes)
-        })
-        .collect();
-    read(&mut bytes)?;
-    drop(bytes);
+pub(crate) trait ReadRegion {
+    /// The region's file offset and bytes.
+    ///
+    /// # Safety
+    ///
+    /// The caller must only write the bytes, as a kernel read does.
+    unsafe fn target(&mut self) -> (u64, &mut [u8]);
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io-uring", feature = "io-uring-raw")
+))]
+impl ReadRegion for (u64, &mut [u8]) {
+    unsafe fn target(&mut self) -> (u64, &mut [u8]) {
+        (self.0, &mut *self.1)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io-uring", feature = "io-uring-raw")
+))]
+impl ReadRegion for (u64, ReadBuf<'_>) {
+    unsafe fn target(&mut self) -> (u64, &mut [u8]) {
+        // SAFETY: the caller only writes the bytes.
+        #[expect(unsafe_code, reason = "see safety")]
+        let bytes = unsafe { self.1.bytes_mut_unchecked() };
+        (self.0, bytes)
+    }
+}
+
+/// Marks every region filled.
+///
+/// # Safety
+///
+/// Every region must have been written whole.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "io-uring", feature = "io-uring-raw")
+))]
+pub(crate) unsafe fn assume_regions_filled(regions: &mut [(u64, ReadBuf<'_>)]) {
     for (_, buf) in regions {
-        // SAFETY: the caller promises `read` filled every region.
+        // SAFETY: the caller promises it.
         #[expect(unsafe_code, reason = "see safety")]
         unsafe {
             buf.assume_filled(buf.capacity());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
