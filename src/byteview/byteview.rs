@@ -83,8 +83,20 @@ unsafe impl Send for ByteView {}
 unsafe impl Sync for ByteView {}
 
 impl Clone for ByteView {
+    #[inline]
     fn clone(&self) -> Self {
-        self.slice(..)
+        #[cfg(feature = "diagnostics")]
+        crate::diagnostics::add(&crate::diagnostics::SLICES, 1);
+        if !self.is_inline() {
+            self.get_heap_region()
+                .ref_count
+                .fetch_add(1, Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            crate::diagnostics::add(&crate::diagnostics::REFS_UP, 1);
+        }
+        // SAFETY: an inline view owns nothing, and a heap view's reference was
+        // just taken for the copy, so both views drop on their own terms.
+        unsafe { core::ptr::read(self) }
     }
 }
 
