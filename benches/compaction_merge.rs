@@ -427,7 +427,8 @@ fn main() -> lsm_tree::Result<()> {
                         }
                         times.sort_unstable();
                         let ns_at = |num: usize, den: usize| {
-                            let time: Duration = times[(times.len() - 1) * num / den];
+                            let at = ((times.len() - 1) * num).div_ceil(den);
+                            let time: Duration = times[at];
                             time.as_nanos() as f64 / n as f64
                         };
                         println!(
