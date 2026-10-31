@@ -17,9 +17,10 @@
 //! | codec | `none`, and `zstd1` when built with `zstd`; `zstd22` only when `COMPACTION_MERGE_CODECS` names it |
 //!
 //! Per configuration it prints the median over the rounds of the compaction
-//! time per entry, and the heap allocations and allocated bytes per entry
-//! counted by a counting global allocator over the compaction alone (the
-//! fixture is built before the count starts). Compaction runs on one thread,
+//! time per entry, the heap allocations and allocated bytes per entry, and the
+//! peak of bytes held at once above what the tree held before, all counted by a
+//! counting global allocator over the compaction alone (the fixture is built
+//! before the count starts). Compaction runs on one thread,
 //! so the counts are this path's, not a worker pool's.
 //!
 //! `COMPACTION_MERGE_ENTRIES` (default 400000) sets the entries per
@@ -63,6 +64,16 @@ struct Counting;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes allocated and not yet freed, and the most of them seen since the last
+/// reset: what a compaction holds at once, which `BYTES` cannot show.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Adds `size` to the live bytes and raises the peak to them.
+fn grew(size: usize) {
+    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
 
 // SAFETY: every call delegates to `System` with the caller's layout and
 // pointer unchanged; the counters only observe.
@@ -73,6 +84,7 @@ unsafe impl GlobalAlloc for Counting {
         if !ptr.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            grew(layout.size());
         }
         ptr
     }
@@ -80,6 +92,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: the caller upholds `dealloc`'s contract, passed through.
         unsafe { System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -88,6 +101,8 @@ unsafe impl GlobalAlloc for Counting {
         if !new.is_null() {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size, Ordering::Relaxed);
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            grew(new_size);
         }
         new
     }
@@ -365,6 +380,7 @@ fn main() -> lsm_tree::Result<()> {
                         let mut times = Vec::with_capacity(rounds);
                         let mut allocs = Vec::with_capacity(rounds);
                         let mut bytes = Vec::with_capacity(rounds);
+                        let mut peaks = Vec::with_capacity(rounds);
                         for _ in 0..rounds {
                             let tree = fixture(shape, len, fanin, placement, codec, n)?;
                             let input_tables = tree.table_count();
@@ -372,6 +388,8 @@ fn main() -> lsm_tree::Result<()> {
                                 ALLOCS.load(Ordering::Relaxed),
                                 BYTES.load(Ordering::Relaxed),
                             );
+                            let live_before = LIVE.load(Ordering::Relaxed);
+                            PEAK.store(live_before, Ordering::Relaxed);
                             if let Some(perf) = &mut perf {
                                 perf.send("enable\n")?;
                             }
@@ -383,6 +401,7 @@ fn main() -> lsm_tree::Result<()> {
                             }
                             allocs.push(ALLOCS.load(Ordering::Relaxed) - a0);
                             bytes.push(BYTES.load(Ordering::Relaxed) - b0);
+                            peaks.push(PEAK.load(Ordering::Relaxed) - live_before);
                             times.push(elapsed);
                             assert_eq!(result.tables_in, input_tables, "every table is merged");
                             assert_eq!(result.tables_out, 1, "into one output table");
@@ -391,13 +410,14 @@ fn main() -> lsm_tree::Result<()> {
                         }
                         let time: Duration = median(times);
                         println!(
-                            "compaction_merge/{}/k{len}/{}/f{fanin}/{}: {:.1} ns/entry, {:.2} allocs/entry, {:.1} B allocated/entry",
+                            "compaction_merge/{}/k{len}/{}/f{fanin}/{}: {:.1} ns/entry, {:.2} allocs/entry, {:.1} B allocated/entry, {:.1} KiB peak",
                             codec.label(),
                             shape.label(),
                             placement.label(),
                             time.as_nanos() as f64 / n as f64,
                             median(allocs) as f64 / n as f64,
                             median(bytes) as f64 / n as f64,
+                            median(peaks) as f64 / 1024.0,
                         );
                     }
                 }
