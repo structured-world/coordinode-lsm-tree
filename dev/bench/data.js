@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793345165622,
+  "lastUpdate": 1793445596499,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -65968,6 +65968,90 @@ window.BENCHMARK_DATA = {
             "value": 338111.80549320445,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 12.2us | P99.9: 92.2us\nthreads: 1 | elapsed: 0.59s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b446d2bd2974151119a3ee0d1b9d2c0e9d3d837e",
+          "message": "perf(compaction): cut per-row merge and write costs (#1027)\n\n## Summary\n- Takes the per-row allocations, copies and repeated work out of the\ncompaction path, from block iteration through the merge to the table\nwriter and filter build.\n- Key allocations per merged row fall from about one to 0.02-0.43 for\nkeys above the inline size, and full compaction gets 12-49% faster\nwithout compression and on zstd level 1.\n- At zstd level 22 the encoder dominates and the gain is 2.4%; the\niterator API stays as it is.\n\n## Changes\n- `KeyChunks`: a scan writes rebuilt keys side by side into shared 4 KiB\nchunks. Carried blocks do the same, and the block and filter partition\nindexes keep their own copies of their keys so they hold no chunk until\nthe table ends. Keys at or below the inline size and keys above a chunk\nkeep their existing path; the `bytes_1` backend keeps one allocation per\nkey.\n- `ByteView::clone` takes a reference and copies the view rather than\ngoing through `slice`.\n- Merge heap: entries are ordered by slot number and binary searched,\nand lexicographic keys compare a word past the common prefix. Custom\ncomparators use the plain comparison.\n- Compaction stream and writers: a row's key is compared with its\nneighbour once, range tombstone coverage is asked once per row, and\nper-row tests are computed once.\n- Filters: keys register without a clone or an estimate, a BuRR layer's\nkeys split in one pass, and a layer solves straight into its stored\npayload.\n- `parking_lot` 0.13 and `parking_lot_core` 0.10.\n- `diagnostics`, a new feature off by default with no stability promise:\nprocess-wide counts of key copies and reference count operations for\nbenches.\n- New benches: `compaction_merge` (key length, prefix shape, fan-in,\noverlap, versions, block size, comparator, codec) and\n`block_cache_contention`.\n- `manifest_many_runs` keeps its oversized edit test on `MemFs`, and\n`idle_wakeups` waits out compaction's tail before it measures.\n\nThe on-disk format is unchanged: the output encoder still computes\nshared lengths against its own restart head.\n\n## Testing\nFormatting, clippy in both feature configurations, the no-std check and\nthe Linux test suite in default and all-features configurations pass.\nTimed results come from paired runs on a benchmark host against a\ncontrol built from `main` with the same bench.\n\nCloses #967\n\n\n<!-- This is an auto-generated comment: release notes by coderabbit.ai\n-->\n<!-- coderabbit-ai-generated:v1 -->\n\n## Summary by CodeRabbit\n\n* **Performance**\n* Improved key handling during reads and compaction to reduce copying,\nand streamlined merge operations, filter construction, and table\nwriting.\n* **Diagnostics**\n* Added an optional, bench-focused feature for tracking key-copy and\nreference-count activity.\n* **Benchmarks**\n* Added benchmarks for block-cache contention and compaction\nperformance, with configurable workloads and latency or memory\nmeasurements.\n<!-- end of auto-generated comment: release notes by coderabbit.ai -->",
+          "timestamp": "2026-10-31T13:00:32+02:00",
+          "tree_id": "25f73331199e130ad4b7fc1b5f528da93609b289",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/b446d2bd2974151119a3ee0d1b9d2c0e9d3d837e"
+        },
+        "date": 1793445595260,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 73816.52377732328,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.4us | P99.9: 28.7us\nthreads: 1 | elapsed: 7.25s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2963314.434005313,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 874297.791335805,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.2us | P99.9: 11.5us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 490971.9874557835,
+            "unit": "ops/sec",
+            "extra": "P50: 1.9us | P99: 6.8us | P99.9: 22.6us\nthreads: 1 | elapsed: 0.41s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3159422.400715546,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 6.2us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 313242.96287428273,
+            "unit": "ops/sec",
+            "extra": "P50: 2.7us | P99: 9.2us | P99.9: 21.6us\nthreads: 1 | elapsed: 0.64s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 182900.23172700324,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 19.1us | P99.9: 35.4us\nthreads: 1 | elapsed: 1.09s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 906202.183675402,
+            "unit": "ops/sec",
+            "extra": "P50: 1.0us | P99: 2.1us | P99.9: 10.9us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1011822.4676130048,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 3.2us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 308491.5961290092,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 14.8us | P99.9: 94.1us\nthreads: 1 | elapsed: 0.65s | num: 200000 | iterations: 3"
           }
         ]
       }
