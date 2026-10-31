@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.1...v7.4.2) - 2026-10-31
+
+### Fixed
+
+- *(fs)* never show uninitialized memory to safe code ([#1029](https://github.com/structured-world/coordinode-lsm-tree/pull/1029))
+
+### Performance
+
+- *(compaction)* cut per-row merge and write costs ([#1027](https://github.com/structured-world/coordinode-lsm-tree/pull/1027))
+
 ## [7.4.1](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.0...v7.4.1) - 2026-10-30
 
 ### Performance
