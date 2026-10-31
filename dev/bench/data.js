@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793453020512,
+  "lastUpdate": 1793453024624,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -91320,6 +91320,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.418413939,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f7e4cff0e7efdcb67a09c79fd654059ae6e85fdd",
+          "message": "fix(fs): never show uninitialized memory to safe code (#1029)\n\n## Summary\n- No safe public API hands uninitialized bytes to a reader or file\nimplementation outside the crate any more, which was undefined behaviour\nreachable from safe code.\n- Buffers are zeroed only where the code doing the read is unknown; the\ncrate's backends, and any other backend whose read only writes, skip it.\n\n## Changes\n- `FsFile::read_at_buf` and `read_many_buf` take a `ReadBuf`. The\ndefault zeroes and calls `read_at`; `StdFs`, both io_uring backends and\n`MemFs` override them without zeroing, and the wrappers forward them.\n- `ReadBuf::fill_with` lets an implementation outside the crate skip the\nzeroing under its own `unsafe` promise.\n- Only the crate constructs a `ReadBuf`, and callers trust its filled\ncount, so a safe implementation can neither swap the buffer nor claim a\nread it did not make; such a read is `UnexpectedEof`.\n- `read_exact`, `read_exact_many`, scanner chunks and encrypted blocks\nread through `ReadBuf`. The scanner reads by offset instead of the file\ncursor.\n- Public `Slice::from_reader` and `ByteView::from_reader`, which take\nany reader, zero.\n\n## For consumers\nExisting `FsFile` implementations, CoordiNode's included, keep compiling\nand stay sound, but each read now pays for zeroing its buffer. An\nimplementation whose read only writes the buffer overrides `read_at_buf`\nwith `ReadBuf::fill_with`, and `read_many_buf` too if it has a batched\nread, to skip the zeroing. A wrapper forwards both to its inner file, or\nit zeroes on behalf of a backend that would not.\n\n## Testing\nLints, tests in both feature sets, doc tests, the doc build, the no-std\ncheck and the visibility ratchet pass on Linux. Miri is clean on the\n`from_reader`, block read, scanner and `ReadBuf` tests. The before and\nafter measurement is in the issue.\n\nCloses #1023",
+          "timestamp": "2026-10-31T12:59:27Z",
+          "tree_id": "d2e4ca9488245ab0becfbc3a3fb217abdd145dc8",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/f7e4cff0e7efdcb67a09c79fd654059ae6e85fdd"
+        },
+        "date": 1793453023376,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 480.872,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 83.737933ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 137.975,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 50.80024ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 454.097,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 98.290664ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 4629.112,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 9708.306999999999,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 25.455,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 53.280767,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.437537306,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.303,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 63.537151,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.436669591,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
