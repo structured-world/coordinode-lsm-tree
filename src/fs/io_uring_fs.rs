@@ -990,7 +990,7 @@ impl RingThread {
                         done: done.clone(),
                         position,
                     };
-                    Self::enqueue(ring, pending, next_id, read, completion);
+                    Self::enqueue(ring, pending, next_id, &read, completion);
                 }
             }
             Submission::Queued { reads, first, sink } => {
@@ -999,7 +999,7 @@ impl RingThread {
                         sink: Arc::clone(&sink),
                         position: first + index,
                     };
-                    Self::enqueue(ring, pending, next_id, read, completion);
+                    Self::enqueue(ring, pending, next_id, &read, completion);
                 }
             }
         }
@@ -1011,7 +1011,7 @@ impl RingThread {
         ring: &mut IoUring,
         pending: &mut HashMap<u64, Completion>,
         next_id: &mut u64,
-        read: BatchRead,
+        read: &BatchRead,
         completion: Completion,
     ) {
         let id = *next_id;
