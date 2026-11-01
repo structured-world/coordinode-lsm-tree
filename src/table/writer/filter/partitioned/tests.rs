@@ -248,23 +248,23 @@ mod parallel {
     /// the configured partition: past it the cache would refuse the partition.
     #[test]
     fn a_partition_stays_within_the_limit_that_split_the_filter() -> crate::Result<()> {
-        let keys = 200_000;
-        let setup = Setup {
-            partition_size: 64 * 1_024,
-            ..Setup::new(keys)
-        };
-        let (_, configured) = setup.write(None, &|| {})?;
         let limit = 8 * 1_024;
-        let filter = BloomConstructionPolicy::default().filter_size_bound(keys as usize) as u64;
-        let (_, capped) = Setup {
-            hold: Some(limit),
-            ..setup
+        let mut writer = PartitionedFilterWriter::new(BloomConstructionPolicy::default())
+            .holding_whole_up_to(limit);
+        writer.partition_size = 64 * 1_024;
+        for i in 0..200_000_u32 {
+            let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
+            FilterWriter::<W>::register_key(&mut writer, &key, crate::hash::hash64(&key))?;
         }
-        .write(None, &|| {})?;
-        assert!(
-            capped as u64 >= filter / limit,
-            "{capped} partitions of a {filter} byte filter, {configured} as configured",
-        );
+        assert!(writer.hold.is_none(), "the filter outgrew its limit");
+        assert!(writer.tli_handles.len() > 10);
+        for handle in &writer.tli_handles {
+            assert!(
+                u64::from(handle.size()) <= limit,
+                "a partition of {} bytes past the limit of {limit}",
+                handle.size(),
+            );
+        }
         Ok(())
     }
 

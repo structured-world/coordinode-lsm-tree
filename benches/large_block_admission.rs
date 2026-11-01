@@ -227,6 +227,11 @@ fn main() -> lsm_tree::Result<()> {
                 );
                 pass(&tree, "get cold", || gets(&tree, fixture, reads, seqno))?;
                 pass(&tree, "get warm", || gets(&tree, fixture, reads, seqno))?;
+                println!("  cache holds {} KiB", cache.size() >> 10);
+
+                // A fresh cache, or the seeks would start on what the gets left.
+                drop((tree, cache));
+                let (tree, cache) = open(&folder, capacity, layout)?;
                 pass(&tree, "seek cold", || seeks(&tree, fixture, reads, seqno))?;
                 pass(&tree, "seek warm", || seeks(&tree, fixture, reads, seqno))?;
                 println!("  cache holds {} KiB", cache.size() >> 10);
