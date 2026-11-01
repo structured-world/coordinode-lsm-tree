@@ -707,7 +707,8 @@ pub struct Config {
 
     /// Default filesystem backend for levels without an explicit route.
     ///
-    /// Defaults to [`StdFs`]. Use [`Config::with_fs`] to plug in an
+    /// Defaults to `IoUringFs` where the kernel offers it, else
+    /// [`StdFs`](crate::fs::StdFs). Use [`Config::with_fs`] to plug in an
     /// alternative backend such as [`MemFs`](crate::fs::MemFs).
     ///
     /// Both fresh tree creation and reopening (recovery) are supported
@@ -1422,7 +1423,8 @@ impl Config {
 
     /// Sets the default filesystem backend used for levels without an explicit route.
     ///
-    /// Defaults to [`StdFs`]. Use [`MemFs`](crate::fs::MemFs) for
+    /// Defaults to `IoUringFs` where the kernel offers it, else
+    /// [`StdFs`](crate::fs::StdFs). Use [`MemFs`](crate::fs::MemFs) for
     /// in-memory trees (testing, ephemeral indexes).
     ///
     /// # Example
