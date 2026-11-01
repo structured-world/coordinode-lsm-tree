@@ -18,12 +18,12 @@ pub(crate) struct ScanTombstones {
     /// order, no duplicates.
     list: Vec<(RangeTombstone, SeqNo)>,
     /// Built by the first check: a scan without merge operands makes none.
-    index: OnceBox<Floors>,
+    index: OnceBox<Stretches>,
 }
 
 /// The stretches between tombstone bounds and the newest visible tombstone
 /// over each.
-struct Floors {
+struct Stretches {
     /// Ascending. Stretch `i` runs from `bounds[i]` up to `bounds[i + 1]`.
     bounds: Vec<UserKey>,
     /// What stretch `i` suppresses: every version below this seqno. `0`
@@ -58,12 +58,12 @@ impl ScanTombstones {
             return false;
         }
         self.index
-            .get_or_init(|| Box::new(Floors::new(&self.list, comparator)))
+            .get_or_init(|| Box::new(Stretches::new(&self.list, comparator)))
             .suppresses(key, seqno, comparator)
     }
 }
 
-impl Floors {
+impl Stretches {
     fn new(list: &[(RangeTombstone, SeqNo)], comparator: &dyn UserComparator) -> Self {
         // `list` is sorted by start, and leaving some out keeps it so.
         let visible: Vec<&RangeTombstone> = list
