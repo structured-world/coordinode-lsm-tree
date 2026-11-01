@@ -2467,6 +2467,10 @@ impl AbstractTree for BlobTree {
         self.index.active_memtable()
     }
 
+    fn active_memtable_is_empty(&self) -> bool {
+        self.index.active_memtable_is_empty()
+    }
+
     fn rotate_memtable(&self) -> Option<Arc<Memtable>> {
         self.index.rotate_memtable()
     }

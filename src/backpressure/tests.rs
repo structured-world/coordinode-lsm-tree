@@ -274,6 +274,51 @@ fn a_budget_reads_its_members_under_their_version_lock() -> crate::Result<()> {
     Ok(())
 }
 
+/// Admission asks whether a tree's active memtable is empty from inside a
+/// version install, which holds the version lock.
+#[test]
+fn an_empty_active_memtable_reads_under_the_version_lock() -> crate::Result<()> {
+    use crate::{AbstractTree, AnyTree, Config, SequenceNumberCounter};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    let AnyTree::Standard(tree) = &tree else {
+        unreachable!("no separation configured");
+    };
+
+    let held = tree.version_history.write();
+    assert!(tree.active_memtable_is_empty());
+    drop(held);
+    Ok(())
+}
+
+/// A tombstone-only memtable is not empty, and telling so takes no memtable
+/// lock: inserting a tombstone holds its lock across the tree's comparator.
+#[test]
+fn a_tombstone_only_active_memtable_reads_under_its_tombstone_lock() -> crate::Result<()> {
+    use crate::{AbstractTree, Config, SequenceNumberCounter};
+
+    let folder = crate::get_tmp_folder();
+    let tree = Config::new(
+        folder.path(),
+        SequenceNumberCounter::default(),
+        SequenceNumberCounter::default(),
+    )
+    .open()?;
+    tree.remove_range("a", "b", 0);
+
+    let active = tree.active_memtable();
+    let held = active.range_tombstones.write();
+    assert!(!tree.active_memtable_is_empty());
+    drop(held);
+    Ok(())
+}
+
 /// A memtable holding only a range tombstone still waits for a flush, and
 /// counting it takes no memtable lock: inserting a tombstone holds its lock
 /// across the tree's comparator, which is the caller's code.
