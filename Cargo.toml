@@ -613,6 +613,12 @@ harness = false
 path = "benches/range_tombstone_merge.rs"
 required-features = ["std"]
 
+[[bench]]
+name = "large_block_admission"
+harness = false
+path = "benches/large_block_admission.rs"
+required-features = ["std", "metrics"]
+
 # Deterministic code layout for anything measured: with the default 16
 # codegen units and no LTO, ANY code change reshuffles function placement and
 # moves hot loops across cache lines, stepping macro-benchmarks by several
