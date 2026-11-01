@@ -29,6 +29,8 @@ struct Floors {
     /// What stretch `i` suppresses: every version below this seqno. `0`
     /// suppresses nothing, no version being below it.
     floors: Vec<SeqNo>,
+    /// The highest of `floors`: a version at or above it needs no bound found.
+    highest: SeqNo,
 }
 
 impl ScanTombstones {
@@ -101,11 +103,15 @@ impl Floors {
 
         Self {
             bounds: bounds.into_iter().cloned().collect(),
+            highest: floors.iter().copied().max().unwrap_or(0),
             floors,
         }
     }
 
     fn suppresses(&self, key: &[u8], seqno: SeqNo, comparator: &dyn UserComparator) -> bool {
+        if seqno >= self.highest {
+            return false;
+        }
         let reached = self
             .bounds
             .partition_point(|bound| comparator.compare(bound, key) != Ordering::Greater);

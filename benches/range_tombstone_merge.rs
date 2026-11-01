@@ -4,9 +4,10 @@
 //! What range tombstones cost a read, by how many there are and how many merge
 //! operands each key holds.
 //!
-//! One flushed table of `KEYS` keys, each a base and its operands, under
-//! tombstones written before them: narrow ones that delete nothing, so every
-//! row reaches the reader and every operand is checked against them.
+//! One flushed table of `KEYS` keys, each a base and its operands, and narrow
+//! tombstones between the keys, which delete nothing, so every row reaches the
+//! reader and every operand is checked against them. The tombstones come
+//! `older` than the data or `newer`, the case that cannot be told by seqno.
 //! - `first_row`: a scan built and read to its first row, its setup;
 //! - `forward` and `reverse`: whole scans, per row;
 //! - `get`: point reads, per read.
@@ -37,16 +38,18 @@ impl MergeOperator for Concat {
     }
 }
 
+/// Key `i`, leaving the odd keys to the tombstones.
 fn key(i: u32) -> [u8; 4] {
-    i.to_be_bytes()
+    (i * 2).to_be_bytes()
 }
 
-/// A tree of `KEYS` keys of `operands` operands each over `tombstones` range
-/// tombstones older than all of them, and the seqno reading all of it.
+/// A tree of `KEYS` keys of `operands` operands each and `tombstones` range
+/// tombstones between them, and the seqno reading all of it.
 fn fill(
     folder: &tempfile::TempDir,
     tombstones: u32,
     operands: u32,
+    newer: bool,
 ) -> lsm_tree::Result<(AnyTree, SeqNo)> {
     let tree = Config::new(
         folder,
@@ -57,10 +60,19 @@ fn fill(
     .open()?;
 
     let mut seqno = 1;
-    for i in 0..tombstones {
-        let start = (u64::from(i) * u64::from(KEYS) / u64::from(tombstones)) as u32;
-        tree.remove_range(key(start).to_vec(), key(start + 1).to_vec(), seqno);
-        seqno += 1;
+    let delete = |seqno: &mut SeqNo| {
+        for i in 0..tombstones {
+            let at = (u64::from(i) * u64::from(KEYS) / u64::from(tombstones)) as u32 * 2 + 1;
+            tree.remove_range(
+                at.to_be_bytes().to_vec(),
+                (at + 1).to_be_bytes().to_vec(),
+                *seqno,
+            );
+            *seqno += 1;
+        }
+    };
+    if !newer {
+        delete(&mut seqno);
     }
     for i in 0..KEYS {
         tree.insert(key(i), [0_u8; 8], seqno);
@@ -69,6 +81,9 @@ fn fill(
             tree.merge(key(i), [1_u8; 8], seqno);
             seqno += 1;
         }
+    }
+    if newer {
+        delete(&mut seqno);
     }
     tree.flush_active_memtable(0)?;
     Ok((tree, seqno))
@@ -87,10 +102,15 @@ fn median(per: u32, mut pass: impl FnMut() -> lsm_tree::Result<()>) -> lsm_tree:
 }
 
 fn main() -> lsm_tree::Result<()> {
-    for tombstones in [0, 1, 4, 16, 64, 256, 1_000, 10_000] {
-        for operands in [0, 1, 16] {
+    for (tombstones, operands, newer) in [0, 1, 4, 16, 64, 256, 1_000, 10_000]
+        .into_iter()
+        .flat_map(|tombstones| [0, 1, 16].map(|operands| (tombstones, operands)))
+        .flat_map(|(tombstones, operands)| [false, true].map(|newer| (tombstones, operands, newer)))
+    {
+        {
             let folder = tempfile::tempdir()?;
-            let (tree, seqno) = fill(&folder, tombstones, operands)?;
+            let (tree, seqno) = fill(&folder, tombstones, operands, newer)?;
+            let age = if newer { "newer" } else { "older" };
 
             let first_row = median(1, || {
                 let row = tree.iter(seqno, None).next();
@@ -123,7 +143,7 @@ fn main() -> lsm_tree::Result<()> {
             })?;
 
             println!(
-                "tombstones {tombstones} operands {operands}: first_row {first_row:.0} ns, \
+                "tombstones {tombstones} {age} operands {operands}: first_row {first_row:.0} ns, \
                  forward {forward:.0} ns/row, reverse {reverse:.0} ns/row, get {get:.0} ns",
             );
         }
