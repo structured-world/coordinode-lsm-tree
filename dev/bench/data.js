@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793556536177,
+  "lastUpdate": 1793559556213,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66556,6 +66556,90 @@ window.BENCHMARK_DATA = {
             "value": 345280.67303103197,
             "unit": "ops/sec",
             "extra": "P50: 2.3us | P99: 11.9us | P99.9: 87.5us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1d7511be8de8f68d5ae4bb8a705e7218233b1da4",
+          "message": "feat(memtable): tell an empty active memtable lock-free (#1038)\n\n## Summary\n- `AbstractTree::active_memtable_is_empty` tells whether a tree's active\nmemtable holds nothing, so that the next write makes one more flush\nowed.\n- Under `std` it takes no lock, so it can be called from inside a\nversion install, where `active_memtable()` would deadlock.\n\n## Changes\n- `Tree` reads the super version mirror and the memtable's size, which\nalso avoids the range-tombstone lock `Memtable::is_empty` takes. Without\n`std`, where the mirror does not exist, it reads through the version\nhistory.\n- `BlobTree` and `AnyTree` forward to it.\n\n## Testing\n- Tests cover nothing written, an insert, a rotation and the next insert\non every tree type, a tombstone-only memtable, and the read under the\nversion lock and under the tombstone lock.\n- Formatting, lints in both feature configurations, the affected tests,\nthe doc test and the no-std check pass on macOS; the full matrix runs in\nCI.\n\nCloses #1037",
+          "timestamp": "2026-11-01T18:41:07Z",
+          "tree_id": "b2e7abd3891bb1aea647bcb29db2f571eb217449",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/1d7511be8de8f68d5ae4bb8a705e7218233b1da4"
+        },
+        "date": 1793559555020,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 126780.48125950272,
+            "unit": "ops/sec",
+            "extra": "P50: 0.5us | P99: 18.5us | P99.9: 27.5us\nthreads: 1 | elapsed: 4.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2684939.90225181,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.7us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 772459.3432729102,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.6us | P99.9: 12.2us\nthreads: 1 | elapsed: 0.26s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 437578.64491590415,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.2us | P99.9: 30.7us\nthreads: 1 | elapsed: 0.46s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3093141.6558815264,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.8us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 305170.2818892988,
+            "unit": "ops/sec",
+            "extra": "P50: 2.8us | P99: 8.0us | P99.9: 25.4us\nthreads: 1 | elapsed: 0.66s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 189521.10626153345,
+            "unit": "ops/sec",
+            "extra": "P50: 4.5us | P99: 10.3us | P99.9: 21.8us\nthreads: 1 | elapsed: 1.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 711635.2390042606,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.0us | P99.9: 13.0us\nthreads: 1 | elapsed: 0.28s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 1021452.7289680138,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.6us | P99.9: 0.7us\nthreads: 1 | elapsed: 0.20s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 320559.9351175151,
+            "unit": "ops/sec",
+            "extra": "P50: 2.4us | P99: 14.4us | P99.9: 95.9us\nthreads: 1 | elapsed: 0.62s | num: 200000 | iterations: 3"
           }
         ]
       }
