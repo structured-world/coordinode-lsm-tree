@@ -89,6 +89,8 @@ mod parallel {
         ecc: Option<crate::table::block::EccParams>,
         encryption: Option<Arc<dyn crate::encryption::EncryptionProvider>>,
         keys: u32,
+        /// Bytes the filter is held whole up to, if at all.
+        hold: Option<u64>,
     }
 
     impl Setup {
@@ -99,6 +101,7 @@ mod parallel {
                 ecc: None,
                 encryption: None,
                 keys,
+                hold: None,
             }
         }
 
@@ -110,13 +113,17 @@ mod parallel {
             parallel: Option<ParallelCompression>,
             before_finish: &dyn Fn(),
         ) -> crate::Result<(Vec<u8>, usize)> {
-            let mut writer: Box<dyn FilterWriter<W>> =
-                Box::new(PartitionedFilterWriter::new(self.policy))
-                    .use_partition_size(self.partition_size)
-                    .use_table_id(7)
-                    .use_ecc(self.ecc)
-                    .use_encryption(self.encryption.clone())
-                    .use_parallel(parallel);
+            let filter = PartitionedFilterWriter::new(self.policy);
+            let filter = match self.hold {
+                Some(limit) => filter.holding_whole_up_to(limit),
+                None => filter,
+            };
+            let mut writer: Box<dyn FilterWriter<W>> = Box::new(filter)
+                .use_partition_size(self.partition_size)
+                .use_table_id(7)
+                .use_ecc(self.ecc)
+                .use_encryption(self.encryption.clone())
+                .use_parallel(parallel);
             let mut last_key = None;
             for i in 0..self.keys {
                 let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
@@ -210,6 +217,71 @@ mod parallel {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// A filter that outgrows its hold writes what a writer that never held
+    /// writes, byte for byte, at any limit: on the writer's thread and on
+    /// workers, the limit crossed anywhere in a partition or at once.
+    #[test]
+    fn a_released_hold_writes_what_partitioning_from_the_start_writes() -> crate::Result<()> {
+        let setup = Setup::new(5_000);
+        let (from_the_start, partitions) = setup.write(None, &|| {})?;
+        assert!(partitions > 10, "{partitions} partitions");
+        // Past 3 000 keys, from a limit of no block at all.
+        let bytes = BloomConstructionPolicy::default().filter_size_bound(3_000) as u64;
+        for limit in [0, 1, 256, 257, 1_000, bytes] {
+            let held = Setup {
+                hold: Some(limit),
+                ..setup.clone()
+            };
+            let (serial, serial_partitions) = held.write(None, &|| {})?;
+            assert_eq!(serial_partitions, partitions, "limit {limit}");
+            assert!(serial == from_the_start, "limit {limit}: serial");
+            let (parallel, _) = held.write(Some(workers(Arc::new(InlineSpawner), 4)), &|| {})?;
+            assert!(parallel == from_the_start, "limit {limit}: on workers");
+        }
+        Ok(())
+    }
+
+    /// A filter that stays under its limit writes what a full filter writer
+    /// writes, byte for byte, and estimates what it estimates.
+    #[test]
+    fn a_kept_hold_writes_what_a_full_filter_writes() -> crate::Result<()> {
+        use crate::table::writer::filter::FullFilterWriter;
+        let keys = 5_000_u32;
+        let policy = BloomConstructionPolicy::default();
+        let held = Setup {
+            hold: Some(policy.filter_size_bound(keys as usize) as u64),
+            ..Setup::new(keys)
+        };
+        let (held_bytes, blocks) = held.write(None, &|| {})?;
+        assert_eq!(blocks, 1, "one block");
+
+        let mut full: Box<dyn FilterWriter<W>> = Box::new(FullFilterWriter::new(policy));
+        full = full.use_table_id(7);
+        let mut estimated: Box<dyn FilterWriter<W>> =
+            Box::new(PartitionedFilterWriter::new(policy).holding_whole_up_to(u64::MAX));
+        let mut last_key = None;
+        for i in 0..keys {
+            let key: crate::UserKey = format!("key{i:08}").into_bytes().into();
+            let hash = crate::hash::hash64(&key);
+            full.register_key(&key, hash)?;
+            estimated.register_key(&key, hash)?;
+            last_key = Some(key);
+        }
+        assert_eq!(estimated.finish_output_bytes(), full.finish_output_bytes());
+        assert_eq!(
+            estimated.finish_scratch_bytes(),
+            full.finish_scratch_bytes()
+        );
+        let mut file = crate::sfa::Writer::from_writer(crate::checksum::ChecksummedWriter::new(
+            std::io::Cursor::new(Vec::new()),
+        ));
+        file.start("data")?;
+        file.write_all(&[0; 64])?;
+        full.finish(&mut file, last_key.as_ref())?;
+        assert!(held_bytes == *file.get_mut().get_ref().get_ref());
         Ok(())
     }
 

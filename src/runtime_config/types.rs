@@ -919,7 +919,9 @@ pub struct RuntimeConfig {
     /// up to 1M keys) while genuinely huge indexes still partition. Takes
     /// effect on the next flush / compaction; existing SSTs keep their
     /// original layout (each SST self-describes it). `0` forces always-
-    /// partition (spill on the first index entry).
+    /// partition (spill on the first index entry). At a level whose index
+    /// is not pinned, the index also spills past one block cache shard,
+    /// which could not keep it whole.
     pub index_partition_spill_threshold: u64,
 
     /// When `true`, the writer clears per-file copy-on-write

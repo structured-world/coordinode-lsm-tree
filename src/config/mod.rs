@@ -2149,6 +2149,14 @@ impl Config {
     }
 
     /// Sets the partitioning policy for filter blocks.
+    ///
+    /// `true` always partitions. `false` writes one block, unless the block
+    /// cache could not keep it: a filter past one cache shard is partitioned
+    /// too, or every read would fetch it whole from the file. A pinned filter
+    /// and a filter under a prefix extractor stay one block regardless, the
+    /// first bypassing the cache and the second answering prefix queries, and
+    /// [`Metrics::block_cache_refused_count`](crate::Metrics::block_cache_refused_count)
+    /// counts the reads such a block costs.
     #[must_use]
     pub fn filter_block_partitioning_policy(mut self, policy: PinningPolicy) -> Self {
         self.filter_block_partitioning_policy = policy;
