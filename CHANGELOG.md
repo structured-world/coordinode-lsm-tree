@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.5.0](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.2...v7.5.0) - 2026-11-01
+
+### Added
+
+- *(backpressure)* report unflushed memtable count ([#1035](https://github.com/structured-world/coordinode-lsm-tree/pull/1035))
+
+### Performance
+
+- keep compaction pages, speed up the blob path ([#1033](https://github.com/structured-world/coordinode-lsm-tree/pull/1033))
+
 ## [7.4.2](https://github.com/structured-world/coordinode-lsm-tree/compare/v7.4.1...v7.4.2) - 2026-10-31
 
 ### Fixed
