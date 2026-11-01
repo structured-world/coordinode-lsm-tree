@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793543982826,
+  "lastUpdate": 1793556523961,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66472,6 +66472,90 @@ window.BENCHMARK_DATA = {
             "value": 369612.3003336566,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 11.6us | P99.9: 82.0us\nthreads: 1 | elapsed: 0.54s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee62466737f2a3175083c99284c787c7a2d826b8",
+          "message": "perf(range): index range tombstones for merge reads (#1036)\n\n## Summary\n- Merge resolution no longer asks every range tombstone about every\noperand: a scan's tombstones are indexed once, so a check costs a binary\nsearch, or one seqno compare for a version above every floor.\n- A scan shares one tombstone list between its stages and its\nrepositions instead of cloning it. A scan with no merge operand no\nlonger pays for the copy, and a scan with no tombstones allocates\nnothing for them.\n- A point merge keeps the seqno of the newest tombstone over its key\ninstead of cloning the tombstones.\n- No on-disk change.\n\n## Changes\n- `src/range_tombstone_index.rs`: `ScanTombstones`, the sorted list with\na lazily built index of the newest visible seqno per stretch between\ntombstone bounds. One seqno per stretch is exact because the index\nbelongs to one scan, whose snapshot and per-source cutoffs are fixed.\n- `MvccStream`: suppression is none, a scan's `ScanTombstones`, or one\nseqno for a stream of one key.\n- `RangeTombstoneFilter`: reads the shared sorted list; only the reverse\norder is built on first use.\n- `point_merge`: tracks one seqno, and is now `pub(crate)` along with\nthe filter, lowering the visibility baseline.\n- `benches/range_tombstone_merge.rs`: tombstone count, age relative to\nthe data and operands per key, with and without a merge operator,\nagainst scan, first row and point read latency (median, P99, P999),\nallocations and peak memory.\n\n## Performance\nForward scan at 1000 tombstones and 16 operands per key: 148473 to 1878\nns per row when the tombstones are older than the data, 133537 to 4208\nwhen newer. Tombstones older than the data gain from one; newer ones\nbreak even between 4 and 16, and cost up to 11% below that. A scan that\nreads few rows pays the index build once: time to the first row with one\noperand per key goes from 712 to 953 us at 10000 tombstones, repaid\nwithin a few rows. Without merge operands peak memory falls 28% at 10000\ntombstones. Full tables are in the issue.\n\n## Testing\n- The index is property tested against asking each tombstone, with\noverlapping, duplicated, inverted and unseen tombstones and a custom\ncomparator.\n- The differential test compares scans and point reads with its model,\nmerges under a reverse comparator among them, over snapshots, both scan\ndirections and table runs.\n- Formatting, lints in both feature configurations, tests, doc tests and\nthe visibility check pass on Linux and macOS.\n\nCloses #956",
+          "timestamp": "2026-11-01T17:39:10Z",
+          "tree_id": "4a8cef27a86e70d86ace3383badc7589b16523a3",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/ee62466737f2a3175083c99284c787c7a2d826b8"
+        },
+        "date": 1793556522114,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 51596.59355714862,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 17.2us | P99.9: 30.4us\nthreads: 1 | elapsed: 10.37s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 2001294.3170866328,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.9us\nthreads: 1 | elapsed: 0.10s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 573704.2545904652,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.0us | P99.9: 13.3us\nthreads: 1 | elapsed: 0.35s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 423245.2594372392,
+            "unit": "ops/sec",
+            "extra": "P50: 2.2us | P99: 7.2us | P99.9: 28.7us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3088838.9145640903,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.7us | P99.9: 7.1us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 283851.04568376363,
+            "unit": "ops/sec",
+            "extra": "P50: 3.1us | P99: 8.0us | P99.9: 15.6us\nthreads: 1 | elapsed: 0.70s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 184862.8207137474,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 10.6us | P99.9: 20.4us\nthreads: 1 | elapsed: 1.08s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 727460.9359660804,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 3.1us | P99.9: 12.1us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 870811.4470115327,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.7us | P99.9: 5.4us\nthreads: 1 | elapsed: 0.23s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 345280.67303103197,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 11.9us | P99.9: 87.5us\nthreads: 1 | elapsed: 0.58s | num: 200000 | iterations: 3"
           }
         ]
       }
