@@ -5,6 +5,7 @@
 use crate::double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 use crate::merge_operator::MergeOperator;
 use crate::range_tombstone::RangeTombstone;
+use crate::range_tombstone_index::ScanTombstones;
 use crate::{InternalValue, SeqNo, UserKey, UserValue, ValueType, comparator::SharedComparator};
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
@@ -121,6 +122,15 @@ impl<I: crate::skip_key::SkipKey> PassVersions<I> for Jump {
     }
 }
 
+/// How a merge tells that a range tombstone deleted an entry.
+enum Suppression {
+    None,
+    /// The tombstones of a scan.
+    Scan(Arc<ScanTombstones>),
+    /// A stream of one key: entries below this seqno are deleted.
+    Below(SeqNo),
+}
+
 /// The versions of a resolved key [`Jump`] walks before it jumps.
 const WALKED_BEFORE_JUMP: usize = 8;
 
@@ -140,10 +150,9 @@ pub struct MvccStream<
     /// tree's stream meets such a base.
     value_log: L,
 
-    /// Range tombstones with per-source visibility cutoffs. When set, merge
-    /// resolution skips entries suppressed by an RT (treats them as a
-    /// tombstone boundary). Each tuple is `(tombstone, cutoff_seqno)`.
-    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    /// What merge resolution treats as deleted: it stops at a suppressed
+    /// entry, as at a tombstone.
+    suppression: Suppression,
 
     /// Reusable buffer for reverse-iteration merge resolution. Avoids
     /// allocating a fresh `Vec` on every `next_back()` call.
@@ -185,7 +194,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>> MvccStream<I> 
             merge_operator,
             comparator,
             value_log: NoValueLog,
-            range_tombstones: Vec::new(),
+            suppression: Suppression::None,
             key_entries_buf: Vec::new(),
             skip_front: None,
             skip_back: None,
@@ -206,7 +215,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, P> MvccStream<
             merge_operator: self.merge_operator,
             comparator: self.comparator,
             value_log,
-            range_tombstones: self.range_tombstones,
+            suppression: self.suppression,
             key_entries_buf: self.key_entries_buf,
             skip_front: self.skip_front,
             skip_back: self.skip_back,
@@ -228,7 +237,7 @@ impl<I: DoubleEndedIterator<Item = crate::Result<InternalValue>>, L> MvccStream<
             merge_operator: self.merge_operator,
             comparator: self.comparator,
             value_log: self.value_log,
-            range_tombstones: self.range_tombstones,
+            suppression: self.suppression,
             key_entries_buf: self.key_entries_buf,
             skip_front: self.skip_front,
             skip_back: self.skip_back,
@@ -248,21 +257,40 @@ impl<
     /// When set, operands or base values suppressed by a range tombstone are
     /// treated as a deletion boundary (merge stops, base = None).
     #[must_use]
-    pub fn with_range_tombstones(mut self, rts: Vec<(RangeTombstone, SeqNo)>) -> Self {
-        self.range_tombstones = rts;
+    pub fn with_range_tombstones(self, mut rts: Vec<(RangeTombstone, SeqNo)>) -> Self {
+        let comparator = self.comparator.as_ref();
+        rts.sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator));
+        self.with_scan_tombstones(Some(Arc::new(ScanTombstones::new(rts))))
+    }
+
+    /// Installs the tombstones of a scan, which its other stages share.
+    #[must_use]
+    pub(crate) fn with_scan_tombstones(mut self, tombstones: Option<Arc<ScanTombstones>>) -> Self {
+        if let Some(tombstones) = tombstones {
+            self.suppression = Suppression::Scan(tombstones);
+        }
+        self
+    }
+
+    /// Makes entries below `seqno` deleted: on a stream of one key, the
+    /// newest tombstone visible over it.
+    #[must_use]
+    pub(crate) fn with_suppression_below(mut self, seqno: SeqNo) -> Self {
+        self.suppression = Suppression::Below(seqno);
         self
     }
 
     /// Returns true if the entry is suppressed by any installed range tombstone.
     fn is_rt_suppressed(&self, entry: &InternalValue) -> bool {
-        self.range_tombstones.iter().any(|(rt, cutoff)| {
-            rt.should_suppress_with(
+        match &self.suppression {
+            Suppression::None => false,
+            Suppression::Below(seqno) => entry.key.seqno < *seqno,
+            Suppression::Scan(tombstones) => tombstones.suppresses(
                 &entry.key.user_key,
                 entry.key.seqno,
-                *cutoff,
                 self.comparator.as_ref(),
-            )
-        })
+            ),
+        }
     }
 
     /// Collects all entries for the given key and applies the merge operator (forward).

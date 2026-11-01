@@ -12,6 +12,7 @@ use crate::{
     mvcc_stream::MvccStream,
     range_tombstone::RangeTombstone,
     range_tombstone_filter::RangeTombstoneFilter,
+    range_tombstone_index::ScanTombstones,
     reseek::{ReseekCtx, Reseekable},
     run_reader::RunReader,
     seeking_merger::SeekingMerger,
@@ -580,7 +581,7 @@ fn lone_table_scan<'a>(
     table: crate::table::Table,
     user_range: UserBounds,
     seqno: SeqNo,
-    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    range_tombstones: Option<Arc<ScanTombstones>>,
     comparator: SharedComparator,
 ) -> BoxedMerge<'a> {
     let reader = table.range(user_range);
@@ -937,15 +938,6 @@ impl TreeIter {
             let lone_one_version = one_version.len() == 1 && one_version.first() == Some(&true);
             let groups_versions = !(lone_one_version && lock.merge_operator.is_none());
 
-            // Clone needed: MvccStream uses the RT set for merge suppression,
-            // while RangeTombstoneFilter below consumes it for post-merge
-            // filtering. An Arc<[_]> could avoid the copy if RT sets grow large.
-            let mvcc_tombstones = if lone.is_some() && !groups_versions {
-                Vec::new()
-            } else {
-                all_range_tombstones.clone()
-            };
-
             // Deduplicate: MultiWriter rotation copies the same RTs into each
             // output table, so collected tombstones can contain duplicates.
             // When the same RT appears from different sources with different
@@ -964,19 +956,17 @@ impl TreeIter {
                 }
             });
 
+            // No tombstones, no allocation: most scans have none.
+            let tombstones = (!all_range_tombstones.is_empty())
+                .then(|| Arc::new(ScanTombstones::new(all_range_tombstones)));
             let comparator = lock.comparator.clone();
             match lone {
-                Some(Source::Table(table, answer)) if !groups_versions => lone_table_scan(
-                    answer,
-                    table,
-                    user_range,
-                    seqno,
-                    all_range_tombstones,
-                    comparator,
-                ),
+                Some(Source::Table(table, answer)) if !groups_versions => {
+                    lone_table_scan(answer, table, user_range, seqno, tombstones, comparator)
+                }
                 Some(source) if !groups_versions => finish_scan(
                     source.into_boxed(&user_range, seqno).filter(is_live),
-                    all_range_tombstones,
+                    tombstones,
                     comparator,
                 ),
                 Some(source) => finish_scan(
@@ -987,9 +977,9 @@ impl TreeIter {
                     )
                     .jumping()
                     .with_value_log(lock.value_log())
-                    .with_range_tombstones(mvcc_tombstones)
+                    .with_scan_tombstones(tombstones.clone())
                     .filter(is_live),
-                    all_range_tombstones,
+                    tombstones,
                     comparator,
                 ),
                 None => finish_scan(
@@ -1006,9 +996,9 @@ impl TreeIter {
                     )
                     .jumping()
                     .with_value_log(lock.value_log())
-                    .with_range_tombstones(mvcc_tombstones)
+                    .with_scan_tombstones(tombstones.clone())
                     .filter(is_live),
-                    all_range_tombstones,
+                    tombstones,
                     comparator,
                 ),
             }
@@ -1034,7 +1024,7 @@ fn holds_one_version_per_key(table: &crate::table::Table) -> bool {
 /// left out when no tombstone is visible at its per-source cutoff.
 fn finish_scan<'a, I>(
     iter: I,
-    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    range_tombstones: Option<Arc<ScanTombstones>>,
     comparator: SharedComparator,
 ) -> BoxedMerge<'a>
 where
@@ -1042,17 +1032,17 @@ where
 {
     // Each RT carries the seqno of its originating source, so the check is
     // per-RT rather than global.
-    if range_tombstones
-        .iter()
-        .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
-    {
-        Box::new(iter)
-    } else {
-        Box::new(RangeTombstoneFilter::new_with_comparator(
-            iter,
-            range_tombstones,
-            comparator,
-        ))
+    let visible = range_tombstones.filter(|tombstones| {
+        tombstones
+            .list()
+            .iter()
+            .any(|(rt, cutoff)| rt.visible_at(*cutoff))
+    });
+    match visible {
+        Some(tombstones) => Box::new(RangeTombstoneFilter::new_with_comparator(
+            iter, tombstones, comparator,
+        )),
+        None => Box::new(iter),
     }
 }
 
@@ -1120,7 +1110,7 @@ pub(crate) fn internal_bounds(
 struct CollectedSources {
     single_tables: Vec<crate::table::Table>,
     multi_runs: Vec<Arc<Run<crate::table::Table>>>,
-    range_tombstones: Vec<(RangeTombstone, SeqNo)>,
+    range_tombstones: Arc<ScanTombstones>,
     union: UserBounds,
 }
 
@@ -1217,7 +1207,7 @@ fn collect_sources(state: &IterState, union: UserBounds, seqno: SeqNo) -> Collec
     CollectedSources {
         single_tables,
         multi_runs,
-        range_tombstones: rts,
+        range_tombstones: Arc::new(ScanTombstones::new(rts)),
         union,
     }
 }
@@ -1580,7 +1570,7 @@ fn build_seek_pipeline<'a>(
     )
     .jumping()
     .with_value_log(state.value_log())
-    .with_range_tombstones(collected.range_tombstones.clone());
+    .with_scan_tombstones(Some(Arc::clone(&collected.range_tombstones)));
     let skip = TombstoneSkip { inner: mvcc };
     // Always wrap in the range-tombstone filter: with an empty or all-invisible
     // tombstone set it suppresses nothing (a per-item visibility check), so the
@@ -1588,7 +1578,7 @@ fn build_seek_pipeline<'a>(
     // staying a single concrete reseekable type.
     RangeTombstoneFilter::new_with_comparator(
         skip,
-        collected.range_tombstones.clone(),
+        Arc::clone(&collected.range_tombstones),
         state.comparator.clone(),
     )
 }
