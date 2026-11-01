@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793538372189,
+  "lastUpdate": 1793538376345,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -93360,6 +93360,96 @@ window.BENCHMARK_DATA = {
           {
             "name": "leveled-sustained / size-only / flush and compaction steps total",
             "value": 0.586055364,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2a3458d8b66a8a260ec0ba88982df52572482a2d",
+          "message": "perf: keep compaction pages, speed up the blob path (#1033)\n\n## Summary\n\n- Compaction output stays in the page cache, so point reads during\nsustained overwrites no longer go to the device: read P99 falls to about\n30 us.\n- The blob path gets the same care as tables: buffered writes, flush\ncompression off the flush thread, in-place decoding on a reused zstd\ndecoder, no copy of a read-ahead span, and blob and table syncs side by\nside.\n- io_uring is on by default on Linux on the architectures its crate\nsupports, with a fallback to `StdFs`. Only batches of two or more cross\nto the ring thread.\n\n## Changes\n\n- `table/writer`: drop the write-once page cache hint from compaction\noutput.\n- `fs`: `io-uring` joins the default features and `default_fs()` shares\none ring per process. Lone reads, writes and syncs run on the caller's\nthread; a lone batched request is read by its descriptor. `IoUringFs`\nbuilds behind the `io_uring_fs` cfg that `build.rs` sets for supported\ntargets.\n- `vlog`: one-call record and header hashing, a 64 KiB write buffer, one\nwrite per frame header. The bytes on disk do not change.\n- `blob_tree`: plain zstd values compress on one background worker\nduring a flush; multi-threading inside a frame stays with the codec.\n- `vlog::blob_file::reader`: lz4 and zstd values decode straight into\ntheir unzeroed allocation, as table blocks do: each slice goes to one\nconcrete decoder that only writes it, and crafted frames pin that.\n`ZstdProvider::decompress` shares the per-thread decoder.\n- `vlog::accessor`: a read-ahead reads into the `Slice` its values\nshare.\n- `blob_tree`: a synced flush finishes blob and table outputs on two\nthreads. Both still precede the manifest edit.\n- `compaction`: a relocating pass encodes pointers in one reused buffer.\n- `vlog`: items unreachable from outside the crate become `pub(crate)`.\n\n## Performance\n\nLinux, one host, six cores, `rocksdb-parity`, 70000 keys, ratio to\nRocksDB; lower is better.\n\n| scenario | plain | blob |\n|---|---|---|\n| write_throughput | 0.93 | 1.13 |\n| write_throughput_zstd22 | 0.59 | 0.97 |\n| point_read | 0.83 | 0.75 |\n| point_read_zstd22 | 0.92 | 0.65 |\n| multi_get | 0.42 | 0.69 |\n| multi_get_zstd22 | 0.45 | 1.11 |\n| range_scan | 0.52 | 1.59 |\n| range_scan_zstd22 | 0.51 | 2.20 |\n| seek_random | 0.66 | 0.64 |\n| seek_random_zstd22 | 0.73 | 0.57 |\n| overwrite | 0.93 | 1.04 |\n| overwrite_zstd22 | 0.63 | 1.01 |\n| overwrite_sustained | 0.84 | 1.02 |\n| overwrite_sustained_zstd22 | 0.80 | 0.87 |\n\nRead P99 under sustained overwrite: plain 28 us, blob 23 us, RocksDB\n32-34 us. With zstd22: plain 38 us, blob 20 us, RocksDB 61 us.\n\nThe blob compaction groups are left out: RocksDB's own time moves by a\nfactor of 3.6 between the two passes though its settings do not, so\nthose ratios are not evidence.\n\nio_uring shows no gain or loss over `StdFs` in `multi_get` or\n`overwrite` here, where the data sits in the page cache. A cold store is\nnot measured.\n\n## Testing\n\nFormat, Clippy, nextest, doc tests, doc builds, the visibility ratchet\nand the `sst-dump` build run on Linux, the no-std check locally; 32-bit\nx86 and Windows are left to CI. `prop_compaction_carry` runs about 20 s\non an idle host and hits its 60 s limit on a host running the suite four\ntimes slower; on the idle host the suite matches `main`.\n\nReplaces #1030.\n\nPart of #943",
+          "timestamp": "2026-11-01T12:42:55Z",
+          "tree_id": "0e2dcd2c01d3fade3931651a9b12959aa2a3dc81",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2a3458d8b66a8a260ec0ba88982df52572482a2d"
+        },
+        "date": 1793538375056,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "mixed-layout / row-updates-over-columnar-base-scan time to first batch",
+            "value": 909.684,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 21090209 B | decoded: 20640914 B | copied: 14931016 B | materialized: 14931016 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 223.498538ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-one-segment time to first batch",
+            "value": 456.445,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 28670793 B | decoded: 28158666 B | copied: 0 B | materialized: 27755176 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 268.352561ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / columnar-scan-overlap-8 time to first batch",
+            "value": 1718.022,
+            "unit": "us",
+            "extra": "keys: 100000 | rows: 100000 | read: 29836368 B | decoded: 29096640 B | copied: 27755168 B | materialized: 27755168 B | payload useful: 0 B | payload incidental: 0 B | blob prefetched: 0 B | elapsed: 312.434445ms\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P50",
+            "value": 5496.186,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "mixed-layout / cells-scan-under-compaction scan P99",
+            "value": 33007.577000000005,
+            "unit": "us",
+            "extra": "keys: 10000 | scans: 40\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / read p99",
+            "value": 24.319,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction step p99",
+            "value": 80.805887,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / aligned / flush and compaction steps total",
+            "value": 0.648249788,
+            "unit": "s",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 53\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / read p99",
+            "value": 24.943,
+            "unit": "us",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction step p99",
+            "value": 134.873087,
+            "unit": "ms",
+            "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
+          },
+          {
+            "name": "leveled-sustained / size-only / flush and compaction steps total",
+            "value": 0.664716021,
             "unit": "s",
             "extra": "num: 200000 | value_size: 100 | flushes: 23 | merges: 23\niterations: 3"
           }
