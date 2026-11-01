@@ -5,13 +5,12 @@
 #[cfg(zstd_any)]
 use crate::compression::CompressionProvider as _;
 #[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 
 use super::meta::{META_VERSION, Metadata};
 use crate::io::BufWriter;
 #[cfg(not(feature = "std"))]
 use crate::io::Write;
-use crate::io::{LittleEndian, WriteBytesExt};
 use crate::path::{Path, PathBuf};
 use crate::{
     Checksum, CompressionType, KeyRange, SeqNo, TreeId, UserKey,
@@ -592,15 +591,20 @@ impl Writer {
         // every write it sees, field by field otherwise.
         let mut header = [0_u8; BLOB_HEADER_LEN];
         {
-            let mut fields = &mut header[..];
-            fields.write_all(BLOB_HEADER_MAGIC)?;
-            fields.write_u128::<LittleEndian>(checksum)?;
-            fields.write_u64::<LittleEndian>(seqno)?;
+            let mut rest = &mut header[..];
+            let mut put = |field: &[u8]| {
+                let (slot, after) = core::mem::take(&mut rest).split_at_mut(field.len());
+                slot.copy_from_slice(field);
+                rest = after;
+            };
+            put(BLOB_HEADER_MAGIC);
+            put(&checksum.to_le_bytes());
+            put(&seqno.to_le_bytes());
             #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-            fields.write_u16::<LittleEndian>(key.len() as u16)?;
-            fields.write_u32::<LittleEndian>(uncompressed_len)?;
-            fields.write_u32::<LittleEndian>(compressed_len_u32)?;
-            fields.write_u32::<LittleEndian>(header_crc)?;
+            put(&(key.len() as u16).to_le_bytes());
+            put(&uncompressed_len.to_le_bytes());
+            put(&compressed_len_u32.to_le_bytes());
+            put(&header_crc.to_le_bytes());
         }
         self.writer.write_all(&header)?;
 

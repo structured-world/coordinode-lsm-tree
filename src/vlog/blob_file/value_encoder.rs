@@ -133,7 +133,7 @@ impl ValueEncoder {
 
     pub(crate) fn submit(&mut self, _: Separated, _: UserValue) {}
 
-    pub(crate) fn take(&mut self) -> Option<crate::Result<(Separated, Vec<u8>)>> {
+    pub(crate) fn take(&mut self) -> Option<crate::Result<(Separated, alloc::vec::Vec<u8>)>> {
         None
     }
 }
