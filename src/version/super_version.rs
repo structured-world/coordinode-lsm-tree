@@ -1189,10 +1189,12 @@ impl SuperVersion {
     }
 
     /// The memtables flushes have yet to write: the sealed ones, and the
-    /// active one unless it is empty.
+    /// active one unless it holds nothing. Its size says so without its
+    /// range-tombstone lock, which `is_empty` takes and a tombstone insert
+    /// holds across the tree's comparator.
     #[cfg(feature = "std")]
     pub(crate) fn unflushed_memtables(&self) -> u64 {
-        self.sealed_memtables.len() as u64 + u64::from(!self.active_memtable.is_empty())
+        self.sealed_memtables.len() as u64 + u64::from(self.active_memtable.size() > 0)
     }
 
     /// Whether a cell row in the active or a sealed memtable references
