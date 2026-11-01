@@ -267,7 +267,7 @@ impl Fs for IoUringFs {
         // Gate matches the `mod open_flags;` declaration in `fs/mod.rs`
         // — the submodule only exists when `feature = "std"` is on.
         // The whole `io_uring_fs` module is already gated by
-        // `cfg(all(target_os = "linux", feature = "io-uring"))`, and
+        // `cfg(io_uring_fs)`, and
         // the `io-uring` feature transitively enables `std` (see the
         // feature declaration in Cargo.toml), so this extra
         // `feature = "std"` predicate is logically redundant here.

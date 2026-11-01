@@ -62,7 +62,7 @@ pub use counting_fs::{
     CountingFs, DirectoryWrites, FileWrites, WriteIoSnapshot, WriteIoStats, WriteOrigin,
 };
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(io_uring_fs)]
 mod io_uring_fs;
 
 // Pure-Rust `no_std` io_uring driver core on raw Linux syscalls (#346).
@@ -73,8 +73,7 @@ mod io_uring_raw;
 #[cfg(all(
     test,
     feature = "std",
-    target_os = "linux",
-    any(feature = "io-uring", feature = "io-uring-raw")
+    any(io_uring_fs, all(target_os = "linux", feature = "io-uring-raw"))
 ))]
 mod batch_conformance;
 
@@ -91,7 +90,7 @@ pub use std_fs::StdFs;
 #[cfg(feature = "std")]
 pub(crate) use std_fs::is_cross_device;
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(io_uring_fs)]
 pub use io_uring_fs::{IoUringFs, is_io_uring_available};
 
 // Raw-syscall `no_std` io_uring driver (#346): the driver core (`IoUringRaw`),
@@ -113,7 +112,7 @@ pub use io_uring_raw::{
 /// ring stays on [`StdFs`] rather than failing to open a tree.
 #[cfg(feature = "std")]
 pub(crate) fn default_fs() -> alloc::sync::Arc<dyn Fs> {
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[cfg(io_uring_fs)]
     {
         static SHARED: std::sync::OnceLock<Option<alloc::sync::Arc<IoUringFs>>> =
             std::sync::OnceLock::new();
