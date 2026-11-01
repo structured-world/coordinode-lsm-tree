@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793454393447,
+  "lastUpdate": 1793538366767,
   "repoUrl": "https://github.com/structured-world/coordinode-lsm-tree",
   "entries": {
     "lsm-tree db_bench costs 6.x": [
@@ -66220,6 +66220,90 @@ window.BENCHMARK_DATA = {
             "value": 329047.9824184398,
             "unit": "ops/sec",
             "extra": "P50: 2.2us | P99: 16.6us | P99.9: 96.3us\nthreads: 1 | elapsed: 0.61s | num: 200000 | iterations: 3"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2a3458d8b66a8a260ec0ba88982df52572482a2d",
+          "message": "perf: keep compaction pages, speed up the blob path (#1033)\n\n## Summary\n\n- Compaction output stays in the page cache, so point reads during\nsustained overwrites no longer go to the device: read P99 falls to about\n30 us.\n- The blob path gets the same care as tables: buffered writes, flush\ncompression off the flush thread, in-place decoding on a reused zstd\ndecoder, no copy of a read-ahead span, and blob and table syncs side by\nside.\n- io_uring is on by default on Linux on the architectures its crate\nsupports, with a fallback to `StdFs`. Only batches of two or more cross\nto the ring thread.\n\n## Changes\n\n- `table/writer`: drop the write-once page cache hint from compaction\noutput.\n- `fs`: `io-uring` joins the default features and `default_fs()` shares\none ring per process. Lone reads, writes and syncs run on the caller's\nthread; a lone batched request is read by its descriptor. `IoUringFs`\nbuilds behind the `io_uring_fs` cfg that `build.rs` sets for supported\ntargets.\n- `vlog`: one-call record and header hashing, a 64 KiB write buffer, one\nwrite per frame header. The bytes on disk do not change.\n- `blob_tree`: plain zstd values compress on one background worker\nduring a flush; multi-threading inside a frame stays with the codec.\n- `vlog::blob_file::reader`: lz4 and zstd values decode straight into\ntheir unzeroed allocation, as table blocks do: each slice goes to one\nconcrete decoder that only writes it, and crafted frames pin that.\n`ZstdProvider::decompress` shares the per-thread decoder.\n- `vlog::accessor`: a read-ahead reads into the `Slice` its values\nshare.\n- `blob_tree`: a synced flush finishes blob and table outputs on two\nthreads. Both still precede the manifest edit.\n- `compaction`: a relocating pass encodes pointers in one reused buffer.\n- `vlog`: items unreachable from outside the crate become `pub(crate)`.\n\n## Performance\n\nLinux, one host, six cores, `rocksdb-parity`, 70000 keys, ratio to\nRocksDB; lower is better.\n\n| scenario | plain | blob |\n|---|---|---|\n| write_throughput | 0.93 | 1.13 |\n| write_throughput_zstd22 | 0.59 | 0.97 |\n| point_read | 0.83 | 0.75 |\n| point_read_zstd22 | 0.92 | 0.65 |\n| multi_get | 0.42 | 0.69 |\n| multi_get_zstd22 | 0.45 | 1.11 |\n| range_scan | 0.52 | 1.59 |\n| range_scan_zstd22 | 0.51 | 2.20 |\n| seek_random | 0.66 | 0.64 |\n| seek_random_zstd22 | 0.73 | 0.57 |\n| overwrite | 0.93 | 1.04 |\n| overwrite_zstd22 | 0.63 | 1.01 |\n| overwrite_sustained | 0.84 | 1.02 |\n| overwrite_sustained_zstd22 | 0.80 | 0.87 |\n\nRead P99 under sustained overwrite: plain 28 us, blob 23 us, RocksDB\n32-34 us. With zstd22: plain 38 us, blob 20 us, RocksDB 61 us.\n\nThe blob compaction groups are left out: RocksDB's own time moves by a\nfactor of 3.6 between the two passes though its settings do not, so\nthose ratios are not evidence.\n\nio_uring shows no gain or loss over `StdFs` in `multi_get` or\n`overwrite` here, where the data sits in the page cache. A cold store is\nnot measured.\n\n## Testing\n\nFormat, Clippy, nextest, doc tests, doc builds, the visibility ratchet\nand the `sst-dump` build run on Linux, the no-std check locally; 32-bit\nx86 and Windows are left to CI. `prop_compaction_carry` runs about 20 s\non an idle host and hits its 60 s limit on a host running the suite four\ntimes slower; on the idle host the suite matches `main`.\n\nReplaces #1030.\n\nPart of #943",
+          "timestamp": "2026-11-01T12:42:55Z",
+          "tree_id": "0e2dcd2c01d3fade3931651a9b12959aa2a3dc81",
+          "url": "https://github.com/structured-world/coordinode-lsm-tree/commit/2a3458d8b66a8a260ec0ba88982df52572482a2d"
+        },
+        "date": 1793538365129,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "lifecycle-zstd22",
+            "value": 118759.7256297458,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 19.5us | P99.9: 37.0us\nthreads: 1 | elapsed: 4.51s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillseq",
+            "value": 3022271.298535184,
+            "unit": "ops/sec",
+            "extra": "P50: 0.2us | P99: 0.6us | P99.9: 0.8us\nthreads: 1 | elapsed: 0.07s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "fillrandom",
+            "value": 739576.7045304424,
+            "unit": "ops/sec",
+            "extra": "P50: 1.1us | P99: 2.8us | P99.9: 13.2us\nthreads: 1 | elapsed: 0.27s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readrandom",
+            "value": 425496.36331449496,
+            "unit": "ops/sec",
+            "extra": "P50: 2.3us | P99: 7.1us | P99.9: 22.7us\nthreads: 1 | elapsed: 0.47s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readseq",
+            "value": 3121408.429425892,
+            "unit": "ops/sec",
+            "extra": "P50: 0.1us | P99: 4.8us | P99.9: 6.7us\nthreads: 1 | elapsed: 0.06s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "seekrandom",
+            "value": 293645.9312120987,
+            "unit": "ops/sec",
+            "extra": "P50: 3.0us | P99: 7.8us | P99.9: 16.5us\nthreads: 1 | elapsed: 0.68s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "prefixscan",
+            "value": 172439.64938828995,
+            "unit": "ops/sec",
+            "extra": "P50: 4.7us | P99: 18.0us | P99.9: 36.2us\nthreads: 1 | elapsed: 1.16s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "overwrite",
+            "value": 690893.1409500389,
+            "unit": "ops/sec",
+            "extra": "P50: 1.2us | P99: 3.2us | P99.9: 13.1us\nthreads: 1 | elapsed: 0.29s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "mergerandom",
+            "value": 909201.839980858,
+            "unit": "ops/sec",
+            "extra": "P50: 0.4us | P99: 0.5us | P99.9: 2.0us\nthreads: 1 | elapsed: 0.22s | num: 200000 | iterations: 3"
+          },
+          {
+            "name": "readwhilewriting",
+            "value": 281183.5929587208,
+            "unit": "ops/sec",
+            "extra": "P50: 2.5us | P99: 17.8us | P99.9: 103.6us\nthreads: 1 | elapsed: 0.71s | num: 200000 | iterations: 3"
           }
         ]
       }
