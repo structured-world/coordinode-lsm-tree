@@ -113,17 +113,20 @@ impl Stretches {
         let mut ended = vec![false; list.len()];
         let mut covering: BinaryHeap<(SeqNo, usize)> = BinaryHeap::new();
         let mut edges = edges.iter().peekable();
-        while let Some(&&Edge { key: bound, .. }) = edges.peek() {
-            while let Some(edge) =
-                edges.next_if(|edge| comparator.compare(edge.key, bound) == Ordering::Equal)
-            {
-                if let Some(ended) = ended.get_mut(edge.at) {
-                    if !edge.starts {
-                        *ended = true;
-                    } else if !*ended {
-                        covering.push((edge.seqno, edge.at));
-                    }
+        while let Some(edge) = edges.next() {
+            if let Some(ended) = ended.get_mut(edge.at) {
+                if !edge.starts {
+                    *ended = true;
+                } else if !*ended {
+                    covering.push((edge.seqno, edge.at));
                 }
+            }
+            // The floor of a bound counts every edge on it.
+            if edges
+                .peek()
+                .is_some_and(|next| comparator.compare(next.key, edge.key) == Ordering::Equal)
+            {
+                continue;
             }
             while let Some(&(_, at)) = covering.peek() {
                 if !ended.get(at).copied().unwrap_or(true) {
@@ -131,7 +134,7 @@ impl Stretches {
                 }
                 covering.pop();
             }
-            bounds.push(bound.clone());
+            bounds.push(edge.key.clone());
             floors.push(covering.peek().map_or(0, |&(seqno, _)| seqno));
         }
 
