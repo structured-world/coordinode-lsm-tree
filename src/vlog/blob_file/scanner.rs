@@ -26,7 +26,7 @@ use std::io::{Read, Seek, SeekFrom};
 /// not when it encounters specific magic bytes. This avoids silent data
 /// loss if corrupted frame bytes happen to match the metadata header
 /// magic (`META`).
-pub struct Scanner {
+pub(crate) struct Scanner {
     pub(crate) blob_file_id: BlobFileId, // TODO: remove unused?
     inner: BufReader<crate::table::util::TimedFile>,
     is_terminated: bool,
@@ -59,7 +59,7 @@ impl Scanner {
     ///
     /// Will return `Err` if an IO error occurs or the blob file lacks
     /// a "data" section.
-    pub fn new<P: AsRef<Path>>(
+    pub(crate) fn new<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
@@ -77,7 +77,7 @@ impl Scanner {
     ///
     /// Returns `Err` if an IO error occurs, the blob file lacks a "data" section,
     /// or `start_offset` falls outside the data section.
-    pub fn resume<P: AsRef<Path>>(
+    pub(crate) fn resume<P: AsRef<Path>>(
         path: P,
         fs: &dyn Fs,
         blob_file_id: BlobFileId,
@@ -200,7 +200,7 @@ impl Scanner {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct ScanEntry {
+pub(crate) struct ScanEntry {
     pub key: UserKey,
     pub seqno: SeqNo,
     pub value: UserValue,

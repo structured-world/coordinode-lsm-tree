@@ -20,7 +20,7 @@ use alloc::{string::ToString, vec::Vec};
 /// each was read for, so a handle taking one out is proven to be the handle it
 /// was read for, as a cache lookup proves it.
 #[derive(Default)]
-pub struct Prefetched {
+pub(crate) struct Prefetched {
     values: crate::HashMap<(crate::vlog::BlobFileId, u64), (crate::UserKey, u32, UserValue)>,
 }
 
@@ -57,7 +57,7 @@ impl Prefetched {
 }
 
 /// Where a read-ahead puts what it reads.
-pub enum PrefetchInto<'p> {
+pub(crate) enum PrefetchInto<'p> {
     /// The shared cache, for every read to find.
     Cache,
     /// The read's own store, bounded by the read-ahead's own budget.
@@ -69,7 +69,7 @@ pub enum PrefetchInto<'p> {
 /// Takes no dictionary: a `ZstdDict` blob file carries its own, pinned on the
 /// handle this walks, so decoding needs nothing the version does not already
 /// hold.
-pub struct Accessor<'a> {
+pub(crate) struct Accessor<'a> {
     blob_files: &'a BlobFileList,
     /// Whether the values this accessor reads from disk go into the cache.
     fill: BlobCacheFill,
@@ -83,7 +83,7 @@ pub struct Accessor<'a> {
 }
 
 impl<'a> Accessor<'a> {
-    pub fn new(
+    pub(crate) fn new(
         blob_files: &'a BlobFileList,
         fill: BlobCacheFill,
         #[cfg(feature = "metrics")] metrics: Option<&'a Metrics>,
@@ -148,7 +148,7 @@ impl<'a> Accessor<'a> {
     /// # Errors
     ///
     /// Propagates the blob file's open / read failures.
-    pub fn get(
+    pub(crate) fn get(
         &self,
         tree_id: TreeId,
         key: &[u8],
@@ -283,7 +283,7 @@ impl<'a> Accessor<'a> {
     /// `into` says where the values go: the shared cache, or the read's own
     /// store when blob values are not cached, which then holds at most one
     /// coalesced read's worth.
-    pub fn prefetch(
+    pub(crate) fn prefetch(
         &self,
         tree_id: TreeId,
         items: &mut Vec<(&[u8], ValueHandle, usize)>,

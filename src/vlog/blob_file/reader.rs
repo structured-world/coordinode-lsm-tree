@@ -35,7 +35,7 @@ use super::writer::MAX_DECOMPRESSION_SIZE;
 /// `u16` limit (a caller cannot inflate the computed read that way), and
 /// [`crate::Error::DecompressedSizeTooLarge`] when the record would exceed the
 /// 256 MiB value cap plus its header / key overhead.
-pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
+pub(crate) fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize> {
     // Enforce the same key-length constraint as the writer (u16::MAX)
     // so that a caller cannot inflate the computed read size.
     if key_len > u16::MAX as usize {
@@ -73,13 +73,13 @@ pub fn record_len(key_len: usize, vhandle: &ValueHandle) -> crate::Result<usize>
 }
 
 /// Reads a single blob from a blob file
-pub struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     blob_file: &'a BlobFile,
     file: &'a dyn FsFile,
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(blob_file: &'a BlobFile, file: &'a dyn FsFile) -> Self {
+    pub(crate) fn new(blob_file: &'a BlobFile, file: &'a dyn FsFile) -> Self {
         Self { blob_file, file }
     }
 
@@ -93,14 +93,18 @@ impl<'a> Reader<'a> {
     /// # Errors
     ///
     /// Returns the file's read failures.
-    pub fn read_record(&self, vhandle: &ValueHandle, len: usize) -> crate::Result<crate::Slice> {
+    pub(crate) fn read_record(
+        &self,
+        vhandle: &ValueHandle,
+        len: usize,
+    ) -> crate::Result<crate::Slice> {
         debug_assert_eq!(vhandle.blob_file_id, self.blob_file.id());
         Ok(crate::file::read_exact(self.file, vhandle.offset, len)?)
     }
 
     /// Reads and parses one record in one call.
     #[cfg(test)]
-    pub fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
+    pub(crate) fn get(&self, key: &'a [u8], vhandle: &'a ValueHandle) -> crate::Result<UserValue> {
         let record = self.read_record(vhandle, record_len(key.len(), vhandle)?)?;
         self.parse_record(key, vhandle, &record, &mut 0)
     }
@@ -122,7 +126,7 @@ impl<'a> Reader<'a> {
     /// Returns the header / checksum / decompression errors of a malformed
     /// record; a caller that prefetched speculatively should treat
     /// them as "leave this one to the read path" rather than as fatal.
-    pub fn parse_record(
+    pub(crate) fn parse_record(
         &self,
         key: &[u8],
         vhandle: &ValueHandle,
@@ -144,7 +148,7 @@ impl<'a> Reader<'a> {
     ///
     /// Returns the file's read failures and the header / checksum errors of a
     /// malformed record.
-    pub fn read_raw(
+    pub(crate) fn read_raw(
         &self,
         key: &[u8],
         vhandle: &ValueHandle,
