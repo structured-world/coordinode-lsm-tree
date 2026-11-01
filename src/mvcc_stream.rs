@@ -260,13 +260,15 @@ impl<
     pub fn with_range_tombstones(self, mut rts: Vec<(RangeTombstone, SeqNo)>) -> Self {
         let comparator = self.comparator.as_ref();
         rts.sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator));
-        self.with_scan_tombstones(Arc::new(ScanTombstones::new(rts)))
+        self.with_scan_tombstones(Some(Arc::new(ScanTombstones::new(rts))))
     }
 
     /// Installs the tombstones of a scan, which its other stages share.
     #[must_use]
-    pub(crate) fn with_scan_tombstones(mut self, tombstones: Arc<ScanTombstones>) -> Self {
-        self.suppression = Suppression::Scan(tombstones);
+    pub(crate) fn with_scan_tombstones(mut self, tombstones: Option<Arc<ScanTombstones>>) -> Self {
+        if let Some(tombstones) = tombstones {
+            self.suppression = Suppression::Scan(tombstones);
+        }
         self
     }
 

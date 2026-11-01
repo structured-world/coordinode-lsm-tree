@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 /// Each tombstone is paired with a per-source visibility cutoff (`SeqNo`).
 /// Different sources may use different cutoffs — e.g., an ephemeral memtable
 /// uses its own `index_seqno` while disk segments use the outer scan seqno.
-pub struct RangeTombstoneFilter<I> {
+pub(crate) struct RangeTombstoneFilter<I> {
     inner: I,
     comparator: SharedComparator,
 
@@ -42,7 +42,7 @@ pub struct RangeTombstoneFilter<I> {
 impl<I> RangeTombstoneFilter<I> {
     /// Creates a new bidirectional filter over tombstones in any order.
     #[cfg(test)]
-    pub fn new(inner: I, mut tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
+    pub(crate) fn new(inner: I, mut tombstones: Vec<(RangeTombstone, SeqNo)>) -> Self {
         let comparator = crate::comparator::default_comparator();
         tombstones.sort_by(|a, b| a.0.cmp_with_comparator(&b.0, comparator.as_ref()));
         Self::new_with_comparator(inner, Arc::new(ScanTombstones::new(tombstones)), comparator)
@@ -53,7 +53,7 @@ impl<I> RangeTombstoneFilter<I> {
     /// The tombstones are in forward order. The reverse order is built by the
     /// first `next_back()`.
     #[must_use]
-    pub fn new_with_comparator(
+    pub(crate) fn new_with_comparator(
         inner: I,
         fwd_tombstones: Arc<ScanTombstones>,
         comparator: SharedComparator,

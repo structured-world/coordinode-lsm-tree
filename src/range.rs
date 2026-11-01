@@ -581,7 +581,7 @@ fn lone_table_scan<'a>(
     table: crate::table::Table,
     user_range: UserBounds,
     seqno: SeqNo,
-    range_tombstones: Arc<ScanTombstones>,
+    range_tombstones: Option<Arc<ScanTombstones>>,
     comparator: SharedComparator,
 ) -> BoxedMerge<'a> {
     let reader = table.range(user_range);
@@ -956,7 +956,9 @@ impl TreeIter {
                 }
             });
 
-            let tombstones = Arc::new(ScanTombstones::new(all_range_tombstones));
+            // No tombstones, no allocation: most scans have none.
+            let tombstones = (!all_range_tombstones.is_empty())
+                .then(|| Arc::new(ScanTombstones::new(all_range_tombstones)));
             let comparator = lock.comparator.clone();
             match lone {
                 Some(Source::Table(table, answer)) if !groups_versions => {
@@ -975,7 +977,7 @@ impl TreeIter {
                     )
                     .jumping()
                     .with_value_log(lock.value_log())
-                    .with_scan_tombstones(Arc::clone(&tombstones))
+                    .with_scan_tombstones(tombstones.clone())
                     .filter(is_live),
                     tombstones,
                     comparator,
@@ -994,7 +996,7 @@ impl TreeIter {
                     )
                     .jumping()
                     .with_value_log(lock.value_log())
-                    .with_scan_tombstones(Arc::clone(&tombstones))
+                    .with_scan_tombstones(tombstones.clone())
                     .filter(is_live),
                     tombstones,
                     comparator,
@@ -1022,7 +1024,7 @@ fn holds_one_version_per_key(table: &crate::table::Table) -> bool {
 /// left out when no tombstone is visible at its per-source cutoff.
 fn finish_scan<'a, I>(
     iter: I,
-    range_tombstones: Arc<ScanTombstones>,
+    range_tombstones: Option<Arc<ScanTombstones>>,
     comparator: SharedComparator,
 ) -> BoxedMerge<'a>
 where
@@ -1030,18 +1032,17 @@ where
 {
     // Each RT carries the seqno of its originating source, so the check is
     // per-RT rather than global.
-    if range_tombstones
-        .list()
-        .iter()
-        .all(|(rt, cutoff)| !rt.visible_at(*cutoff))
-    {
-        Box::new(iter)
-    } else {
-        Box::new(RangeTombstoneFilter::new_with_comparator(
-            iter,
-            range_tombstones,
-            comparator,
-        ))
+    let visible = range_tombstones.filter(|tombstones| {
+        tombstones
+            .list()
+            .iter()
+            .any(|(rt, cutoff)| rt.visible_at(*cutoff))
+    });
+    match visible {
+        Some(tombstones) => Box::new(RangeTombstoneFilter::new_with_comparator(
+            iter, tombstones, comparator,
+        )),
+        None => Box::new(iter),
     }
 }
 
@@ -1569,7 +1570,7 @@ fn build_seek_pipeline<'a>(
     )
     .jumping()
     .with_value_log(state.value_log())
-    .with_scan_tombstones(Arc::clone(&collected.range_tombstones));
+    .with_scan_tombstones(Some(Arc::clone(&collected.range_tombstones)));
     let skip = TombstoneSkip { inner: mvcc };
     // Always wrap in the range-tombstone filter: with an empty or all-invisible
     // tombstone set it suppresses nothing (a per-item visibility check), so the

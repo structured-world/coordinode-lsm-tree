@@ -46,7 +46,7 @@ enum Source<'a> {
 /// the memtables up to the next table and hands that table out,
 /// [`Self::take_table`] takes its versions of the key, and once no table is
 /// left [`Self::finish`] resolves them.
-pub struct MergeWalk<'v> {
+pub(crate) struct MergeWalk<'v> {
     super_version: &'v SuperVersion,
     key: UserKey,
     seqno: SeqNo,
@@ -70,7 +70,7 @@ pub struct MergeWalk<'v> {
 
 /// A table [`MergeWalk::next_table`] hands out, and its place in the version:
 /// level, run in the level, position in the run.
-pub struct MergeTable<'v> {
+pub(crate) struct MergeTable<'v> {
     pub table: &'v Table,
     pub at: (usize, usize, usize),
 }
@@ -265,7 +265,7 @@ impl<'v> MergeWalk<'v> {
 
 /// The versions and tombstones a [`MergeWalk`] read of one key, holding no
 /// borrow of the version it read them from.
-pub struct MergeRead {
+pub(crate) struct MergeRead {
     entries: Vec<(usize, InternalValue)>,
     hiding: Option<SeqNo>,
 }
@@ -320,7 +320,7 @@ impl MergeRead {
 
 /// What a table's filters said of a merge's key, the probe counted.
 #[derive(Clone, Copy)]
-pub struct TableFilter(FilterAnswer);
+pub(crate) struct TableFilter(FilterAnswer);
 
 impl TableFilter {
     /// Asks `table`'s filters about `key`, counting the probe they answer.
@@ -381,7 +381,7 @@ impl TableFilter {
 /// operands visible there make over the newest base, or `None` when the key
 /// reads as deleted. `blob_source` reads a base kept in the value log, which
 /// only a blob tree's index holds.
-pub fn resolve_point_merge(
+pub(crate) fn resolve_point_merge(
     super_version: &SuperVersion,
     key: &[u8],
     seqno: SeqNo,
