@@ -165,6 +165,31 @@ fn write_encoded_value(
     Ok(true)
 }
 
+/// Finishes a flush's blob and table outputs. Nothing orders the syncs of the
+/// two against each other, only both against the manifest edit that names them,
+/// so a synced flush runs them side by side.
+fn finish_flush(
+    blob_writer: BlobFileWriter,
+    table_writer: crate::table::multi_writer::MultiWriter,
+    durability: crate::config::FlushDurability,
+) -> (
+    crate::Result<Vec<BlobFile>>,
+    crate::Result<crate::table::multi_writer::Written>,
+) {
+    #[cfg(feature = "std")]
+    if durability == crate::config::FlushDurability::Synced {
+        return std::thread::scope(|scope| {
+            let blob = scope.spawn(|| blob_writer.finish());
+            let table = table_writer.finish();
+            let blob = blob
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (blob, table)
+        });
+    }
+    (blob_writer.finish(), table_writer.finish())
+}
+
 /// The value `prefetched` holds for `vhandle`: read ahead for this very item,
 /// under its key, so its place and declared size are what identify it.
 fn prefetched_value(
@@ -2336,9 +2361,13 @@ impl AbstractTree for BlobTree {
             while write_encoded_value(ahead, &mut blob_writer, &mut table_writer, &mut encoded)? {}
         }
 
-        let blob_files = blob_writer.finish()?;
-
-        let written = table_writer.finish()?;
+        let (blob_files, written) = finish_flush(
+            blob_writer,
+            table_writer,
+            self.index.config.flush_durability,
+        );
+        let blob_files = blob_files?;
+        let written = written?;
         let entries_durable = written.entries_durable;
 
         log::debug!("Flushed memtable(s) in {:?}", start.elapsed());
