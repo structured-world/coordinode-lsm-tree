@@ -1728,6 +1728,32 @@ impl Config {
 mod tests;
 
 impl Config {
+    /// The bytes past which a full filter at `level` is partitioned instead,
+    /// because the block cache could not keep it. `None` where it stays whole:
+    /// a pinned filter never goes through the cache, and only a full filter
+    /// answers prefix queries.
+    pub(crate) fn whole_filter_limit(&self, level: usize) -> Option<u64> {
+        (!self.filter_block_pinning_policy.get(level) && self.prefix_extractor.is_none()).then(
+            || {
+                self.cache
+                    .largest_block(crate::table::block::BlockType::Filter)
+            },
+        )
+    }
+
+    /// The index spill threshold at `level`: `configured`, lowered to what the
+    /// block cache can keep where the index goes through it.
+    pub(crate) fn index_spill_threshold(&self, level: usize, configured: u64) -> u64 {
+        if self.index_block_pinning_policy.get(level) {
+            configured
+        } else {
+            configured.min(
+                self.cache
+                    .largest_block(crate::table::block::BlockType::Index),
+            )
+        }
+    }
+
     /// The [`level_routes`](Self::level_routes) entry covering `level`, if any.
     ///
     /// The single place the level→route lookup lives, so the path a level's

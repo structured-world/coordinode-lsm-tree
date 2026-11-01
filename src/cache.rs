@@ -759,6 +759,15 @@ impl Cache {
         self.data.max_entry_weight()
     }
 
+    /// The largest payload of a block of `block_type` this cache can keep.
+    #[must_use]
+    pub(crate) fn largest_block(&self, block_type: BlockType) -> u64 {
+        // A cache smaller than a header keeps no block at all: zero is the
+        // answer, not a masked underflow.
+        self.max_entry_weight()
+            .saturating_sub(Header::header_len(block_type) as u64)
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn get_block(&self, id: GlobalTableId, offset: BlockOffset) -> Option<Block> {

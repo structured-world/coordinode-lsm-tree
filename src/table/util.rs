@@ -608,6 +608,15 @@ pub(crate) fn load_block_paced(
         cache.record_block_load(table_id, handle.offset(), timer);
     }
     if charge.touches_cache() {
+        #[cfg(feature = "metrics")]
+        {
+            let weight = crate::cache::block_weight(&block);
+            if charge.is_counted() && weight > cache.max_entry_weight() {
+                use core::sync::atomic::Ordering::Relaxed;
+                metrics.block_cache_refused.fetch_add(1, Relaxed);
+                metrics.block_cache_refused_bytes.fetch_add(weight, Relaxed);
+            }
+        }
         cache.insert_block(table_id, handle.offset(), block.clone());
     }
     if let Some(lead) = lead {

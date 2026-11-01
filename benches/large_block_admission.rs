@@ -3,11 +3,11 @@
 
 //! What a filter or an index block heavier than a block cache shard costs.
 //!
-//! One table holding one whole filter block and one whole index block, not
-//! pinned, as a table below L0 holds them by default. Each fixture is read
-//! through caches of `CACHES` bytes twice: the first pass cold, the second
-//! showing what stayed resident. `partitioned` writes the same keys with both
-//! blocks in 4 KiB pieces, which fit every shard.
+//! One table with its filter and index not pinned, as a table below L0 holds
+//! them by default, laid out as the writer chooses for the cache. Each fixture
+//! is read through caches of `CACHES` bytes twice: the first pass cold, the
+//! second showing what stayed resident. `partitioned` writes the same keys with
+//! both always in 4 KiB pieces, which fit every shard.
 //!
 //! - `get`: point reads of existing keys, each timed alone;
 //! - `seek`: a new iterator read to its first row, each timed alone.
@@ -80,7 +80,6 @@ fn open(
     .filter_block_pinning_policy(PinningPolicy::all(false))
     .index_block_pinning_policy(PinningPolicy::all(false))
     .filter_block_partitioning_policy(PinningPolicy::all(partitioned))
-    .index_block_partitioning_policy(PinningPolicy::all(partitioned))
     .open()?;
     if partitioned {
         let AnyTree::Standard(standard) = &tree else {

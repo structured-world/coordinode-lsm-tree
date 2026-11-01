@@ -1265,10 +1265,15 @@ impl AbstractTree for Tree {
             // spilling to a partitioned index only once the index grows past the
             // threshold. Recovers the point-read cost of an unconditional
             // two-level index on small/medium SSTs.
-            table_writer = table_writer.use_adaptive_index(rc.index_partition_spill_threshold);
+            table_writer = table_writer.use_adaptive_index(
+                self.config
+                    .index_spill_threshold(0, rc.index_partition_spill_threshold),
+            );
         }
         if filter_partitioning {
             table_writer = table_writer.use_partitioned_filter();
+        } else if let Some(limit) = self.config.whole_filter_limit(0) {
+            table_writer = table_writer.use_whole_filter_up_to(limit);
         }
 
         table_writer = table_writer.use_prefix_extractor(self.config.prefix_extractor.clone());
