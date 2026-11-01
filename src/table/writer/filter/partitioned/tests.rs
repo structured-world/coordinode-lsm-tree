@@ -281,7 +281,7 @@ mod parallel {
         file.start("data")?;
         file.write_all(&[0; 64])?;
         full.finish(&mut file, last_key.as_ref())?;
-        assert!(held_bytes == *file.get_mut().get_ref().get_ref());
+        assert_eq!(held_bytes, *file.get_mut().get_ref().get_ref());
         Ok(())
     }
 
