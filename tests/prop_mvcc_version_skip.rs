@@ -413,6 +413,18 @@ fn run(
     for read in reads.into_iter().map(|r| r % end).chain([end]) {
         check(&tree, &model, read, &Bound::Unbounded, &Bound::Unbounded)?;
         check(&tree, &model, read, &lo, &hi)?;
+        for idx in 0..KEY_SPACE {
+            let got = tree
+                .get(key(idx), read)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(
+                got.map(|value| value.to_vec()),
+                model.resolve(&key(idx), read),
+                "get of {} at {}",
+                idx,
+                read,
+            );
+        }
     }
     Ok(())
 }
@@ -474,6 +486,24 @@ proptest! {
     ) {
         run(Variant::Columnar, ops, reads, bounds)?;
     }
+}
+
+/// A tombstone in the memtable, newer than the snapshot: the merge below it
+/// reads as if it were not there, while the newest read stops at it.
+#[test]
+fn a_memtable_tombstone_above_the_snapshot_hides_nothing_from_a_merge() -> Result<(), TestCaseError>
+{
+    run(
+        Variant::Merge,
+        vec![
+            Op::Put { key: 0, value: 1 },
+            Op::Merge { key: 0, op: 2 },
+            Op::RemoveRange { a: 0, b: 1 },
+            Op::Merge { key: 0, op: 3 },
+        ],
+        vec![2],
+        (None, None),
+    )
 }
 
 /// Chains in a run of narrow tables, one key's versions to a table, with

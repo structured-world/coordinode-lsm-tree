@@ -74,6 +74,10 @@ struct Edge<'a> {
 }
 
 impl Stretches {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "`at` is a position in `list`, whose length `ended` has"
+    )]
     fn new(list: &[(RangeTombstone, SeqNo)], comparator: &dyn UserComparator) -> Self {
         // Every start and end, a tombstone's start and end side by side: a
         // list of tombstones that do not overlap comes out already sorted,
@@ -114,12 +118,10 @@ impl Stretches {
         let mut covering: BinaryHeap<(SeqNo, usize)> = BinaryHeap::new();
         let mut edges = edges.iter().peekable();
         while let Some(edge) = edges.next() {
-            if let Some(ended) = ended.get_mut(edge.at) {
-                if !edge.starts {
-                    *ended = true;
-                } else if !*ended {
-                    covering.push((edge.seqno, edge.at));
-                }
+            if !edge.starts {
+                ended[edge.at] = true;
+            } else if !ended[edge.at] {
+                covering.push((edge.seqno, edge.at));
             }
             // The floor of a bound counts every edge on it.
             if edges
@@ -129,7 +131,7 @@ impl Stretches {
                 continue;
             }
             while let Some(&(_, at)) = covering.peek() {
-                if !ended.get(at).copied().unwrap_or(true) {
+                if !ended[at] {
                     break;
                 }
                 covering.pop();
