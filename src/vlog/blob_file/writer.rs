@@ -218,7 +218,9 @@ pub(crate) struct Writer {
     pub(crate) uncompressed_bytes: u64,
 
     pub(crate) first_key: Option<UserKey>,
-    pub(crate) last_key: Option<UserKey>,
+    /// Rewritten by every frame, so it reuses its buffer rather than keeping a
+    /// key of its own per frame.
+    pub(crate) last_key: Vec<u8>,
 
     pub(crate) compression: CompressionType,
 
@@ -344,7 +346,7 @@ impl Writer {
             uncompressed_bytes: 0,
 
             first_key: None,
-            last_key: None,
+            last_key: Vec::new(),
 
             compression: CompressionType::None,
             metadata_compression_override: None,
@@ -555,7 +557,8 @@ impl Writer {
         if self.first_key.is_none() {
             self.first_key = Some(key.into());
         }
-        self.last_key = Some(key.into());
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
 
         self.uncompressed_bytes += u64::from(uncompressed_len);
 
@@ -585,26 +588,21 @@ impl Writer {
         // detected as an inconsistency between header and data.
         let checksum = record_checksum(key, value, header_crc);
 
-        // Write header
-        self.writer.write_all(BLOB_HEADER_MAGIC)?;
-
-        // Write data checksum
-        self.writer.write_u128::<LittleEndian>(checksum)?;
-
-        // Write seqno
-        self.writer.write_u64::<LittleEndian>(seqno)?;
-
-        #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
-        self.writer.write_u16::<LittleEndian>(key.len() as u16)?;
-
-        // Write uncompressed value length
-        self.writer.write_u32::<LittleEndian>(uncompressed_len)?;
-
-        // Write compressed (on-disk) value length
-        self.writer.write_u32::<LittleEndian>(compressed_len_u32)?;
-
-        // Write header CRC
-        self.writer.write_u32::<LittleEndian>(header_crc)?;
+        // The header goes down as one write: the file's own checksum hashes
+        // every write it sees, field by field otherwise.
+        let mut header = [0_u8; BLOB_HEADER_LEN];
+        {
+            let mut fields = &mut header[..];
+            fields.write_all(BLOB_HEADER_MAGIC)?;
+            fields.write_u128::<LittleEndian>(checksum)?;
+            fields.write_u64::<LittleEndian>(seqno)?;
+            #[expect(clippy::cast_possible_truncation, reason = "keys are u16 length max")]
+            fields.write_u16::<LittleEndian>(key.len() as u16)?;
+            fields.write_u32::<LittleEndian>(uncompressed_len)?;
+            fields.write_u32::<LittleEndian>(compressed_len_u32)?;
+            fields.write_u32::<LittleEndian>(header_crc)?;
+        }
+        self.writer.write_all(&header)?;
 
         self.writer.write_all(key)?;
         self.writer.write_all(value)?;
@@ -661,9 +659,7 @@ impl Writer {
                 self.first_key
                     .clone()
                     .expect("should have written at least 1 item"),
-                self.last_key
-                    .clone()
-                    .expect("should have written at least 1 item"),
+                UserKey::from(self.last_key.as_slice()),
             )),
             // Record the override (relocation passthrough) when set, so a
             // reopened reader sees the real codec of the already-compressed

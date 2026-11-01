@@ -2191,6 +2191,9 @@ impl AbstractTree for BlobTree {
         // carry the RT metadata.
         table_writer.set_range_tombstones(range_tombstones);
 
+        // One buffer for every indirection of the flush.
+        let mut encoded = Vec::new();
+
         for item in stream {
             let item = item?;
 
@@ -2242,9 +2245,10 @@ impl AbstractTree for BlobTree {
                     size: value_size,
                 };
 
+                encoded.clear();
+                indirection.encode_into(&mut encoded)?;
                 table_writer.write({
-                    let mut vptr =
-                        InternalValue::new(item.key.clone(), indirection.encode_into_vec());
+                    let mut vptr = InternalValue::new(item.key, UserValue::new(&encoded));
                     vptr.key.value_type = crate::ValueType::Indirection;
                     vptr
                 })?;
