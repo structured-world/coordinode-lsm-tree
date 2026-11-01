@@ -12,13 +12,43 @@
 //! - `forward` and `reverse`: whole scans, per row;
 //! - `get`: point reads, per read.
 //!
-//! Timings are printed directly, the median of `SAMPLES` passes.
+//! Timings are printed directly, the median of `SAMPLES` passes, and after them
+//! what a whole forward scan allocates: how many times, and its peak in bytes
+//! above where it began.
 
 use lsm_tree::{
     AbstractTree, AnyTree, Config, Guard, MergeOperator, SeqNo, SequenceNumberCounter, UserValue,
 };
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
+
+struct Counting;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: forwards to `System` as it is called, and only counts on the side.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Relaxed);
+        let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
+        PEAK.fetch_max(live, Relaxed);
+        // SAFETY: the caller's layout, passed on.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Relaxed);
+        // SAFETY: `ptr` came from `alloc` with this layout.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 const KEYS: u32 = 20_000;
 const GETS: u32 = 2_000;
@@ -142,9 +172,19 @@ fn main() -> lsm_tree::Result<()> {
                 Ok(())
             })?;
 
+            let before = LIVE.load(Relaxed);
+            PEAK.store(before, Relaxed);
+            let allocations_before = ALLOCATIONS.load(Relaxed);
+            for row in tree.iter(seqno, None) {
+                row.into_inner()?;
+            }
+            let allocations = ALLOCATIONS.load(Relaxed) - allocations_before;
+            let peak = PEAK.load(Relaxed) - before;
+
             println!(
                 "tombstones {tombstones} {age} operands {operands}: first_row {first_row:.0} ns, \
-                 forward {forward:.0} ns/row, reverse {reverse:.0} ns/row, get {get:.0} ns",
+                 forward {forward:.0} ns/row, reverse {reverse:.0} ns/row, get {get:.0} ns, \
+                 scan {allocations} allocations, peak {peak} bytes",
             );
         }
     }
