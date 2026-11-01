@@ -79,6 +79,12 @@ impl Slice {
         builder
     }
 
+    /// A zeroed buffer to fill in place and freeze, without a copy.
+    #[must_use]
+    pub(crate) fn builder(len: usize) -> Builder {
+        Builder::zeroed(len)
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn slice(&self, range: impl core::ops::RangeBounds<usize>) -> Self {
